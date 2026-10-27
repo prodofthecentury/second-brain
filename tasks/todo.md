@@ -11,9 +11,11 @@ manifest/scoring; and truthful doctor/README readiness language. See
 `docs/system-sweep-2026-10-24.md` for exact evidence.
 
 Still open: full failure-injection audit, authenticated dashboard/MCP identity,
-merge/supersession workflow, answer-level trap evaluation, broader owner-approved
-retrieval coverage, and an approved Git migration baseline. One atom is now
-owner-approved; sodium-ion remains pending. See the 2026-10-27 system sweep for
+merge/supersession workflow, answer-level trap evaluation, and broader
+owner-approved retrieval coverage. One atom is owner-approved; sodium-ion
+remains pending. The code-only Git baseline is committed locally as `f4ab16e`;
+the older history still contains old-layout vault files, so do not add a remote
+before reviewing or scrubbing that history. See the 2026-10-27 system sweep for
 current status.
 
 ## Follow-up — 2026-10-27
@@ -24,7 +26,7 @@ current status.
 - Reviewed `structured-logging.md` and `sodium-ion-battery-cost-record.md` against their stored sources. Neither was owner-approved: one is a local excerpt without author metadata, and the other lacks the original article and is explicitly speculative.
 - Added a seven-query provisional evaluation set (five positive, two traps). Candidate Recall@5 is 1.00 for lexical and dense; MRR is 0.90/1.00, nDCG@5 0.939/1.00, and median latency about 6.4/57.9 ms. These labels are not owner-curated and are insufficient to claim dense retrieval is superior. Both trusted paths returned zero memories on all seven because no atom has owner approval.
 - Classified `tmp/pdfs/` as reproducible page previews from the PDFs in the design-study source register and added it to `.gitignore`; files remain on disk.
-- Git still has no clean baseline: nothing is staged, prior vault-root paths show as deleted, and the new `brain/` tree/project remain untracked. Do not stage or commit raw/private Markdown without the owner's choice.
+- The pre-approval Git observation was that no baseline was staged and the migrated tree was untracked. The owner later selected a code-only baseline; see the current system sweep and commit `f4ab16e`.
 
 Current verification: 14 system safety tests, smoke test, real Chroma canary,
 compileall, doctor, and retrieval evaluator passed. See

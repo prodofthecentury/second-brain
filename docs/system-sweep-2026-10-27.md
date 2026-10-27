@@ -11,7 +11,7 @@ The project has working, source-backed owner review; a real local Chroma cosine 
 - Ollama exposes four installed models; `llama3.2:3b` and `nomic-embed-text` are configured. `llava` is absent; another advertised vision model remains unverified and disabled.
 - 23 raw captures, 14 queued URLs, no source Markdown pages or generated threads.
 - `run_dashboard.ps1` returned HTTP 200/`ok` from `/_stcore/health`; its listener was `127.0.0.1:8501`. It was stopped after verification. The dashboard has no authentication.
-- The repository root is correct but has no clean project baseline: HEAD is `bffca9e` (`Initial vault setup`) and tracks only 18 old-layout vault files. The current project and `brain/` are untracked; those old paths are deleted in the worktree. Nothing is staged, there is no remote, and no commit was made. The user-data files remain on disk.
+- The code-only baseline is committed as `f4ab16e` (`chore: establish code-only project baseline`). The working tree is clean; the live `brain/` vault and `tmp/` remain local and ignored. There is no Git remote. The prior commit `bffca9e` still contains 18 old-layout vault files in local history, so do not add a remote or push until that history is reviewed or scrubbed.
 
 ## Retrieval result and change
 
@@ -58,7 +58,7 @@ The current evaluator has no separately labelled dense-only, keyword-only, and c
 1. Add more owner-approved memories only after source review; keep sodium-ion pending until primary evidence is present.
 2. Expand the gold set and manually inspect missed matches, false matches, and answer output. Add explicit dense-only/keyword-only/hybrid categories and p95 latency before making a dense/default decision.
 3. Make factual answer behavior structural. The current prompt can still answer from general knowledge when retrieval is empty; the two successful manual model replies do not prove a zero trap-fabrication rate.
-4. Establish the selected code-only Git baseline. The live `brain/` data is excluded; the existing initial Git commit still contains 18 old-layout vault files and must stay local until that history is reviewed or removed.
+4. Before any future remote is configured, review or remove the 18 old-layout vault files retained in local Git history. The current code-only baseline is local and clean; the live vault remains excluded.
 5. Obtain the required independent Claude review after its CLI authentication is restored, then reconcile its findings.
 
 ## Product direction

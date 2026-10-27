@@ -8,10 +8,12 @@ runtime. A real 13-atom cosine generation now works. Scout connections are
 IP-pinned to validated public DNS results. The owner approved the structured-
 logging atom and a seven-query evaluation set. A conservative literal claim
 overlap gate now prevents the two current trap queries from returning trusted
-context; synonym-only recall may be missed. The Git migration remains
-unstaged/uncommitted pending the owner's choice about raw/private Markdown.
-See `system-sweep-2026-10-27.md` for current evidence and limitations; the
-2026-10-24 report is a historical snapshot.
+context; synonym-only recall may be missed. The owner selected a code-only
+baseline, committed as `f4ab16e`; the working tree is clean and the live
+`brain/` vault is excluded. No remote is configured. The earlier `bffca9e`
+commit still contains 18 old-layout vault files, so do not push until that
+history is reviewed or scrubbed. See `system-sweep-2026-10-27.md` for current
+evidence and limitations; the 2026-10-24 report is a historical snapshot.
 
 **Long-term product direction:** the owner wants a one-click installable Brain
 plugin for any PC, with local/offline and online modes and adapters for
