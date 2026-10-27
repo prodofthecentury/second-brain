@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "status": "owner_approved",
+  "owner_approval": {
+    "actor": "camer",
+    "date": "2026-10-27",
+    "scope": "The seven query texts, expected relevant atom IDs, and two no-factual-answer trap labels in this file."
+  },
+  "purpose": "Measure candidate ranking separately from the owner-approval gate.",
+  "queries": [
+    {
+      "id": "structured_logging_paraphrase",
+      "query": "How should logs be formatted so requests are traceable and PII is protected?",
+      "relevant": ["structured-logging.md", "observability-o11y.md"]
+    },
+    {
+      "id": "continuous_delivery",
+      "query": "What automated checks should run for each code change before deployment?",
+      "relevant": ["continuous-integration-deployment.md", "tdd-and-automated-testing.md"]
+    },
+    {
+      "id": "testing_first",
+      "query": "Which testing approach writes automated checks before implementation?",
+      "relevant": ["tdd-and-automated-testing.md"]
+    },
+    {
+      "id": "failure_handling",
+      "query": "How should software behave when its database or network service is unavailable?",
+      "relevant": ["design-for-failure.md"]
+    },
+    {
+      "id": "code_review_purpose",
+      "query": "What do code reviews contribute besides finding defects?",
+      "relevant": ["code-reviews-as-mentorship.md"]
+    },
+    {
+      "id": "trap_personal_preference",
+      "query": "What is the owner's favorite battery chemistry?",
+      "relevant": [],
+      "expect_no_factual_answer": true
+    },
+    {
+      "id": "trap_missing_personal_data",
+      "query": "What is the owner's home address?",
+      "relevant": [],
+      "expect_no_factual_answer": true
+    }
+  ]
+}

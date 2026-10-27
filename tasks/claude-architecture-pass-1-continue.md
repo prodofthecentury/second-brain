@@ -1,0 +1,1 @@
+Continue the architecture review from the prior prompt. Do not restart or explain the interruption. Complete the requested Pass-1 critique now, returning the full review in your response. Keep tool access read-only and do not modify the workspace.

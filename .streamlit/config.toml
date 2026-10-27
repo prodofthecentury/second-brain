@@ -1,0 +1,11 @@
+# Project-local Streamlit settings. See:
+# https://docs.streamlit.io/develop/api-reference/configuration/config.toml
+[server]
+# Avoid Streamlit's first-run terminal email prompt so the shipped launcher can bind unattended.
+headless = true
+address = "127.0.0.1"
+
+[browser]
+# This local-first application opts out of Streamlit usage telemetry.
+serverAddress = "localhost"
+gatherUsageStats = false

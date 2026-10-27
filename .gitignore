@@ -1,0 +1,39 @@
+# Second Brain — Git configuration
+
+# Keep owner-specific memories and raw captures out of the application baseline.
+brain/
+
+# Obsidian cache and workspace state (regenerates automatically)
+brain/.obsidian/workspace.json
+brain/.obsidian/cache
+
+# Rebuildable indexes and inter-process coordination state
+brain/.chroma/
+brain/.sidecar/
+
+# Agent scratch space — never commit in-progress work
+brain/1-desk/*.draft
+brain/1-desk/*.link-pending
+brain/1-desk/refinery-handoff-*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor temp files
+*.swp
+*.tmp
+*~
+
+# Python/runtime output
+__pycache__/
+*.py[cod]
+*.log
+
+# Local agent scratch
+.agents/
+
+# Reproducible page previews rendered while preparing the learning-design memo.
+# Their source PDFs and SHA-256 inventory are recorded in docs/learning-and-memory-design-synthesis.md.
+tmp/pdfs/
