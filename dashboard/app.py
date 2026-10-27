@@ -45,6 +45,7 @@ from scripts.config import (
     normalize_markdown_filename, safe_file_in_dir
 )
 from scripts.recall import RecallOptions, search_memory as recall_search_memory
+from scripts.answer_policy import answer_from_memory
 from scripts.atom_mutator import apply_atom_edit
 from scripts.review_atom import apply_review_transition, approved_revision_is_current
 from scripts.memory_review import parse_atom_record
@@ -566,7 +567,7 @@ if nav_selection == "💬 Chat with Memory":
                 st.info(f"📚 Retrieved {len(direct_refs)} direct atoms and {len(neighbor_refs)} linked atoms.")
             else:
                 ref_text = ""
-                st.warning("⚠ No relevant memory vectors found. Responding with base parameters.")
+                st.warning("⚠ No relevant owner-approved memory found. The assistant will abstain.")
                 
             # Render references container
             if all_refs:
@@ -576,42 +577,45 @@ if nav_selection == "💬 Chat with Memory":
                         st.markdown(f"**[{r['filename']}]** `{trust}`")
                         st.code(r['content'][:300] + "...")
                         
-            # Ollama prompt construction
-            system_instruction = f"""
-You are a brilliant assistant. Answer the user's question. 
-Use the context below from the user's Second Brain vault to craft your answer.
-If the context is irrelevant, answer from general knowledge, but always prioritize vault facts.
-Cite the filenames of the atoms when referencing their claims.
+            response_container = st.empty()
+            full_response = ""
+            if not ref_text.strip():
+                full_response = answer_from_memory(ref_text, lambda: "")
+                response_container.markdown(full_response)
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": full_response,
+                    "references": []
+                })
+            else:
+                # Ollama prompt construction
+                system_instruction = f"""
+You are a research assistant answering from the user's Second Brain vault.
+Use only the approved vault context below. If it does not contain enough evidence,
+say that the approved memory does not contain the answer. Do not fill gaps with general knowledge.
+Cite filenames for claims drawn from the vault.
 
 VAULT CONTEXT:
 {ref_text}
 """
-            # Build conversation message history
-            ollama_msgs = [{"role": "system", "content": system_instruction}]
-            # Add past chat history (up to last 10 messages to keep context reasonable)
-            for past_msg in st.session_state.chat_history[-10:]:
-                ollama_msgs.append({"role": past_msg["role"], "content": past_msg["content"]})
-                
-            response_container = st.empty()
-            full_response = ""
-            
-            try:
-                # Stream response from Ollama
-                response_stream = ollama.chat(model=st_model, messages=ollama_msgs, stream=True)
-                for chunk in response_stream:
-                    content = chunk["message"]["content"]
-                    full_response += content
-                    response_container.markdown(full_response + "▌")
-                response_container.markdown(full_response)
-                
-                # Append assistant response to state
-                st.session_state.chat_history.append({
-                    "role": "assistant",
-                    "content": full_response,
-                    "references": all_refs
-                })
-            except Exception as e:
-                st.error(f"Error connecting to Ollama: {e}")
+                ollama_msgs = [{"role": "system", "content": system_instruction}]
+                for past_msg in st.session_state.chat_history[-10:]:
+                    ollama_msgs.append({"role": past_msg["role"], "content": past_msg["content"]})
+
+                try:
+                    response_stream = ollama.chat(model=st_model, messages=ollama_msgs, stream=True)
+                    for chunk in response_stream:
+                        content = chunk["message"]["content"]
+                        full_response += content
+                        response_container.markdown(full_response + "▌")
+                    response_container.markdown(full_response)
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": full_response,
+                        "references": all_refs
+                    })
+                except Exception as e:
+                    st.error(f"Error connecting to Ollama: {e}")
 
 
 # PAGE 2: KNOWLEDGE GRAPH

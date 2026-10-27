@@ -14,6 +14,7 @@ from rich.panel import Panel
 from scripts.config import (
     GEN_MODEL,
 )
+from scripts.answer_policy import answer_from_memory
 from scripts.recall import (
     MemoryRecallUnavailable,
     RecallOptions,
@@ -54,12 +55,19 @@ def chat_loop():
             console.print("[dim green]✓ Relevant memories retrieved.[/dim green]")
         else:
             console.print("[dim yellow]⚠ No relevant memories found.[/dim yellow]")
+
+        if not memory_context.strip():
+            full_response = answer_from_memory(memory_context, lambda: "")
+            console.print(f"\n[bold blue]Ollama>[/bold blue] {full_response}")
+            messages.append({"role": "user", "content": user_input})
+            messages.append({"role": "assistant", "content": full_response})
+            continue
             
         system_prompt = f"""
-You are a brilliant research assistant with a perfect memory, powered by the user's Second Brain vault.
-Answer the user's question. Use the context provided below from the vault.
-If the context is irrelevant to the question, you can answer from your general knowledge, but always prioritize the vault context.
-If you use the vault context, cite the filename.
+You are a research assistant answering from the user's Second Brain vault.
+Use only the approved vault context below. If it does not contain enough evidence to answer,
+say that the approved memory does not contain the answer. Do not fill gaps with general knowledge.
+Cite the filename for each claim drawn from the vault.
 
 VAULT CONTEXT:
 {memory_context}

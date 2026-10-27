@@ -2,7 +2,7 @@
 
 ## Verdict
 
-The project has working, source-backed owner review; a real local Chroma cosine index; public-IP-pinned Scout fetches; and a local dashboard launcher that starts on loopback. It is still not a release-ready factual assistant. The newly measured relevance defect was that an approved but unrelated atom entered trusted context for both owner-personal trap queries. A conservative lexical claim-overlap check now blocks those two cases. That check is intentionally lossy and does not establish broad answer safety.
+The project has working, source-backed owner review; a real local Chroma cosine index; public-IP-pinned Scout fetches; and a local dashboard launcher that starts on loopback. It is still not a release-ready factual assistant. A conservative two-term overlap gate blocks the two owner-personal trap queries, while a fresh audit caught that the gate was also suppressing the approved logging paraphrase because it ignored the atom's supporting Evidence section. The gate now checks both Claim and Evidence. That remains a literal heuristic, not a proof of answerability.
 
 ## Current state
 
@@ -22,13 +22,13 @@ Owner-approved evaluation corpus: five positive queries and two no-factual-answe
 | Mean Recall@5 | 1.00 | 1.00 |
 | Mean MRR | 0.90 | 1.00 |
 | Mean nDCG@5 | 0.939 | 1.00 |
-| Median retrieval latency | 6.3 ms | 53.6 ms |
+| Median retrieval latency | 5.8 ms | 59.1 ms |
 
 The raw ranking metrics are over only five positive queries and 13 atoms. They do not show that dense retrieval is better in representative use, and the ~9x median latency difference does not include p95 or end-to-end answer latency.
 
-Before the relevance check, both trusted paths returned one approved result for each trap (four false-positive retrievals total). The test-first change requires at least two meaningful query tokens to occur in a candidate's `Claim` section before lexical or dense recall can return it; linked neighbors receive the same check. The live rerun returned **zero trusted results for both traps**. Of the five positive queries, only the structured-logging paraphrase currently returned trusted context, because the other expected atoms remain unapproved. This is the right trust outcome; candidate ranking must not make pending atoms answerable.
+Before the relevance check, both trusted paths returned one approved result for each trap (four false-positive retrievals total). The test-first change requires at least two meaningful query tokens to occur in a candidate's `Claim` or `Evidence` section before lexical or dense recall can return it; linked neighbors receive the same check. The fresh live rerun returned **zero trusted results for both traps** and returned the currently approved `structured-logging.md` atom for the structured-logging paraphrase through both retrieval paths. The other positive examples remain unapproved and are correctly withheld from trusted context. Candidate ranking must not make pending atoms answerable.
 
-The overlap test is a conservative literal match. It can miss valid paraphrases and it is not proof that the returned atom answers the question. Do not describe the current 0/2 trap result as a zero fabrication rate: `evaluate_retrieval.py` counts retrieved documents, not generated answers. A one-off local `llama3.2:3b` check answered these two exact personal-data questions without inventing a battery preference or address, but this is not a repeatable answer-safety gate and the current prompts still allow general-knowledge answers when context is empty.
+The overlap test is a conservative literal match. It can miss valid paraphrases and it is not proof that the returned atom answers the question. Do not describe the current 0/2 trap result as a zero fabrication rate: `evaluate_retrieval.py` counts retrieved documents, not generated answers. The CLI and dashboard now structurally abstain without calling the model when retrieval yields no approved context. With context present, the model may still overstate or invent claims, so answer-level grounding is still unmeasured.
 
 The current evaluator has no separately labelled dense-only, keyword-only, and combined-ranker categories; it measures lexical and dense candidate rankings independently. The default `search_memory` selects lexical when the FTS sidecar exists. The owner-approved set is a useful initial regression baseline, not calibration evidence for score weights or general answerability.
 
@@ -44,8 +44,9 @@ The current evaluator has no separately labelled dense-only, keyword-only, and c
 
 ## Verification performed
 
-- `uv run scripts/smoke_test.py` — passed after adding lexical and dense trap regression assertions. The test was first run before the implementation and failed on the lexical trap, confirming the bug.
-- `uv run scripts/evaluate_retrieval.py --output docs/retrieval-evaluation-results-2026-10-27.json` — passed against the live Chroma generation; raw candidate metrics above; trusted trap false positives `0`.
+- `uv run --python 3.11 scripts/smoke_test.py` — passed after adding lexical/dense evidence-supported paraphrase checks, no-context abstention checks, and trap regression assertions. The new paraphrase regression failed before the Claim+Evidence implementation.
+- `uv run --python 3.11 scripts/evaluate_retrieval.py --output docs/retrieval-evaluation-results-2026-10-27.json` — passed against the live Chroma generation; raw ranking metrics above; the approved structured-logging paraphrase retrieves one distinct trusted atom through each path; trusted trap false positives `0`.
+- `uv run --python 3.11 scripts/chroma_rebuild_canary.py` — `CHROMA_REBUILD_CANARY_OK` for both canary atoms.
 - `uv run --python 3.11 --with httpx --with trafilatura --with beautifulsoup4 python scripts/system_safety_tests.py` — 14 tests passed after the relevance change.
 - `uv run scripts/archive_manifest_canary.py` — passed after the relevance change.
 - `uv run scripts/chroma_rebuild_canary.py` — passed against persistent Chroma after the relevance change.
@@ -57,7 +58,7 @@ The current evaluator has no separately labelled dense-only, keyword-only, and c
 
 1. Add more owner-approved memories only after source review; keep sodium-ion pending until primary evidence is present.
 2. Expand the gold set and manually inspect missed matches, false matches, and answer output. Add explicit dense-only/keyword-only/hybrid categories and p95 latency before making a dense/default decision.
-3. Make factual answer behavior structural. The current prompt can still answer from general knowledge when retrieval is empty; the two successful manual model replies do not prove a zero trap-fabrication rate.
+3. Evaluate answer-level factuality on repeated model outputs and broader trap questions. Empty-context abstention is now structural in the CLI and dashboard, but that does not prove grounded answers when context is present.
 4. Before any future remote is configured, review or remove the 18 old-layout vault files retained in local Git history. The current code-only baseline is local and clean; the live vault remains excluded.
 5. Obtain the required independent Claude review after its CLI authentication is restored, then reconcile its findings.
 

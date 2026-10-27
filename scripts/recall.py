@@ -284,23 +284,29 @@ def result_from_candidate(
 
 
 def candidate_has_query_overlap(query: str, content: str) -> bool:
-    """Require literal claim-term corroboration before trusted recall can inject a result.
+    """Require literal claim/evidence corroboration before trusted recall injects a result.
 
     This is a conservative relevance precondition, not a relevance score or proof of
-    entailment. It intentionally declines synonym-only matches until the approved
-    evaluation corpus can justify a stronger answerability method.
+    entailment. Supporting evidence can be more specific than a concise claim, so both
+    sections count. Synonym-only matches remain excluded until evaluation justifies a
+    stronger answerability method.
     """
     parsed = split_frontmatter(content)
     if parsed is None:
         return False
-    claim = section_text("\n".join(parsed[1]), "Claim")
+    body = "\n".join(parsed[1])
+    claim = section_text(body, "Claim")
+    evidence = section_text(body, "Evidence")
     query_terms = {
         term.casefold()
         for term in TOKEN_PATTERN.findall(str(query or ""))
         if term.casefold() not in QUERY_STOP_WORDS and len(term) > 1
     }
-    claim_terms = {term.casefold() for term in TOKEN_PATTERN.findall(claim)}
-    return len(query_terms.intersection(claim_terms)) >= 2
+    corroborating_terms = {
+        term.casefold()
+        for term in TOKEN_PATTERN.findall(f"{claim}\n{evidence}")
+    }
+    return len(query_terms.intersection(corroborating_terms)) >= 2
 
 
 def wikilinks(content: str) -> list[str]:

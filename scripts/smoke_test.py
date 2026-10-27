@@ -34,6 +34,7 @@ from config import (
 from memory_format import extract_memory_documents, normalize_memory_document
 from memory_review import list_review_queue, parse_atom_record
 from recall import RecallOptions, rerank_candidates
+from answer_policy import NO_APPROVED_MEMORY_RESPONSE, answer_from_memory
 from refinery_targets import intake_status, is_supported_refinery_target
 from vector_store import JsonVectorCollection, json_collection_path, reset_vector_collection
 
@@ -41,6 +42,19 @@ from vector_store import JsonVectorCollection, json_collection_path, reset_vecto
 def check(condition: bool, message: str):
     if not condition:
         raise AssertionError(message)
+
+
+def test_memory_chat_abstains_without_approved_context():
+    calls = []
+    generate = lambda: calls.append("called") or "model answer"
+
+    response = answer_from_memory(" \n", generate)
+    check(response == NO_APPROVED_MEMORY_RESPONSE, "empty memory context gets deterministic abstention")
+    check(not calls, "model generation is not called without approved context")
+
+    response = answer_from_memory("approved atom", generate)
+    check(response == "model answer", "model generation runs when approved context exists")
+    check(calls == ["called"], "generation callback is called exactly once")
 
 
 def test_path_guards():
@@ -1055,7 +1069,7 @@ review_status: accepted
 Lexical retrieval indexes structured logs without an embedding model.
 
 ## Evidence
-The local FTS sidecar is a rebuildable projection.
+Structured JSON logs contain request IDs for tracing and avoid logging PII.
 """
     candidate_atom = accepted_atom.replace("lexical-accepted", "lexical-candidate").replace(
         "claim_state: human_reviewed", "claim_state: candidate"
@@ -1092,6 +1106,17 @@ The local FTS sidecar is a rebuildable projection.
         check(direct[0].source == "lexical", "lexical recall exposes its retrieval source")
 
         with patch("recall.approved_revision_is_current", return_value=True):
+            paraphrase, _ = search_lexical_memory(
+                "How should logs be formatted so requests are traceable and PII is protected?",
+                RecallOptions(n_results=5, follow_links=False),
+                atoms_dir=str(atoms_dir),
+                index_path=str(index_path),
+            )
+            check(
+                [item.filename for item in paraphrase] == ["accepted.md"],
+                "approved claims remain retrievable when two query terms are supported by evidence",
+            )
+
             trap_direct, _ = search_lexical_memory(
                 "What is the owner's favorite battery chemistry?",
                 RecallOptions(n_results=5, follow_links=False),
@@ -1138,6 +1163,24 @@ The local FTS sidecar is a rebuildable projection.
                     atoms_dir=str(atoms_dir),
                 ) == [],
                 "one shared topic word is not enough to inject an atom into a personal-preference query",
+            )
+            dense_evidence_match = {
+                "documents": [[accepted_atom]],
+                "metadatas": [[{
+                    "filename": "accepted.md",
+                    "content_sha256": hashlib.sha256((atoms_dir / "accepted.md").read_bytes()).hexdigest(),
+                }]],
+                "distances": [[0.05]],
+            }
+            dense_evidence_results = rerank_candidates(
+                    dense_evidence_match,
+                    RecallOptions(n_results=1),
+                    query="How should logs be formatted so requests are traceable and PII is protected?",
+                    atoms_dir=str(atoms_dir),
+                )
+            check(
+                [item.filename for item in dense_evidence_results] == ["accepted.md"],
+                "dense recall retains an approved paraphrase corroborated by evidence terms",
             )
 
         linked_seed = accepted_atom.replace("links: []", "links:\n  - unrelated.md", 1)
@@ -1199,6 +1242,7 @@ def test_python_syntax():
 
 
 def main():
+    test_memory_chat_abstains_without_approved_context()
     test_path_guards()
     test_archive_manifest_entry_shape_and_append()
     test_json_vector_collection_reset_removes_stale_items()
