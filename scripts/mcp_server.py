@@ -1,24 +1,22 @@
 # /// script
 # requires-python = ">=3.11,<3.12"
 # dependencies = [
-#     "mcp",
-#     "ollama",
+#     "mcp>=2.3,<3",
+#     "ollama>=0.6,<1",
 # ]
 # ///
 """
 Feature 4 — Native MCP Server
 Exposes a deliberately limited MCP (Model Context Protocol) interface to a
-trusted local process. It is disabled unless BRAIN_ENABLE_LOCAL_MCP=1 is set.
+trusted local stdio process. It is disabled unless BRAIN_ENABLE_LOCAL_MCP=1 is set.
 
 Tools exposed:
-  search_memory(query)     — Semantic vector search across all atoms
+  search_memory(query)     — Shared recall over currently approved atoms
   get_atom(atom_id)        — Read a specifically named, currently approved atom
   add_to_inbox(content)    — Add a size-limited, untrusted capture to 0-raw/
 
-Resources exposed:
-  brain://atoms/{id}       — Direct atom access
-  brain://threads/{slug}   — Direct thread access
-  brain://briefings/latest — Latest briefing
+Resources: no listable resource catalog; direct approved atom resources only.
+Tool/resource use is audited by canonical name and timestamp; input text is not logged.
 
 Run only from an explicitly trusted local process:
     $env:BRAIN_ENABLE_LOCAL_MCP = "1"
@@ -29,6 +27,7 @@ import os
 import sys
 import json
 import glob
+import datetime
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -45,9 +44,8 @@ from review_atom import approved_revision_is_current
 
 
 MAX_INBOX_CHARS = 100_000
-
-app = Server("second-brain")
-
+MCP_AUDIT_PATH = os.path.join(RAW_DIR, "archive", "mcp-audit.jsonl")
+TOOL_NAMES = {"search_memory", "get_atom", "add_to_inbox"}
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -79,11 +77,33 @@ def latest_briefing_path() -> str | None:
     return files[0] if files else None
 
 
+def audit_mcp_use(action: str, audit_path: str = MCP_AUDIT_PATH) -> dict:
+    """Append a content-free audit event before serving an MCP request."""
+    if action not in {"tool:search_memory", "tool:get_atom", "tool:add_to_inbox", "tool:unknown", "resource:read"}:
+        raise ValueError("MCP audit action is not allowlisted.")
+    os.makedirs(os.path.dirname(os.path.abspath(audit_path)), exist_ok=True)
+    record = {
+        "schema_version": 1,
+        "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "transport": "stdio",
+        "event": action,
+    }
+    payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    descriptor = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        written = os.write(descriptor, payload)
+        if written != len(payload):
+            raise OSError("MCP audit append was incomplete.")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return record
+
+
 # ─── MCP Tools ────────────────────────────────────────────────────────────────
 
-@app.list_tools()
-async def list_tools() -> list[types.Tool]:
-    return [
+async def handle_list_tools(_ctx, _params) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=[
         types.Tool(
             name="search_memory",
             description="Semantically search the Second Brain vault for relevant atomic notes.",
@@ -119,11 +139,13 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["content"],
             },
         ),
-    ]
+    ])
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
+    name = params.name
+    arguments = params.arguments or {}
+    audit_mcp_use(f"tool:{name}" if name in TOOL_NAMES else "tool:unknown")
     ensure_dirs()
 
     if name == "search_memory":
@@ -132,7 +154,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         try:
             results = semantic_search(query, n_results=n)
         except MemoryRecallUnavailable as exc:
-            return [types.TextContent(type="text", text=f"Memory recall unavailable: {exc}")]
+            return types.CallToolResult(content=[types.TextContent(type="text", text=f"Memory recall unavailable: {exc}")], isError=True)
         if not results:
             text = "No relevant memories found for this query."
         else:
@@ -145,23 +167,23 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 )
                 parts.append(f"### {r['filename']}\n\n`{trust}`\n\n{r['content']}")
             text = "\n\n---\n\n".join(parts)
-        return [types.TextContent(type="text", text=text)]
+        return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
     elif name == "get_atom":
         atom_id = normalize_markdown_filename(arguments["atom_id"])
         path    = safe_file_in_dir(ATOMS_DIR, atom_id, allowed_exts={".md"})
         if not path:
-            return [types.TextContent(type="text", text=f"Atom '{atom_id}' not found or invalid.")]
+            return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{atom_id}' not found or invalid.")])
         if not approved_revision_is_current(path):
-            return [types.TextContent(type="text", text="Atom is not currently owner-approved for external reading.")]
+            return types.CallToolResult(content=[types.TextContent(type="text", text="Atom is not currently owner-approved for external reading.")])
         content  = read_file_safe(path)
         text     = content if content else f"Atom '{atom_id}' not found."
-        return [types.TextContent(type="text", text=text)]
+        return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
     elif name == "add_to_inbox":
         content = str(arguments.get("content", ""))
         if not content.strip() or len(content) > MAX_INBOX_CHARS:
-            return [types.TextContent(type="text", text=f"Inbox content must contain 1 to {MAX_INBOX_CHARS} characters.")]
+            return types.CallToolResult(content=[types.TextContent(type="text", text=f"Inbox content must contain 1 to {MAX_INBOX_CHARS} characters.")])
         source  = arguments.get("source", "MCP agent")
         source = str(source).replace("--", "—").replace("\r", " ").replace("\n", " ")[:500]
         filename = f"{now_slug()}-mcp-note.md"
@@ -177,28 +199,38 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 path = os.path.join(RAW_DIR, filename)
                 suffix += 1
         text = f"Note saved to inbox as '{filename}'. It will be processed on the next Refinery Run."
-        return [types.TextContent(type="text", text=text)]
+        return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
-    return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+    return types.CallToolResult(content=[types.TextContent(type="text", text=f"Unknown tool: {name}")], isError=True)
 
 
 # ─── MCP Resources ────────────────────────────────────────────────────────────
 
-@app.list_resources()
-async def list_resources() -> list[types.Resource]:
+async def handle_list_resources(_ctx, _params) -> types.ListResourcesResult:
     # No listable resource catalog: it would enumerate private vault material.
-    return []
+    return types.ListResourcesResult(resources=[])
 
 
-@app.read_resource()
-async def read_resource(uri: str) -> str:
+async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) -> types.ReadResourceResult:
+    audit_mcp_use("resource:read")
+    uri = str(params.uri)
     if uri.startswith("brain://atoms/"):
         filename = uri.removeprefix("brain://atoms/")
         path = safe_file_in_dir(ATOMS_DIR, filename, allowed_exts={".md"})
         if not path or not approved_revision_is_current(path):
-            return ""
-        return read_file_safe(path)
-    return ""
+            return types.ReadResourceResult(contents=[])
+        return types.ReadResourceResult(contents=[types.TextResourceContents(uri=uri, mimeType="text/markdown", text=read_file_safe(path))])
+    return types.ReadResourceResult(contents=[])
+
+
+app = Server(
+    "second-brain",
+    version="0.1.0",
+    on_list_tools=handle_list_tools,
+    on_call_tool=handle_call_tool,
+    on_list_resources=handle_list_resources,
+    on_read_resource=handle_read_resource,
+)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────

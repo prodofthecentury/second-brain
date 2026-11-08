@@ -15,7 +15,7 @@ Provides chat with memory, 2D/3D knowledge graph, vault browser & editor,
 Web Scout control, and system action triggers with live streaming logs.
 
 Run it with:
-    uv run --python 3.11 --with streamlit --with plotly --with networkx --with pandas --with ollama streamlit run dashboard/app.py
+    uv run --locked --extra dashboard streamlit run dashboard/app.py --server.address 127.0.0.1
 """
 
 import os
@@ -45,11 +45,13 @@ from scripts.config import (
     normalize_markdown_filename, safe_file_in_dir
 )
 from scripts.recall import RecallOptions, search_memory as recall_search_memory
-from scripts.answer_policy import answer_from_memory
+from scripts.answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, answer_from_memory, build_grounding_prompt, validate_standard_answer
 from scripts.atom_mutator import apply_atom_edit
 from scripts.review_atom import apply_review_transition, approved_revision_is_current
 from scripts.memory_review import parse_atom_record
 from scripts.review_atom import review_lock
+from scripts.review_details import atom_review_details
+from scripts.dashboard_auth import require_dashboard_login
 
 ensure_dirs()
 
@@ -60,6 +62,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Do not inspect or render vault data until the local owner session is unlocked.
+dashboard_authenticated = require_dashboard_login(st)
+if not dashboard_authenticated:
+    st.stop()
 
 # Custom Tokyo Night stylesheet
 st.markdown("""
@@ -525,13 +532,15 @@ if nav_selection == "💬 Chat with Memory":
     # Display chat messages
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg.get("references"):
-                with st.expander("📚 References used", expanded=False):
-                    for ref in msg["references"]:
-                        trust = f"{ref.get('review_status', 'unknown')} | score {ref.get('score', 0):.3f}"
-                        st.markdown(f"**[{ref['filename']}]** `{trust}`")
-                        st.text(ref['content'][:400] + "..." if len(ref['content']) > 400 else ref['content'])
+            if msg["role"] == "assistant" and msg.get("claims"):
+                replay = validate_standard_answer(
+                    msg["draft_json"], msg["retrieved_atoms"], atoms_dir=ATOMS_DIR
+                )
+                st.text(replay.text)
+            elif msg["role"] == "assistant":
+                st.text(msg.get("content", answer_from_memory("", lambda: "")))
+            else:
+                st.text(msg.get("content", ""))
 
     # Handle input
     if user_prompt := st.chat_input("Ask your second brain anything..."):
@@ -539,7 +548,7 @@ if nav_selection == "💬 Chat with Memory":
         st.session_state.chat_history.append({"role": "user", "content": user_prompt})
         
         with st.chat_message("user"):
-            st.markdown(user_prompt)
+            st.text(user_prompt)
             
         with st.chat_message("assistant"):
             with st.spinner("🧠 Querying vector memories..."):
@@ -550,69 +559,57 @@ if nav_selection == "💬 Chat with Memory":
                 )
                 
             all_refs = direct_refs + neighbor_refs
-            
-            # Construct context block
+
             if all_refs:
-                ref_text = "\n\n".join([
-                    (
-                        f"--- Source: {r['filename']} "
-                        f"(status={r.get('review_status', 'unknown')}; "
-                        f"type={r.get('memory_type', 'unknown')}; "
-                        f"confidence={r.get('confidence', 0):.2f}; "
-                        f"importance={r.get('importance', 0):.2f}; "
-                        f"score={r.get('score', 0):.3f}) ---\n{r['content']}"
-                    )
-                    for r in all_refs
-                ])
+                ref_text = build_grounding_prompt(
+                    AnswerRequest(query=user_prompt, result_limit=rag_n_results),
+                    all_refs,
+                )
                 st.info(f"📚 Retrieved {len(direct_refs)} direct atoms and {len(neighbor_refs)} linked atoms.")
             else:
                 ref_text = ""
                 st.warning("⚠ No relevant owner-approved memory found. The assistant will abstain.")
                 
-            # Render references container
-            if all_refs:
-                with st.expander("📚 Sources injected", expanded=False):
-                    for r in all_refs:
-                        trust = f"{r.get('review_status', 'unknown')} | score {r.get('score', 0):.3f}"
-                        st.markdown(f"**[{r['filename']}]** `{trust}`")
-                        st.code(r['content'][:300] + "...")
-                        
             response_container = st.empty()
             full_response = ""
             if not ref_text.strip():
                 full_response = answer_from_memory(ref_text, lambda: "")
-                response_container.markdown(full_response)
+                response_container.text(full_response)
                 st.session_state.chat_history.append({
                     "role": "assistant",
                     "content": full_response,
-                    "references": []
+                    "claims": (),
                 })
             else:
-                # Ollama prompt construction
-                system_instruction = f"""
-You are a research assistant answering from the user's Second Brain vault.
-Use only the approved vault context below. If it does not contain enough evidence,
-say that the approved memory does not contain the answer. Do not fill gaps with general knowledge.
-Cite filenames for claims drawn from the vault.
-
-VAULT CONTEXT:
-{ref_text}
-"""
-                ollama_msgs = [{"role": "system", "content": system_instruction}]
+                ollama_msgs = [{"role": "system", "content": ref_text}]
                 for past_msg in st.session_state.chat_history[-10:]:
-                    ollama_msgs.append({"role": past_msg["role"], "content": past_msg["content"]})
+                    if past_msg["role"] == "user":
+                        ollama_msgs.append({"role": "user", "content": past_msg.get("content", "")})
+                    elif past_msg.get("claims"):
+                        replay = validate_standard_answer(
+                            past_msg.get("draft_json", ""), past_msg.get("retrieved_atoms", []),
+                            atoms_dir=ATOMS_DIR,
+                        )
+                        if replay.answerable:
+                            ollama_msgs.append({"role": "assistant", "content": replay.text})
 
                 try:
-                    response_stream = ollama.chat(model=st_model, messages=ollama_msgs, stream=True)
+                    response_stream = ollama.chat(
+                        model=st_model, messages=ollama_msgs, format=ANSWER_DRAFT_SCHEMA, stream=True
+                    )
                     for chunk in response_stream:
                         content = chunk["message"]["content"]
                         full_response += content
-                        response_container.markdown(full_response + "▌")
-                    response_container.markdown(full_response)
+                    model_draft_json = full_response
+                    answer = validate_standard_answer(full_response, all_refs, atoms_dir=ATOMS_DIR)
+                    full_response = answer.text
+                    response_container.text(full_response)
                     st.session_state.chat_history.append({
                         "role": "assistant",
-                        "content": full_response,
-                        "references": all_refs
+                        "content": full_response if not answer.answerable else "",
+                        "claims": answer.claims,
+                        "draft_json": model_draft_json if answer.answerable else "",
+                        "retrieved_atoms": all_refs if answer.answerable else [],
                     })
                 except Exception as e:
                     st.error(f"Error connecting to Ollama: {e}")
@@ -698,6 +695,8 @@ elif nav_selection == "🗄️ Vault Explorer":
         st.info("This vault category has no files yet.")
     else:
         files = sorted([f for f in os.listdir(dir_path) if f.endswith(".md") or f.endswith(".intake")])
+        if dir_path == ATOMS_DIR:
+            files = [filename for filename in files if filename != "README.md"]
         search_query = st.text_input("🔍 Search filenames", "")
         
         if search_query:
@@ -751,16 +750,60 @@ elif nav_selection == "🗄️ Vault Explorer":
                             st.rerun()
 
                     if dir_path == ATOMS_DIR and preview_mode == "Preview":
+                        record = None
+                        current_approval = False
                         try:
                             record = parse_atom_record(file_path)
                             current_approval = approved_revision_is_current(file_path)
                             approval_text = "verified current owner approval" if current_approval else f"{record['review_status']} (not eligible for recall)"
-                            st.caption(f"Lifecycle: {approval_text}")
+                            review_details = atom_review_details(
+                                file_content,
+                                atom_path=file_path,
+                                atoms_dir=ATOMS_DIR,
+                                brain_dir=os.path.dirname(ATOMS_DIR),
+                            )
+                            st.caption(f"Lifecycle: {approval_text} · atom SHA-256: `{review_details['atom_sha256']}`")
+                            st.markdown("#### Evidence and trust status")
+                            st.caption(f"Stored evidence excerpt: {review_details['stored_quote'] or '(missing)'}")
+                            anchor = review_details["anchor"]
+                            if all(anchor.values()):
+                                st.caption(f"Stored anchor: `{anchor['evidence_source']}` · bytes {anchor['evidence_start']}–{anchor['evidence_end']} · source SHA-256 `{anchor['evidence_sha256']}`")
+                                source_state = "current" if review_details["anchor_current"] and review_details["current_source_sha256"] == anchor["evidence_sha256"] else "STALE / UNVERIFIABLE"
+                                st.caption(f"Current source SHA-256: `{review_details['current_source_sha256'] or 'unavailable'}` · anchor {source_state}")
+                                if review_details["current_quote"] is not None:
+                                    st.code(review_details["current_quote"] or "(empty source slice)", language=None)
+                            else:
+                                st.warning(review_details["source_error"] or "No complete verified source anchor is stored on this atom.")
+                            if review_details["source_error"] and all(anchor.values()):
+                                st.error(f"Evidence source unavailable or unsafe: {review_details['source_error']}")
+
+                            st.markdown("#### Related atoms")
+                            if review_details["related_atoms"]:
+                                for related in review_details["related_atoms"]:
+                                    if related.get("error"):
+                                        st.caption(f"`{related['filename']}` · {related['error']}")
+                                    else:
+                                        st.caption(f"`{related['filename']}` · {related['review_status']} · {related['claim']}")
+                            else:
+                                st.caption("No related atom links recorded.")
                         except Exception as exc:
                             st.warning(f"Atom metadata could not be validated: {exc}")
                         approve_col, reject_col = st.columns(2)
                         expected_hash = hashlib.sha256(file_content.encode("utf-8")).hexdigest()
-                        if approve_col.button("Approve exact revision", key=f"approve-{selected_file}"):
+                        if record and (record.get("review_status") == "accepted" or record.get("claim_state") == "human_reviewed") and not current_approval:
+                            if st.button("Demote stale approval to pending", key=f"demote-{selected_file}"):
+                                try:
+                                    apply_review_transition(
+                                        atom_path=file_path,
+                                        action="demote",
+                                        expected_sha256=expected_hash,
+                                        actor="local_dashboard_owner",
+                                    )
+                                    st.success("Stale approval demoted; inspect current source evidence before re-approval.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Demotion failed: {exc}")
+                        if record and approve_col.button("Approve exact revision", key=f"approve-{selected_file}"):
                             try:
                                 apply_review_transition(
                                     atom_path=file_path,
@@ -772,7 +815,7 @@ elif nav_selection == "🗄️ Vault Explorer":
                                 st.rerun()
                             except Exception as exc:
                                 st.error(f"Approval failed: {exc}")
-                        if reject_col.button("Reject exact revision", key=f"reject-{selected_file}"):
+                        if record and reject_col.button("Reject exact revision", key=f"reject-{selected_file}"):
                             try:
                                 apply_review_transition(
                                     atom_path=file_path,

@@ -12,6 +12,436 @@ import types
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+
+class EvaluationDatasetTests(unittest.TestCase):
+    def _dataset(self, atoms_dir: Path) -> dict:
+        atom = atoms_dir / "approved.md"
+        atom.write_text("approved revision", encoding="utf-8")
+        revision = hashlib.sha256(atom.read_bytes()).hexdigest()
+        return {
+            "schema_version": 2,
+            "dataset_id": "unit-test",
+            "dataset_version": "1.0.0",
+            "status": "owner_approved",
+            "purpose": "Test the dataset contract.",
+            "owner_approval": {"actor": "owner", "date": "2026-10-27", "scope": "test labels"},
+            "queries": [
+                {
+                    "id": "positive",
+                    "query": "What is known?",
+                    "category": "paraphrase",
+                    "split": "regression",
+                    "project_scope": None,
+                    "answerability": "answerable",
+                    "answer_mode": "standard",
+                    "expected_atom_ids": ["approved.md"],
+                    "acceptable_atom_ids": [],
+                    "candidate_relevance": ["approved.md"],
+                    "expected_claims": [{"text": "A supported claim.", "supported_by": ["approved.md"]}],
+                    "expected_atom_revisions": [{"atom_id": "approved.md", "revision_sha256": revision}],
+                    "expected_behavior": "answer_with_evidence",
+                    "trap_reason": None,
+                }
+            ],
+        }
+
+    def test_versioned_answerable_case_requires_current_approved_atom_revision(self):
+        from evaluation_dataset import validate_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            dataset = self._dataset(atoms_dir)
+            validated = validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+        self.assertEqual(validated["dataset_version"], "1.0.0")
+
+    def test_dataset_rejects_an_atom_revision_hash_that_does_not_match_current_file(self):
+        from evaluation_dataset import EvaluationDatasetError, validate_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            dataset = self._dataset(atoms_dir)
+            dataset["queries"][0]["expected_atom_revisions"][0]["revision_sha256"] = "0" * 64
+            with self.assertRaises(EvaluationDatasetError):
+                validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+
+    def test_dataset_rejects_an_unapproved_answer_target(self):
+        from evaluation_dataset import EvaluationDatasetError, validate_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            dataset = self._dataset(atoms_dir)
+            with self.assertRaises(EvaluationDatasetError):
+                validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: False)
+
+    def test_dataset_rejects_atom_path_traversal_outside_atom_directory(self):
+        from evaluation_dataset import EvaluationDatasetError, validate_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            dataset = self._dataset(atoms_dir)
+            case = dataset["queries"][0]
+            case.update({
+                "answerability": "exploratory",
+                "answer_mode": "candidate_retrieval",
+                "expected_atom_ids": [],
+                "candidate_relevance": ["../external.md"],
+                "expected_atom_revisions": [],
+                "expected_claims": [],
+                "expected_behavior": "not_scored",
+            })
+            with self.assertRaises(EvaluationDatasetError):
+                validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: False)
+
+    def test_exploratory_candidate_may_reference_pending_atom_without_approval(self):
+        from evaluation_dataset import validate_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            dataset = self._dataset(atoms_dir)
+            pending = atoms_dir / "pending.md"
+            pending.write_text("pending candidate", encoding="utf-8")
+            case = dataset["queries"][0]
+            case.update({
+                "answerability": "exploratory",
+                "answer_mode": "candidate_retrieval",
+                "expected_atom_ids": [],
+                "candidate_relevance": ["pending.md"],
+                "expected_atom_revisions": [],
+                "expected_claims": [],
+                "expected_behavior": "not_scored",
+            })
+            validated = validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: False)
+        self.assertEqual(validated["queries"][0]["answerability"], "exploratory")
+
+    def test_dataset_rejects_an_atom_path_outside_atom_directory(self):
+        from evaluation_dataset import EvaluationDatasetError, validate_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            dataset = self._dataset(atoms_dir)
+            dataset["queries"][0]["expected_atom_ids"] = ["../outside.md"]
+            with self.assertRaises(EvaluationDatasetError):
+                validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+
+    def test_no_answer_case_requires_a_reason_and_cannot_claim_expected_atoms(self):
+        from evaluation_dataset import EvaluationDatasetError, validate_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            dataset = self._dataset(atoms_dir)
+            trap = dict(dataset["queries"][0])
+            trap.update({
+                "id": "trap",
+                "answerability": "unanswerable",
+                "expected_atom_ids": [],
+                "candidate_relevance": [],
+                "expected_claims": [],
+                "expected_atom_revisions": [],
+                "expected_behavior": "abstain",
+                "trap_reason": None,
+            })
+            dataset["queries"].append(trap)
+            with self.assertRaises(EvaluationDatasetError):
+                validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+
+
+class AnswerGroundingTests(unittest.TestCase):
+    def _atom(self, atoms_dir: Path, *, approve: bool = True) -> tuple[Path, str]:
+        from evidence import find_evidence_anchor
+
+        brain_dir = atoms_dir.parent
+        source_path = brain_dir / "0-raw" / "source.md"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text("Structured logs should use JSON and request IDs.\n", encoding="utf-8")
+        content = """---
+id: approved
+sources:
+  - 0-raw/source.md
+review_status: accepted
+claim_state: human_reviewed
+citation_integrity: missing
+---
+
+## Claim
+Logs should be structured as JSON.
+
+## Evidence
+Structured logs should use JSON and request IDs.
+"""
+        path = atoms_dir / "approved.md"
+        atoms_dir.mkdir(parents=True, exist_ok=True)
+        parsed = content.split("---", 2)
+        anchor = find_evidence_anchor(content, str(brain_dir))
+        frontmatter = parsed[1]
+        for key, value in anchor.items():
+            if isinstance(value, str):
+                frontmatter += f"{key}: {value}\n"
+            else:
+                frontmatter += f"{key}: {value}\n"
+        frontmatter = frontmatter.replace("citation_integrity: missing", "citation_integrity: anchored")
+        content = f"---{frontmatter}---{parsed[2]}"
+        path.write_text(content, encoding="utf-8")
+        if approve:
+            from atom_mutator import apply_review_transition
+
+            apply_review_transition(
+                action="approve",
+                atom_path=str(path),
+                expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                actor="system-safety-test",
+                decision_log_path=str(brain_dir / "0-raw" / "archive" / "decision-record.jsonl"),
+                brain_dir=str(brain_dir),
+                atoms_dir=str(atoms_dir),
+            )
+        return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _draft(self, revision: str) -> str:
+        import json
+
+        return json.dumps({
+            "claims": ["Logs should be structured as JSON."],
+        })
+
+    def test_grounded_answer_renders_only_exact_approved_claim_and_program_built_citation(self):
+        from answer_policy import validate_standard_answer
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            path, revision = self._atom(atoms_dir)
+            atoms_dir = path.parent
+            revision = hashlib.sha256(path.read_bytes()).hexdigest()
+            result = validate_standard_answer(
+                self._draft(revision),
+                [{"filename": path.name, "content": path.read_text(encoding="utf-8")}],
+                atoms_dir=atoms_dir,
+            )
+        self.assertTrue(result.answerable)
+        self.assertIn("Logs should be structured as JSON.", result.text)
+        self.assertIn("[approved.md]", result.text)
+        self.assertIn("Structured logs should use JSON and request IDs.", result.text)
+
+    def test_grounding_rejects_a_plausible_but_unsupported_paraphrase(self):
+        from answer_policy import validate_standard_answer
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            path, revision = self._atom(atoms_dir)
+            draft = self._draft(revision).replace(
+                "Logs should be structured as JSON.",
+                "JSON logging always prevents security incidents.",
+            )
+            result = validate_standard_answer(
+                draft,
+                [{"filename": path.name, "content": path.read_text(encoding="utf-8")}],
+                atoms_dir=atoms_dir,
+            )
+        self.assertFalse(result.answerable)
+        self.assertIn("does not support a claim", result.text.casefold())
+
+    def test_grounding_rejects_a_claim_that_is_not_in_retrieved_memory(self):
+        from answer_policy import validate_standard_answer
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            path, revision = self._atom(atoms_dir)
+            draft = self._draft(revision).replace(
+                "Logs should be structured as JSON.",
+                "Other files contain sensitive facts.",
+            )
+            result = validate_standard_answer(
+                draft,
+                [{"filename": path.name, "content": path.read_text(encoding="utf-8")}],
+                atoms_dir=atoms_dir,
+            )
+        self.assertFalse(result.answerable)
+
+    def test_grounding_rejects_stale_atom_revision_and_revoked_approval(self):
+        from answer_policy import validate_standard_answer
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory) / "brain" / "2-atoms"
+            atoms_dir.mkdir(parents=True)
+            path, revision = self._atom(atoms_dir)
+            retrieved_content = path.read_text(encoding="utf-8")
+            stale_retrieval = retrieved_content + "\nChanged after retrieval.\n"
+            stale_result = validate_standard_answer(
+                self._draft(revision),
+                [{"filename": path.name, "content": stale_retrieval}],
+                atoms_dir=atoms_dir,
+            )
+            from atom_mutator import apply_review_transition
+            apply_review_transition(
+                action="demote", atom_path=str(path), expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                actor="system-safety-test", decision_log_path=str(atoms_dir.parent / "0-raw" / "archive" / "decision-record.jsonl"),
+                brain_dir=str(atoms_dir.parent), atoms_dir=str(atoms_dir),
+            )
+            revoked_result = validate_standard_answer(
+                self._draft(revision),
+                [{"filename": path.name, "content": retrieved_content}],
+                atoms_dir=atoms_dir,
+            )
+        self.assertFalse(stale_result.answerable)
+        self.assertFalse(revoked_result.answerable)
+
+    def test_grounding_rejects_model_supplied_citation_fields(self):
+        from answer_policy import validate_standard_answer
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory) / "brain" / "2-atoms"
+            atoms_dir.mkdir(parents=True)
+            path, revision = self._atom(atoms_dir)
+            draft = self._draft(revision).replace(
+                '"Logs should be structured as JSON."',
+                '{"text": "Logs should be structured as JSON.", "atom_id": "approved.md", "quote": "forged"}',
+            )
+            result = validate_standard_answer(
+                draft,
+                [{"filename": path.name, "content": path.read_text(encoding="utf-8")}],
+                atoms_dir=atoms_dir,
+            )
+        self.assertFalse(result.answerable)
+
+    def test_grounding_rejects_source_changed_after_atom_approval(self):
+        from answer_policy import validate_standard_answer
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory) / "brain" / "2-atoms"
+            atoms_dir.mkdir(parents=True)
+            path, revision = self._atom(atoms_dir)
+            retrieved_content = path.read_text(encoding="utf-8")
+            (atoms_dir.parent / "0-raw" / "source.md").write_text(
+                "Changed source content after approval.\n", encoding="utf-8"
+            )
+            result = validate_standard_answer(
+                self._draft(revision),
+                [{"filename": path.name, "content": retrieved_content}],
+                atoms_dir=atoms_dir,
+            )
+        self.assertFalse(result.answerable)
+
+    def test_standard_prompt_rejects_unimplemented_research_mode(self):
+        from answer_policy import AnswerRequest, build_grounding_prompt
+
+        with self.assertRaises(ValueError):
+            build_grounding_prompt(AnswerRequest(query="question", mode="research"), [])
+
+    def test_grounding_prompt_lists_only_exact_claim_sections_as_allowed_output(self):
+        from answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, build_grounding_prompt
+
+        atom = {
+            "filename": "approved.md",
+            "content": "---\nid: approved\n---\n\n## Claim\nExact claim.\n\n## Evidence\nDifferent source wording.\n",
+        }
+        prompt = build_grounding_prompt(AnswerRequest(query="question"), [atom])
+        self.assertIn('["Exact claim."]', prompt)
+        self.assertEqual(ANSWER_DRAFT_SCHEMA["properties"]["claims"]["items"]["type"], "string")
+
+
+class AnswerEvaluationTests(unittest.TestCase):
+    def test_scores_expected_claim_coverage_and_trap_leakage_separately(self):
+        from evaluate_answers import score_evaluation
+
+        corpus = {"queries": [
+            {
+                "id": "positive", "answerability": "answerable",
+                "expected_claims": [{"text": "Supported claim."}],
+            },
+            {
+                "id": "trap", "answerability": "unanswerable",
+                "expected_claims": [],
+            },
+        ]}
+        observations = [
+            {"case_id": "positive", "claims": ["Supported claim."], "abstained": False},
+            {"case_id": "positive", "claims": ["Unexpected claim."], "abstained": False},
+            {"case_id": "trap", "claims": ["Leaked claim."], "abstained": False},
+            {"case_id": "trap", "claims": [], "abstained": True},
+        ]
+        metrics = score_evaluation(corpus, observations)
+        self.assertEqual(metrics["answerable_run_count"], 2)
+        self.assertEqual(metrics["positive_expected_claim_coverage"], 0.5)
+        self.assertEqual(metrics["unexpected_displayed_claim_count"], 1)
+        self.assertEqual(metrics["trap_claim_leakage_rate"], 0.5)
+
+    def test_quality_gate_fails_on_missed_positive_claims_or_any_trap_leak(self):
+        from evaluate_answers import evaluate_quality_gate
+
+        passing = {
+            "answerable_run_count": 2,
+            "positive_complete_answer_rate": 1.0,
+            "unexpected_displayed_claim_count": 0,
+            "trap_run_count": 2,
+            "trap_claim_leak_count": 0,
+            "validated_claim_citation_rate": 1.0,
+        }
+        self.assertTrue(evaluate_quality_gate(passing)["passed"])
+        failing = {**passing, "positive_complete_answer_rate": 0.5, "trap_claim_leak_count": 1}
+        result = evaluate_quality_gate(failing)
+        self.assertFalse(result["passed"])
+        self.assertEqual(len(result["failures"]), 2)
+
+    def test_rejects_observations_for_exploratory_or_unknown_cases(self):
+        from evaluate_answers import EvaluationRunError, score_evaluation
+
+        corpus = {"queries": [{
+            "id": "explore", "answerability": "exploratory", "expected_claims": [],
+        }]}
+        with self.assertRaises(EvaluationRunError):
+            score_evaluation(corpus, [{"case_id": "explore", "claims": [], "abstained": True}])
+
+
+class SourceAuditTests(unittest.TestCase):
+    def _approved_fixture(self, root: Path) -> tuple[Path, Path, Path]:
+        atoms_dir = root / "brain" / "2-atoms"
+        atoms_dir.mkdir(parents=True)
+        path, _ = AnswerGroundingTests()._atom(atoms_dir)
+        brain_dir = atoms_dir.parent
+        return path, atoms_dir, brain_dir / "0-raw" / "archive" / "decision-record.jsonl"
+
+    def test_source_audit_reports_changed_evidence_without_mutating(self):
+        from audit_sources import audit_sources
+
+        with tempfile.TemporaryDirectory() as directory:
+            path, atoms_dir, decision_log = self._approved_fixture(Path(directory))
+            source_path = atoms_dir.parent / "0-raw" / "source.md"
+            source_path.write_text("The reviewed evidence source has changed.\n", encoding="utf-8")
+            report = audit_sources(
+                atoms_dir=atoms_dir, brain_dir=atoms_dir.parent, decision_log_path=decision_log,
+            )
+            content = path.read_text(encoding="utf-8")
+        self.assertEqual(report[0]["anchor_status"], "stale_or_unverifiable")
+        self.assertFalse(report[0]["approval_current"])
+        self.assertEqual(report[0]["action"], "review_required")
+        self.assertEqual(report[0]["source_status"], "present")
+        self.assertNotEqual(
+            report[0]["stored_anchor"]["evidence_sha256"],
+            report[0]["current_source_sha256"],
+        )
+        self.assertIn("review_status: accepted", content)
+
+    def test_source_audit_opt_in_demotes_through_canonical_mutator(self):
+        from audit_sources import audit_sources
+        from atom_mutator import approved_revision_is_current
+
+        with tempfile.TemporaryDirectory() as directory:
+            path, atoms_dir, decision_log = self._approved_fixture(Path(directory))
+            (atoms_dir.parent / "0-raw" / "source.md").write_text(
+                "The reviewed evidence source has changed.\n", encoding="utf-8",
+            )
+            report = audit_sources(
+                atoms_dir=atoms_dir, brain_dir=atoms_dir.parent, decision_log_path=decision_log,
+                demote_stale=True, actor="source-audit-test",
+            )
+            content = path.read_text(encoding="utf-8")
+            current = approved_revision_is_current(
+                str(path), decision_log_path=str(decision_log),
+                brain_dir=str(atoms_dir.parent), atoms_dir=str(atoms_dir),
+            )
+        self.assertEqual(report[0]["action"], "demoted")
+        self.assertIn("review_status: pending", content)
+        self.assertFalse(current)
 
 
 class DashboardBoundaryTests(unittest.TestCase):
@@ -28,6 +458,122 @@ class DashboardBoundaryTests(unittest.TestCase):
         self.assertIsNone(re.search(r"(?im)^\s*git\s+(?:init|add|commit)\b", setup))
         self.assertIn("will not initialize, stage, or commit files", setup)
 
+    def test_installed_dashboard_launcher_preserves_loopback_and_origin_controls(self):
+        from unittest.mock import patch
+
+        from scripts import cli
+
+        with (
+            patch("scripts.cli._capability", return_value=True),
+            patch("scripts.dashboard_auth.load_password_record", return_value={}),
+            patch("scripts.cli.subprocess.call", return_value=0) as launch,
+        ):
+            self.assertEqual(cli.launch_dashboard(), 0)
+
+        command = launch.call_args.args[0]
+        self.assertIn("--server.address=127.0.0.1", command)
+        self.assertIn("--server.enableCORS=true", command)
+        self.assertIn("--server.enableXsrfProtection=true", command)
+        self.assertIn("--server.allowedHosts=127.0.0.1", command)
+        self.assertIn("--server.corsAllowedOrigins=http://127.0.0.1:8501", command)
+
+    def test_dashboard_streamlit_cors_xsrf_and_allowed_hosts_are_explicit(self):
+        config = (ROOT / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+        self.assertIn("enableCORS = true", config)
+        self.assertIn("enableXsrfProtection = true", config)
+        self.assertIn('allowedHosts = ["127.0.0.1"]', config)
+        self.assertIn('corsAllowedOrigins = ["http://127.0.0.1:8501"]', config)
+
+    def test_dashboard_requires_password_gate_before_vault_content(self):
+        app = (ROOT / "dashboard" / "app.py").read_text(encoding="utf-8")
+        gate = app.index("dashboard_authenticated = require_dashboard_login(st)")
+        vault_count = app.index("counts = get_counts()")
+        self.assertLess(gate, vault_count)
+        self.assertIn("if not dashboard_authenticated:\n    st.stop()", app)
+
+
+class DashboardAuthTests(unittest.TestCase):
+    def test_scrypt_verifier_accepts_only_matching_password_and_has_unique_salt(self):
+        from dashboard_auth import build_password_record, verify_password
+        first = build_password_record("a-long-owner-password")
+        second = build_password_record("a-long-owner-password")
+        self.assertTrue(verify_password("a-long-owner-password", first))
+        self.assertFalse(verify_password("wrong-password", first))
+        self.assertNotEqual(first["salt"], second["salt"])
+        self.assertNotEqual(first["password_hash"], second["password_hash"])
+
+    def test_auth_store_fails_closed_on_missing_or_malformed_data_and_can_be_reset(self):
+        from dashboard_auth import load_password_record, save_password_record, build_password_record, verify_password
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "private" / "dashboard-auth.json"
+            self.assertIsNone(load_password_record(path))
+            save_password_record(build_password_record("another-long-owner-password"), path)
+            loaded = load_password_record(path)
+            self.assertTrue(verify_password("another-long-owner-password", loaded))
+            path.write_text("not json", encoding="utf-8")
+            self.assertIsNone(load_password_record(path))
+
+    def test_login_gate_stops_unauthenticated_and_unlocks_matching_session(self):
+        from dashboard_auth import require_dashboard_login, build_password_record, save_password_record
+        import time
+        from dashboard_auth import MAX_SESSION_FAILURES, SESSION_IDLE_SECONDS
+
+        class Form:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+
+        class FakeStreamlit:
+            def __init__(self, submitted=False, password=""):
+                self.session_state = {}
+                self.submitted = submitted
+                self.password = password
+                self.sidebar = self
+                self.errors = []
+                self.titles = []
+            def title(self, message): self.titles.append(message)
+            def caption(self, *_args): pass
+            def error(self, message): self.errors.append(message)
+            def warning(self, *_args): pass
+            def code(self, *_args, **_kwargs): pass
+            def form(self, *_args, **_kwargs): return Form()
+            def text_input(self, *_args, **_kwargs):
+                self.session_state["brain_dashboard_password"] = self.password
+                return self.password
+            def form_submit_button(self, *_args, **_kwargs): return self.submitted
+            def button(self, *_args, **_kwargs): return False
+            def rerun(self): raise RuntimeError("rerun")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "auth.json"
+            save_password_record(build_password_record("test-password-long-enough"), path)
+            unauthenticated = FakeStreamlit()
+            self.assertFalse(require_dashboard_login(unauthenticated, path))
+            self.assertIn("Unlock Second Brain", unauthenticated.titles)
+
+            wrong = FakeStreamlit(submitted=True, password="wrong-password")
+            with self.assertRaisesRegex(RuntimeError, "rerun"):
+                require_dashboard_login(wrong, path)
+            self.assertNotIn("_brain_dashboard_auth_fingerprint", wrong.session_state)
+
+            valid = FakeStreamlit(submitted=True, password="test-password-long-enough")
+            with self.assertRaisesRegex(RuntimeError, "rerun"):
+                require_dashboard_login(valid, path)
+            self.assertIn("_brain_dashboard_auth_fingerprint", valid.session_state)
+            valid.submitted = False
+            self.assertTrue(require_dashboard_login(valid, path))
+            valid.session_state["_brain_dashboard_last_activity"] = time.time() - SESSION_IDLE_SECONDS - 1
+            self.assertFalse(require_dashboard_login(valid, path))
+            self.assertNotIn("_brain_dashboard_auth_fingerprint", valid.session_state)
+
+            attacker = FakeStreamlit(submitted=True, password="wrong-password")
+            for _ in range(MAX_SESSION_FAILURES):
+                with self.assertRaisesRegex(RuntimeError, "rerun"):
+                    require_dashboard_login(attacker, path)
+            self.assertIn("_brain_dashboard_locked_until", attacker.session_state)
+            self.assertFalse(require_dashboard_login(attacker, path))
+
 
 class MCPBoundaryTests(unittest.TestCase):
     def test_mcp_is_opt_in_bounded_and_does_not_enumerate_vault(self):
@@ -41,6 +587,46 @@ class MCPBoundaryTests(unittest.TestCase):
         self.assertIn("return []", implementation)
         self.assertIn("do not register it with", policy)
         self.assertIn("cloud-connected clients", policy)
+
+    def test_mcp_audit_is_content_free_and_happens_before_tool_execution(self):
+        from mcp_server import audit_mcp_use
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mcp-audit.jsonl"
+            record = audit_mcp_use("tool:search_memory", str(path))
+            stored = path.read_text(encoding="utf-8")
+        self.assertEqual(record["event"], "tool:search_memory")
+        self.assertEqual(record["transport"], "stdio")
+        self.assertNotIn("query", record)
+        self.assertNotIn("content", record)
+        self.assertNotIn("private search phrase", stored)
+        implementation = (ROOT / "scripts" / "mcp_server.py").read_text(encoding="utf-8")
+        call_body = implementation.split("async def handle_call_tool", 1)[1].split("async def handle_list_resources", 1)[0]
+        self.assertLess(call_body.index("audit_mcp_use("), call_body.index("ensure_dirs()"))
+
+    def test_mcp_audit_rejects_unrecognized_event_names(self):
+        from mcp_server import audit_mcp_use
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(ValueError):
+                audit_mcp_use("query:private search phrase", str(Path(temporary) / "audit.jsonl"))
+
+    def test_mcp_sdk_v2_handlers_return_protocol_results_and_reject_audit_failure(self):
+        from unittest.mock import patch
+
+        import mcp_server
+        from mcp import types
+
+        async def scenario():
+            listed = await mcp_server.handle_list_tools(None, None)
+            self.assertIsInstance(listed, types.ListToolsResult)
+            self.assertEqual({tool.name for tool in listed.tools}, {"search_memory", "get_atom", "add_to_inbox"})
+            resources = await mcp_server.handle_list_resources(None, None)
+            self.assertEqual(resources.resources, [])
+            with patch("mcp_server.audit_mcp_use", side_effect=OSError("audit unavailable")):
+                with self.assertRaises(OSError):
+                    await mcp_server.handle_call_tool(None, types.CallToolRequestParams(name="add_to_inbox", arguments={"content": "must not write"}))
+
+        import asyncio
+        asyncio.run(scenario())
 
 
 class ScoutPinningTests(unittest.TestCase):
@@ -232,7 +818,6 @@ The source makes a claim.
                 encoding="utf-8",
             )
             self.assertFalse(approved_revision_is_current(str(atom_path), str(decision_log), str(vault), str(atoms)))
-
             duplicate_source = vault / "0-raw" / "archive" / "2026-10" / "duplicate.md"
             duplicate_source.write_text(
                 "The exact source sentence is here. Then again: The exact source sentence is here.",
@@ -290,6 +875,8 @@ The source makes a claim.
             self.assertFalse(approved_revision_is_current(str(atom_path), str(decision_log), str(vault), str(atoms)))
             self.assertTrue(lexical_index_is_current(str(atoms), str(vault / ".sidecar" / "lexical.sqlite3")))
 
+
+
     def test_failed_derived_index_refresh_rolls_back_atom_and_decision(self):
         from unittest.mock import patch
         from atom_mutator import apply_atom_edit
@@ -315,6 +902,183 @@ The source makes a claim.
                     )
             self.assertEqual(atom_path.read_text(encoding="utf-8"), original)
             self.assertFalse(decision_log.exists())
+
+
+class ReviewDetailsTests(unittest.TestCase):
+    def test_review_details_report_current_quote_then_detect_source_drift(self):
+        from evidence import find_evidence_anchor, ANCHOR_FIELDS
+        from memory_format import set_scalar_field, split_frontmatter, render_memory_document
+        from review_details import atom_review_details
+
+        with tempfile.TemporaryDirectory() as temporary:
+            brain = Path(temporary) / "brain"
+            atoms = brain / "2-atoms"
+            source = brain / "0-raw" / "source.md"
+            atoms.mkdir(parents=True)
+            source.parent.mkdir(parents=True)
+            source.write_text("The durable evidence sentence for review details.", encoding="utf-8")
+            atom = atoms / "review.md"
+            content = (
+                "---\nid: review\ntype: atom\nmemory_type: semantic\nsources:\n  - 0-raw/source.md\n"
+                "links: []\ncontexts: []\nsupersedes: []\nsuperseded_by: []\ncontested_by: []\n"
+                "origin: user_local\ncitation_integrity: missing\nclaim_state: candidate\n"
+                "epistemic_label: claim\nreview_status: pending\n---\n\n## Claim\nA review claim.\n\n"
+                "## Evidence\nThe durable evidence sentence for review details.\n"
+            )
+            anchor = find_evidence_anchor(content, str(brain))
+            frontmatter, body = split_frontmatter(content)
+            for key in ANCHOR_FIELDS:
+                frontmatter = set_scalar_field(frontmatter, key, str(anchor[key]), "origin")
+            atom.write_text(render_memory_document(frontmatter, body), encoding="utf-8")
+            initial = atom_review_details(atom.read_text(encoding="utf-8"), atom_path=str(atom), atoms_dir=str(atoms), brain_dir=str(brain))
+            self.assertTrue(initial["anchor_current"])
+            self.assertEqual(initial["current_quote"], "The durable evidence sentence for review details.")
+            source.write_text("The durable evidence sentence for review details. Changed.", encoding="utf-8")
+            changed = atom_review_details(atom.read_text(encoding="utf-8"), atom_path=str(atom), atoms_dir=str(atoms), brain_dir=str(brain))
+            self.assertFalse(changed["anchor_current"])
+            self.assertNotEqual(changed["current_source_sha256"], anchor["evidence_sha256"])
+
+    def test_review_details_never_reads_traversal_source_paths(self):
+        from review_details import atom_review_details
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            brain = root / "brain"
+            atoms = brain / "2-atoms"
+            atoms.mkdir(parents=True)
+            outside = root / "secret.md"
+            outside.write_text("private", encoding="utf-8")
+            content = (
+                "---\nid: unsafe\nevidence_source: ../secret.md\nevidence_sha256: " + "0" * 64 +
+                "\nevidence_start: 0\nevidence_end: 7\nevidence_quote_sha256: " + "0" * 64 +
+                "\nlinks: []\nsupersedes: []\nsuperseded_by: []\ncontested_by: []\n---\n\n"
+                "## Claim\nUnsafe path.\n\n## Evidence\nPrivate.\n"
+            )
+            details = atom_review_details(content, atom_path=str(atoms / "unsafe.md"), atoms_dir=str(atoms), brain_dir=str(brain))
+            self.assertIn("traverses parent", details["source_error"])
+            self.assertIsNone(details["current_quote"])
+
+class AtomMergeTests(unittest.TestCase):
+    def _fixture(self, root: Path):
+        brain = root / "brain"
+        atoms = brain / "2-atoms"
+        atoms.mkdir(parents=True)
+        survivor = atoms / "survivor.md"
+        superseded = atoms / "superseded.md"
+        def document(atom_id: str, claim: str) -> str:
+            return (
+                f"---\nid: {atom_id}\ntype: atom\nmemory_type: semantic\n"
+                "sources: []\nlinks: []\ncontexts: []\nsupersedes: []\n"
+                "superseded_by: []\ncontested_by: []\norigin: user_local\n"
+                "citation_integrity: missing\nclaim_state: candidate\n"
+                "epistemic_label: claim\nreview_status: pending\n---\n\n"
+                f"## Claim\n{claim}\n\n## Evidence\nOwner-provided evidence excerpt.\n"
+            )
+        survivor.write_text(document("survivor", "The surviving claim."), encoding="utf-8")
+        superseded.write_text(document("superseded", "The old claim."), encoding="utf-8")
+        return brain, atoms, survivor, superseded
+
+    def _merge(self, brain, atoms, survivor, superseded, **overrides):
+        from atom_mutator import apply_atom_merge
+        args = {
+            "survivor_path": str(survivor),
+            "survivor_expected_sha256": hashlib.sha256(survivor.read_bytes()).hexdigest(),
+            "superseded_path": str(superseded),
+            "superseded_expected_sha256": hashlib.sha256(superseded.read_bytes()).hexdigest(),
+            "actor": "owner-test",
+            "rationale": "Owner confirmed these records describe the same fact.",
+            "decision_log_path": str(brain / "0-raw" / "decision.jsonl"),
+            "history_dir": str(atoms / ".history"),
+            "brain_dir": str(brain),
+            "atoms_dir": str(atoms),
+        }
+        args.update(overrides)
+        return apply_atom_merge(**args)
+
+    def test_merge_links_both_preserved_atoms_and_records_both_revisions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            brain, atoms, survivor, superseded = self._fixture(Path(temporary))
+            old_superseded = superseded.read_bytes()
+            records = self._merge(brain, atoms, survivor, superseded)
+            survivor_text = survivor.read_text(encoding="utf-8")
+            superseded_text = superseded.read_text(encoding="utf-8")
+            self.assertIn('  - "superseded.md"', survivor_text)
+            self.assertIn('  - "survivor.md"', superseded_text)
+            self.assertIn("review_status: pending", survivor_text)
+            self.assertIn("review_status: merged", superseded_text)
+            self.assertIn("claim_state: superseded", superseded_text)
+            self.assertEqual(len(records), 2)
+            self.assertEqual(superseded.with_suffix(".md").read_bytes() != old_superseded, True)
+            self.assertTrue((atoms / ".history" / f"superseded.md.{hashlib.sha256(old_superseded).hexdigest()}.bak").is_file())
+            audit = [__import__("json").loads(line) for line in (brain / "0-raw" / "decision.jsonl").read_text().splitlines()]
+            self.assertEqual(len(audit), 2)
+            self.assertTrue(all(item["action"] == "merge" for item in audit))
+
+    def test_merge_rejects_stale_second_hash_without_mutating_either_atom(self):
+        from atom_mutator import ReviewConflictError
+        with tempfile.TemporaryDirectory() as temporary:
+            brain, atoms, survivor, superseded = self._fixture(Path(temporary))
+            before = (survivor.read_bytes(), superseded.read_bytes())
+            with self.assertRaises(ReviewConflictError):
+                self._merge(brain, atoms, survivor, superseded, superseded_expected_sha256="0" * 64)
+            self.assertEqual((survivor.read_bytes(), superseded.read_bytes()), before)
+            self.assertFalse((brain / "0-raw" / "decision.jsonl").exists())
+
+    def test_merged_atom_cannot_be_reapproved_through_single_atom_transition(self):
+        from atom_mutator import ReviewTransitionError, apply_review_transition
+        with tempfile.TemporaryDirectory() as temporary:
+            brain, atoms, survivor, superseded = self._fixture(Path(temporary))
+            self._merge(brain, atoms, survivor, superseded)
+            with self.assertRaisesRegex(ReviewTransitionError, "cannot be approved"):
+                apply_review_transition(
+                    atom_path=str(superseded),
+                    action="approve",
+                    expected_sha256=hashlib.sha256(superseded.read_bytes()).hexdigest(),
+                    actor="owner-test",
+                    decision_log_path=str(brain / "0-raw" / "decision.jsonl"),
+                    brain_dir=str(brain),
+                    atoms_dir=str(atoms),
+                )
+            self.assertIn("review_status: merged", superseded.read_text(encoding="utf-8"))
+
+    def test_merge_rejects_missing_rationale_and_rolls_back_index_failure(self):
+        from unittest.mock import patch
+        from atom_mutator import ReviewTransitionError
+        with tempfile.TemporaryDirectory() as temporary:
+            brain, atoms, survivor, superseded = self._fixture(Path(temporary))
+            before = (survivor.read_bytes(), superseded.read_bytes())
+            with self.assertRaises(ReviewTransitionError):
+                self._merge(brain, atoms, survivor, superseded, rationale=" ")
+            self.assertEqual((survivor.read_bytes(), superseded.read_bytes()), before)
+            with patch("atom_mutator.refresh_lexical_index", side_effect=RuntimeError("index unavailable")):
+                with self.assertRaisesRegex(RuntimeError, "index unavailable"):
+                    self._merge(brain, atoms, survivor, superseded)
+            self.assertEqual((survivor.read_bytes(), superseded.read_bytes()), before)
+            self.assertFalse((brain / "0-raw" / "decision.jsonl").exists())
+
+    def test_merge_rolls_back_both_files_when_second_write_or_audit_fails(self):
+        from unittest.mock import patch
+        import atom_mutator
+        with tempfile.TemporaryDirectory() as temporary:
+            brain, atoms, survivor, superseded = self._fixture(Path(temporary))
+            before = (survivor.read_bytes(), superseded.read_bytes())
+            real_write = atom_mutator.atomic_write_bytes
+            calls = 0
+            def fail_second(path, content):
+                nonlocal calls
+                calls += 1
+                if calls == 4:  # two backups, survivor write, then superseded write
+                    raise OSError("second atom write failed")
+                return real_write(path, content)
+            with patch("atom_mutator.atomic_write_bytes", side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, "second atom write failed"):
+                    self._merge(brain, atoms, survivor, superseded)
+            self.assertEqual((survivor.read_bytes(), superseded.read_bytes()), before)
+
+            with patch("atom_mutator.append_decision_records", side_effect=OSError("audit unavailable")):
+                with self.assertRaisesRegex(OSError, "audit unavailable"):
+                    self._merge(brain, atoms, survivor, superseded)
+            self.assertEqual((survivor.read_bytes(), superseded.read_bytes()), before)
+            self.assertFalse((brain / "0-raw" / "decision.jsonl").exists())
 
 
 class DenseScoreTests(unittest.TestCase):

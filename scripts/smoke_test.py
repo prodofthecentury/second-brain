@@ -34,7 +34,7 @@ from config import (
 from memory_format import extract_memory_documents, normalize_memory_document
 from memory_review import list_review_queue, parse_atom_record
 from recall import RecallOptions, rerank_candidates
-from answer_policy import NO_APPROVED_MEMORY_RESPONSE, answer_from_memory
+from answer_policy import NO_APPROVED_MEMORY_RESPONSE, UNVALIDATED_DRAFT_RESPONSE, answer_from_memory
 from refinery_targets import intake_status, is_supported_refinery_target
 from vector_store import JsonVectorCollection, json_collection_path, reset_vector_collection
 
@@ -44,7 +44,7 @@ def check(condition: bool, message: str):
         raise AssertionError(message)
 
 
-def test_memory_chat_abstains_without_approved_context():
+def test_memory_chat_refuses_unvalidated_model_prose():
     calls = []
     generate = lambda: calls.append("called") or "model answer"
 
@@ -53,8 +53,8 @@ def test_memory_chat_abstains_without_approved_context():
     check(not calls, "model generation is not called without approved context")
 
     response = answer_from_memory("approved atom", generate)
-    check(response == "model answer", "model generation runs when approved context exists")
-    check(calls == ["called"], "generation callback is called exactly once")
+    check(response == UNVALIDATED_DRAFT_RESPONSE, "approved context alone does not authorize raw model text")
+    check(not calls, "legacy callback is never invoked without structured evidence validation")
 
 
 def test_path_guards():
@@ -232,7 +232,8 @@ def test_json_vector_collection_rejects_unproven_or_incompatible_embeddings():
 def test_dashboard_launcher_uses_the_supported_python_version():
     root = pathlib.Path(__file__).resolve().parents[1]
     launcher = (root / "run_dashboard.ps1").read_text(encoding="utf-8")
-    check("uv run --python 3.11" in launcher, "dashboard launcher pins the supported Python 3.11 runtime")
+    check("uv sync --locked --extra dashboard" in launcher, "dashboard launcher syncs the locked dashboard extra")
+    check("uv run --locked streamlit run" in launcher, "dashboard launch uses the locked project environment")
     check("--server.address 127.0.0.1" in launcher, "dashboard launcher binds only to loopback")
 
 
@@ -1242,7 +1243,7 @@ def test_python_syntax():
 
 
 def main():
-    test_memory_chat_abstains_without_approved_context()
+    test_memory_chat_refuses_unvalidated_model_prose()
     test_path_guards()
     test_archive_manifest_entry_shape_and_append()
     test_json_vector_collection_reset_removes_stale_items()

@@ -23,6 +23,7 @@ from memory_format import (
     normalize_memory_document,
     render_memory_document,
     set_scalar_field,
+    set_string_list_field,
     split_frontmatter,
 )
 from memory_review import parse_frontmatter_values
@@ -111,6 +112,21 @@ def append_decision_record(record: dict, decision_log_path: str):
         written = os.write(descriptor, payload)
         if written != len(payload):
             raise OSError("Decision record append was incomplete.")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def append_decision_records(records: list[dict], decision_log_path: str):
+    """Append a related group of audit records in one O_APPEND write."""
+    directory = os.path.dirname(os.path.abspath(decision_log_path))
+    os.makedirs(directory, exist_ok=True)
+    payload = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records).encode("utf-8")
+    descriptor = os.open(decision_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        written = os.write(descriptor, payload)
+        if written != len(payload):
+            raise OSError("Decision record group append was incomplete.")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -294,6 +310,9 @@ def apply_atom_mutation(
             updated = updated_text.encode("utf-8")
         else:
             if action == "approve":
+                values = parse_frontmatter_values(frontmatter)
+                if values.get("review_status") == "merged" or values.get("claim_state") == "superseded":
+                    raise ReviewTransitionError("Merged or superseded atoms cannot be approved; choose and review a new survivor instead.")
                 if frontmatter_value(frontmatter, "epistemic_label") in {"hypothesis", "preference"}:
                     raise ReviewTransitionError("Hypotheses and preferences cannot be promoted to factual standard recall.")
                 try:
@@ -335,6 +354,155 @@ def apply_atom_edit(**kwargs) -> dict:
 def apply_review_transition(*, action: str, **kwargs) -> dict:
     """Compatibility wrapper; all behavior lives in apply_atom_mutation."""
     return apply_atom_mutation(action=action, **kwargs)
+
+
+def apply_atom_merge(
+    *, survivor_path: str, survivor_expected_sha256: str,
+    superseded_path: str, superseded_expected_sha256: str,
+    actor: str, rationale: str, decision_log_path: str = DECISION_LOG,
+    history_dir: str | None = None, brain_dir: str | None = None,
+    atoms_dir: str = ATOMS_DIR, reviewed_on: str | None = None,
+) -> list[dict]:
+    """Owner-directed two-atom supersession with CAS, rollback, and paired audit."""
+    atoms_dir = os.path.abspath(atoms_dir)
+    brain_dir = os.path.abspath(brain_dir or os.path.dirname(atoms_dir))
+    survivor_path = _canonical_atom_path(survivor_path, atoms_dir)
+    superseded_path = _canonical_atom_path(superseded_path, atoms_dir)
+    decision_log_path = os.path.abspath(decision_log_path)
+    history_dir = os.path.abspath(history_dir or os.path.join(atoms_dir, ".history"))
+    if survivor_path == superseded_path:
+        raise ReviewTransitionError("An atom cannot supersede itself.")
+    if not actor or not actor.strip():
+        raise ReviewTransitionError("An explicit owner actor is required for atom merges.")
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise ReviewTransitionError("A non-empty owner rationale is required for atom merges.")
+    for value, label in ((survivor_expected_sha256, "survivor"), (superseded_expected_sha256, "superseded")):
+        if not isinstance(value, str) or len(value) != 64:
+            raise ReviewConflictError(f"An exact 64-character expected SHA-256 is required for the {label} atom.")
+
+    lock_path = os.path.join(brain_dir, ".sidecar", "writer.lock")
+    with review_lock(lock_path):
+        paths = [survivor_path, superseded_path]
+        originals = [Path(path).read_bytes() for path in paths]
+        expected = [survivor_expected_sha256, superseded_expected_sha256]
+        actual = [content_sha256(data) for data in originals]
+        for label, want, got in zip(("survivor", "superseded"), expected, actual):
+            if want != got:
+                raise ReviewConflictError(f"The {label} atom changed (expected {want}, found {got}); reopen both atoms before merging.")
+
+        parsed_docs = []
+        for label, data in zip(("survivor", "superseded"), originals):
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ReviewTransitionError(f"The {label} atom is not valid UTF-8 Markdown.") from exc
+            parsed = split_frontmatter(text)
+            if parsed is None or not is_memory_document(text):
+                raise ReviewTransitionError(f"The {label} atom must contain valid frontmatter, Claim, and Evidence sections.")
+            frontmatter, body = parsed
+            from memory_review import parse_frontmatter_values
+            values = parse_frontmatter_values(frontmatter)
+            if values.get("review_status") == "merged" or values.get("claim_state") == "superseded":
+                raise ReviewTransitionError(f"The {label} atom is already superseded.")
+            parsed_docs.append((frontmatter, body, values))
+
+        survivor_frontmatter, survivor_body, survivor_values = parsed_docs[0]
+        superseded_frontmatter, superseded_body, superseded_values = parsed_docs[1]
+        survivor_links = survivor_values.get("supersedes", [])
+        superseded_links = superseded_values.get("superseded_by", [])
+        if isinstance(survivor_links, str):
+            survivor_links = [survivor_links]
+        if isinstance(superseded_links, str):
+            superseded_links = [superseded_links]
+        survivor_links = list(survivor_links or [])
+        superseded_links = list(superseded_links or [])
+        if Path(superseded_path).name in survivor_links or Path(survivor_path).name in superseded_links:
+            raise ReviewTransitionError("These atoms already have a merge relationship.")
+        for related_name in [*survivor_links, *superseded_links]:
+            related_path = os.path.join(atoms_dir, str(related_name))
+            if not os.path.isfile(related_path):
+                continue
+            try:
+                related_doc = Path(related_path).read_text(encoding="utf-8")
+                related_parsed = split_frontmatter(related_doc)
+                related_frontmatter = related_parsed[0] if related_parsed else []
+                related_values = parse_frontmatter_values(related_frontmatter)
+            except (OSError, UnicodeDecodeError):
+                continue
+            related_superseded_by = related_values.get("superseded_by", [])
+            if isinstance(related_superseded_by, str):
+                related_superseded_by = [related_superseded_by]
+            if Path(superseded_path).name in (related_superseded_by or []):
+                raise ReviewTransitionError("Merge would create a supersession cycle.")
+        survivor_links.append(Path(superseded_path).name)
+        superseded_links.append(Path(survivor_path).name)
+        reviewed_on = reviewed_on or datetime.datetime.now().strftime("%Y-%m-%d")
+        updated_survivor = set_string_list_field(survivor_frontmatter, "supersedes", survivor_links, "contexts")
+        updated_survivor = set_scalar_field(updated_survivor, "claim_state", "candidate", "citation_integrity")
+        updated_survivor = set_scalar_field(updated_survivor, "review_status", "pending", "epistemic_label")
+        updated_survivor = set_scalar_field(updated_survivor, "last-reviewed", reviewed_on, "created")
+        updated_superseded = set_string_list_field(superseded_frontmatter, "superseded_by", superseded_links, "supersedes")
+        updated_superseded = set_scalar_field(updated_superseded, "claim_state", "superseded", "citation_integrity")
+        updated_superseded = set_scalar_field(updated_superseded, "review_status", "merged", "epistemic_label")
+        updated_superseded = set_scalar_field(updated_superseded, "last-reviewed", reviewed_on, "created")
+        updated = [
+            render_memory_document(updated_survivor, survivor_body).encode("utf-8"),
+            render_memory_document(updated_superseded, superseded_body).encode("utf-8"),
+        ]
+
+        os.makedirs(history_dir, exist_ok=True)
+        backup_paths = []
+        for path, original in zip(paths, originals):
+            backup_path = os.path.join(history_dir, f"{Path(path).name}.{content_sha256(original)}.bak")
+            if not os.path.exists(backup_path):
+                atomic_write_bytes(backup_path, original)
+            backup_paths.append(backup_path)
+        written_paths = []
+        try:
+            for path, content in zip(paths, updated):
+                atomic_write_bytes(path, content)
+                written_paths.append(path)
+            index_result = refresh_lexical_index(atoms_dir, brain_dir)
+            from index_manifest import index_manifest_is_current, load_index_manifest
+            dense_manifest = load_index_manifest(os.path.join(brain_dir, ".chroma"))
+            dense_active = (
+                isinstance(dense_manifest, dict)
+                and dense_manifest.get("distance_metric") == "cosine"
+                and bool(dense_manifest.get("embedding_model"))
+                and isinstance(dense_manifest.get("embedding_dimensions"), int)
+                and bool(dense_manifest.get("generation_id"))
+                and index_manifest_is_current(dense_manifest, atoms_dir)
+            )
+            now = datetime.datetime.now().isoformat(timespec="seconds")
+            peer_paths = [superseded_path, survivor_path]
+            records = []
+            for index, path in enumerate(paths):
+                records.append({
+                    "schema_version": 1,
+                    "recorded_at": now,
+                    "action": "merge",
+                    "actor": actor.strip(),
+                    "rationale": rationale.strip(),
+                    "atom_filename": Path(path).name,
+                    "peer_filename": Path(peer_paths[index]).name,
+                    "relationship": "survivor" if index == 0 else "superseded",
+                    "content_sha256_before": content_sha256(originals[index]),
+                    "content_sha256_after": content_sha256(updated[index]),
+                    "backup_path": backup_paths[index],
+                    "lexical_index_path": index_result["index_path"],
+                    "dense_index_state": "stale" if dense_active else "not_active",
+                })
+            append_decision_records(records, decision_log_path)
+        except Exception:
+            for path, original in zip(paths, originals):
+                if path in written_paths:
+                    atomic_write_bytes(path, original)
+            try:
+                refresh_lexical_index(atoms_dir, brain_dir)
+            except Exception:
+                pass
+            raise
+        return records
 
 
 def approved_revision_is_current(

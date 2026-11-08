@@ -15,7 +15,7 @@ import json
 # ─── Root Paths ──────────────────────────────────────────────────────────────
 SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR     = os.path.dirname(SCRIPTS_DIR)
-BRAIN_DIR    = os.path.join(ROOT_DIR, "brain")
+BRAIN_DIR    = os.path.abspath(os.environ.get("BRAIN_VAULT_DIR", os.path.join(ROOT_DIR, "brain")))
 
 # ─── Vault Folders ───────────────────────────────────────────────────────────
 RAW_DIR      = os.path.join(BRAIN_DIR, "0-raw")

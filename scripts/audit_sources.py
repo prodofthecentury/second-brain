@@ -1,0 +1,196 @@
+# /// script
+# requires-python = ">=3.11,<3.12"
+# dependencies = []
+# ///
+"""Audit atom source anchors and optionally demote stale approvals."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from atom_mutator import (
+    ReviewConflictError,
+    ReviewTransitionError,
+    apply_review_transition,
+    approved_revision_is_current,
+    review_lock,
+)
+from config import ATOMS_DIR, BRAIN_DIR, is_content_markdown
+from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor
+from memory_format import split_frontmatter
+from memory_review import parse_frontmatter_values
+from atom_mutator import DECISION_LOG
+
+
+def _source_snapshot(brain_root: Path, anchor: dict[str, Any]) -> tuple[str, str | None, str | None]:
+    source = anchor.get("evidence_source")
+    if not isinstance(source, str) or not source.strip():
+        return "missing_path", None, "No evidence_source anchor is stored."
+    relative = Path(source.replace("\\", "/"))
+    if relative.is_absolute() or ".." in relative.parts:
+        return "unsafe_path", None, "Stored evidence path is absolute or traverses parent directories."
+    try:
+        path = (brain_root / relative).resolve(strict=True)
+        allowed_roots = [(brain_root / "0-raw").resolve(), (brain_root / "sources").resolve()]
+        if not path.is_file() or not any(path.is_relative_to(root) for root in allowed_roots):
+            return "outside_allowed_sources", None, "Stored evidence source is outside durable source directories."
+        return "present", hashlib.sha256(path.read_bytes()).hexdigest(), None
+    except OSError as exc:
+        return "missing_or_unreadable", None, str(exc)
+
+
+def audit_sources(
+    *,
+    atoms_dir: str | Path = ATOMS_DIR,
+    brain_dir: str | Path = BRAIN_DIR,
+    decision_log_path: str | Path = DECISION_LOG,
+    demote_stale: bool = False,
+    actor: str | None = None,
+) -> list[dict[str, Any]]:
+    """Report source/approval drift; only demote on explicit opt-in.
+
+    Demotion uses the canonical compare-and-swap mutator and appends its normal
+    owner decision record. The audit never edits evidence or silently repairs
+    an anchor; the owner must inspect the current source before re-approval.
+    """
+    atoms_root = Path(atoms_dir).resolve()
+    brain_root = Path(brain_dir).resolve()
+    decision_path = Path(decision_log_path).resolve()
+    if demote_stale and (not isinstance(actor, str) or not actor.strip()):
+        raise ValueError("An explicit actor is required with --demote-stale.")
+
+    reports: list[dict[str, Any]] = []
+    lock_path = brain_root / ".sidecar" / "writer.lock"
+    for atom_path in sorted(atoms_root.iterdir()) if atoms_root.is_dir() else []:
+        if not atom_path.is_file() or not is_content_markdown(atom_path.name):
+            continue
+        entry: dict[str, Any] = {
+            "atom_id": atom_path.name,
+            "anchor_status": "unreadable",
+            "anchor_error": None,
+            "review_status": "unknown",
+            "claim_state": "unknown",
+            "atom_sha256": None,
+            "stored_anchor": None,
+            "current_anchor": None,
+            "source_status": "unknown",
+            "current_source_sha256": None,
+            "approval_current": False,
+            "action": "none",
+            "mutation_error": None,
+        }
+        atom_hash = None
+        should_demote = False
+        try:
+            with review_lock(str(lock_path)):
+                raw = atom_path.read_bytes()
+                content = raw.decode("utf-8")
+                atom_hash = hashlib.sha256(raw).hexdigest()
+                parsed = split_frontmatter(content)
+                if parsed is None:
+                    raise ValueError("Atom has invalid or missing frontmatter.")
+                values = parse_frontmatter_values(parsed[0])
+                entry["review_status"] = str(values.get("review_status", "pending"))
+                entry["claim_state"] = str(values.get("claim_state", "candidate"))
+                entry["atom_sha256"] = atom_hash
+
+                anchors = {key: values.get(key) for key in ANCHOR_FIELDS}
+                if not all(value is not None and str(value).strip() for value in anchors.values()):
+                    entry["anchor_status"] = "missing"
+                else:
+                    entry["stored_anchor"] = anchors
+                    entry["source_status"], entry["current_source_sha256"], source_error = _source_snapshot(
+                        brain_root, anchors,
+                    )
+                    if source_error:
+                        entry["anchor_error"] = source_error
+                    try:
+                        current_anchor = find_evidence_anchor(content, str(brain_root))
+                        entry["current_anchor"] = current_anchor
+                        entry["anchor_status"] = (
+                            "current"
+                            if all(str(current_anchor.get(key)) == str(anchors.get(key)) for key in ANCHOR_FIELDS)
+                            else "stale_or_unverifiable"
+                        )
+                    except (EvidenceValidationError, OSError, ValueError) as exc:
+                        entry["anchor_status"] = "stale_or_unverifiable"
+                        entry["anchor_error"] = str(exc)
+
+                entry["approval_current"] = approved_revision_is_current(
+                    str(atom_path),
+                    decision_log_path=str(decision_path),
+                    brain_dir=str(brain_root),
+                    atoms_dir=str(atoms_root),
+                )
+                approval_metadata_present = (
+                    entry["review_status"] == "accepted"
+                    or entry["claim_state"] == "human_reviewed"
+                )
+                should_demote = approval_metadata_present and not entry["approval_current"]
+                if should_demote:
+                    entry["action"] = "would_demote" if demote_stale else "review_required"
+                elif entry["approval_current"]:
+                    entry["action"] = "none"
+                else:
+                    entry["action"] = "not_approved"
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            entry["anchor_error"] = str(exc)
+            if entry["review_status"] == "accepted" or entry["claim_state"] == "human_reviewed":
+                should_demote = True
+                entry["action"] = "would_demote" if demote_stale else "review_required"
+
+        if demote_stale and should_demote and atom_hash:
+            try:
+                apply_review_transition(
+                    action="demote",
+                    atom_path=str(atom_path),
+                    expected_sha256=atom_hash,
+                    actor=str(actor).strip(),
+                    decision_log_path=str(decision_path),
+                    brain_dir=str(brain_root),
+                    atoms_dir=str(atoms_root),
+                )
+                entry["action"] = "demoted"
+            except (ReviewConflictError, ReviewTransitionError, OSError, ValueError) as exc:
+                entry["action"] = "conflict_or_failure"
+                entry["mutation_error"] = str(exc)
+        reports.append(entry)
+    return reports
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--atoms-dir", default=ATOMS_DIR)
+    parser.add_argument("--brain-dir", default=BRAIN_DIR)
+    parser.add_argument("--decision-log", default=DECISION_LOG)
+    parser.add_argument(
+        "--demote-stale", action="store_true",
+        help="Demote accepted atoms whose approval no longer matches current atom/source bytes.",
+    )
+    parser.add_argument("--actor", help="Required audit actor for --demote-stale.")
+    args = parser.parse_args(argv)
+    try:
+        report = audit_sources(
+            atoms_dir=args.atoms_dir,
+            brain_dir=args.brain_dir,
+            decision_log_path=args.decision_log,
+            demote_stale=args.demote_stale,
+            actor=args.actor,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Source audit failed: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 1 if any(row["action"] == "conflict_or_failure" for row in report) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

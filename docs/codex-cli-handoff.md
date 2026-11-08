@@ -1,19 +1,33 @@
 # Codex CLI Handoff — Second Brain
 
-**Last refreshed:** 2026-10-24 (Pacific/Auckland)
+**Last refreshed:** 2026-10-27 (Pacific/Auckland)
 
-**Current runtime follow-up:** 2026-10-27. The Chroma Windows import failure
-was fixed by installing the official signed Microsoft Visual C++ v14 x64
-runtime. A real 13-atom cosine generation now works. Scout connections are
-IP-pinned to validated public DNS results. The owner approved the structured-
-logging atom and a seven-query evaluation set. A conservative literal claim
-overlap gate now prevents the two current trap queries from returning trusted
-context; synonym-only recall may be missed. The owner selected a code-only
-baseline, committed as `f4ab16e`; the working tree is clean and the live
-`brain/` vault is excluded. No remote is configured. The earlier `bffca9e`
-commit still contains 18 old-layout vault files, so do not push until that
-history is reviewed or scrubbed. See `system-sweep-2026-10-27.md` for current
-evidence and limitations; the 2026-10-24 report is a historical snapshot.
+**Current runtime follow-up:** 2026-10-27. Native Chroma imports and queries
+the current 14-atom cosine generation after installing the official signed
+Microsoft Visual C++ v14 x64 runtime. Scout pins connections to validated
+public DNS results. The owner approved `structured-logging.md` and
+`design-for-failure.md`, plus the seven-query evaluation set. The corrected
+procedure candidate and product-target draft remain pending. The
+Claim+Evidence literal overlap gate keeps both current traps out while
+returning approved logging and failure-handling memories through lexical and
+dense paths. CLI and dashboard abstain without approved context; answer
+grounding with context is still unmeasured. Current test/evaluation
+evidence and open gaps are in `system-sweep-2026-10-27.md`.
+
+The retrieval dataset is now version 2.0.0: five candidate-ranking examples,
+two answerability examples pinned to approved atom revisions, three exploratory
+examples, and two documented abstention traps. The evaluator rejects stale or
+unapproved answer targets before scoring. All cases are still regression
+examples; there is no development or holdout set, and generated answer quality
+has not been evaluated.
+
+The owner-selected code-only baseline is committed through `db9d182`; its
+checkpoint was clean, and the live `brain/` vault and `tmp/` are excluded. The
+roadmap/review preparation is currently uncommitted. No remote is configured.
+The earlier `bffca9e` commit still contains 18 old-layout vault files, so do
+not push until that history is reviewed or scrubbed. The current dependency-
+ordered roadmap is `tasks/plan.md` and `tasks/todo.md`; they supersede the old
+checklist chronology below. The 2026-10-24 report is a historical snapshot.
 
 **Long-term product direction:** the owner wants a one-click installable Brain
 plugin for any PC, with local/offline and online modes and adapters for
@@ -146,7 +160,7 @@ Measured on 2026-07-27:
   - `qwen3.6:latest` — 23 GB
 - Direct local API probe previously verified that `llama3.2:3b` returned exactly `HEALTHY` and `nomic-embed-text` returned a 768-dimensional vector.
 - A listed model is not a proven viable capability. In particular, do not assume the 23 GB Qwen model is usable on 16 GB RAM.
-- Current data counts: 13 atoms, 0 threads, 0 source files, 23 raw captures, and 14 queued URLs.
+- Current data counts: 14 atoms, 0 threads, 0 source files, 24 queued captures, and 14 queued URLs.
 - Do not start Scout, daemon, night shift, MCP, or vector rebuild before the corresponding safety slices. The queued data is user data and intentionally untouched.
 
 ## Dashboard launcher verification
@@ -197,7 +211,7 @@ run_night_shift.ps1     Refinery then editor; do not run yet
 - `docs/unified-local-ai-brain.md` and `docs/cognitive-core.md` are prior project/spec material. They are useful background but predate the final cross-model review.
 - `docs/architecture-review-draft.md` is the current proposed architecture and supersedes conflicting direction in older task documents.
 - `docs/system-sweep-2026-07-26.md` is the current pre-repair release gate.
-- `tasks/plan.md` and `tasks/todo.md` describe an older partial implementation plan. Reconcile or replace them before coding; do not blindly check off old tasks.
+- `tasks/plan.md` and `tasks/todo.md` were reconciled on 2026-10-27 against the current source and system sweep. Follow their Goal 0–8 dependency order; do not revive the historical unchecked tasks below.
 - `tasks/claude-*.md` contain the exact prior external-review prompts. Outputs were reconciled into this handoff and the two review documents.
 - `CODEX_CLI_GOAL.md` is the ready-to-copy task instruction.
 
@@ -288,4 +302,12 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:11434/api/embed' -ContentT
 
 Architecture and review work is complete enough to guide implementation. A safety implementation pass on 2026-10-24 added loopback-only dashboard binding, model-trust resets, evidence anchors, owner-decision hash checks, a shared writer lock for canonical mutations, create-only threads/captures, stable-file checks, cosine vector manifests/scoring, and readiness warnings for optional model services. See [the 2026-10-24 system sweep](system-sweep-2026-10-24.md) for exact scope and verification.
 
-The **implementation and release gate are not complete**. In particular, no trusted-memory release claim is made: no full runtime smoke was completed in the direct system Python yet, no labelled retrieval evaluation or failure-injection audit was run, and the repository-boundary migration remains uncommitted. Historical findings above describe the earlier audit state; use the 2026-10-24 report and current source for the current state.
+The **local pilot implementation and release gate are not complete**. The current
+local runtime has a verified Chroma generation, owner-reviewed evidence,
+lexical/dense retrieval measurements, empty-context abstention, and hardened
+Scout fetching. It still lacks answer-level claim/citation validation, a broad
+held-out evaluation, dashboard/MCP identity controls, reproducible dependency
+locking, complete merge/source-change review workflows, and independent final
+review. Historical findings above describe earlier audit states; use the
+2026-10-27 system sweep, current source, and reconciled plan/task queue for
+present status.

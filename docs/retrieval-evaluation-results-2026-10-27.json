@@ -1,39 +1,63 @@
 {
   "evaluation_status": "owner_approved",
-  "index_generation": "231a0548c2a847b6bd7ecaf6a907756b",
+  "dataset_id": "second-brain-retrieval-pilot",
+  "dataset_version": "2.0.0",
+  "dataset_sha256": "625f61fff06515bd6688fd1e853a6c64752b036fe621847d99200b8ae756770b",
+  "index_generation": "ce48706db17d440fbba04b8c7f86c37e",
   "embedding_model": "nomic-embed-text",
   "embedding_dimensions": 768,
   "k": 5,
-  "labelled_query_count": 5,
-  "trap_query_count": 2,
-  "lexical_mean_recall_at_k": 1.0,
-  "dense_mean_recall_at_k": 1.0,
-  "lexical_mean_mrr": 0.9,
-  "dense_mean_mrr": 1.0,
-  "lexical_mean_ndcg_at_k": 0.9386852807234541,
-  "dense_mean_ndcg_at_k": 1.0,
-  "lexical_median_latency_ms": 5.844400000114547,
-  "dense_median_latency_ms": 59.14789999997083,
+  "candidate_ranking_query_count": 5,
+  "answerable_query_count": 2,
+  "exploratory_candidate_query_count": 3,
+  "unanswerable_query_count": 2,
+  "candidate_lexical_mean_recall_at_k": 1.0,
+  "candidate_dense_mean_recall_at_k": 1.0,
+  "candidate_lexical_mean_mrr": 1.0,
+  "candidate_dense_mean_mrr": 1.0,
+  "candidate_lexical_mean_ndcg_at_k": 0.9754430630676099,
+  "candidate_dense_mean_ndcg_at_k": 1.0,
+  "answerable_lexical_expected_atom_recall_at_k": 1.0,
+  "answerable_dense_expected_atom_recall_at_k": 1.0,
+  "trusted_answerable_lexical_expected_atom_recall": 1.0,
+  "trusted_answerable_dense_expected_atom_recall": 1.0,
+  "lexical_median_latency_ms": 6.5509999999449064,
+  "dense_median_latency_ms": 57.64660000022559,
   "trusted_trap_false_positives": 0,
   "queries": [
     {
       "id": "structured_logging_paraphrase",
-      "relevant": [
+      "answerability": "answerable",
+      "split": "regression",
+      "candidate_relevance": [
         "observability-o11y.md",
         "structured-logging.md"
+      ],
+      "expected_atom_ids": [
+        "structured-logging.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "Logs should be structured (JSON) to facilitate observability and traceability.",
+          "supported_by": [
+            "structured-logging.md"
+          ]
+        }
       ],
       "lexical": {
         "ranked": [
           "structured-logging.md",
           "observability-o11y.md",
-          "ollama-refinery-entrypoint.md",
           "continuous-integration-deployment.md",
+          "ollama-refinery-entrypoint.md",
           "code-reviews-as-mentorship.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 5.844
+        "latency_ms": 6.551,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
       },
       "dense": {
         "ranked": [
@@ -41,34 +65,42 @@
           "observability-o11y.md",
           "ollama-refinery-entrypoint.md",
           "controlled-refinery-change-validation.md",
-          "tdd-and-automated-testing.md"
+          "owner-product-target.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 115.032
+        "latency_ms": 113.431,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
       },
       "trusted_result_count_across_both_paths": 2,
       "trusted_false_positives": null
     },
     {
       "id": "continuous_delivery",
-      "relevant": [
+      "answerability": "exploratory",
+      "split": "regression",
+      "candidate_relevance": [
         "continuous-integration-deployment.md",
         "tdd-and-automated-testing.md"
       ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
       "lexical": {
         "ranked": [
-          "controlled-refinery-change-validation.md",
           "continuous-integration-deployment.md",
+          "controlled-refinery-change-validation.md",
+          "owner-product-target.md",
           "tdd-and-automated-testing.md",
-          "code-reviews-as-mentorship.md",
-          "structured-logging.md"
+          "code-reviews-as-mentorship.md"
         ],
         "recall_at_k": 1.0,
-        "mrr": 0.5,
-        "ndcg_at_k": 0.6934264036172708,
-        "latency_ms": 6.844
+        "mrr": 1.0,
+        "ndcg_at_k": 0.8772153153380493,
+        "latency_ms": 7.172,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "dense": {
         "ranked": [
@@ -81,16 +113,22 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 59.148
+        "latency_ms": 57.647,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "trusted_result_count_across_both_paths": 0,
       "trusted_false_positives": null
     },
     {
       "id": "testing_first",
-      "relevant": [
+      "answerability": "exploratory",
+      "split": "regression",
+      "candidate_relevance": [
         "tdd-and-automated-testing.md"
       ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
       "lexical": {
         "ranked": [
           "tdd-and-automated-testing.md",
@@ -102,7 +140,9 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 7.074
+        "latency_ms": 5.115,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "dense": {
         "ranked": [
@@ -115,136 +155,180 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 55.514
+        "latency_ms": 46.99,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "trusted_result_count_across_both_paths": 0,
       "trusted_false_positives": null
     },
     {
       "id": "failure_handling",
-      "relevant": [
+      "answerability": "answerable",
+      "split": "regression",
+      "candidate_relevance": [
         "design-for-failure.md"
+      ],
+      "expected_atom_ids": [
+        "design-for-failure.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "High-level systems should be designed to handle failures gracefully.",
+          "supported_by": [
+            "design-for-failure.md"
+          ]
+        }
       ],
       "lexical": {
         "ranked": [
           "design-for-failure.md",
-          "ollama-refinery-entrypoint.md",
+          "owner-product-target.md",
           "observability-o11y.md",
-          "cognitive-core-validation-embeddings.md",
-          "sodium-ion-battery-cost-record.md"
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-validation-embeddings.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 5.291
+        "latency_ms": 8.665,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
       },
       "dense": {
         "ranked": [
           "design-for-failure.md",
           "observability-o11y.md",
           "continuous-integration-deployment.md",
-          "tdd-and-automated-testing.md",
-          "code-reviews-as-mentorship.md"
-        ],
-        "recall_at_k": 1.0,
-        "mrr": 1.0,
-        "ndcg_at_k": 1.0,
-        "latency_ms": 61.715
-      },
-      "trusted_result_count_across_both_paths": 0,
-      "trusted_false_positives": null
-    },
-    {
-      "id": "code_review_purpose",
-      "relevant": [
-        "code-reviews-as-mentorship.md"
-      ],
-      "lexical": {
-        "ranked": [
-          "code-reviews-as-mentorship.md",
+          "owner-product-target.md",
           "tdd-and-automated-testing.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 5.242
+        "latency_ms": 60.731,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_both_paths": 2,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "code_review_purpose",
+      "answerability": "exploratory",
+      "split": "regression",
+      "candidate_relevance": [
+        "code-reviews-as-mentorship.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "code-reviews-as-mentorship.md",
+          "tdd-and-automated-testing.md",
+          "owner-product-target.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 6.176,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "dense": {
         "ranked": [
           "code-reviews-as-mentorship.md",
           "tdd-and-automated-testing.md",
-          "observability-o11y.md",
-          "continuous-integration-deployment.md",
-          "controlled-refinery-change-validation.md"
+          "design-for-failure.md",
+          "controlled-refinery-change-validation.md",
+          "observability-o11y.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 51.226
+        "latency_ms": 48.843,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "trusted_result_count_across_both_paths": 0,
       "trusted_false_positives": null
     },
     {
       "id": "trap_personal_preference",
-      "relevant": [],
+      "answerability": "unanswerable",
+      "split": "regression",
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
       "lexical": {
         "ranked": [
           "sodium-ion-battery-cost-record.md",
+          "owner-product-target.md",
           "ollama-refinery-entrypoint.md",
           "cognitive-core-single-file-mode.md",
-          "cognitive-core-validation-markdown-durability.md",
-          "controlled-refinery-change-validation.md"
+          "cognitive-core-validation-markdown-durability.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 5.534
+        "latency_ms": 6.033,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "dense": {
         "ranked": [
           "sodium-ion-battery-cost-record.md",
+          "owner-product-target.md",
           "tdd-and-automated-testing.md",
           "controlled-refinery-change-validation.md",
-          "design-for-failure.md",
-          "structured-logging.md"
+          "design-for-failure.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 55.219
+        "latency_ms": 53.786,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "trusted_result_count_across_both_paths": 0,
       "trusted_false_positives": 0
     },
     {
       "id": "trap_missing_personal_data",
-      "relevant": [],
+      "answerability": "unanswerable",
+      "split": "regression",
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
       "lexical": {
         "ranked": [
+          "owner-product-target.md",
           "sodium-ion-battery-cost-record.md",
           "ollama-refinery-entrypoint.md",
           "cognitive-core-single-file-mode.md",
-          "cognitive-core-validation-markdown-durability.md",
-          "controlled-refinery-change-validation.md"
+          "cognitive-core-validation-markdown-durability.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 7.495
+        "latency_ms": 6.721,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "dense": {
         "ranked": [
+          "owner-product-target.md",
           "structured-logging.md",
           "sodium-ion-battery-cost-record.md",
           "ollama-refinery-entrypoint.md",
-          "cognitive-core-validation-markdown-durability.md",
-          "continuous-integration-deployment.md"
+          "cognitive-core-validation-markdown-durability.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 59.531
+        "latency_ms": 58.927,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
       },
       "trusted_result_count_across_both_paths": 0,
       "trusted_false_positives": 0

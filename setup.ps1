@@ -1,75 +1,66 @@
-<#
-.SYNOPSIS
-One-time setup script for the Second Brain system.
+param([switch]$NoLaunch)
+$ErrorActionPreference = 'Stop'
+$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+Write-Host 'Setup will not initialize, stage, or commit files. Review the repository boundary separately.' -ForegroundColor Yellow
 
-.DESCRIPTION
-This script verifies the directory structure, reports the current Git boundary,
-and provides instructions for setting up Windows Task Scheduler.
-#>
-
-$ScriptPath = $MyInvocation.MyCommand.Path
-$ProjectRoot = Split-Path $ScriptPath
-$BrainDir = Join-Path $ProjectRoot "brain"
-
-Write-Host "Setting up Second Brain..." -ForegroundColor Cyan
-
-# 1. Verify Directories
-$RequiredDirs = @(
-    "0-raw",
-    "0-raw\archive",
-    "1-desk",
-    "2-atoms",
-    "2-atoms\.history",
-    "3-threads",
-    "sources",
-    "briefings",
-    ".sidecar",
-    ".chroma",
-    "playbooks",
-    "playbooks\templates",
-    ".obsidian"
-)
-
-Write-Host "Verifying directory structure..."
-foreach ($Dir in $RequiredDirs) {
-    $FullPath = Join-Path $BrainDir $Dir
-    if (!(Test-Path $FullPath)) {
-        Write-Host "  Creating $Dir..."
-        New-Item -ItemType Directory -Path $FullPath | Out-Null
-    } else {
-        Write-Host "  $Dir exists." -ForegroundColor Green
-    }
-}
-
-# 2. Repository boundary detection
-Write-Host "`nChecking for Git..."
-if (Get-Command git -ErrorAction SilentlyContinue) {
-    $RepoRoot = git -C $ProjectRoot rev-parse --show-toplevel 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        $ResolvedRepoRoot = [System.IO.Path]::GetFullPath($RepoRoot.Trim())
-        $ResolvedProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
-        if ($ResolvedRepoRoot -eq $ResolvedProjectRoot) {
-            Write-Host "Project root is the Git repository boundary." -ForegroundColor Green
-        } else {
-            Write-Host "Git resolves to parent boundary: $ResolvedRepoRoot" -ForegroundColor Yellow
-            Write-Host "Review the boundary and ignore rules before committing project data."
-        }
-    } else {
-        Write-Host "No Git repository detected. Setup will not initialize, stage, or commit files." -ForegroundColor Yellow
-        Write-Host "Choose and review the repository boundary and backup policy before using Git."
+$UvCommand = Get-Command uv -ErrorAction SilentlyContinue
+if ($UvCommand) {
+    $UvExe = $UvCommand.Source
+} elseif (Get-Command winget -ErrorAction SilentlyContinue) {
+    Write-Host 'Installing the uv bootstrap with Windows Package Manager...'
+    & winget install --id astral-sh.uv --exact --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) { throw 'Could not install uv with winget.' }
+    $UvCommand = Get-Command uv -ErrorAction SilentlyContinue
+    $UvCandidates = @(
+        (Join-Path $env:USERPROFILE '.local\bin\uv.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\uv\uv.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\uv.exe')
+    )
+    if ($UvCommand) { $UvExe = $UvCommand.Source }
+    else {
+        $UvExe = $UvCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $UvExe) { throw 'uv was installed, but its executable was not found. Open a new shell and rerun setup.ps1.' }
     }
 } else {
-    Write-Host "Git is not installed or not in PATH." -ForegroundColor Yellow
-    Write-Host "Install Git if you want version history and rollback capabilities." -ForegroundColor Yellow
+    $PythonExecutable = $null
+    $PythonPrefix = @()
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        & py -3.11 --version *> $null
+        if ($LASTEXITCODE -eq 0) { $PythonExecutable = 'py'; $PythonPrefix = @('-3.11') }
+    }
+    if (-not $PythonExecutable -and (Get-Command python3.11 -ErrorAction SilentlyContinue)) {
+        & python3.11 --version *> $null
+        if ($LASTEXITCODE -eq 0) { $PythonExecutable = 'python3.11' }
+    }
+    if (-not $PythonExecutable) { throw 'Install uv or Python 3.11, then rerun setup.ps1.' }
+    Write-Host 'Installing the user-scoped uv bootstrap with Python pip...'
+    $InstallUvArgs = @($PythonPrefix) + @('-m', 'pip', 'install', '--user', 'uv')
+    & $PythonExecutable @InstallUvArgs
+    if ($LASTEXITCODE -ne 0) { throw 'Could not install uv with pip.' }
+    $SiteArgs = @($PythonPrefix) + @('-m', 'site', '--user-base')
+    $UserBase = (& $PythonExecutable @SiteArgs).Trim()
+    $UvExe = Join-Path $UserBase 'Scripts\uv.exe'
+    if (-not (Test-Path $UvExe)) { throw "uv installed, but its executable was not found at $UvExe. Start a new shell and rerun setup.ps1." }
 }
 
-# 3. Task Scheduler Info
-Write-Host "`nSetup Complete." -ForegroundColor Cyan
-Write-Host "`nTo schedule the night shift, you can register run_night_shift.ps1 in Windows Task Scheduler:"
-Write-Host "1. Open Task Scheduler"
-Write-Host "2. Create Basic Task..."
-Write-Host "3. Trigger: Daily at 11:00 PM (or whenever you want the run to start)"
-Write-Host "4. Action: Start a program"
-Write-Host "5. Program/script: powershell.exe"
-Write-Host "6. Add arguments: -ExecutionPolicy Bypass -File `"$ProjectRoot\run_night_shift.ps1`""
-Write-Host "`nSee README.md for full usage instructions."
+& $UvExe python install 3.11
+if ($LASTEXITCODE -ne 0) { throw 'uv could not install or locate managed Python 3.11.' }
+
+Push-Location $ProjectRoot
+try {
+    & $UvExe sync --locked --extra dashboard
+    if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+    & $UvExe run --locked second-brain install
+    if ($LASTEXITCODE -ne 0) { throw 'Vault initialization failed.' }
+    & $UvExe run --locked second-brain doctor
+    if ($LASTEXITCODE -ne 0) { throw 'Capability report failed.' }
+    if (-not $NoLaunch) {
+        Write-Host 'Starting the local dashboard. Ollama must be installed separately for local model features.' -ForegroundColor Cyan
+        & $UvExe run --locked second-brain dashboard
+        if ($LASTEXITCODE -ne 0) { throw 'Dashboard exited with an error.' }
+    }
+} finally {
+    Pop-Location
+}
+
+if ($NoLaunch) { Write-Host 'Setup is ready. Start the dashboard later with: uv run --locked second-brain dashboard' -ForegroundColor Green }

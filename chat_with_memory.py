@@ -6,19 +6,20 @@
 # ]
 # ///
 
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+
 import ollama
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.panel import Panel
 
-from scripts.config import (
-    GEN_MODEL,
-)
-from scripts.answer_policy import answer_from_memory
+from scripts.config import ATOMS_DIR, GEN_MODEL
+from scripts.answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, answer_from_memory, build_grounding_prompt, validate_standard_answer
 from scripts.recall import (
     MemoryRecallUnavailable,
     RecallOptions,
-    format_context,
     search_memory as recall_search_memory,
 )
 
@@ -29,8 +30,8 @@ def search_memory(query):
         direct, neighbors = recall_search_memory(query, RecallOptions(n_results=3, follow_links=True))
     except MemoryRecallUnavailable as exc:
         console.print(f"[bold yellow]Memory recall unavailable: {exc}[/bold yellow]")
-        return ""
-    return format_context(direct + neighbors)
+        return []
+    return direct + neighbors
 
 def chat_loop():
     console.print(Panel.fit("[bold cyan]Ollama Memory Interface (Graph RAG)[/bold cyan]\nType 'exit' to quit.", border_style="cyan"))
@@ -49,43 +50,40 @@ def chat_loop():
             continue
             
         with console.status("[bold dark_gray]Searching semantic memory...[/bold dark_gray]"):
-            memory_context = search_memory(user_input)
+            retrieved_atoms = search_memory(user_input)
             
-        if memory_context:
+        if retrieved_atoms:
             console.print("[dim green]✓ Relevant memories retrieved.[/dim green]")
         else:
             console.print("[dim yellow]⚠ No relevant memories found.[/dim yellow]")
 
-        if not memory_context.strip():
-            full_response = answer_from_memory(memory_context, lambda: "")
-            console.print(f"\n[bold blue]Ollama>[/bold blue] {full_response}")
+        if not retrieved_atoms:
+            full_response = answer_from_memory("", lambda: "")
+            console.print(f"\n[bold blue]Ollama>[/bold blue]")
+            console.print(full_response, markup=False)
             messages.append({"role": "user", "content": user_input})
             messages.append({"role": "assistant", "content": full_response})
             continue
             
-        system_prompt = f"""
-You are a research assistant answering from the user's Second Brain vault.
-Use only the approved vault context below. If it does not contain enough evidence to answer,
-say that the approved memory does not contain the answer. Do not fill gaps with general knowledge.
-Cite the filename for each claim drawn from the vault.
-
-VAULT CONTEXT:
-{memory_context}
-"""
+        system_prompt = build_grounding_prompt(
+            AnswerRequest(query=user_input, result_limit=len(retrieved_atoms)),
+            retrieved_atoms,
+        )
         
         # Inject context invisibly for this turn
         turn_messages = [{"role": "system", "content": system_prompt}] + messages + [{"role": "user", "content": user_input}]
         
-        console.print("\n[bold blue]Ollama>[/bold blue] ", end="")
-        
         full_response = ""
         try:
-            response_stream = ollama.chat(model=GEN_MODEL, messages=turn_messages, stream=True)
+            response_stream = ollama.chat(
+                model=GEN_MODEL, messages=turn_messages, format=ANSWER_DRAFT_SCHEMA, stream=True
+            )
             for chunk in response_stream:
                 content = chunk["message"]["content"]
                 full_response += content
-                print(content, end="", flush=True)
-            print()
+            answer = validate_standard_answer(full_response, retrieved_atoms, atoms_dir=ATOMS_DIR)
+            full_response = answer.text
+            console.print(f"\n[bold blue]Ollama>[/bold blue] {full_response}")
         except Exception as e:
             console.print(f"\n[bold red]Error connecting to Ollama: {e}[/bold red]")
             continue

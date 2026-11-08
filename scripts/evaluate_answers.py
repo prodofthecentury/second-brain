@@ -1,0 +1,297 @@
+# /// script
+# requires-python = ">=3.11,<3.12"
+# dependencies = ["ollama", "chromadb"]
+# ///
+"""Run repeated answer-level grounding checks against the approved regression set."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import statistics
+import sys
+import tempfile
+import time
+from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, build_grounding_prompt, validate_standard_answer
+from atom_mutator import approved_revision_is_current
+from config import ATOMS_DIR, CHROMA_PATH, GEN_MODEL, LEXICAL_INDEX_PATH, SIDECAR_DIR
+from evaluation_dataset import validate_dataset
+from index_manifest import load_index_manifest
+from recall import RecallOptions, search_memory
+
+ROOT = Path(__file__).resolve().parents[1]
+DATASET_PATH = ROOT / "docs" / "retrieval-evaluation-proposed.json"
+DEFAULT_OUTPUT_PATH = Path(SIDECAR_DIR) / "answer-evaluation-latest.json"
+
+
+class EvaluationRunError(RuntimeError):
+    """Raised when an answer evaluation is incomplete and cannot be scored."""
+
+
+def _ratio(numerator: int, denominator: int) -> float | None:
+    return round(numerator / denominator, 4) if denominator else None
+
+
+def _percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int((len(ordered) * fraction + 0.999999)) - 1))
+    return round(ordered[index], 3)
+
+
+def score_evaluation(corpus: dict[str, Any], observations: list[dict[str, Any]]) -> dict[str, Any]:
+    """Score validated complete answers against explicit expected claims and traps."""
+    cases = {
+        item["id"]: item
+        for item in corpus.get("queries", [])
+        if item.get("answerability") in {"answerable", "unanswerable"}
+    }
+
+    if not cases:
+        raise EvaluationRunError("No answerable or unanswerable cases are available to score.")
+
+    grouped: dict[str, list[dict[str, Any]]] = {case_id: [] for case_id in cases}
+    for observation in observations:
+        if not isinstance(observation, dict) or observation.get("case_id") not in cases:
+            raise EvaluationRunError("An observation refers to an unknown or exploratory case.")
+        claims = observation.get("claims")
+        if not isinstance(claims, list) or any(not isinstance(claim, str) for claim in claims):
+            raise EvaluationRunError("Every observation must contain a list of validated claim strings.")
+        if not isinstance(observation.get("abstained"), bool):
+            raise EvaluationRunError("Every observation must report whether the answer abstained.")
+        grouped[observation["case_id"]].append(observation)
+
+    positive_runs = 0
+    positive_expected = 0
+    positive_covered = 0
+    full_positive_answers = 0
+    unexpected_claims = 0
+    displayed_claims = 0
+    trap_runs = 0
+    trap_leaks = 0
+    invalid_abstentions = 0
+    citation_count = 0
+    all_claim_count = 0
+    positive_latency: list[float] = []
+
+    for case_id, case_runs in grouped.items():
+        case = cases[case_id]
+        expected_claims = {claim["text"] for claim in case.get("expected_claims", [])}
+        for observation in case_runs:
+            claims = observation["claims"]
+            displayed_claims += len(claims)
+            all_claim_count += len(claims)
+            citation_count += int(observation.get("citation_count", 0))
+            invalid_abstentions += int(bool(observation.get("invalid_draft")))
+            if isinstance(observation.get("end_to_end_ms"), (int, float)) and case["answerability"] == "answerable":
+                positive_latency.append(float(observation["end_to_end_ms"]))
+
+            if case["answerability"] == "answerable":
+                positive_runs += 1
+                positive_expected += len(expected_claims)
+                matches = expected_claims.intersection(claims)
+                positive_covered += len(matches)
+                if expected_claims and expected_claims.issubset(set(claims)):
+                    full_positive_answers += 1
+                unexpected_claims += len(set(claims) - expected_claims)
+            else:
+                trap_runs += 1
+                if claims:
+                    trap_leaks += 1
+
+    return {
+        "answerable_run_count": positive_runs,
+        "positive_expected_claim_coverage": _ratio(positive_covered, positive_expected),
+        "positive_complete_answer_rate": _ratio(full_positive_answers, positive_runs),
+        "positive_abstention_rate": _ratio(
+            sum(bool(item["abstained"]) for case_id, items in grouped.items()
+                if cases[case_id]["answerability"] == "answerable" for item in items),
+            positive_runs,
+        ),
+        "unexpected_displayed_claim_count": unexpected_claims,
+        "displayed_claim_count": displayed_claims,
+        "unexpected_displayed_claim_rate": _ratio(unexpected_claims, displayed_claims),
+        "trap_run_count": trap_runs,
+        "trap_claim_leak_count": trap_leaks,
+        "trap_claim_leakage_rate": _ratio(trap_leaks, trap_runs),
+        "trap_abstention_rate": _ratio(trap_runs - trap_leaks, trap_runs),
+        "invalid_draft_abstention_count": invalid_abstentions,
+        "validated_claim_citation_rate": _ratio(citation_count, all_claim_count),
+        "positive_end_to_end_latency_ms": {
+            "p50": round(statistics.median(positive_latency), 3) if positive_latency else None,
+            "p95": _percentile(positive_latency, 0.95),
+            "max": round(max(positive_latency), 3) if positive_latency else None,
+        },
+        "case_run_counts": {case_id: len(items) for case_id, items in grouped.items()},
+    }
+
+
+def evaluate_quality_gate(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Apply strict regression conditions to the small, owner-reviewed pilot set."""
+    failures = []
+    if metrics.get("answerable_run_count", 0) <= 0:
+        failures.append("no answerable runs were scored")
+    if metrics.get("positive_complete_answer_rate") != 1.0:
+        failures.append("not every answerable run covered all expected claims")
+    if metrics.get("unexpected_displayed_claim_count") != 0:
+        failures.append("unexpected claims were displayed")
+    if metrics.get("trap_run_count", 0) <= 0:
+        failures.append("no unanswerable trap runs were scored")
+    if metrics.get("trap_claim_leak_count") != 0:
+        failures.append("at least one trap produced a displayed claim")
+    if metrics.get("validated_claim_citation_rate") != 1.0:
+        failures.append("displayed claims did not all have verified citations")
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "requirements": {
+            "positive_complete_answer_rate": 1.0,
+            "unexpected_displayed_claim_count": 0,
+            "trap_claim_leak_count": 0,
+            "validated_claim_citation_rate": 1.0,
+        },
+        "scope_note": "Regression gate for the current tiny pilot set; not evidence of general model quality.",
+    }
+
+
+def _write_json_atomically(output_path: Path, payload: dict[str, Any]) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, staging = tempfile.mkstemp(prefix=".answer-eval-", suffix=".tmp", dir=output_path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staging, output_path)
+    except Exception:
+        try:
+            os.unlink(staging)
+        except OSError:
+            pass
+        raise
+
+
+def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) -> dict[str, Any]:
+    """Run the local Ollama model over every scored case and repeat."""
+    if not isinstance(runs, int) or not 1 <= runs <= 50:
+        raise EvaluationRunError("runs must be an integer from 1 through 50.")
+    if not isinstance(model, str) or not model.strip():
+        raise EvaluationRunError("A non-empty Ollama model name is required.")
+
+    from ollama import chat
+
+    decision_log = Path(ATOMS_DIR).parent / "0-raw" / "archive" / "decision-record.jsonl"
+    dataset_bytes = dataset_path.read_bytes()
+    corpus = validate_dataset(
+        json.loads(dataset_bytes.decode("utf-8")),
+        atoms_dir=ATOMS_DIR,
+        approval_check=lambda path: approved_revision_is_current(
+            str(path), decision_log_path=str(decision_log), atoms_dir=ATOMS_DIR,
+        ),
+    )
+    scored_cases = [case for case in corpus["queries"] if case["answerability"] in {"answerable", "unanswerable"}]
+    observations: list[dict[str, Any]] = []
+    for run_number in range(1, runs + 1):
+        for case in scored_cases:
+            started = time.perf_counter()
+            try:
+                direct, neighbors = search_memory(
+                    case["query"], RecallOptions(n_results=5, follow_links=True),
+                )
+            except Exception as exc:
+                raise EvaluationRunError(f"Trusted recall failed for {case['id']}: {exc}") from exc
+            retrieved = direct + neighbors
+            retrieval_ms = (time.perf_counter() - started) * 1000
+            if not retrieved:
+                observations.append({
+                    "case_id": case["id"], "run": run_number, "claims": [], "abstained": True,
+                    "abstention_reason": "no_approved_context", "invalid_draft": False,
+                    "citation_count": 0, "retrieved_atom_ids": [],
+                    "retrieval_ms": round(retrieval_ms, 3), "end_to_end_ms": round(retrieval_ms, 3),
+                })
+                continue
+
+            prompt = build_grounding_prompt(AnswerRequest(query=case["query"], result_limit=5), retrieved)
+            try:
+                response = chat(
+                    model=model,
+                    messages=[{"role": "system", "content": prompt}],
+                    format=ANSWER_DRAFT_SCHEMA,
+                    stream=False,
+                )
+                draft_json = response["message"]["content"]
+            except Exception as exc:
+                raise EvaluationRunError(f"Generation failed for {case['id']} run {run_number}: {exc}") from exc
+            try:
+                answer = validate_standard_answer(draft_json, retrieved, atoms_dir=ATOMS_DIR)
+            except Exception as exc:
+                raise EvaluationRunError(f"Answer validation failed for {case['id']} run {run_number}: {exc}") from exc
+            observations.append({
+                "case_id": case["id"], "run": run_number,
+                "claims": [claim.text for claim in answer.claims],
+                "abstained": not answer.answerable,
+                "abstention_reason": answer.reason,
+                "invalid_draft": answer.reason not in {
+                    None, "The model did not provide a supported claim."
+                },
+                "citation_count": sum(len(claim.evidence) for claim in answer.claims),
+                "retrieved_atom_ids": [item.filename for item in retrieved],
+                "retrieved_atom_revisions": [
+                    {"atom_id": item.filename,
+                     "revision_sha256": hashlib.sha256(item.content.encode("utf-8")).hexdigest()}
+                    for item in retrieved
+                ],
+                "retrieval_ms": round(retrieval_ms, 3),
+                "end_to_end_ms": round((time.perf_counter() - started) * 1000, 3),
+            })
+
+    manifest = load_index_manifest(CHROMA_PATH)
+    payload = {
+        "schema_version": 1,
+        "evaluation_type": "repeated_answer_grounding",
+        "dataset_id": corpus["dataset_id"],
+        "dataset_version": corpus["dataset_version"],
+        "dataset_sha256": hashlib.sha256(dataset_bytes).hexdigest(),
+        "model": model,
+        "retrieval_backend": "lexical" if os.path.exists(LEXICAL_INDEX_PATH) else "semantic",
+        "index_generation": manifest.get("generation_id") if isinstance(manifest, dict) else None,
+        "requested_runs_per_case": runs,
+        "scored_case_count": len(scored_cases),
+        "observations": observations,
+        "metrics": score_evaluation(corpus, observations),
+    }
+    payload["quality_gate"] = evaluate_quality_gate(payload["metrics"])
+    return payload
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runs", type=int, default=3, help="Complete independent outputs per scored case (1-50).")
+    parser.add_argument("--model", default=GEN_MODEL, help="Installed Ollama generation model.")
+    parser.add_argument("--output", default=str(DEFAULT_OUTPUT_PATH), help="Local JSON result path (default is ignored brain sidecar).")
+    args = parser.parse_args(argv)
+    try:
+        result = run_evaluation(runs=args.runs, model=args.model)
+        _write_json_atomically(Path(args.output), result)
+    except Exception as exc:
+        print(f"Answer evaluation unavailable: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result["metrics"], indent=2))
+    print(f"Saved answer evaluation: {args.output}")
+    if not result["quality_gate"]["passed"]:
+        print("Answer evaluation quality gate failed: " + "; ".join(result["quality_gate"]["failures"]), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

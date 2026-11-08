@@ -1,49 +1,146 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "dataset_id": "second-brain-retrieval-pilot",
+  "dataset_version": "2.0.0",
   "status": "owner_approved",
   "owner_approval": {
     "actor": "camer",
     "date": "2026-10-27",
-    "scope": "The seven query texts, expected relevant atom IDs, and two no-factual-answer trap labels in this file."
+    "scope": "The seven query texts, candidate relevance labels, and two no-factual-answer trap labels. Answerability and expected claims are limited to the two explicitly approved atom revisions below."
   },
-  "purpose": "Measure candidate ranking separately from the owner-approval gate.",
+  "purpose": "Keep raw candidate ranking separate from approved-answer evaluation. Candidate labels for pending atoms are exploratory and never count as answerable factual coverage.",
   "queries": [
     {
       "id": "structured_logging_paraphrase",
       "query": "How should logs be formatted so requests are traceable and PII is protected?",
-      "relevant": ["structured-logging.md", "observability-o11y.md"]
+      "category": "paraphrase",
+      "split": "regression",
+      "project_scope": null,
+      "answerability": "answerable",
+      "answer_mode": "standard",
+      "expected_atom_ids": ["structured-logging.md"],
+      "acceptable_atom_ids": [],
+      "candidate_relevance": ["structured-logging.md", "observability-o11y.md"],
+      "expected_atom_revisions": [
+        {
+          "atom_id": "structured-logging.md",
+          "revision_sha256": "eced24071ba4649a6ca6f71376d3574810765c23a3cd2143bc8cb45835c7f5b1"
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "Logs should be structured (JSON) to facilitate observability and traceability.",
+          "supported_by": ["structured-logging.md"]
+        }
+      ],
+      "expected_behavior": "answer_with_evidence",
+      "trap_reason": null
     },
     {
       "id": "continuous_delivery",
       "query": "What automated checks should run for each code change before deployment?",
-      "relevant": ["continuous-integration-deployment.md", "tdd-and-automated-testing.md"]
+      "category": "workflow",
+      "split": "regression",
+      "project_scope": null,
+      "answerability": "exploratory",
+      "answer_mode": "candidate_retrieval",
+      "expected_atom_ids": [],
+      "acceptable_atom_ids": [],
+      "candidate_relevance": ["continuous-integration-deployment.md", "tdd-and-automated-testing.md"],
+      "expected_atom_revisions": [],
+      "expected_claims": [],
+      "expected_behavior": "not_scored",
+      "trap_reason": null
     },
     {
       "id": "testing_first",
       "query": "Which testing approach writes automated checks before implementation?",
-      "relevant": ["tdd-and-automated-testing.md"]
+      "category": "method",
+      "split": "regression",
+      "project_scope": null,
+      "answerability": "exploratory",
+      "answer_mode": "candidate_retrieval",
+      "expected_atom_ids": [],
+      "acceptable_atom_ids": [],
+      "candidate_relevance": ["tdd-and-automated-testing.md"],
+      "expected_atom_revisions": [],
+      "expected_claims": [],
+      "expected_behavior": "not_scored",
+      "trap_reason": null
     },
     {
       "id": "failure_handling",
       "query": "How should software behave when its database or network service is unavailable?",
-      "relevant": ["design-for-failure.md"]
+      "category": "resilience",
+      "split": "regression",
+      "project_scope": null,
+      "answerability": "answerable",
+      "answer_mode": "standard",
+      "expected_atom_ids": ["design-for-failure.md"],
+      "acceptable_atom_ids": [],
+      "candidate_relevance": ["design-for-failure.md"],
+      "expected_atom_revisions": [
+        {
+          "atom_id": "design-for-failure.md",
+          "revision_sha256": "48a4570aff7fce6f152fdbf2eb5d4caa3a4baff816045957f8de3eef5b20c80a"
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "High-level systems should be designed to handle failures gracefully.",
+          "supported_by": ["design-for-failure.md"]
+        }
+      ],
+      "expected_behavior": "answer_with_evidence",
+      "trap_reason": null
     },
     {
       "id": "code_review_purpose",
       "query": "What do code reviews contribute besides finding defects?",
-      "relevant": ["code-reviews-as-mentorship.md"]
+      "category": "concept",
+      "split": "regression",
+      "project_scope": null,
+      "answerability": "exploratory",
+      "answer_mode": "candidate_retrieval",
+      "expected_atom_ids": [],
+      "acceptable_atom_ids": [],
+      "candidate_relevance": ["code-reviews-as-mentorship.md"],
+      "expected_atom_revisions": [],
+      "expected_claims": [],
+      "expected_behavior": "not_scored",
+      "trap_reason": null
     },
     {
       "id": "trap_personal_preference",
       "query": "What is the owner's favorite battery chemistry?",
-      "relevant": [],
-      "expect_no_factual_answer": true
+      "category": "personal_preference_absence",
+      "split": "regression",
+      "project_scope": null,
+      "answerability": "unanswerable",
+      "answer_mode": "standard",
+      "expected_atom_ids": [],
+      "acceptable_atom_ids": [],
+      "candidate_relevance": [],
+      "expected_atom_revisions": [],
+      "expected_claims": [],
+      "expected_behavior": "abstain",
+      "trap_reason": "The vault has only an explicitly tentative sodium-ion lead, not an owner-stated battery preference or verified factual source."
     },
     {
       "id": "trap_missing_personal_data",
       "query": "What is the owner's home address?",
-      "relevant": [],
-      "expect_no_factual_answer": true
+      "category": "personal_data_absence",
+      "split": "regression",
+      "project_scope": null,
+      "answerability": "unanswerable",
+      "answer_mode": "standard",
+      "expected_atom_ids": [],
+      "acceptable_atom_ids": [],
+      "candidate_relevance": [],
+      "expected_atom_revisions": [],
+      "expected_claims": [],
+      "expected_behavior": "abstain",
+      "trap_reason": "No owner home-address memory is present in the vault."
     }
   ]
 }

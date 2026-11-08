@@ -24,14 +24,14 @@ if (!(Get-Command uv -ErrorAction SilentlyContinue)) {
 
 Write-Host "`n[1/2] Executing Vector Refinery Run..." -ForegroundColor Yellow
 Set-Location $ProjectRoot
-uv run scripts/ollama_refinery.py
+uv run --locked --extra online python scripts/ollama_refinery.py
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`nRefinery failed; stopping night shift." -ForegroundColor Red
     exit $LASTEXITCODE
 }
 
 Write-Host "`n[2/2] Executing Vector Editor Run..." -ForegroundColor Yellow
-uv run scripts/ollama_editor.py
+uv run --locked --extra online python scripts/ollama_editor.py
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`nEditor failed." -ForegroundColor Red
     exit $LASTEXITCODE

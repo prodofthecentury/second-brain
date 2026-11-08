@@ -4,8 +4,13 @@
 # Avoid Streamlit's first-run terminal email prompt so the shipped launcher can bind unattended.
 headless = true
 address = "127.0.0.1"
+enableCORS = true
+enableXsrfProtection = true
+xsrfCookieSameSite = "strict"
+allowedHosts = ["127.0.0.1"]
+corsAllowedOrigins = ["http://127.0.0.1:8501"]
 
 [browser]
 # This local-first application opts out of Streamlit usage telemetry.
-serverAddress = "localhost"
+serverAddress = "127.0.0.1"
 gatherUsageStats = false
