@@ -313,8 +313,13 @@ def apply_atom_mutation(
                 values = parse_frontmatter_values(frontmatter)
                 if values.get("review_status") == "merged" or values.get("claim_state") == "superseded":
                     raise ReviewTransitionError("Merged or superseded atoms cannot be approved; choose and review a new survivor instead.")
-                if frontmatter_value(frontmatter, "epistemic_label") in {"hypothesis", "preference"}:
-                    raise ReviewTransitionError("Hypotheses and preferences cannot be promoted to factual standard recall.")
+                epistemic_label = frontmatter_value(frontmatter, "epistemic_label")
+                if epistemic_label == "hypothesis":
+                    raise ReviewTransitionError("Hypotheses cannot be promoted to factual standard recall.")
+                if epistemic_label == "preference":
+                    contract = frontmatter_value(frontmatter, "epistemic_contract") or "owner_subjective_preference"
+                    updated_frontmatter = set_scalar_field(frontmatter, "epistemic_contract", contract, "epistemic_label")
+                    frontmatter = updated_frontmatter
                 try:
                     evidence_anchor = find_evidence_anchor(original_text, brain_dir)
                 except (EvidenceValidationError, OSError, ValueError) as exc:

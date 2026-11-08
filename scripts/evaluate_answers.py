@@ -224,7 +224,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
             try:
                 response = chat(
                     model=model,
-                    messages=[{"role": "system", "content": prompt}],
+                    messages=[{"role": "user", "content": prompt}],
                     format=ANSWER_DRAFT_SCHEMA,
                     stream=False,
                 )

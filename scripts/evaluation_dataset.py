@@ -13,7 +13,7 @@ class EvaluationDatasetError(ValueError):
 
 
 SPLITS = {"regression", "development", "holdout"}
-ANSWERABILITY = {"answerable", "unanswerable", "exploratory"}
+ANSWERABILITY = {"answerable", "unanswerable", "exploratory", "preference"}
 
 
 def _is_atom_filename(value: object) -> bool:
@@ -158,6 +158,15 @@ def validate_dataset(
                 errors.append(f"{label} unanswerable cases cannot declare candidate relevance.")
             if not isinstance(case.get("trap_reason"), str) or not case["trap_reason"].strip():
                 errors.append(f"{label} unanswerable cases require a non-empty trap_reason.")
+        elif answerability == "preference":
+            if case.get("answer_mode") != "preference":
+                errors.append(f"{label} preference cases require answer_mode=preference.")
+            if case.get("expected_behavior") != "preference_recall":
+                errors.append(f"{label} preference cases require expected_behavior=preference_recall.")
+            if not relevance:
+                errors.append(f"{label} preference cases require candidate_relevance.")
+            if case.get("trap_reason") is not None:
+                errors.append(f"{label} preference cases must have trap_reason=null.")
         else:
             if case.get("answer_mode") != "candidate_retrieval" or case.get("expected_behavior") != "not_scored":
                 errors.append(f"{label} exploratory cases require candidate_retrieval mode and not_scored behavior.")
