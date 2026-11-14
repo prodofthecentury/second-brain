@@ -76,7 +76,7 @@ class VaultTreeProvider {
       if (element.label === "Notes") {
         const res = await apiRequest("GET", "/v1/notes?limit=50");
         if (!res.ok) return [new vscode.TreeItem("API offline — start Second Brain desktop or CLI")];
-        return (res.data.notes || []).map((n) => {
+        return (res.data?.items || res.data?.notes || []).map((n) => {
           const item = new vscode.TreeItem(n.title || n.filename, vscode.TreeItemCollapsibleState.None);
           item.description = (n.tags || []).join(", ");
           item.tooltip = n.filename;
@@ -86,9 +86,9 @@ class VaultTreeProvider {
       if (element.label === "Verified Atoms") {
         const res = await apiRequest("GET", "/v1/atoms?limit=50");
         if (!res.ok) return [new vscode.TreeItem("API offline")];
-        return (res.data.atoms || []).map((a) => {
+        return (res.data?.items || res.data?.atoms || []).map((a) => {
           const item = new vscode.TreeItem(a.filename, vscode.TreeItemCollapsibleState.None);
-          item.description = a.status || "";
+          item.description = a.review_status || a.status || "";
           item.tooltip = a.claim || "";
           return item;
         });
@@ -142,7 +142,7 @@ function activate(context) {
       if (!query) return;
       try {
         const res = await apiRequest("GET", `/v1/notes?query=${encodeURIComponent(query)}&limit=10`);
-        const notes = res.ok ? (res.data.notes || []) : [];
+        const notes = res.ok ? (res.data?.items || res.data?.notes || []) : [];
         if (!notes.length) {
           vscode.window.showInformationMessage("No matching notes found.");
           return;
@@ -171,7 +171,7 @@ function activate(context) {
         vscode.ViewColumn.Beside,
         { enableScripts: true }
       );
-      panel.webview.html = `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:14px;background:#0d1117;color:#e6edf3;">
+      panel.webview.html = `<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';" /></head><body style="font-family:sans-serif;padding:14px;background:#0d1117;color:#e6edf3;">
         <h3>Second Brain Streaming Chat</h3>
         <div style="display:flex;gap:8px;margin-bottom:10px;">
           <input id="q" style="flex:1;padding:8px;background:#161b22;color:#fff;border:1px solid #30363d;border-radius:6px;" placeholder="Ask your vault..." />
@@ -229,8 +229,8 @@ function activate(context) {
                 else if (line.startsWith("data:")) {
                   try {
                     const data = JSON.parse(line.slice(5).trim());
-                    if (ev === "token") panel.webview.postMessage({ type: "append", text: data.token || "" });
-                    else if (ev === "verified_answer") panel.webview.postMessage({ type: "reset", text: data.answer || "" });
+                    if (ev === "token") panel.webview.postMessage({ type: "append", text: data.text ?? data.token ?? "" });
+                    else if (ev === "verified_answer") panel.webview.postMessage({ type: "reset", text: data.text || data.answer || "" });
                     else if (ev === "context" && mode === "instant") {
                       const summary = (data.sources || []).map((s) => `- ${s.title || s.filename}: ${s.excerpt || s.claim || ""}`).join("\n");
                       panel.webview.postMessage({ type: "reset", text: summary || "No matches." });

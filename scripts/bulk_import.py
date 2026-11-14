@@ -29,6 +29,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
+from config import _is_reparse_or_link  # noqa: E402
 from lexical_store import sync_lexical_index  # noqa: E402
 from notes_store import (  # noqa: E402
     DEFAULT_PATHS,
@@ -75,11 +76,17 @@ def _load_manifest(paths: NotePaths) -> dict[str, dict[str, str]]:
 
 def iter_source_files(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d not in SKIP_DIRS
+            and not d.startswith(".")
+            and not _is_reparse_or_link(os.path.join(dirpath, d))
+        )
         for name in sorted(filenames):
             if Path(name).suffix.lower() in IMPORT_EXTS and not name.startswith("."):
                 path = Path(dirpath) / name
-                if not path.is_symlink():
+                if not path.is_symlink() and not _is_reparse_or_link(str(path)):
                     yield path
 
 
@@ -102,6 +109,8 @@ def import_folder(
     dry_run: bool = False,
     progress=None,
 ) -> ImportStats:
+    if _is_reparse_or_link(str(Path(source_root).expanduser())) or _is_reparse_or_link(str(paths.notes_dir)):
+        raise PermissionError("Refusing to import from or into a symlink/junction directory.")
     root = Path(source_root).expanduser().resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"Import source is not a folder: {root}")
@@ -155,7 +164,10 @@ def import_folder(
                 stats.updated += 1 if entry else 0
                 continue
             if entry and (notes_dir / entry["note"]).exists():
-                atomic_write_bytes(str(notes_dir / entry["note"]), rendered)
+                dest_note = str(notes_dir / entry["note"])
+                if _is_reparse_or_link(dest_note):
+                    raise PermissionError(f"Refusing to overwrite symlinked note file: {entry['note']}")
+                atomic_write_bytes(dest_note, rendered)
                 stats.updated += 1
                 note_name = entry["note"]
             else:

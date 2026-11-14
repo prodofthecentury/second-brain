@@ -40,6 +40,7 @@ from config import ATOMS_DIR, BRAIN_DIR, CHROMA_PATH, LEXICAL_INDEX_PATH  # noqa
 from host_adapters import (  # noqa: E402
     HostConsentError,
     _audit_outbound_call,
+    inspect_and_redact_outbound,
     load_host_policies,
     validate_endpoint_network_boundary,
     validate_model_identifier,
@@ -176,8 +177,15 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
         warning = f"Verified memory unavailable: {exc}"
     notes: list[dict[str, object]] = []
     note_bodies: dict[str, str] = {}
+    scope_raw = (project_scope or "").strip()
+    allowed_tags: set[str] = set()
+    if scope_raw:
+        scope_bare = scope_raw.casefold().removeprefix("project:")
+        allowed_tags = {scope_bare, f"project:{scope_bare}"}
     try:
-        for rec in search_notes(query, limit=MAX_NOTES, paths=paths.notes):
+        for rec in search_notes(query, limit=MAX_NOTES * 3 if scope_raw else MAX_NOTES, paths=paths.notes):
+            if allowed_tags and not ({t.casefold() for t in rec.tags} & allowed_tags):
+                continue
             from notes_store import get_note
 
             full = get_note(rec.filename, paths=paths.notes)
@@ -185,12 +193,35 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
             nid = f"N{len(notes) + 1}"
             notes.append({"id": nid, "filename": rec.filename, "title": rec.title, "origin": rec.origin, "excerpt": excerpt})
             note_bodies[nid] = excerpt
+            if len(notes) >= MAX_NOTES:
+                break
     except Exception as exc:  # notes are optional context; never block verified recall
         warning = (warning + "; " if warning else "") + f"Notes unavailable: {exc}"
+    sources = [
+        {
+            "tier": "verified",
+            "citation_id": v["id"],
+            "filename": v["atom_id"],
+            "title": v["atom_id"],
+            "claim": v["claim"],
+            "excerpt": v["evidence"],
+        }
+        for v in verified
+    ] + [
+        {
+            "tier": "note",
+            "citation_id": n["id"],
+            "filename": n["filename"],
+            "title": n["title"],
+            "excerpt": n["excerpt"],
+        }
+        for n in notes
+    ]
     return {
         "type": "context",
         "verified": verified,
         "notes": notes,
+        "sources": sources,
         "retrieval_ms": round((time.perf_counter() - t0) * 1000, 1),
         "warning": warning,
         "_records": records,
@@ -255,6 +286,38 @@ def _public(event: dict[str, object]) -> dict[str, object]:
     return {k: v for k, v in event.items() if not k.startswith("_")}
 
 
+def _outbound_secret_block_events(
+    prompt: str,
+    *,
+    brain_dir: str | Path,
+    rule,
+    model: str,
+    atom_ids: list[str],
+    started: float,
+) -> list[dict[str, object]]:
+    """Return error+done events and audit if an outbound prompt contains credentials."""
+    hits = inspect_and_redact_outbound(
+        prompt,
+        redact_pii=False,
+        fail_on_secret_detection=False,
+    ).secret_hits
+    if not hits:
+        return []
+    _audit_outbound_call(
+        brain_dir=brain_dir,
+        rule=rule,
+        model=model,
+        atom_ids=atom_ids,
+        pii_redactions=0,
+        outcome="blocked_secret",
+    )
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
+    return [
+        {"type": "error", "error": f"Outbound secret blocked: {', '.join(hits)}"},
+        {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed},
+    ]
+
+
 def chat_events(
     query: str,
     *,
@@ -277,28 +340,44 @@ def chat_events(
 
     if mode == "instant" or (not verified and not notes):
         if not verified and not notes:
-            yield {"type": "abstain", "text": "Nothing in your verified memory or notes matches this question yet."}
-        yield {"type": "done", "total_ms": round((time.perf_counter() - started) * 1000, 1)}
+            msg = "Nothing in your verified memory or notes matches this question yet."
+            yield {"type": "abstain", "text": msg, "reason": msg}
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
         return
 
     try:
         rule = _ollama_rule(paths.policy_path)
     except HostConsentError as exc:
         yield {"type": "error", "error": str(exc)}
-        yield {"type": "done", "total_ms": round((time.perf_counter() - started) * 1000, 1)}
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
         return
     model = validate_model_identifier((model_override or "").strip() or rule.default_model, provider=rule.provider)
     shared_ids = [str(v["atom_id"]) for v in verified] + [f"note:{n['filename']}" for n in notes]
 
     if mode == "verified":
         if not verified:
-            yield {"type": "verified_answer", "answerable": False, "text": "No owner-verified claim matches this question.", "claims": []}
+            msg = "No owner-verified claim matches this question."
+            yield {"type": "verified_answer", "answerable": False, "text": msg, "answer": msg, "claims": []}
         else:
+            sel_prompt = build_claim_selection_prompt(query, verified)
+            blocked_events = _outbound_secret_block_events(
+                sel_prompt,
+                brain_dir=paths.brain_dir,
+                rule=rule,
+                model=model,
+                atom_ids=shared_ids[: len(verified)],
+                started=started,
+            )
+            if blocked_events:
+                yield from blocked_events
+                return
             fn = json_fn or default_json_fn(rule.endpoint_url)
             t0 = time.perf_counter()
             outcome = "abstained"
             try:
-                raw = fn(build_claim_selection_prompt(query, verified), model, claim_selection_schema(len(verified)))
+                raw = fn(sel_prompt, model, claim_selection_schema(len(verified)))
                 ids = json.loads(raw).get("claim_ids", [])
                 chosen = []
                 for i in ids if isinstance(ids, list) else []:
@@ -320,6 +399,7 @@ def chat_events(
                     "type": "verified_answer",
                     "answerable": True,
                     "text": result.text,
+                    "answer": result.text,
                     "model_ms": model_ms,
                     "claims": [
                         {
@@ -339,21 +419,35 @@ def chat_events(
                     ],
                 }
             else:
+                text_val = result.text if result is not None else "No verified claim was selected as answering this question."
                 yield {
                     "type": "verified_answer",
                     "answerable": False,
                     "model_ms": model_ms,
-                    "text": (result.text if result is not None else "No verified claim was selected as answering this question."),
+                    "text": text_val,
+                    "answer": text_val,
                     "claims": [],
                 }
             _audit_outbound_call(brain_dir=paths.brain_dir, rule=rule, model=model, atom_ids=shared_ids[: len(verified)],
                                  pii_redactions=0, outcome=outcome)
-        yield {"type": "done", "total_ms": round((time.perf_counter() - started) * 1000, 1)}
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
         return
 
     # mode == "stream"
-    fn = stream_fn or default_stream_fn(rule.endpoint_url)
     prompt = build_synthesis_prompt(query, verified, notes)
+    blocked_events = _outbound_secret_block_events(
+        prompt,
+        brain_dir=paths.brain_dir,
+        rule=rule,
+        model=model,
+        atom_ids=shared_ids,
+        started=started,
+    )
+    if blocked_events:
+        yield from blocked_events
+        return
+    fn = stream_fn or default_stream_fn(rule.endpoint_url)
     pieces: list[str] = []
     first_token_ms = None
     outcome = "streamed_synthesis"
@@ -362,7 +456,7 @@ def chat_events(
             if first_token_ms is None:
                 first_token_ms = round((time.perf_counter() - started) * 1000, 1)
             pieces.append(piece)
-            yield {"type": "token", "text": piece}
+            yield {"type": "token", "text": piece, "token": piece}
     except Exception as exc:
         outcome = "transport_error"
         yield {"type": "error", "error": f"Model stream failed: {exc.__class__.__name__}"}
@@ -373,7 +467,8 @@ def chat_events(
     grounding = check_citations(full_text, verified, notes)
     grounding["first_token_ms"] = first_token_ms
     yield grounding
-    yield {"type": "done", "total_ms": round((time.perf_counter() - started) * 1000, 1)}
+    elapsed = round((time.perf_counter() - started) * 1000, 1)
+    yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
 
 
 def main(argv: list[str] | None = None) -> int:

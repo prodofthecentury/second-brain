@@ -35,12 +35,14 @@ from config import (
     PLAYBOOKS_DIR,
     TELEMETRY_DB_PATH,
     _is_reparse_or_link,
+    is_content_markdown,
     safe_file_in_dir,
 )
 from evidence import verify_evidence_anchor
 from host_adapters import (
     HostConsentError,
     HostSharingRule,
+    OutboundSecretBlockedError,
     _audit_outbound_call,
     _invoke_provider_draft,
     _redact_outbound_with_map,
@@ -55,6 +57,7 @@ from memory_review import parse_frontmatter_values, parse_scalar_list, section_t
 from recall import (
     EXCLUDED_RECALL_STATUSES,
     QUERY_STOP_WORDS,
+    MemoryRecallUnavailable,
     RecallOptions,
     RecallResult,
     assemble_bounded_working_context,
@@ -175,7 +178,7 @@ class ExecutivePlanResult:
             return "\n".join(lines)
 
         if self.preconditions:
-            lines.append("## Verified Preconditions")
+            lines.append("## Owner-Authored Preconditions")
             lines.extend(f"- {item}" for item in self.preconditions)
             lines.append("")
 
@@ -269,17 +272,36 @@ def _contexts_allowed_for_host(contexts: tuple[str, ...], rule: HostSharingRule)
     return all(bool(project_tags_match((tag,), norm_allowed)) for tag in proj_tags)
 
 
-def _playbook_allowed_for_host(pb: PlaybookIntegrityReport, rule: HostSharingRule) -> bool:
-    """Require the merged contexts AND every backing atom's own contexts to satisfy host consent.
+def _playbook_allowed_for_host(
+    pb: PlaybookIntegrityReport,
+    rule: HostSharingRule,
+    *,
+    atoms_dir: str | None = None,
+) -> bool:
+    """Require merged contexts, every backing atom's contexts, and host atom policy to allow sharing.
 
-    Per-atom checks stop an unscoped backing atom from riding along with a scoped one to a host
-    whose policy has allow_unscoped_atoms=False.
+    Per-atom checks stop an unscoped or policy-disallowed backing atom from riding along inside a
+    playbook to a host whose policy forbids it.
     """
     if not pb.backing_atom_contexts or len(pb.backing_atom_contexts) != len(pb.backing_atoms):
         return False
     if not _contexts_allowed_for_host(pb.contexts, rule):
         return False
-    return all(_contexts_allowed_for_host(tuple(ctx), rule) for ctx in pb.backing_atom_contexts)
+    if not all(_contexts_allowed_for_host(tuple(ctx), rule) for ctx in pb.backing_atom_contexts):
+        return False
+    if atoms_dir is not None:
+        records: list[dict[str, str]] = []
+        for aid in pb.backing_atoms:
+            apath = safe_file_in_dir(atoms_dir, aid, allowed_exts={".md"}, must_exist=True)
+            if not apath or not os.path.isfile(apath) or _is_reparse_or_link(apath):
+                return False
+            try:
+                records.append({"filename": aid, "content": Path(apath).read_text(encoding="utf-8")})
+            except OSError:
+                return False
+        if len(filter_atoms_for_host(records, rule, mode="standard")) != len(pb.backing_atoms):
+            return False
+    return True
 
 
 def _verified_atom_citation(atom_id: str, brain_dir: str, atoms_dir: str) -> str | None:
@@ -329,6 +351,11 @@ def _count_unapproved_candidates(
                 # Never act as a cross-project oracle: only count pending atoms in the requested scope.
                 if not project_tags_match(atom_ctx, projects):
                     continue
+            sup = fm.get("superseded_by") or []
+            if isinstance(sup, str):
+                sup = parse_scalar_list(sup)
+            if sup:
+                continue
             if str(fm.get("review_status", "pending")) not in EXCLUDED_RECALL_STATUSES:
                 pending += 1
         except OSError:
@@ -419,7 +446,7 @@ def assemble_executive_plan(
     )
     matched_pbs = [pb for pb in all_active_pbs if _playbook_matches_goal(pb, clean_goal, projects)]
     if host_rule is not None:
-        matched_pbs = [pb for pb in matched_pbs if _playbook_allowed_for_host(pb, host_rule)]
+        matched_pbs = [pb for pb in matched_pbs if _playbook_allowed_for_host(pb, host_rule, atoms_dir=atoms_dir)]
 
     # 2. Retrieve approved Atoms with fitness & context-profile ranking + bounded working context
     recall_opts = RecallOptions(
@@ -433,13 +460,20 @@ def assemble_executive_plan(
         active_context_profile=request.active_context_profile,
         telemetry_db_path=telemetry_db_path,
     )
-    direct, neighbors = search_memory(
-        clean_goal,
-        recall_opts,
-        atoms_dir=atoms_dir,
-        index_path=lexical_index_path,
-        chroma_path=chroma_path,
-    )
+    try:
+        direct, neighbors = search_memory(
+            clean_goal,
+            recall_opts,
+            atoms_dir=atoms_dir,
+            index_path=lexical_index_path,
+            chroma_path=chroma_path,
+        )
+    except MemoryRecallUnavailable:
+        has_atom_files = os.path.isdir(atoms_dir) and any(is_content_markdown(n) for n in os.listdir(atoms_dir))
+        if not os.path.exists(lexical_index_path) and not has_atom_files:
+            direct, neighbors = [], []
+        else:
+            raise
     bundle = assemble_bounded_working_context(
         list(direct) + list(neighbors),
         max_chars=request.max_context_chars,
@@ -610,6 +644,7 @@ def assemble_executive_plan(
             fail_on_secret_detection=host_rule.fail_on_secret_detection,
         )
         shared_atom_ids = sorted({aid for s in catalog_list for aid in s.backing_atom_ids})
+        draft_raw: str | None = None
         try:
             draft_raw = _invoke_provider_draft(
                 host_rule,
@@ -621,7 +656,7 @@ def assemble_executive_plan(
                 schema_name="select_executive_plan_steps",
                 gemini_response_schema=GEMINI_PLAN_RESPONSE_SCHEMA,
             )
-        except Exception:
+        except (HostConsentError, OutboundSecretBlockedError, ValueError):
             _audit_outbound_call(
                 brain_dir=brain_dir,
                 rule=host_rule,
@@ -631,73 +666,109 @@ def assemble_executive_plan(
                 outcome="planner_transport_error",
             )
             raise
-
-        validated_steps: list[PlanStep] = []
-        seen_ids: set[str] = set()
-        try:
-            parsed_draft = json.loads(draft_raw)
-            raw_ids = parsed_draft.get("selected_step_ids", []) if isinstance(parsed_draft, dict) else []
-            if isinstance(raw_ids, list):
-                for raw_id in raw_ids:
-                    sid = str(raw_id).strip()
-                    if sid in catalog_by_id and sid not in seen_ids:
-                        seen_ids.add(sid)
-                        validated_steps.append(catalog_by_id[sid])
-        except json.JSONDecodeError:
-            validated_steps = []
-
-        # Playbooks are atomic owner-authored procedures: the model may choose WHICH Playbooks
-        # (and which standalone atoms) apply and their relative order, but can never drop or
-        # reorder steps inside a Playbook (e.g. skipping "take a backup" before "run migration").
-        if validated_steps:
-            pb_steps_in_order: dict[str, list[PlanStep]] = {}
-            for s in catalog_list:
-                if s.source_playbook_id:
-                    pb_steps_in_order.setdefault(s.source_playbook_id, []).append(s)
-            expanded: list[PlanStep] = []
-            emitted_pbs: set[str] = set()
-            for s in validated_steps:
-                if s.source_playbook_id:
-                    if s.source_playbook_id in emitted_pbs:
-                        continue
-                    emitted_pbs.add(s.source_playbook_id)
-                    expanded.extend(pb_steps_in_order.get(s.source_playbook_id, []))
-                else:
-                    expanded.append(s)
-            validated_steps = expanded
-
-        if validated_steps:
-            selected_steps = validated_steps
-            effective_mode = f"model_assisted:{host_rule.host_id}"
-            outcome = "grounded_plan"
-        else:
-            # Safe deterministic fallback if model emitted zero valid whitelist IDs
+        except Exception as exc:
+            _audit_outbound_call(
+                brain_dir=brain_dir,
+                rule=host_rule,
+                model=chosen_model,
+                atom_ids=shared_atom_ids,
+                pii_redactions=redaction.pii_redaction_count,
+                outcome="planner_transport_fallback",
+            )
+            gaps.append(
+                f"Model-assisted ordering unavailable ({exc.__class__.__name__}); used deterministic verified catalog order."
+            )
             selected_steps = list(catalog_list)
             effective_mode = "deterministic_fallback"
-            outcome = "deterministic_fallback"
 
-        _audit_outbound_call(
-            brain_dir=brain_dir,
-            rule=host_rule,
-            model=chosen_model,
-            atom_ids=shared_atom_ids,
-            pii_redactions=redaction.pii_redaction_count,
-            outcome=outcome,
-        )
+        if draft_raw is not None:
+            validated_steps: list[PlanStep] = []
+            seen_ids: set[str] = set()
+            if isinstance(draft_raw, str) and len(draft_raw) <= 65_536:
+                try:
+                    parsed_draft = json.loads(draft_raw)
+                    raw_ids = parsed_draft.get("selected_step_ids", []) if isinstance(parsed_draft, dict) else []
+                    if isinstance(raw_ids, list):
+                        for raw_id in raw_ids:
+                            sid = str(raw_id).strip()
+                            if sid in catalog_by_id and sid not in seen_ids:
+                                seen_ids.add(sid)
+                                validated_steps.append(catalog_by_id[sid])
+                except json.JSONDecodeError:
+                    validated_steps = []
 
+            # Playbooks are atomic owner-authored procedures: the model may choose WHICH Playbooks
+            # (and which standalone atoms) apply and their relative order, but can never drop or
+            # reorder steps inside a Playbook (e.g. skipping "take a backup" before "run migration").
+            if validated_steps:
+                pb_steps_in_order: dict[str, list[PlanStep]] = {}
+                for s in catalog_list:
+                    if s.source_playbook_id:
+                        pb_steps_in_order.setdefault(s.source_playbook_id, []).append(s)
+                expanded: list[PlanStep] = []
+                emitted_pbs: set[str] = set()
+                for s in validated_steps:
+                    if s.source_playbook_id:
+                        if s.source_playbook_id in emitted_pbs:
+                            continue
+                        emitted_pbs.add(s.source_playbook_id)
+                        expanded.extend(pb_steps_in_order.get(s.source_playbook_id, []))
+                    else:
+                        expanded.append(s)
+                validated_steps = expanded
+
+            if validated_steps:
+                selected_steps = validated_steps
+                effective_mode = f"model_assisted:{host_rule.host_id}"
+                outcome = "grounded_plan"
+            else:
+                # Safe deterministic fallback if model emitted zero valid whitelist IDs
+                selected_steps = list(catalog_list)
+                effective_mode = "deterministic_fallback"
+                outcome = "deterministic_fallback"
+
+            _audit_outbound_call(
+                brain_dir=brain_dir,
+                rule=host_rule,
+                model=chosen_model,
+                atom_ids=shared_atom_ids,
+                pii_redactions=redaction.pii_redaction_count,
+                outcome=outcome,
+            )
+
+    selected_pb_ids_set = {s.source_playbook_id for s in selected_steps if s.source_playbook_id}
+    selected_pbs = [pb for pb in matched_pbs if pb.playbook_id in selected_pb_ids_set and pb.playbook_id in matched_pb_ids]
+    final_pb_ids: list[str] = []
+    final_preconditions: list[str] = []
+    final_expected_outputs: list[str] = []
+    final_rollback_checkpoints: list[str] = []
+    for pb in selected_pbs:
+        if pb.playbook_id not in final_pb_ids:
+            final_pb_ids.append(pb.playbook_id)
+        for p in pb.preconditions:
+            if p not in final_preconditions:
+                final_preconditions.append(p)
+        for o in pb.expected_outputs:
+            if o not in final_expected_outputs:
+                final_expected_outputs.append(o)
+        for r in pb.failure_recovery:
+            if r not in final_rollback_checkpoints:
+                final_rollback_checkpoints.append(r)
+
+    selected_atom_count = sum(1 for s in selected_steps if s.kind in {"procedural_atom", "semantic_constraint"})
     plan = ExecutivePlanResult(
         plan_ready=True,
         goal=clean_goal,
         mode_used=effective_mode,
         summary=(
             f"Assembled {len(selected_steps)} grounded step(s) from "
-            f"{len(matched_pb_ids)} verified playbook(s) and {len(factual_procedural_atoms)} approved atom(s)."
+            f"{len(final_pb_ids)} verified playbook(s) and {selected_atom_count} approved atom(s)."
         ),
         steps=tuple(selected_steps),
-        matched_playbook_ids=tuple(matched_pb_ids),
-        preconditions=tuple(preconditions),
-        expected_outputs=tuple(expected_outputs),
-        rollback_checkpoints=tuple(rollback_checkpoints),
+        matched_playbook_ids=tuple(final_pb_ids),
+        preconditions=tuple(final_preconditions),
+        expected_outputs=tuple(final_expected_outputs),
+        rollback_checkpoints=tuple(final_rollback_checkpoints),
         preference_constraints=tuple(preference_claims),
         pending_candidate_count=pending_count,
         epistemic_gaps=tuple(gaps),

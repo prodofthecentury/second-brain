@@ -43,6 +43,10 @@
         "to": "backend/uv.lock"
       },
       {
+        "from": "../README.md",
+        "to": "backend/README.md"
+      },
+      {
         "from": "../plugins",
         "to": "backend/plugins"
       }

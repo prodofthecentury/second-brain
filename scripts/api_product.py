@@ -146,6 +146,7 @@ def _atom_card(path: str, rt) -> dict[str, object]:
         "claim": rec["claim"],
         "evidence": evidence,
         "review_status": rec["review_status"],
+        "status": rec["review_status"],
         "memory_type": rec["memory_type"],
         "origin": rec["origin"],
         "sources": rec["sources"],
@@ -191,14 +192,20 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
     paths = _paths(rt)
     q = parse_qs(query or "")
     is_owner = owner_authorized(handler.headers.get(OWNER_HEADER))
+    _api_mod = sys.modules.get("memory_api") or sys.modules.get("scripts.memory_api") or sys.modules.get("__main__")
+    _audit_fn = getattr(_api_mod, "_audit_api_event", None)
+    if _audit_fn is None:
+        from memory_api import _audit_api_event as _audit_fn
 
     def owner_only() -> bool:
         if not is_owner:
+            _audit_fn(rt.brain_dir, path, method, 403)
             handler._send_json(403, {"error": "403 Forbidden: this action requires the owner token (desktop app/CLI)."})
             return False
         return True
 
     def send(status: int, payload: dict) -> bool:
+        _audit_fn(rt.brain_dir, path, method, status)
         handler._send_json(status, payload)
         return True
 
@@ -208,7 +215,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             limit = max(1, min(int((q.get("limit") or ["100"])[0]), 500))
             offset = max(0, int((q.get("offset") or ["0"])[0]))
             items, total = list_notes(query=(q.get("query") or [""])[0][:500], limit=limit, offset=offset, paths=paths)
-            return send(200, {"total": total, "items": [i.as_dict() for i in items]})
+            items_payload = [i.as_dict() for i in items]
+            return send(200, {"total": total, "items": items_payload, "notes": items_payload})
 
         if path == "/v1/notes" and method == "POST":
             if not owner_only():
@@ -232,7 +240,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if method == "GET" and action is None:
                 return send(200, get_note(filename, paths=paths).as_dict())
             if method == "GET" and action == "backlinks":
-                return send(200, {"items": [b.as_dict() for b in backlinks(filename, paths=paths)]})
+                bl_payload = [b.as_dict() for b in backlinks(filename, paths=paths)]
+                return send(200, {"items": bl_payload, "backlinks": bl_payload})
             if not owner_only():
                 return True
             if method == "PUT" and action is None:
@@ -286,6 +295,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 policy_path=rt.policy_path,
             )
             scope = body.get("project_scope") if isinstance(body.get("project_scope"), str) else None
+            _audit_fn(rt.brain_dir, path, method, 200)
             stream_sse(handler, chat_events(_str(body, "query", max_len=2000), mode=mode, paths=cp, project_scope=scope))
             return True
 
@@ -315,7 +325,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     card = _atom_card(p, rt)
                     if card["verified"] or is_owner:
                         cards.append(card)
-            return send(200, {"items": cards})
+            return send(200, {"total": len(cards), "items": cards, "atoms": cards})
 
         if path.startswith("/v1/atoms/") and method == "POST":
             if not owner_only():

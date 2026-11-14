@@ -31,6 +31,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from config import _is_reparse_or_link  # noqa: E402
+from host_adapters import restrict_security_file_permissions  # noqa: E402
+
 SERVER_KEY = "second-brain"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -122,14 +125,29 @@ def _load_json(path: Path) -> dict:
 
 def _atomic_write_json(path: Path, data: dict) -> Path | None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_link(str(path.parent)) or (os.path.lexists(path) and _is_reparse_or_link(str(path))):
+        raise PermissionError(f"Refusing to write config through symlink or junction: {path}")
     backup = None
     if path.exists():
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = path.with_name(f"{path.name}.bak-{stamp}")
+        if os.path.lexists(backup) and _is_reparse_or_link(str(backup)):
+            raise PermissionError(f"Refusing to write backup through symlink or junction: {backup}")
         shutil.copy2(path, backup)
+        restrict_security_file_permissions(backup)
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if os.path.lexists(tmp) and _is_reparse_or_link(str(tmp)):
+        raise PermissionError(f"Refusing to write temp file through symlink or junction: {tmp}")
+    raw = (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+    fd = os.open(str(tmp), flags, 0o600)
+    try:
+        os.write(fd, raw)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.replace(tmp, path)
+    restrict_security_file_permissions(path)
     return backup
 
 
@@ -218,18 +236,31 @@ PRIVACY_NOTICE = (
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="second-brain connect", description="Connect AI hosts/IDEs to Second Brain.")
+    parser.add_argument("--json", action="store_true", help="Emit JSON output.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("add", help="Connect a host.")
     c.add_argument("host", choices=sorted(host_targets()))
     c.add_argument("--yes", action="store_true", help="Accept the privacy notice non-interactively.")
     c.add_argument("--dry-run", action="store_true")
+    c.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     d = sub.add_parser("remove", help="Disconnect a host.")
     d.add_argument("host", choices=sorted(host_targets()))
-    sub.add_parser("status", help="Show which hosts are connected.")
+    d.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    s = sub.add_parser("status", help="Show which hosts are connected.")
+    s.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.cmd == "status":
-        for row in status():
+        rows = status()
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {"targets": {r["host"]: {**r, "name": r["label"]} for r in rows}, "items": rows},
+                    indent=2,
+                )
+            )
+            return 0
+        for row in rows:
             mark = "✔ connected" if row["connected"] else ("· available" if row["installed"] else "  not installed")
             print(f"{mark:16} {row['label']:34} {row['config_path']}")
         return 0

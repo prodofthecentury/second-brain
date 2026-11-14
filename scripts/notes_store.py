@@ -50,6 +50,7 @@ from config import (  # noqa: E402
     NOTES_INDEX_PATH,
     NOTE_SNAPSHOTS_DIR,
     _is_reparse_or_link,
+    safe_file_in_dir,
 )
 from evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
 from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
@@ -162,12 +163,15 @@ def render_note(
     updated: str,
     source_path: str | None = None,
 ) -> str:
+    safe_origin = origin if origin in NOTE_ORIGINS else "owner_import"
+    safe_created = _clean_line(created, 64).lstrip("-") or _now_iso()
+    safe_updated = _clean_line(updated, 64).lstrip("-") or _now_iso()
     fm = [
         f"title: {json.dumps(title, ensure_ascii=False)}",
         "type: note",
-        f"origin: {origin}",
-        f"created: {created}",
-        f"updated: {updated}",
+        f"origin: {safe_origin}",
+        f"created: {safe_created}",
+        f"updated: {safe_updated}",
         f"tags: {json.dumps(list(tags), ensure_ascii=False)}",
     ]
     if source_path:
@@ -210,9 +214,9 @@ def _snippet(body: str, query: str = "", width: int = 220) -> str:
             pos = flat.casefold().find(term)
             if pos >= 0:
                 start = max(0, pos - width // 3)
-                prefix = "â€¦" if start > 0 else ""
-                return prefix + flat[start : start + width] + ("â€¦" if start + width < len(flat) else "")
-    return flat[:width] + ("â€¦" if len(flat) > width else "")
+                prefix = "…" if start > 0 else ""
+                return prefix + flat[start : start + width] + ("…" if start + width < len(flat) else "")
+    return flat[:width] + ("…" if len(flat) > width else "")
 
 
 def _record_from_text(filename: str, text: str, digest: str, *, query: str = "", include_body: bool = False) -> NoteRecord:
@@ -232,11 +236,17 @@ def _record_from_text(filename: str, text: str, digest: str, *, query: str = "",
 
 
 def _resolve_note(paths: NotePaths, filename: str, *, must_exist: bool = True) -> Path:
+    if os.path.lexists(paths.notes_dir) and _is_reparse_or_link(paths.notes_dir):
+        raise PermissionError(f"Refusing to use symlinked directory: {paths.notes_dir}")
     name = Path(str(filename or "")).name
     if name != filename or not name.endswith(".md") or name.startswith(".") or name == "README.md":
         raise NoteError(f"Invalid note filename: {filename!r}")
-    root = Path(paths.notes_dir).resolve()
-    target = root / name
+    safe_target = safe_file_in_dir(paths.notes_dir, name, allowed_exts={".md"}, must_exist=must_exist)
+    if not safe_target:
+        if must_exist:
+            raise NoteError(f"Note not found: {filename}")
+        raise NoteError(f"Invalid note filename: {filename!r}")
+    target = Path(safe_target)
     if must_exist:
         if not target.is_file() or _is_reparse_or_link(str(target)):
             raise NoteError(f"Note not found: {filename}")
@@ -274,8 +284,12 @@ def _create_exclusive(directory: str, stem: str, data: bytes) -> str:
 
 def _quarantine_agent_capture(paths: NotePaths, title: str, body: str, risks: tuple[str, ...], source: str) -> dict:
     os.makedirs(paths.inbox_dir, exist_ok=True)
+    if _is_reparse_or_link(paths.inbox_dir):
+        raise PermissionError(f"Refusing to quarantine capture into symlinked inbox directory: {paths.inbox_dir}")
+    if _is_reparse_or_link(paths.inbox_dir):
+        raise PermissionError("Refusing to write to symlinked inbox directory.")
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe_source = re.sub(r"[^A-Za-z0-9._:-]", "", source)[:64] or "agent"
+    safe_source = re.sub(r"-{2,}", "-", re.sub(r"[^A-Za-z0-9._:-]", "", str(source or "")))[:64].strip("-") or "agent"
     payload = (
         "<!-- second_brain_origin: api_local -->\n"
         f"<!-- capture_source: {safe_source} -->\n\n# {title}\n\n{body}\n"
@@ -373,6 +387,8 @@ def update_note(
         history = Path(paths.notes_dir) / ".history"
         history.mkdir(exist_ok=True)
         backup = history / f"{filename}.{current[:16]}.bak"
+        if _is_reparse_or_link(str(history)) or (os.path.lexists(backup) and _is_reparse_or_link(str(backup))):
+            raise PermissionError("Refusing to write note history through a symlink or junction.")
         if not backup.exists():
             atomic_write_bytes(str(backup), original)
         atomic_write_bytes(str(target), rendered)
@@ -390,6 +406,8 @@ def delete_note(filename: str, *, expected_sha256: str, paths: NotePaths = DEFAU
         trash = Path(paths.notes_dir) / ".trash"
         trash.mkdir(exist_ok=True)
         dest = trash / f"{current[:12]}-{filename}"
+        if _is_reparse_or_link(str(trash)) or (os.path.lexists(dest) and _is_reparse_or_link(str(dest))):
+            raise PermissionError("Refusing to move note to symlinked trash path.")
         os.replace(target, dest)
         upsert_lexical_atoms(paths.notes_dir, paths.index_path, [], [filename])
     return {"status": "trashed", "filename": filename, "trash_path": str(dest)}
@@ -482,12 +500,17 @@ def verify_note_excerpt(
         raise NoteError("Select at least 12 characters of the note to verify.")
     if len(flat_excerpt) > 4000:
         raise NoteError("Verified excerpts are limited to 4,000 characters; select a single claim.")
-    flat_claim = re.sub(r"\s+", " ", str(claim or flat_excerpt)).strip()
+    flat_claim = re.sub(r"\s+", " ", str(claim or flat_excerpt)).strip().lstrip("#>*- ").strip()
     if not flat_claim or len(flat_claim) > 2000:
         raise NoteError("Claim must be between 1 and 2,000 characters.")
+    risks = scan_inbox_payload_risks(f"{flat_claim}\n{flat_excerpt}")
+    if risks:
+        raise NoteError(f"Cannot verify excerpt containing security risk flags: {', '.join(risks)}")
 
     os.makedirs(paths.snapshots_dir, exist_ok=True)
     os.makedirs(paths.atoms_dir, exist_ok=True)
+    if _is_reparse_or_link(paths.snapshots_dir) or _is_reparse_or_link(paths.atoms_dir):
+        raise PermissionError("Refusing to use symlinked snapshots or atoms directory.")
     with review_lock(paths.lock_path):
         target = _resolve_note(paths, filename)
         note_bytes = target.read_bytes()
@@ -497,6 +520,8 @@ def verify_note_excerpt(
         stem = Path(filename).stem
         snap_name = f"{stem}-{note_sha[:12]}.md"
         snap_path = os.path.join(paths.snapshots_dir, snap_name)
+        if os.path.lexists(snap_path) and _is_reparse_or_link(snap_path):
+            raise PermissionError("Refusing to use symlinked snapshot file.")
         if os.path.exists(snap_path):
             if content_sha256(Path(snap_path).read_bytes()) != note_sha:
                 raise NoteError("Existing snapshot does not match; refusing to overwrite immutable evidence.")
@@ -557,7 +582,16 @@ def verify_note_excerpt(
             atoms_dir=paths.atoms_dir,
         )
     except (ReviewConflictError, ReviewTransitionError) as exc:
-        raise NoteError(f"Atom created as pending ({atom_name}) but approval failed: {exc}") from exc
+        with review_lock(paths.lock_path):
+            if os.path.isfile(atom_path):
+                os.remove(atom_path)
+            upsert_lexical_atoms(
+                paths.atoms_dir,
+                os.path.join(paths.brain_dir, ".sidecar", "lexical.sqlite3"),
+                [],
+                [atom_name],
+            )
+        raise NoteError(f"Atom created as pending ({atom_name}) failed approval and was rolled back: {exc}") from exc
     return {
         "status": "verified",
         "atom_filename": atom_name,

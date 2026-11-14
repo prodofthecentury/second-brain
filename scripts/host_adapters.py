@@ -653,7 +653,14 @@ def _invoke_provider_draft(
     if rule.provider == "ollama":
         import ollama
 
-        client = ollama.Client(host=rule.endpoint_url)
+        client_kwargs: dict[str, object] = {
+            "timeout": timeout_s,
+            "follow_redirects": False,
+            "trust_env": False,
+        }
+        if http_transport is not None:
+            client_kwargs["transport"] = http_transport
+        client = ollama.Client(host=rule.endpoint_url, **client_kwargs)
         resp = client.chat(
             model=safe_model,
             messages=[{"role": "user", "content": prompt}],

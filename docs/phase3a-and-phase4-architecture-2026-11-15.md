@@ -98,6 +98,29 @@ An isolated read-only `security-auditor` sweep (`dda00b6d-652b-41d6-adb9-2fc4549
   - VS Code / Cursor / Windsurf extension (`extensions/vscode-second-brain/`) exposes Vault Explorer, Remember Selection (`Ctrl+Alt+M`), Quick Recall (`Ctrl+Alt+R`), and Streaming Chat.
   - Release signing helper (`scripts/sign_release.ps1`) handles Windows Authenticode signing (`.exe` / `.msi`) and `SHA256SUMS.txt` generation.
 
+### 4B. Phase 4 Adversarial Security & Contract Audit Reconciliation
+
+Following initial Phase 4 implementation, a full security and contract audit (`P4-HIGH-01` through `P4-MED-04`) hardened boundaries across storage, streaming chat, API/import surfaces, and desktop/IDE clients:
+
+- **Note Frontmatter & Verification Integrity (`P4-HIGH-01`, `P4-HIGH-02`, `P4-MED-01`, `scripts/notes_store.py`):**
+  - `render_note` enforces `origin` allowlisting against `NOTE_ORIGINS` (defaulting invalid origins to `"owner_import"`) and strips control/leading-dash characters from `created`/`updated` metadata to prevent YAML frontmatter injection.
+  - `_quarantine_agent_capture` rejects reparse/symlink `inbox_dir` targets and collapses `--` runs in `source`.
+  - `verify_note_excerpt` strips leading `#`, `>`, `*`, `-`, and spaces from claims, scans combined claim and excerpt payloads via `scan_inbox_payload_risks` (raising `NoteError`), rejects reparse/symlink snapshot/atom directories or snapshot files, and cleans up newly created orphan pending atoms and lexical index entries under `review_lock` when `apply_review_transition` raises `ReviewConflictError` or `ReviewTransitionError`.
+  - `update_note` and `delete_note` guard `.history/` and `.trash/` paths against reparse/symlink traversal.
+- **Streaming Chat Scope & Secret DLP (`P4-HIGH-03`, `scripts/streaming_chat.py`):**
+  - `retrieve_context` enforces `project` scoping (`project:<scope>` or bare tag match) across retrieved note snippets rather than restricting only verified atoms.
+  - `chat_events` scans outbound `verified` and `stream` prompts with `inspect_and_redact_outbound` (`fail_on_secret_detection=False`) before model invocation, emitting `error` + `done` events and auditing `"blocked_secret"` if triggered.
+- **Product API Auditing & Bulk Import Symlink Hardening (`P4-HIGH-04`, `scripts/api_product.py`, `scripts/bulk_import.py`):**
+  - `api_product.dispatch` resolves `memory_api._audit_api_event` so `/v1/notes`, `/v1/atoms`, `/v1/ide/*`, `owner_only` `403` denials, and `/v1/chat/stream` completions record entries to `memory-api-audit.jsonl`.
+  - `bulk_import.py` checks `_is_reparse_or_link` on `source_root` before `.resolve()`, skips symlink/junction files and subdirectories during `iter_source_files`, and blocks symlink/reparse `notes_dir` or existing destination note targets.
+- **IDE Connector Atomic Writes & CLI Contract (`P4-MED-02`, `scripts/ide_connector.py`):**
+  - `_atomic_write_json` rejects symlinks/junctions, writes using OS-level binary/write/create/truncate flags with `os.fsync`, and applies `restrict_security_file_permissions` to written configs and `.bak-*` backup files.
+  - `ide_connector.py` exposes `--json` (accepted before or after subcommands via `argparse.SUPPRESS` on subparsers), with `status --json` returning `{"targets": {<host>: {..., "name": label}}, "items": rows}`.
+- **Schema Reconciliation & Desktop/Extension Client Hardening (`P4-MED-03`, `P4-MED-04`, `desktop/`, `extensions/vscode-second-brain/`):**
+  - Reconciled API JSON payloads and SSE event fields between Python endpoints and TypeScript/JS clients (`items` alongside `notes`/`atoms`/`backlinks`/`total`, `sources`, `review_status`/`status`, `text`/`token`/`answer`/`reason`, and `total_ms`/`elapsed_ms`).
+  - Hardened `desktop/main.js` (`apiRequest` restricted to `GET`/`POST`/`PUT`/`DELETE` and `/v1/` paths without whitespace/CR/LF; `ide:action` allowlisted to `status`/`add`/`remove` with non-dash `[a-z0-9-]+` targets; `setWindowOpenHandler` deny + `will-navigate` prevention on main and capture windows).
+  - Replaced dynamic `innerHTML` assignments in `desktop/renderer/app.js` (`loadReviewQueue`, `loadIdeStatus`, `loadSystemView`) with `document.createElement` + `textContent`, and added `<meta http-equiv="Content-Security-Policy">` to the VS Code Streaming Chat webview.
+
 ---
 
 ## 5. Unified 10-Suite Release Verification (`scripts/test_all.py`)
@@ -110,7 +133,7 @@ The unified gate runs **10/10** suites end-to-end (`doctor`, `evaluation_dataset
 - `system_safety_tests` (CAS, grounding, RRF/project scoping & security penetration suite)
 - `phase2_safety_tests` (Phase 2 hardware tiers, inbox triage, consent/PII adapters, telemetry & API)
 - `phase3_cognitive_tests` (10 tests: Phase 3A fitness/ranking, Playbooks, Executive Planner & H1/H2/M1–M4/L1–L7 regressions)
-- `phase4_product_tests` (20 tests: Scale engine, notes, one-click verify, streaming chat, dual-token API, Obsidian import, IDE connectors & MCP auth)
+- `phase4_product_tests` (25 tests: Scale engine, notes, one-click verify, streaming chat, dual-token API, Obsidian import, IDE connectors, MCP auth & Phase 4 security/contract audit regressions)
 - `scale_benchmark_1500` (1,500-note synthetic corpus correctness & latency canary)
 - `chroma_rebuild_canary` (real ChromaDB staged rebuild, cosine activation, rollback & handle cleanup canary)
 - `smoke_test` (end-to-end intake, grounding, lexical & dense recall smoke test)

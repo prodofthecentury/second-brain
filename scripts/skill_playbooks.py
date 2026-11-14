@@ -478,7 +478,18 @@ def promote_skill_playbook(
                 )
 
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-        previous_sha = file_sha256(target_path) if os.path.isfile(target_path) else None
+        previous_sha: str | None = None
+        if os.path.lexists(target_path):
+            if not os.path.isfile(target_path) or _is_reparse_or_link(target_path):
+                raise PermissionError(f"Refusing to overwrite symlink or non-regular file: {pb_filename}")
+            existing_text = Path(target_path).read_text(encoding="utf-8")
+            existing_parsed = split_frontmatter(existing_text)
+            existing_fm = parse_frontmatter_values(existing_parsed[0]) if existing_parsed else {}
+            if str(existing_fm.get("type", "")) != "playbook":
+                raise PlaybookValidationError(
+                    f"Refusing to overwrite non-playbook file '{pb_filename}' in playbooks directory."
+                )
+            previous_sha = file_sha256(target_path)
         if previous_sha:
             expected_pb_norm = str(expected_playbook_sha256 or "").strip().lower()
             if not expected_pb_norm or expected_pb_norm != previous_sha:
@@ -752,6 +763,14 @@ def verify_playbook_integrity(
                 pb_id, fname, False, status, f"corrupt_backing_atom:{atom_name}", title=title, sha256=sha
             )
         atom_fm = parse_frontmatter_values(atom_parsed[0])
+        if str(atom_fm.get("memory_type", "semantic")) != "procedural":
+            return PlaybookIntegrityReport(
+                pb_id, fname, False, status, f"non_procedural_backing_atom:{atom_name}", title=title, sha256=sha
+            )
+        if str(atom_fm.get("epistemic_label", "claim")) == "preference" or bool(atom_fm.get("epistemic_contract")):
+            return PlaybookIntegrityReport(
+                pb_id, fname, False, status, f"preference_backing_atom_forbidden:{atom_name}", title=title, sha256=sha
+            )
         atom_ctx = _atom_contexts_from_frontmatter(atom_fm)
         per_atom_contexts.append(atom_ctx)
         for cs in atom_ctx:

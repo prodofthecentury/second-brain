@@ -79,6 +79,11 @@ function findFreePort(preferred = 8765) {
 function spawnBackendCli(args) {
   const root = getBackendRoot();
   const env = { ...process.env, PYTHONUTF8: "1" };
+  if (app.isPackaged && !env.BRAIN_VAULT_DIR) {
+    const userVault = path.join(app.getPath("userData"), "brain");
+    fs.mkdirSync(userVault, { recursive: true });
+    env.BRAIN_VAULT_DIR = userVault;
+  }
   return spawn("uv", ["--directory", root, "run", "--frozen", "python", ...args], {
     cwd: root,
     env,
@@ -168,7 +173,17 @@ async function startApiSidecar() {
   });
 }
 
+const ALLOWED_HTTP_METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
+
 function apiRequest(method, apiPath, body = null) {
+  const safeMethod = String(method || "").toUpperCase();
+  if (!ALLOWED_HTTP_METHODS.has(safeMethod)) {
+    return Promise.reject(new Error(`Disallowed HTTP method: ${String(method)}`));
+  }
+  if (typeof apiPath !== "string" || !apiPath.startsWith("/v1/") || /[\s\r\n]/.test(apiPath)) {
+    return Promise.reject(new Error(`Disallowed API path: ${String(apiPath)}`));
+  }
+  method = safeMethod;
   const { apiToken, ownerToken } = readTokens();
   const payload = body !== null && body !== undefined ? JSON.stringify(body) : null;
   const headers = {
@@ -264,6 +279,13 @@ function streamChat(sender, payload) {
   });
 }
 
+function hardenWindowNavigation(win) {
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.webContents.on("will-navigate", (event) => {
+    event.preventDefault();
+  });
+}
+
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -282,6 +304,7 @@ function createMainWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+  hardenWindowNavigation(mainWindow);
   mainWindow.on("close", (event) => {
     if (!isQuitting && !isSmokeTest) {
       event.preventDefault();
@@ -308,6 +331,7 @@ function toggleCaptureWindow() {
       },
     });
     captureWindow.loadFile(path.join(__dirname, "renderer", "capture.html"));
+    hardenWindowNavigation(captureWindow);
     captureWindow.on("closed", () => {
       captureWindow = null;
     });
@@ -386,9 +410,25 @@ ipcMain.handle("dialog:pickFolder", async () => {
   return res.canceled ? null : res.filePaths[0];
 });
 
-ipcMain.handle("ide:action", async (_event, { action, target }) => {
+const ALLOWED_IDE_ACTIONS = new Set(["status", "add", "remove"]);
+const IDE_TARGET_RE = /^[a-z0-9-]+$/;
+
+ipcMain.handle("ide:action", async (_event, payload = {}) => {
+  const { action, target } = payload && typeof payload === "object" ? payload : {};
+  if (!ALLOWED_IDE_ACTIONS.has(action)) {
+    throw new Error(`Disallowed IDE action: ${String(action)}`);
+  }
+  if (action === "add" || action === "remove") {
+    if (typeof target !== "string" || target.startsWith("-") || !IDE_TARGET_RE.test(target)) {
+      throw new Error(`Invalid IDE target: ${String(target)}`);
+    }
+  } else if (target !== undefined && target !== null && target !== "") {
+    if (typeof target !== "string" || target.startsWith("-") || !IDE_TARGET_RE.test(target)) {
+      throw new Error(`Invalid IDE target: ${String(target)}`);
+    }
+  }
   const args = ["scripts/ide_connector.py", action];
-  if (target) args.push(target);
+  if (target && action !== "status") args.push(target);
   if (action === "add") args.push("--yes");
   args.push("--json");
   const { stdout } = await runBackendCli(args);

@@ -32,8 +32,8 @@ async function refreshHealth() {
     }
     const atomsRes = await window.secondBrain.request("GET", "/v1/atoms?limit=1");
     const notesRes = await window.secondBrain.request("GET", "/v1/notes?limit=1");
-    const nCount = notesRes.data?.total ?? notesCache.length;
-    const aCount = atomsRes.data?.total ?? atomsRes.data?.atoms?.length ?? "?";
+    const nCount = notesRes.data?.total ?? notesRes.data?.items?.length ?? notesRes.data?.notes?.length ?? notesCache.length;
+    const aCount = atomsRes.data?.total ?? atomsRes.data?.items?.length ?? atomsRes.data?.atoms?.length ?? "?";
     document.getElementById("vaultMetrics").textContent = `Notes: ${nCount} · Atoms: ${aCount}`;
   } catch {
     document.getElementById("apiStatusText").textContent = "Disconnected";
@@ -44,7 +44,7 @@ async function loadNotes(query = "") {
   const q = query ? `?query=${encodeURIComponent(query)}&limit=200` : "?limit=200";
   const res = await window.secondBrain.request("GET", `/v1/notes${q}`);
   if (!res.ok) return;
-  notesCache = res.data.notes || [];
+  notesCache = res.data?.items || res.data?.notes || [];
   const listEl = document.getElementById("notesList");
   listEl.innerHTML = "";
   for (const note of notesCache) {
@@ -73,7 +73,7 @@ async function openNote(filename) {
 
   const blRes = await window.secondBrain.request("GET", `/v1/notes/${encodeURIComponent(filename)}/backlinks`);
   const blEl = document.getElementById("noteBacklinks");
-  const backlinks = blRes.ok ? (blRes.data.backlinks || []) : [];
+  const backlinks = blRes.ok ? (blRes.data?.items || blRes.data?.backlinks || []) : [];
   blEl.textContent = backlinks.length
     ? `Backlinks (${backlinks.length}): ${backlinks.map((b) => b.title || b.filename).join(", ")}`
     : "Backlinks: none";
@@ -205,16 +205,17 @@ window.secondBrain.onChatEvent(({ event, data }) => {
       chatSourcesEl.appendChild(card);
     }
   } else if (event === "token") {
-    chatOutputEl.textContent += data.token || "";
+    chatOutputEl.textContent += data.text ?? data.token ?? "";
   } else if (event === "verified_answer") {
-    chatOutputEl.textContent = data.answer || JSON.stringify(data, null, 2);
+    chatOutputEl.textContent = data.text || data.answer || JSON.stringify(data, null, 2);
   } else if (event === "abstain") {
-    chatOutputEl.textContent = `Abstained: ${data.reason || JSON.stringify(data)}`;
+    chatOutputEl.textContent = `Abstained: ${data.reason || data.text || JSON.stringify(data)}`;
   } else if (event === "error") {
     chatBannerEl.textContent = `Error: ${data.error || JSON.stringify(data)}`;
   } else if (event === "done") {
-    if (data.elapsed_ms !== undefined) {
-      chatBannerEl.textContent += ` · Completed in ${data.elapsed_ms} ms`;
+    const ms = data.elapsed_ms ?? data.total_ms;
+    if (ms !== undefined) {
+      chatBannerEl.textContent += ` · Completed in ${ms} ms`;
     }
   }
 });
@@ -253,7 +254,13 @@ async function loadReviewQueue() {
   for (const item of inboxRes.data?.items || []) {
     const card = document.createElement("div");
     card.className = "card";
-    card.innerHTML = `<strong>Inbox: ${item.filename}</strong><div class="note-item-meta">${item.risk_flags?.join(", ") || "quarantined"}</div>`;
+    const strong = document.createElement("strong");
+    strong.textContent = `Inbox: ${item.filename || ""}`;
+    const meta = document.createElement("div");
+    meta.className = "note-item-meta";
+    meta.textContent = item.risk_flags?.join(", ") || "quarantined";
+    card.appendChild(strong);
+    card.appendChild(meta);
     const row = document.createElement("div");
     row.className = "toolbar";
     const promoteBtn = document.createElement("button");
@@ -356,9 +363,19 @@ async function loadIdeStatus() {
       const card = document.createElement("div");
       card.className = "card";
       const connected = Boolean(info.connected || info.installed);
-      card.innerHTML = `<strong>${info.name || key}</strong>
-        <div class="note-item-meta">${info.config_path || info.path || ""}</div>
-        <div><span class="pill">${connected ? "Connected" : "Not connected"}</span></div>`;
+      const titleEl = document.createElement("strong");
+      titleEl.textContent = info.name || info.label || key;
+      const pathEl = document.createElement("div");
+      pathEl.className = "note-item-meta";
+      pathEl.textContent = info.config_path || info.path || "";
+      const pillWrap = document.createElement("div");
+      const pill = document.createElement("span");
+      pill.className = "pill";
+      pill.textContent = connected ? "Connected" : "Not connected";
+      pillWrap.appendChild(pill);
+      card.appendChild(titleEl);
+      card.appendChild(pathEl);
+      card.appendChild(pillWrap);
       const btn = document.createElement("button");
       btn.className = connected ? "btn danger" : "btn primary";
       btn.textContent = connected ? "Disconnect" : "1-Click Connect";
@@ -384,11 +401,25 @@ async function loadSystemView() {
     window.secondBrain.request("GET", "/v1/profile"),
     window.secondBrain.request("GET", "/v1/playbooks"),
   ]);
-  grid.innerHTML = `
-    <div class="card"><strong>Health</strong><pre style="white-space:pre-wrap;font-size:12px;">${JSON.stringify(health.data, null, 2)}</pre></div>
-    <div class="card"><strong>Hardware Profile</strong><pre style="white-space:pre-wrap;font-size:12px;">${JSON.stringify(profile.data, null, 2)}</pre></div>
-    <div class="card"><strong>Verified Playbooks</strong><pre style="white-space:pre-wrap;font-size:12px;">${JSON.stringify(playbooks.data, null, 2)}</pre></div>
-  `;
+  grid.replaceChildren();
+  const sections = [
+    ["Health", health.data],
+    ["Hardware Profile", profile.data],
+    ["Verified Playbooks", playbooks.data],
+  ];
+  for (const [heading, data] of sections) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const strong = document.createElement("strong");
+    strong.textContent = heading;
+    const pre = document.createElement("pre");
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.fontSize = "12px";
+    pre.textContent = JSON.stringify(data, null, 2);
+    card.appendChild(strong);
+    card.appendChild(pre);
+    grid.appendChild(card);
+  }
 }
 document.getElementById("refreshSystemBtn").addEventListener("click", loadSystemView);
 

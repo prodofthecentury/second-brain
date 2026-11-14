@@ -691,15 +691,16 @@ def search_lexical_memory(
     use_bm25_ratio = fitness_or_profile and best_bm25 > 0.0
 
     direct = []
-    for position, candidate, current_content in gated:
-        # Preserve legacy 1/(pos+1) when fitness/profile ranking is off; use proportional BM25
+    trusted_position = 0
+    for _position, candidate, current_content in gated:
+        # Preserve legacy 1/(trusted_pos+1) when fitness/profile ranking is off; use proportional BM25
         # relevance (normalized over trusted candidates only) when fitness/profile ranking is active
         # so near-equal BM25 hits can be differentiated by context profile, fitness utility/corrections,
         # and freshness without overriding strong topical matches.
         if use_bm25_ratio:
             lexical_similarity = clamp_number(abs(float(candidate.rank)) / best_bm25)
         else:
-            lexical_similarity = 1.0 / (position + 1)
+            lexical_similarity = 1.0 / (trusted_position + 1)
         result = result_from_candidate(
             content=current_content,
             filename=candidate.filename,
@@ -711,6 +712,7 @@ def search_lexical_memory(
         )
         if result:
             direct.append(result)
+            trusted_position += 1
 
     direct = sorted(direct, key=lambda item: item.score, reverse=True)[: options.n_results]
     neighbors = []
