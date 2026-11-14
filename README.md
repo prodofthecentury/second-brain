@@ -21,12 +21,13 @@
 ```text
 second_brain/
 ├── brain/                  durable Markdown vault and source evidence
-│   ├── 0-raw/              captures and archived originals
+│   ├── 0-raw/              captures, quarantined inbox/, and archived originals
 │   ├── 1-desk/             working area
 │   ├── 2-atoms/            canonical memory atoms and revision history
 │   ├── 3-threads/          generated, non-overwriting synthesis files
+│   ├── 4-experiences/      create-only task experience episodes (Cognitive Core)
 │   ├── sources/            external source pages and captured evidence
-│   ├── .sidecar/           rebuildable lexical index and writer lock
+│   ├── .sidecar/           rebuildable FTS5 index, telemetry WAL DB, and writer lock
 │   └── .chroma/            optional rebuildable dense index
 ├── scripts/                ingestion, review, retrieval, and health tools
 ├── dashboard/              local Streamlit application
@@ -90,13 +91,20 @@ See [the dashboard security boundary](docs/dashboard-security.md) for the threat
 ## Common commands
 
 ```powershell
+uv run --locked second-brain doctor
+uv run --locked second-brain profile
+uv run --locked second-brain serve --port 8765
+uv run --locked second-brain adapter-config --port 8765
 uv run --locked python scripts/memory_review.py --status all
 uv run --locked python scripts/review_atom.py transition approve <atom.md> --expected-sha256 <sha256> --actor <owner>
 uv run --locked python scripts/review_atom.py merge <survivor.md> <superseded.md> --survivor-sha256 <sha256> --superseded-sha256 <sha256> --actor <owner> --rationale "<reason>"
+uv run --locked python scripts/inbox_workflow.py list
+uv run --locked python scripts/host_adapters.py list
+uv run --locked python scripts/cognitive_core.py fitness
 uv run --locked python scripts/audit_sources.py
 uv run --locked python scripts/rebuild_lexical_index.py
 uv run --locked python scripts/rebuild_vectors.py
-uv run --locked python scripts/doctor.py
+uv run --locked python scripts/test_all.py
 ```
 
 `review_atom.py transition approve` refuses missing or ambiguous evidence. Editing an atom later invalidates the approval, even if its frontmatter still says `accepted`. Rebuild dense vectors only when the embedder is available; the rebuild is staged and records its model, dimensions, generation, source revisions, and cosine metric. Chroma’s collection metric is configured explicitly because its default single-node metric is squared L2, not cosine ([Chroma collection configuration](https://docs.trychroma.com/docs/collections/configure)).
@@ -109,9 +117,11 @@ Dataset `second-brain-retrieval-pilot` v2.0.0 separates five candidate-ranking q
 
 The answer run took 6.1 seconds p50 and 49.8 seconds p95 including cold start on this CPU-only host. The configured default `llama3.2:3b` did not answer either positive case in one repeat, so it is not yet a dependable default. These pilot results are too small to claim general model quality.
 
-## MCP policy
+## Loopback Memory API, Host Adapters, and MCP policy
 
-MCP is not part of the default operating path. Do not connect this vault to cloud-connected hosts or expose the MCP process through a network service. The opt-in local interface (`BRAIN_ENABLE_LOCAL_MCP=1`) fails closed without a configured local bearer token (`--generate-token`) supplied via MCP request `_meta` (`authorization: Bearer <token>`, never tool `arguments`), returns only specifically requested, currently approved atoms, has no listable resource catalog, and writes bounded input to the quarantined `brain/0-raw/inbox/` queue requiring owner promotion. Only enable it for a trusted local process.
+- **Loopback Memory API (`second-brain serve` / `scripts/memory_api.py`):** Binds strictly to `127.0.0.1` (default port `8765`), requires a 256-bit Bearer token (`--generate-token` or auto-provisioned under the OS user security state directory), enforces `Host`, `Origin`, and `Sec-Fetch-Site` browser rebinding/CSRF guards, exposes read-only approved recall (`POST /v1/recall`), grounded answers (`POST /v1/answer`), quarantined inbox capture (`POST /v1/inbox`), fitness telemetry (`GET /v1/cognitive/fitness`), and episode logging (`POST /v1/cognitive/experiences`), and ships with the typed `MemoryApiClient` SDK. See [Phase 2 Architecture & Adversarial Security Sweep](docs/phase2-architecture-and-sweep-2026-11-15.md).
+- **Per-Host Online & Custom AI Adapters (`scripts/host_adapters.py`):** Local loopback Ollama (`ollama_local`) is the only host enabled out of the box. Online providers (`openai_online`, `anthropic_online`, `gemini_online`) and `owner_custom_local` are disabled by default (`enabled: false`), require explicit owner consent and `project:<id>` allowlists in `host-sharing-policy.json`, scrub PII and block outbound secrets before opening any socket, enforce DNS-pinned `https://...:443` transport, and validate every draft claim outside the model via `scripts/answer_policy.py`.
+- **MCP (`scripts/mcp_server.py`):** MCP is not part of the default operating path. Do not connect this vault to cloud-connected hosts or expose the MCP process through a network service. The opt-in local interface (`BRAIN_ENABLE_LOCAL_MCP=1`) fails closed without a configured local bearer token (`--generate-token`) supplied via MCP request `_meta` (`authorization: Bearer <token>`, never tool `arguments`), returns only specifically requested, currently approved atoms, has no listable resource catalog, and writes bounded input to the quarantined `brain/0-raw/inbox/` queue requiring owner promotion (`scripts/inbox_workflow.py`). Only enable it for a trusted local process.
 
 ## Git safety
 

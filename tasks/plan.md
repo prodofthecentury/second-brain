@@ -1,10 +1,9 @@
 # Implementation Plan: Dependable Local Brain Pilot
 
-**Plan status:** COMPLETE (Local Pilot Release Gate Passed — 2026-11-15).
+**Plan status:** COMPLETE (Phase 1 Local Pilot + Phase 2 Universal Brain Plugin & Cognitive Core Release Gate Passed — 2026-11-15).
 Reconciled with current source, `docs/system-sweep-2026-10-27.md`,
-`docs/system-sweep-2026-11-15.md`, and `docs/independent-review-2026-11-15.md`.
-Universal multi-host adapters and external online sharing remain under the
-Deferred product horizon below.
+`docs/system-sweep-2026-11-15.md`, `docs/independent-review-2026-11-15.md`, and
+`docs/phase2-architecture-and-sweep-2026-11-15.md`.
 
 ## Verified release baseline (2026-11-15)
 
@@ -44,7 +43,16 @@ Deferred product horizon below.
   core and 7 optional extras (`124` packages); `setup.ps1` and `setup.sh` verify
   host capabilities without touching Git; historical commit `bffca9e` is audited
   (`docs/git-history-audit-2026-11-15.md`) with a clean `release-code-only`
-  branch ready; `scripts/test_all.py` passes **6/6 suites (`100% PASS`)**.
+  branch ready; `scripts/test_all.py` passes **7/7 suites (`100% PASS`)**.
+- **Phase 2 Universal Host & Cognitive Core:** Hardware-tiered capability
+  profiling (`scripts/hardware_profile.py`), CAS-locked quarantined inbox
+  promotion (`scripts/inbox_workflow.py`), per-host online/local AI adapters
+  with DNS-pinned HTTPS, multi-project containment, and secret/PII redaction
+  (`scripts/host_adapters.py`), zero-churn SQLite WAL Cognitive Core telemetry
+  and `brain/4-experiences/` episode logs (`scripts/cognitive_core.py`), and
+  bearer-authenticated `127.0.0.1` HTTP Loopback Memory API + `MemoryApiClient`
+  SDK (`scripts/memory_api.py`) are verified across all 12 independent security
+  audit checks (`scripts/phase2_safety_tests.py`).
 
 ## Architecture and trust rules
 
@@ -193,13 +201,85 @@ in code/docs (`docs/independent-review-2026-11-15.md`); unified CI gate
 **Files:** `scripts/test_all.py`, `scripts/system_safety_tests.py`,
 `docs/independent-review-2026-11-15.md`, `docs/system-sweep-2026-11-15.md`.
 
+### Goal 9 — Hardware-tiered capability profiles — COMPLETE
+
+**Outcome:** Deterministic OS/CPU/RAM/VRAM/C++ ABI inspection and loopback-only
+Ollama probing (`scripts/hardware_profile.py`) classify hosts into
+`tier_0_lexical_only`..`tier_3_gpu_accelerated` with explicit retrieval/answer
+SLOs and model recommendations across CLI, `doctor`, installers, Dashboard, and
+Loopback API.
+
+**Verification:** `HardwareProfileTests` and `Phase2AuditReconciliationTests` in
+`scripts/phase2_safety_tests.py`, `second-brain profile`, and
+`setup.ps1 -NoLaunch`.
+
+**Files:** `scripts/hardware_profile.py`, `scripts/cli.py`, `scripts/doctor.py`,
+`setup.ps1`, `setup.sh`, `dashboard/app.py`.
+
+### Goal 10 — Quarantined inbox promotion and multi-atom Refinery — COMPLETE
+
+**Outcome:** Untrusted captures in `brain/0-raw/inbox/` undergo deterministic
+risk scanning, CAS-locked owner promotion or rejection with frontmatter/HTML
+comment neutralization, beacon defanging, and origin anti-laundering
+(`scripts/inbox_workflow.py`), feeding verbatim-quote multi-atom Refinery
+extraction (`scripts/ollama_refinery.py`).
+
+**Verification:** `QuarantinedInboxPromotionTests` and `test_high01_*` in
+`scripts/phase2_safety_tests.py`.
+
+**Files:** `scripts/inbox_workflow.py`, `scripts/memory_format.py`,
+`scripts/ollama_refinery.py`, `dashboard/app.py`.
+
+### Goal 11 — Per-host online and custom AI adapters — COMPLETE
+
+**Outcome:** Explicit per-host consent (`host-sharing-policy.json`), multi-project
+`all(...)` scope containment, outbound credential blocking and PII redaction,
+DNS-pinned `https://...:443` transport (`PinnedHTTPTransport`), and out-of-model
+grounding (`scripts/answer_policy.py`) unify `ollama_local`,
+`owner_custom_local`, `openai_online`, `anthropic_online`, and `gemini_online`.
+
+**Verification:** `HostAdapterConsentAndRedactionTests`, `test_critical01_*`,
+and `test_high03_*` in `scripts/phase2_safety_tests.py`.
+
+**Files:** `scripts/host_adapters.py`, `chat_with_memory.py`,
+`dashboard/app.py`, `scripts/memory_api.py`.
+
+### Goal 12 — Cognitive Core telemetry, fitness, and experience episodes — COMPLETE
+
+**Outcome:** Disposable SQLite WAL telemetry (`brain/.sidecar/telemetry.sqlite3`)
+tracks retrieval/citation/bottleneck/feedback fitness and procedural skill
+maturity (`procedural_draft` -> `verified_procedure` -> `skill_candidate`) with
+zero canonical atom hash churn, alongside create-only `brain/4-experiences/`
+records and quarantined procedural inbox proposals (`scripts/cognitive_core.py`).
+
+**Verification:** `CognitiveCoreTests` in `scripts/phase2_safety_tests.py`.
+
+**Files:** `scripts/cognitive_core.py`, `scripts/config.py`, `dashboard/app.py`,
+`chat_with_memory.py`, `scripts/memory_api.py`.
+
+### Goal 13 — Loopback Memory API, SDK, and Phase 2 security audit — COMPLETE
+
+**Outcome:** Multi-threaded `127.0.0.1` HTTP JSON service, typed
+`MemoryApiClient` SDK, and IDE/host adapter descriptors (`scripts/memory_api.py`)
+enforce bearer auth, DNS-rebinding `Host` checks, `Origin`/`Sec-Fetch-Site`
+CSRF rejection, socket read timeouts, and non-lockout valid-token protection;
+all 12 findings from independent `security-auditor` session
+`b8248c56-e4ba-423f-85d9-1fda32190901` are remediated and verified in the `7/7`
+unified CI gate (`scripts/test_all.py`).
+
+**Verification:** `uv run --frozen python scripts/test_all.py` (`7/7 PASS`,
+`100% PASS`).
+
+**Files:** `scripts/memory_api.py`, `scripts/phase2_safety_tests.py`,
+`scripts/test_all.py`, `docs/phase2-architecture-and-sweep-2026-11-15.md`.
+
 ## Deferred product horizon
 
-Goal 8 completes the trustworthy local pilot foundation. Post-pilot product
-phases extend this core into a host-independent memory API, narrow local and
-online AI host adapters with explicit per-host sharing consent, and signed
-OS-native installers. Comparative external SOTA claims remain gated on large
-human-reviewed corpora and multi-hardware benchmarks (`CODEX_CLI_GOAL.md`).
+Goals 1–13 complete the local pilot, universal loopback API, per-host online
+consent/redaction adapters, quarantined inbox promotion workflow, hardware-tiered
+profiling, and Cognitive Core layer. Remaining post-Phase-2 items are OS-signed
+desktop GUI installers (MSI/DMG/AppImage) and large-corpus comparative external
+SOTA benchmarks (`CODEX_CLI_GOAL.md`).
 
 ## Checkpoints
 

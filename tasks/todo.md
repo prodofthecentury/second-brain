@@ -1,7 +1,8 @@
 # Task Queue: Dependable Local Brain Pilot
 
 This queue is reconciled with current source, `docs/system-sweep-2026-10-27.md`,
-`docs/system-sweep-2026-11-15.md`, and `docs/independent-review-2026-11-15.md`.
+`docs/system-sweep-2026-11-15.md`, `docs/independent-review-2026-11-15.md`, and
+`docs/phase2-architecture-and-sweep-2026-11-15.md`.
 Full outcomes, existing behavior, changes, acceptance criteria, dependencies,
 verification, and files are in `tasks/plan.md`. Task IDs and statuses are
 synchronized across both files.
@@ -195,12 +196,75 @@ synchronized across both files.
 - **Depends on:** Goals 1–7.
 - **Details:** `tasks/plan.md` Goal 8.
 
+### Goal 9 — Hardware-tiered capability profiles — COMPLETE
+
+- [x] Implement deterministic OS/CPU/RAM/VRAM/C++ ABI inspection and loopback-only
+  Ollama probing (`scripts/hardware_profile.py`) across `tier_0_lexical_only` to
+  `tier_3_gpu_accelerated` with 30s TTL caching and zero-proxy/zero-redirect
+  SSRF protection.
+- [x] Expose capability tiers, retrieval/answer latency SLOs, and recommended
+  models in `second-brain profile`, `second-brain doctor`, `setup.ps1`,
+  `setup.sh`, Dashboard System Health, and `GET /v1/profile`.
+- **Depends on:** Goal 5.
+- **Details:** `tasks/plan.md` Goal 9.
+
+### Goal 10 — Quarantined inbox promotion and multi-atom Refinery — COMPLETE
+
+- [x] Implement deterministic risk scanning, SHA-256 CAS owner promotion, and
+  CAS rejection for `brain/0-raw/inbox/` (`scripts/inbox_workflow.py`) with
+  frontmatter/HTML-comment neutralization, inline/angle/reference/`<img>` beacon
+  defanging, collision-safe archives, and origin anti-laundering
+  (`scripts/memory_format.py`).
+- [x] Expose Quarantined Inbox triage in Dashboard (`dashboard/app.py`) and
+  `GET /v1/inbox/queue`, and enforce verbatim-quote multi-atom candidate
+  extraction in `scripts/ollama_refinery.py`.
+- **Depends on:** Goals 3–4.
+- **Details:** `tasks/plan.md` Goal 10.
+
+### Goal 11 — Per-host online and custom AI adapters — COMPLETE
+
+- [x] Implement default-deny per-host sharing rules (`host-sharing-policy.json`
+  with DACL/`0600` and symlink guards), multi-project `all(...)` scope
+  containment, outbound credential blocking, PII scrubbing (including `## Claim`
+  PII exclusion on online hosts), DNS-pinned `https://...:443` transport, and
+  outbound audit logging (`scripts/host_adapters.py`).
+- [x] Route all local (`ollama_local`, `owner_custom_local`) and online
+  (`openai_online`, `anthropic_online`, `gemini_online`) draft generations
+  through `scripts/answer_policy.py` across CLI, Dashboard, and Loopback API.
+- **Depends on:** Goals 2, 4, and 6.
+- **Details:** `tasks/plan.md` Goal 11.
+
+### Goal 12 — Cognitive Core telemetry, fitness, and experience episodes — COMPLETE
+
+- [x] Implement disposable SQLite WAL telemetry (`brain/.sidecar/telemetry.sqlite3`)
+  for retrieval, candidate bottleneck (`peek_lexical_candidate_atom_ids`),
+  citation, and feedback metrics with zero canonical atom hash churn
+  (`scripts/cognitive_core.py`).
+- [x] Compute memory fitness and procedural skill maturity (`procedural_draft` ->
+  `verified_procedure` -> `skill_candidate`), and persist create-only episode
+  logs in `brain/4-experiences/` with optional quarantined procedural proposals
+  in `brain/0-raw/inbox/`.
+- **Depends on:** Goals 2–3 and 10.
+- **Details:** `tasks/plan.md` Goal 12.
+
+### Goal 13 — Loopback Memory API, SDK, and Phase 2 security audit — COMPLETE
+
+- [x] Implement multi-threaded `127.0.0.1` HTTP JSON service (`second-brain serve`),
+  typed `MemoryApiClient` SDK, and IDE/host adapter templates
+  (`second-brain adapter-config`) in `scripts/memory_api.py` with 256-bit Bearer
+  auth, `Host`/`Origin`/`Sec-Fetch-Site` guards, socket timeouts, and valid-token
+  lockout immunity.
+- [x] Complete isolated `security-auditor` adversarial review
+  (`b8248c56-e4ba-423f-85d9-1fda32190901`), remediate all 12 findings, add
+  regression coverage in `scripts/phase2_safety_tests.py`, and verify `7/7`
+  suites pass (`100% PASS`) in `scripts/test_all.py`.
+- **Depends on:** Goals 8–12.
+- **Details:** `tasks/plan.md` Goal 13.
+
 ## Deferred product horizon
 
-- **Post-Pilot Universal Host Ecosystem:** Host-independent memory API, external
-  online/owner-built AI host adapters with per-host sharing consent, and signed
-  OS-native GUI installers build on top of the completed Goal 8 local pilot
-  core (`tasks/plan.md`, `CODEX_CLI_GOAL.md`).
+- **OS-Signed Desktop Installers:** Native code-signed MSI / DMG / AppImage GUI
+  bundles wrapping `setup.ps1` / `setup.sh` and system tray lifecycle controls.
 - **Comparative External SOTA Benchmarking:** Benchmark against third-party
   memory systems on large multi-hundred-atom owner-reviewed corpora and declared
   GPU/CPU hardware profiles before making external state-of-the-art marketing
