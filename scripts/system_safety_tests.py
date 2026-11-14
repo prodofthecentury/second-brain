@@ -2448,6 +2448,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "chroma_rebuild_canary",
                 "smoke_test",
                 "phase4_product_tests",
+                "phase5_god_features_tests",
                 "scale_benchmark_1500",
             },
         )

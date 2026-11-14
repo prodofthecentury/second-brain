@@ -278,6 +278,10 @@ def main(argv: list[str] | None = None) -> int:
         ("chat", "Chat with streaming answers over verified memory and notes."),
         ("connect", "One-click connect Claude Code/Desktop, Cursor, Windsurf, VS Code, or Antigravity."),
         ("benchmark", "Run the corpus-scale benchmark on a synthetic isolated vault."),
+        ("sota-benchmark", "Run comparative SOTA benchmarks against external RAG/memory baselines."),
+        ("ledger", "Cryptographic Vault Merkle proof and tamper-evident audit ledger."),
+        ("graph", "Contradiction & Drift Radar + temporal knowledge graph."),
+        ("snapshot", "Time-travel vault snapshots, semantic diff, and point-in-time recall."),
     ):
         p = subparsers.add_parser(name, help=help_text, add_help=False)
         p.add_argument("sub_argv", nargs=argparse.REMAINDER)
@@ -340,7 +344,11 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-_PASSTHROUGH_COMMANDS = frozenset({"inbox", "hosts", "cognitive", "playbooks", "plan", "notes", "import", "chat", "connect", "benchmark"})
+_PASSTHROUGH_COMMANDS = frozenset({
+    "inbox", "hosts", "cognitive", "playbooks", "plan",
+    "notes", "import", "chat", "connect", "benchmark",
+    "sota-benchmark", "ledger", "graph", "snapshot",
+})
 
 
 def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
@@ -384,6 +392,22 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.scale_benchmark import main as bench_main
 
         return bench_main(forwarded)
+    if command == "sota-benchmark":
+        from scripts.sota_benchmark import main as sota_main
+
+        return sota_main(forwarded)
+    if command == "ledger":
+        from scripts.vault_ledger import main as ledger_main
+
+        return ledger_main(forwarded)
+    if command == "graph":
+        from scripts.knowledge_graph import main as graph_main
+
+        return graph_main(forwarded)
+    if command == "snapshot":
+        from scripts.time_travel import main as snap_main
+
+        return snap_main(forwarded)
     return 2
 
 

@@ -64,6 +64,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "phase4_product_tests.py")),
     ),
     (
+        "phase5_god_features_tests",
+        "Desktop installers/tray, comparative SOTA benchmark, Merkle vault ledger, contradiction radar & time-travel snapshots (scripts/phase5_god_features_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "phase5_god_features_tests.py")),
+    ),
+    (
         "scale_benchmark_1500",
         "Corpus-scale correctness canary on a 1,500-note isolated vault (scripts/scale_benchmark.py)",
         (str(SCRIPTS_DIR / "scale_benchmark.py"), "--notes", "1500", "--queries", "20"),

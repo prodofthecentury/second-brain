@@ -387,6 +387,107 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             stats = import_folder(_str(body, "source_dir", max_len=1000), tags=tuple(_tags(body)), paths=paths)
             return send(200, stats.as_dict())
 
+        # ── Cryptographic Vault Merkle Ledger ──
+        if path == "/v1/ledger/verify" and method == "GET":
+            from vault_ledger import verify_vault_ledger
+
+            return send(200, verify_vault_ledger(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir, playbooks_dir=rt.playbooks_dir))
+
+        if path == "/v1/ledger/commit" and method == "POST":
+            if not owner_only():
+                return True
+            from vault_ledger import commit_ledger_checkpoint
+
+            entry = commit_ledger_checkpoint(
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                playbooks_dir=rt.playbooks_dir,
+                actor=_str(body, "actor", max_len=120) or "owner",
+                note=_str(body, "note", max_len=300, required=False),
+            )
+            return send(201, entry)
+
+        if path.startswith("/v1/ledger/prove/") and method == "GET":
+            from vault_ledger import prove_atom_membership
+
+            atom_name = unquote(path[len("/v1/ledger/prove/"):])
+            return send(
+                200,
+                prove_atom_membership(atom_name, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir, playbooks_dir=rt.playbooks_dir),
+            )
+
+        # ── Contradiction & Drift Radar + Knowledge Graph ──
+        if path == "/v1/graph/contradictions" and method == "GET":
+            from knowledge_graph import detect_contradictions
+
+            proj = ((q.get("project") or [None])[0] or None)
+            inc_pending = bool(is_owner and ((q.get("include_pending") or ["1"])[0] != "0"))
+            return send(
+                200,
+                detect_contradictions(
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                    project_scope=proj,
+                    include_pending=inc_pending,
+                ),
+            )
+
+        if path == "/v1/graph/summary" and method == "GET":
+            from knowledge_graph import build_knowledge_graph
+
+            proj = ((q.get("project") or [None])[0] or None)
+            res = build_knowledge_graph(
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                project_scope=proj,
+                include_pending=False,
+            )
+            return send(200, {k: v for k, v in res.items() if k not in {"nodes", "edges"}})
+
+        # ── Time-Travel Snapshots, Diff & Point-in-Time Recall ──
+        if path == "/v1/snapshots" and method == "GET":
+            from time_travel import list_snapshots
+
+            snaps = list_snapshots(brain_dir=rt.brain_dir)
+            return send(200, {"total": len(snaps), "snapshots": snaps})
+
+        if path == "/v1/snapshots" and method == "POST":
+            if not owner_only():
+                return True
+            from time_travel import create_snapshot
+
+            doc = create_snapshot(
+                label=_str(body, "label", max_len=160, required=False),
+                actor=_str(body, "actor", max_len=120) or "owner",
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                playbooks_dir=rt.playbooks_dir,
+            )
+            return send(201, doc)
+
+        if path == "/v1/snapshots/diff" and method == "POST":
+            from time_travel import diff_snapshots
+
+            res = diff_snapshots(
+                _str(body, "from_snapshot", max_len=120),
+                _str(body, "to_snapshot", max_len=120, required=False) or "live",
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                playbooks_dir=rt.playbooks_dir,
+            )
+            return send(200, res)
+
+        if path == "/v1/snapshots/recall" and method == "POST":
+            from time_travel import recall_at_snapshot
+
+            res = recall_at_snapshot(
+                _str(body, "query", max_len=1000),
+                _str(body, "snapshot_id", max_len=120),
+                project_scope=_str(body, "project_scope", max_len=120, required=False) or None,
+                brain_dir=rt.brain_dir,
+            )
+            return send(200, res)
+
     except (ReviewConflictError,) as exc:
         return send(409, {"error": str(exc), "conflict": True})
     except (NoteError, ReviewTransitionError, ValueError, NotADirectoryError, FileNotFoundError) as exc:

@@ -7,6 +7,7 @@ const {
   ipcMain,
   dialog,
   nativeImage,
+  shell,
 } = require("electron");
 const path = require("path");
 const fs = require("fs");
@@ -153,6 +154,7 @@ async function startApiSidecar() {
         settled = true;
         apiReady = true;
         clearTimeout(timeout);
+        refreshTrayMenu();
         resolve(apiPort);
       }
     };
@@ -172,6 +174,10 @@ async function startApiSidecar() {
     });
     proc.on("close", (code) => {
       apiReady = false;
+      if (apiProcess === proc) {
+        apiProcess = null;
+      }
+      refreshTrayMenu();
       if (!settled) {
         settled = true;
         clearTimeout(timeout);
@@ -179,6 +185,27 @@ async function startApiSidecar() {
       }
     });
   });
+}
+
+function getVaultDir() {
+  if (process.env.BRAIN_VAULT_DIR) {
+    return path.resolve(process.env.BRAIN_VAULT_DIR);
+  }
+  if (app.isPackaged) {
+    return path.join(app.getPath("userData"), "brain");
+  }
+  return path.join(getBackendRoot(), "brain");
+}
+
+function stopApiSidecar() {
+  if (apiProcess) {
+    try {
+      apiProcess.kill();
+    } catch (_) {}
+    apiProcess = null;
+  }
+  apiReady = false;
+  refreshTrayMenu();
 }
 
 const ALLOWED_HTTP_METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
@@ -353,11 +380,19 @@ function toggleCaptureWindow() {
   }
 }
 
-function createTray() {
-  const icon = nativeImage.createFromPath(path.join(__dirname, "assets", "icon.png"));
-  tray = new Tray(icon.resize({ width: 16, height: 16 }));
-  tray.setToolTip("Second Brain — Local AI Memory");
+function refreshTrayMenu() {
+  if (!tray) return;
+  const statusLabel = apiReady && apiPort
+    ? `Memory API: Running (127.0.0.1:${apiPort})`
+    : "Memory API: Stopped";
+  let openAtLogin = false;
+  try {
+    openAtLogin = Boolean(app.getLoginItemSettings().openAtLogin);
+  } catch (_) {}
+
   const contextMenu = Menu.buildFromTemplate([
+    { label: statusLabel, enabled: false },
+    { type: "separator" },
     {
       label: "Open Second Brain",
       click: () => {
@@ -371,14 +406,40 @@ function createTray() {
       label: "Quick Capture (Ctrl+Shift+Space)",
       click: () => toggleCaptureWindow(),
     },
+    {
+      label: "Open Vault Folder",
+      click: () => {
+        const vaultPath = getVaultDir();
+        fs.mkdirSync(vaultPath, { recursive: true });
+        shell.openPath(vaultPath);
+      },
+    },
     { type: "separator" },
     {
-      label: "Restart API Sidecar",
+      label: apiReady ? "Restart Memory API" : "Start Memory API",
       click: async () => {
         await startApiSidecar().catch(() => {});
+        refreshTrayMenu();
         if (mainWindow) mainWindow.webContents.send("vault:refresh");
       },
     },
+    {
+      label: "Stop Memory API",
+      enabled: Boolean(apiProcess || apiReady),
+      click: () => stopApiSidecar(),
+    },
+    {
+      label: "Launch at Login",
+      type: "checkbox",
+      checked: openAtLogin,
+      click: (menuItem) => {
+        try {
+          app.setLoginItemSettings({ openAtLogin: Boolean(menuItem.checked) });
+        } catch (_) {}
+        refreshTrayMenu();
+      },
+    },
+    { type: "separator" },
     {
       label: "Quit",
       click: () => {
@@ -387,7 +448,14 @@ function createTray() {
       },
     },
   ]);
+  tray.setToolTip(`Second Brain — ${statusLabel}`);
   tray.setContextMenu(contextMenu);
+}
+
+function createTray() {
+  const icon = nativeImage.createFromPath(path.join(__dirname, "assets", "icon.png"));
+  tray = new Tray(icon.resize({ width: 16, height: 16 }));
+  refreshTrayMenu();
   tray.on("double-click", () => {
     if (mainWindow) {
       mainWindow.show();
