@@ -146,6 +146,60 @@ class EvaluationDatasetTests(unittest.TestCase):
             with self.assertRaises(EvaluationDatasetError):
                 validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
 
+    def test_preference_case_with_expected_atoms_enforces_sha256_revision_and_approval(self):
+        from evaluation_dataset import EvaluationDatasetError, validate_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            dataset = self._dataset(atoms_dir)
+            pref_atom = atoms_dir / "indent-pref.md"
+            pref_atom.write_text("owner prefers 4 spaces", encoding="utf-8")
+            pref_sha = hashlib.sha256(pref_atom.read_bytes()).hexdigest()
+
+            pref_case = {
+                "id": "pref-scored",
+                "query": "What indentation style does the owner prefer?",
+                "category": "preference",
+                "split": "regression",
+                "project_scope": None,
+                "answerability": "preference",
+                "answer_mode": "preference",
+                "expected_atom_ids": ["indent-pref.md"],
+                "acceptable_atom_ids": [],
+                "candidate_relevance": ["indent-pref.md"],
+                "expected_claims": [{"text": "Use 4-space indentation.", "supported_by": ["indent-pref.md"]}],
+                "expected_atom_revisions": [{"atom_id": "indent-pref.md", "revision_sha256": pref_sha}],
+                "expected_behavior": "preference_recall",
+                "trap_reason": None,
+            }
+            dataset["queries"] = [pref_case]
+
+            validated = validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+            self.assertEqual(validated["queries"][0]["answerability"], "preference")
+
+            # Reject unapproved preference target atom
+            with self.assertRaisesRegex(EvaluationDatasetError, "not currently owner-approved"):
+                validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: False)
+
+            # Reject mismatched SHA-256 revision on preference target atom
+            bad_sha_dataset = {
+                **dataset,
+                "queries": [{
+                    **pref_case,
+                    "expected_atom_revisions": [{"atom_id": "indent-pref.md", "revision_sha256": "0" * 64}],
+                }],
+            }
+            with self.assertRaisesRegex(EvaluationDatasetError, "revision hash is stale"):
+                validate_dataset(bad_sha_dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+
+            # Reject missing revision metadata when expected_atom_ids is non-empty
+            missing_rev_dataset = {
+                **dataset,
+                "queries": [{**pref_case, "expected_atom_revisions": []}],
+            }
+            with self.assertRaisesRegex(EvaluationDatasetError, "revision metadata must cover"):
+                validate_dataset(missing_rev_dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+
 
 class AnswerGroundingTests(unittest.TestCase):
     def _atom(self, atoms_dir: Path, *, approve: bool = True) -> tuple[Path, str]:
@@ -208,7 +262,8 @@ Structured logs should use JSON and request IDs.
         from answer_policy import validate_standard_answer
 
         with tempfile.TemporaryDirectory() as directory:
-            atoms_dir = Path(directory)
+            atoms_dir = Path(directory) / "brain" / "2-atoms"
+            atoms_dir.mkdir(parents=True)
             path, revision = self._atom(atoms_dir)
             atoms_dir = path.parent
             revision = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -226,7 +281,8 @@ Structured logs should use JSON and request IDs.
         from answer_policy import validate_standard_answer
 
         with tempfile.TemporaryDirectory() as directory:
-            atoms_dir = Path(directory)
+            atoms_dir = Path(directory) / "brain" / "2-atoms"
+            atoms_dir.mkdir(parents=True)
             path, revision = self._atom(atoms_dir)
             draft = self._draft(revision).replace(
                 "Logs should be structured as JSON.",
@@ -244,7 +300,8 @@ Structured logs should use JSON and request IDs.
         from answer_policy import validate_standard_answer
 
         with tempfile.TemporaryDirectory() as directory:
-            atoms_dir = Path(directory)
+            atoms_dir = Path(directory) / "brain" / "2-atoms"
+            atoms_dir.mkdir(parents=True)
             path, revision = self._atom(atoms_dir)
             draft = self._draft(revision).replace(
                 "Logs should be structured as JSON.",
@@ -443,6 +500,45 @@ class SourceAuditTests(unittest.TestCase):
         self.assertIn("review_status: pending", content)
         self.assertFalse(current)
 
+    def test_source_audit_cli_check_returns_exit_code_one_on_tampered_source(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import json
+        import audit_sources
+
+        with tempfile.TemporaryDirectory() as directory:
+            path, atoms_dir, decision_log = self._approved_fixture(Path(directory))
+            brain_dir = atoms_dir.parent
+
+            clean_out = StringIO()
+            with redirect_stdout(clean_out):
+                clean_code = audit_sources.main([
+                    "--brain-dir", str(brain_dir),
+                    "--atoms-dir", str(atoms_dir),
+                    "--decision-log", str(decision_log),
+                    "--check",
+                ])
+            self.assertEqual(clean_code, 0)
+
+            (brain_dir / "0-raw" / "source.md").write_text(
+                "Tampered source bytes after owner approval.\n", encoding="utf-8",
+            )
+            tampered_out = StringIO()
+            with redirect_stdout(tampered_out):
+                tampered_code = audit_sources.main([
+                    "--brain-dir", str(brain_dir),
+                    "--atoms-dir", str(atoms_dir),
+                    "--decision-log", str(decision_log),
+                    "--check",
+                ])
+            payload = json.loads(tampered_out.getvalue())
+            atom_after = path.read_text(encoding="utf-8")
+
+        self.assertEqual(tampered_code, 1)
+        self.assertEqual(payload[0]["action"], "review_required")
+        self.assertFalse(payload[0]["approval_current"])
+        self.assertIn("review_status: accepted", atom_after)
+
 
 class DashboardBoundaryTests(unittest.TestCase):
     def test_dashboard_binds_only_to_loopback(self):
@@ -493,14 +589,20 @@ class DashboardBoundaryTests(unittest.TestCase):
 
     def test_non_loopback_binding_and_cross_origin_penetration_rejected(self):
         import http.client
+        import os
         import socket
         import subprocess
         import time
         from dashboard_auth import SESSION_COOKIE_POLICY, assert_loopback_address, format_session_cookie
         from mcp_server import assert_mcp_loopback_transport
 
-        # 1. Explicit loopback assertions reject 0.0.0.0, IPv6 wildcard, and LAN/public IPs
+        # 1. Explicit loopback assertions reject None, empty, 0.0.0.0, IPv6 wildcard, and LAN/public IPs
         self.assertEqual(assert_loopback_address("127.0.0.1"), "127.0.0.1")
+        for missing_or_empty in (None, "", "   "):
+            with self.assertRaisesRegex(PermissionError, "403 Forbidden"):
+                assert_loopback_address(missing_or_empty)
+        with self.assertRaisesRegex(PermissionError, "403 Forbidden"):
+            assert_mcp_loopback_transport("")
         for forbidden in ("0.0.0.0", "::", "192.168.1.50", "10.0.0.5", "8.8.8.8"):
             with self.assertRaisesRegex(PermissionError, "403 Forbidden"):
                 assert_loopback_address(forbidden)
@@ -514,103 +616,143 @@ class DashboardBoundaryTests(unittest.TestCase):
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Strict", cookie)
 
-        # 3. Live Tornado/Streamlit penetration probe on loopback ephemeral port
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
-            probe_sock.bind(("127.0.0.1", 0))
-            port = probe_sock.getsockname()[1]
+        # 3. Live Tornado/Streamlit penetration probe on loopback ephemeral port (isolated vault/auth)
+        with tempfile.TemporaryDirectory() as st_tmp:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
+                probe_sock.bind(("127.0.0.1", 0))
+                port = probe_sock.getsockname()[1]
 
-        proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "streamlit", "run",
-                str(ROOT / "dashboard" / "app.py"),
-                "--server.headless=true",
-                "--server.address=127.0.0.1",
-                f"--server.port={port}",
-                "--server.enableCORS=true",
-                "--server.enableXsrfProtection=true",
-                "--server.xsrfCookieSameSite=strict",
-                "--server.allowedHosts=127.0.0.1",
-                f"--server.corsAllowedOrigins=http://127.0.0.1:{port}",
-                "--browser.gatherUsageStats=false",
-            ],
-            cwd=str(ROOT),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            ready = False
-            deadline = time.time() + 20.0
-            while time.time() < deadline:
+            child_env = dict(os.environ)
+            child_env["BRAIN_VAULT_DIR"] = str(Path(st_tmp) / "brain")
+            child_env["BRAIN_DASHBOARD_AUTH_FILE"] = str(Path(st_tmp) / "auth.json")
+
+            proc = subprocess.Popen(
+                [
+                    sys.executable, "-m", "streamlit", "run",
+                    str(ROOT / "dashboard" / "app.py"),
+                    "--server.headless=true",
+                    "--server.address=127.0.0.1",
+                    f"--server.port={port}",
+                    "--server.enableCORS=true",
+                    "--server.enableXsrfProtection=true",
+                    "--server.xsrfCookieSameSite=strict",
+                    "--server.allowedHosts=127.0.0.1",
+                    f"--server.corsAllowedOrigins=http://127.0.0.1:{port}",
+                    "--browser.gatherUsageStats=false",
+                ],
+                cwd=str(ROOT),
+                env=child_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                ready = False
+                deadline = time.time() + 20.0
+                while time.time() < deadline:
+                    try:
+                        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+                        conn.request("GET", "/_stcore/health", headers={"Host": f"127.0.0.1:{port}"})
+                        resp = conn.getresponse()
+                        resp.read()
+                        conn.close()
+                        if resp.status == 200:
+                            ready = True
+                            break
+                    except OSError:
+                        time.sleep(0.25)
+                self.assertTrue(ready, "Streamlit loopback listener failed to become healthy within 20s")
+
+                # 3a. Cross-origin WebSocket upgrade to /_stcore/stream must fail with 403 Forbidden
+                ws_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+                ws_conn.request(
+                    "GET",
+                    "/_stcore/stream",
+                    headers={
+                        "Host": f"127.0.0.1:{port}",
+                        "Origin": "https://evil-attacker.example",
+                        "Connection": "Upgrade",
+                        "Upgrade": "websocket",
+                        "Sec-WebSocket-Version": "13",
+                        "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                    },
+                )
+                ws_resp = ws_conn.getresponse()
+                ws_resp.read()
+                ws_conn.close()
+                self.assertEqual(ws_resp.status, 403)
+
+                # 3b. Spoofed external Host header WebSocket upgrade must fail with 403 Forbidden
+                spoof_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+                spoof_conn.request(
+                    "GET",
+                    "/_stcore/stream",
+                    headers={
+                        "Host": f"evil-host.example:{port}",
+                        "Origin": f"http://evil-host.example:{port}",
+                        "Connection": "Upgrade",
+                        "Upgrade": "websocket",
+                        "Sec-WebSocket-Version": "13",
+                        "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                    },
+                )
+                spoof_resp = spoof_conn.getresponse()
+                spoof_resp.read()
+                spoof_conn.close()
+                self.assertEqual(spoof_resp.status, 403)
+
+                # 3c. Non-loopback LAN IP connection attempt must be refused immediately
                 try:
-                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
-                    conn.request("GET", "/_stcore/health", headers={"Host": f"127.0.0.1:{port}"})
-                    resp = conn.getresponse()
-                    resp.read()
-                    conn.close()
-                    if resp.status == 200:
-                        ready = True
-                        break
+                    lan_ip = socket.gethostbyname(socket.gethostname())
                 except OSError:
-                    time.sleep(0.25)
-            self.assertTrue(ready, "Streamlit loopback listener failed to become healthy within 20s")
-
-            # 3a. Cross-origin WebSocket upgrade to /_stcore/stream must fail with 403 Forbidden
-            ws_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
-            ws_conn.request(
-                "GET",
-                "/_stcore/stream",
-                headers={
-                    "Host": f"127.0.0.1:{port}",
-                    "Origin": "https://evil-attacker.example",
-                    "Connection": "Upgrade",
-                    "Upgrade": "websocket",
-                    "Sec-WebSocket-Version": "13",
-                    "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
-                },
-            )
-            ws_resp = ws_conn.getresponse()
-            ws_resp.read()
-            ws_conn.close()
-            self.assertEqual(ws_resp.status, 403)
-
-            # 3b. Spoofed external Host header WebSocket upgrade must fail with 403 Forbidden
-            spoof_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
-            spoof_conn.request(
-                "GET",
-                "/_stcore/stream",
-                headers={
-                    "Host": f"evil-host.example:{port}",
-                    "Origin": f"http://evil-host.example:{port}",
-                    "Connection": "Upgrade",
-                    "Upgrade": "websocket",
-                    "Sec-WebSocket-Version": "13",
-                    "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
-                },
-            )
-            spoof_resp = spoof_conn.getresponse()
-            spoof_resp.read()
-            spoof_conn.close()
-            self.assertEqual(spoof_resp.status, 403)
-
-            # 3c. Non-loopback LAN IP connection attempt must be refused immediately
-            try:
-                lan_ip = socket.gethostbyname(socket.gethostname())
-            except OSError:
-                lan_ip = "127.0.0.1"
-            if lan_ip and not lan_ip.startswith("127."):
-                with self.assertRaises(OSError):
-                    with socket.create_connection((lan_ip, port), timeout=1.5):
-                        pass
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+                    lan_ip = "127.0.0.1"
+                if lan_ip and not lan_ip.startswith("127."):
+                    with self.assertRaises(OSError):
+                        with socket.create_connection((lan_ip, port), timeout=1.5):
+                            pass
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
 
 
 class DashboardAuthTests(unittest.TestCase):
+    @staticmethod
+    def _make_fake_streamlit(*, submitted: bool = False, password: str = "", server_address: str | None = "127.0.0.1"):
+        class Form:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+
+        class FakeStreamlit:
+            def __init__(self):
+                self.session_state = {}
+                self.submitted = submitted
+                self.password = password
+                self.sidebar = self
+                self.errors = []
+                self.warnings = []
+                self.titles = []
+            def get_option(self, name):
+                return server_address if name == "server.address" else None
+            def title(self, message): self.titles.append(message)
+            def caption(self, *_args): pass
+            def error(self, message): self.errors.append(message)
+            def warning(self, message): self.warnings.append(message)
+            def code(self, *_args, **_kwargs): pass
+            def form(self, *_args, **_kwargs): return Form()
+            def text_input(self, *_args, **_kwargs):
+                self.session_state["brain_dashboard_password"] = self.password
+                return self.password
+            def form_submit_button(self, *_args, **_kwargs): return self.submitted
+            def button(self, *_args, **_kwargs): return False
+            def rerun(self): raise RuntimeError("rerun")
+
+        return FakeStreamlit()
+
     def test_scrypt_verifier_accepts_only_matching_password_and_has_unique_salt(self):
         from dashboard_auth import build_password_record, verify_password
         first = build_password_record("a-long-owner-password")
@@ -632,79 +774,324 @@ class DashboardAuthTests(unittest.TestCase):
             self.assertIsNone(load_password_record(path))
 
     def test_login_gate_stops_unauthenticated_and_unlocks_matching_session(self):
-        from dashboard_auth import require_dashboard_login, build_password_record, save_password_record
+        import copy
         import time
-        from dashboard_auth import MAX_SESSION_FAILURES, SESSION_IDLE_SECONDS
+        import dashboard_auth
+        from dashboard_auth import (
+            MAX_SESSION_FAILURES,
+            SESSION_IDLE_SECONDS,
+            build_password_record,
+            require_dashboard_login,
+            save_password_record,
+        )
 
-        class Form:
-            def __enter__(self):
-                return self
-            def __exit__(self, *_args):
-                return False
+        saved_tracker = copy.deepcopy(dashboard_auth._RATE_LIMIT_TRACKER)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "auth.json"
+                save_password_record(build_password_record("test-password-long-enough"), path)
+                unauthenticated = self._make_fake_streamlit()
+                self.assertFalse(require_dashboard_login(unauthenticated, path))
+                self.assertIn("Unlock Second Brain", unauthenticated.titles)
 
-        class FakeStreamlit:
-            def __init__(self, submitted=False, password=""):
-                self.session_state = {}
-                self.submitted = submitted
-                self.password = password
-                self.sidebar = self
-                self.errors = []
-                self.titles = []
-            def title(self, message): self.titles.append(message)
-            def caption(self, *_args): pass
-            def error(self, message): self.errors.append(message)
-            def warning(self, *_args): pass
-            def code(self, *_args, **_kwargs): pass
-            def form(self, *_args, **_kwargs): return Form()
-            def text_input(self, *_args, **_kwargs):
-                self.session_state["brain_dashboard_password"] = self.password
-                return self.password
-            def form_submit_button(self, *_args, **_kwargs): return self.submitted
-            def button(self, *_args, **_kwargs): return False
-            def rerun(self): raise RuntimeError("rerun")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "auth.json"
-            save_password_record(build_password_record("test-password-long-enough"), path)
-            unauthenticated = FakeStreamlit()
-            self.assertFalse(require_dashboard_login(unauthenticated, path))
-            self.assertIn("Unlock Second Brain", unauthenticated.titles)
-
-            wrong = FakeStreamlit(submitted=True, password="wrong-password")
-            with self.assertRaisesRegex(RuntimeError, "rerun"):
-                require_dashboard_login(wrong, path)
-            self.assertNotIn("_brain_dashboard_auth_fingerprint", wrong.session_state)
-
-            valid = FakeStreamlit(submitted=True, password="test-password-long-enough")
-            with self.assertRaisesRegex(RuntimeError, "rerun"):
-                require_dashboard_login(valid, path)
-            self.assertIn("_brain_dashboard_auth_fingerprint", valid.session_state)
-            valid.submitted = False
-            self.assertTrue(require_dashboard_login(valid, path))
-            valid.session_state["_brain_dashboard_last_activity"] = time.time() - SESSION_IDLE_SECONDS - 1
-            self.assertFalse(require_dashboard_login(valid, path))
-            self.assertNotIn("_brain_dashboard_auth_fingerprint", valid.session_state)
-
-            attacker = FakeStreamlit(submitted=True, password="wrong-password")
-            for _ in range(MAX_SESSION_FAILURES):
+                wrong = self._make_fake_streamlit(submitted=True, password="wrong-password")
                 with self.assertRaisesRegex(RuntimeError, "rerun"):
-                    require_dashboard_login(attacker, path)
-            self.assertIn("_brain_dashboard_locked_until", attacker.session_state)
-            self.assertFalse(require_dashboard_login(attacker, path))
+                    require_dashboard_login(wrong, path)
+                self.assertNotIn("_brain_dashboard_auth_fingerprint", wrong.session_state)
+
+                valid = self._make_fake_streamlit(submitted=True, password="test-password-long-enough")
+                with self.assertRaisesRegex(RuntimeError, "rerun"):
+                    require_dashboard_login(valid, path)
+                self.assertIn("_brain_dashboard_auth_fingerprint", valid.session_state)
+                valid.submitted = False
+                self.assertTrue(require_dashboard_login(valid, path))
+                valid.session_state["_brain_dashboard_last_activity"] = time.time() - SESSION_IDLE_SECONDS - 1
+                self.assertFalse(require_dashboard_login(valid, path))
+                self.assertNotIn("_brain_dashboard_auth_fingerprint", valid.session_state)
+
+                attacker = self._make_fake_streamlit(submitted=True, password="wrong-password")
+                for _ in range(MAX_SESSION_FAILURES):
+                    with self.assertRaisesRegex(RuntimeError, "rerun"):
+                        require_dashboard_login(attacker, path)
+                self.assertIn("_brain_dashboard_locked_until", attacker.session_state)
+                self.assertFalse(require_dashboard_login(attacker, path))
+        finally:
+            with dashboard_auth._RATE_LIMIT_LOCK:
+                dashboard_auth._RATE_LIMIT_TRACKER.clear()
+                dashboard_auth._RATE_LIMIT_TRACKER.update(saved_tracker)
+
+    def test_login_gate_rejects_non_loopback_or_missing_server_address_and_rate_limits_across_sessions(self):
+        import copy
+        import dashboard_auth
+        from dashboard_auth import (
+            MAX_SESSION_FAILURES,
+            assert_loopback_address,
+            build_password_record,
+            require_dashboard_login,
+            save_password_record,
+        )
+
+        with self.assertRaisesRegex(PermissionError, "403 Forbidden"):
+            assert_loopback_address(None)
+        with self.assertRaisesRegex(PermissionError, "403 Forbidden"):
+            assert_loopback_address("")
+
+        saved_tracker = copy.deepcopy(dashboard_auth._RATE_LIMIT_TRACKER)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "multi-session-auth.json"
+                save_password_record(build_password_record("test-password-long-enough"), path)
+
+                # Non-loopback or missing server.address fails closed with 403 Forbidden
+                for bad_address in ("0.0.0.0", None):
+                    bad_st = self._make_fake_streamlit(
+                        submitted=True,
+                        password="test-password-long-enough",
+                        server_address=bad_address,
+                    )
+                    self.assertFalse(require_dashboard_login(bad_st, path))
+                    self.assertTrue(any("403 Forbidden" in msg for msg in bad_st.errors))
+                    self.assertNotIn("_brain_dashboard_auth_fingerprint", bad_st.session_state)
+
+                # 5 distinct FakeStreamlit instances (each fresh session_state={}) lock out the 6th fresh session
+                for attempt in range(MAX_SESSION_FAILURES):
+                    fresh_attacker = self._make_fake_streamlit(
+                        submitted=True,
+                        password=f"wrong-password-{attempt}",
+                    )
+                    self.assertEqual(fresh_attacker.session_state, {})
+                    with self.assertRaisesRegex(RuntimeError, "rerun"):
+                        require_dashboard_login(fresh_attacker, path)
+
+                sixth_fresh_session = self._make_fake_streamlit(
+                    submitted=True,
+                    password="test-password-long-enough",
+                )
+                self.assertEqual(sixth_fresh_session.session_state, {})
+                self.assertFalse(require_dashboard_login(sixth_fresh_session, path))
+                self.assertTrue(any("Too many failed attempts" in msg for msg in sixth_fresh_session.warnings))
+                self.assertNotIn("_brain_dashboard_auth_fingerprint", sixth_fresh_session.session_state)
+        finally:
+            with dashboard_auth._RATE_LIMIT_LOCK:
+                dashboard_auth._RATE_LIMIT_TRACKER.clear()
+                dashboard_auth._RATE_LIMIT_TRACKER.update(saved_tracker)
 
 
 class MCPBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _write_candidate_atom(path: Path, atom_id: str, source_rel: str, claim: str, evidence: str) -> None:
+        path.write_text(
+            f"---\nid: {atom_id}\ntype: atom\nmemory_type: semantic\nsources:\n  - {source_rel}\n"
+            "links: []\ncontexts: []\nsupersedes: []\nsuperseded_by: []\ncontested_by: []\n"
+            "origin: user_local\ncitation_integrity: missing\nclaim_state: candidate\n"
+            "epistemic_label: claim\nreview_status: pending\n---\n\n"
+            f"## Claim\n{claim}\n\n## Evidence\n{evidence}\n",
+            encoding="utf-8",
+        )
+
+    def _isolated_mcp_env(self, *, configure_token: str | None = "secret-mcp-bearer-token-123456"):
+        from contextlib import ExitStack, contextmanager
+        import os
+        from unittest.mock import patch
+        import config
+        import mcp_server
+        import recall
+        from atom_mutator import apply_atom_merge, apply_review_transition
+        from lexical_store import rebuild_lexical_index
+
+        @contextmanager
+        def _ctx():
+            with tempfile.TemporaryDirectory() as tmp_root, ExitStack() as stack:
+                root = Path(tmp_root)
+                brain_dir = root / "brain"
+                raw_dir = brain_dir / "0-raw"
+                inbox_dir = raw_dir / "inbox"
+                desk_dir = brain_dir / "1-desk"
+                atoms_dir = brain_dir / "2-atoms"
+                threads_dir = brain_dir / "3-threads"
+                sources_dir = brain_dir / "sources"
+                briefings_dir = brain_dir / "briefings"
+                chroma_dir = brain_dir / ".chroma"
+                sidecar_dir = brain_dir / ".sidecar"
+                for d in (
+                    raw_dir, inbox_dir, desk_dir, atoms_dir, threads_dir,
+                    sources_dir, briefings_dir, chroma_dir, sidecar_dir,
+                ):
+                    d.mkdir(parents=True, exist_ok=True)
+
+                decision_log = raw_dir / "archive" / "decision-record.jsonl"
+                audit_path = raw_dir / "archive" / "mcp-audit.jsonl"
+                lexical_index_path = sidecar_dir / "lexical.sqlite3"
+                token_file = root / "security" / "mcp-token"
+
+                # 1. Seed owner-approved current atom (structured-logging.md)
+                log_src = raw_dir / "logging-source.md"
+                log_quote = "Logs should be structured (JSON) with correlation request IDs."
+                log_src.write_text(log_quote + "\n", encoding="utf-8")
+                approved_atom = atoms_dir / "structured-logging.md"
+                self._write_candidate_atom(
+                    approved_atom, "structured-logging", "0-raw/logging-source.md", log_quote, log_quote
+                )
+                apply_review_transition(
+                    action="approve",
+                    atom_path=str(approved_atom),
+                    expected_sha256=hashlib.sha256(approved_atom.read_bytes()).hexdigest(),
+                    actor="mcp-test-owner",
+                    decision_log_path=str(decision_log),
+                    history_dir=str(atoms_dir / ".history"),
+                    brain_dir=str(brain_dir),
+                    atoms_dir=str(atoms_dir),
+                )
+
+                # 2. Seed pending candidate atom (observability-o11y.md)
+                pending_atom = atoms_dir / "observability-o11y.md"
+                self._write_candidate_atom(
+                    pending_atom,
+                    "observability-o11y",
+                    "0-raw/logging-source.md",
+                    "Pending unapproved observability note.",
+                    log_quote,
+                )
+
+                # 3. Seed superseded atom via canonical merge (superseded-logging.md -> survivor-logging.md)
+                sup_src = raw_dir / "superseded-source.md"
+                sup_quote = "Legacy plaintext logs were superseded by structured JSON logs."
+                sup_src.write_text(sup_quote + "\n", encoding="utf-8")
+                superseded_atom = atoms_dir / "superseded-logging.md"
+                survivor_atom = atoms_dir / "survivor-logging.md"
+                self._write_candidate_atom(
+                    superseded_atom, "superseded-logging", "0-raw/superseded-source.md", sup_quote, sup_quote
+                )
+                self._write_candidate_atom(
+                    survivor_atom, "survivor-logging", "0-raw/logging-source.md", log_quote, log_quote
+                )
+                apply_review_transition(
+                    action="approve",
+                    atom_path=str(superseded_atom),
+                    expected_sha256=hashlib.sha256(superseded_atom.read_bytes()).hexdigest(),
+                    actor="mcp-test-owner",
+                    decision_log_path=str(decision_log),
+                    history_dir=str(atoms_dir / ".history"),
+                    brain_dir=str(brain_dir),
+                    atoms_dir=str(atoms_dir),
+                )
+                apply_atom_merge(
+                    survivor_path=str(survivor_atom),
+                    survivor_expected_sha256=hashlib.sha256(survivor_atom.read_bytes()).hexdigest(),
+                    superseded_path=str(superseded_atom),
+                    superseded_expected_sha256=hashlib.sha256(superseded_atom.read_bytes()).hexdigest(),
+                    actor="mcp-test-owner",
+                    rationale="Superseded in isolated MCP fixture.",
+                    decision_log_path=str(decision_log),
+                    history_dir=str(atoms_dir / ".history"),
+                    brain_dir=str(brain_dir),
+                    atoms_dir=str(atoms_dir),
+                )
+
+                # 4. Seed tampered-source atom (approved, then source modified on disk)
+                tamp_src = raw_dir / "tampered-source.md"
+                tamp_quote = "Original verified evidence sentence before tampering."
+                tamp_src.write_text(tamp_quote + "\n", encoding="utf-8")
+                tampered_atom = atoms_dir / "tampered-logging.md"
+                self._write_candidate_atom(
+                    tampered_atom, "tampered-logging", "0-raw/tampered-source.md", tamp_quote, tamp_quote
+                )
+                apply_review_transition(
+                    action="approve",
+                    atom_path=str(tampered_atom),
+                    expected_sha256=hashlib.sha256(tampered_atom.read_bytes()).hexdigest(),
+                    actor="mcp-test-owner",
+                    decision_log_path=str(decision_log),
+                    history_dir=str(atoms_dir / ".history"),
+                    brain_dir=str(brain_dir),
+                    atoms_dir=str(atoms_dir),
+                )
+                tamp_src.write_text("Tampered source content after owner approval.\n", encoding="utf-8")
+
+                rebuild_lexical_index(str(atoms_dir), str(lexical_index_path))
+
+                env_updates = {
+                    "BRAIN_VAULT_DIR": str(brain_dir),
+                    "BRAIN_MCP_TOKEN_FILE": str(token_file),
+                }
+                if configure_token is not None:
+                    env_updates["BRAIN_MCP_BEARER_TOKEN"] = configure_token
+                stack.enter_context(patch.dict(os.environ, env_updates, clear=False))
+                if configure_token is None:
+                    os.environ.pop("BRAIN_MCP_BEARER_TOKEN", None)
+                os.environ.pop("BRAIN_MCP_ALLOWED_TOOLS", None)
+                os.environ.pop("BRAIN_MCP_BIND_ADDRESS", None)
+
+                for mod in (config, mcp_server):
+                    stack.enter_context(patch.object(mod, "BRAIN_DIR", str(brain_dir), create=True))
+                    stack.enter_context(patch.object(mod, "RAW_DIR", str(raw_dir), create=True))
+                    stack.enter_context(patch.object(mod, "INBOX_DIR", str(inbox_dir), create=True))
+                    stack.enter_context(patch.object(mod, "ATOMS_DIR", str(atoms_dir), create=True))
+                    stack.enter_context(patch.object(mod, "THREADS_DIR", str(threads_dir), create=True))
+                    stack.enter_context(patch.object(mod, "BRIEFINGS_DIR", str(briefings_dir), create=True))
+                stack.enter_context(patch.object(config, "DESK_DIR", str(desk_dir)))
+                stack.enter_context(patch.object(config, "SOURCES_DIR", str(sources_dir)))
+                stack.enter_context(patch.object(config, "CHROMA_PATH", str(chroma_dir)))
+                stack.enter_context(patch.object(config, "SIDECAR_DIR", str(sidecar_dir)))
+                stack.enter_context(patch.object(config, "LEXICAL_INDEX_PATH", str(lexical_index_path)))
+                stack.enter_context(
+                    patch.object(config, "ARCHIVE_MANIFEST", str(raw_dir / "archive" / "manifest.jsonl"))
+                )
+                stack.enter_context(patch.object(mcp_server, "MCP_AUDIT_PATH", str(audit_path)))
+
+                stack.enter_context(patch.object(recall, "BRAIN_DIR", str(brain_dir)))
+                stack.enter_context(patch.object(recall, "RAW_DIR", str(raw_dir)))
+                stack.enter_context(patch.object(recall, "ATOMS_DIR", str(atoms_dir)))
+                stack.enter_context(patch.object(recall, "CHROMA_PATH", str(chroma_dir)))
+                stack.enter_context(patch.object(recall, "LEXICAL_INDEX_PATH", str(lexical_index_path)))
+
+                real_search_memory = recall.search_memory
+
+                def isolated_search_memory(query, options=None, **kwargs):
+                    kwargs.setdefault("atoms_dir", str(atoms_dir))
+                    kwargs.setdefault("index_path", str(lexical_index_path))
+                    kwargs.setdefault("chroma_path", str(chroma_dir))
+                    return real_search_memory(query, options, **kwargs)
+
+                stack.enter_context(patch.object(mcp_server, "search_memory", side_effect=isolated_search_memory))
+
+                yield {
+                    "brain_dir": brain_dir,
+                    "raw_dir": raw_dir,
+                    "inbox_dir": inbox_dir,
+                    "atoms_dir": atoms_dir,
+                    "audit_path": audit_path,
+                    "token_file": token_file,
+                    "token": configure_token,
+                }
+
+        return _ctx()
+
     def test_mcp_is_opt_in_bounded_and_does_not_enumerate_vault(self):
+        import mcp_server
+
         implementation = (ROOT / "scripts" / "mcp_server.py").read_text(encoding="utf-8")
-        policy = (ROOT / "brain" / "mcp-config.md").read_text(encoding="utf-8").lower()
+        readme_policy = (ROOT / "README.md").read_text(encoding="utf-8").lower()
 
         self.assertIn('os.environ.get("BRAIN_ENABLE_LOCAL_MCP") != "1"', implementation)
         self.assertIn("MAX_INBOX_CHARS = 100_000", implementation)
         self.assertNotIn('name="list_atoms"', implementation)
         self.assertNotIn('name="list_threads"', implementation)
         self.assertIn("return []", implementation)
-        self.assertIn("do not register it with", policy)
-        self.assertIn("cloud-connected clients", policy)
+        self.assertIn("do not register it with cloud-connected clients", readme_policy)
+
+        vault_policy_path = ROOT / "brain" / "mcp-config.md"
+        if vault_policy_path.is_file():
+            vault_policy = vault_policy_path.read_text(encoding="utf-8").lower()
+            self.assertIn("do not register it with", vault_policy)
+            self.assertIn("cloud-connected clients", vault_policy)
+
+        for tool in mcp_server.ALL_TOOLS:
+            schema = getattr(tool, "input_schema", None) or tool.model_dump(by_alias=True).get("inputSchema", {})
+            props = schema.get("properties", {})
+            self.assertNotIn("bearer_token", props)
+            self.assertNotIn("auth_token", props)
+            self.assertNotIn("token", props)
 
     def test_mcp_audit_is_content_free_and_happens_before_tool_execution(self):
         from mcp_server import audit_mcp_use
@@ -728,7 +1115,7 @@ class MCPBoundaryTests(unittest.TestCase):
                 audit_mcp_use("query:private search phrase", str(Path(temporary) / "audit.jsonl"))
 
     def test_mcp_sdk_v2_handlers_return_protocol_results_and_reject_audit_failure(self):
-        import os
+        import asyncio
         from types import SimpleNamespace
         from unittest.mock import patch
 
@@ -739,7 +1126,7 @@ class MCPBoundaryTests(unittest.TestCase):
         auth_ctx = SimpleNamespace(meta={"authorization": f"Bearer {test_token}"})
 
         async def scenario():
-            with patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token}):
+            with self._isolated_mcp_env(configure_token=test_token) as env:
                 listed = await mcp_server.handle_list_tools(auth_ctx, None)
                 self.assertIsInstance(listed, types.ListToolsResult)
                 self.assertEqual({tool.name for tool in listed.tools}, {"search_memory", "get_atom", "add_to_inbox"})
@@ -751,17 +1138,16 @@ class MCPBoundaryTests(unittest.TestCase):
                             auth_ctx,
                             types.CallToolRequestParams(
                                 name="add_to_inbox",
-                                arguments={"content": "must not write", "bearer_token": test_token},
+                                arguments={"content": "must not write"},
+                                _meta={"authorization": f"Bearer {test_token}"},
                             ),
                         )
+                self.assertEqual(list(env["inbox_dir"].glob("*.md")), [])
 
-        import asyncio
         asyncio.run(scenario())
 
     def test_mcp_bearer_token_authorization(self):
         import asyncio
-        import os
-        from unittest.mock import patch
         import mcp_server
         from mcp import types
 
@@ -769,60 +1155,70 @@ class MCPBoundaryTests(unittest.TestCase):
 
         async def run_auth_checks():
             # 1. Fail-closed by default when NO token is configured anywhere
-            with tempfile.TemporaryDirectory() as empty_dir:
-                missing_token_file = str(Path(empty_dir) / "no-token")
-                with patch.dict(os.environ, {"BRAIN_MCP_TOKEN_FILE": missing_token_file}, clear=False):
-                    os.environ.pop("BRAIN_MCP_BEARER_TOKEN", None)
-                    unconf_call = await mcp_server.handle_call_tool(
-                        None,
-                        types.CallToolRequestParams(name="search_memory", arguments={"query": "test"}),
-                    )
-                    self.assertTrue(unconf_call.is_error)
-                    self.assertIn("Unauthorized", unconf_call.content[0].text)
+            with self._isolated_mcp_env(configure_token=None) as unconf_env:
+                unconf_call = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(name="search_memory", arguments={"query": "structured JSON"}),
+                )
+                self.assertTrue(unconf_call.is_error)
+                self.assertIn("Unauthorized", unconf_call.content[0].text)
+                self.assertFalse(unconf_env["audit_path"].exists())
 
                 # Truncated token file must also fail closed
-                short_file = Path(empty_dir) / "short-token"
-                short_file.write_text("short\n", encoding="utf-8")
-                with patch.dict(os.environ, {"BRAIN_MCP_TOKEN_FILE": str(short_file)}, clear=False):
-                    os.environ.pop("BRAIN_MCP_BEARER_TOKEN", None)
-                    self.assertFalse(mcp_server.is_authorized())
+                unconf_env["token_file"].parent.mkdir(parents=True, exist_ok=True)
+                unconf_env["token_file"].write_text("short\n", encoding="utf-8")
+                self.assertFalse(mcp_server.is_authorized())
 
-            # 2. Configured token enforcement + pre-auth audit protection
-            with tempfile.TemporaryDirectory() as audit_tmp:
-                audit_path = Path(audit_tmp) / "mcp-audit.jsonl"
-                with (
-                    patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token}),
-                    patch.object(mcp_server, "MCP_AUDIT_PATH", str(audit_path)),
-                ):
-                    # Request without token fails BEFORE writing audit log
-                    no_auth_call = await mcp_server.handle_call_tool(
-                        None,
-                        types.CallToolRequestParams(name="search_memory", arguments={"query": "test"}),
-                    )
-                    self.assertTrue(no_auth_call.is_error)
-                    self.assertIn("Unauthorized", no_auth_call.content[0].text)
-                    self.assertFalse(audit_path.exists())
+            # 2. Configured token enforcement + pre-auth audit protection + _meta bearer header
+            with self._isolated_mcp_env(configure_token=test_token) as auth_env:
+                audit_path = auth_env["audit_path"]
 
-                    # Request with wrong token fails BEFORE writing audit log
-                    wrong_auth_call = await mcp_server.handle_call_tool(
-                        None,
-                        types.CallToolRequestParams(
-                            name="search_memory", arguments={"query": "test", "bearer_token": "wrong"}
-                        ),
-                    )
-                    self.assertTrue(wrong_auth_call.is_error)
-                    self.assertIn("Unauthorized", wrong_auth_call.content[0].text)
-                    self.assertFalse(audit_path.exists())
+                # Request without token fails BEFORE writing audit log
+                no_auth_call = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(name="search_memory", arguments={"query": "structured JSON"}),
+                )
+                self.assertTrue(no_auth_call.is_error)
+                self.assertIn("Unauthorized", no_auth_call.content[0].text)
+                self.assertFalse(audit_path.exists())
 
-                    # Request with valid token succeeds and records audit
-                    valid_auth_call = await mcp_server.handle_call_tool(
-                        None,
-                        types.CallToolRequestParams(
-                            name="search_memory", arguments={"query": "test", "bearer_token": test_token}
-                        ),
-                    )
-                    self.assertFalse(valid_auth_call.is_error)
-                    self.assertTrue(audit_path.exists())
+                # Request with wrong token fails BEFORE writing audit log
+                wrong_auth_call = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="search_memory",
+                        arguments={"query": "structured JSON"},
+                        _meta={"authorization": "Bearer wrong-token-value"},
+                    ),
+                )
+                self.assertTrue(wrong_auth_call.is_error)
+                self.assertIn("Unauthorized", wrong_auth_call.content[0].text)
+                self.assertFalse(audit_path.exists())
+
+                # Request passing token in tool arguments without _meta MUST be rejected
+                args_only_call = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="search_memory",
+                        arguments={"query": "structured JSON", "bearer_token": test_token},
+                    ),
+                )
+                self.assertTrue(args_only_call.is_error)
+                self.assertIn("Unauthorized", args_only_call.content[0].text)
+                self.assertFalse(audit_path.exists())
+
+                # Request with valid token in _meta succeeds against isolated lexical index and records audit
+                valid_auth_call = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="search_memory",
+                        arguments={"query": "structured JSON correlation request"},
+                        _meta={"authorization": f"Bearer {test_token}"},
+                    ),
+                )
+                self.assertFalse(valid_auth_call.is_error)
+                self.assertIn("structured-logging.md", valid_auth_call.content[0].text)
+                self.assertTrue(audit_path.exists())
 
         asyncio.run(run_auth_checks())
 
@@ -838,43 +1234,45 @@ class MCPBoundaryTests(unittest.TestCase):
         auth_ctx = SimpleNamespace(meta={"authorization": f"Bearer {test_token}"})
 
         async def run_permission_checks():
-            # Restrict tools to only search_memory
-            with patch.dict(os.environ, {"BRAIN_MCP_ALLOWED_TOOLS": "search_memory", "BRAIN_MCP_BEARER_TOKEN": test_token}):
-                listed = await mcp_server.handle_list_tools(auth_ctx, None)
-                tool_names = {t.name for t in listed.tools}
-                self.assertEqual(tool_names, {"search_memory"})
-                self.assertNotIn("add_to_inbox", tool_names)
+            with self._isolated_mcp_env(configure_token=test_token):
+                # Restrict tools to only search_memory
+                with patch.dict(os.environ, {"BRAIN_MCP_ALLOWED_TOOLS": "search_memory"}):
+                    listed = await mcp_server.handle_list_tools(auth_ctx, None)
+                    tool_names = {t.name for t in listed.tools}
+                    self.assertEqual(tool_names, {"search_memory"})
+                    self.assertNotIn("add_to_inbox", tool_names)
 
-                # Calling a forbidden tool returns permission error
-                denied_call = await mcp_server.handle_call_tool(
-                    auth_ctx,
-                    types.CallToolRequestParams(
-                        name="add_to_inbox", arguments={"content": "hello", "bearer_token": test_token}
-                    ),
-                )
-                self.assertTrue(denied_call.is_error)
-                self.assertIn("Permission denied", denied_call.content[0].text)
+                    # Calling a forbidden tool returns permission error
+                    denied_call = await mcp_server.handle_call_tool(
+                        auth_ctx,
+                        types.CallToolRequestParams(
+                            name="add_to_inbox",
+                            arguments={"content": "hello"},
+                            _meta={"authorization": f"Bearer {test_token}"},
+                        ),
+                    )
+                    self.assertTrue(denied_call.is_error)
+                    self.assertIn("Permission denied", denied_call.content[0].text)
 
         asyncio.run(run_permission_checks())
 
     def test_mcp_inbox_path_traversal_and_size_rejection(self):
         import asyncio
-        import os
-        from unittest.mock import patch
         import mcp_server
         from mcp import types
 
         test_token = "secret-mcp-bearer-token-123456"
 
         async def run_ingestion_checks():
-            with patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token}):
+            with self._isolated_mcp_env(configure_token=test_token):
                 # Path traversal attempt in arguments raises descriptive ValueError
                 with self.assertRaisesRegex(ValueError, "Path traversal attempt detected"):
                     await mcp_server.handle_call_tool(
                         None,
                         types.CallToolRequestParams(
                             name="add_to_inbox",
-                            arguments={"content": "malicious content", "source": "../../evil", "bearer_token": test_token},
+                            arguments={"content": "malicious content", "source": "../../evil"},
+                            _meta={"authorization": f"Bearer {test_token}"},
                         ),
                     )
 
@@ -883,7 +1281,8 @@ class MCPBoundaryTests(unittest.TestCase):
                         None,
                         types.CallToolRequestParams(
                             name="add_to_inbox",
-                            arguments={"content": "malicious content", "filename": "../../../boot.ini", "bearer_token": test_token},
+                            arguments={"content": "malicious content", "filename": "../../../boot.ini"},
+                            _meta={"authorization": f"Bearer {test_token}"},
                         ),
                     )
 
@@ -894,7 +1293,8 @@ class MCPBoundaryTests(unittest.TestCase):
                         None,
                         types.CallToolRequestParams(
                             name="add_to_inbox",
-                            arguments={"content": oversized_content, "bearer_token": test_token},
+                            arguments={"content": oversized_content},
+                            _meta={"authorization": f"Bearer {test_token}"},
                         ),
                     )
 
@@ -904,7 +1304,8 @@ class MCPBoundaryTests(unittest.TestCase):
                         None,
                         types.CallToolRequestParams(
                             name="add_to_inbox",
-                            arguments={"content": "data with \x00 null byte", "bearer_token": test_token},
+                            arguments={"content": "data with \x00 null byte"},
+                            _meta={"authorization": f"Bearer {test_token}"},
                         ),
                     )
 
@@ -912,76 +1313,143 @@ class MCPBoundaryTests(unittest.TestCase):
 
     def test_mcp_get_atom_restricts_to_accepted_and_quarantines_inbox(self):
         import asyncio
-        import os
-        from unittest.mock import patch
         import mcp_server
         from mcp import types
 
         test_token = "secret-mcp-bearer-token-123456"
 
         async def run_atom_and_quarantine_checks():
-            with patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token}):
+            with self._isolated_mcp_env(configure_token=test_token) as env:
+                meta = {"authorization": f"Bearer {test_token}"}
+
                 # 1. Approved atom can be read
                 approved_res = await mcp_server.handle_call_tool(
                     None,
                     types.CallToolRequestParams(
-                        name="get_atom", arguments={"atom_id": "structured-logging.md", "bearer_token": test_token}
+                        name="get_atom",
+                        arguments={"atom_id": "structured-logging.md"},
+                        _meta=meta,
                     ),
                 )
                 self.assertIn("Logs should be structured (JSON)", approved_res.content[0].text)
 
-                # 2. Pending atom is strictly blocked from external reading
-                pending_res = await mcp_server.handle_call_tool(
-                    None,
-                    types.CallToolRequestParams(
-                        name="get_atom", arguments={"atom_id": "observability-o11y.md", "bearer_token": test_token}
-                    ),
-                )
-                self.assertIn("not currently owner-approved", pending_res.content[0].text)
+                # 2. Pending, superseded, and tampered-source atoms are blocked from external reading
+                for blocked_id in ("observability-o11y.md", "superseded-logging.md", "tampered-logging.md"):
+                    blocked_res = await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(
+                            name="get_atom",
+                            arguments={"atom_id": blocked_id},
+                            _meta=meta,
+                        ),
+                    )
+                    self.assertIn("not currently owner-approved", blocked_res.content[0].text)
 
                 # 3. Path traversal in get_atom is rejected
                 trav_res = await mcp_server.handle_call_tool(
                     None,
                     types.CallToolRequestParams(
-                        name="get_atom", arguments={"atom_id": "../../pyproject.toml", "bearer_token": test_token}
+                        name="get_atom",
+                        arguments={"atom_id": "../../pyproject.toml"},
+                        _meta=meta,
                     ),
                 )
                 self.assertIn("not found or invalid", trav_res.content[0].text)
 
                 # 4. Valid add_to_inbox writes strictly to quarantined inbox (0-raw/inbox/) and never top-level 0-raw/
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    raw_dir = Path(tmp_dir) / "0-raw"
-                    inbox_dir = raw_dir / "inbox"
-                    audit_file = raw_dir / "archive" / "mcp-audit.jsonl"
-                    raw_dir.mkdir(parents=True, exist_ok=True)
-                    with (
-                        patch.object(mcp_server, "RAW_DIR", str(raw_dir)),
-                        patch.object(mcp_server, "INBOX_DIR", str(inbox_dir)),
-                        patch.object(mcp_server, "MCP_AUDIT_PATH", str(audit_file)),
-                        patch("mcp_server.audit_mcp_use", return_value={}),
-                    ):
-                        inbox_res = await mcp_server.handle_call_tool(
-                            None,
-                            types.CallToolRequestParams(
-                                name="add_to_inbox",
-                                arguments={
-                                    "content": "Quarantined capture test payload.",
-                                    "source": "unit_test",
-                                    "bearer_token": test_token,
-                                },
-                            ),
-                        )
-                    self.assertIn("quarantined inbox", inbox_res.content[0].text)
-                    self.assertIn("remains isolated in 0-raw/inbox/", inbox_res.content[0].text)
-                    inbox_files = list(inbox_dir.glob("*.md"))
-                    raw_root_files = list(raw_dir.glob("*.md"))
-                    self.assertEqual(len(inbox_files), 1)
-                    self.assertEqual(len(raw_root_files), 0)
-                    stored_text = inbox_files[0].read_text(encoding="utf-8")
-                    self.assertIn("<!-- second_brain_origin: mcp_local -->", stored_text)
-                    self.assertIn("Quarantined capture test payload.", stored_text)
+                existing_raw_md = set(env["raw_dir"].glob("*.md"))
+                inbox_res = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="add_to_inbox",
+                        arguments={
+                            "content": "Quarantined capture test payload.",
+                            "source": "unit_test",
+                        },
+                        _meta=meta,
+                    ),
+                )
+                self.assertIn("quarantined inbox", inbox_res.content[0].text)
+                self.assertIn("remains isolated in 0-raw/inbox/", inbox_res.content[0].text)
+                inbox_files = list(env["inbox_dir"].glob("*.md"))
+                new_raw_root_files = set(env["raw_dir"].glob("*.md")) - existing_raw_md
+                self.assertEqual(len(inbox_files), 1)
+                self.assertEqual(len(new_raw_root_files), 0)
+                stored_text = inbox_files[0].read_text(encoding="utf-8")
+                self.assertIn("<!-- second_brain_origin: mcp_local -->", stored_text)
+                self.assertIn("Quarantined capture test payload.", stored_text)
 
         asyncio.run(run_atom_and_quarantine_checks())
+
+    def test_mcp_read_resource_enforces_auth_approval_tamper_and_traversal_guards(self):
+        import asyncio
+        import mcp_server
+        from mcp import types
+
+        test_token = "secret-mcp-bearer-token-123456"
+
+        async def run_resource_checks():
+            with self._isolated_mcp_env(configure_token=test_token):
+                # Verify bearer_token is absent from every ALL_TOOLS inputSchema["properties"]
+                for tool in mcp_server.ALL_TOOLS:
+                    schema = getattr(tool, "input_schema", None) or tool.model_dump(by_alias=True).get("inputSchema", {})
+                    self.assertNotIn("bearer_token", schema.get("properties", {}))
+
+                meta = {"authorization": f"Bearer {test_token}"}
+
+                # (a) Unauthorized call (missing or wrong token) returns contents=[]
+                unauth_none = await mcp_server.handle_read_resource(
+                    None,
+                    types.ReadResourceRequestParams(uri="brain://atoms/structured-logging.md"),
+                )
+                self.assertEqual(unauth_none.contents, [])
+
+                unauth_wrong = await mcp_server.handle_read_resource(
+                    None,
+                    types.ReadResourceRequestParams(
+                        uri="brain://atoms/structured-logging.md",
+                        _meta={"authorization": "Bearer wrong-token-123456"},
+                    ),
+                )
+                self.assertEqual(unauth_wrong.contents, [])
+
+                # (b) Authorized call via _meta on accepted current atom returns markdown content
+                ok_res = await mcp_server.handle_read_resource(
+                    None,
+                    types.ReadResourceRequestParams(
+                        uri="brain://atoms/structured-logging.md",
+                        _meta=meta,
+                    ),
+                )
+                self.assertEqual(len(ok_res.contents), 1)
+                self.assertEqual(ok_res.contents[0].mime_type, "text/markdown")
+                self.assertIn("Logs should be structured (JSON)", ok_res.contents[0].text)
+
+                # (c) pending, superseded_by, or tampered-source atom returns contents=[]
+                for blocked_uri in (
+                    "brain://atoms/observability-o11y.md",
+                    "brain://atoms/superseded-logging.md",
+                    "brain://atoms/tampered-logging.md",
+                ):
+                    blocked = await mcp_server.handle_read_resource(
+                        None,
+                        types.ReadResourceRequestParams(uri=blocked_uri, _meta=meta),
+                    )
+                    self.assertEqual(blocked.contents, [], f"Expected empty contents for {blocked_uri}")
+
+                # (d) Traversal URI brain://atoms/../../pyproject.toml returns contents=[]
+                for trav_uri in (
+                    "brain://atoms/../../pyproject.toml",
+                    "brain://atoms/..\\..\\pyproject.toml",
+                    "brain://other/structured-logging.md",
+                ):
+                    trav = await mcp_server.handle_read_resource(
+                        None,
+                        types.ReadResourceRequestParams(uri=trav_uri, _meta=meta),
+                    )
+                    self.assertEqual(trav.contents, [], f"Expected empty contents for {trav_uri}")
+
+        asyncio.run(run_resource_checks())
 
 
 class ScoutPinningTests(unittest.TestCase):
@@ -1257,6 +1725,80 @@ The source makes a claim.
                     )
             self.assertEqual(atom_path.read_text(encoding="utf-8"), original)
             self.assertFalse(decision_log.exists())
+
+    def test_resolve_under_and_safe_file_reject_junction_escape_ntfs_ads_and_reserved_devices(self):
+        import os
+        import subprocess
+        from config import resolve_under, safe_file_in_dir
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base_dir = root / "vault"
+            outside_dir = root / "outside"
+            base_dir.mkdir()
+            outside_dir.mkdir()
+            (outside_dir / "secret.md").write_text("outside secret", encoding="utf-8")
+            (base_dir / "note.md").write_text("legit note", encoding="utf-8")
+
+            escape_junc = base_dir / "escape_junc"
+            direct_junc_md = base_dir / "junction-note.md"
+            created_junctions: list[Path] = []
+            try:
+                for link_path in (escape_junc, direct_junc_md):
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["cmd", "/c", "mklink", "/J", str(link_path), str(outside_dir)],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                    else:
+                        os.symlink(outside_dir, link_path, target_is_directory=True)
+                    created_junctions.append(link_path)
+
+                # 1. NTFS directory junction / symlink escaping base_dir returns None
+                self.assertIsNone(resolve_under(str(base_dir), "escape_junc/secret.md", must_exist=True))
+                self.assertIsNone(resolve_under(str(base_dir), "escape_junc/new.md", must_exist=False))
+                self.assertIsNone(resolve_under(str(base_dir), "escape_junc", must_exist=True))
+                self.assertIsNone(resolve_under(str(base_dir), "escape_junc", must_exist=False))
+                self.assertIsNone(
+                    safe_file_in_dir(str(base_dir), "junction-note.md", allowed_exts={".md"}, must_exist=True)
+                )
+                self.assertIsNone(
+                    safe_file_in_dir(str(base_dir), "junction-note.md", allowed_exts={".md"}, must_exist=False)
+                )
+
+                # 2. NTFS Alternate Data Streams (ADS) return None
+                for ads_name in ("note.md:stream", "note.md:stream:$DATA", "note.md:hidden.md"):
+                    self.assertIsNone(resolve_under(str(base_dir), ads_name, must_exist=True))
+                    self.assertIsNone(resolve_under(str(base_dir), ads_name, must_exist=False))
+                    self.assertIsNone(
+                        safe_file_in_dir(str(base_dir), ads_name, allowed_exts={".md"}, must_exist=True)
+                    )
+                    self.assertIsNone(
+                        safe_file_in_dir(str(base_dir), ads_name, allowed_exts={".md"}, must_exist=False)
+                    )
+
+                # 3. Reserved Windows device names return None across both helpers
+                for reserved in ("CON.md", "NUL.md", "COM1.md", "con.md", "NUL.tar.md"):
+                    self.assertIsNone(resolve_under(str(base_dir), reserved, must_exist=True))
+                    self.assertIsNone(resolve_under(str(base_dir), reserved, must_exist=False))
+                    self.assertIsNone(resolve_under(str(base_dir), f"sub/{reserved}", must_exist=False))
+                    self.assertIsNone(
+                        safe_file_in_dir(str(base_dir), reserved, allowed_exts={".md"}, must_exist=True)
+                    )
+                    self.assertIsNone(
+                        safe_file_in_dir(str(base_dir), reserved, allowed_exts={".md"}, must_exist=False)
+                    )
+            finally:
+                for link_path in reversed(created_junctions):
+                    try:
+                        if os.name == "nt":
+                            os.rmdir(link_path)
+                        else:
+                            os.unlink(link_path)
+                    except OSError:
+                        pass
 
 
 class ReviewDetailsTests(unittest.TestCase):
@@ -1794,15 +2336,69 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
         self.assertTrue(sh.startswith("#!/usr/bin/env bash"))
 
     def test_doctor_and_test_all_orchestrator_contracts(self):
+        from contextlib import ExitStack
+        from unittest.mock import patch
         import doctor
         import test_all
+        from lexical_store import rebuild_lexical_index
 
-        checks = doctor.run_checks()
+        def _patch_doctor_vault(stack: ExitStack, vault_root: Path) -> None:
+            raw_dir = vault_root / "0-raw"
+            stack.enter_context(patch.object(doctor, "BRAIN_DIR", str(vault_root)))
+            stack.enter_context(patch.object(doctor, "RAW_DIR", str(raw_dir)))
+            stack.enter_context(patch.object(doctor, "INBOX_DIR", str(raw_dir / "inbox")))
+            stack.enter_context(patch.object(doctor, "ATOMS_DIR", str(vault_root / "2-atoms")))
+            stack.enter_context(patch.object(doctor, "THREADS_DIR", str(vault_root / "3-threads")))
+            stack.enter_context(patch.object(doctor, "SOURCES_DIR", str(vault_root / "sources")))
+            stack.enter_context(patch.object(doctor, "BRIEFINGS_DIR", str(vault_root / "briefings")))
+            stack.enter_context(patch.object(doctor, "CHROMA_PATH", str(vault_root / ".chroma")))
+            stack.enter_context(
+                patch.object(doctor, "LEXICAL_INDEX_PATH", str(vault_root / ".sidecar" / "lexical.sqlite3"))
+            )
+            stack.enter_context(patch.object(doctor, "READING_LIST", str(raw_dir / "reading-list.md")))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+
+            # 1. Uninitialized empty BRAIN_VAULT_DIR returns structured FAILs without raising FileNotFoundError
+            uninit_vault = tmp_root / "empty-vault"
+            uninit_vault.mkdir()
+            with ExitStack() as stack:
+                _patch_doctor_vault(stack, uninit_vault)
+                uninit_checks = doctor.run_checks()
+            uninit_failed_areas = {area for status, area, _ in uninit_checks if status == "FAIL"}
+            self.assertIn("vault dirs", uninit_failed_areas)
+            self.assertIn("lexical recall", uninit_failed_areas)
+
+            # 2. Seeded isolated temporary vault passes all required doctor checks cleanly
+            healthy_vault = tmp_root / "healthy-vault"
+            for subdir in (
+                "0-raw",
+                "0-raw/inbox",
+                "1-desk",
+                "2-atoms",
+                "3-threads",
+                "sources",
+                "briefings",
+                ".chroma",
+                ".sidecar",
+            ):
+                (healthy_vault / subdir).mkdir(parents=True, exist_ok=True)
+            rebuild_lexical_index(
+                str(healthy_vault / "2-atoms"),
+                str(healthy_vault / ".sidecar" / "lexical.sqlite3"),
+            )
+            with ExitStack() as stack:
+                _patch_doctor_vault(stack, healthy_vault)
+                checks = doctor.run_checks()
+
         areas = {area for _, area, _ in checks}
         self.assertIn("host runtime", areas)
         self.assertIn("c++ runtime", areas)
         self.assertIn("compute device", areas)
         self.assertIn("capabilities", areas)
+        self.assertIn("vault dirs", areas)
+        self.assertIn("lexical recall", areas)
         failures = [item for item in checks if item[0] == "FAIL"]
         self.assertEqual(failures, [])
 
@@ -1818,6 +2414,36 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "smoke_test",
             },
         )
+
+    def test_launcher_and_bootstrap_script_paths_exist_and_setup_sh_is_lf_only(self):
+        launcher_files = (
+            "run_dashboard.ps1",
+            "run_daemon.ps1",
+            "run_night_shift.ps1",
+            "setup.ps1",
+            "setup.sh",
+        )
+        scripts_dir = ROOT / "scripts"
+        pattern = re.compile(r"scripts[\\/]([A-Za-z0-9_.-]+\.py)")
+
+        for launcher_name in launcher_files:
+            launcher_path = ROOT / launcher_name
+            self.assertTrue(launcher_path.is_file(), f"Missing launcher file: {launcher_name}")
+            text = launcher_path.read_text(encoding="utf-8")
+            referenced_scripts = pattern.findall(text)
+            self.assertTrue(
+                referenced_scripts,
+                f"Expected at least one scripts/*.py reference in {launcher_name}",
+            )
+            for script_basename in referenced_scripts:
+                target = scripts_dir / script_basename
+                self.assertTrue(
+                    target.is_file(),
+                    f"{launcher_name} references missing script: scripts/{script_basename}",
+                )
+
+        setup_sh_bytes = (ROOT / "setup.sh").read_bytes()
+        self.assertEqual(setup_sh_bytes.count(b"\r"), 0, "setup.sh must use LF line endings (zero \\r bytes)")
 
 
 class IndependentAuditReconciliationTests(unittest.TestCase):

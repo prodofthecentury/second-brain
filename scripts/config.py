@@ -16,7 +16,7 @@ import stat
 # ─── Root Paths ──────────────────────────────────────────────────────────────
 SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR     = os.path.dirname(SCRIPTS_DIR)
-BRAIN_DIR    = os.path.abspath(os.environ.get("BRAIN_VAULT_DIR", os.path.join(ROOT_DIR, "brain")))
+BRAIN_DIR    = os.path.abspath((os.environ.get("BRAIN_VAULT_DIR") or "").strip() or os.path.join(ROOT_DIR, "brain"))
 
 # ─── Vault Folders ───────────────────────────────────────────────────────────
 RAW_DIR      = os.path.join(BRAIN_DIR, "0-raw")
@@ -24,6 +24,7 @@ INBOX_DIR    = os.path.join(RAW_DIR, "inbox")
 DESK_DIR     = os.path.join(BRAIN_DIR, "1-desk")
 ATOMS_DIR    = os.path.join(BRAIN_DIR, "2-atoms")
 THREADS_DIR  = os.path.join(BRAIN_DIR, "3-threads")
+EXPERIENCES_DIR = os.path.join(BRAIN_DIR, "4-experiences")
 SOURCES_DIR  = os.path.join(BRAIN_DIR, "sources")
 BRIEFINGS_DIR= os.path.join(BRAIN_DIR, "briefings")
 
@@ -33,6 +34,7 @@ HOUSE_RULES  = os.path.join(BRAIN_DIR, "house-rules.md")
 CHROMA_PATH  = os.path.join(BRAIN_DIR, ".chroma")
 SIDECAR_DIR  = os.path.join(BRAIN_DIR, ".sidecar")
 LEXICAL_INDEX_PATH = os.path.join(SIDECAR_DIR, "lexical.sqlite3")
+TELEMETRY_DB_PATH  = os.path.join(SIDECAR_DIR, "telemetry.sqlite3")
 ARCHIVE_MANIFEST = os.path.join(RAW_DIR, "archive", "manifest.jsonl")
 
 # ─── Archive ─────────────────────────────────────────────────────────────────
@@ -57,7 +59,7 @@ VAULT_README = "README.md"
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def ensure_dirs():
     """Create all vault directories if they don't exist."""
-    for d in [RAW_DIR, INBOX_DIR, DESK_DIR, ATOMS_DIR, THREADS_DIR, SOURCES_DIR, BRIEFINGS_DIR, CHROMA_PATH, SIDECAR_DIR]:
+    for d in [RAW_DIR, INBOX_DIR, DESK_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, SOURCES_DIR, BRIEFINGS_DIR, CHROMA_PATH, SIDECAR_DIR]:
         os.makedirs(d, exist_ok=True)
     os.makedirs(os.path.dirname(ARCHIVE_MANIFEST), exist_ok=True)
 
@@ -158,6 +160,14 @@ def resolve_under(base_dir: str, relative_path: str, must_exist: bool = True) ->
     rel_path = raw.replace("\\", os.sep).replace("/", os.sep)
     if os.path.isabs(rel_path):
         return None
+
+    for segment in rel_path.split(os.sep):
+        if not segment:
+            continue
+        seg_stem = os.path.splitext(segment)[0].rstrip(" .").lower()
+        seg_first = segment.split(".", 1)[0].rstrip(" .").lower()
+        if seg_stem in _WINDOWS_RESERVED_STEMS or seg_first in _WINDOWS_RESERVED_STEMS:
+            return None
 
     try:
         base = os.path.realpath(base_dir)

@@ -146,17 +146,6 @@ def _extract_token_from_meta(meta: object) -> str | None:
 
 
 def extract_bearer_token(params=None, ctx=None) -> str | None:
-    if params is not None:
-        args_dict = params.get("arguments") if isinstance(params, Mapping) else getattr(params, "arguments", None)
-        if isinstance(args_dict, Mapping):
-            for key in ("bearer_token", "auth_token", "token"):
-                val = args_dict.get(key)
-                if isinstance(val, str) and val.strip():
-                    cleaned = val.strip()
-                    if cleaned.lower().startswith("bearer "):
-                        cleaned = cleaned[7:].strip()
-                    if cleaned:
-                        return cleaned
     for holder in (params, ctx):
         if holder is None:
             continue
