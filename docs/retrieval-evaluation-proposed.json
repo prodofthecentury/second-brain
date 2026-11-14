@@ -194,7 +194,7 @@
     },
     {
       "id": "pos_network_timeout_handling_08",
-      "query": "When external network calls encounter errors, what design pattern should be applied?",
+      "query": "When network calls fail and services timeout, what design pattern should be applied?",
       "category": "resilience",
       "split": "development",
       "project_scope": null,
@@ -246,7 +246,7 @@
     },
     {
       "id": "pos_outage_design_tenet_10",
-      "query": "What core tenet dictates how production services react to database outages?",
+      "query": "How should high-level systems be designed to handle database failure and outages?",
       "category": "resilience",
       "split": "holdout",
       "project_scope": null,
