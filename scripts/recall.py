@@ -14,16 +14,33 @@ Markdown memory metadata before callers inject those memories into chat.
 
 from __future__ import annotations
 
+from contextlib import closing
 import contextvars
 from dataclasses import dataclass, field, replace
+import datetime
 import hashlib
 import math
 import os
 import re
+import sqlite3
 import sys
 
-from config import ATOMS_DIR, CHROMA_PATH, EMBED_MODEL, LEXICAL_INDEX_PATH, normalize_markdown_filename, safe_file_in_dir
-from config import BRAIN_DIR, RAW_DIR, is_content_markdown
+if __name__ in ("recall", "scripts.recall"):
+    sys.modules.setdefault("recall", sys.modules[__name__])
+    sys.modules.setdefault("scripts.recall", sys.modules[__name__])
+
+from config import (
+    ATOMS_DIR,
+    BRAIN_DIR,
+    CHROMA_PATH,
+    EMBED_MODEL,
+    LEXICAL_INDEX_PATH,
+    RAW_DIR,
+    TELEMETRY_DB_PATH,
+    is_content_markdown,
+    normalize_markdown_filename,
+    safe_file_in_dir,
+)
 from index_manifest import index_manifest_is_current, load_index_manifest
 from lexical_store import LexicalIndexUnavailable, TOKEN_PATTERN, search_lexical_index
 from memory_format import split_frontmatter
@@ -94,6 +111,24 @@ class RecallOptions:
     memory_types: tuple[str, ...] = ()
     candidate_multiplier: int = 4
     retrieval_mode: str = "auto"  # 'auto', 'rrf', 'lexical', 'dense'
+    enable_fitness_boost: bool = False
+    active_context_profile: tuple[str, ...] = ()
+    telemetry_db_path: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkingContextBundle:
+    """Bounded, provenance-tracked working context assembled without truncating atom claims or evidence."""
+
+    included_results: tuple[RecallResult, ...]
+    included_atom_ids: tuple[str, ...]
+    deferred_atom_ids: tuple[str, ...]
+    used_chars: int
+    budget_chars: int
+    max_atoms: int
+    index_generation: str | None
+    source_sha256_map: dict[str, str]
+    formatted_context: str
 
 
 _LAST_DEGRADATION_WARNING: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -299,6 +334,48 @@ def context_match_score(record_contexts: tuple[str, ...], requested_contexts: tu
     return len(matches) / len(requested_contexts), tuple(matches)
 
 
+def _load_single_atom_telemetry(filename: str, telemetry_db_path: str | None = None) -> dict[str, int]:
+    """Read-only lookup of disposable sidecar telemetry; returns zeros if DB is absent or locked."""
+    db_path = telemetry_db_path or TELEMETRY_DB_PATH
+    if not db_path or not os.path.isfile(db_path):
+        return {}
+    try:
+        with closing(sqlite3.connect(db_path, timeout=2.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT retrieval_hits, grounded_citations, positive_feedback, corrections
+                FROM atom_telemetry
+                WHERE atom_id = ?
+                """,
+                (filename,),
+            ).fetchone()
+            if not row:
+                return {}
+            return {
+                "retrieval_hits": int(row["retrieval_hits"] or 0),
+                "grounded_citations": int(row["grounded_citations"] or 0),
+                "positive_feedback": int(row["positive_feedback"] or 0),
+                "corrections": int(row["corrections"] or 0),
+            }
+    except sqlite3.Error:
+        return {}
+
+
+def _compute_freshness_bonus(record: dict) -> float:
+    """Gentle 180-day half-life recency bonus in [0.0, 0.03] from last-reviewed or created ISO date."""
+    raw_date = str(record.get("last-reviewed") or record.get("created") or "").strip()
+    if not raw_date:
+        return 0.0
+    try:
+        parsed_day = datetime.date.fromisoformat(raw_date[:10])
+    except ValueError:
+        return 0.0
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    age_days = max(0.0, float((today - parsed_day).days))
+    return round(0.03 * (2.0 ** (-age_days / 180.0)), 6)
+
+
 def result_from_candidate(
     content: str,
     filename: str,
@@ -323,6 +400,7 @@ def result_from_candidate(
     memory_type = str(record.get("memory_type", "semantic"))
     contexts = metadata_contexts(record)
     context_score, matched_contexts = context_match_score(contexts, options.contexts)
+    profile_score, matched_profile = context_match_score(contexts, options.active_context_profile)
     matched_projects = project_tags_match(contexts, options.projects)
 
     score = (
@@ -338,8 +416,36 @@ def result_from_candidate(
         reasons.append("exploratory:unreviewed")
     if matched_contexts:
         reasons.append("context:" + ",".join(matched_contexts))
+    if matched_profile:
+        score += profile_score * 0.08
+        reasons.append("profile_context:" + ",".join(matched_profile))
     if matched_projects:
         reasons.append("project:" + ",".join(matched_projects))
+
+    if options.enable_fitness_boost:
+        effective_db = options.telemetry_db_path
+        if effective_db is None and os.path.abspath(atoms_dir) != os.path.abspath(ATOMS_DIR):
+            effective_db = os.path.join(os.path.abspath(os.path.join(atoms_dir, os.pardir)), ".sidecar", "telemetry.sqlite3")
+        t_stats = _load_single_atom_telemetry(filename, effective_db)
+        if t_stats:
+            # Retrieval hits are intentionally excluded: boosted results would otherwise accrue
+            # hits and self-reinforce their own rank (feedback loop). Only grounded citations,
+            # explicit owner feedback, and corrections influence the bounded fitness delta.
+            utility = (
+                (t_stats["grounded_citations"] * 2.0)
+                + (t_stats["positive_feedback"] * 1.5)
+                - (t_stats["corrections"] * 3.0)
+            )
+            fitness_delta = round(0.06 * math.tanh(utility / 10.0), 6)
+            score += fitness_delta
+            if fitness_delta > 0:
+                reasons.append(f"fitness:boost(+{fitness_delta:.4f})")
+            elif fitness_delta < 0:
+                reasons.append(f"fitness:demote({fitness_delta:.4f};corrections={t_stats['corrections']})")
+        freshness = _compute_freshness_bonus(record)
+        if freshness > 0:
+            score += freshness
+            reasons.append(f"freshness:+{freshness:.4f}")
 
     return RecallResult(
         filename=filename,
@@ -555,14 +661,45 @@ def search_lexical_memory(
     candidate_count = max(options.n_results, options.n_results * max(1, options.candidate_multiplier))
     candidates = search_lexical_index(query, index_path, n_results=candidate_count, atoms_dir=atoms_dir)
 
-    direct = []
+    fitness_or_profile = bool(options.enable_fitness_boost or options.active_context_profile)
+
+    # Apply the canonical content/overlap gates first so untrusted (pending, out-of-scope,
+    # tampered) candidates never participate in BM25 normalization.
+    gated: list[tuple[int, object, str]] = []
     for position, candidate in enumerate(candidates):
         current_content = verified_atom_content(candidate.filename, candidate.content_sha256, atoms_dir=atoms_dir)
-        if current_content is None:
+        if current_content is None or not candidate_has_query_overlap(query, current_content):
             continue
-        # FTS5 rank is an ordering-specific BM25 value. Keep it separate from vector
-        # distance and only map position to the existing display score contract.
-        lexical_similarity = 1.0 / (position + 1)
+        gated.append((position, candidate, current_content))
+
+    best_bm25 = 0.0
+    if fitness_or_profile:
+        trusted_ranks = [
+            abs(float(candidate.rank))
+            for _, candidate, current_content in gated
+            if result_from_candidate(
+                content=current_content,
+                filename=candidate.filename,
+                distance=None,
+                options=options,
+                source="lexical",
+                atoms_dir=atoms_dir,
+                similarity_override=1.0,
+            )
+        ]
+        best_bm25 = max(trusted_ranks, default=0.0)
+    use_bm25_ratio = fitness_or_profile and best_bm25 > 0.0
+
+    direct = []
+    for position, candidate, current_content in gated:
+        # Preserve legacy 1/(pos+1) when fitness/profile ranking is off; use proportional BM25
+        # relevance (normalized over trusted candidates only) when fitness/profile ranking is active
+        # so near-equal BM25 hits can be differentiated by context profile, fitness utility/corrections,
+        # and freshness without overriding strong topical matches.
+        if use_bm25_ratio:
+            lexical_similarity = clamp_number(abs(float(candidate.rank)) / best_bm25)
+        else:
+            lexical_similarity = 1.0 / (position + 1)
         result = result_from_candidate(
             content=current_content,
             filename=candidate.filename,
@@ -572,7 +709,7 @@ def search_lexical_memory(
             atoms_dir=atoms_dir,
             similarity_override=lexical_similarity,
         )
-        if result and candidate_has_query_overlap(query, current_content):
+        if result:
             direct.append(result)
 
     direct = sorted(direct, key=lambda item: item.score, reverse=True)[: options.n_results]
@@ -821,3 +958,54 @@ def format_context(results: list[RecallResult]) -> str:
         )
         parts.append(f"--- Source Atom: {result.filename} ({trust}) ---\n{result.content}")
     return "\n\n".join(parts)
+
+
+def assemble_bounded_working_context(
+    results: list[RecallResult],
+    *,
+    max_chars: int = 6000,
+    max_atoms: int = 6,
+    atoms_dir: str = ATOMS_DIR,
+    chroma_path: str = CHROMA_PATH,
+) -> WorkingContextBundle:
+    """Assemble a bounded, whole-atom working context bundle without truncating Claim or Evidence text."""
+    effective_budget = max(256, int(max_chars))
+    effective_cap = max(1, int(max_atoms))
+
+    manifest = load_index_manifest(chroma_path) if os.path.isdir(chroma_path) else None
+    gen_id = str(manifest["generation_id"]) if isinstance(manifest, dict) and manifest.get("generation_id") else None
+
+    included: list[RecallResult] = []
+    included_ids: list[str] = []
+    deferred_ids: list[str] = []
+    sha_map: dict[str, str] = {}
+    used_chars = 0
+
+    for item in results:
+        if item.filename in sha_map or item.filename in deferred_ids:
+            continue
+        atom_len = len(item.content)
+        separator_len = 2 if included else 0
+        if len(included) >= effective_cap or (used_chars + separator_len + atom_len) > effective_budget:
+            deferred_ids.append(item.filename)
+            continue
+
+        # Hash the exact verified content being included (not a fresh re-read of the file),
+        # so the reported SHA always describes the bytes actually placed in working context.
+        sha_map[item.filename] = hashlib.sha256(item.content.encode("utf-8")).hexdigest()
+
+        included.append(item)
+        included_ids.append(item.filename)
+        used_chars += separator_len + atom_len
+
+    return WorkingContextBundle(
+        included_results=tuple(included),
+        included_atom_ids=tuple(included_ids),
+        deferred_atom_ids=tuple(deferred_ids),
+        used_chars=used_chars,
+        budget_chars=effective_budget,
+        max_atoms=effective_cap,
+        index_generation=gen_id,
+        source_sha256_map=sha_map,
+        formatted_context=format_context(included),
+    )

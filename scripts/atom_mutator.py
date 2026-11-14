@@ -13,10 +13,12 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 
 from config import ATOMS_DIR, RAW_DIR
 from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor, verify_evidence_anchor
+from index_manifest import record_known_atom_hash
 from memory_format import (
     frontmatter_value,
     is_memory_document,
@@ -89,6 +91,63 @@ def content_sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+_DECISION_CACHE_LOCK = threading.Lock()
+# Maps abs_log_path -> (mtime_ns, size_bytes, prefix_sha256, latest_by_atom_filename_dict)
+_DECISION_LOG_CACHE: dict[str, tuple[int, int, str, dict[str, dict]]] = {}
+
+
+def invalidate_decision_log_cache(decision_log_path: str | None = None) -> None:
+    with _DECISION_CACHE_LOCK:
+        if decision_log_path is None:
+            _DECISION_LOG_CACHE.clear()
+        else:
+            _DECISION_LOG_CACHE.pop(os.path.abspath(decision_log_path), None)
+
+
+def latest_decisions_by_atom(decision_log_path: str) -> dict[str, dict]:
+    """Return latest decision record per atom_filename in O(1) cached time when log is unchanged."""
+    abs_log = os.path.abspath(decision_log_path)
+    with open(abs_log, "rb") as raw_fh:
+        raw = raw_fh.read()
+    # Hashing raw bytes is cheap (GB/s); JSON parsing is the expensive part we avoid.
+    full_sha = hashlib.sha256(raw).hexdigest()
+    size = len(raw)
+    with _DECISION_CACHE_LOCK:
+        cached = _DECISION_LOG_CACHE.get(abs_log)
+    if cached is not None and cached[1] == size and cached[2] == full_sha:
+        return cached[3]
+
+    # Parse only the appended tail when the cached prefix is byte-identical; else full scan.
+    latest_map: dict[str, dict] = {}
+    start_offset = 0
+    if (
+        cached is not None
+        and size > cached[1]
+        and raw[cached[1] - 1 : cached[1]] == b"\n"
+        and hashlib.sha256(raw[: cached[1]]).hexdigest() == cached[2]
+    ):
+        start_offset = cached[1]
+        latest_map = dict(cached[3])
+    tail_text = raw[start_offset:].decode("utf-8")
+
+    for line in tail_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parsed_line = json.loads(stripped)
+        if not isinstance(parsed_line, dict):
+            raise TypeError("Decision log record must be a JSON object.")
+        fname = parsed_line.get("atom_filename")
+        if isinstance(fname, str) and fname:
+            latest_map[fname] = parsed_line
+
+    with _DECISION_CACHE_LOCK:
+        if len(_DECISION_LOG_CACHE) > 256:
+            _DECISION_LOG_CACHE.clear()
+        _DECISION_LOG_CACHE[abs_log] = (0, size, full_sha, latest_map)
+    return latest_map
+
+
 def atomic_write_bytes(path: str, content: bytes):
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
@@ -102,13 +161,16 @@ def atomic_write_bytes(path: str, content: bytes):
     finally:
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
+    if str(path).endswith(".md"):
+        record_known_atom_hash(path, content_sha256(content))
 
 
 def append_decision_record(record: dict, decision_log_path: str):
-    directory = os.path.dirname(os.path.abspath(decision_log_path))
+    abs_log = os.path.abspath(decision_log_path)
+    directory = os.path.dirname(abs_log)
     os.makedirs(directory, exist_ok=True)
     payload = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-    descriptor = os.open(decision_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    descriptor = os.open(abs_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         written = os.write(descriptor, payload)
         if written != len(payload):
@@ -116,14 +178,16 @@ def append_decision_record(record: dict, decision_log_path: str):
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    invalidate_decision_log_cache(abs_log)
 
 
 def append_decision_records(records: list[dict], decision_log_path: str):
     """Append a related group of audit records in one O_APPEND write."""
-    directory = os.path.dirname(os.path.abspath(decision_log_path))
+    abs_log = os.path.abspath(decision_log_path)
+    directory = os.path.dirname(abs_log)
     os.makedirs(directory, exist_ok=True)
     payload = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records).encode("utf-8")
-    descriptor = os.open(decision_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    descriptor = os.open(abs_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         written = os.write(descriptor, payload)
         if written != len(payload):
@@ -131,13 +195,21 @@ def append_decision_records(records: list[dict], decision_log_path: str):
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    invalidate_decision_log_cache(abs_log)
 
 
-def refresh_lexical_index(atoms_dir: str, brain_dir: str) -> dict:
+def refresh_lexical_index(
+    atoms_dir: str,
+    brain_dir: str,
+    *,
+    changed_filenames: list[str] | tuple[str, ...] | None = None,
+) -> dict:
     """Refresh the rebuildable model-free index while the shared writer lock is held."""
-    from lexical_store import rebuild_lexical_index
+    from lexical_store import rebuild_lexical_index, upsert_lexical_atoms
 
     index_path = os.path.join(brain_dir, ".sidecar", "lexical.sqlite3")
+    if changed_filenames:
+        return upsert_lexical_atoms(atoms_dir, index_path, changed_filenames)
     return rebuild_lexical_index(atoms_dir, index_path)
 
 
@@ -179,26 +251,33 @@ def _write_mutation(
 
     atomic_write_bytes(atom_path, updated)
     try:
-        index_result = refresh_lexical_index(os.path.dirname(atom_path), brain_dir)
+        index_result = refresh_lexical_index(
+            os.path.dirname(atom_path),
+            brain_dir,
+            changed_filenames=[Path(atom_path).name],
+        )
         dense_state = "not_active"
         dense_generation = None
         dense_error = None
         if dense_refresh_required:
-            try:
-                from rebuild_vectors import rebuild_vectors
+            if int(index_result.get("atom_count", 0)) <= 64:
+                try:
+                    from rebuild_vectors import rebuild_vectors
 
-                dense_result = rebuild_vectors(
-                    atoms_dir=os.path.dirname(atom_path),
-                    store_path=os.path.join(brain_dir, ".chroma"),
-                    collection_name="atoms",
-                    model=dense_model,
-                    _writer_lock_held=True,
-                )
-                dense_state = "current" if dense_result.get("committed") else "stale"
-                dense_generation = dense_result.get("generation_id") if dense_state == "current" else None
-            except Exception as exc:
+                    dense_result = rebuild_vectors(
+                        atoms_dir=os.path.dirname(atom_path),
+                        store_path=os.path.join(brain_dir, ".chroma"),
+                        collection_name="atoms",
+                        model=dense_model,
+                        _writer_lock_held=True,
+                    )
+                    dense_state = "current" if dense_result.get("committed") else "stale"
+                    dense_generation = dense_result.get("generation_id") if dense_state == "current" else None
+                except Exception as exc:
+                    dense_state = "stale"
+                    dense_error = str(exc)[:1000]
+            else:
                 dense_state = "stale"
-                dense_error = str(exc)[:1000]
         record = {
             "schema_version": 1,
             "recorded_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -590,12 +669,11 @@ def approved_revision_is_current(
         anchors = {key: values.get(key) for key in ANCHOR_FIELDS}
         if not all(anchors.values()) or frontmatter_value(frontmatter, "citation_integrity") != "anchored":
             return False
-        with open(resolved_decision_log, "r", encoding="utf-8") as file:
-            records = [json.loads(line) for line in file if line.strip()]
+        latest_map = latest_decisions_by_atom(resolved_decision_log)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ReviewTransitionError):
         return False
 
-    latest = next((record for record in reversed(records) if record.get("atom_filename") == Path(path).name), None)
+    latest = latest_map.get(Path(path).name)
     if not latest or latest.get("action") != "approve" or latest.get("content_sha256_after") != current_hash:
         return False
     return verify_evidence_anchor(content, anchors, brain_dir)

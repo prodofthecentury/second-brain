@@ -643,8 +643,12 @@ def _invoke_provider_draft(
     timeout_s: float = 45.0,
     http_transport: httpx.BaseTransport | None = None,
     pinned_target: ValidatedRemoteTarget | None = None,
+    json_schema: dict | None = None,
+    schema_name: str = "grounded_claim_draft",
+    gemini_response_schema: dict | None = None,
 ) -> str:
     """Invoke the configured model endpoint and return raw structured JSON text."""
+    effective_schema = json_schema or ANSWER_DRAFT_SCHEMA
     safe_model = validate_model_identifier(model, provider=rule.provider)
     if rule.provider == "ollama":
         import ollama
@@ -653,7 +657,7 @@ def _invoke_provider_draft(
         resp = client.chat(
             model=safe_model,
             messages=[{"role": "user", "content": prompt}],
-            format=ANSWER_DRAFT_SCHEMA,
+            format=effective_schema,
             options={"temperature": 0},
         )
         return str(resp["message"]["content"])
@@ -697,9 +701,9 @@ def _invoke_provider_draft(
                     "response_format": {
                         "type": "json_schema",
                         "json_schema": {
-                            "name": "grounded_claim_draft",
+                            "name": schema_name,
                             "strict": True,
-                            "schema": ANSWER_DRAFT_SCHEMA,
+                            "schema": effective_schema,
                         },
                     },
                 }
@@ -709,6 +713,7 @@ def _invoke_provider_draft(
                 return str(data["choices"][0]["message"]["content"])
 
             if rule.provider == "anthropic":
+                tool_name = "emit_grounded_claims" if json_schema is None else schema_name
                 headers = {
                     "Content-Type": "application/json",
                     "x-api-key": api_key,
@@ -720,23 +725,33 @@ def _invoke_provider_draft(
                     "temperature": 0,
                     "tools": [
                         {
-                            "name": "emit_grounded_claims",
-                            "description": "Emit exact verbatim claim strings supported by retrieved atoms.",
-                            "input_schema": ANSWER_DRAFT_SCHEMA,
+                            "name": tool_name,
+                            "description": "Emit structured JSON strictly matching the schema.",
+                            "input_schema": effective_schema,
                         }
                     ],
-                    "tool_choice": {"type": "tool", "name": "emit_grounded_claims"},
+                    "tool_choice": {"type": "tool", "name": tool_name},
                     "messages": [{"role": "user", "content": prompt}],
                 }
                 resp = client.post(f"{rule.endpoint_url}/messages", headers=headers, json=body)
                 resp.raise_for_status()
                 data = resp.json()
                 for block in data.get("content", []):
-                    if block.get("type") == "tool_use" and block.get("name") == "emit_grounded_claims":
-                        return json.dumps(block.get("input", {"claims": []}))
-                return '{"claims":[]}'
+                    if block.get("type") == "tool_use" and block.get("name") == tool_name:
+                        return json.dumps(block.get("input", {}))
+                return "{}"
 
             if rule.provider == "gemini":
+                default_gem_schema = {
+                    "type": "OBJECT",
+                    "properties": {
+                        "claims": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"},
+                        }
+                    },
+                    "required": ["claims"],
+                }
                 headers = {
                     "Content-Type": "application/json",
                     "x-goog-api-key": api_key,
@@ -746,16 +761,7 @@ def _invoke_provider_draft(
                     "generationConfig": {
                         "temperature": 0,
                         "responseMimeType": "application/json",
-                        "responseSchema": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "claims": {
-                                    "type": "ARRAY",
-                                    "items": {"type": "STRING"},
-                                }
-                            },
-                            "required": ["claims"],
-                        },
+                        "responseSchema": gemini_response_schema or default_gem_schema,
                     },
                 }
                 encoded_model = url_quote(safe_model, safe="._-")

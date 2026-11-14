@@ -2,8 +2,14 @@
 
 ## Status
 
-Draft architecture note. This document describes the direction for the next
-major capability layer on top of the existing Second Brain infrastructure.
+**Implemented (Phases 2 & 3A).** This note originally specified the Cognitive
+Core architecture layer on top of Second Brain. All six Cognitive Core
+milestones—including Layers 4–5 (fitness-aware ranking, owner-gated Skill
+Playbooks in `brain/5-playbooks/`, and the grounded Executive Planner in
+`scripts/executive_planner.py`)—are now implemented, security-audited, and
+verified. See `docs/phase2-architecture-and-sweep-2026-11-15.md` and
+`docs/phase3a-and-phase4-architecture-2026-11-15.md` for current architecture
+details and security invariants.
 
 ## Purpose
 
@@ -143,19 +149,20 @@ Promotion should depend on repeated successful use, low correction rate, clear
 inputs, clear outputs, and human-readable recovery steps. Executable skills are
 not part of the current slice.
 
-## What Not To Build Yet
+## Guardrails (Still In Force)
 
 - No self-modifying code pipeline.
 - No continual model fine-tuning.
 - No distributed CRDT synchronization.
 - No autonomous deletion of memories.
-- No executive planner until typed memory and reflection records are reliable.
+- No autonomous Playbook promotion or edits outside owner CAS + SHA-256 audit logs (`brain/0-raw/archive/playbook-decisions.jsonl`).
+- Executive plans (`scripts/executive_planner.py`) must remain strictly grounded in verified Playbooks and owner-approved Atoms, never raw notes or unapproved candidates.
 
-## Next Milestones
+## Milestone Status
 
-1. Multi-memory typed Refinery.
-2. Operational stats store for retrieval and utility metrics.
-3. Memory fitness reports.
-4. Experience and reflection records.
-5. Procedure verification and skill-candidate tracking.
-6. Executive planner using mature skills and memory, not raw notes.
+1. Multi-memory typed Refinery — **Complete** (`scripts/ollama_refinery.py`).
+2. Operational stats store for retrieval and utility metrics — **Complete** (`brain/.sidecar/telemetry.sqlite3` + durable canonical correction log `brain/0-raw/archive/atom-corrections.jsonl` in `scripts/cognitive_core.py`).
+3. Memory fitness reports — **Complete** (`second-brain cognitive fitness`, `GET /v1/cognitive/fitness`, context-profile & fitness-aware ranking in `scripts/recall.py`).
+4. Experience and reflection records — **Complete** (`brain/4-experiences/`, `POST /v1/cognitive/experiences`).
+5. Procedure verification and skill-candidate tracking — **Complete** (owner-gated Skill Playbooks in `brain/5-playbooks/`, `scripts/skill_playbooks.py`, `second-brain playbooks`, `GET /v1/playbooks`).
+6. Executive planner using mature skills and memory, not raw notes — **Complete** (`scripts/executive_planner.py`, `second-brain plan`, `POST /v1/plan`).

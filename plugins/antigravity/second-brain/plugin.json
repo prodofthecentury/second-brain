@@ -1,0 +1,11 @@
+{
+  "name": "second-brain",
+  "displayName": "Second Brain",
+  "version": "0.2.0",
+  "description": "Your local-first Second Brain: search owner-verified memories and notes, and remember decisions across sessions. The vault stays on your machine.",
+  "suggestedPrompts": [
+    "What do my notes say about this project's deployment process?",
+    "Remember that this repo uses uv and Python 3.11",
+    "Search my verified memories for logging guidelines"
+  ]
+}

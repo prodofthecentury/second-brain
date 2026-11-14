@@ -54,6 +54,21 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "phase2_safety_tests.py")),
     ),
     (
+        "phase3_cognitive_tests",
+        "Phase 3A context/fitness ranking, owner-gated Playbooks & grounded Executive Planner suite (scripts/phase3_cognitive_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "phase3_cognitive_tests.py")),
+    ),
+    (
+        "phase4_product_tests",
+        "Phase 4 scale engine, zero-friction notes, one-click verify, streaming chat, product API, import & IDE connector suite (scripts/phase4_product_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "phase4_product_tests.py")),
+    ),
+    (
+        "scale_benchmark_1500",
+        "Corpus-scale correctness canary on a 1,500-note isolated vault (scripts/scale_benchmark.py)",
+        (str(SCRIPTS_DIR / "scale_benchmark.py"), "--notes", "1500", "--queries", "20"),
+    ),
+    (
         "chroma_rebuild_canary",
         "Real ChromaDB staged vector rebuild, cosine activation & handle cleanup canary (scripts/chroma_rebuild_canary.py)",
         (str(SCRIPTS_DIR / "chroma_rebuild_canary.py"),),

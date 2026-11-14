@@ -25,8 +25,13 @@ DESK_DIR     = os.path.join(BRAIN_DIR, "1-desk")
 ATOMS_DIR    = os.path.join(BRAIN_DIR, "2-atoms")
 THREADS_DIR  = os.path.join(BRAIN_DIR, "3-threads")
 EXPERIENCES_DIR = os.path.join(BRAIN_DIR, "4-experiences")
+PLAYBOOKS_DIR = os.path.join(BRAIN_DIR, "5-playbooks")
 SOURCES_DIR  = os.path.join(BRAIN_DIR, "sources")
 BRIEFINGS_DIR= os.path.join(BRAIN_DIR, "briefings")
+# Owner knowledge base: zero-friction, immediately searchable, never treated as verified claims.
+NOTES_DIR    = os.path.join(BRAIN_DIR, "notes")
+# Immutable note snapshots used as evidence sources for one-click verified atoms.
+NOTE_SNAPSHOTS_DIR = os.path.join(RAW_DIR, "note-snapshots")
 
 # ─── Special Files ───────────────────────────────────────────────────────────
 READING_LIST = os.path.join(RAW_DIR, "reading-list.md")
@@ -34,6 +39,7 @@ HOUSE_RULES  = os.path.join(BRAIN_DIR, "house-rules.md")
 CHROMA_PATH  = os.path.join(BRAIN_DIR, ".chroma")
 SIDECAR_DIR  = os.path.join(BRAIN_DIR, ".sidecar")
 LEXICAL_INDEX_PATH = os.path.join(SIDECAR_DIR, "lexical.sqlite3")
+NOTES_INDEX_PATH   = os.path.join(SIDECAR_DIR, "notes.sqlite3")
 TELEMETRY_DB_PATH  = os.path.join(SIDECAR_DIR, "telemetry.sqlite3")
 ARCHIVE_MANIFEST = os.path.join(RAW_DIR, "archive", "manifest.jsonl")
 
@@ -59,7 +65,7 @@ VAULT_README = "README.md"
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def ensure_dirs():
     """Create all vault directories if they don't exist."""
-    for d in [RAW_DIR, INBOX_DIR, DESK_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, SOURCES_DIR, BRIEFINGS_DIR, CHROMA_PATH, SIDECAR_DIR]:
+    for d in [RAW_DIR, INBOX_DIR, DESK_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, PLAYBOOKS_DIR, SOURCES_DIR, BRIEFINGS_DIR, NOTES_DIR, NOTE_SNAPSHOTS_DIR, CHROMA_PATH, SIDECAR_DIR]:
         os.makedirs(d, exist_ok=True)
     os.makedirs(os.path.dirname(ARCHIVE_MANIFEST), exist_ok=True)
 

@@ -100,6 +100,13 @@ def doctor() -> int:
     atoms_dir = Path(_config.ATOMS_DIR)
     atom_files = sorted(path for path in atoms_dir.glob("*.md") if path.name != "README.md") if atoms_dir.is_dir() else []
     print(f"Atoms: {len(atom_files)}")
+    playbooks_dir = Path(_config.PLAYBOOKS_DIR)
+    playbook_files = (
+        sorted(path for path in playbooks_dir.glob("*.md") if path.name != "README.md")
+        if playbooks_dir.is_dir()
+        else []
+    )
+    print(f"Playbooks: {len(playbook_files)}")
     try:
         from scripts.review_atom import approved_revision_is_current
 
@@ -251,7 +258,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     cognitive_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
 
-    args, remainder = parser.parse_known_args(argv)
+    playbooks_parser = subparsers.add_parser(
+        "playbooks",
+        help="Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks.",
+        add_help=False,
+    )
+    playbooks_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
+
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help="Assemble a grounded, citation-verified Executive Plan from Playbooks and approved Atoms.",
+        add_help=False,
+    )
+    plan_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
+
+    for name, help_text in (
+        ("notes", "Zero-friction notes: add, search, list, reindex, verify an excerpt."),
+        ("import", "Bulk-import an Obsidian vault or Markdown folder into notes."),
+        ("chat", "Chat with streaming answers over verified memory and notes."),
+        ("connect", "One-click connect Claude Code/Desktop, Cursor, Windsurf, VS Code, or Antigravity."),
+        ("benchmark", "Run the corpus-scale benchmark on a synthetic isolated vault."),
+    ):
+        p = subparsers.add_parser(name, help=help_text, add_help=False)
+        p.add_argument("sub_argv", nargs=argparse.REMAINDER)
+    serve_parser.add_argument("--ensure-tokens", action="store_true", help="Create agent and owner tokens if missing.")
+
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] in _PASSTHROUGH_COMMANDS:
+        # Forward sub-command arguments verbatim: argparse.REMAINDER reorders leading
+        # optionals (e.g. `plan --goal X`), so passthrough commands bypass the top-level parser.
+        forwarded = raw_argv[1:]
+        if forwarded[:1] == ["--"]:
+            forwarded = forwarded[1:]
+        return _dispatch_passthrough(raw_argv[0], forwarded)
+
+    args, remainder = parser.parse_known_args(raw_argv)
     if args.command == "doctor":
         if remainder:
             parser.error(f"unrecognized arguments: {' '.join(remainder)}")
@@ -282,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
         api_argv = ["--host", args.host, "--port", str(args.port)]
         if args.generate_token:
             api_argv.append("--generate-token")
+        if getattr(args, "ensure_tokens", False):
+            api_argv.append("--ensure-tokens")
         return api_main(api_argv)
     if args.command == "adapter-config":
         if remainder:
@@ -289,21 +332,58 @@ def main(argv: list[str] | None = None) -> int:
         from scripts.memory_api import main as api_main
 
         return api_main(["--port", str(args.port), "--print-adapter-config"])
-    if args.command in {"inbox", "hosts", "cognitive"}:
+    if args.command in _PASSTHROUGH_COMMANDS:
         forwarded = list(getattr(args, "sub_argv", []) or []) + list(remainder)
         if forwarded[:1] == ["--"]:
             forwarded = forwarded[1:]
-        if args.command == "inbox":
-            from scripts.inbox_workflow import main as inbox_main
+        return _dispatch_passthrough(args.command, forwarded)
+    return 2
 
-            return inbox_main(forwarded)
-        if args.command == "hosts":
-            from scripts.host_adapters import main as hosts_main
 
-            return hosts_main(forwarded)
+_PASSTHROUGH_COMMANDS = frozenset({"inbox", "hosts", "cognitive", "playbooks", "plan", "notes", "import", "chat", "connect", "benchmark"})
+
+
+def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
+    if command == "inbox":
+        from scripts.inbox_workflow import main as inbox_main
+
+        return inbox_main(forwarded)
+    if command == "hosts":
+        from scripts.host_adapters import main as hosts_main
+
+        return hosts_main(forwarded)
+    if command == "cognitive":
         from scripts.cognitive_core import main as cognitive_main
 
         return cognitive_main(forwarded)
+    if command == "playbooks":
+        from scripts.skill_playbooks import main as playbooks_main
+
+        return playbooks_main(forwarded)
+    if command == "plan":
+        from scripts.executive_planner import main as plan_main
+
+        return plan_main(forwarded)
+    if command == "notes":
+        from scripts.notes_store import main as notes_main
+
+        return notes_main(forwarded)
+    if command == "import":
+        from scripts.bulk_import import main as import_main
+
+        return import_main(forwarded)
+    if command == "chat":
+        from scripts.streaming_chat import main as chat_main
+
+        return chat_main(forwarded)
+    if command == "connect":
+        from scripts.ide_connector import main as connect_main
+
+        return connect_main(forwarded)
+    if command == "benchmark":
+        from scripts.scale_benchmark import main as bench_main
+
+        return bench_main(forwarded)
     return 2
 
 

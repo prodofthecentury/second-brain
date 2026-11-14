@@ -261,6 +261,57 @@ synchronized across both files.
 - **Depends on:** Goals 8–12.
 - **Details:** `tasks/plan.md` Goal 13.
 
+### Goal 14 — Context/Fitness Ranking, Skill Playbooks & Grounded Executive Planner (Phase 3A) — COMPLETE
+
+- [x] Implement fitness-aware ranking, validated `best_bm25` normalization, and
+  content-hashed bounded working-context assembly (`scripts/recall.py`), backed
+  by durable `brain/0-raw/archive/atom-corrections.jsonl` (`scripts/cognitive_core.py`).
+- [x] Standardize owner-gated CAS Skill Playbooks under `brain/5-playbooks/`
+  (`scripts/skill_playbooks.py`, `scripts/config.py`) with SHA-256 decision log
+  verification, `.history/` backups, whole-Claim step grounding, and per-atom
+  project scope gates.
+- [x] Implement grounded Executive Planner (`scripts/executive_planner.py`),
+  `second-brain playbooks` / `plan`, `GET /v1/playbooks`, `POST /v1/plan`, and
+  Dashboard Playbooks & Planner tabs (`dashboard/app.py`).
+- [x] Complete independent `security-auditor` review (`dda00b6d-652b-41d6-adb9-2fc45492e3cf`)
+  and lock down `H1`, `H2`, `M1`–`M4`, `L1`–`L7` in `scripts/phase3_cognitive_tests.py`
+  (10 tests passing).
+- **Depends on:** Goals 12–13.
+- **Details:** `tasks/plan.md` Goal 14.
+
+### Goal 15 — Scale Engine, Zero-Friction Notes, Excerpt Verification & Bulk Importer (Phase 4) — COMPLETE
+
+- [x] Implement stat-cached `os.scandir()` revision scans (`scripts/index_manifest.py`),
+  incremental FTS5 upsert/sync/fast browse (`scripts/lexical_store.py`), tail-cached
+  decision logs (`scripts/atom_mutator.py`), SHA-256 cached source normalization
+  (`scripts/evidence.py`), Windows-safe Chroma activation retries
+  (`scripts/rebuild_vectors.py`), and `scripts/scale_benchmark.py`.
+- [x] Build zero-friction owner notes (`scripts/notes_store.py`, `brain/notes/`,
+  `brain/.sidecar/notes.sqlite3`) with CAS updates, quarantine for risky captures,
+  and one-click `verify_note_excerpt()` immutable snapshotting under
+  `brain/0-raw/note-snapshots/`.
+- [x] Implement idempotent Markdown/Obsidian bulk importer (`scripts/bulk_import.py`,
+  `second-brain import`).
+- **Depends on:** Goals 5, 7, 13.
+- **Details:** `tasks/plan.md` Goal 15.
+
+### Goal 16 — Streaming Chat, Dual-Token Product API & IDE Connectors (Phase 4) — COMPLETE
+
+- [x] Build `instant` / `verified` / `stream` chat (`scripts/streaming_chat.py`,
+  `second-brain chat`, `POST /v1/chat/stream`, `POST /v1/chat/warmup`).
+- [x] Expose dual-token Loopback Product API (`scripts/api_product.py`, `scripts/memory_api.py`)
+  separating `owner_authorized` mutations from agent read/quarantined `/v1/remember`.
+- [x] Ship one-click IDE/host connector (`scripts/ide_connector.py`,
+  `second-brain connect`), plugin bundles (`plugins/antigravity/second-brain/`,
+  `plugins/claude-code/second-brain/`), Electron desktop app (`desktop/`), VS Code
+  extension (`extensions/vscode-second-brain/`), Authenticode signing script
+  (`scripts/sign_release.ps1`), custom planner schema support (`scripts/host_adapters.py`),
+  MCP notes/remember tools with `trusted_stdio_session()`, and 20 tests in
+  `scripts/phase4_product_tests.py` integrated into the 10-suite `scripts/test_all.py`
+  release gate (`10/10 PASS`).
+- **Depends on:** Goals 13–15.
+- **Details:** `tasks/plan.md` Goal 16.
+
 ## Deferred product horizon
 
 - **OS-Signed Desktop Installers:** Native code-signed MSI / DMG / AppImage GUI

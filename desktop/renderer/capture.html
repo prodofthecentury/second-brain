@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+  <title>Quick Capture</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body style="padding:14px; background:#161b22;">
+  <div style="display:flex; flex-direction:column; gap:10px; height:100%;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <strong style="font-size:14px;">Quick Capture to Second Brain</strong>
+      <span class="kbd">Esc to close</span>
+    </div>
+    <input type="text" id="qcTitle" placeholder="Optional title..." />
+    <textarea id="qcBody" placeholder="Capture a thought, snippet, or decision... (Ctrl+Enter to save)" style="flex:1; resize:none;"></textarea>
+    <div style="display:flex; gap:8px; justify-content:flex-end;">
+      <button class="btn" id="qcCancel">Cancel</button>
+      <button class="btn primary" id="qcSave">Save Note</button>
+    </div>
+  </div>
+  <script src="capture.js"></script>
+</body>
+</html>

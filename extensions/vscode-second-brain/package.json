@@ -1,0 +1,79 @@
+{
+  "name": "second-brain-vscode",
+  "displayName": "Second Brain — Local AI Memory",
+  "description": "Zero-friction notes, SHA-256 verified atoms, instant recall, and streaming chat inside VS Code, Cursor, and Windsurf.",
+  "version": "0.2.0",
+  "publisher": "second-brain",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "AI"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "second-brain-container",
+          "title": "Second Brain",
+          "icon": "$(book)"
+        }
+      ]
+    },
+    "views": {
+      "second-brain-container": [
+        {
+          "id": "secondBrain.vaultView",
+          "name": "Vault Explorer"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "secondBrain.rememberSelection",
+        "title": "Second Brain: Remember Selection"
+      },
+      {
+        "command": "secondBrain.quickRecall",
+        "title": "Second Brain: Quick Recall"
+      },
+      {
+        "command": "secondBrain.openChat",
+        "title": "Second Brain: Open Streaming Chat"
+      },
+      {
+        "command": "secondBrain.refreshVault",
+        "title": "Second Brain: Refresh Vault"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "secondBrain.rememberSelection",
+        "key": "ctrl+alt+m",
+        "mac": "cmd+alt+m",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "secondBrain.quickRecall",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r"
+      }
+    ],
+    "configuration": {
+      "title": "Second Brain",
+      "properties": {
+        "secondBrain.apiPort": {
+          "type": "number",
+          "default": 8765,
+          "description": "Loopback port of the local Second Brain HTTP API."
+        }
+      }
+    }
+  }
+}

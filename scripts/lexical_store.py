@@ -21,14 +21,14 @@ import re
 import sqlite3
 import tempfile
 
-from index_manifest import atom_revisions, revisions_fingerprint
+from index_manifest import atom_revisions, record_known_atom_hash, revisions_fingerprint
 
 
 LEXICAL_SCHEMA_VERSION = 1
 FTS_TABLE = "atoms_fts"
 META_TABLE = "lexical_meta"
 MAX_QUERY_TERMS = 24
-MAX_QUERY_RESULTS = 100
+MAX_QUERY_RESULTS = 500
 TOKEN_PATTERN = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
 
 
@@ -170,6 +170,158 @@ def rebuild_lexical_index(atoms_dir: str, index_path: str) -> dict[str, object]:
         "index_path": str(destination),
         "atom_revisions_sha256": revisions_fingerprint(revisions),
     }
+
+
+def upsert_lexical_atoms(
+    atoms_dir: str,
+    index_path: str,
+    changed_filenames: list[str] | tuple[str, ...] | set[str],
+    deleted_filenames: list[str] | tuple[str, ...] | set[str] = (),
+) -> dict[str, object]:
+    """Incrementally update specific rows in the FTS5 index in O(|changed|) time.
+
+    Falls back automatically to full atomic rebuild if the index does not yet
+    exist or its schema is unrecognized. Must be called while holding writer.lock.
+    """
+    destination = Path(index_path).resolve()
+    if not destination.is_file():
+        return rebuild_lexical_index(atoms_dir, index_path)
+
+    changed_clean = sorted({Path(f).name for f in changed_filenames if f and str(f).endswith(".md") and Path(f).name != "README.md"})
+    deleted_clean = sorted({Path(f).name for f in deleted_filenames if f and str(f).endswith(".md")})
+    target_names = sorted(set(changed_clean) | set(deleted_clean))
+
+    try:
+        conn = sqlite3.connect(str(destination), timeout=10.0)
+        try:
+            meta = _read_metadata(conn)
+            if not isinstance(meta, dict) or meta.get("schema_version") != LEXICAL_SCHEMA_VERSION:
+                conn.close()
+                return rebuild_lexical_index(atoms_dir, index_path)
+
+            with conn:
+                if target_names:
+                    placeholders = ",".join("?" for _ in target_names)
+                    conn.execute(f"DELETE FROM {FTS_TABLE} WHERE filename IN ({placeholders})", target_names)
+                for fname in changed_clean:
+                    atom_path = os.path.join(atoms_dir, fname)
+                    if not os.path.isfile(atom_path):
+                        continue
+                    with open(atom_path, "rb") as fh:
+                        raw = fh.read()
+                    text = raw.decode("utf-8")
+                    digest = hashlib.sha256(raw).hexdigest()
+                    record_known_atom_hash(atom_path, digest)
+                    conn.execute(
+                        f"INSERT INTO {FTS_TABLE}(filename, content, content_sha256) VALUES (?, ?, ?)",
+                        (fname, text, digest),
+                    )
+                row_count_row = conn.execute(f"SELECT COUNT(*) FROM {FTS_TABLE}").fetchone()
+                indexed_count = int(row_count_row[0]) if row_count_row else 0
+                revisions = atom_revisions(atoms_dir)
+                if indexed_count != len(revisions):
+                    # Self-heal if out-of-band file changes occurred since last sync
+                    raise RuntimeError("Row count drifted from disk; triggering clean atomic rebuild.")
+                fp = revisions_fingerprint(revisions)
+                updated_meta = {
+                    "schema_version": LEXICAL_SCHEMA_VERSION,
+                    "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "atom_count": len(revisions),
+                    "indexed_count": indexed_count,
+                    "atom_revisions_sha256": fp,
+                }
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {META_TABLE}(key, value) VALUES (?, ?)",
+                    [(k, json.dumps(v, ensure_ascii=False)) for k, v in updated_meta.items()],
+                )
+        finally:
+            conn.close()
+    except Exception:
+        return rebuild_lexical_index(atoms_dir, index_path)
+
+    return {
+        "indexed_count": indexed_count,
+        "atom_count": len(revisions),
+        "index_path": str(destination),
+        "atom_revisions_sha256": fp,
+        "incremental": True,
+    }
+
+
+def sync_lexical_index(atoms_dir: str, index_path: str) -> dict[str, object]:
+    """Reconcile the index with disk by diffing (filename, sha256) and upserting only the delta.
+
+    Handles out-of-band edits (external editors, sync tools) in O(changed) index writes.
+    Must be called while holding writer.lock.
+    """
+    destination = Path(index_path).resolve()
+    if lexical_index_is_current(atoms_dir, index_path):
+        return {"changed": 0, "deleted": 0, "rebuilt": False}
+    if not destination.is_file():
+        stats = rebuild_lexical_index(atoms_dir, index_path)
+        return {"changed": stats["indexed_count"], "deleted": 0, "rebuilt": True}
+    try:
+        conn = _readonly_connection(index_path)
+        try:
+            indexed = dict(conn.execute(f"SELECT filename, content_sha256 FROM {FTS_TABLE}").fetchall())
+        finally:
+            conn.close()
+    except (LexicalIndexUnavailable, sqlite3.Error):
+        stats = rebuild_lexical_index(atoms_dir, index_path)
+        return {"changed": stats["indexed_count"], "deleted": 0, "rebuilt": True}
+    on_disk = {rev["filename"]: rev["content_sha256"] for rev in atom_revisions(atoms_dir)}
+    changed = [name for name, digest in on_disk.items() if indexed.get(name) != digest]
+    deleted = [name for name in indexed if name not in on_disk]
+    upsert_lexical_atoms(atoms_dir, index_path, changed, deleted)
+    return {"changed": len(changed), "deleted": len(deleted), "rebuilt": False}
+
+
+def list_indexed_atoms_fast(
+    index_path: str,
+    *,
+    query: str = "",
+    limit: int = 200,
+    offset: int = 0,
+) -> tuple[list[LexicalCandidate], int]:
+    """Fast paginated browse/search directly from FTS5 sidecar for thousands of notes."""
+    connection = _readonly_connection(index_path)
+    try:
+        safe_limit = max(1, min(int(limit), 1000))
+        safe_offset = max(0, int(offset))
+        expr = _fts_query(query) if query and query.strip() else ""
+        if expr:
+            total_row = connection.execute(
+                f"SELECT COUNT(*) FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ?",
+                (expr,),
+            ).fetchone()
+            rows = connection.execute(
+                f"SELECT filename, content, content_sha256, rank "
+                f"FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ? ORDER BY rank LIMIT ? OFFSET ?",
+                (expr, safe_limit, safe_offset),
+            ).fetchall()
+        else:
+            total_row = connection.execute(f"SELECT COUNT(*) FROM {FTS_TABLE}").fetchone()
+            rows = connection.execute(
+                f"SELECT filename, content, content_sha256, 0.0 AS rank "
+                f"FROM {FTS_TABLE} ORDER BY filename ASC LIMIT ? OFFSET ?",
+                (safe_limit, safe_offset),
+            ).fetchall()
+        total = int(total_row[0]) if total_row else 0
+    except sqlite3.Error as exc:
+        raise LexicalIndexUnavailable(f"Lexical list query failed: {exc}") from exc
+    finally:
+        connection.close()
+
+    items = [
+        LexicalCandidate(
+            filename=str(filename),
+            content=str(content),
+            content_sha256=str(content_sha256),
+            rank=float(rank),
+        )
+        for filename, content, content_sha256, rank in rows
+    ]
+    return items, total
 
 
 def search_lexical_index(

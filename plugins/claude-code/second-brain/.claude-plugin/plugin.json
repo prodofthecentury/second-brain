@@ -1,0 +1,9 @@
+{
+  "name": "second-brain",
+  "version": "0.2.0",
+  "description": "Local-first verifiable AI memory for Claude Code: zero-friction notes, SHA-256 source-anchored atoms, and hybrid recall via MCP.",
+  "author": {
+    "name": "Second Brain"
+  },
+  "license": "MIT"
+}

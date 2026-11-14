@@ -37,3 +37,14 @@ __pycache__/
 # Reproducible page previews rendered while preparing the learning-design memo.
 # Their source PDFs and SHA-256 inventory are recorded in docs/learning-and-memory-design-synthesis.md.
 tmp/pdfs/
+
+# Node dependencies and desktop/extension build artifacts
+node_modules/
+desktop/node_modules/
+dist/
+desktop/dist/
+*.exe
+*.msi
+*.vsix
+*.pfx
+*.cer

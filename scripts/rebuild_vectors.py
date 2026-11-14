@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import argparse
 from functools import wraps
+import gc
 import hashlib
 import os
 import shutil
 import sys
+import time
 import uuid
 
 from config import ATOMS_DIR, CHROMA_PATH, EMBED_MODEL, ensure_dirs, is_content_markdown
@@ -88,6 +90,18 @@ def prune_previous_generations(active_path: str, keep: int = 2) -> None:
         shutil.rmtree(old_dir, ignore_errors=True)
 
 
+def _replace_dir_with_retry(src: str, dst: str) -> None:
+    """Replace a directory, tolerating brief Windows handle-release delays on newly closed stores."""
+    for delay in (0.05, 0.1, 0.2, 0.3, 0.5):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            gc.collect()
+            time.sleep(delay)
+    os.replace(src, dst)
+
+
 def activate_staged_store(staging_path: str, active_path: str) -> str | None:
     """Swap a complete staging store into place and retain the previous generation as a rollback backup."""
     active_path = os.path.abspath(active_path)
@@ -96,13 +110,13 @@ def activate_staged_store(staging_path: str, active_path: str) -> str | None:
 
     if os.path.exists(active_path):
         backup_path = f"{active_path}.previous-{uuid.uuid4().hex}"
-        os.replace(active_path, backup_path)
+        _replace_dir_with_retry(active_path, backup_path)
 
     try:
-        os.replace(staging_path, active_path)
+        _replace_dir_with_retry(staging_path, active_path)
     except Exception:
         if backup_path and os.path.exists(backup_path) and not os.path.exists(active_path):
-            os.replace(backup_path, active_path)
+            _replace_dir_with_retry(backup_path, active_path)
         raise
     prune_previous_generations(active_path, keep=2)
     return backup_path

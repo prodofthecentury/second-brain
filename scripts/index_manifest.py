@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import json
 import os
+import threading
 import tempfile
 import uuid
 
@@ -17,35 +18,133 @@ import uuid
 INDEX_MANIFEST_FILENAME = "index-manifest.json"
 INDEX_SCHEMA_VERSION = 2
 VECTOR_DISTANCE_METRIC = "cosine"
+LARGE_VAULT_STAT_CACHE_THRESHOLD = 64
+
+_STAT_HASH_LOCK = threading.Lock()
+_STAT_HASH_CACHE: dict[str, tuple[int, int, int, str]] = {}
+_MAX_STAT_CACHE_ENTRIES = 50_000
+# abs_dir -> (stat signature tuple, revisions list) — whole-directory memo for large vaults
+_DIR_MEMO: dict[str, tuple[tuple, list[dict[str, str]]]] = {}
+# id(revisions) -> (revisions, fingerprint)
+_FP_MEMO: dict[int, tuple[list[dict[str, str]], str]] = {}
+
+
+def invalidate_atom_revision_cache(path: str | None = None) -> None:
+    """Clear cached stat->sha256 entries (all or one specific file)."""
+    with _STAT_HASH_LOCK:
+        _DIR_MEMO.clear()
+        if path is None:
+            _STAT_HASH_CACHE.clear()
+            _FP_MEMO.clear()
+        else:
+            _STAT_HASH_CACHE.pop(os.path.abspath(path), None)
+
+
+def record_known_atom_hash(path: str, content_sha256: str) -> None:
+    """Update stat->sha256 cache immediately after an atomic write."""
+    abs_path = os.path.abspath(path)
+    try:
+        st = os.stat(abs_path)
+    except OSError:
+        invalidate_atom_revision_cache(abs_path)
+        return
+    with _STAT_HASH_LOCK:
+        if len(_STAT_HASH_CACHE) >= _MAX_STAT_CACHE_ENTRIES:
+            _STAT_HASH_CACHE.clear()
+        _STAT_HASH_CACHE[abs_path] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, content_sha256)
 
 
 def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
-    """Return the deterministic filename/hash set for indexable Markdown atoms."""
+    """Return the deterministic filename/hash set for indexable Markdown atoms.
+
+    Uses os.scandir() (zero extra per-file Win32 stat syscalls) and stat-backed
+    SHA-256 caching on vaults above LARGE_VAULT_STAT_CACHE_THRESHOLD so 5,000+
+    note checks complete in a few milliseconds while tiny test vaults hash raw
+    bytes unconditionally on every call.
+    """
     if not os.path.isdir(atoms_dir):
         return []
 
-    revisions = []
-    for filename in sorted(os.listdir(atoms_dir)):
-        if not filename.endswith(".md") or filename == "README.md":
-            continue
-        path = os.path.join(atoms_dir, filename)
+    abs_dir = os.path.abspath(atoms_dir)
+    entries: list[os.DirEntry[str]] = []
+    try:
+        with os.scandir(abs_dir) as it:
+            for entry in it:
+                name = entry.name
+                if name.endswith(".md") and name != "README.md" and entry.is_file(follow_symlinks=True):
+                    entries.append(entry)
+    except OSError as exc:
+        raise RuntimeError(f"Could not scan atoms directory {atoms_dir}: {exc}") from exc
+
+    entries.sort(key=lambda e: e.name)
+    use_stat_cache = len(entries) > LARGE_VAULT_STAT_CACHE_THRESHOLD
+    revisions: list[dict[str, str]] = []
+
+    if use_stat_cache:
         try:
-            with open(path, "rb") as file:
-                content = file.read()
+            sigs = tuple((e.name, *_entry_sig(e)) for e in entries)
         except OSError as exc:
-            raise RuntimeError(f"Could not read atom revision {filename}: {exc}") from exc
-        revisions.append(
-            {
-                "filename": filename,
-                "content_sha256": hashlib.sha256(content).hexdigest(),
-            }
-        )
+            raise RuntimeError(f"Could not stat atoms in {atoms_dir}: {exc}") from exc
+        with _STAT_HASH_LOCK:
+            memo = _DIR_MEMO.get(abs_dir)
+        if memo is not None and memo[0] == sigs:
+            return memo[1]
+
+    for index, entry in enumerate(entries):
+        filename = entry.name
+        abs_path = entry.path
+        if use_stat_cache:
+            sig = sigs[index][1:]
+            with _STAT_HASH_LOCK:
+                cached = _STAT_HASH_CACHE.get(abs_path)
+            if cached is not None and cached[:3] == sig:
+                revisions.append({"filename": filename, "content_sha256": cached[3]})
+                continue
+            try:
+                with open(abs_path, "rb") as file:
+                    digest = hashlib.sha256(file.read()).hexdigest()
+            except OSError as exc:
+                raise RuntimeError(f"Could not read atom revision {filename}: {exc}") from exc
+            with _STAT_HASH_LOCK:
+                if len(_STAT_HASH_CACHE) >= _MAX_STAT_CACHE_ENTRIES:
+                    _STAT_HASH_CACHE.clear()
+                _STAT_HASH_CACHE[abs_path] = (*sig, digest)
+            revisions.append({"filename": filename, "content_sha256": digest})
+        else:
+            try:
+                with open(abs_path, "rb") as file:
+                    content = file.read()
+            except OSError as exc:
+                raise RuntimeError(f"Could not read atom revision {filename}: {exc}") from exc
+            digest = hashlib.sha256(content).hexdigest()
+            revisions.append({"filename": filename, "content_sha256": digest})
+    if use_stat_cache:
+        with _STAT_HASH_LOCK:
+            if len(_DIR_MEMO) > 64:
+                _DIR_MEMO.clear()
+            _DIR_MEMO[abs_dir] = (sigs, revisions)
     return revisions
 
 
+def _entry_sig(entry: os.DirEntry[str]) -> tuple[int, int, int]:
+    st = entry.stat(follow_symlinks=True)
+    return (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+
+
 def revisions_fingerprint(revisions: list[dict[str, str]]) -> str:
+    with _STAT_HASH_LOCK:
+        memo = _FP_MEMO.get(id(revisions))
+    if memo is not None and memo[0] is revisions:
+        return memo[1]
     encoded = json.dumps(revisions, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    digest = hashlib.sha256(encoded).hexdigest()
+    if len(revisions) > LARGE_VAULT_STAT_CACHE_THRESHOLD:
+        with _STAT_HASH_LOCK:
+            if len(_FP_MEMO) > 64:
+                _FP_MEMO.clear()
+            # Holding a strong ref keeps id() stable; memoized lists are treated as immutable.
+            _FP_MEMO[id(revisions)] = (revisions, digest)
+    return digest
 
 
 def build_index_manifest(

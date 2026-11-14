@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import threading
 
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values, parse_scalar_list
@@ -22,6 +23,34 @@ ANCHOR_FIELDS = (
     "evidence_end",
     "evidence_quote_sha256",
 )
+
+_SOURCE_NORM_LOCK = threading.Lock()
+# Keyed by raw-bytes SHA-256 so a cache hit is cryptographically exact, never stat-trusted.
+_SOURCE_NORM_CACHE: dict[str, tuple[str, str, list[int]]] = {}
+_MAX_SOURCE_CACHE = 4096
+
+
+def _load_normalized_source(path: Path) -> tuple[str, str, str, list[int]] | None:
+    """Return (sha256, source_text, normalized_source, offsets); raw bytes are always re-hashed."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    digest = hashlib.sha256(raw).hexdigest()
+    with _SOURCE_NORM_LOCK:
+        cached = _SOURCE_NORM_CACHE.get(digest)
+    if cached is not None:
+        return digest, cached[0], cached[1], cached[2]
+    try:
+        source_text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    normalized_source, offsets = _normalize_with_offsets(source_text)
+    with _SOURCE_NORM_LOCK:
+        if len(_SOURCE_NORM_CACHE) >= _MAX_SOURCE_CACHE:
+            _SOURCE_NORM_CACHE.clear()
+        _SOURCE_NORM_CACHE[digest] = (source_text, normalized_source, offsets)
+    return digest, source_text, normalized_source, offsets
 
 
 def _normalize_with_offsets(value: str) -> tuple[str, list[int]]:
@@ -131,12 +160,10 @@ def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
     matches: list[dict[str, str | int]] = []
     for source in sources:
         for path in _source_candidates(source, brain_dir):
-            raw = path.read_bytes()
-            try:
-                source_text = raw.decode("utf-8")
-            except UnicodeDecodeError:
+            loaded = _load_normalized_source(path)
+            if loaded is None:
                 continue
-            normalized_source, offsets = _normalize_with_offsets(source_text)
+            source_sha256, source_text, normalized_source, offsets = loaded
             start = 0
             while True:
                 start = normalized_source.find(normalized_quote, start)
@@ -147,7 +174,7 @@ def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
                 source_end = offsets[end - 1] + 1
                 matches.append({
                     "evidence_source": path.relative_to(Path(brain_dir).resolve()).as_posix(),
-                    "evidence_sha256": hashlib.sha256(raw).hexdigest(),
+                    "evidence_sha256": source_sha256,
                     "evidence_start": len(source_text[:source_start].encode("utf-8")),
                     "evidence_end": len(source_text[:source_end].encode("utf-8")),
                     "evidence_quote_sha256": hashlib.sha256(normalized_quote.encode("utf-8")).hexdigest(),

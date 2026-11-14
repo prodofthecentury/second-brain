@@ -30,6 +30,7 @@ from config import (
     GEN_MODEL,
     INBOX_DIR,
     LEXICAL_INDEX_PATH,
+    PLAYBOOKS_DIR,
     RAW_DIR,
     READING_LIST,
     SOURCES_DIR,
@@ -303,6 +304,22 @@ def run_checks() -> list[tuple[str, str, str]]:
     checks.append(ok("atoms", f"{count_files(ATOMS_DIR, ('.md',))} atom file(s)"))
     checks.append(ok("threads", f"{count_files(THREADS_DIR, ('.md',))} thread file(s)"))
     checks.append(ok("experiences", f"{count_files(EXPERIENCES_DIR, ('.md',))} experience record(s)"))
+    playbook_total = count_files(PLAYBOOKS_DIR, (".md",))
+    active_playbooks = 0
+    if playbook_total:
+        try:
+            from skill_playbooks import list_playbooks
+
+            reports = list_playbooks(
+                playbooks_dir=PLAYBOOKS_DIR,
+                atoms_dir=ATOMS_DIR,
+                brain_dir=BRAIN_DIR,
+                active_only=False,
+            )
+            active_playbooks = sum(1 for item in reports if item.valid)
+        except Exception:
+            active_playbooks = 0
+    checks.append(ok("playbooks", f"{playbook_total} playbook file(s) ({active_playbooks} active)"))
     checks.append(ok("sources", f"{count_files(SOURCES_DIR, ('.md',))} source file(s)"))
 
     hw_profile = detect_hardware_profile(ollama_timeout=2.0)

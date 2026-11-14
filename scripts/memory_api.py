@@ -25,12 +25,15 @@ import tempfile
 import threading
 import time
 from typing import Annotated
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote as url_quote, urlparse
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if __name__ in ("memory_api", "scripts.memory_api"):
+    sys.modules.setdefault("memory_api", sys.modules[__name__])
+    sys.modules.setdefault("scripts.memory_api", sys.modules[__name__])
 
 from answer_policy import AnswerRequest
 from atom_mutator import approved_revision_is_current
@@ -48,12 +51,14 @@ from config import (
     EXPERIENCES_DIR,
     INBOX_DIR,
     LEXICAL_INDEX_PATH,
+    PLAYBOOKS_DIR,
     TELEMETRY_DB_PATH,
     _is_reparse_or_link,
     ensure_dirs,
     is_content_markdown,
     safe_file_in_dir,
 )
+from executive_planner import ExecutivePlanRequest, assemble_executive_plan
 from hardware_profile import detect_hardware_profile
 from host_adapters import (
     HostConsentError,
@@ -69,7 +74,15 @@ from index_manifest import index_manifest_is_current, load_index_manifest
 from lexical_store import lexical_index_is_current
 from memory_format import split_frontmatter
 from memory_review import section_text
-from recall import RecallOptions, consume_last_degradation_warning, search_memory, suggest_duplicate_atoms
+from recall import (
+    RecallOptions,
+    consume_last_degradation_warning,
+    project_tags_match,
+    search_memory,
+    suggest_duplicate_atoms,
+)
+from skill_playbooks import list_playbooks, playbook_visible_in_scope
+import api_product
 
 
 def _extract_claim_text(content: str) -> str:
@@ -215,6 +228,9 @@ def _check_and_record_auth(client_key: str, provided_header: str | None, expecte
 BoundedExperienceItem = Annotated[str, Field(min_length=1, max_length=500)]
 
 
+BoundedContextTag = Annotated[str, Field(min_length=1, max_length=64)]
+
+
 class ApiRecallRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     query: str = Field(..., min_length=1, max_length=2000)
@@ -224,6 +240,8 @@ class ApiRecallRequest(BaseModel):
     allow_cross_project: bool = False
     follow_links: bool = True
     include_duplicates: bool = False
+    enable_fitness_boost: bool = False
+    active_context_profile: list[BoundedContextTag] = Field(default_factory=list, max_length=16)
 
 
 class ApiAnswerRequest(BaseModel):
@@ -276,6 +294,39 @@ class ApiExperienceCreateRequest(BaseModel):
     propose_to_inbox: bool = False
 
 
+class ApiExecutivePlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    goal: str = Field(..., min_length=1, max_length=2000)
+    project_scope: str | None = Field(default=None, max_length=120)
+    allow_cross_project: bool = False
+    active_context_profile: list[BoundedContextTag] = Field(default_factory=list, max_length=16)
+    retrieval_mode: str = Field(default="lexical", pattern=r"^(auto|lexical|dense|rrf)$")
+    include_preferences: bool = False
+    mode: str = Field(default="deterministic", pattern=r"^(deterministic|model_assisted)$")
+    host_id: str = Field(default="ollama_local", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    model_override: str | None = Field(default=None, max_length=128)
+    max_context_chars: int = Field(default=6000, ge=512, le=24000)
+    max_atoms: int = Field(default=6, ge=1, le=15)
+
+    @field_validator("model_override")
+    @classmethod
+    def _check_plan_model_override(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if (
+            not v
+            or v.startswith("/")
+            or ".." in v
+            or "?" in v
+            or "#" in v
+            or "%" in v
+            or any(ch.isspace() for ch in v)
+            or not _MODEL_OVERRIDE_RE.fullmatch(v)
+        ):
+            raise ValueError(f"Invalid or unsafe model_override identifier: {v!r}")
+        return validate_model_identifier(v)
+
+
 class MemoryApiRuntimeConfig:
     def __init__(
         self,
@@ -284,10 +335,12 @@ class MemoryApiRuntimeConfig:
         atoms_dir: str = ATOMS_DIR,
         inbox_dir: str = INBOX_DIR,
         experiences_dir: str = EXPERIENCES_DIR,
+        playbooks_dir: str | None = None,
         lexical_index_path: str = LEXICAL_INDEX_PATH,
         chroma_path: str = CHROMA_PATH,
         telemetry_db_path: str = TELEMETRY_DB_PATH,
         token_path: Path | None = None,
+        owner_token_path: Path | None = None,
         policy_path: Path | None = None,
         http_transport: httpx.BaseTransport | None = None,
         skip_dns_check_for_mock_transport: bool = False,
@@ -296,10 +349,17 @@ class MemoryApiRuntimeConfig:
         self.atoms_dir = os.path.abspath(atoms_dir)
         self.inbox_dir = os.path.abspath(inbox_dir)
         self.experiences_dir = os.path.abspath(experiences_dir)
+        if playbooks_dir is not None:
+            self.playbooks_dir = os.path.abspath(playbooks_dir)
+        elif self.brain_dir != os.path.abspath(BRAIN_DIR):
+            self.playbooks_dir = os.path.join(self.brain_dir, "5-playbooks")
+        else:
+            self.playbooks_dir = os.path.abspath(PLAYBOOKS_DIR)
         self.lexical_index_path = os.path.abspath(lexical_index_path)
         self.chroma_path = os.path.abspath(chroma_path)
         self.telemetry_db_path = os.path.abspath(telemetry_db_path)
         self.token_path = token_path
+        self.owner_token_path = owner_token_path
         self.policy_path = policy_path
         self.http_transport = http_transport
         self.skip_dns_check_for_mock_transport = skip_dns_check_for_mock_transport
@@ -547,7 +607,67 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, sanitized_report)
             return
 
+        if path == "/v1/playbooks":
+            parsed_url = urlparse(self.path)
+            qs = parse_qs(parsed_url.query)
+            proj_raw = (qs.get("project") or [""])[0].strip()
+            if len(proj_raw) > 120:
+                self._send_json(422, {"error": "Invalid project query filter."})
+                return
+            active_pbs = list_playbooks(
+                playbooks_dir=rt.playbooks_dir,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                telemetry_db_path=rt.telemetry_db_path,
+                active_only=True,
+            )
+            if proj_raw:
+                # Require EVERY backing atom to individually match the scope (no merged-union laundering).
+                active_pbs = [p for p in active_pbs if playbook_visible_in_scope(p, (proj_raw,))]
+            _audit_api_event(rt.brain_dir, path, "GET", 200)
+            self._send_json(
+                200,
+                {
+                    "count": len(active_pbs),
+                    "playbooks": [
+                        {
+                            "playbook_id": p.playbook_id,
+                            "filename": p.filename,
+                            "title": p.title,
+                            "sha256": p.sha256,
+                            "contexts": list(p.contexts),
+                            "backing_atoms": list(p.backing_atoms),
+                            "trigger": p.trigger,
+                            "preconditions": list(p.preconditions),
+                            "steps": list(p.steps),
+                            "expected_outputs": list(p.expected_outputs),
+                            "failure_recovery": list(p.failure_recovery),
+                        }
+                        for p in active_pbs
+                    ],
+                },
+            )
+            return
+
+        if api_product.dispatch(self, "GET", path, urlparse(self.path).query, None):
+            return
         self._send_json(404, {"error": f"Unknown endpoint: {path}"})
+
+    def _dispatch_body_method(self, method: str) -> None:
+        if not self._verify_security_envelope():
+            return
+        raw_json = self._read_json_body()
+        if raw_json is None:
+            return
+        path = urlparse(self.path).path
+        if not api_product.dispatch(self, method, path, urlparse(self.path).query, raw_json):
+            self._send_json(404, {"error": f"Unknown endpoint: {path}"})
+
+    def do_PUT(self) -> None:
+        self._dispatch_body_method("PUT")
+
+    def do_DELETE(self) -> None:
+        self._dispatch_body_method("DELETE")
 
     def do_POST(self) -> None:
         if not self._verify_security_envelope():
@@ -569,6 +689,9 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     projects=projects,
                     allow_cross_project=req.allow_cross_project,
                     retrieval_mode=req.retrieval_mode,
+                    enable_fitness_boost=req.enable_fitness_boost,
+                    active_context_profile=tuple(req.active_context_profile),
+                    telemetry_db_path=rt.telemetry_db_path,
                 )
                 consume_last_degradation_warning()
                 t0 = time.perf_counter()
@@ -783,6 +906,40 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(201, saved)
                 return
 
+            if path == "/v1/plan":
+                req = ApiExecutivePlanRequest.model_validate(raw_json)
+                plan_req = ExecutivePlanRequest(
+                    goal=req.goal,
+                    project_scope=req.project_scope,
+                    allow_cross_project=req.allow_cross_project,
+                    active_context_profile=tuple(req.active_context_profile),
+                    retrieval_mode=req.retrieval_mode,
+                    include_preferences=req.include_preferences,
+                    mode=req.mode,
+                    host_id=req.host_id,
+                    model_override=req.model_override,
+                    max_context_chars=req.max_context_chars,
+                    max_atoms=req.max_atoms,
+                )
+                plan_res = assemble_executive_plan(
+                    plan_req,
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                    playbooks_dir=rt.playbooks_dir,
+                    lexical_index_path=rt.lexical_index_path,
+                    chroma_path=rt.chroma_path,
+                    telemetry_db_path=rt.telemetry_db_path,
+                    policy_path=rt.policy_path,
+                    http_transport=rt.http_transport,
+                    skip_dns_check_for_mock_transport=rt.skip_dns_check_for_mock_transport,
+                    save_briefing=False,
+                )
+                _audit_api_event(rt.brain_dir, path, "POST", 200)
+                self._send_json(200, plan_res.as_dict())
+                return
+
+            if api_product.dispatch(self, "POST", path, urlparse(self.path).query, raw_json):
+                return
             self._send_json(404, {"error": f"Unknown endpoint: {path}"})
         except (HostConsentError, OutboundSecretBlockedError) as exc:
             _audit_api_event(rt.brain_dir, path, "POST", 403)
@@ -877,6 +1034,40 @@ class MemoryApiClient:
     def fitness(self) -> dict[str, object]:
         return self._request("GET", "/v1/cognitive/fitness")
 
+    def playbooks(self, *, project_scope: str | None = None) -> dict[str, object]:
+        if project_scope and project_scope.strip():
+            return self._request("GET", f"/v1/playbooks?project={url_quote(project_scope.strip(), safe=':_/-')}")
+        return self._request("GET", "/v1/playbooks")
+
+    def plan(
+        self,
+        goal: str,
+        *,
+        project_scope: str | None = None,
+        allow_cross_project: bool = False,
+        active_context_profile: list[str] | None = None,
+        retrieval_mode: str = "lexical",
+        include_preferences: bool = False,
+        mode: str = "deterministic",
+        host_id: str = "ollama_local",
+        model_override: str | None = None,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/plan",
+            {
+                "goal": goal,
+                "project_scope": project_scope,
+                "allow_cross_project": allow_cross_project,
+                "active_context_profile": active_context_profile or [],
+                "retrieval_mode": retrieval_mode,
+                "include_preferences": include_preferences,
+                "mode": mode,
+                "host_id": host_id,
+                "model_override": model_override,
+            },
+        )
+
     def record_experience(
         self,
         *,
@@ -932,8 +1123,10 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
             "endpoints": [
                 "GET /v1/health",
                 "GET /v1/profile",
+                "GET /v1/playbooks",
                 "POST /v1/recall",
                 "POST /v1/answer",
+                "POST /v1/plan",
                 "POST /v1/inbox",
                 "GET /v1/inbox/queue",
                 "GET /v1/cognitive/fitness",
@@ -960,7 +1153,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_API_PORT, help=f"Loopback TCP port (default {DEFAULT_API_PORT}).")
     parser.add_argument("--generate-token", action="store_true", help="Generate and save a fresh 256-bit API bearer token.")
     parser.add_argument("--print-adapter-config", action="store_true", help="Output IDE and custom host adapter JSON.")
+    parser.add_argument(
+        "--ensure-tokens",
+        action="store_true",
+        help="Create the agent API token and owner token if missing (used by the desktop app on first run).",
+    )
     args = parser.parse_args(argv)
+
+    if args.ensure_tokens:
+        if not get_configured_api_token():
+            generate_memory_api_token()
+        api_product.ensure_owner_token()
 
     if args.generate_token:
         _, saved = generate_memory_api_token()
@@ -973,7 +1176,9 @@ def main(argv: list[str] | None = None) -> int:
 
     ensure_dirs()
     server = MemoryLoopbackHTTPServer(args.host, args.port)
-    print(f"Second Brain Loopback Memory API listening on http://{ALLOWED_API_BIND_HOST}:{args.port}")
+    # Machine-readable readiness line for the desktop app supervisor.
+    print(f"SECOND_BRAIN_API_READY port={args.port}", flush=True)
+    print(f"Second Brain Loopback Memory API listening on http://{ALLOWED_API_BIND_HOST}:{args.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

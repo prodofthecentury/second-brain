@@ -273,11 +273,48 @@ unified CI gate (`scripts/test_all.py`).
 **Files:** `scripts/memory_api.py`, `scripts/phase2_safety_tests.py`,
 `scripts/test_all.py`, `docs/phase2-architecture-and-sweep-2026-11-15.md`.
 
+### Goal 14 — Context/Fitness Ranking, Skill Playbooks & Grounded Executive Planner (Phase 3A) — COMPLETE
+
+**Why:** Extend Cognitive Core Layers 4–5 with fitness-aware ranking, bounded working-context assembly, owner-gated CAS Skill Playbooks under `brain/5-playbooks/`, and a citation-verified Executive Planner, locked down by an independent `security-auditor` sweep.
+
+**What was built:**
+1. Context-profile and fitness-aware ranking (`scripts/recall.py`: `best_bm25` over validated candidates, utility excluding raw `retrieval_hits`, direct `item.content` hashing in `assemble_bounded_working_context`) plus durable correction logging in `brain/0-raw/archive/atom-corrections.jsonl` (`scripts/cognitive_core.py`).
+2. Owner-gated Skill Playbooks (`scripts/skill_playbooks.py`, `brain/5-playbooks/`, `playbook-decisions.jsonl`, `.history/` backups): CAS re-promotion (`expected_playbook_sha256`), per-atom project scope containment (`allow_multi_project`, `playbook_visible_in_scope`), whole-Claim step grounding (`_claim_grounding_units`), fail-closed `verify_playbook_integrity`, and frontmatter-only deprecation.
+3. Grounded Executive Planner (`scripts/executive_planner.py`, `POST /v1/plan`, `GET /v1/playbooks`, `second-brain playbooks` / `plan`, Dashboard tabs): per-atom host scope containment, scoped pending candidate counts, full-Playbook expansion in `model_assisted` mode (`EXECUTIVE_PLAN_DRAFT_SCHEMA`), and regression tests for `H1`, `H2`, `M1`–`M4`, `L1`–`L7` in `scripts/phase3_cognitive_tests.py` (10 tests).
+
+**Files:** `scripts/recall.py`, `scripts/cognitive_core.py`, `scripts/skill_playbooks.py`, `scripts/executive_planner.py`, `scripts/memory_api.py`, `scripts/cli.py`, `scripts/doctor.py`, `dashboard/app.py`, `scripts/phase3_cognitive_tests.py`, `docs/phase3a-and-phase4-architecture-2026-11-15.md`.
+
+### Goal 15 — Scale Engine, Zero-Friction Notes, Excerpt Verification & Bulk Importer (Phase 4) — COMPLETE
+
+**Why:** Scale lexical indexing and provenance verification to multi-thousand-note corpora with millisecond freshness/query paths while enabling instant owner note capture and one-click promotion to cryptographically anchored atoms.
+
+**What was built:**
+1. Stat-cached `os.scandir()` revision manifests (`scripts/index_manifest.py` above `LARGE_VAULT_STAT_CACHE_THRESHOLD = 64`), O(|changed|) `upsert_lexical_atoms` / `sync_lexical_index` / paginated `list_indexed_atoms_fast` (`scripts/lexical_store.py`), tail-cached `latest_decisions_by_atom` (`scripts/atom_mutator.py`), SHA-256 cached source normalization (`scripts/evidence.py`), and synthetic corpus benchmarking (`scripts/scale_benchmark.py`, `second-brain benchmark`).
+2. Zero-friction working notes (`scripts/notes_store.py`, `brain/notes/`, `brain/.sidecar/notes.sqlite3`) with CAS updates/deletes, quarantined risky captures, and `verify_note_excerpt()` creating immutable raw snapshots under `brain/0-raw/note-snapshots/` before anchoring and owner approval.
+3. Idempotent Markdown/Obsidian vault importer (`scripts/bulk_import.py`, `second-brain import`).
+
+**Files:** `scripts/index_manifest.py`, `scripts/lexical_store.py`, `scripts/atom_mutator.py`, `scripts/evidence.py`, `scripts/notes_store.py`, `scripts/bulk_import.py`, `scripts/scale_benchmark.py`, `scripts/rebuild_vectors.py`.
+
+### Goal 16 — Streaming Chat, Dual-Token Product API & IDE/Antigravity Connectors (Phase 4) — COMPLETE
+
+**Why:** Deliver low-latency `instant` / `verified` / `stream` chat over verified atoms and working notes, strict owner-vs-agent token separation on the Loopback HTTP API, and one-click MCP setup for local IDEs and agent hosts.
+
+**What was built:**
+1. Streaming/instant/verified chat (`scripts/streaming_chat.py`, `second-brain chat`, `POST /v1/chat/stream`, `POST /v1/chat/warmup`) with out-of-model citation checks and claim validation.
+2. Dual-token Loopback Product API (`scripts/api_product.py` dispatched from `scripts/memory_api.py`): gating notes write/verify, review approvals, inbox triage, and bulk imports behind `owner_authorized` while allowing agent tokens read recall/notes and quarantined `/v1/remember` capture.
+3. One-click host connector (`scripts/ide_connector.py`, `second-brain connect`), plugin bundles (`plugins/antigravity/second-brain/`, `plugins/claude-code/second-brain/`), Electron desktop companion (`desktop/`), VS Code / Cursor / Windsurf extension (`extensions/vscode-second-brain/`), Windows release signing script (`scripts/sign_release.ps1`), custom planner schema support (`scripts/host_adapters.py`), MCP note/remember tools paired with `trusted_stdio_session()` (`scripts/mcp_server.py`), and 20 product/connector regression tests in `scripts/phase4_product_tests.py` inside the **10-suite unified test gate** (`scripts/test_all.py`).
+
+**Files:** `scripts/streaming_chat.py`, `scripts/api_product.py`, `scripts/ide_connector.py`, `scripts/mcp_server.py`, `scripts/host_adapters.py`, `scripts/sign_release.ps1`, `desktop/`, `extensions/vscode-second-brain/`, `plugins/`, `scripts/phase4_product_tests.py`, `scripts/test_all.py`, `scripts/system_safety_tests.py`.
+
 ## Deferred product horizon
 
-Goals 1–13 complete the local pilot, universal loopback API, per-host online
+Goals 1–16 complete the local pilot, universal loopback API, per-host online
 consent/redaction adapters, quarantined inbox promotion workflow, hardware-tiered
-profiling, and Cognitive Core layer. Remaining post-Phase-2 items are OS-signed
+profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated
+Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine,
+zero-friction notes with one-click excerpt verification, streaming chat, bulk
+Obsidian importer, IDE/Antigravity connectors, and the 10-suite unified release
+gate (`scripts/test_all.py`, 10/10 PASS). Remaining deferred items are OS-signed
 desktop GUI installers (MSI/DMG/AppImage) and large-corpus comparative external
 SOTA benchmarks (`CODEX_CLI_GOAL.md`).
 

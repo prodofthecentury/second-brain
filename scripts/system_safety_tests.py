@@ -1134,7 +1134,10 @@ class MCPBoundaryTests(unittest.TestCase):
             with self._isolated_mcp_env(configure_token=test_token) as env:
                 listed = await mcp_server.handle_list_tools(auth_ctx, None)
                 self.assertIsInstance(listed, types.ListToolsResult)
-                self.assertEqual({tool.name for tool in listed.tools}, {"search_memory", "get_atom", "add_to_inbox"})
+                self.assertEqual(
+                    {tool.name for tool in listed.tools},
+                    {"search_memory", "get_atom", "add_to_inbox", "search_notes", "get_note", "remember"},
+                )
                 resources = await mcp_server.handle_list_resources(auth_ctx, None)
                 self.assertEqual(resources.resources, [])
                 with patch("mcp_server.audit_mcp_use", side_effect=OSError("audit unavailable")):
@@ -2355,6 +2358,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
             stack.enter_context(patch.object(doctor, "ATOMS_DIR", str(vault_root / "2-atoms")))
             stack.enter_context(patch.object(doctor, "THREADS_DIR", str(vault_root / "3-threads")))
             stack.enter_context(patch.object(doctor, "EXPERIENCES_DIR", str(vault_root / "4-experiences")))
+            stack.enter_context(patch.object(doctor, "PLAYBOOKS_DIR", str(vault_root / "5-playbooks")))
             stack.enter_context(patch.object(doctor, "SOURCES_DIR", str(vault_root / "sources")))
             stack.enter_context(patch.object(doctor, "BRIEFINGS_DIR", str(vault_root / "briefings")))
             stack.enter_context(patch.object(doctor, "CHROMA_PATH", str(vault_root / ".chroma")))
@@ -2385,6 +2389,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "2-atoms",
                 "3-threads",
                 "4-experiences",
+                "5-playbooks",
                 "sources",
                 "briefings",
                 ".chroma",
@@ -2407,6 +2412,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
         self.assertIn("vault dirs", areas)
         self.assertIn("lexical recall", areas)
         self.assertIn("capability tier", areas)
+        self.assertIn("playbooks", areas)
         failures = [item for item in checks if item[0] == "FAIL"]
         self.assertEqual(failures, [])
 
@@ -2419,8 +2425,11 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "audit_sources",
                 "system_safety_tests",
                 "phase2_safety_tests",
+                "phase3_cognitive_tests",
                 "chroma_rebuild_canary",
                 "smoke_test",
+                "phase4_product_tests",
+                "scale_benchmark_1500",
             },
         )
 

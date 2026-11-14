@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+  <title>Second Brain</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-dot" id="apiDot"></div>
+        <div>
+          <div class="brand-title">Second Brain</div>
+          <div class="brand-sub" id="apiStatusText">Connecting...</div>
+        </div>
+      </div>
+
+      <button class="nav-btn active" data-view="notes">Notes <span class="kbd">Ctrl+1</span></button>
+      <button class="nav-btn" data-view="chat">Streaming Chat <span class="kbd">Ctrl+2</span></button>
+      <button class="nav-btn" data-view="review">Inbox &amp; Review <span class="kbd">Ctrl+3</span></button>
+      <button class="nav-btn" data-view="import">Bulk Import <span class="kbd">Ctrl+4</span></button>
+      <button class="nav-btn" data-view="ide">IDE Hub <span class="kbd">Ctrl+5</span></button>
+      <button class="nav-btn" data-view="system">System <span class="kbd">Ctrl+6</span></button>
+
+      <div class="sidebar-footer">
+        <div>Quick Capture: <span class="kbd">Ctrl+Shift+Space</span></div>
+        <div id="vaultMetrics" style="margin-top:4px;">Loading vault...</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <!-- NOTES VIEW -->
+      <section class="view active" id="view-notes">
+        <div class="toolbar">
+          <input type="search" id="noteSearchInput" placeholder="Search notes &amp; tags..." style="flex:1; min-width:220px;" />
+          <button class="btn primary" id="newNoteBtn">+ New Note</button>
+          <button class="btn" id="saveNoteBtn">Save <span class="kbd">Ctrl+S</span></button>
+          <button class="btn good" id="verifyExcerptBtn">Verify Selection as Atom</button>
+          <button class="btn danger" id="deleteNoteBtn">Delete</button>
+        </div>
+        <div class="status-banner" id="notesBanner">Zero-friction owner notes index immediately without manual SHA-256 sign-off. Select any excerpt to promote it to a verified Atom.</div>
+        <div class="notes-grid">
+          <div class="pane">
+            <div class="scroll-list" id="notesList"></div>
+          </div>
+          <div class="pane">
+            <div class="editor-wrap">
+              <div class="toolbar">
+                <input type="text" id="noteTitleInput" placeholder="Note title..." style="flex:1; font-weight:600;" />
+                <input type="text" id="noteTagsInput" placeholder="tags (comma-separated)" style="width:220px;" />
+              </div>
+              <textarea class="editor-textarea" id="noteBodyInput" placeholder="Write markdown notes... Use [[Note Title]] for wikilinks."></textarea>
+              <div class="backlinks-bar" id="noteBacklinks">Backlinks: none</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CHAT VIEW -->
+      <section class="view" id="view-chat">
+        <div class="toolbar">
+          <input type="text" id="chatQueryInput" placeholder="Ask your Second Brain..." style="flex:1;" />
+          <select id="chatModeSelect">
+            <option value="stream">Stream (Instant cards + SSE)</option>
+            <option value="verified">Verified (Claim-ID grounded)</option>
+            <option value="instant">Instant (&lt;20ms retrieval only)</option>
+          </select>
+          <input type="text" id="chatScopeInput" placeholder="Scope (optional)" style="width:150px;" />
+          <button class="btn primary" id="chatSendBtn">Ask</button>
+          <button class="btn" id="chatWarmupBtn">Warmup Model</button>
+        </div>
+        <div class="status-banner" id="chatBanner">Sub-20ms retrieval cards appear immediately before LLM tokens stream.</div>
+        <div class="chat-layout">
+          <div class="pane">
+            <div class="chat-output" id="chatOutput">Ask a question to search notes, verified atoms, and playbooks.</div>
+          </div>
+          <div class="pane">
+            <div style="padding:10px 12px; border-bottom:1px solid var(--border); font-weight:600; font-size:12px;">Retrieved Sources</div>
+            <div class="scroll-list" id="chatSources"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- INBOX & REVIEW VIEW -->
+      <section class="view" id="view-review">
+        <div class="toolbar">
+          <h3 style="margin:0;">Inbox &amp; Atom Review Queue</h3>
+          <button class="btn" id="refreshReviewBtn" style="margin-left:auto;">Refresh</button>
+        </div>
+        <div class="cards-grid" id="reviewGrid"></div>
+      </section>
+
+      <!-- IMPORT VIEW -->
+      <section class="view" id="view-import">
+        <div class="toolbar">
+          <h3 style="margin:0;">Obsidian / Markdown Bulk Importer</h3>
+        </div>
+        <div class="card">
+          <div class="toolbar">
+            <input type="text" id="importDirInput" placeholder="Select folder containing .md notes..." style="flex:1;" />
+            <button class="btn" id="pickImportDirBtn">Browse Folder...</button>
+          </div>
+          <div class="toolbar">
+            <input type="text" id="importTagsInput" placeholder="Extra tags (e.g. obsidian,imported)" style="flex:1;" />
+            <button class="btn primary" id="runImportBtn">Import Notes</button>
+          </div>
+          <div class="status-banner" id="importResult">Idempotent SHA-256 content-hashed import. Existing identical notes are skipped automatically.</div>
+        </div>
+      </section>
+
+      <!-- IDE HUB VIEW -->
+      <section class="view" id="view-ide">
+        <div class="toolbar">
+          <h3 style="margin:0;">Plug-and-Play IDE Ecosystem</h3>
+          <button class="btn" id="refreshIdeBtn" style="margin-left:auto;">Refresh Status</button>
+        </div>
+        <div class="status-banner">One-click connect configures MCP stdio auth and skills/rules for each detected IDE or agent host.</div>
+        <div class="cards-grid" id="ideGrid"></div>
+      </section>
+
+      <!-- SYSTEM VIEW -->
+      <section class="view" id="view-system">
+        <div class="toolbar">
+          <h3 style="margin:0;">System Profile &amp; Health</h3>
+          <button class="btn" id="refreshSystemBtn" style="margin-left:auto;">Refresh</button>
+        </div>
+        <div class="cards-grid" id="systemGrid"></div>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

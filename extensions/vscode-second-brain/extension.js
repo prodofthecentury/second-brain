@@ -1,0 +1,255 @@
+const vscode = require("vscode");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+function getSecurityDir() {
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    return path.join(localAppData, "SecondBrain", "security");
+  }
+  const stateHome = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
+  return path.join(stateHome, "SecondBrain", "security");
+}
+
+function readApiToken() {
+  const tokenPath = path.join(getSecurityDir(), "memory-api-token");
+  return fs.existsSync(tokenPath) ? fs.readFileSync(tokenPath, "utf8").trim() : "";
+}
+
+function getPort() {
+  return vscode.workspace.getConfiguration("secondBrain").get("apiPort", 8765);
+}
+
+function apiRequest(method, apiPath, body = null) {
+  const port = getPort();
+  const token = readApiToken();
+  const payload = body !== null ? JSON.stringify(body) : null;
+  const headers = {
+    Host: `127.0.0.1:${port}`,
+    Accept: "application/json",
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (payload !== null) {
+    headers["Content-Type"] = "application/json";
+    headers["Content-Length"] = Buffer.byteLength(payload, "utf8");
+  }
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname: "127.0.0.1", port, path: apiPath, method, headers }, (res) => {
+      let raw = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => (raw += c));
+      res.on("end", () => {
+        try {
+          resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, data: raw ? JSON.parse(raw) : {} });
+        } catch {
+          resolve({ ok: false, status: res.statusCode, data: { raw } });
+        }
+      });
+    });
+    req.on("error", reject);
+    if (payload !== null) req.write(payload);
+    req.end();
+  });
+}
+
+class VaultTreeProvider {
+  constructor() {
+    this._onDidChangeTreeData = new vscode.EventEmitter();
+    this.onDidChangeTreeData = this._onDidChangeTreeData.event;
+  }
+  refresh() {
+    this._onDidChangeTreeData.fire();
+  }
+  getTreeItem(el) {
+    return el;
+  }
+  async getChildren(element) {
+    if (!element) {
+      return [
+        new vscode.TreeItem("Notes", vscode.TreeItemCollapsibleState.Expanded),
+        new vscode.TreeItem("Verified Atoms", vscode.TreeItemCollapsibleState.Collapsed),
+      ];
+    }
+    try {
+      if (element.label === "Notes") {
+        const res = await apiRequest("GET", "/v1/notes?limit=50");
+        if (!res.ok) return [new vscode.TreeItem("API offline — start Second Brain desktop or CLI")];
+        return (res.data.notes || []).map((n) => {
+          const item = new vscode.TreeItem(n.title || n.filename, vscode.TreeItemCollapsibleState.None);
+          item.description = (n.tags || []).join(", ");
+          item.tooltip = n.filename;
+          return item;
+        });
+      }
+      if (element.label === "Verified Atoms") {
+        const res = await apiRequest("GET", "/v1/atoms?limit=50");
+        if (!res.ok) return [new vscode.TreeItem("API offline")];
+        return (res.data.atoms || []).map((a) => {
+          const item = new vscode.TreeItem(a.filename, vscode.TreeItemCollapsibleState.None);
+          item.description = a.status || "";
+          item.tooltip = a.claim || "";
+          return item;
+        });
+      }
+    } catch {
+      return [new vscode.TreeItem("Start Second Brain API (`second-brain serve`)")];
+    }
+    return [];
+  }
+}
+
+function activate(context) {
+  const treeProvider = new VaultTreeProvider();
+  vscode.window.registerTreeDataProvider("secondBrain.vaultView", treeProvider);
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("secondBrain.refreshVault", () => treeProvider.refresh()),
+
+    vscode.commands.registerCommand("secondBrain.rememberSelection", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+      const text = editor.document.getText(editor.selection).trim();
+      if (!text) {
+        vscode.window.showWarningMessage("Select text to remember in Second Brain.");
+        return;
+      }
+      const title = await vscode.window.showInputBox({
+        prompt: "Optional title for this memory",
+        value: path.basename(editor.document.fileName),
+      });
+      try {
+        const res = await apiRequest("POST", "/v1/remember", {
+          content: text,
+          title: title || undefined,
+          source: `vscode:${path.basename(editor.document.fileName)}`,
+          tags: ["vscode"],
+        });
+        if (res.ok) {
+          vscode.window.showInformationMessage(`Remembered in Second Brain (${res.data.tier || "notes"}).`);
+          treeProvider.refresh();
+        } else {
+          vscode.window.showErrorMessage(`Second Brain remember failed: ${res.data?.error || res.status}`);
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API unreachable: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.quickRecall", async () => {
+      const query = await vscode.window.showInputBox({ prompt: "Search Second Brain notes & verified atoms" });
+      if (!query) return;
+      try {
+        const res = await apiRequest("GET", `/v1/notes?query=${encodeURIComponent(query)}&limit=10`);
+        const notes = res.ok ? (res.data.notes || []) : [];
+        if (!notes.length) {
+          vscode.window.showInformationMessage("No matching notes found.");
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          notes.map((n) => ({ label: n.title || n.filename, description: n.filename, detail: n.snippet || "" })),
+          { placeHolder: "Select a note to preview" }
+        );
+        if (picked) {
+          const full = await apiRequest("GET", `/v1/notes/${encodeURIComponent(picked.description)}`);
+          const doc = await vscode.workspace.openTextDocument({
+            content: full.data?.note?.body || full.data?.body || "",
+            language: "markdown",
+          });
+          await vscode.window.showTextDocument(doc, { preview: true });
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API unreachable: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.openChat", () => {
+      const panel = vscode.window.createWebviewPanel(
+        "secondBrainChat",
+        "Second Brain Chat",
+        vscode.ViewColumn.Beside,
+        { enableScripts: true }
+      );
+      panel.webview.html = `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:14px;background:#0d1117;color:#e6edf3;">
+        <h3>Second Brain Streaming Chat</h3>
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+          <input id="q" style="flex:1;padding:8px;background:#161b22;color:#fff;border:1px solid #30363d;border-radius:6px;" placeholder="Ask your vault..." />
+          <select id="m" style="padding:8px;background:#161b22;color:#fff;border:1px solid #30363d;border-radius:6px;">
+            <option value="stream">Stream</option>
+            <option value="verified">Verified</option>
+            <option value="instant">Instant</option>
+          </select>
+          <button id="go" style="padding:8px 14px;background:#7c5cff;color:#fff;border:none;border-radius:6px;cursor:pointer;">Ask</button>
+        </div>
+        <pre id="out" style="white-space:pre-wrap;line-height:1.5;background:#161b22;padding:12px;border-radius:8px;min-height:220px;"></pre>
+        <script>
+          const vscode = acquireVsCodeApi();
+          document.getElementById("go").onclick = () => {
+            document.getElementById("out").textContent = "Retrieving...";
+            vscode.postMessage({ query: document.getElementById("q").value, mode: document.getElementById("m").value });
+          };
+          window.addEventListener("message", (e) => {
+            const msg = e.data;
+            const out = document.getElementById("out");
+            if (msg.type === "reset") out.textContent = msg.text || "";
+            if (msg.type === "append") out.textContent += msg.text || "";
+          });
+        </script></body></html>`;
+
+      panel.webview.onDidReceiveMessage(async ({ query, mode }) => {
+        if (!query) return;
+        const port = getPort();
+        const token = readApiToken();
+        const body = JSON.stringify({ query, mode });
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port,
+            path: "/v1/chat/stream",
+            method: "POST",
+            headers: {
+              Host: `127.0.0.1:${port}`,
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+              "Content-Length": Buffer.byteLength(body, "utf8"),
+            },
+          },
+          (res) => {
+            panel.webview.postMessage({ type: "reset", text: "" });
+            let buf = "";
+            let ev = "message";
+            res.setEncoding("utf8");
+            res.on("data", (chunk) => {
+              buf += chunk;
+              const lines = buf.split(/\r?\n/);
+              buf = lines.pop() || "";
+              for (const line of lines) {
+                if (line.startsWith("event:")) ev = line.slice(6).trim();
+                else if (line.startsWith("data:")) {
+                  try {
+                    const data = JSON.parse(line.slice(5).trim());
+                    if (ev === "token") panel.webview.postMessage({ type: "append", text: data.token || "" });
+                    else if (ev === "verified_answer") panel.webview.postMessage({ type: "reset", text: data.answer || "" });
+                    else if (ev === "context" && mode === "instant") {
+                      const summary = (data.sources || []).map((s) => `- ${s.title || s.filename}: ${s.excerpt || s.claim || ""}`).join("\n");
+                      panel.webview.postMessage({ type: "reset", text: summary || "No matches." });
+                    }
+                  } catch {}
+                  ev = "message";
+                }
+              }
+            });
+          }
+        );
+        req.on("error", (err) => panel.webview.postMessage({ type: "reset", text: `Error: ${err.message}` }));
+        req.write(body);
+        req.end();
+      });
+    })
+  );
+}
+
+function deactivate() {}
+
+module.exports = { activate, deactivate };

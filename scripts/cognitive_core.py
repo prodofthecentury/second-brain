@@ -26,6 +26,7 @@ from config import (
     INBOX_DIR,
     LEXICAL_INDEX_PATH,
     TELEMETRY_DB_PATH,
+    _is_reparse_or_link,
     file_sha256,
     is_content_markdown,
     safe_file_in_dir,
@@ -188,14 +189,82 @@ def record_grounded_answer_telemetry(
         conn.commit()
 
 
+def _brain_dir_for_telemetry_db(db_path: str) -> str | None:
+    """Telemetry sidecars live at <brain>/.sidecar/telemetry.sqlite3; derive the owning vault."""
+    abs_db = os.path.abspath(db_path)
+    if abs_db == os.path.abspath(TELEMETRY_DB_PATH):
+        return BRAIN_DIR
+    parent = os.path.dirname(abs_db)
+    if os.path.basename(parent) == ".sidecar":
+        return os.path.dirname(parent)
+    return None
+
+
+def atom_correction_log_path(brain_dir: str) -> str:
+    return os.path.join(brain_dir, "0-raw", "archive", "atom-corrections.jsonl")
+
+
+def _append_canonical_correction(brain_dir: str, atom_id: str) -> None:
+    """Durable append-only correction record so Playbook staleness never depends on a disposable sidecar."""
+    log_path = atom_correction_log_path(brain_dir)
+    archive_dir = os.path.dirname(log_path)
+    os.makedirs(archive_dir, exist_ok=True)
+    if _is_reparse_or_link(archive_dir) or (os.path.lexists(log_path) and _is_reparse_or_link(log_path)):
+        raise PermissionError("Refusing to write atom correction log through a symlink or reparse point.")
+    record = {
+        "schema_version": 1,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "action": "atom_correction",
+        "atom_id": atom_id,
+    }
+    encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        if os.write(fd, encoded) != len(encoded):
+            raise OSError("Incomplete write to atom-corrections.jsonl.")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def count_canonical_corrections(brain_dir: str, atom_id: str) -> int | None:
+    """Count durable correction records for an atom; None when the log is unsafe or unreadable (fail closed)."""
+    log_path = atom_correction_log_path(brain_dir)
+    if not os.path.lexists(log_path):
+        return 0
+    if _is_reparse_or_link(log_path) or _is_reparse_or_link(os.path.dirname(log_path)):
+        return None
+    count = 0
+    try:
+        with open(log_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict) and rec.get("action") == "atom_correction" and rec.get("atom_id") == atom_id:
+                    count += 1
+    except OSError:
+        return None
+    return count
+
+
 def record_atom_feedback(
     atom_id: str,
     *,
     helpful: bool,
     db_path: str = TELEMETRY_DB_PATH,
+    brain_dir: str | None = None,
 ) -> None:
     if not _valid_atom_id(atom_id):
         raise ValueError(f"Invalid atom_id for telemetry feedback: {atom_id!r}")
+    if not helpful:
+        owning_brain = brain_dir or _brain_dir_for_telemetry_db(db_path)
+        if owning_brain:
+            _append_canonical_correction(owning_brain, atom_id)
     init_telemetry_db(db_path)
     col = "positive_feedback" if helpful else "corrections"
     with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:

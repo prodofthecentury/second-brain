@@ -38,7 +38,7 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts"))
 
 from scripts.config import (
-    BRAIN_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, RAW_DIR, INBOX_DIR, SOURCES_DIR, BRIEFINGS_DIR, SIDECAR_DIR,
+    BRAIN_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, PLAYBOOKS_DIR, RAW_DIR, INBOX_DIR, SOURCES_DIR, BRIEFINGS_DIR, SIDECAR_DIR,
     GEN_MODEL, READING_LIST,
     ensure_dirs, read_house_rules, today, now_slug,
     is_content_markdown,
@@ -85,6 +85,17 @@ from scripts.cognitive_core import (
     record_grounded_answer_telemetry,
     record_retrieval_telemetry,
     save_experience_record,
+)
+from scripts.skill_playbooks import (
+    PlaybookValidationError,
+    deprecate_skill_playbook,
+    inspect_skill_candidates,
+    list_playbooks,
+    promote_skill_playbook,
+)
+from scripts.executive_planner import (
+    ExecutivePlanRequest,
+    assemble_executive_plan,
 )
 
 ensure_dirs()
@@ -309,6 +320,8 @@ def search_memory(
     projects=(),
     retrieval_mode="auto",
     allow_cross_project=False,
+    enable_fitness_boost=False,
+    active_context_profile=(),
 ):
     consume_last_degradation_warning()
     try:
@@ -320,6 +333,8 @@ def search_memory(
                 projects=tuple(projects),
                 allow_cross_project=allow_cross_project,
                 retrieval_mode=retrieval_mode,
+                enable_fitness_boost=enable_fitness_boost,
+                active_context_profile=tuple(active_context_profile),
             ),
         )
     except Exception as e:
@@ -605,6 +620,7 @@ if nav_selection == "💬 Chat with Memory":
         with c2:
             rag_follow = st.checkbox("Follow Graph Links (Graph RAG)", value=True)
             rag_cross_project = st.checkbox("Allow Cross-Project Links", value=False)
+            rag_fitness_boost = st.checkbox("Fitness & Freshness Boost (Approved Only)", value=False)
             rag_answer_mode = st.selectbox("Answer Contract Mode", ["standard", "preference"], index=0)
         with c3:
             installed_models = get_ollama_model_names()
@@ -619,6 +635,7 @@ if nav_selection == "💬 Chat with Memory":
             ]))
             st_model = st.selectbox("Ollama Model", model_options)
             rag_project_scope = st.text_input("Project Scope (optional, e.g. project:second_brain)", value="")
+            rag_context_profile = st.text_input("Active Context Profile (optional, e.g. windows, python)", value="")
             
     # Clear button
     if st.button("🧹 Clear Chat History"):
@@ -653,6 +670,14 @@ if nav_selection == "💬 Chat with Memory":
             project_tuple = tuple(
                 p.strip() for p in rag_project_scope.split(",") if p.strip()
             )
+            context_profile_tuple = tuple(
+                c.strip() for c in rag_context_profile.split(",") if c.strip()
+            )
+            extra_recall_kwargs = {}
+            if rag_fitness_boost:
+                extra_recall_kwargs["enable_fitness_boost"] = True
+            if context_profile_tuple:
+                extra_recall_kwargs["active_context_profile"] = context_profile_tuple
             with st.spinner("🧠 Querying vector memories..."):
                 direct_refs, neighbor_refs = search_memory(
                     user_prompt, 
@@ -661,6 +686,7 @@ if nav_selection == "💬 Chat with Memory":
                     projects=project_tuple,
                     retrieval_mode=rag_retrieval_mode,
                     allow_cross_project=rag_cross_project,
+                    **extra_recall_kwargs,
                 )
                 
             all_refs = direct_refs + neighbor_refs
@@ -852,6 +878,7 @@ elif nav_selection == "🗄️ Vault Explorer":
         "Vault Category",
         [
             "2-atoms (Atoms)",
+            "5-playbooks (Skill Playbooks)",
             "3-threads (Threads)",
             "4-experiences (Experience Records)",
             "sources (Web Pages)",
@@ -863,6 +890,7 @@ elif nav_selection == "🗄️ Vault Explorer":
     # Map category to folder path
     folder_map = {
         "2-atoms (Atoms)": ATOMS_DIR,
+        "5-playbooks (Skill Playbooks)": PLAYBOOKS_DIR,
         "3-threads (Threads)": THREADS_DIR,
         "4-experiences (Experience Records)": EXPERIENCES_DIR,
         "sources (Web Pages)": SOURCES_DIR,
@@ -875,7 +903,7 @@ elif nav_selection == "🗄️ Vault Explorer":
         st.info("This vault category has no files yet.")
     else:
         files = sorted([f for f in os.listdir(dir_path) if f.endswith(".md") or f.endswith(".intake")])
-        if dir_path in (ATOMS_DIR, INBOX_DIR, EXPERIENCES_DIR):
+        if dir_path in (ATOMS_DIR, INBOX_DIR, EXPERIENCES_DIR, PLAYBOOKS_DIR):
             files = [filename for filename in files if filename != "README.md"]
         search_query = st.text_input("🔍 Search filenames", "")
         
@@ -1192,10 +1220,12 @@ elif nav_selection == "📥 Inbox & Web Scout":
 # PAGE 4B: HOST API, QUARANTINE & COGNITIVE FITNESS
 elif nav_selection == "🧬 Host API, Quarantine & Fitness":
     st.title("🧬 Host Ecosystem, Quarantine & Cognitive Core")
-    tab_quarantine, tab_hosts, tab_fitness = st.tabs([
+    tab_quarantine, tab_hosts, tab_fitness, tab_playbooks, tab_planner = st.tabs([
         "🛡️ Quarantined Inbox (0-raw/inbox)",
         "🔌 Hardware Tier & AI Host Consent",
         "🧠 Cognitive Fitness & Experiences",
+        "📘 Skill Playbooks",
+        "🧭 Executive Planner",
     ])
 
     with tab_quarantine:
@@ -1335,6 +1365,157 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                 st.success(f"Saved `4-experiences/{saved_exp['filename']}` (SHA-256 `{saved_exp['sha256']}`).")
             except Exception as exc:
                 st.error(f"Could not save experience: {exc}")
+
+    with tab_playbooks:
+        st.subheader("Owner-Gated Skill Playbooks (`brain/5-playbooks/`)")
+        st.caption(
+            "Playbooks are human-readable operational checklists anchored by exact SHA-256 to approved `procedural` atoms. "
+            "They are never executed as code and automatically become inactive if any backing atom is edited, demoted, or receives unacknowledged corrections."
+        )
+
+        candidates = inspect_skill_candidates()
+        if candidates:
+            st.markdown("#### Approved Procedural Atoms & Promotion Readiness")
+            st.dataframe(pd.DataFrame(candidates), use_container_width=True)
+        else:
+            st.info("No currently owner-approved `procedural` atoms found in `2-atoms/`.")
+
+        with st.expander("➕ Promote Approved Procedural Atom(s) to Skill Playbook (CAS-Locked)", expanded=False):
+            cand_map = {str(c["atom_id"]): str(c["sha256"]) for c in candidates}
+            selected_backing = st.multiselect(
+                "Backing Approved Procedural Atoms (CAS SHA-256 bound)",
+                options=sorted(cand_map.keys()),
+                key="pb_backing_atoms",
+            )
+            pb_id_in = st.text_input("Playbook ID (slug, e.g. `staged-vector-rebuild`)", key="pb_id_in")
+            pb_title_in = st.text_input("Playbook Title", key="pb_title_in")
+            pb_actor_in = st.text_input("Human Owner Actor", value="local_dashboard_owner", key="pb_actor_in")
+            pb_trigger_in = st.text_input("Trigger & Applicability", key="pb_trigger_in")
+            pb_pre_in = st.text_area("Preconditions & Inputs (one per line)", height=80, key="pb_pre_in")
+            pb_steps_in = st.text_area(
+                "Ordered Steps (one per line — each step must be verbatim-grounded in a backing atom's Claim or Evidence)",
+                height=110,
+                key="pb_steps_in",
+            )
+            pb_out_in = st.text_area("Expected Outputs & Verification (one per line)", height=80, key="pb_out_in")
+            pb_rec_in = st.text_area("Failure Modes & Rollback (one per line)", height=80, key="pb_rec_in")
+            pb_prev_sha = st.text_input(
+                "Existing Playbook SHA-256 (leave empty for initial creation; required when updating an existing playbook)",
+                value="",
+                key="pb_prev_sha",
+            )
+            pb_early = st.checkbox("Allow Early Owner Promotion (< 3 grounded citations)", value=False, key="pb_early")
+            pb_ack_corr = st.checkbox("Acknowledge Existing Backing Atom Corrections", value=False, key="pb_ack_corr")
+            pb_rationale_in = st.text_input("Promotion / Override Rationale", value="", key="pb_rationale_in")
+
+            if st.button("✅ Promote Playbook (CAS-Verified)", key="btn_promote_playbook"):
+                try:
+                    promoted_res = promote_skill_playbook(
+                        playbook_id=pb_id_in,
+                        title=pb_title_in,
+                        backing_atoms=[(aid, cand_map[aid]) for aid in selected_backing],
+                        trigger=pb_trigger_in,
+                        preconditions=[ln.strip() for ln in pb_pre_in.splitlines() if ln.strip()],
+                        steps=[ln.strip() for ln in pb_steps_in.splitlines() if ln.strip()],
+                        expected_outputs=[ln.strip() for ln in pb_out_in.splitlines() if ln.strip()],
+                        failure_recovery=[ln.strip() for ln in pb_rec_in.splitlines() if ln.strip()],
+                        actor=pb_actor_in,
+                        rationale=pb_rationale_in,
+                        allow_early_owner_override=pb_early,
+                        acknowledge_corrections=pb_ack_corr,
+                        expected_playbook_sha256=pb_prev_sha.strip() or None,
+                    )
+                    st.success(f"Promoted `5-playbooks/{promoted_res['filename']}` (SHA-256 `{promoted_res['sha256']}`).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Playbook promotion blocked: {exc}")
+
+        st.divider()
+        st.markdown("#### Registered Skill Playbooks & Cryptographic Integrity")
+        all_playbooks = list_playbooks(active_only=False)
+        if not all_playbooks:
+            st.caption("No Playbooks present in `brain/5-playbooks/` yet.")
+        else:
+            pb_rows = [
+                {
+                    "playbook_id": pb.playbook_id,
+                    "filename": pb.filename,
+                    "valid": pb.valid,
+                    "status": pb.status,
+                    "reason": pb.reason,
+                    "title": pb.title,
+                    "contexts": ", ".join(pb.contexts),
+                    "backing_atoms": ", ".join(pb.backing_atoms),
+                    "sha256": pb.sha256,
+                }
+                for pb in all_playbooks
+            ]
+            st.dataframe(pd.DataFrame(pb_rows), use_container_width=True)
+
+            active_choices = {pb.filename: pb.sha256 for pb in all_playbooks if pb.status != "deprecated"}
+            if active_choices:
+                with st.expander("🗑️ Deprecate Playbook (CAS-Locked)", expanded=False):
+                    dep_target = st.selectbox("Playbook to Deprecate", sorted(active_choices.keys()), key="dep_pb_target")
+                    dep_actor = st.text_input("Human Owner Actor", value="local_dashboard_owner", key="dep_pb_actor")
+                    dep_reason = st.text_input("Deprecation Rationale (required)", key="dep_pb_reason")
+                    if st.button("🗑️ Deprecate Selected Playbook", key="btn_deprecate_pb"):
+                        try:
+                            dep_res = deprecate_skill_playbook(
+                                dep_target,
+                                expected_sha256=active_choices[dep_target],
+                                actor=dep_actor,
+                                rationale=dep_reason,
+                            )
+                            st.info(f"Deprecated `5-playbooks/{dep_res['filename']}` (new SHA-256 `{dep_res['sha256']}`).")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Playbook deprecation blocked: {exc}")
+
+    with tab_planner:
+        st.subheader("Grounded Executive Planner")
+        st.caption(
+            "Synthesizes structured execution plans strictly from active verified Playbooks and owner-approved Atoms. "
+            "Every step carries cryptographic source/playbook anchors; unsupported goals abstain explicitly."
+        )
+        plan_goal = st.text_input("Task Goal", placeholder="e.g. Triage failing background workers and inspect logs", key="plan_goal_in")
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            plan_mode = st.selectbox("Planning Mode", ["deterministic", "model_assisted"], index=0, key="plan_mode_in")
+            host_keys = sorted(load_host_policies().keys())
+            default_idx = host_keys.index("ollama_local") if "ollama_local" in host_keys else 0
+            plan_host = st.selectbox("AI Host (used when model_assisted)", host_keys, index=default_idx, key="plan_host_in")
+        with pc2:
+            plan_project = st.text_input("Project Scope (optional, e.g. project:second_brain)", value="", key="plan_proj_in")
+            plan_contexts = st.text_input("Active Context Profile (comma-separated, e.g. windows, python)", value="", key="plan_ctx_in")
+        with pc3:
+            plan_prefs = st.checkbox("Include Subjective Owner Preferences (as non-factual guardrails)", value=False, key="plan_prefs_in")
+            plan_save = st.checkbox("Save Read-Only Briefing to `brain/briefings/`", value=False, key="plan_save_in")
+
+        if st.button("🧭 Assemble Grounded Executive Plan", key="btn_run_planner"):
+            if not plan_goal.strip():
+                st.warning("Enter a non-empty task goal.")
+            else:
+                try:
+                    req = ExecutivePlanRequest(
+                        goal=plan_goal.strip(),
+                        project_scope=plan_project.strip() or None,
+                        active_context_profile=tuple(c.strip() for c in plan_contexts.split(",") if c.strip()),
+                        include_preferences=plan_prefs,
+                        mode=plan_mode,
+                        host_id=plan_host,
+                    )
+                    plan_result = assemble_executive_plan(req, save_briefing=plan_save)
+                    if plan_result.plan_ready:
+                        st.success(f"Plan assembled ({plan_result.mode_used}): {plan_result.summary}")
+                    else:
+                        st.warning(f"Abstained ({plan_result.mode_used}): {plan_result.summary}")
+                    if plan_result.saved_briefing_path:
+                        st.caption(f"Saved read-only briefing: `{plan_result.saved_briefing_path}`")
+                    st.code(plan_result.render_markdown(), language="markdown")
+                    with st.expander("🔍 Inspect Structured Plan JSON & Citations", expanded=False):
+                        st.json(plan_result.as_dict())
+                except Exception as exc:
+                    st.error(f"Executive planning failed: {exc}")
 
 
 # PAGE 5: SYSTEM CONTROL
