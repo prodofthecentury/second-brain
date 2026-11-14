@@ -1022,6 +1022,16 @@ class MCPBoundaryTests(unittest.TestCase):
                     os.environ.pop("BRAIN_MCP_BEARER_TOKEN", None)
                 os.environ.pop("BRAIN_MCP_ALLOWED_TOOLS", None)
                 os.environ.pop("BRAIN_MCP_BIND_ADDRESS", None)
+                os.environ.pop("BRAIN_MCP_TRUSTED_STDIO", None)
+                os.environ.pop("BRAIN_MCP_CLIENT_TOKEN", None)
+
+                import notes_store
+
+                playbooks_dir = brain_dir / "5-playbooks"
+                notes_dir = brain_dir / "notes"
+                playbooks_dir.mkdir(parents=True, exist_ok=True)
+                notes_dir.mkdir(parents=True, exist_ok=True)
+                isolated_note_paths = notes_store.NotePaths.for_brain(str(brain_dir))
 
                 for mod in (config, mcp_server):
                     stack.enter_context(patch.object(mod, "BRAIN_DIR", str(brain_dir), create=True))
@@ -1032,6 +1042,15 @@ class MCPBoundaryTests(unittest.TestCase):
                     stack.enter_context(patch.object(mod, "BRIEFINGS_DIR", str(briefings_dir), create=True))
                 stack.enter_context(patch.object(config, "DESK_DIR", str(desk_dir)))
                 stack.enter_context(patch.object(config, "EXPERIENCES_DIR", str(experiences_dir)))
+                stack.enter_context(patch.object(config, "PLAYBOOKS_DIR", str(playbooks_dir), create=True))
+                stack.enter_context(patch.object(config, "NOTES_DIR", str(notes_dir), create=True))
+                stack.enter_context(
+                    patch.object(config, "NOTE_SNAPSHOTS_DIR", isolated_note_paths.snapshots_dir, create=True)
+                )
+                stack.enter_context(
+                    patch.object(config, "NOTES_INDEX_PATH", isolated_note_paths.index_path, create=True)
+                )
+                stack.enter_context(patch.object(notes_store, "DEFAULT_PATHS", isolated_note_paths))
                 stack.enter_context(patch.object(config, "SOURCES_DIR", str(sources_dir)))
                 stack.enter_context(patch.object(config, "CHROMA_PATH", str(chroma_dir)))
                 stack.enter_context(patch.object(config, "SIDECAR_DIR", str(sidecar_dir)))

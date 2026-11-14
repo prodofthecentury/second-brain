@@ -39,12 +39,28 @@ class Phase3IsolatedTestCase(unittest.TestCase):
                     "BRAIN_MEMORY_API_TOKEN_FILE": str(sec_dir / "memory-api-token"),
                     "BRAIN_HOST_POLICY_FILE": str(sec_dir / "host-sharing-policy.json"),
                     "BRAIN_MCP_TOKEN_FILE": str(sec_dir / "mcp-token"),
+                    "BRAIN_OWNER_TOKEN_FILE": str(sec_dir / "owner-token"),
                 },
                 clear=False,
             )
         )
-        os.environ.pop("BRAIN_MEMORY_API_TOKEN", None)
-        os.environ.pop("OLLAMA_HOST", None)
+        for key in (
+            "BRAIN_MEMORY_API_TOKEN",
+            "BRAIN_MCP_BEARER_TOKEN",
+            "BRAIN_MCP_CLIENT_TOKEN",
+            "BRAIN_MCP_TRUSTED_STDIO",
+            "OLLAMA_HOST",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            os.environ.pop(key, None)
 
 
 def _seed_atom(
@@ -1300,6 +1316,358 @@ class SecurityAuditRegressionTests(Phase3IsolatedTestCase):
             )
             self.assertEqual(alpha.pending_candidate_count, 0)
             self.assertGreaterEqual(beta.pending_candidate_count, 1)
+
+
+class Phase3RemediationRegressionTests(Phase3IsolatedTestCase):
+    """Regression coverage for Phase 3A hardening remediations."""
+
+    def test_non_playbook_refusal_semantic_pref_integrity_and_duplicate_deprecate(self):
+        from atom_mutator import apply_review_transition
+        from evidence import find_evidence_anchor
+        from skill_playbooks import (
+            PlaybookValidationError,
+            deprecate_skill_playbook,
+            promote_skill_playbook,
+            verify_playbook_integrity,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            telemetry_db = str(brain / ".sidecar" / "telemetry.sqlite3")
+            pb_dir = brain / "5-playbooks"
+            pb_dir.mkdir(parents=True, exist_ok=True)
+            random_note = pb_dir / "notes-readme.md"
+            random_note.write_text("# Random Note\nDo not overwrite me.\n", encoding="utf-8")
+
+            step_text = "Verify checksums before rotating SQLite archives."
+            _, proc_sha = _seed_atom(
+                brain,
+                filename="proc-checksum.md",
+                claim=step_text,
+                evidence=step_text,
+                memory_type="procedural",
+                approve=True,
+            )
+            with self.assertRaises(PlaybookValidationError):
+                _promote_for_test(brain, telemetry_db, "notes-readme", [("proc-checksum.md", proc_sha)], [step_text])
+            self.assertEqual(random_note.read_text(encoding="utf-8"), "# Random Note\nDo not overwrite me.\n")
+
+            # Valid promotion + deprecate twice must fail closed on already-deprecated playbook.
+            promoted = _promote_for_test(brain, telemetry_db, "valid-checksum", [("proc-checksum.md", proc_sha)], [step_text])
+            first_dep = deprecate_skill_playbook(
+                "valid-checksum.md",
+                expected_sha256=promoted["sha256"],
+                actor="owner",
+                rationale="Superseded",
+                brain_dir=str(brain),
+                playbooks_dir=str(pb_dir),
+            )
+            with self.assertRaises(PlaybookValidationError):
+                deprecate_skill_playbook(
+                    "valid-checksum.md",
+                    expected_sha256=first_dep["sha256"],
+                    actor="owner",
+                    rationale="Second deprecation",
+                    brain_dir=str(brain),
+                    playbooks_dir=str(pb_dir),
+                )
+
+            # Semantic & preference backing atoms must be rejected by both promote & verify_playbook_integrity.
+            _, sem_sha = _seed_atom(
+                brain,
+                filename="sem-fact.md",
+                claim="SQLite WAL files grow during long transactions.",
+                evidence="SQLite WAL files grow during long transactions.",
+                memory_type="semantic",
+                approve=True,
+            )
+            with self.assertRaises(PlaybookValidationError):
+                _promote_for_test(
+                    brain,
+                    telemetry_db,
+                    "bad-sem-pb",
+                    [("sem-fact.md", sem_sha)],
+                    ["SQLite WAL files grow during long transactions."],
+                )
+            forged_sem = pb_dir / "bad-sem-pb.md"
+            forged_sem.write_text(
+                "---\n"
+                "id: bad-sem-pb\n"
+                "playbook_id: bad-sem-pb\n"
+                "type: playbook\n"
+                "playbook_status: active\n"
+                "backing_atoms:\n  - sem-fact.md\n"
+                f"backing_atom_sha256:\n  sem-fact.md: {sem_sha}\n"
+                "contexts:\n  - project:second_brain\n"
+                "---\n\n"
+                "## Trigger / Scope\nWhen debugging WAL\n\n"
+                "## Owner-Authored Preconditions\n- Lock acquired\n\n"
+                "## Ordered Steps\n1. SQLite WAL files grow during long transactions.\n\n"
+                "## Expected Outputs & Verification\n- WAL bounded\n\n"
+                "## Failure Modes & Rollback\n- Abort cleanly\n",
+                encoding="utf-8",
+            )
+            forged_sem_sha = hashlib.sha256(forged_sem.read_bytes()).hexdigest()
+            with patch(
+                "skill_playbooks._latest_playbook_decision",
+                return_value=(True, {"action": "promote_playbook", "new_sha256": forged_sem_sha}),
+            ):
+                rep_sem = verify_playbook_integrity(
+                    str(forged_sem),
+                    brain_dir=str(brain),
+                    atoms_dir=str(brain / "2-atoms"),
+                    playbooks_dir=str(pb_dir),
+                    telemetry_db_path=telemetry_db,
+                )
+            self.assertFalse(rep_sem.valid)
+            self.assertEqual(rep_sem.reason, "non_procedural_backing_atom:sem-fact.md")
+
+            _, pref_sha = _seed_atom(
+                brain,
+                filename="pref-rule.md",
+                claim="Prefer concise checklists before deployments.",
+                evidence="Prefer concise checklists before deployments.",
+                memory_type="procedural",
+                epistemic_label="preference",
+                approve=True,
+            )
+            with self.assertRaises(PlaybookValidationError):
+                _promote_for_test(
+                    brain,
+                    telemetry_db,
+                    "bad-pref-pb",
+                    [("pref-rule.md", pref_sha)],
+                    ["Prefer concise checklists before deployments."],
+                )
+            forged_pref = pb_dir / "bad-pref-pb.md"
+            forged_pref.write_text(
+                "---\n"
+                "id: bad-pref-pb\n"
+                "playbook_id: bad-pref-pb\n"
+                "type: playbook\n"
+                "playbook_status: active\n"
+                "backing_atoms:\n  - pref-rule.md\n"
+                f"backing_atom_sha256:\n  pref-rule.md: {pref_sha}\n"
+                "contexts:\n  - project:second_brain\n"
+                "---\n\n"
+                "## Trigger / Scope\nWhen preparing release\n\n"
+                "## Owner-Authored Preconditions\n- Checklist open\n\n"
+                "## Ordered Steps\n1. Prefer concise checklists before deployments.\n\n"
+                "## Expected Outputs & Verification\n- Checklist done\n\n"
+                "## Failure Modes & Rollback\n- Halt release\n",
+                encoding="utf-8",
+            )
+            forged_pref_sha = hashlib.sha256(forged_pref.read_bytes()).hexdigest()
+            with patch(
+                "skill_playbooks._latest_playbook_decision",
+                return_value=(True, {"action": "promote_playbook", "new_sha256": forged_pref_sha}),
+            ):
+                rep_pref = verify_playbook_integrity(
+                    str(forged_pref),
+                    brain_dir=str(brain),
+                    atoms_dir=str(brain / "2-atoms"),
+                    playbooks_dir=str(pb_dir),
+                    telemetry_db_path=telemetry_db,
+                )
+            self.assertFalse(rep_pref.valid)
+            self.assertEqual(rep_pref.reason, "preference_backing_atom_forbidden:pref-rule.md")
+
+    def test_empty_vault_abstention_superseded_count_host_atom_scope_and_transport_fallback(self):
+        from executive_planner import (
+            ExecutivePlanRequest,
+            _count_unapproved_candidates,
+            _playbook_allowed_for_host,
+            assemble_executive_plan,
+        )
+        from host_adapters import HostConsentError, HostSharingRule, builtin_default_policies, save_host_policies
+        from lexical_store import rebuild_lexical_index
+        from skill_playbooks import verify_playbook_integrity
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = root / "brain"
+            atoms_dir = brain / "2-atoms"
+            pb_dir = brain / "5-playbooks"
+            sidecar_dir = brain / ".sidecar"
+            lexical_db = str(sidecar_dir / "lexical.sqlite3")
+            telemetry_db = str(sidecar_dir / "telemetry.sqlite3")
+            policy_file = root / "policy.json"
+            for d in (brain / "0-raw", atoms_dir, pb_dir, sidecar_dir):
+                d.mkdir(parents=True, exist_ok=True)
+
+            # Empty vault must abstain cleanly instead of crashing on MemoryRecallUnavailable.
+            empty_plan = assemble_executive_plan(
+                ExecutivePlanRequest(goal="Deploy database safely"),
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                playbooks_dir=str(pb_dir),
+                lexical_index_path=lexical_db,
+                chroma_path=str(brain / ".chroma"),
+                telemetry_db_path=telemetry_db,
+                policy_path=policy_file,
+            )
+            self.assertTrue(empty_plan.abstained)
+            self.assertFalse(empty_plan.plan_ready)
+
+            # _count_unapproved_candidates skips superseded drafts.
+            _seed_atom(
+                brain,
+                filename="active-draft.md",
+                claim="Purge stale queue items before restart.",
+                evidence="Purge stale queue items before restart.",
+                memory_type="procedural",
+                contexts=["project:alpha"],
+                approve=False,
+            )
+            sup_path, _ = _seed_atom(
+                brain,
+                filename="superseded-draft.md",
+                claim="Purge stale queue items old draft.",
+                evidence="Purge stale queue items old draft.",
+                memory_type="procedural",
+                contexts=["project:alpha"],
+                approve=False,
+            )
+            sup_text = sup_path.read_text(encoding="utf-8").replace(
+                "review_status: pending\n", "superseded_by:\n  - active-draft.md\nreview_status: pending\n"
+            )
+            sup_path.write_text(sup_text, encoding="utf-8")
+            rebuild_lexical_index(str(atoms_dir), lexical_db)
+            pending_n = _count_unapproved_candidates(
+                "Purge stale queue items",
+                lexical_index_path=lexical_db,
+                atoms_dir=str(atoms_dir),
+                brain_dir=str(brain),
+                projects=("project:alpha",),
+            )
+            self.assertEqual(pending_n, 1)
+
+            # _playbook_allowed_for_host rejects backing atom with disallowed project tag via filter_atoms_for_host.
+            step_txt = "Run alpha-beta cross-check before deploy."
+            _, ab_sha = _seed_atom(
+                brain,
+                filename="ab-proc.md",
+                claim=step_txt,
+                evidence=step_txt,
+                memory_type="procedural",
+                contexts=["project:alpha", "project:beta"],
+                approve=True,
+            )
+            _promote_for_test(brain, telemetry_db, "ab-pb", [("ab-proc.md", ab_sha)], [step_txt])
+            rep = verify_playbook_integrity(
+                str(pb_dir / "ab-pb.md"),
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                playbooks_dir=str(pb_dir),
+                telemetry_db_path=telemetry_db,
+            )
+            self.assertTrue(rep.valid)
+            alpha_only = HostSharingRule(
+                host_id="alpha_host",
+                provider="ollama",
+                transport="local",
+                endpoint_url="http://127.0.0.1:11434",
+                default_model="llama3.2",
+                enabled=True,
+                allowed_projects=("project:alpha",),
+            )
+            self.assertFalse(_playbook_allowed_for_host(rep, alpha_only, atoms_dir=str(atoms_dir)))
+
+            # Model-assisted planner: disabled host raises HostConsentError; offline transport falls back deterministically.
+            save_host_policies(builtin_default_policies(), policy_file)
+            with self.assertRaises(HostConsentError):
+                assemble_executive_plan(
+                    ExecutivePlanRequest(
+                        goal="Run alpha-beta cross-check before deploy",
+                        project_scope="project:alpha",
+                        mode="model_assisted",
+                        host_id="ollama_local",
+                    ),
+                    brain_dir=str(brain),
+                    atoms_dir=str(atoms_dir),
+                    playbooks_dir=str(pb_dir),
+                    lexical_index_path=lexical_db,
+                    chroma_path=str(brain / ".chroma"),
+                    telemetry_db_path=telemetry_db,
+                    policy_path=policy_file,
+                )
+
+            save_host_policies(
+                {
+                    "openai_online": HostSharingRule(
+                        host_id="openai_online",
+                        provider="openai_compatible",
+                        transport="online",
+                        endpoint_url="https://api.openai.com/v1",
+                        default_model="gpt-4o-mini",
+                        api_key_env="PLAN_FALLBACK_KEY",
+                        enabled=True,
+                        allowed_projects=("project:alpha", "project:beta"),
+                        redact_pii=True,
+                    )
+                },
+                policy_file,
+            )
+
+            def failing_transport(_req: httpx.Request) -> httpx.Response:
+                raise httpx.ConnectError("connection refused")
+
+            with patch.dict(os.environ, {"PLAN_FALLBACK_KEY": "sk-test-dummy"}):
+                fb_plan = assemble_executive_plan(
+                    ExecutivePlanRequest(
+                        goal="Run alpha-beta cross-check before deploy",
+                        mode="model_assisted",
+                        host_id="openai_online",
+                    ),
+                    brain_dir=str(brain),
+                    atoms_dir=str(atoms_dir),
+                    playbooks_dir=str(pb_dir),
+                    lexical_index_path=lexical_db,
+                    chroma_path=str(brain / ".chroma"),
+                    telemetry_db_path=telemetry_db,
+                    policy_path=policy_file,
+                    http_transport=httpx.MockTransport(failing_transport),
+                    skip_dns_check_for_mock_transport=True,
+                )
+            self.assertTrue(fb_plan.plan_ready)
+            self.assertIn("planner_transport_fallback", fb_plan.gaps)
+
+    def test_lexical_recall_trusted_position_unaffected_by_unapproved_drafts(self):
+        from lexical_store import rebuild_lexical_index
+        from recall import RecallOptions, search_memory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms_dir = brain / "2-atoms"
+            lexical_db = str(brain / ".sidecar" / "lexical.sqlite3")
+            _seed_atom(
+                brain,
+                filename="approved-quantum.md",
+                claim="Quantum deployment checklist requires signed manifest verification.",
+                evidence="Quantum deployment checklist requires signed manifest verification.",
+                approve=True,
+            )
+            opts = RecallOptions(n_results=5, retrieval_mode="lexical")
+            base_direct, _ = search_memory(
+                "quantum deployment checklist", opts, atoms_dir=str(atoms_dir), index_path=lexical_db
+            )
+            self.assertEqual(len(base_direct), 1)
+            base_score = base_direct[0].score
+
+            for i in range(10):
+                _seed_atom(
+                    brain,
+                    filename=f"unapproved-quantum-{i}.md",
+                    claim="quantum deployment checklist " * 6,
+                    evidence="quantum deployment checklist " * 6,
+                    approve=False,
+                )
+            rebuild_lexical_index(str(atoms_dir), lexical_db)
+            after_direct, _ = search_memory(
+                "quantum deployment checklist", opts, atoms_dir=str(atoms_dir), index_path=lexical_db
+            )
+            self.assertEqual([r.filename for r in after_direct], ["approved-quantum.md"])
+            self.assertAlmostEqual(after_direct[0].score, base_score, places=6)
 
 
 if __name__ == "__main__":
