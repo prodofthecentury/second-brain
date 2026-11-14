@@ -30,6 +30,8 @@ import glob
 import datetime
 import hmac
 import secrets
+import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 from mcp.server import Server
@@ -48,8 +50,10 @@ from memory_review import parse_atom_record
 
 
 MAX_INBOX_CHARS = 100_000
+MIN_BEARER_TOKEN_LENGTH = 16
 MCP_AUDIT_PATH = os.path.join(RAW_DIR, "archive", "mcp-audit.jsonl")
 TOOL_NAMES = {"search_memory", "get_atom", "add_to_inbox"}
+UNAVAILABLE_ATOM_MESSAGE = "Atom not found or not currently owner-approved for external reading."
 
 
 # ─── Security & Authorization ─────────────────────────────────────────────────
@@ -69,16 +73,20 @@ def default_mcp_token_path() -> Path:
 
 def get_configured_bearer_token() -> str | None:
     env_token = os.environ.get("BRAIN_MCP_BEARER_TOKEN")
-    if env_token and env_token.strip():
-        return env_token.strip()
+    if env_token is not None:
+        cleaned = env_token.strip()
+        if len(cleaned) < 16:
+            raise PermissionError("Configured BRAIN_MCP_BEARER_TOKEN must contain at least 16 characters.")
+        return cleaned
     token_path = default_mcp_token_path()
-    try:
-        if token_path.is_file():
+    if token_path.exists():
+        try:
             content = token_path.read_text(encoding="utf-8").strip()
-            if content:
-                return content
-    except OSError:
-        pass
+        except OSError as exc:
+            raise PermissionError(f"MCP token file could not be read safely: {exc}") from exc
+        if len(content) < 16:
+            raise PermissionError("MCP token file is empty or shorter than 16 characters.")
+        return content
     return None
 
 
@@ -87,47 +95,94 @@ def generate_bearer_token() -> str:
 
 
 def save_bearer_token(token: str, token_path: Path | None = None) -> Path:
-    if not token or len(token) < 16:
-        raise ValueError("MCP bearer token must contain at least 16 characters.")
+    cleaned = str(token or "").strip()
+    if len(cleaned) < MIN_BEARER_TOKEN_LENGTH:
+        raise ValueError(f"MCP bearer token must contain at least {MIN_BEARER_TOKEN_LENGTH} characters.")
     path = Path(token_path or default_mcp_token_path()).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_text(token.strip() + "\n", encoding="utf-8")
     try:
         if os.name != "nt":
-            os.chmod(path, 0o600)
+            os.chmod(path.parent, 0o700)
     except OSError:
         pass
+    descriptor, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=".mcp-token-")
+    try:
+        try:
+            if os.name != "nt":
+                os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            file.write(cleaned + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
     return path
+
+
+def _extract_token_from_meta(meta: object) -> str | None:
+    if meta is None:
+        return None
+    mapping = None
+    if isinstance(meta, Mapping):
+        mapping = meta
+    elif hasattr(meta, "model_extra") and isinstance(meta.model_extra, Mapping):
+        mapping = meta.model_extra
+    for key in ("authorization", "bearer_token", "auth_token", "token"):
+        val = mapping.get(key) if mapping is not None else getattr(meta, key, None)
+        if isinstance(val, str) and val.strip():
+            cleaned = val.strip()
+            if cleaned.lower().startswith("bearer "):
+                cleaned = cleaned[7:].strip()
+            if cleaned:
+                return cleaned
+    return None
 
 
 def extract_bearer_token(params=None, ctx=None) -> str | None:
     if params is not None:
-        if hasattr(params, "arguments") and isinstance(params.arguments, dict):
+        args_dict = params.get("arguments") if isinstance(params, Mapping) else getattr(params, "arguments", None)
+        if isinstance(args_dict, Mapping):
             for key in ("bearer_token", "auth_token", "token"):
-                val = params.arguments.get(key)
-                if val and isinstance(val, str):
-                    return val.strip()
-        if hasattr(params, "meta") and isinstance(params.meta, dict):
-            for key in ("authorization", "auth_token", "token"):
-                val = params.meta.get(key)
-                if val and isinstance(val, str):
-                    if val.lower().startswith("bearer "):
-                        return val[7:].strip()
-                    return val.strip()
-    if ctx is not None and hasattr(ctx, "meta") and isinstance(ctx.meta, dict):
-        val = ctx.meta.get("authorization")
-        if val and isinstance(val, str):
-            if val.lower().startswith("bearer "):
-                return val[7:].strip()
-            return val.strip()
+                val = args_dict.get(key)
+                if isinstance(val, str) and val.strip():
+                    cleaned = val.strip()
+                    if cleaned.lower().startswith("bearer "):
+                        cleaned = cleaned[7:].strip()
+                    if cleaned:
+                        return cleaned
+    for holder in (params, ctx):
+        if holder is None:
+            continue
+        candidates = []
+        if isinstance(holder, Mapping):
+            candidates.extend([holder.get("meta"), holder.get("_meta")])
+        else:
+            candidates.extend([getattr(holder, "meta", None), getattr(holder, "_meta", None)])
+            extra = getattr(holder, "model_extra", None)
+            if isinstance(extra, Mapping):
+                candidates.extend([extra.get("_meta"), extra.get("meta")])
+        for meta in candidates:
+            token = _extract_token_from_meta(meta)
+            if token:
+                return token
     return None
 
 
 def is_authorized(params=None, ctx=None) -> bool:
-    configured = get_configured_bearer_token()
-    require_auth = os.environ.get("BRAIN_MCP_REQUIRE_AUTH") == "1"
-    if not configured:
-        return not require_auth
+    """Fail-closed bearer token authorization across all MCP handlers."""
+    try:
+        configured = get_configured_bearer_token()
+    except PermissionError:
+        return False
+    if not configured or len(configured) < MIN_BEARER_TOKEN_LENGTH:
+        return False
     provided = extract_bearer_token(params, ctx)
     if not provided:
         return False
@@ -194,19 +249,35 @@ def latest_briefing_path() -> str | None:
     return files[0] if files else None
 
 
-def audit_mcp_use(action: str, audit_path: str = MCP_AUDIT_PATH) -> dict:
+def audit_mcp_use(
+    event_type: str | None = None,
+    outcome: str = "authorized",
+    audit_path: str | None = None,
+    *,
+    action: str | None = None,
+) -> dict:
     """Append a content-free audit event before serving an MCP request."""
-    if action not in {"tool:search_memory", "tool:get_atom", "tool:add_to_inbox", "tool:unknown", "resource:read"}:
+    resolved_event = event_type if event_type is not None else action
+    if audit_path is None and outcome not in {"authorized", "denied"} and (
+        "/" in outcome or "\\" in outcome or outcome.endswith(".jsonl")
+    ):
+        audit_path = outcome
+        outcome = "authorized"
+    if resolved_event not in {"tool:search_memory", "tool:get_atom", "tool:add_to_inbox", "tool:unknown", "resource:read"}:
         raise ValueError("MCP audit action is not allowlisted.")
-    os.makedirs(os.path.dirname(os.path.abspath(audit_path)), exist_ok=True)
+    if outcome not in {"authorized", "denied"}:
+        raise ValueError("MCP audit outcome is not allowlisted.")
+    target_path = audit_path or MCP_AUDIT_PATH
+    os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
     record = {
         "schema_version": 1,
         "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "transport": "stdio",
-        "event": action,
+        "event": resolved_event,
+        "outcome": outcome,
     }
     payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-    descriptor = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    descriptor = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         written = os.write(descriptor, payload)
         if written != len(payload):
@@ -226,10 +297,9 @@ ALL_TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "query":        {"type": "string", "description": "Natural language search query."},
-                "n_results":    {"type": "integer", "description": "Number of results (default 5)."},
-                "project":      {"type": "string", "description": "Optional project scope tag (e.g. project:second_brain)."},
-                "bearer_token": {"type": "string", "description": "Optional MCP bearer token for authorization."},
+                "query":     {"type": "string", "description": "Natural language search query."},
+                "n_results": {"type": "integer", "description": "Number of results (default 5)."},
+                "project":   {"type": "string", "description": "Optional project scope tag (e.g. project:second_brain)."},
             },
             "required": ["query"],
         },
@@ -240,21 +310,19 @@ ALL_TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "atom_id":      {"type": "string", "description": "Atom filename (e.g. 2026-0619-sodium-ion.md)"},
-                "bearer_token": {"type": "string", "description": "Optional MCP bearer token for authorization."},
+                "atom_id": {"type": "string", "description": "Atom filename (e.g. 2026-0619-sodium-ion.md)"},
             },
             "required": ["atom_id"],
         },
     ),
     types.Tool(
         name="add_to_inbox",
-        description="Add a new note or idea to the Second Brain inbox for overnight processing.",
+        description="Add a new note or idea to the Second Brain quarantined inbox (0-raw/inbox/) for owner review.",
         inputSchema={
             "type": "object",
             "properties": {
-                "content":      {"type": "string", "maxLength": MAX_INBOX_CHARS, "description": "Untrusted raw capture, limited to 100,000 characters."},
-                "source":       {"type": "string", "description": "Where this came from (optional)."},
-                "bearer_token": {"type": "string", "description": "Optional MCP bearer token for authorization."},
+                "content": {"type": "string", "maxLength": MAX_INBOX_CHARS, "description": "Untrusted raw capture, limited to 100,000 characters."},
+                "source":  {"type": "string", "description": "Where this came from (optional)."},
             },
             "required": ["content"],
         },
@@ -272,17 +340,20 @@ async def handle_list_tools(_ctx, _params) -> types.ListToolsResult:
 
 
 async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
+    assert_mcp_loopback_transport()
     name = params.name
     arguments = params.arguments or {}
-    audit_mcp_use(f"tool:{name}" if name in TOOL_NAMES else "tool:unknown")
-    ensure_dirs()
-    assert_mcp_loopback_transport()
+    event_name = f"tool:{name}" if name in TOOL_NAMES else "tool:unknown"
+    auth_ok = is_authorized(params, _ctx)
 
-    if not is_authorized(params, _ctx):
+    if not auth_ok:
         return types.CallToolResult(
             content=[types.TextContent(type="text", text="Unauthorized: Invalid or missing MCP bearer token.")],
             isError=True,
         )
+
+    audit_mcp_use(event_name, outcome="authorized")
+    ensure_dirs()
 
     if name not in get_allowed_tools():
         return types.CallToolResult(
@@ -291,9 +362,14 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     if name == "search_memory":
-        query    = arguments["query"]
-        n        = arguments.get("n_results", 5)
-        project  = arguments.get("project")
+        query = str(arguments.get("query") or "").strip()
+        if not query:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Invalid search request: 'query' must be a non-empty string.")],
+                isError=True,
+            )
+        n       = arguments.get("n_results", 5)
+        project = arguments.get("project")
         try:
             results = semantic_search(query, n_results=n, project=project)
         except MemoryRecallUnavailable as exc:
@@ -314,27 +390,29 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
     elif name == "get_atom":
-        raw_atom_id = str(arguments.get("atom_id", ""))
-        if "../" in raw_atom_id or "..\\" in raw_atom_id or "/" in raw_atom_id or "\\" in raw_atom_id:
+        raw_atom_id = str(arguments.get("atom_id") or "").strip()
+        if not raw_atom_id or "../" in raw_atom_id or "..\\" in raw_atom_id or "/" in raw_atom_id or "\\" in raw_atom_id:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{raw_atom_id}' not found or invalid.")])
         atom_id = normalize_markdown_filename(raw_atom_id)
         path    = safe_file_in_dir(ATOMS_DIR, atom_id, allowed_exts={".md"})
         if not path:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{atom_id}' not found or invalid.")])
-        if not approved_revision_is_current(path):
-            return types.CallToolResult(content=[types.TextContent(type="text", text="Atom is not currently owner-approved for external reading.")])
+        vault_root = os.path.dirname(os.path.abspath(ATOMS_DIR))
+        if not approved_revision_is_current(path, brain_dir=vault_root, atoms_dir=ATOMS_DIR):
+            return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
         try:
             record = parse_atom_record(path)
-            if record.get("review_status") != "accepted":
-                return types.CallToolResult(content=[types.TextContent(type="text", text="Atom is not currently owner-approved for external reading.")])
+            if record.get("review_status") != "accepted" or bool(record.get("superseded_by")):
+                return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
         except Exception:
-            return types.CallToolResult(content=[types.TextContent(type="text", text="Atom is not currently owner-approved for external reading.")])
-        content  = read_file_safe(path)
-        text     = content if content else f"Atom '{atom_id}' not found."
-        return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+            return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
+        content = read_file_safe(path)
+        if not content:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
+        return types.CallToolResult(content=[types.TextContent(type="text", text=content)])
 
     elif name == "add_to_inbox":
-        for key in ("content", "source", "filename", "path"):
+        for key in ("source", "filename", "path"):
             val = str(arguments.get(key, ""))
             if "../" in val or "..\\" in val or "/.." in val or "\\.." in val:
                 raise ValueError("Path traversal attempt detected in arguments.")
@@ -377,7 +455,10 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                 if not target_path:
                     raise ValueError("Path traversal attempt detected: destination outside inbox.")
                 suffix += 1
-        text = f"Note saved to quarantined inbox as '{filename}'. It will be processed on the next Refinery Run."
+        text = (
+            f"Note saved to quarantined inbox as '{filename}'. "
+            "It remains isolated in 0-raw/inbox/ until owner review and promotion before Refinery processing."
+        )
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
     return types.CallToolResult(content=[types.TextContent(type="text", text=f"Unknown tool: {name}")], isError=True)
@@ -394,23 +475,29 @@ async def handle_list_resources(_ctx, _params) -> types.ListResourcesResult:
 
 
 async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) -> types.ReadResourceResult:
-    audit_mcp_use("resource:read")
     assert_mcp_loopback_transport()
-    if not is_authorized(params, _ctx):
+    auth_ok = is_authorized(params, _ctx)
+    if not auth_ok:
+        if os.path.isdir(os.path.dirname(os.path.abspath(MCP_AUDIT_PATH))):
+            audit_mcp_use("resource:read", outcome="denied")
         return types.ReadResourceResult(contents=[])
+    audit_mcp_use("resource:read", outcome="authorized")
     uri = str(params.uri)
     if uri.startswith("brain://atoms/"):
         filename = uri.removeprefix("brain://atoms/")
         path = safe_file_in_dir(ATOMS_DIR, filename, allowed_exts={".md"})
-        if not path or not approved_revision_is_current(path):
+        vault_root = os.path.dirname(os.path.abspath(ATOMS_DIR))
+        if not path or not approved_revision_is_current(path, brain_dir=vault_root, atoms_dir=ATOMS_DIR):
             return types.ReadResourceResult(contents=[])
         try:
             record = parse_atom_record(path)
-            if record.get("review_status") != "accepted":
+            if record.get("review_status") != "accepted" or bool(record.get("superseded_by")):
                 return types.ReadResourceResult(contents=[])
         except Exception:
             return types.ReadResourceResult(contents=[])
         content = read_file_safe(path)
+        if not content:
+            return types.ReadResourceResult(contents=[])
         return types.ReadResourceResult(contents=[types.TextResourceContents(uri=uri, mimeType="text/markdown", text=content)])
     return types.ReadResourceResult(contents=[])
 
@@ -431,6 +518,18 @@ async def main():
     if os.environ.get("BRAIN_ENABLE_LOCAL_MCP") != "1":
         raise SystemExit("MCP is disabled. Set BRAIN_ENABLE_LOCAL_MCP=1 only for a trusted local process; do not enable it in cloud-connected clients.")
     assert_mcp_loopback_transport()
+    try:
+        configured = get_configured_bearer_token()
+    except PermissionError as exc:
+        raise SystemExit(
+            f"MCP startup aborted (fail-closed auth): {exc} "
+            "Run `python scripts/mcp_server.py --generate-token` or set BRAIN_MCP_BEARER_TOKEN."
+        ) from exc
+    if not configured or len(configured) < MIN_BEARER_TOKEN_LENGTH:
+        raise SystemExit(
+            "MCP startup aborted: bearer token is required (16+ characters). "
+            "Run `python scripts/mcp_server.py --generate-token` or set BRAIN_MCP_BEARER_TOKEN."
+        )
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
@@ -441,11 +540,13 @@ if __name__ == "__main__":
 
     cli_parser = argparse.ArgumentParser(add_help=False)
     cli_parser.add_argument("--generate-token", action="store_true", help="Generate and persist a cryptographic MCP bearer token.")
+    cli_parser.add_argument("--print-token", action="store_true", help="Print the generated bearer token even when stdout is not a TTY.")
     known_args, _ = cli_parser.parse_known_args()
     if known_args.generate_token:
         new_token = generate_bearer_token()
         saved = save_bearer_token(new_token)
         print(f"MCP bearer token generated and stored at {saved}")
-        print(f"BRAIN_MCP_BEARER_TOKEN={new_token}")
+        if known_args.print_token or sys.stdout.isatty():
+            print(f"BRAIN_MCP_BEARER_TOKEN={new_token}")
         raise SystemExit(0)
     asyncio.run(main())

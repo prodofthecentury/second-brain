@@ -728,20 +728,32 @@ class MCPBoundaryTests(unittest.TestCase):
                 audit_mcp_use("query:private search phrase", str(Path(temporary) / "audit.jsonl"))
 
     def test_mcp_sdk_v2_handlers_return_protocol_results_and_reject_audit_failure(self):
+        import os
+        from types import SimpleNamespace
         from unittest.mock import patch
 
         import mcp_server
         from mcp import types
 
+        test_token = "secret-mcp-bearer-token-123456"
+        auth_ctx = SimpleNamespace(meta={"authorization": f"Bearer {test_token}"})
+
         async def scenario():
-            listed = await mcp_server.handle_list_tools(None, None)
-            self.assertIsInstance(listed, types.ListToolsResult)
-            self.assertEqual({tool.name for tool in listed.tools}, {"search_memory", "get_atom", "add_to_inbox"})
-            resources = await mcp_server.handle_list_resources(None, None)
-            self.assertEqual(resources.resources, [])
-            with patch("mcp_server.audit_mcp_use", side_effect=OSError("audit unavailable")):
-                with self.assertRaises(OSError):
-                    await mcp_server.handle_call_tool(None, types.CallToolRequestParams(name="add_to_inbox", arguments={"content": "must not write"}))
+            with patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token}):
+                listed = await mcp_server.handle_list_tools(auth_ctx, None)
+                self.assertIsInstance(listed, types.ListToolsResult)
+                self.assertEqual({tool.name for tool in listed.tools}, {"search_memory", "get_atom", "add_to_inbox"})
+                resources = await mcp_server.handle_list_resources(auth_ctx, None)
+                self.assertEqual(resources.resources, [])
+                with patch("mcp_server.audit_mcp_use", side_effect=OSError("audit unavailable")):
+                    with self.assertRaises(OSError):
+                        await mcp_server.handle_call_tool(
+                            auth_ctx,
+                            types.CallToolRequestParams(
+                                name="add_to_inbox",
+                                arguments={"content": "must not write", "bearer_token": test_token},
+                            ),
+                        )
 
         import asyncio
         asyncio.run(scenario())
@@ -756,51 +768,89 @@ class MCPBoundaryTests(unittest.TestCase):
         test_token = "secret-mcp-bearer-token-123456"
 
         async def run_auth_checks():
-            with patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token, "BRAIN_MCP_REQUIRE_AUTH": "1"}):
-                # Request without token should fail
-                no_auth_call = await mcp_server.handle_call_tool(
-                    None,
-                    types.CallToolRequestParams(name="search_memory", arguments={"query": "test"})
-                )
-                self.assertTrue(no_auth_call.is_error)
-                self.assertIn("Unauthorized", no_auth_call.content[0].text)
+            # 1. Fail-closed by default when NO token is configured anywhere
+            with tempfile.TemporaryDirectory() as empty_dir:
+                missing_token_file = str(Path(empty_dir) / "no-token")
+                with patch.dict(os.environ, {"BRAIN_MCP_TOKEN_FILE": missing_token_file}, clear=False):
+                    os.environ.pop("BRAIN_MCP_BEARER_TOKEN", None)
+                    unconf_call = await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(name="search_memory", arguments={"query": "test"}),
+                    )
+                    self.assertTrue(unconf_call.is_error)
+                    self.assertIn("Unauthorized", unconf_call.content[0].text)
 
-                # Request with wrong token should fail
-                wrong_auth_call = await mcp_server.handle_call_tool(
-                    None,
-                    types.CallToolRequestParams(name="search_memory", arguments={"query": "test", "bearer_token": "wrong"})
-                )
-                self.assertTrue(wrong_auth_call.is_error)
-                self.assertIn("Unauthorized", wrong_auth_call.content[0].text)
+                # Truncated token file must also fail closed
+                short_file = Path(empty_dir) / "short-token"
+                short_file.write_text("short\n", encoding="utf-8")
+                with patch.dict(os.environ, {"BRAIN_MCP_TOKEN_FILE": str(short_file)}, clear=False):
+                    os.environ.pop("BRAIN_MCP_BEARER_TOKEN", None)
+                    self.assertFalse(mcp_server.is_authorized())
 
-                # Request with valid token should succeed
-                valid_auth_call = await mcp_server.handle_call_tool(
-                    None,
-                    types.CallToolRequestParams(name="search_memory", arguments={"query": "test", "bearer_token": test_token})
-                )
-                self.assertFalse(valid_auth_call.is_error)
+            # 2. Configured token enforcement + pre-auth audit protection
+            with tempfile.TemporaryDirectory() as audit_tmp:
+                audit_path = Path(audit_tmp) / "mcp-audit.jsonl"
+                with (
+                    patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token}),
+                    patch.object(mcp_server, "MCP_AUDIT_PATH", str(audit_path)),
+                ):
+                    # Request without token fails BEFORE writing audit log
+                    no_auth_call = await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(name="search_memory", arguments={"query": "test"}),
+                    )
+                    self.assertTrue(no_auth_call.is_error)
+                    self.assertIn("Unauthorized", no_auth_call.content[0].text)
+                    self.assertFalse(audit_path.exists())
+
+                    # Request with wrong token fails BEFORE writing audit log
+                    wrong_auth_call = await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(
+                            name="search_memory", arguments={"query": "test", "bearer_token": "wrong"}
+                        ),
+                    )
+                    self.assertTrue(wrong_auth_call.is_error)
+                    self.assertIn("Unauthorized", wrong_auth_call.content[0].text)
+                    self.assertFalse(audit_path.exists())
+
+                    # Request with valid token succeeds and records audit
+                    valid_auth_call = await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(
+                            name="search_memory", arguments={"query": "test", "bearer_token": test_token}
+                        ),
+                    )
+                    self.assertFalse(valid_auth_call.is_error)
+                    self.assertTrue(audit_path.exists())
 
         asyncio.run(run_auth_checks())
 
     def test_mcp_granular_tool_permissions(self):
         import asyncio
         import os
+        from types import SimpleNamespace
         from unittest.mock import patch
         import mcp_server
         from mcp import types
 
+        test_token = "secret-mcp-bearer-token-123456"
+        auth_ctx = SimpleNamespace(meta={"authorization": f"Bearer {test_token}"})
+
         async def run_permission_checks():
             # Restrict tools to only search_memory
-            with patch.dict(os.environ, {"BRAIN_MCP_ALLOWED_TOOLS": "search_memory"}):
-                listed = await mcp_server.handle_list_tools(None, None)
+            with patch.dict(os.environ, {"BRAIN_MCP_ALLOWED_TOOLS": "search_memory", "BRAIN_MCP_BEARER_TOKEN": test_token}):
+                listed = await mcp_server.handle_list_tools(auth_ctx, None)
                 tool_names = {t.name for t in listed.tools}
                 self.assertEqual(tool_names, {"search_memory"})
                 self.assertNotIn("add_to_inbox", tool_names)
 
                 # Calling a forbidden tool returns permission error
                 denied_call = await mcp_server.handle_call_tool(
-                    None,
-                    types.CallToolRequestParams(name="add_to_inbox", arguments={"content": "hello"})
+                    auth_ctx,
+                    types.CallToolRequestParams(
+                        name="add_to_inbox", arguments={"content": "hello", "bearer_token": test_token}
+                    ),
                 )
                 self.assertTrue(denied_call.is_error)
                 self.assertIn("Permission denied", denied_call.content[0].text)
@@ -809,107 +859,127 @@ class MCPBoundaryTests(unittest.TestCase):
 
     def test_mcp_inbox_path_traversal_and_size_rejection(self):
         import asyncio
+        import os
+        from unittest.mock import patch
         import mcp_server
         from mcp import types
 
+        test_token = "secret-mcp-bearer-token-123456"
+
         async def run_ingestion_checks():
-            # Path traversal attempt in arguments raises descriptive ValueError
-            with self.assertRaisesRegex(ValueError, "Path traversal attempt detected"):
-                await mcp_server.handle_call_tool(
-                    None,
-                    types.CallToolRequestParams(
-                        name="add_to_inbox",
-                        arguments={"content": "malicious content", "source": "../../evil"}
+            with patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token}):
+                # Path traversal attempt in arguments raises descriptive ValueError
+                with self.assertRaisesRegex(ValueError, "Path traversal attempt detected"):
+                    await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(
+                            name="add_to_inbox",
+                            arguments={"content": "malicious content", "source": "../../evil", "bearer_token": test_token},
+                        ),
                     )
-                )
 
-            with self.assertRaisesRegex(ValueError, "Path traversal attempt detected"):
-                await mcp_server.handle_call_tool(
-                    None,
-                    types.CallToolRequestParams(
-                        name="add_to_inbox",
-                        arguments={"content": "malicious content", "filename": "../../../boot.ini"}
+                with self.assertRaisesRegex(ValueError, "Path traversal attempt detected"):
+                    await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(
+                            name="add_to_inbox",
+                            arguments={"content": "malicious content", "filename": "../../../boot.ini", "bearer_token": test_token},
+                        ),
                     )
-                )
 
-            # Oversized payload raises descriptive ValueError
-            oversized_content = "x" * (mcp_server.MAX_INBOX_CHARS + 10)
-            with self.assertRaisesRegex(ValueError, "Inbox content must contain"):
-                await mcp_server.handle_call_tool(
-                    None,
-                    types.CallToolRequestParams(
-                        name="add_to_inbox",
-                        arguments={"content": oversized_content}
+                # Oversized payload raises descriptive ValueError
+                oversized_content = "x" * (mcp_server.MAX_INBOX_CHARS + 10)
+                with self.assertRaisesRegex(ValueError, "Inbox content must contain"):
+                    await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(
+                            name="add_to_inbox",
+                            arguments={"content": oversized_content, "bearer_token": test_token},
+                        ),
                     )
-                )
 
-            # Null byte injection raises descriptive ValueError
-            with self.assertRaisesRegex(ValueError, "null bytes detected"):
-                await mcp_server.handle_call_tool(
-                    None,
-                    types.CallToolRequestParams(
-                        name="add_to_inbox",
-                        arguments={"content": "data with \x00 null byte"}
+                # Null byte injection raises descriptive ValueError
+                with self.assertRaisesRegex(ValueError, "null bytes detected"):
+                    await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(
+                            name="add_to_inbox",
+                            arguments={"content": "data with \x00 null byte", "bearer_token": test_token},
+                        ),
                     )
-                )
 
         asyncio.run(run_ingestion_checks())
 
     def test_mcp_get_atom_restricts_to_accepted_and_quarantines_inbox(self):
         import asyncio
+        import os
         from unittest.mock import patch
         import mcp_server
         from mcp import types
 
+        test_token = "secret-mcp-bearer-token-123456"
+
         async def run_atom_and_quarantine_checks():
-            # 1. Approved atom can be read
-            approved_res = await mcp_server.handle_call_tool(
-                None,
-                types.CallToolRequestParams(name="get_atom", arguments={"atom_id": "structured-logging.md"}),
-            )
-            self.assertIn("Logs should be structured (JSON)", approved_res.content[0].text)
+            with patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token}):
+                # 1. Approved atom can be read
+                approved_res = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="get_atom", arguments={"atom_id": "structured-logging.md", "bearer_token": test_token}
+                    ),
+                )
+                self.assertIn("Logs should be structured (JSON)", approved_res.content[0].text)
 
-            # 2. Pending atom is strictly blocked from external reading
-            pending_res = await mcp_server.handle_call_tool(
-                None,
-                types.CallToolRequestParams(name="get_atom", arguments={"atom_id": "observability-o11y.md"}),
-            )
-            self.assertIn("not currently owner-approved", pending_res.content[0].text)
+                # 2. Pending atom is strictly blocked from external reading
+                pending_res = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="get_atom", arguments={"atom_id": "observability-o11y.md", "bearer_token": test_token}
+                    ),
+                )
+                self.assertIn("not currently owner-approved", pending_res.content[0].text)
 
-            # 3. Path traversal in get_atom is rejected
-            trav_res = await mcp_server.handle_call_tool(
-                None,
-                types.CallToolRequestParams(name="get_atom", arguments={"atom_id": "../../pyproject.toml"}),
-            )
-            self.assertIn("not found or invalid", trav_res.content[0].text)
+                # 3. Path traversal in get_atom is rejected
+                trav_res = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="get_atom", arguments={"atom_id": "../../pyproject.toml", "bearer_token": test_token}
+                    ),
+                )
+                self.assertIn("not found or invalid", trav_res.content[0].text)
 
-            # 4. Valid add_to_inbox writes strictly to quarantined inbox (0-raw/inbox/) and never top-level 0-raw/
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                raw_dir = Path(tmp_dir) / "0-raw"
-                inbox_dir = raw_dir / "inbox"
-                audit_file = raw_dir / "archive" / "mcp-audit.jsonl"
-                raw_dir.mkdir(parents=True, exist_ok=True)
-                with (
-                    patch.object(mcp_server, "RAW_DIR", str(raw_dir)),
-                    patch.object(mcp_server, "INBOX_DIR", str(inbox_dir)),
-                    patch.object(mcp_server, "MCP_AUDIT_PATH", str(audit_file)),
-                    patch("mcp_server.audit_mcp_use", return_value={}),
-                ):
-                    inbox_res = await mcp_server.handle_call_tool(
-                        None,
-                        types.CallToolRequestParams(
-                            name="add_to_inbox",
-                            arguments={"content": "Quarantined capture test payload.", "source": "unit_test"},
-                        ),
-                    )
-                self.assertIn("quarantined inbox", inbox_res.content[0].text)
-                inbox_files = list(inbox_dir.glob("*.md"))
-                raw_root_files = list(raw_dir.glob("*.md"))
-                self.assertEqual(len(inbox_files), 1)
-                self.assertEqual(len(raw_root_files), 0)
-                stored_text = inbox_files[0].read_text(encoding="utf-8")
-                self.assertIn("<!-- second_brain_origin: mcp_local -->", stored_text)
-                self.assertIn("Quarantined capture test payload.", stored_text)
+                # 4. Valid add_to_inbox writes strictly to quarantined inbox (0-raw/inbox/) and never top-level 0-raw/
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    raw_dir = Path(tmp_dir) / "0-raw"
+                    inbox_dir = raw_dir / "inbox"
+                    audit_file = raw_dir / "archive" / "mcp-audit.jsonl"
+                    raw_dir.mkdir(parents=True, exist_ok=True)
+                    with (
+                        patch.object(mcp_server, "RAW_DIR", str(raw_dir)),
+                        patch.object(mcp_server, "INBOX_DIR", str(inbox_dir)),
+                        patch.object(mcp_server, "MCP_AUDIT_PATH", str(audit_file)),
+                        patch("mcp_server.audit_mcp_use", return_value={}),
+                    ):
+                        inbox_res = await mcp_server.handle_call_tool(
+                            None,
+                            types.CallToolRequestParams(
+                                name="add_to_inbox",
+                                arguments={
+                                    "content": "Quarantined capture test payload.",
+                                    "source": "unit_test",
+                                    "bearer_token": test_token,
+                                },
+                            ),
+                        )
+                    self.assertIn("quarantined inbox", inbox_res.content[0].text)
+                    self.assertIn("remains isolated in 0-raw/inbox/", inbox_res.content[0].text)
+                    inbox_files = list(inbox_dir.glob("*.md"))
+                    raw_root_files = list(raw_dir.glob("*.md"))
+                    self.assertEqual(len(inbox_files), 1)
+                    self.assertEqual(len(raw_root_files), 0)
+                    stored_text = inbox_files[0].read_text(encoding="utf-8")
+                    self.assertIn("<!-- second_brain_origin: mcp_local -->", stored_text)
+                    self.assertIn("Quarantined capture test payload.", stored_text)
 
         asyncio.run(run_atom_and_quarantine_checks())
 
@@ -1704,6 +1774,265 @@ Distributed request correlation relies on structured JSON logging with PII redac
             self.assertEqual(suggestions[0]["atom_b"], "dup-two.md")
             self.assertEqual(p1.read_bytes(), before_1)
             self.assertEqual(p2.read_bytes(), before_2)
+
+
+class ProductionPackagingAndGateTests(unittest.TestCase):
+    def test_posix_and_windows_setup_scripts_inspect_capabilities_without_git_mutations(self):
+        ps1 = (ROOT / "setup.ps1").read_text(encoding="utf-8")
+        sh = (ROOT / "setup.sh").read_text(encoding="utf-8")
+
+        for script_text in (ps1, sh):
+            lowered = script_text.lower()
+            self.assertIsNone(re.search(r"(?im)^\s*git\s+(?:init|add|commit)\b", lowered))
+            self.assertIn("will not initialize, stage, or commit files", lowered)
+            self.assertIn("sync --frozen", lowered)
+
+        self.assertIn("vcruntime140.dll", ps1)
+        self.assertIn("nvidia-smi", ps1)
+        self.assertIn("libstdc++.so.6", sh)
+        self.assertIn("nvidia-smi", sh)
+        self.assertTrue(sh.startswith("#!/usr/bin/env bash"))
+
+    def test_doctor_and_test_all_orchestrator_contracts(self):
+        import doctor
+        import test_all
+
+        checks = doctor.run_checks()
+        areas = {area for _, area, _ in checks}
+        self.assertIn("host runtime", areas)
+        self.assertIn("c++ runtime", areas)
+        self.assertIn("compute device", areas)
+        self.assertIn("capabilities", areas)
+        failures = [item for item in checks if item[0] == "FAIL"]
+        self.assertEqual(failures, [])
+
+        suite_ids = {suite_id for suite_id, _, _ in test_all.SUITES}
+        self.assertEqual(
+            suite_ids,
+            {
+                "doctor",
+                "evaluation_dataset",
+                "audit_sources",
+                "system_safety_tests",
+                "chroma_rebuild_canary",
+                "smoke_test",
+            },
+        )
+
+
+class IndependentAuditReconciliationTests(unittest.TestCase):
+    def test_no_legacy_powershell_or_shell_bypass_of_cas_or_grounding(self):
+        refinery_ps1 = (ROOT / "ollama_refinery.ps1").read_text(encoding="utf-8")
+        chat_ps1 = (ROOT / "chat_with_memory.ps1").read_text(encoding="utf-8")
+
+        self.assertNotIn("Set-Content", refinery_ps1)
+        self.assertNotIn("api/generate", refinery_ps1)
+        self.assertIn("scripts/ollama_refinery.py", refinery_ps1)
+
+        self.assertNotIn("api/generate", chat_ps1)
+        self.assertNotIn("Search-Vault", chat_ps1)
+        self.assertIn("chat_with_memory.py", chat_ps1)
+
+    def test_merged_atoms_are_permanently_terminal_against_demote_edit_and_cycles(self):
+        from atom_mutator import (
+            ReviewTransitionError,
+            apply_atom_edit,
+            apply_atom_merge,
+            apply_review_transition,
+            approved_revision_is_current,
+        )
+
+        helper = AtomMergeTests()
+        with tempfile.TemporaryDirectory() as tmp:
+            brain, atoms, survivor, superseded = helper._fixture(Path(tmp))
+            helper._merge(brain, atoms, survivor, superseded)
+
+            # Merged atom rejects demote, quarantine, reject, approve, AND edit
+            for action in ("demote", "quarantine", "reject", "approve"):
+                with self.assertRaisesRegex(ReviewTransitionError, "Merged or superseded"):
+                    apply_review_transition(
+                        atom_path=str(superseded),
+                        action=action,
+                        expected_sha256=hashlib.sha256(superseded.read_bytes()).hexdigest(),
+                        actor="owner-test",
+                        decision_log_path=str(brain / "0-raw" / "decision.jsonl"),
+                        brain_dir=str(brain),
+                        atoms_dir=str(atoms),
+                    )
+            with self.assertRaisesRegex(ReviewTransitionError, "Merged or superseded"):
+                apply_atom_edit(
+                    atom_path=str(superseded),
+                    edited_content=superseded.read_text(encoding="utf-8").replace("superseded_by:", "tags:"),
+                    expected_sha256=hashlib.sha256(superseded.read_bytes()).hexdigest(),
+                    actor="owner-test",
+                    decision_log_path=str(brain / "0-raw" / "decision.jsonl"),
+                    brain_dir=str(brain),
+                    atoms_dir=str(atoms),
+                )
+
+            # Transitive cycle rejection: A supersedes B, B supersedes C => C cannot supersede A
+            atom_c = atoms / "atom-c.md"
+            atom_c.write_text(
+                survivor.read_text(encoding="utf-8").replace("id: survivor", "id: atom-c").replace('  - "superseded.md"\n', ""),
+                encoding="utf-8",
+            )
+            # Merge survivor (A) into atom_c (so atom_c supersedes survivor, which supersedes superseded)
+            apply_atom_merge(
+                survivor_path=str(atom_c),
+                survivor_expected_sha256=hashlib.sha256(atom_c.read_bytes()).hexdigest(),
+                superseded_path=str(survivor),
+                superseded_expected_sha256=hashlib.sha256(survivor.read_bytes()).hexdigest(),
+                actor="owner-test",
+                rationale="Chained merge test.",
+                decision_log_path=str(brain / "0-raw" / "decision.jsonl"),
+                history_dir=str(atoms / ".history"),
+                brain_dir=str(brain),
+                atoms_dir=str(atoms),
+            )
+            self.assertFalse(
+                approved_revision_is_current(
+                    str(survivor),
+                    decision_log_path=str(brain / "0-raw" / "decision.jsonl"),
+                    brain_dir=str(brain),
+                    atoms_dir=str(atoms),
+                )
+            )
+
+    def test_epistemic_contract_sanitization_and_strict_mode_isolation(self):
+        import json
+        from answer_policy import AnswerRequest, build_grounding_prompt, validate_standard_answer
+        from atom_mutator import apply_review_transition
+        from memory_format import normalize_memory_document
+
+        # 1. Forged epistemic_contract is stripped during normalization
+        forged = (
+            "---\nid: forged-pref\nepistemic_label: claim\nepistemic_contract: injected_contract\n---\n\n"
+            "## Claim\nEmpirical statement.\n\n## Evidence\nEmpirical statement quote.\n"
+        )
+        normalized = normalize_memory_document(forged, "source.md", current_date="2026-11-15")
+        self.assertNotIn("epistemic_contract", normalized)
+
+        # 2. Strict standard vs preference mode isolation
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms = brain / "2-atoms"
+            source = brain / "0-raw" / "pref-source.md"
+            atoms.mkdir(parents=True)
+            source.parent.mkdir(parents=True)
+            source.write_text("Owner prefers 4-space indentation in Python modules.\n", encoding="utf-8")
+
+            pref_atom = atoms / "indent-pref.md"
+            pref_atom.write_text(
+                "---\nid: indent-pref\ntype: atom\nmemory_type: semantic\nsources:\n  - 0-raw/pref-source.md\n"
+                "origin: user_local\ncitation_integrity: missing\nclaim_state: candidate\n"
+                "epistemic_label: preference\nepistemic_contract: forged_value\nreview_status: pending\n---\n\n"
+                "## Claim\nUse 4-space indentation in Python modules.\n\n"
+                "## Evidence\nOwner prefers 4-space indentation in Python modules.\n",
+                encoding="utf-8",
+            )
+            decision_log = brain / "0-raw" / "archive" / "decision-record.jsonl"
+            apply_review_transition(
+                action="approve",
+                atom_path=str(pref_atom),
+                expected_sha256=hashlib.sha256(pref_atom.read_bytes()).hexdigest(),
+                actor="owner-test",
+                decision_log_path=str(decision_log),
+                brain_dir=str(brain),
+                atoms_dir=str(atoms),
+            )
+            approved_text = pref_atom.read_text(encoding="utf-8")
+            self.assertIn("epistemic_contract: owner_subjective_preference", approved_text)
+            self.assertNotIn("forged_value", approved_text)
+
+            retrieved = [{"filename": pref_atom.name, "content": approved_text}]
+            std_prompt = build_grounding_prompt(AnswerRequest(query="indentation?", mode="standard"), retrieved)
+            pref_prompt = build_grounding_prompt(AnswerRequest(query="indentation?", mode="preference"), retrieved)
+            self.assertIn("[]", std_prompt)
+            self.assertIn("Use 4-space indentation in Python modules.", pref_prompt)
+
+            draft = json.dumps({"claims": ["Use 4-space indentation in Python modules."]})
+            blocked_in_std = validate_standard_answer(draft, retrieved, atoms_dir=atoms, mode="standard")
+            self.assertFalse(blocked_in_std.answerable)
+
+            allowed_in_pref = validate_standard_answer(draft, retrieved, atoms_dir=atoms, mode="preference")
+            self.assertTrue(allowed_in_pref.answerable)
+            self.assertIn("[Preference]", allowed_in_pref.text)
+            self.assertIn("[Owner Preference / Non-Factual (owner_subjective_preference)]", allowed_in_pref.text)
+
+    def test_rrf_pool_depth_missing_chroma_degradation_and_manifest_completeness(self):
+        from index_manifest import build_index_manifest, index_manifest_is_current
+        from lexical_store import rebuild_lexical_index
+        from recall import (
+            RecallOptions,
+            consume_last_degradation_warning,
+            search_hybrid_rrf_memory,
+        )
+        from vector_store import get_vector_collection
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atoms = Path(tmp) / "2-atoms"
+            atoms.mkdir()
+            (atoms / "a.md").write_text(
+                "---\nid: a\ntype: atom\nmemory_type: semantic\nclaim_state: human_reviewed\nreview_status: accepted\n---\n\n"
+                "## Claim\nConsensus retrieval target alpha beta.\n\n## Evidence\nConsensus retrieval target alpha beta.\n",
+                encoding="utf-8",
+            )
+            # Manifest with indexed_count < atom_count must be rejected as non-current
+            incomplete = build_index_manifest(
+                atoms_dir=str(atoms),
+                collection_name="atoms",
+                embedding_model="nomic-embed-text",
+                embedding_dimensions=768,
+                indexed_count=0,
+            )
+            self.assertFalse(index_manifest_is_current(incomplete, str(atoms)))
+
+            # Read-only vector probe on empty store must NOT create chroma.sqlite3
+            empty_store = Path(tmp) / "empty-chroma"
+            empty_store.mkdir()
+            col = get_vector_collection(str(empty_store), create=False)
+            self.assertFalse((empty_store / "chroma.sqlite3").exists())
+            col.close() if hasattr(col, "close") else None
+
+            # Missing .chroma directory triggers explicit FTS5 degradation banner in RRF mode
+            lex_path = Path(tmp) / "lexical.sqlite3"
+            rebuild_lexical_index(str(atoms), str(lex_path))
+            from unittest.mock import patch
+            with patch("recall.approved_revision_is_current", return_value=True):
+                consume_last_degradation_warning()
+                direct, _ = search_hybrid_rrf_memory(
+                    "consensus retrieval target alpha",
+                    RecallOptions(n_results=3, retrieval_mode="rrf"),
+                    atoms_dir=str(atoms),
+                    index_path=str(lex_path),
+                    chroma_path=str(Path(tmp) / "nonexistent-chroma"),
+                )
+                banner = consume_last_degradation_warning()
+                self.assertEqual([r.filename for r in direct], ["a.md"])
+                self.assertIsNotNone(banner)
+                self.assertIn("Dense vector store directory is missing", banner)
+
+    def test_scout_rejects_nat64_and_ipv4_mapped_loopback_and_packaging_extras_exist(self):
+        import tomllib
+        from ollama_scout import is_public_ip_address
+
+        self.assertTrue(is_public_ip_address("8.8.8.8"))
+        self.assertFalse(is_public_ip_address("64:ff9b::7f00:1"))
+        self.assertFalse(is_public_ip_address("64:ff9b:1::1"))
+        self.assertFalse(is_public_ip_address("::ffff:127.0.0.1"))
+        self.assertFalse(is_public_ip_address("127.0.0.1"))
+
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        extras = set(pyproject.get("project", {}).get("optional-dependencies", {}).keys())
+        for required_extra in ("dashboard", "online", "mcp", "scout", "watchdog", "evaluation", "dev"):
+            self.assertIn(required_extra, extras)
+
+        playbook = (ROOT / "docs" / "recovery-and-operations-playbook.md").read_text(encoding="utf-8")
+        self.assertNotIn("rebuild_vector_index.py", playbook)
+        self.assertIn("scripts/rebuild_vectors.py", playbook)
+        self.assertIn("scripts/review_atom.py", playbook)
+        self.assertIn("scripts/dashboard_auth.py set-password", playbook)
+        self.assertIn("--runs 5", playbook)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scr
 
 import ollama
 from rich.console import Console
+from rich.markup import escape as rich_escape
 from rich.panel import Panel
 
 from scripts.config import ATOMS_DIR, GEN_MODEL
@@ -70,6 +71,12 @@ def chat_loop(argv: list[str] | None = None):
         action="store_true",
         help="Allow linked neighbor references across project boundaries.",
     )
+    parser.add_argument(
+        "--answer-mode",
+        choices=("standard", "preference"),
+        default="standard",
+        help="Epistemic answer contract mode ('standard' empirical facts or 'preference' owner preferences).",
+    )
     args = parser.parse_args(argv)
     projects = tuple(p.strip() for p in args.project if p.strip())
 
@@ -77,7 +84,7 @@ def chat_loop(argv: list[str] | None = None):
     console.print(
         Panel.fit(
             f"[bold cyan]Ollama Memory Interface (Graph RAG)[/bold cyan]\n"
-            f"mode={args.mode}{scope_label}\nType 'exit' to quit.",
+            f"mode={args.mode} | contract={args.answer_mode}{scope_label}\nType 'exit' to quit.",
             border_style="cyan",
         )
     )
@@ -120,7 +127,7 @@ def chat_loop(argv: list[str] | None = None):
             continue
             
         system_prompt = build_grounding_prompt(
-            AnswerRequest(query=user_input, result_limit=len(retrieved_atoms)),
+            AnswerRequest(query=user_input, mode=args.answer_mode, result_limit=len(retrieved_atoms)),
             retrieved_atoms,
         )
         
@@ -135,9 +142,11 @@ def chat_loop(argv: list[str] | None = None):
             for chunk in response_stream:
                 content = chunk["message"]["content"]
                 full_response += content
-            answer = validate_standard_answer(full_response, retrieved_atoms, atoms_dir=ATOMS_DIR)
+            answer = validate_standard_answer(
+                full_response, retrieved_atoms, atoms_dir=ATOMS_DIR, mode=args.answer_mode
+            )
             full_response = answer.text
-            console.print(f"\n[bold blue]Ollama>[/bold blue] {full_response}")
+            console.print(f"\n[bold blue]Ollama>[/bold blue] {rich_escape(full_response)}")
         except Exception as e:
             console.print(f"\n[bold red]Error connecting to Ollama: {e}[/bold red]")
             continue

@@ -64,7 +64,28 @@ def rebuild_staging_path(store_path: str) -> str:
 def remove_staging_store(path: str):
     """Remove only a staging directory created for the current rebuild attempt."""
     if os.path.isdir(path):
-        shutil.rmtree(path)
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def prune_previous_generations(active_path: str, keep: int = 2) -> None:
+    """Retain at most `keep` `.previous-*` rollback directories alongside `active_path`."""
+    active_abs = os.path.abspath(active_path)
+    parent = os.path.dirname(active_abs)
+    prefix = f"{os.path.basename(active_abs)}.previous-"
+    if not os.path.isdir(parent):
+        return
+    backups = []
+    for entry in os.listdir(parent):
+        if entry.startswith(prefix):
+            full = os.path.join(parent, entry)
+            if os.path.isdir(full):
+                try:
+                    backups.append((os.path.getmtime(full), full))
+                except OSError:
+                    continue
+    backups.sort(key=lambda item: item[0], reverse=True)
+    for _, old_dir in backups[keep:]:
+        shutil.rmtree(old_dir, ignore_errors=True)
 
 
 def activate_staged_store(staging_path: str, active_path: str) -> str | None:
@@ -83,6 +104,7 @@ def activate_staged_store(staging_path: str, active_path: str) -> str | None:
         if backup_path and os.path.exists(backup_path) and not os.path.exists(active_path):
             os.replace(backup_path, active_path)
         raise
+    prune_previous_generations(active_path, keep=2)
     return backup_path
 
 

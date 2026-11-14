@@ -232,9 +232,19 @@ def test_json_vector_collection_rejects_unproven_or_incompatible_embeddings():
 def test_dashboard_launcher_uses_the_supported_python_version():
     root = pathlib.Path(__file__).resolve().parents[1]
     launcher = (root / "run_dashboard.ps1").read_text(encoding="utf-8")
-    check("uv sync --locked --extra dashboard" in launcher, "dashboard launcher syncs the locked dashboard extra")
+    check("uv sync --locked" in launcher, "dashboard launcher syncs the locked project environment")
+    check("--extra dashboard" not in launcher, "dashboard launcher does not pass removed dashboard extra")
+    check(
+        "uv run --locked python scripts/dashboard_auth.py ensure-configured" in launcher,
+        "dashboard launcher enforces password configuration gate",
+    )
     check("uv run --locked streamlit run" in launcher, "dashboard launch uses the locked project environment")
     check("--server.address 127.0.0.1" in launcher, "dashboard launcher binds only to loopback")
+    check("--browser.serverAddress 127.0.0.1" in launcher, "dashboard launcher binds browser address to loopback")
+    check("--browser.gatherUsageStats false" in launcher, "dashboard launcher disables Streamlit telemetry")
+    for script_name in ("run_daemon.ps1", "run_night_shift.ps1"):
+        script_text = (root / script_name).read_text(encoding="utf-8")
+        check("--extra " not in script_text, f"{script_name} does not pass removed uv extras")
 
 
 def test_dashboard_has_noninteractive_local_streamlit_configuration():

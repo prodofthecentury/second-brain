@@ -23,10 +23,18 @@ dependencies = [
     "watchdog>=6,<7",
     "filelock>=3.12,<4",
     "pydantic>=2.7,<3",
+    "rich>=13,<15",
 ]
 
 [project.optional-dependencies]
+dashboard = ["streamlit>=1.66,<2", "plotly>=6,<7", "networkx>=3.4,<4", "pandas>=2.2,<3"]
+online = ["ollama>=0.6,<1", "chromadb>=1.0,<2", "rich>=13,<15"]
+mcp = ["mcp>=2.3,<3", "ollama>=0.6,<1"]
+scout = ["httpx>=0.28,<1", "httpcore>=1,<2", "trafilatura>=2,<3", "beautifulsoup4>=4.13,<5"]
+watchdog = ["watchdog>=6,<7"]
+evaluation = ["ollama>=0.6,<1", "chromadb>=1.0,<2"]
 multimodal = ["faster-whisper>=1.1,<2", "Pillow>=11,<13"]
+dev = []
 all = [
     "faster-whisper>=1.1,<2",
     "Pillow>=11,<13",

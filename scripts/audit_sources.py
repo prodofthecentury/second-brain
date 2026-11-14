@@ -51,7 +51,7 @@ def audit_sources(
     *,
     atoms_dir: str | Path = ATOMS_DIR,
     brain_dir: str | Path = BRAIN_DIR,
-    decision_log_path: str | Path = DECISION_LOG,
+    decision_log_path: str | Path | None = None,
     demote_stale: bool = False,
     actor: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -63,7 +63,11 @@ def audit_sources(
     """
     atoms_root = Path(atoms_dir).resolve()
     brain_root = Path(brain_dir).resolve()
-    decision_path = Path(decision_log_path).resolve()
+    decision_path = (
+        Path(decision_log_path).resolve()
+        if decision_log_path is not None
+        else (brain_root / "0-raw" / "archive" / "decision-record.jsonl").resolve()
+    )
     if demote_stale and (not isinstance(actor, str) or not actor.strip()):
         raise ValueError("An explicit actor is required with --demote-stale.")
 
@@ -170,7 +174,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--atoms-dir", default=ATOMS_DIR)
     parser.add_argument("--brain-dir", default=BRAIN_DIR)
-    parser.add_argument("--decision-log", default=DECISION_LOG)
+    parser.add_argument("--decision-log", default=None)
+    parser.add_argument(
+        "--check", action="store_true",
+        help="Exit 1 when any atom requires review, failed mutation, or has an unreadable anchor.",
+    )
     parser.add_argument(
         "--demote-stale", action="store_true",
         help="Demote accepted atoms whose approval no longer matches current atom/source bytes.",
@@ -189,6 +197,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Source audit failed: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(report, indent=2, ensure_ascii=False))
+    if args.check:
+        has_issues = any(
+            row["action"] in {"conflict_or_failure", "review_required"}
+            or row["anchor_status"] == "unreadable"
+            for row in report
+        )
+        return 1 if has_issues else 0
     return 1 if any(row["action"] == "conflict_or_failure" for row in report) else 0
 
 

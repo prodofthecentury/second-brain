@@ -251,7 +251,7 @@ def normalize_memory_document(
     # assigned only by the local review code after verifying source bytes.
     frontmatter = remove_frontmatter_fields(frontmatter, {
         "evidence_source", "evidence_sha256", "evidence_start", "evidence_end",
-        "evidence_quote_sha256",
+        "evidence_quote_sha256", "epistemic_contract",
     })
     frontmatter = set_scalar_field(frontmatter, "citation_integrity", "missing", "origin")
     frontmatter = set_scalar_field(frontmatter, "claim_state", "candidate", "citation_integrity")

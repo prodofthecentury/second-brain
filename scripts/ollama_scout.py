@@ -35,7 +35,7 @@ import httpcore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
-    READING_LIST, SOURCES_DIR, RAW_DIR, SIDECAR_DIR,
+    BRIEFINGS_DIR, READING_LIST, SOURCES_DIR, RAW_DIR, SIDECAR_DIR,
     today, ensure_dirs
 )
 from review_atom import atomic_write_bytes, review_lock
@@ -76,6 +76,23 @@ def _normalized_hostname(hostname: str) -> str:
     return hostname.rstrip(".").encode("idna").decode("ascii").lower()
 
 
+_NAT64_NETWORKS = (
+    ipaddress.ip_network("64:ff9b::/96"),      # RFC 6052 Well-Known NAT64 Prefix
+    ipaddress.ip_network("64:ff9b:1::/48"),    # RFC 8215 Local-Use NAT64 Prefix
+)
+
+
+def is_public_ip_address(raw_address: str) -> bool:
+    """Return True only for globally routable public IPs, rejecting NAT64 and IPv4-mapped internal addresses."""
+    address = ipaddress.ip_address(raw_address)
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return address.ipv4_mapped.is_global
+        if any(address in net for net in _NAT64_NETWORKS):
+            return False
+    return address.is_global
+
+
 def validate_remote_url(url: str) -> ValidatedRemoteTarget:
     """Resolve once, reject non-public answers, and retain those exact addresses for connect."""
     try:
@@ -106,8 +123,9 @@ def validate_remote_url(url: str) -> ValidatedRemoteTarget:
         raise UnsafeRemoteUrlError("hostname did not resolve to an address")
     addresses = []
     for answer in answers:
-        address = ipaddress.ip_address(answer[4][0])
-        if not address.is_global:
+        raw_ip = answer[4][0]
+        address = ipaddress.ip_address(raw_ip)
+        if not is_public_ip_address(str(address)):
             raise UnsafeRemoteUrlError(f"non-public target address is not allowed: {address}")
         if str(address) not in addresses:
             addresses.append(str(address))
@@ -429,11 +447,9 @@ def run_scout():
 
         print()
 
-    # Write scout log to briefings/
-    log_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "brain", "briefings", f"scout-log-{today()}.md"
-    )
+    # Write scout log to configured BRIEFINGS_DIR
+    os.makedirs(BRIEFINGS_DIR, exist_ok=True)
+    log_path = os.path.join(BRIEFINGS_DIR, f"scout-log-{today()}.md")
     suffix = 1
     base, ext = os.path.splitext(log_path)
     while os.path.exists(log_path):

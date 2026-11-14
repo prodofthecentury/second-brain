@@ -167,6 +167,14 @@ def validate_dataset(
                 errors.append(f"{label} preference cases require candidate_relevance.")
             if case.get("trap_reason") is not None:
                 errors.append(f"{label} preference cases must have trap_reason=null.")
+            if not expected:
+                if acceptable or claims or revisions:
+                    errors.append(f"{label} preference cases without expected atoms cannot declare acceptable atoms, claims, or revisions.")
+            else:
+                if not set(expected).issubset(set(relevance)):
+                    errors.append(f"{label} expected atoms must also appear in candidate_relevance.")
+                if not set(acceptable).issubset(set(relevance)):
+                    errors.append(f"{label} acceptable atoms must also appear in candidate_relevance.")
         else:
             if case.get("answer_mode") != "candidate_retrieval" or case.get("expected_behavior") != "not_scored":
                 errors.append(f"{label} exploratory cases require candidate_retrieval mode and not_scored behavior.")
@@ -177,7 +185,10 @@ def validate_dataset(
             if case.get("trap_reason") is not None:
                 errors.append(f"{label} exploratory cases must have trap_reason=null.")
 
-        if answerability != "answerable":
+        requires_revision_binding = answerability == "answerable" or (
+            answerability == "preference" and bool(expected)
+        )
+        if not requires_revision_binding:
             continue
         revision_map: dict[str, str] = {}
         for revision in revisions:
@@ -247,3 +258,70 @@ def load_dataset(
     except (OSError, json.JSONDecodeError) as exc:
         raise EvaluationDatasetError(f"Could not read evaluation dataset: {exc}") from exc
     return validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=approval_check)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import sys
+    from collections import Counter
+
+    scripts_dir = Path(__file__).resolve().parent
+    root_dir = scripts_dir.parent
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    from config import ATOMS_DIR, BRAIN_DIR
+    from review_atom import approved_revision_is_current
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dataset",
+        default=str(root_dir / "docs" / "retrieval-evaluation-proposed.json"),
+        help="Path to the curated evaluation dataset JSON.",
+    )
+    parser.add_argument("--atoms-dir", default=ATOMS_DIR, help="Path to canonical atoms directory.")
+    parser.add_argument("--brain-dir", default=BRAIN_DIR, help="Path to vault root directory.")
+    parser.add_argument(
+        "--require-all-splits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require non-empty regression, development, and holdout splits.",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        validated = load_dataset(
+            args.dataset,
+            atoms_dir=args.atoms_dir,
+            approval_check=lambda p: approved_revision_is_current(
+                str(p), brain_dir=args.brain_dir, atoms_dir=args.atoms_dir
+            ),
+        )
+    except EvaluationDatasetError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    queries = validated.get("queries", [])
+    split_counts = Counter(q.get("split") for q in queries)
+    answerability_counts = Counter(q.get("answerability") for q in queries)
+
+    if args.require_all_splits:
+        missing_splits = sorted(SPLITS - {s for s, c in split_counts.items() if c > 0})
+        if missing_splits:
+            print(f"Missing required non-empty dataset splits: {', '.join(missing_splits)}", file=sys.stderr)
+            return 1
+
+    summary = {
+        "status": "valid",
+        "dataset_id": validated.get("dataset_id"),
+        "dataset_version": validated.get("dataset_version"),
+        "query_count": len(queries),
+        "splits": dict(sorted(split_counts.items())),
+        "answerability": dict(sorted(answerability_counts.items())),
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

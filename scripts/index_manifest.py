@@ -108,5 +108,6 @@ def index_manifest_is_current(manifest: dict | None, atoms_dir: str) -> bool:
     revisions = atom_revisions(atoms_dir)
     return (
         manifest.get("atom_count") == len(revisions)
+        and manifest.get("indexed_count") == len(revisions)
         and manifest.get("atom_revisions_sha256") == revisions_fingerprint(revisions)
     )

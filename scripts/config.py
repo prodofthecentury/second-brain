@@ -11,6 +11,7 @@ import os
 import datetime
 import hashlib
 import json
+import stat
 
 # ─── Root Paths ──────────────────────────────────────────────────────────────
 SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -121,26 +122,69 @@ def normalize_markdown_filename(value: str) -> str:
         filename += ".md"
     return filename
 
+_WINDOWS_RESERVED_STEMS = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+})
+
+
+def _is_reparse_or_link(path: str) -> bool:
+    """Return True if path itself (without following) is a symlink, junction, or reparse point."""
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    if callable(isjunction) and isjunction(path):
+        return True
+    if os.name == "nt":
+        try:
+            attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+            if attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                return True
+        except OSError:
+            return False
+    return False
+
+
 def resolve_under(base_dir: str, relative_path: str, must_exist: bool = True) -> str | None:
     """Resolve a relative path under a base directory, or return None."""
     if not relative_path:
         return None
 
-    rel_path = str(relative_path).strip().replace("\\", os.sep).replace("/", os.sep)
+    raw = str(relative_path).strip()
+    if not raw or ":" in raw or "\x00" in raw or raw.startswith(("/", "\\")):
+        return None
+
+    rel_path = raw.replace("\\", os.sep).replace("/", os.sep)
     if os.path.isabs(rel_path):
         return None
 
-    base = os.path.abspath(base_dir)
-    candidate = os.path.abspath(os.path.join(base, rel_path))
-
     try:
-        if os.path.commonpath([base, candidate]) != base:
+        base = os.path.realpath(base_dir)
+        lexical = os.path.abspath(os.path.join(base, rel_path))
+        candidate = os.path.realpath(lexical)
+        if os.path.normcase(os.path.commonpath([base, lexical])) != os.path.normcase(base):
             return None
-    except ValueError:
+        if os.path.normcase(os.path.commonpath([base, candidate])) != os.path.normcase(base):
+            return None
+    except (OSError, ValueError):
         return None
 
-    if must_exist and not os.path.exists(candidate):
-        return None
+    if must_exist:
+        if not os.path.exists(candidate):
+            return None
+    else:
+        if os.path.lexists(lexical) and _is_reparse_or_link(lexical):
+            return None
+        current = lexical
+        while os.path.normcase(current) != os.path.normcase(base):
+            if os.path.lexists(current) and _is_reparse_or_link(current):
+                return None
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
     return candidate
 
 def safe_file_in_dir(
@@ -151,7 +195,12 @@ def safe_file_in_dir(
 ) -> str | None:
     """Resolve a single filename inside a directory, rejecting subpaths."""
     name = str(filename or "").strip().replace("\\", "/")
-    if not name or "/" in name or os.path.isabs(name):
+    if not name or name in {".", ".."} or "/" in name or ":" in name or "\x00" in name or os.path.isabs(name):
+        return None
+
+    stem = os.path.splitext(name)[0].rstrip(" .").lower()
+    first_stem = name.split(".", 1)[0].rstrip(" .").lower()
+    if stem in _WINDOWS_RESERVED_STEMS or first_stem in _WINDOWS_RESERVED_STEMS:
         return None
 
     if allowed_exts is not None:

@@ -51,15 +51,24 @@ def _capability(module: str) -> bool:
 
 def doctor() -> int:
     """Report runtime capabilities and locally reachable model services."""
-    print(f"Second Brain {platform.python_version()} on {platform.system()} {platform.machine()}")
+    from scripts.doctor import gpu_driver_status, native_cpp_runtime_status, system_memory_summary
+    from scripts.vector_store import JsonVectorCollection, close_vector_collection, get_vector_collection, json_collection_path
+
+    print(f"Second Brain {platform.python_version()} on {platform.system()} {platform.release()} ({platform.machine()})")
     print(f"Vault: {BRAIN_DIR}")
     print(f"CPU threads: {os.cpu_count() or 'unknown'}")
+    print(f"System memory: {system_memory_summary()}")
+    cpp_ok, cpp_detail = native_cpp_runtime_status()
+    print(f"C++ runtime: {'ready' if cpp_ok else 'missing'} ({cpp_detail})")
+    print(f"Compute device: {gpu_driver_status()}")
     capabilities = {
         "lexical_search_engine": True,
         "online_model_adapter": _capability("ollama"),
         "dashboard": _capability("streamlit"),
         "mcp": _capability("mcp"),
         "dense_index": _capability("chromadb"),
+        "scout_http": _capability("httpx"),
+        "extractor": _capability("trafilatura"),
         "multimodal_audio": _capability("faster_whisper"),
         "image_processing_library": _capability("PIL"),
     }
@@ -80,8 +89,9 @@ def doctor() -> int:
     lexical_ready = lexical_index_is_current(_config.ATOMS_DIR, _config.LEXICAL_INDEX_PATH)
     print(f"Lexical index: {'current' if lexical_ready else 'missing or stale'}")
     try:
-        ollama_base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
-        with urllib.request.urlopen(f"{ollama_base}/api/tags", timeout=1.5) as response:
+        raw_host = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip().rstrip("/")
+        ollama_base = raw_host if raw_host.startswith(("http://", "https://")) else f"http://{raw_host}"
+        with urllib.request.urlopen(f"{ollama_base}/api/tags", timeout=5.0) as response:
             payload = json.loads(response.read().decode("utf-8"))
         models = sorted(item.get("name", item.get("model", "unknown")) for item in payload.get("models", []))
         print(f"Ollama service: ready ({len(models)} model(s))")
@@ -97,16 +107,31 @@ def doctor() -> int:
         from scripts.index_manifest import index_manifest_is_current, load_index_manifest
 
         manifest = load_index_manifest(_config.CHROMA_PATH)
+        backend_note = ""
+        json_fallback_file = json_collection_path(_config.CHROMA_PATH, "atoms")
+        if os.path.isdir(_config.CHROMA_PATH) and (manifest is not None or os.path.exists(json_fallback_file)):
+            collection = get_vector_collection(_config.CHROMA_PATH, name="atoms", create=False)
+            try:
+                if isinstance(collection, JsonVectorCollection):
+                    reason = collection.fallback_reason or "chromadb unavailable"
+                    backend_note = f" [degraded JSON backend: {reason}]"
+            finally:
+                close_vector_collection(collection)
         if manifest and index_manifest_is_current(manifest, _config.ATOMS_DIR):
             print(
-                "Dense index: current; model={} dimensions={} generation={}".format(
-                    manifest.get("embedding_model"), manifest.get("embedding_dimensions"), manifest.get("generation_id")
+                "Dense index: current; model={} dimensions={} generation={}{}".format(
+                    manifest.get("embedding_model"),
+                    manifest.get("embedding_dimensions"),
+                    manifest.get("generation_id"),
+                    backend_note,
                 )
             )
+        elif manifest is not None:
+            print(f"Dense index: stale manifest (generation={manifest.get('generation_id')}); run scripts/rebuild_vectors.py")
         else:
-            print("Dense index: unavailable or stale; no dense results will be served")
-    except (OSError, ValueError, TypeError):
-        print("Dense index: unavailable or invalid; no dense results will be served")
+            print("Dense index: unavailable (no active manifest); lexical FTS5 handles recall cleanly")
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"Dense index: unavailable or invalid ({exc}); no dense results will be served")
     return 0
 
 
@@ -128,15 +153,15 @@ def install(args: argparse.Namespace) -> int:
     if _capability("streamlit"):
         print("Start the local dashboard with `second-brain dashboard`.")
     else:
-        print("Install the dashboard with `uv sync --locked --extra dashboard`.")
+        print("Install runtime dependencies with `uv sync --frozen`.")
     if not _capability("ollama"):
-        print("Model client is not installed. Install the `online` extra; an Ollama service and model are separate.")
+        print("Ollama Python client is not installed. Run `uv sync --frozen`; an Ollama daemon and model are separate.")
     return 0
 
 
 def launch_dashboard() -> int:
     if not _capability("streamlit"):
-        print("Dashboard is not installed. Install the `dashboard` extra first.", file=sys.stderr)
+        print("Dashboard dependencies are not installed. Run `uv sync --frozen` first.", file=sys.stderr)
         return 2
     from scripts.dashboard_auth import configure_password_interactively, load_password_record
 

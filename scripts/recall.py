@@ -479,17 +479,23 @@ def rerank_candidates(
     return sorted(ranked, key=lambda item: item.score, reverse=True)[: options.n_results]
 
 
-def search_semantic_memory(query: str, options: RecallOptions | None = None) -> tuple[list[RecallResult], list[RecallResult]]:
+def search_semantic_memory(
+    query: str,
+    options: RecallOptions | None = None,
+    *,
+    atoms_dir: str = ATOMS_DIR,
+    chroma_path: str = CHROMA_PATH,
+) -> tuple[list[RecallResult], list[RecallResult]]:
     from ollama_utils import EmbeddingUnavailableError, embed_text
 
     options = options or RecallOptions()
-    if not os.path.exists(CHROMA_PATH):
-        return [], []
+    if not os.path.exists(chroma_path):
+        raise MemoryRecallUnavailable("Dense vector store directory is missing; run scripts/rebuild_vectors.py.")
 
-    manifest = load_index_manifest(CHROMA_PATH)
+    manifest = load_index_manifest(chroma_path)
 
     try:
-        collection = get_vector_collection(CHROMA_PATH, name="atoms", create=False)
+        collection = get_vector_collection(chroma_path, name="atoms", create=False)
     except Exception as exc:
         raise MemoryRecallUnavailable(f"Semantic recall index is unavailable: {exc}") from exc
 
@@ -500,7 +506,7 @@ def search_semantic_memory(query: str, options: RecallOptions | None = None) -> 
             raise MemoryRecallUnavailable(f"Semantic recall is unavailable: {exc}") from exc
         generation_id = validated_index_generation(
             manifest,
-            atoms_dir=ATOMS_DIR,
+            atoms_dir=atoms_dir,
             collection_name="atoms",
             embedding_model=EMBED_MODEL,
             embedding_dimensions=len(embedding),
@@ -521,13 +527,13 @@ def search_semantic_memory(query: str, options: RecallOptions | None = None) -> 
             raise MemoryRecallUnavailable(f"Semantic recall query failed: {exc}") from exc
     finally:
         close_vector_collection(collection)
-    direct = rerank_candidates(results, options, query=query)
+    direct = rerank_candidates(results, options, query=query, atoms_dir=atoms_dir)
 
     neighbors = []
     seen = {item.filename for item in direct}
     if options.follow_links:
         for result in direct:
-            for neighbor in linked_neighbors(result, options, query=query):
+            for neighbor in linked_neighbors(result, options, atoms_dir=atoms_dir, query=query):
                 if neighbor.filename not in seen:
                     seen.add(neighbor.filename)
                     neighbors.append(neighbor)
@@ -601,30 +607,46 @@ def search_hybrid_rrf_memory(
     *,
     atoms_dir: str = ATOMS_DIR,
     index_path: str = LEXICAL_INDEX_PATH,
+    chroma_path: str = CHROMA_PATH,
     k_constant: int = 60,
 ) -> tuple[list[RecallResult], list[RecallResult]]:
     """Reciprocal Rank Fusion (RRF) combining SQLite FTS5 (lexical) and Chroma (dense)."""
     options = options or RecallOptions()
-    lex_direct, lex_neighbors = search_lexical_memory(
-        query, options, atoms_dir=atoms_dir, index_path=index_path
+    pool_size = max(options.n_results * 4, 20)
+    pool_options = replace(options, n_results=pool_size, follow_links=False)
+
+    lex_pool, _ = search_lexical_memory(
+        query, pool_options, atoms_dir=atoms_dir, index_path=index_path
     )
     try:
-        dense_direct, _ = search_semantic_memory(query, options)
+        dense_pool, _ = search_semantic_memory(
+            query, pool_options, atoms_dir=atoms_dir, chroma_path=chroma_path
+        )
     except MemoryRecallUnavailable as exc:
         emit_degradation_warning(str(exc))
-        return _tag_degraded_results(lex_direct, lex_neighbors)
+        fallback_direct = lex_pool[: options.n_results]
+        fallback_neighbors = []
+        seen_fb = {item.filename for item in fallback_direct}
+        if options.follow_links:
+            for result in fallback_direct:
+                for neighbor in linked_neighbors(result, options, atoms_dir=atoms_dir, query=query):
+                    if neighbor.filename not in seen_fb:
+                        seen_fb.add(neighbor.filename)
+                        fallback_neighbors.append(neighbor)
+        fallback_neighbors = sorted(fallback_neighbors, key=lambda item: item.score, reverse=True)
+        return _tag_degraded_results(fallback_direct, fallback_neighbors)
 
     rrf_scores: dict[str, float] = {}
     candidate_map: dict[str, RecallResult] = {}
     lex_ranks: dict[str, int] = {}
     dense_ranks: dict[str, int] = {}
 
-    for rank, res in enumerate(lex_direct):
+    for rank, res in enumerate(lex_pool):
         rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
         candidate_map[res.filename] = res
         lex_ranks[res.filename] = rank + 1
 
-    for rank, res in enumerate(dense_direct):
+    for rank, res in enumerate(dense_pool):
         rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
         dense_ranks[res.filename] = rank + 1
         if res.filename not in candidate_map:
@@ -633,7 +655,7 @@ def search_hybrid_rrf_memory(
     fused: list[RecallResult] = []
     for filename, rrf_score in sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)[: options.n_results]:
         base = candidate_map[filename]
-        extra = [f"retrieval:rrf_hybrid", f"rrf_score:{round(rrf_score, 6)}"]
+        extra = ["retrieval:rrf_hybrid", f"rrf_score:{round(rrf_score, 6)}"]
         if filename in lex_ranks:
             extra.append(f"lexical_rank:{lex_ranks[filename]}")
         if filename in dense_ranks:
@@ -667,27 +689,38 @@ def search_hybrid_rrf_memory(
     return fused, sorted(neighbors, key=lambda item: item.score, reverse=True)
 
 
-def search_memory(query: str, options: RecallOptions | None = None) -> tuple[list[RecallResult], list[RecallResult]]:
+def search_memory(
+    query: str,
+    options: RecallOptions | None = None,
+    *,
+    atoms_dir: str = ATOMS_DIR,
+    index_path: str = LEXICAL_INDEX_PATH,
+    chroma_path: str = CHROMA_PATH,
+) -> tuple[list[RecallResult], list[RecallResult]]:
     """Retrieve memories using configured mode ('auto', 'rrf', 'lexical', or 'dense')."""
     options = options or RecallOptions()
     if options.retrieval_mode == "rrf":
-        return search_hybrid_rrf_memory(query, options)
+        return search_hybrid_rrf_memory(
+            query, options, atoms_dir=atoms_dir, index_path=index_path, chroma_path=chroma_path
+        )
     if options.retrieval_mode == "dense":
         try:
-            return search_semantic_memory(query, options)
+            return search_semantic_memory(query, options, atoms_dir=atoms_dir, chroma_path=chroma_path)
         except MemoryRecallUnavailable as exc:
-            if os.path.exists(LEXICAL_INDEX_PATH):
+            if os.path.exists(index_path):
                 emit_degradation_warning(str(exc))
-                lex_direct, lex_neighbors = search_lexical_memory(query, options)
+                lex_direct, lex_neighbors = search_lexical_memory(
+                    query, options, atoms_dir=atoms_dir, index_path=index_path
+                )
                 return _tag_degraded_results(lex_direct, lex_neighbors)
             raise
     if options.retrieval_mode == "lexical":
-        return search_lexical_memory(query, options)
+        return search_lexical_memory(query, options, atoms_dir=atoms_dir, index_path=index_path)
 
     # auto mode: use lexical if sidecar exists, else dense
-    if os.path.exists(LEXICAL_INDEX_PATH):
-        return search_lexical_memory(query, options)
-    return search_semantic_memory(query, options)
+    if os.path.exists(index_path):
+        return search_lexical_memory(query, options, atoms_dir=atoms_dir, index_path=index_path)
+    return search_semantic_memory(query, options, atoms_dir=atoms_dir, chroma_path=chroma_path)
 
 
 def suggest_duplicate_atoms(atoms_dir: str = ATOMS_DIR, min_jaccard: float = 0.35) -> list[dict]:

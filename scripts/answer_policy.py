@@ -150,6 +150,13 @@ def build_grounding_prompt(query: str | AnswerRequest, retrieved_atoms) -> str:
         revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
         parsed = split_frontmatter(content)
         if parsed is not None:
+            fm_values = parse_frontmatter_values(parsed[0])
+            atom_label = str(fm_values.get("epistemic_label", "claim"))
+            is_pref_atom = atom_label == "preference" or bool(fm_values.get("epistemic_contract"))
+            if mode == "preference" and not is_pref_atom:
+                continue
+            if mode == "standard" and is_pref_atom:
+                continue
             claim = section_text("\n".join(parsed[1]), "Claim")
             if claim:
                 allowed_claims.append(claim)
@@ -185,6 +192,7 @@ def validate_standard_answer(
     retrieved_atoms,
     *,
     atoms_dir: str | Path,
+    mode: str = "standard",
 ) -> AnswerResult:
     """Validate model claims and render only exact, current approved atom claims.
 
@@ -193,6 +201,8 @@ draft identifies a retrieved atom and reproduces its Claim exactly. Program-
 verified source provenance and the full anchored evidence excerpt are rendered
 from current source bytes, never selected by the model.
     """
+    if mode not in {"standard", "preference", "auto"}:
+        raise ValueError("Unsupported answer validation mode.")
     atoms_root = Path(atoms_dir).resolve()
     brain_root = atoms_root.parent
     try:
@@ -285,6 +295,10 @@ from current source bytes, never selected by the model.
                     atom_epistemic_label = str(values.get("epistemic_label", "claim"))
                     atom_contract = values.get("epistemic_contract")
                     is_pref = atom_epistemic_label == "preference" or bool(atom_contract)
+                    if mode == "standard" and is_pref:
+                        return _abstain("Subjective owner preferences are excluded from standard factual answers.")
+                    if mode == "preference" and not is_pref:
+                        return _abstain("Empirical factual claims are excluded from subjective preference mode.")
                     supported = GroundedClaim(
                         text=atom_claim,
                         evidence=(EvidenceReference(

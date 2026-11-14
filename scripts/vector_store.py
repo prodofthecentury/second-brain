@@ -30,11 +30,12 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
 
 
 class JsonVectorCollection:
-    def __init__(self, path: str, name: str, fallback_reason: str | None = None):
+    def __init__(self, path: str, name: str, fallback_reason: str | None = None, create_dir: bool = True):
         self.path = path
         self.name = name
         self.fallback_reason = fallback_reason
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if create_dir:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
 
     def _load(self) -> dict[str, dict[str, Any]]:
         if not os.path.exists(self.path):
@@ -44,6 +45,7 @@ class JsonVectorCollection:
         return payload.get("items", {})
 
     def _save(self, items: dict[str, dict[str, Any]]):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as file:
             json.dump({"name": self.name, "items": items}, file, ensure_ascii=False, indent=2)
 
@@ -118,6 +120,25 @@ class JsonVectorCollection:
         }
 
 
+def _close_chroma_client(client) -> None:
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+            return
+        except Exception:
+            pass
+    system = getattr(client, "_system", None)
+    stop = getattr(system, "stop", None)
+    if callable(stop):
+        try:
+            stop()
+        except Exception:
+            pass
+
+
 class ManagedChromaCollection:
     """Keep the owning client reachable so rebuilds can release file handles."""
 
@@ -131,7 +152,7 @@ class ManagedChromaCollection:
 
     def close(self):
         if not self._closed:
-            self._owner_client.close()
+            _close_chroma_client(self._owner_client)
             self._closed = True
 
 
@@ -147,7 +168,24 @@ def json_collection_path(store_path: str, name: str) -> str:
 
 
 def get_vector_collection(store_path: str, name: str = "atoms", create: bool = True, announce: bool = False):
-    os.makedirs(store_path, exist_ok=True)
+    if create:
+        os.makedirs(store_path, exist_ok=True)
+    elif not os.path.isdir(store_path):
+        return JsonVectorCollection(
+            json_collection_path(store_path, name),
+            name,
+            fallback_reason="vector store directory not initialized",
+            create_dir=False,
+        )
+    elif not os.path.isfile(os.path.join(store_path, "chroma.sqlite3")):
+        return JsonVectorCollection(
+            json_collection_path(store_path, name),
+            name,
+            fallback_reason="chroma.sqlite3 not initialized",
+            create_dir=False,
+        )
+
+    client = None
     try:
         import chromadb
 
@@ -158,9 +196,16 @@ def get_vector_collection(store_path: str, name: str = "atoms", create: bool = T
             collection = client.get_collection(name=name)
         return ManagedChromaCollection(client, collection)
     except Exception as exc:
+        if client is not None:
+            _close_chroma_client(client)
         if announce:
             print(f"[!] ChromaDB persistent store unavailable; using JSON vector fallback ({exc})")
-        return JsonVectorCollection(json_collection_path(store_path, name), name, fallback_reason=str(exc))
+        return JsonVectorCollection(
+            json_collection_path(store_path, name),
+            name,
+            fallback_reason=str(exc),
+            create_dir=create,
+        )
 
 
 def reset_vector_collection(
@@ -188,7 +233,7 @@ def reset_vector_collection(
             return ManagedChromaCollection(client, collection)
         except Exception as exc:
             if client is not None:
-                client.close()
+                _close_chroma_client(client)
             if announce:
                 print(f"[!] ChromaDB reset unavailable; using JSON vector fallback ({exc})")
 

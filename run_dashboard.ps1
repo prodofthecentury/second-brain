@@ -3,11 +3,11 @@
 Launches the Second Brain local web dashboard.
 #>
 $ScriptPath = $MyInvocation.MyCommand.Path
-$ProjectRoot = Split-Path $ScriptPath
+$ProjectRoot = Split-Path -Parent $ScriptPath
 
 Write-Host "Booting Second Brain Web Dashboard..." -ForegroundColor Cyan
-Set-Location $ProjectRoot
-uv sync --locked --extra dashboard
+Set-Location -LiteralPath $ProjectRoot
+uv sync --locked
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Dashboard dependencies could not be installed from uv.lock." -ForegroundColor Red
     exit $LASTEXITCODE
@@ -24,4 +24,6 @@ uv run --locked streamlit run dashboard/app.py `
     --server.enableXsrfProtection true `
     --server.xsrfCookieSameSite strict `
     --server.allowedHosts 127.0.0.1 `
-    --server.corsAllowedOrigins http://127.0.0.1:8501
+    --server.corsAllowedOrigins http://127.0.0.1:8501 `
+    --browser.serverAddress 127.0.0.1 `
+    --browser.gatherUsageStats false
