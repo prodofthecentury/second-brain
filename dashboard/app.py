@@ -44,9 +44,14 @@ from scripts.config import (
     is_content_markdown,
     normalize_markdown_filename, safe_file_in_dir
 )
-from scripts.recall import RecallOptions, search_memory as recall_search_memory
+from scripts.recall import (
+    RecallOptions,
+    consume_last_degradation_warning,
+    search_memory as recall_search_memory,
+    suggest_duplicate_atoms,
+)
 from scripts.answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, answer_from_memory, build_grounding_prompt, validate_standard_answer
-from scripts.atom_mutator import apply_atom_edit
+from scripts.atom_mutator import apply_atom_edit, apply_atom_merge
 from scripts.review_atom import apply_review_transition, approved_revision_is_current
 from scripts.memory_review import parse_atom_record
 from scripts.review_atom import review_lock
@@ -241,15 +246,32 @@ def safe_wikilink_filename(link: str) -> str | None:
 
 # ─── Chat RAG Core ────────────────────────────────────────────────────────────
 
-def search_memory(query, n_results=3, follow_links=True):
+def search_memory(
+    query,
+    n_results=3,
+    follow_links=True,
+    projects=(),
+    retrieval_mode="auto",
+    allow_cross_project=False,
+):
+    consume_last_degradation_warning()
     try:
         direct, neighbors = recall_search_memory(
             query,
-            RecallOptions(n_results=n_results, follow_links=follow_links),
+            RecallOptions(
+                n_results=n_results,
+                follow_links=follow_links,
+                projects=tuple(projects),
+                allow_cross_project=allow_cross_project,
+                retrieval_mode=retrieval_mode,
+            ),
         )
     except Exception as e:
         st.error(f"Recall Error: {e}")
         return [], []
+    degradation = consume_last_degradation_warning()
+    if degradation:
+        st.warning(degradation)
 
     return [item.as_dict() for item in direct], [item.as_dict() for item in neighbors]
 
@@ -516,8 +538,10 @@ if nav_selection == "💬 Chat with Memory":
         c1, c2, c3 = st.columns(3)
         with c1:
             rag_n_results = st.slider("Atoms to Retrieve", 1, 10, 3)
+            rag_retrieval_mode = st.selectbox("Retrieval Mode", ["auto", "rrf", "lexical", "dense"], index=0)
         with c2:
             rag_follow = st.checkbox("Follow Graph Links (Graph RAG)", value=True)
+            rag_cross_project = st.checkbox("Allow Cross-Project Links", value=False)
         with c3:
             installed_models = get_ollama_model_names()
             model_options = list(dict.fromkeys([
@@ -530,6 +554,7 @@ if nav_selection == "💬 Chat with Memory":
                 "phi3",
             ]))
             st_model = st.selectbox("Ollama Model", model_options)
+            rag_project_scope = st.text_input("Project Scope (optional, e.g. project:second_brain)", value="")
             
     # Clear button
     if st.button("🧹 Clear Chat History"):
@@ -558,11 +583,17 @@ if nav_selection == "💬 Chat with Memory":
             st.text(user_prompt)
             
         with st.chat_message("assistant"):
+            project_tuple = tuple(
+                p.strip() for p in rag_project_scope.split(",") if p.strip()
+            )
             with st.spinner("🧠 Querying vector memories..."):
                 direct_refs, neighbor_refs = search_memory(
                     user_prompt, 
                     n_results=rag_n_results, 
-                    follow_links=rag_follow
+                    follow_links=rag_follow,
+                    projects=project_tuple,
+                    retrieval_mode=rag_retrieval_mode,
+                    allow_cross_project=rag_cross_project,
                 )
                 
             all_refs = direct_refs + neighbor_refs
@@ -795,21 +826,14 @@ elif nav_selection == "🗄️ Vault Explorer":
                                 st.caption("No related atom links recorded.")
                         except Exception as exc:
                             st.warning(f"Atom metadata could not be validated: {exc}")
-                        approve_col, reject_col = st.columns(2)
+                        st.markdown("#### Owner review actions")
+                        st.caption(
+                            "Consequences: **Approve** anchors exact source bytes for trusted recall; "
+                            "**Quarantine** flags `needs_edit` and blocks recall; **Demote** resets to `pending` "
+                            "for re-verification; **Reject** permanently excludes this revision while keeping it auditable."
+                        )
+                        approve_col, quarantine_col, demote_col, reject_col = st.columns(4)
                         expected_hash = hashlib.sha256(file_content.encode("utf-8")).hexdigest()
-                        if record and (record.get("review_status") == "accepted" or record.get("claim_state") == "human_reviewed") and not current_approval:
-                            if st.button("Demote stale approval to pending", key=f"demote-{selected_file}"):
-                                try:
-                                    apply_review_transition(
-                                        atom_path=file_path,
-                                        action="demote",
-                                        expected_sha256=expected_hash,
-                                        actor="local_dashboard_owner",
-                                    )
-                                    st.success("Stale approval demoted; inspect current source evidence before re-approval.")
-                                    st.rerun()
-                                except Exception as exc:
-                                    st.error(f"Demotion failed: {exc}")
                         if record and approve_col.button("Approve exact revision", key=f"approve-{selected_file}"):
                             try:
                                 apply_review_transition(
@@ -822,6 +846,30 @@ elif nav_selection == "🗄️ Vault Explorer":
                                 st.rerun()
                             except Exception as exc:
                                 st.error(f"Approval failed: {exc}")
+                        if record and quarantine_col.button("Quarantine (needs_edit)", key=f"quarantine-{selected_file}"):
+                            try:
+                                apply_review_transition(
+                                    atom_path=file_path,
+                                    action="quarantine",
+                                    expected_sha256=expected_hash,
+                                    actor="local_dashboard_owner",
+                                )
+                                st.success("Atom quarantined as needs_edit and excluded from recall.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Quarantine failed: {exc}")
+                        if record and demote_col.button("Demote to pending", key=f"demote-{selected_file}"):
+                            try:
+                                apply_review_transition(
+                                    atom_path=file_path,
+                                    action="demote",
+                                    expected_sha256=expected_hash,
+                                    actor="local_dashboard_owner",
+                                )
+                                st.success("Atom demoted to pending; inspect current source evidence before re-approval.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Demotion failed: {exc}")
                         if record and reject_col.button("Reject exact revision", key=f"reject-{selected_file}"):
                             try:
                                 apply_review_transition(
@@ -834,6 +882,60 @@ elif nav_selection == "🗄️ Vault Explorer":
                                 st.rerun()
                             except Exception as exc:
                                 st.error(f"Rejection failed: {exc}")
+
+                        with st.expander("🔀 Merge / Supersede Another Atom Into This Survivor", expanded=False):
+                            st.caption(
+                                "Consequence: Both files are preserved on disk with CAS verification. "
+                                "The selected secondary atom becomes `merged` (`superseded_by` this survivor) and leaves recall; "
+                                "this survivor atom moves to `pending` so you can review the combined claim before approval."
+                            )
+                            other_atoms = [
+                                f for f in sorted(os.listdir(ATOMS_DIR))
+                                if is_content_markdown(f) and f != selected_file
+                            ]
+                            if other_atoms:
+                                merge_target = st.selectbox("Atom to supersede (retire)", other_atoms, key=f"merge-target-{selected_file}")
+                                merge_rationale = st.text_input("Merge rationale (required)", key=f"merge-rationale-{selected_file}")
+                                if st.button("Execute Two-Atom CAS Merge", key=f"merge-btn-{selected_file}"):
+                                    target_path = safe_file_in_dir(ATOMS_DIR, merge_target, allowed_exts={".md"})
+                                    if not target_path or not merge_rationale.strip():
+                                        st.error("Select a valid target atom and provide a non-empty merge rationale.")
+                                    else:
+                                        try:
+                                            with open(target_path, "rb") as tf:
+                                                target_hash = hashlib.sha256(tf.read()).hexdigest()
+                                            apply_atom_merge(
+                                                survivor_path=file_path,
+                                                survivor_expected_sha256=expected_hash,
+                                                superseded_path=target_path,
+                                                superseded_expected_sha256=target_hash,
+                                                actor="local_dashboard_owner",
+                                                rationale=merge_rationale.strip(),
+                                            )
+                                            st.success(f"Merged `{merge_target}` into survivor `{selected_file}`; survivor queued as pending.")
+                                            st.rerun()
+                                        except Exception as exc:
+                                            st.error(f"Merge failed: {exc}")
+                            else:
+                                st.caption("No other atoms available to merge.")
+
+                        with st.expander("🔍 Read-Only Duplicate Suggestions", expanded=False):
+                            dupes = [
+                                d for d in suggest_duplicate_atoms(ATOMS_DIR)
+                                if selected_file in (d["atom_a"], d["atom_b"])
+                            ]
+                            if dupes:
+                                for d in dupes:
+                                    peer = d["atom_b"] if d["atom_a"] == selected_file else d["atom_a"]
+                                    peer_status = d["atom_b_status"] if d["atom_a"] == selected_file else d["atom_a_status"]
+                                    peer_hash = d["atom_b_sha256"] if d["atom_a"] == selected_file else d["atom_a_sha256"]
+                                    peer_claim = d["atom_b_claim"] if d["atom_a"] == selected_file else d["atom_a_claim"]
+                                    st.caption(
+                                        f"Candidate overlap `{peer}` (Jaccard `{d['jaccard_similarity']:.2f}` · "
+                                        f"status `{peer_status}` · SHA-256 `{peer_hash[:12]}…`): {peer_claim}"
+                                    )
+                            else:
+                                st.caption("No duplicate candidates above threshold for this atom.")
 
 
 # PAGE 4: INBOX & WEB SCOUT

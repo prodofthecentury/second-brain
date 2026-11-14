@@ -1499,5 +1499,212 @@ class DenseScoreTests(unittest.TestCase):
                 )
 
 
+class HybridAndScopedRecallTests(unittest.TestCase):
+    def test_include_statuses_never_bypasses_approval_or_superseded_invariants(self):
+        from recall import RecallOptions, should_include_record
+
+        unverified_accepted = {
+            "review_status": "accepted",
+            "claim_state": "human_reviewed",
+            "approved_revision_current": False,
+            "memory_type": "semantic",
+        }
+        self.assertFalse(should_include_record(unverified_accepted, RecallOptions()))
+        self.assertFalse(should_include_record(unverified_accepted, RecallOptions(include_statuses={"accepted"})))
+        self.assertFalse(
+            should_include_record(
+                unverified_accepted,
+                RecallOptions(include_statuses={"accepted"}, allow_unreviewed_exploratory=True),
+            )
+        )
+
+        pending_candidate = {
+            "review_status": "pending",
+            "claim_state": "candidate",
+            "approved_revision_current": False,
+            "memory_type": "semantic",
+        }
+        self.assertFalse(should_include_record(pending_candidate, RecallOptions(include_statuses={"pending"})))
+        self.assertTrue(
+            should_include_record(
+                pending_candidate,
+                RecallOptions(include_statuses={"pending"}, allow_unreviewed_exploratory=True),
+            )
+        )
+
+        superseded_approved = {
+            "review_status": "accepted",
+            "claim_state": "human_reviewed",
+            "approved_revision_current": True,
+            "superseded_by": ["survivor.md"],
+            "memory_type": "semantic",
+        }
+        self.assertFalse(should_include_record(superseded_approved, RecallOptions()))
+
+    def test_project_scoping_hierarchical_matching_and_cross_project_link_gate(self):
+        from unittest.mock import patch
+        from lexical_store import rebuild_lexical_index
+        from recall import RecallOptions, search_lexical_memory
+
+        atom_sb = """---
+id: sb-auth
+type: atom
+memory_type: semantic
+contexts: [project:second-brain/auth]
+claim_state: human_reviewed
+review_status: accepted
+---
+
+## Claim
+Structured JSON logs trace authentication events safely.
+
+## Evidence
+"Structured JSON logs trace authentication events safely across services."
+"""
+        atom_client = """---
+id: client-alpha
+type: atom
+memory_type: semantic
+contexts: [project:client_alpha]
+claim_state: human_reviewed
+review_status: accepted
+---
+
+## Claim
+Client alpha services emit structured JSON authentication logs.
+
+## Evidence
+"Client alpha services emit structured JSON authentication logs."
+"""
+        atom_sb_linked = atom_sb + "\n## Links\n[[client-alpha.md]]\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atoms_dir = Path(tmp) / "2-atoms"
+            atoms_dir.mkdir(parents=True)
+            index_path = Path(tmp) / "lexical.sqlite3"
+            (atoms_dir / "sb-auth.md").write_text(atom_sb_linked, encoding="utf-8")
+            (atoms_dir / "client-alpha.md").write_text(atom_client, encoding="utf-8")
+            rebuild_lexical_index(str(atoms_dir), str(index_path))
+
+            with patch("recall.approved_revision_is_current", return_value=True):
+                # Scoped to project:second_brain without cross-project permission
+                direct, neighbors = search_lexical_memory(
+                    "structured JSON authentication logs",
+                    RecallOptions(projects=("project:second_brain",), allow_cross_project=False),
+                    atoms_dir=str(atoms_dir),
+                    index_path=str(index_path),
+                )
+                self.assertEqual([item.filename for item in direct], ["sb-auth.md"])
+                self.assertEqual(neighbors, [])
+                self.assertIn("project:project:second-brain/auth", direct[0].match_reasons)
+
+                # Scoped to project:second_brain WITH explicit cross-project link permission
+                direct_cp, neighbors_cp = search_lexical_memory(
+                    "structured JSON authentication logs",
+                    RecallOptions(projects=("project:second_brain",), allow_cross_project=True),
+                    atoms_dir=str(atoms_dir),
+                    index_path=str(index_path),
+                )
+                self.assertEqual([item.filename for item in direct_cp], ["sb-auth.md"])
+                self.assertEqual([item.filename for item in neighbors_cp], ["client-alpha.md"])
+                self.assertIn("cross_project_reference", neighbors_cp[0].match_reasons)
+                self.assertIn("linked_from:sb-auth.md", neighbors_cp[0].match_reasons)
+
+    def test_rrf_hybrid_fusion_and_graceful_fts5_degradation_banner(self):
+        from unittest.mock import patch
+        from lexical_store import rebuild_lexical_index
+        from recall import (
+            MemoryRecallUnavailable,
+            RecallOptions,
+            consume_last_degradation_warning,
+            search_hybrid_rrf_memory,
+        )
+
+        atom = """---
+id: rrf-test
+type: atom
+memory_type: semantic
+contexts: [project:second_brain]
+claim_state: human_reviewed
+review_status: accepted
+---
+
+## Claim
+Hybrid retrieval fuses lexical and dense rankings deterministically.
+
+## Evidence
+"Hybrid retrieval fuses lexical and dense rankings deterministically."
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            atoms_dir = Path(tmp) / "2-atoms"
+            atoms_dir.mkdir(parents=True)
+            index_path = Path(tmp) / "lexical.sqlite3"
+            (atoms_dir / "rrf-test.md").write_text(atom, encoding="utf-8")
+            rebuild_lexical_index(str(atoms_dir), str(index_path))
+
+            with patch("recall.approved_revision_is_current", return_value=True):
+                consume_last_degradation_warning()
+                with patch("recall.search_semantic_memory", side_effect=MemoryRecallUnavailable("Ollama daemon offline")):
+                    degraded_direct, _ = search_hybrid_rrf_memory(
+                        "hybrid retrieval lexical dense rankings",
+                        RecallOptions(retrieval_mode="rrf"),
+                        atoms_dir=str(atoms_dir),
+                        index_path=str(index_path),
+                    )
+                banner = consume_last_degradation_warning()
+                self.assertEqual([item.filename for item in degraded_direct], ["rrf-test.md"])
+                self.assertIsNotNone(banner)
+                self.assertIn("dynamically degraded to FTS5 lexical retrieval", banner)
+                self.assertIn("degraded:lexical_fallback", degraded_direct[0].match_reasons)
+
+    def test_read_only_duplicate_suggestions_never_mutate_files(self):
+        from recall import suggest_duplicate_atoms
+
+        atom_one = """---
+id: dup-one
+type: atom
+memory_type: semantic
+origin: user_local
+review_status: pending
+---
+
+## Claim
+Structured JSON logging enables distributed request correlation and redacts PII.
+
+## Evidence
+"Structured JSON logging enables distributed request correlation and redacts sensitive PII fields."
+"""
+        atom_two = """---
+id: dup-two
+type: atom
+memory_type: semantic
+origin: mcp_local
+review_status: pending
+---
+
+## Claim
+Distributed request correlation relies on structured JSON logging with PII redaction.
+
+## Evidence
+"Services use structured JSON logging for distributed request correlation while redacting PII fields."
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            atoms_dir = Path(tmp) / "2-atoms"
+            atoms_dir.mkdir(parents=True)
+            p1 = atoms_dir / "dup-one.md"
+            p2 = atoms_dir / "dup-two.md"
+            p1.write_text(atom_one, encoding="utf-8")
+            p2.write_text(atom_two, encoding="utf-8")
+            before_1 = p1.read_bytes()
+            before_2 = p2.read_bytes()
+
+            suggestions = suggest_duplicate_atoms(str(atoms_dir), min_jaccard=0.35)
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0]["atom_a"], "dup-one.md")
+            self.assertEqual(suggestions[0]["atom_b"], "dup-two.md")
+            self.assertEqual(p1.read_bytes(), before_1)
+            self.assertEqual(p2.read_bytes(), before_2)
+
+
 if __name__ == "__main__":
     unittest.main()

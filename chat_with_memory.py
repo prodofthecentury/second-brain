@@ -6,6 +6,7 @@
 # ]
 # ///
 
+import argparse
 import os
 import sys
 
@@ -20,21 +21,66 @@ from scripts.answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, answer_fro
 from scripts.recall import (
     MemoryRecallUnavailable,
     RecallOptions,
+    consume_last_degradation_warning,
     search_memory as recall_search_memory,
 )
 
 console = Console()
 
-def search_memory(query):
+
+def search_memory(
+    query: str,
+    *,
+    projects: tuple[str, ...] = (),
+    retrieval_mode: str = "auto",
+    allow_cross_project: bool = False,
+):
+    consume_last_degradation_warning()
     try:
-        direct, neighbors = recall_search_memory(query, RecallOptions(n_results=3, follow_links=True))
+        direct, neighbors = recall_search_memory(
+            query,
+            RecallOptions(
+                n_results=3,
+                follow_links=True,
+                projects=projects,
+                allow_cross_project=allow_cross_project,
+                retrieval_mode=retrieval_mode,
+            ),
+        )
     except MemoryRecallUnavailable as exc:
         console.print(f"[bold yellow]Memory recall unavailable: {exc}[/bold yellow]")
         return []
+    degradation = consume_last_degradation_warning()
+    if degradation:
+        console.print(Panel(f"[bold yellow]{degradation}[/bold yellow]", border_style="yellow"))
     return direct + neighbors
 
-def chat_loop():
-    console.print(Panel.fit("[bold cyan]Ollama Memory Interface (Graph RAG)[/bold cyan]\nType 'exit' to quit.", border_style="cyan"))
+
+def chat_loop(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="Interactive Grounded Memory Chat")
+    parser.add_argument("--project", action="append", default=[], help="Filter recall by project:<id> tag.")
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "rrf", "lexical", "dense"),
+        default="auto",
+        help="Retrieval ranking mode.",
+    )
+    parser.add_argument(
+        "--allow-cross-project",
+        action="store_true",
+        help="Allow linked neighbor references across project boundaries.",
+    )
+    args = parser.parse_args(argv)
+    projects = tuple(p.strip() for p in args.project if p.strip())
+
+    scope_label = f" | projects={','.join(projects)}" if projects else ""
+    console.print(
+        Panel.fit(
+            f"[bold cyan]Ollama Memory Interface (Graph RAG)[/bold cyan]\n"
+            f"mode={args.mode}{scope_label}\nType 'exit' to quit.",
+            border_style="cyan",
+        )
+    )
     
     messages = []
     
@@ -50,10 +96,18 @@ def chat_loop():
             continue
             
         with console.status("[bold dark_gray]Searching semantic memory...[/bold dark_gray]"):
-            retrieved_atoms = search_memory(user_input)
+            retrieved_atoms = search_memory(
+                user_input,
+                projects=projects,
+                retrieval_mode=args.mode,
+                allow_cross_project=args.allow_cross_project,
+            )
             
         if retrieved_atoms:
-            console.print("[dim green]✓ Relevant memories retrieved.[/dim green]")
+            explanations = "; ".join(
+                f"{item.filename}[{','.join(item.match_reasons)}]" for item in retrieved_atoms
+            )
+            console.print(f"[dim green]✓ Relevant memories retrieved: {explanations}[/dim green]")
         else:
             console.print("[dim yellow]⚠ No relevant memories found.[/dim yellow]")
 

@@ -23,13 +23,29 @@ from evaluation_dataset import load_dataset
 from index_manifest import index_manifest_is_current, load_index_manifest
 from lexical_store import search_lexical_index
 from ollama_utils import EmbeddingUnavailableError, embed_text
-from recall import RecallOptions, search_lexical_memory, search_semantic_memory, validated_index_generation
+from recall import (
+    RecallOptions,
+    search_hybrid_rrf_memory,
+    search_lexical_memory,
+    search_semantic_memory,
+    validated_index_generation,
+)
 from vector_store import get_vector_collection, close_vector_collection
 
 
 ROOT = Path(__file__).resolve().parents[1]
 EVALUATION_PATH = ROOT / "docs" / "retrieval-evaluation-proposed.json"
 K = 5
+CANDIDATE_POOL = 20
+RRF_K_CONSTANT = 60
+
+
+def percentile(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round((p / 100.0) * (len(ordered) - 1)))))
+    return round(ordered[idx], 3)
 
 
 def reciprocal_rank(ranked: list[str], relevant: set[str]) -> float:
@@ -43,7 +59,16 @@ def ndcg_at_k(ranked: list[str], relevant: set[str], k: int) -> float:
     return dcg / ideal if ideal else 0.0
 
 
-def dense_candidates(query: str, collection, manifest: dict) -> tuple[list[str], float]:
+def fuse_rrf_candidates(lexical_pool: list[str], dense_pool: list[str], k: int = K, rrf_k: int = RRF_K_CONSTANT) -> list[str]:
+    scores: dict[str, float] = {}
+    for rank, name in enumerate(lexical_pool):
+        scores[name] = scores.get(name, 0.0) + (1.0 / (rrf_k + rank + 1))
+    for rank, name in enumerate(dense_pool):
+        scores[name] = scores.get(name, 0.0) + (1.0 / (rrf_k + rank + 1))
+    return [name for name, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:k]]
+
+
+def dense_candidates(query: str, collection, manifest: dict, n_results: int = CANDIDATE_POOL) -> tuple[list[str], float]:
     started = time.perf_counter()
     embedding = embed_text(query, model=EMBED_MODEL)
     generation = validated_index_generation(
@@ -55,7 +80,7 @@ def dense_candidates(query: str, collection, manifest: dict) -> tuple[list[str],
     )
     result = collection.query(
         query_embeddings=[embedding],
-        n_results=K,
+        n_results=n_results,
         where={"$and": [{"embedding_model": EMBED_MODEL}, {"index_generation": generation}]},
         include=["metadatas", "distances"],
     )
@@ -96,6 +121,7 @@ def main(argv=None) -> int:
     records = []
     lexical_times = []
     dense_times = []
+    rrf_times = []
     trusted_false_positives = 0
     try:
         for case in corpus["queries"]:
@@ -103,24 +129,36 @@ def main(argv=None) -> int:
             relevant = set(case["candidate_relevance"])
 
             start = time.perf_counter()
-            lexical = search_lexical_index(query, LEXICAL_INDEX_PATH, n_results=K, atoms_dir=ATOMS_DIR)
+            lexical_pool_items = search_lexical_index(query, LEXICAL_INDEX_PATH, n_results=CANDIDATE_POOL, atoms_dir=ATOMS_DIR)
             lexical_ms = (time.perf_counter() - start) * 1000
-            lexical_ranked = [item.filename for item in lexical]
+            lexical_pool = [item.filename for item in lexical_pool_items]
+            lexical_ranked = lexical_pool[:K]
 
             try:
-                dense_ranked, dense_ms = dense_candidates(query, collection, manifest)
+                dense_pool, dense_ms = dense_candidates(query, collection, manifest, n_results=CANDIDATE_POOL)
             except EmbeddingUnavailableError as exc:
                 return _score_error(str(exc))
             except Exception as exc:
                 return _score_error(f"dense retrieval failed for {case['id']}: {exc}")
+            dense_ranked = dense_pool[:K]
+
+            rrf_start = time.perf_counter()
+            rrf_ranked = fuse_rrf_candidates(lexical_pool, dense_pool, k=K)
+            rrf_ms = lexical_ms + dense_ms + (time.perf_counter() - rrf_start) * 1000
+
             lexical_times.append(lexical_ms)
             dense_times.append(dense_ms)
+            rrf_times.append(rrf_ms)
 
-            trusted_lexical, _ = search_lexical_memory(query, RecallOptions(n_results=K, follow_links=False))
-            trusted_dense, _ = search_semantic_memory(query, RecallOptions(n_results=K, follow_links=False))
+            proj_opt = (case["project_scope"],) if case.get("project_scope") else ()
+            base_opts = RecallOptions(n_results=K, follow_links=False, projects=proj_opt)
+            trusted_lexical, _ = search_lexical_memory(query, base_opts)
+            trusted_dense, _ = search_semantic_memory(query, base_opts)
+            trusted_rrf, _ = search_hybrid_rrf_memory(query, base_opts)
             trusted_lexical_filenames = [item.filename for item in trusted_lexical]
             trusted_dense_filenames = [item.filename for item in trusted_dense]
-            trusted_result_count = len(trusted_lexical) + len(trusted_dense)
+            trusted_rrf_filenames = [item.filename for item in trusted_rrf]
+            trusted_result_count = len(trusted_lexical) + len(trusted_dense) + len(trusted_rrf)
             false_positives = trusted_result_count if case["answerability"] == "unanswerable" else None
             expected_atoms = set(case["expected_atom_ids"])
             lexical_expected_recall = (
@@ -131,6 +169,10 @@ def main(argv=None) -> int:
                 len(expected_atoms.intersection(dense_ranked)) / len(expected_atoms)
                 if case["answerability"] == "answerable" else None
             )
+            rrf_expected_recall = (
+                len(expected_atoms.intersection(rrf_ranked)) / len(expected_atoms)
+                if case["answerability"] == "answerable" else None
+            )
             trusted_lexical_expected_recall = (
                 len(expected_atoms.intersection(trusted_lexical_filenames)) / len(expected_atoms)
                 if case["answerability"] == "answerable" else None
@@ -139,13 +181,19 @@ def main(argv=None) -> int:
                 len(expected_atoms.intersection(trusted_dense_filenames)) / len(expected_atoms)
                 if case["answerability"] == "answerable" else None
             )
+            trusted_rrf_expected_recall = (
+                len(expected_atoms.intersection(trusted_rrf_filenames)) / len(expected_atoms)
+                if case["answerability"] == "answerable" else None
+            )
             if false_positives is not None:
                 trusted_false_positives += false_positives
 
             records.append({
                 "id": case["id"],
+                "category": case.get("category", "unknown"),
                 "answerability": case["answerability"],
                 "split": case["split"],
+                "project_scope": case.get("project_scope"),
                 "candidate_relevance": sorted(relevant),
                 "expected_atom_ids": case["expected_atom_ids"],
                 "expected_claims": case["expected_claims"],
@@ -167,7 +215,16 @@ def main(argv=None) -> int:
                     "expected_atom_recall_at_k": dense_expected_recall,
                     "trusted_expected_atom_recall": trusted_dense_expected_recall,
                 },
-                "trusted_result_count_across_both_paths": trusted_result_count,
+                "rrf_hybrid": {
+                    "ranked": rrf_ranked,
+                    "recall_at_k": len(relevant.intersection(rrf_ranked)) / len(relevant) if relevant else None,
+                    "mrr": reciprocal_rank(rrf_ranked, relevant) if relevant else None,
+                    "ndcg_at_k": ndcg_at_k(rrf_ranked, relevant, K) if relevant else None,
+                    "latency_ms": round(rrf_ms, 3),
+                    "expected_atom_recall_at_k": rrf_expected_recall,
+                    "trusted_expected_atom_recall": trusted_rrf_expected_recall,
+                },
+                "trusted_result_count_across_all_paths": trusted_result_count,
                 "trusted_false_positives": false_positives,
             })
     finally:
@@ -175,8 +232,45 @@ def main(argv=None) -> int:
 
     candidate_scored = [record for record in records if record["candidate_relevance"]]
     answerable = [record for record in records if record["answerability"] == "answerable"]
+    preference = [record for record in records if record["answerability"] == "preference"]
     exploratory = [record for record in records if record["answerability"] == "exploratory"]
     unanswerable = [record for record in records if record["answerability"] == "unanswerable"]
+
+    def _group_recall(group: list[dict], mode_key: str) -> float | None:
+        vals = [r[mode_key]["recall_at_k"] for r in group if r[mode_key]["recall_at_k"] is not None]
+        return round(statistics.mean(vals), 4) if vals else None
+
+    split_summary = {}
+    for split_name in ("regression", "development", "holdout"):
+        sub = [r for r in candidate_scored if r["split"] == split_name]
+        split_summary[split_name] = {
+            "scored_query_count": len(sub),
+            "lexical_recall_at_k": _group_recall(sub, "lexical"),
+            "dense_recall_at_k": _group_recall(sub, "dense"),
+            "rrf_hybrid_recall_at_k": _group_recall(sub, "rrf_hybrid"),
+        }
+
+    category_summary = {
+        "answerable": {
+            "count": len(answerable),
+            "lexical_recall_at_k": _group_recall(answerable, "lexical"),
+            "dense_recall_at_k": _group_recall(answerable, "dense"),
+            "rrf_hybrid_recall_at_k": _group_recall(answerable, "rrf_hybrid"),
+        },
+        "preference": {
+            "count": len(preference),
+            "lexical_recall_at_k": _group_recall(preference, "lexical"),
+            "dense_recall_at_k": _group_recall(preference, "dense"),
+            "rrf_hybrid_recall_at_k": _group_recall(preference, "rrf_hybrid"),
+        },
+        "exploratory": {
+            "count": len(exploratory),
+            "lexical_recall_at_k": _group_recall(exploratory, "lexical"),
+            "dense_recall_at_k": _group_recall(exploratory, "dense"),
+            "rrf_hybrid_recall_at_k": _group_recall(exploratory, "rrf_hybrid"),
+        },
+    }
+
     summary = {
         "evaluation_status": corpus["status"],
         "dataset_id": corpus["dataset_id"],
@@ -188,20 +282,32 @@ def main(argv=None) -> int:
         "k": K,
         "candidate_ranking_query_count": len(candidate_scored),
         "answerable_query_count": len(answerable),
+        "preference_query_count": len(preference),
         "exploratory_candidate_query_count": len(exploratory),
         "unanswerable_query_count": len(unanswerable),
         "candidate_lexical_mean_recall_at_k": statistics.mean(record["lexical"]["recall_at_k"] for record in candidate_scored),
         "candidate_dense_mean_recall_at_k": statistics.mean(record["dense"]["recall_at_k"] for record in candidate_scored),
+        "candidate_rrf_hybrid_mean_recall_at_k": statistics.mean(record["rrf_hybrid"]["recall_at_k"] for record in candidate_scored),
         "candidate_lexical_mean_mrr": statistics.mean(record["lexical"]["mrr"] for record in candidate_scored),
         "candidate_dense_mean_mrr": statistics.mean(record["dense"]["mrr"] for record in candidate_scored),
+        "candidate_rrf_hybrid_mean_mrr": statistics.mean(record["rrf_hybrid"]["mrr"] for record in candidate_scored),
         "candidate_lexical_mean_ndcg_at_k": statistics.mean(record["lexical"]["ndcg_at_k"] for record in candidate_scored),
         "candidate_dense_mean_ndcg_at_k": statistics.mean(record["dense"]["ndcg_at_k"] for record in candidate_scored),
+        "candidate_rrf_hybrid_mean_ndcg_at_k": statistics.mean(record["rrf_hybrid"]["ndcg_at_k"] for record in candidate_scored),
         "answerable_lexical_expected_atom_recall_at_k": statistics.mean(record["lexical"]["expected_atom_recall_at_k"] for record in answerable),
         "answerable_dense_expected_atom_recall_at_k": statistics.mean(record["dense"]["expected_atom_recall_at_k"] for record in answerable),
+        "answerable_rrf_hybrid_expected_atom_recall_at_k": statistics.mean(record["rrf_hybrid"]["expected_atom_recall_at_k"] for record in answerable),
         "trusted_answerable_lexical_expected_atom_recall": statistics.mean(record["lexical"]["trusted_expected_atom_recall"] for record in answerable),
         "trusted_answerable_dense_expected_atom_recall": statistics.mean(record["dense"]["trusted_expected_atom_recall"] for record in answerable),
+        "trusted_answerable_rrf_hybrid_expected_atom_recall": statistics.mean(record["rrf_hybrid"]["trusted_expected_atom_recall"] for record in answerable),
         "lexical_median_latency_ms": statistics.median(lexical_times),
+        "lexical_p95_latency_ms": percentile(lexical_times, 95),
         "dense_median_latency_ms": statistics.median(dense_times),
+        "dense_p95_latency_ms": percentile(dense_times, 95),
+        "rrf_hybrid_median_latency_ms": statistics.median(rrf_times),
+        "rrf_hybrid_p95_latency_ms": percentile(rrf_times, 95),
+        "by_split": split_summary,
+        "by_category": category_summary,
         "trusted_trap_false_positives": trusted_false_positives,
         "queries": records,
     }

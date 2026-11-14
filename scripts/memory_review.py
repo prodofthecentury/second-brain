@@ -105,6 +105,14 @@ def parse_atom_record(path: str | Path) -> dict:
     if isinstance(contexts, str):
         contexts = parse_scalar_list(contexts)
 
+    supersedes = values.get("supersedes", [])
+    if isinstance(supersedes, str):
+        supersedes = parse_scalar_list(supersedes)
+
+    superseded_by = values.get("superseded_by", [])
+    if isinstance(superseded_by, str):
+        superseded_by = parse_scalar_list(superseded_by)
+
     return {
         "filename": atom_path.name,
         "id": str(values.get("id", "")),
@@ -119,6 +127,8 @@ def parse_atom_record(path: str | Path) -> dict:
         "importance": str(values.get("importance", "")),
         "sources": list(sources),
         "contexts": list(contexts),
+        "supersedes": list(supersedes),
+        "superseded_by": list(superseded_by),
     }
 
 

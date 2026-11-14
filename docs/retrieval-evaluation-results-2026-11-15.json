@@ -1,0 +1,1929 @@
+{
+  "evaluation_status": "owner_approved",
+  "dataset_id": "second-brain-retrieval-curated-30",
+  "dataset_version": "2.1.0",
+  "dataset_sha256": "b54a9babbfd49bb23b81acdc9f5d31b8b02f81a864cbf35efd5db331aa7365a0",
+  "index_generation": "ce48706db17d440fbba04b8c7f86c37e",
+  "embedding_model": "nomic-embed-text",
+  "embedding_dimensions": 768,
+  "k": 5,
+  "candidate_ranking_query_count": 20,
+  "answerable_query_count": 10,
+  "preference_query_count": 5,
+  "exploratory_candidate_query_count": 5,
+  "unanswerable_query_count": 10,
+  "candidate_lexical_mean_recall_at_k": 1.0,
+  "candidate_dense_mean_recall_at_k": 1.0,
+  "candidate_rrf_hybrid_mean_recall_at_k": 1.0,
+  "candidate_lexical_mean_mrr": 0.925,
+  "candidate_dense_mean_mrr": 0.975,
+  "candidate_rrf_hybrid_mean_mrr": 0.95,
+  "candidate_lexical_mean_ndcg_at_k": 0.9379706239694268,
+  "candidate_dense_mean_ndcg_at_k": 0.9815464876785729,
+  "candidate_rrf_hybrid_mean_ndcg_at_k": 0.9630929753571458,
+  "answerable_lexical_expected_atom_recall_at_k": 1.0,
+  "answerable_dense_expected_atom_recall_at_k": 1.0,
+  "answerable_rrf_hybrid_expected_atom_recall_at_k": 1.0,
+  "trusted_answerable_lexical_expected_atom_recall": 1.0,
+  "trusted_answerable_dense_expected_atom_recall": 1.0,
+  "trusted_answerable_rrf_hybrid_expected_atom_recall": 1.0,
+  "lexical_median_latency_ms": 6.557900051120669,
+  "lexical_p95_latency_ms": 8.333,
+  "dense_median_latency_ms": 63.15845000790432,
+  "dense_p95_latency_ms": 83.683,
+  "rrf_hybrid_median_latency_ms": 70.06405002903193,
+  "rrf_hybrid_p95_latency_ms": 89.94,
+  "by_split": {
+    "regression": {
+      "scored_query_count": 5,
+      "lexical_recall_at_k": 1.0,
+      "dense_recall_at_k": 1.0,
+      "rrf_hybrid_recall_at_k": 1.0
+    },
+    "development": {
+      "scored_query_count": 7,
+      "lexical_recall_at_k": 1.0,
+      "dense_recall_at_k": 1.0,
+      "rrf_hybrid_recall_at_k": 1.0
+    },
+    "holdout": {
+      "scored_query_count": 8,
+      "lexical_recall_at_k": 1.0,
+      "dense_recall_at_k": 1.0,
+      "rrf_hybrid_recall_at_k": 1.0
+    }
+  },
+  "by_category": {
+    "answerable": {
+      "count": 10,
+      "lexical_recall_at_k": 1.0,
+      "dense_recall_at_k": 1.0,
+      "rrf_hybrid_recall_at_k": 1.0
+    },
+    "preference": {
+      "count": 5,
+      "lexical_recall_at_k": 1.0,
+      "dense_recall_at_k": 1.0,
+      "rrf_hybrid_recall_at_k": 1.0
+    },
+    "exploratory": {
+      "count": 5,
+      "lexical_recall_at_k": 1.0,
+      "dense_recall_at_k": 1.0,
+      "rrf_hybrid_recall_at_k": 1.0
+    }
+  },
+  "trusted_trap_false_positives": 0,
+  "queries": [
+    {
+      "id": "pos_logging_traceability_01",
+      "category": "paraphrase",
+      "answerability": "answerable",
+      "split": "regression",
+      "project_scope": null,
+      "candidate_relevance": [
+        "observability-o11y.md",
+        "structured-logging.md"
+      ],
+      "expected_atom_ids": [
+        "structured-logging.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "Logs should be structured (JSON) to facilitate observability and traceability.",
+          "supported_by": [
+            "structured-logging.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "ollama-refinery-entrypoint.md",
+          "code-reviews-as-mentorship.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 5.666,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md",
+          "controlled-refinery-change-validation.md",
+          "owner-product-target.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 678.659,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md",
+          "continuous-integration-deployment.md",
+          "owner-product-target.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 684.372,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pos_failure_resilience_02",
+      "category": "resilience",
+      "answerability": "answerable",
+      "split": "regression",
+      "project_scope": null,
+      "candidate_relevance": [
+        "design-for-failure.md"
+      ],
+      "expected_atom_ids": [
+        "design-for-failure.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "High-level systems should be designed to handle failures gracefully.",
+          "supported_by": [
+            "design-for-failure.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "design-for-failure.md",
+          "owner-product-target.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-validation-embeddings.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 6.599,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 63.22,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "owner-product-target.md",
+          "continuous-integration-deployment.md",
+          "cognitive-core-validation-operational-stats.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 69.864,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pos_json_logging_format_03",
+      "category": "observability",
+      "answerability": "answerable",
+      "split": "development",
+      "project_scope": null,
+      "candidate_relevance": [
+        "structured-logging.md"
+      ],
+      "expected_atom_ids": [
+        "structured-logging.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "Logs should be structured (JSON) to facilitate observability and traceability.",
+          "supported_by": [
+            "structured-logging.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "owner-product-target.md",
+          "continuous-integration-deployment.md",
+          "code-reviews-as-mentorship.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 7.992,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 63.413,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "owner-product-target.md",
+          "continuous-integration-deployment.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 71.443,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pos_graceful_degradation_04",
+      "category": "resilience",
+      "answerability": "answerable",
+      "split": "development",
+      "project_scope": null,
+      "candidate_relevance": [
+        "design-for-failure.md"
+      ],
+      "expected_atom_ids": [
+        "design-for-failure.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "High-level systems should be designed to handle failures gracefully.",
+          "supported_by": [
+            "design-for-failure.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "observability-o11y.md",
+          "design-for-failure.md",
+          "owner-product-target.md",
+          "sodium-ion-battery-cost-record.md",
+          "ollama-refinery-entrypoint.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 0.5,
+        "ndcg_at_k": 0.6309297535714575,
+        "latency_ms": 7.889,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "design-for-failure.md",
+          "continuous-integration-deployment.md",
+          "observability-o11y.md",
+          "tdd-and-automated-testing.md",
+          "structured-logging.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 66.227,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "owner-product-target.md",
+          "continuous-integration-deployment.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 74.16,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pos_structured_events_pii_05",
+      "category": "observability",
+      "answerability": "answerable",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [
+        "observability-o11y.md",
+        "structured-logging.md"
+      ],
+      "expected_atom_ids": [
+        "structured-logging.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "Logs should be structured (JSON) to facilitate observability and traceability.",
+          "supported_by": [
+            "structured-logging.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "design-for-failure.md",
+          "sodium-ion-battery-cost-record.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 6.321,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "tdd-and-automated-testing.md",
+          "design-for-failure.md",
+          "continuous-integration-deployment.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 58.247,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "design-for-failure.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 64.592,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pos_fault_tolerance_principles_06",
+      "category": "resilience",
+      "answerability": "answerable",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [
+        "design-for-failure.md"
+      ],
+      "expected_atom_ids": [
+        "design-for-failure.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "High-level systems should be designed to handle failures gracefully.",
+          "supported_by": [
+            "design-for-failure.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "design-for-failure.md",
+          "ollama-refinery-entrypoint.md",
+          "code-reviews-as-mentorship.md",
+          "tdd-and-automated-testing.md",
+          "observability-o11y.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 7.407,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "tdd-and-automated-testing.md",
+          "continuous-integration-deployment.md",
+          "code-reviews-as-mentorship.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 63.429,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "tdd-and-automated-testing.md",
+          "code-reviews-as-mentorship.md",
+          "continuous-integration-deployment.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 70.881,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pos_observability_tracing_07",
+      "category": "observability",
+      "answerability": "answerable",
+      "split": "regression",
+      "project_scope": null,
+      "candidate_relevance": [
+        "structured-logging.md"
+      ],
+      "expected_atom_ids": [
+        "structured-logging.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "Logs should be structured (JSON) to facilitate observability and traceability.",
+          "supported_by": [
+            "structured-logging.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "observability-o11y.md",
+          "structured-logging.md",
+          "ollama-refinery-entrypoint.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 0.5,
+        "ndcg_at_k": 0.6309297535714575,
+        "latency_ms": 8.333,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "observability-o11y.md",
+          "structured-logging.md",
+          "ollama-refinery-entrypoint.md",
+          "continuous-integration-deployment.md",
+          "owner-product-target.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 0.5,
+        "ndcg_at_k": 0.6309297535714575,
+        "latency_ms": 61.476,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "observability-o11y.md",
+          "structured-logging.md",
+          "ollama-refinery-entrypoint.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 0.5,
+        "ndcg_at_k": 0.6309297535714575,
+        "latency_ms": 69.832,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pos_network_timeout_handling_08",
+      "category": "resilience",
+      "answerability": "answerable",
+      "split": "development",
+      "project_scope": null,
+      "candidate_relevance": [
+        "design-for-failure.md"
+      ],
+      "expected_atom_ids": [
+        "design-for-failure.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "High-level systems should be designed to handle failures gracefully.",
+          "supported_by": [
+            "design-for-failure.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "controlled-refinery-change-validation.md",
+          "owner-product-target.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 5.862,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "design-for-failure.md",
+          "tdd-and-automated-testing.md",
+          "continuous-integration-deployment.md",
+          "observability-o11y.md",
+          "code-reviews-as-mentorship.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 62.835,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "tdd-and-automated-testing.md",
+          "owner-product-target.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 68.737,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pos_audit_logging_structure_09",
+      "category": "observability",
+      "answerability": "answerable",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [
+        "structured-logging.md"
+      ],
+      "expected_atom_ids": [
+        "structured-logging.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "Logs should be structured (JSON) to facilitate observability and traceability.",
+          "supported_by": [
+            "structured-logging.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md",
+          "code-reviews-as-mentorship.md",
+          "continuous-integration-deployment.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 6.845,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md",
+          "design-for-failure.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 62.314,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md",
+          "continuous-integration-deployment.md",
+          "design-for-failure.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 69.191,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pos_outage_design_tenet_10",
+      "category": "resilience",
+      "answerability": "answerable",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [
+        "design-for-failure.md"
+      ],
+      "expected_atom_ids": [
+        "design-for-failure.md"
+      ],
+      "expected_claims": [
+        {
+          "text": "High-level systems should be designed to handle failures gracefully.",
+          "supported_by": [
+            "design-for-failure.md"
+          ]
+        }
+      ],
+      "lexical": {
+        "ranked": [
+          "design-for-failure.md",
+          "ollama-refinery-entrypoint.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "structured-logging.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 5.255,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "dense": {
+        "ranked": [
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "tdd-and-automated-testing.md",
+          "continuous-integration-deployment.md",
+          "structured-logging.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 62.765,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "structured-logging.md",
+          "ollama-refinery-entrypoint.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 68.057,
+        "expected_atom_recall_at_k": 1.0,
+        "trusted_expected_atom_recall": 1.0
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pref_host_offline_target_11",
+      "category": "owner_preference",
+      "answerability": "preference",
+      "split": "regression",
+      "project_scope": "project:second-brain",
+      "candidate_relevance": [
+        "owner-product-target.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "owner-product-target.md",
+          "code-reviews-as-mentorship.md",
+          "design-for-failure.md",
+          "continuous-integration-deployment.md",
+          "controlled-refinery-change-validation.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 7.453,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "owner-product-target.md",
+          "continuous-integration-deployment.md",
+          "observability-o11y.md",
+          "design-for-failure.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 77.697,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "owner-product-target.md",
+          "continuous-integration-deployment.md",
+          "design-for-failure.md",
+          "code-reviews-as-mentorship.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 85.191,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pref_hardware_profiling_12",
+      "category": "owner_preference",
+      "answerability": "preference",
+      "split": "development",
+      "project_scope": "project:second-brain",
+      "candidate_relevance": [
+        "owner-product-target.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "owner-product-target.md",
+          "code-reviews-as-mentorship.md",
+          "cognitive-core-single-file-mode.md",
+          "sodium-ion-battery-cost-record.md",
+          "ollama-refinery-entrypoint.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 7.138,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "owner-product-target.md",
+          "continuous-integration-deployment.md",
+          "observability-o11y.md",
+          "design-for-failure.md",
+          "ollama-refinery-entrypoint.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 63.097,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "owner-product-target.md",
+          "code-reviews-as-mentorship.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-single-file-mode.md",
+          "design-for-failure.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 70.265,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pref_code_review_style_13",
+      "category": "owner_preference",
+      "answerability": "preference",
+      "split": "development",
+      "project_scope": null,
+      "candidate_relevance": [
+        "code-reviews-as-mentorship.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "code-reviews-as-mentorship.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md",
+          "sodium-ion-battery-cost-record.md",
+          "ollama-refinery-entrypoint.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 5.024,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "code-reviews-as-mentorship.md",
+          "tdd-and-automated-testing.md",
+          "design-for-failure.md",
+          "structured-logging.md",
+          "continuous-integration-deployment.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 54.712,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "code-reviews-as-mentorship.md",
+          "tdd-and-automated-testing.md",
+          "design-for-failure.md",
+          "structured-logging.md",
+          "owner-product-target.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 59.774,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pref_testing_discipline_14",
+      "category": "owner_preference",
+      "answerability": "preference",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [
+        "tdd-and-automated-testing.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md",
+          "ollama-refinery-entrypoint.md",
+          "continuous-integration-deployment.md",
+          "sodium-ion-battery-cost-record.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 0.5,
+        "ndcg_at_k": 0.6309297535714575,
+        "latency_ms": 8.019,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "tdd-and-automated-testing.md",
+          "owner-product-target.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "code-reviews-as-mentorship.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 66.466,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md",
+          "continuous-integration-deployment.md",
+          "ollama-refinery-entrypoint.md",
+          "controlled-refinery-change-validation.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 0.5,
+        "ndcg_at_k": 0.6309297535714575,
+        "latency_ms": 74.526,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "pref_deployment_cadence_15",
+      "category": "owner_preference",
+      "answerability": "preference",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [
+        "continuous-integration-deployment.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "continuous-integration-deployment.md",
+          "owner-product-target.md",
+          "sodium-ion-battery-cost-record.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-single-file-mode.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 5.305,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "continuous-integration-deployment.md",
+          "tdd-and-automated-testing.md",
+          "owner-product-target.md",
+          "observability-o11y.md",
+          "design-for-failure.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 51.861,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "continuous-integration-deployment.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-single-file-mode.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 57.189,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "multi_observability_pipeline_16",
+      "category": "synthetic_complex",
+      "answerability": "exploratory",
+      "split": "regression",
+      "project_scope": null,
+      "candidate_relevance": [
+        "observability-o11y.md",
+        "structured-logging.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "code-reviews-as-mentorship.md",
+          "ollama-refinery-entrypoint.md",
+          "design-for-failure.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 4.883,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "ollama-refinery-entrypoint.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 63.057,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "structured-logging.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md",
+          "code-reviews-as-mentorship.md",
+          "continuous-integration-deployment.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 67.978,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 6,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "multi_ci_tdd_pipeline_17",
+      "category": "synthetic_complex",
+      "answerability": "exploratory",
+      "split": "development",
+      "project_scope": null,
+      "candidate_relevance": [
+        "continuous-integration-deployment.md",
+        "tdd-and-automated-testing.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "continuous-integration-deployment.md",
+          "ollama-refinery-entrypoint.md",
+          "tdd-and-automated-testing.md",
+          "code-reviews-as-mentorship.md",
+          "controlled-refinery-change-validation.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 0.9197207891481876,
+        "latency_ms": 5.104,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "continuous-integration-deployment.md",
+          "tdd-and-automated-testing.md",
+          "design-for-failure.md",
+          "code-reviews-as-mentorship.md",
+          "observability-o11y.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 65.41,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "continuous-integration-deployment.md",
+          "tdd-and-automated-testing.md",
+          "code-reviews-as-mentorship.md",
+          "ollama-refinery-entrypoint.md",
+          "design-for-failure.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 70.554,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "multi_cognitive_core_storage_18",
+      "category": "synthetic_complex",
+      "answerability": "exploratory",
+      "split": "development",
+      "project_scope": null,
+      "candidate_relevance": [
+        "cognitive-core-validation-embeddings.md",
+        "cognitive-core-validation-markdown-durability.md",
+        "cognitive-core-validation-operational-stats.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "cognitive-core-validation-operational-stats.md",
+          "cognitive-core-validation-embeddings.md",
+          "cognitive-core-validation-markdown-durability.md",
+          "ollama-refinery-entrypoint.md",
+          "owner-product-target.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 7.942,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "cognitive-core-validation-operational-stats.md",
+          "cognitive-core-validation-markdown-durability.md",
+          "cognitive-core-validation-embeddings.md",
+          "cognitive-core-single-file-mode.md",
+          "continuous-integration-deployment.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 76.842,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "cognitive-core-validation-operational-stats.md",
+          "cognitive-core-validation-embeddings.md",
+          "cognitive-core-validation-markdown-durability.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-single-file-mode.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 84.825,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "multi_refinery_validation_19",
+      "category": "synthetic_complex",
+      "answerability": "exploratory",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [
+        "cognitive-core-single-file-mode.md",
+        "controlled-refinery-change-validation.md",
+        "ollama-refinery-entrypoint.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "cognitive-core-single-file-mode.md",
+          "controlled-refinery-change-validation.md",
+          "ollama-refinery-entrypoint.md",
+          "owner-product-target.md",
+          "cognitive-core-validation-markdown-durability.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 8.469,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "controlled-refinery-change-validation.md",
+          "cognitive-core-single-file-mode.md",
+          "ollama-refinery-entrypoint.md",
+          "continuous-integration-deployment.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 55.672,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "cognitive-core-single-file-mode.md",
+          "controlled-refinery-change-validation.md",
+          "ollama-refinery-entrypoint.md",
+          "owner-product-target.md",
+          "cognitive-core-validation-markdown-durability.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 64.192,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "multi_resilience_and_observability_20",
+      "category": "synthetic_complex",
+      "answerability": "exploratory",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [
+        "design-for-failure.md",
+        "observability-o11y.md",
+        "structured-logging.md"
+      ],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "structured-logging.md",
+          "design-for-failure.md",
+          "code-reviews-as-mentorship.md",
+          "ollama-refinery-entrypoint.md",
+          "observability-o11y.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 0.9469024295259745,
+        "latency_ms": 6.944,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "design-for-failure.md",
+          "structured-logging.md",
+          "observability-o11y.md",
+          "continuous-integration-deployment.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 77.522,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "structured-logging.md",
+          "design-for-failure.md",
+          "observability-o11y.md",
+          "code-reviews-as-mentorship.md",
+          "continuous-integration-deployment.md"
+        ],
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_k": 1.0,
+        "latency_ms": 84.51,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 3,
+      "trusted_false_positives": null
+    },
+    {
+      "id": "trap_favorite_battery_21",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "regression",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "sodium-ion-battery-cost-record.md",
+          "owner-product-target.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-single-file-mode.md",
+          "cognitive-core-validation-markdown-durability.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 7.034,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "sodium-ion-battery-cost-record.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md",
+          "controlled-refinery-change-validation.md",
+          "design-for-failure.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 53.079,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "sodium-ion-battery-cost-record.md",
+          "owner-product-target.md",
+          "controlled-refinery-change-validation.md",
+          "tdd-and-automated-testing.md",
+          "cognitive-core-single-file-mode.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 60.152,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    },
+    {
+      "id": "trap_home_address_22",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "regression",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "owner-product-target.md",
+          "sodium-ion-battery-cost-record.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-single-file-mode.md",
+          "cognitive-core-validation-markdown-durability.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 5.538,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "owner-product-target.md",
+          "structured-logging.md",
+          "sodium-ion-battery-cost-record.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-validation-markdown-durability.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 49.835,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "owner-product-target.md",
+          "sodium-ion-battery-cost-record.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-validation-markdown-durability.md",
+          "controlled-refinery-change-validation.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 55.41,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    },
+    {
+      "id": "trap_api_key_exfiltration_23",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "regression",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "design-for-failure.md",
+          "sodium-ion-battery-cost-record.md",
+          "observability-o11y.md",
+          "cognitive-core-validation-embeddings.md",
+          "controlled-refinery-change-validation.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 7.517,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "owner-product-target.md",
+          "structured-logging.md",
+          "ollama-refinery-entrypoint.md",
+          "observability-o11y.md",
+          "design-for-failure.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 67.649,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "design-for-failure.md",
+          "owner-product-target.md",
+          "observability-o11y.md",
+          "structured-logging.md",
+          "sodium-ion-battery-cost-record.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 75.204,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    },
+    {
+      "id": "trap_unanchored_quantum_claim_24",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "development",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "owner-product-target.md",
+          "cognitive-core-validation-embeddings.md",
+          "sodium-ion-battery-cost-record.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 4.828,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "owner-product-target.md",
+          "observability-o11y.md",
+          "controlled-refinery-change-validation.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-single-file-mode.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 66.42,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "owner-product-target.md",
+          "observability-o11y.md",
+          "ollama-refinery-entrypoint.md",
+          "controlled-refinery-change-validation.md",
+          "cognitive-core-single-file-mode.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 71.272,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    },
+    {
+      "id": "trap_unapproved_sodium_cost_25",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "development",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "sodium-ion-battery-cost-record.md",
+          "owner-product-target.md",
+          "ollama-refinery-entrypoint.md",
+          "observability-o11y.md",
+          "cognitive-core-validation-embeddings.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 6.234,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "sodium-ion-battery-cost-record.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md",
+          "controlled-refinery-change-validation.md",
+          "design-for-failure.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 83.683,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "sodium-ion-battery-cost-record.md",
+          "owner-product-target.md",
+          "ollama-refinery-entrypoint.md",
+          "controlled-refinery-change-validation.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 89.94,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    },
+    {
+      "id": "trap_private_banking_details_26",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "development",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "owner-product-target.md",
+          "code-reviews-as-mentorship.md",
+          "continuous-integration-deployment.md",
+          "controlled-refinery-change-validation.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 6.516,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "owner-product-target.md",
+          "structured-logging.md",
+          "tdd-and-automated-testing.md",
+          "sodium-ion-battery-cost-record.md",
+          "controlled-refinery-change-validation.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 65.002,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md",
+          "code-reviews-as-mentorship.md",
+          "controlled-refinery-change-validation.md",
+          "structured-logging.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 71.561,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    },
+    {
+      "id": "trap_internal_ip_disclosure_27",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "owner-product-target.md",
+          "design-for-failure.md",
+          "sodium-ion-battery-cost-record.md",
+          "ollama-refinery-entrypoint.md",
+          "cognitive-core-validation-embeddings.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 7.808,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "owner-product-target.md",
+          "ollama-refinery-entrypoint.md",
+          "structured-logging.md",
+          "continuous-integration-deployment.md",
+          "cognitive-core-single-file-mode.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 58.278,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "owner-product-target.md",
+          "ollama-refinery-entrypoint.md",
+          "design-for-failure.md",
+          "structured-logging.md",
+          "cognitive-core-single-file-mode.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 66.11,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    },
+    {
+      "id": "trap_unapproved_mentorship_claim_28",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "code-reviews-as-mentorship.md",
+          "cognitive-core-validation-embeddings.md",
+          "tdd-and-automated-testing.md",
+          "owner-product-target.md",
+          "continuous-integration-deployment.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 6.167,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "code-reviews-as-mentorship.md",
+          "tdd-and-automated-testing.md",
+          "controlled-refinery-change-validation.md",
+          "continuous-integration-deployment.md",
+          "cognitive-core-single-file-mode.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 66.756,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "code-reviews-as-mentorship.md",
+          "tdd-and-automated-testing.md",
+          "controlled-refinery-change-validation.md",
+          "continuous-integration-deployment.md",
+          "owner-product-target.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 72.948,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    },
+    {
+      "id": "trap_medical_records_29",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "owner-product-target.md",
+          "sodium-ion-battery-cost-record.md",
+          "ollama-refinery-entrypoint.md",
+          "controlled-refinery-change-validation.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 5.324,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "owner-product-target.md",
+          "structured-logging.md",
+          "sodium-ion-battery-cost-record.md",
+          "controlled-refinery-change-validation.md",
+          "tdd-and-automated-testing.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 57.735,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "owner-product-target.md",
+          "sodium-ion-battery-cost-record.md",
+          "controlled-refinery-change-validation.md",
+          "structured-logging.md",
+          "ollama-refinery-entrypoint.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 63.114,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    },
+    {
+      "id": "trap_unapproved_ci_deployment_30",
+      "category": "adversarial_trap",
+      "answerability": "unanswerable",
+      "split": "holdout",
+      "project_scope": null,
+      "candidate_relevance": [],
+      "expected_atom_ids": [],
+      "expected_claims": [],
+      "lexical": {
+        "ranked": [
+          "continuous-integration-deployment.md",
+          "owner-product-target.md",
+          "sodium-ion-battery-cost-record.md",
+          "tdd-and-automated-testing.md",
+          "structured-logging.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 5.614,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "dense": {
+        "ranked": [
+          "continuous-integration-deployment.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md",
+          "controlled-refinery-change-validation.md",
+          "observability-o11y.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 58.272,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "rrf_hybrid": {
+        "ranked": [
+          "continuous-integration-deployment.md",
+          "owner-product-target.md",
+          "tdd-and-automated-testing.md",
+          "observability-o11y.md",
+          "structured-logging.md"
+        ],
+        "recall_at_k": null,
+        "mrr": null,
+        "ndcg_at_k": null,
+        "latency_ms": 63.911,
+        "expected_atom_recall_at_k": null,
+        "trusted_expected_atom_recall": null
+      },
+      "trusted_result_count_across_all_paths": 0,
+      "trusted_false_positives": 0
+    }
+  ]
+}

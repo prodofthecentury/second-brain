@@ -14,20 +14,21 @@ Markdown memory metadata before callers inject those memories into chat.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import math
 import os
 import re
+import sys
 
 from config import ATOMS_DIR, CHROMA_PATH, EMBED_MODEL, LEXICAL_INDEX_PATH, normalize_markdown_filename, safe_file_in_dir
-from config import BRAIN_DIR, RAW_DIR
+from config import BRAIN_DIR, RAW_DIR, is_content_markdown
 from index_manifest import index_manifest_is_current, load_index_manifest
 from lexical_store import LexicalIndexUnavailable, TOKEN_PATTERN, search_lexical_index
 from memory_format import split_frontmatter
 from memory_review import REVIEW_STATUSES, parse_atom_record, parse_scalar_list, section_text
 from review_atom import approved_revision_is_current
-from vector_store import get_vector_collection
+from vector_store import close_vector_collection, get_vector_collection
 
 
 class MemoryRecallUnavailable(RuntimeError):
@@ -87,9 +88,58 @@ class RecallOptions:
     exclude_statuses: set[str] = field(default_factory=lambda: set(EXCLUDED_RECALL_STATUSES))
     contexts: tuple[str, ...] = ()
     projects: tuple[str, ...] = ()
+    allow_cross_project: bool = False
+    allow_unreviewed_exploratory: bool = False
     memory_types: tuple[str, ...] = ()
     candidate_multiplier: int = 4
     retrieval_mode: str = "auto"  # 'auto', 'rrf', 'lexical', 'dense'
+
+
+_LAST_DEGRADATION_WARNING: str | None = None
+
+
+def emit_degradation_warning(reason: str) -> str:
+    """Emit an explicit warning banner when dense retrieval degrades to FTS5 lexical search."""
+    global _LAST_DEGRADATION_WARNING
+    banner = (
+        f"[WARNING] Dense embedding service unavailable ({reason}); "
+        "dynamically degraded to FTS5 lexical retrieval."
+    )
+    _LAST_DEGRADATION_WARNING = banner
+    print(banner, file=sys.stderr)
+    return banner
+
+
+def consume_last_degradation_warning() -> str | None:
+    """Return and clear the most recent degradation warning banner, if any."""
+    global _LAST_DEGRADATION_WARNING
+    warning = _LAST_DEGRADATION_WARNING
+    _LAST_DEGRADATION_WARNING = None
+    return warning
+
+
+def normalize_project_tag(tag: str) -> str:
+    cleaned = str(tag or "").strip().lower().replace("-", "_")
+    if not cleaned:
+        return ""
+    return cleaned if cleaned.startswith("project:") else f"project:{cleaned}"
+
+
+def project_tags_match(record_contexts: tuple[str, ...], requested_projects: tuple[str, ...]) -> tuple[str, ...]:
+    """Match normalized project:<id> tags, supporting hierarchical sub-scopes (project:parent/child)."""
+    req_tags = [normalize_project_tag(p) for p in requested_projects if str(p or "").strip()]
+    if not req_tags:
+        return ()
+    matched = []
+    for raw_ctx in record_contexts:
+        if not raw_ctx.lower().startswith("project:"):
+            continue
+        norm_ctx = normalize_project_tag(raw_ctx)
+        for req in req_tags:
+            if norm_ctx == req or norm_ctx.startswith(req + "/"):
+                matched.append(raw_ctx)
+                break
+    return tuple(matched)
 
 
 @dataclass(frozen=True)
@@ -199,13 +249,22 @@ def should_include_record(record: dict, options: RecallOptions) -> bool:
     include_statuses = normalize_statuses(options.include_statuses)
     exclude_statuses = normalize_statuses(options.exclude_statuses) or set()
 
+    superseded_by = record.get("superseded_by", [])
+    if isinstance(superseded_by, str):
+        superseded_by = parse_scalar_list(superseded_by)
+    if superseded_by:
+        return False
+
     if status in exclude_statuses:
         return False
     if include_statuses is not None and status not in include_statuses:
         return False
     if include_statuses is None and status not in NORMAL_RECALL_STATUSES:
         return False
-    if include_statuses is None:
+
+    # Unconditional trust invariant: standard recall and ANY 'accepted' atom must
+    # always verify human_reviewed claim_state and current approved revision.
+    if not options.allow_unreviewed_exploratory or status == "accepted":
         if claim_state != "human_reviewed":
             return False
         if record.get("approved_revision_current") is not True:
@@ -218,16 +277,7 @@ def should_include_record(record: dict, options: RecallOptions) -> bool:
 
     if options.projects:
         record_contexts = metadata_contexts(record)
-        proj_tags = {
-            c.lower().replace("-", "_")
-            for c in record_contexts
-            if c.lower().startswith("project:")
-        }
-        req_tags = {
-            p.lower().replace("-", "_") if p.lower().startswith("project:") else f"project:{p.lower().replace('-', '_')}"
-            for p in options.projects
-        }
-        if not proj_tags.intersection(req_tags):
+        if not project_tags_match(record_contexts, options.projects):
             return False
 
     return True
@@ -272,6 +322,7 @@ def result_from_candidate(
     memory_type = str(record.get("memory_type", "semantic"))
     contexts = metadata_contexts(record)
     context_score, matched_contexts = context_match_score(contexts, options.contexts)
+    matched_projects = project_tags_match(contexts, options.projects)
 
     score = (
         similarity * 0.70
@@ -281,9 +332,13 @@ def result_from_candidate(
         + REVIEW_STATUS_WEIGHTS.get(status, -0.04)
     )
 
-    reasons = [f"status:{status}", f"type:{memory_type}"]
+    reasons = [f"status:{status}", f"type:{memory_type}", f"retrieval:{source}"]
+    if status != "accepted" and options.allow_unreviewed_exploratory:
+        reasons.append("exploratory:unreviewed")
     if matched_contexts:
         reasons.append("context:" + ",".join(matched_contexts))
+    if matched_projects:
+        reasons.append("project:" + ",".join(matched_projects))
 
     return RecallResult(
         filename=filename,
@@ -338,6 +393,11 @@ def linked_neighbors(
     query: str,
 ) -> list[RecallResult]:
     neighbors = []
+    neighbor_options = (
+        replace(options, projects=())
+        if options.projects and options.allow_cross_project
+        else options
+    )
     for target in wikilinks(result.content):
         target_path = safe_file_in_dir(atoms_dir, target, allowed_exts={".md"})
         if not target_path:
@@ -350,12 +410,17 @@ def linked_neighbors(
             content=content,
             filename=target,
             distance=0.35,
-            options=options,
+            options=neighbor_options,
             source="graph",
             atoms_dir=atoms_dir,
         )
         if neighbor:
-            neighbors.append(neighbor)
+            extra_reasons = [f"linked_from:{result.filename}"]
+            if options.projects and not project_tags_match(neighbor.contexts, options.projects):
+                extra_reasons.append("cross_project_reference")
+            neighbors.append(
+                replace(neighbor, match_reasons=neighbor.match_reasons + tuple(extra_reasons))
+            )
     return neighbors
 
 
@@ -429,30 +494,33 @@ def search_semantic_memory(query: str, options: RecallOptions | None = None) -> 
         raise MemoryRecallUnavailable(f"Semantic recall index is unavailable: {exc}") from exc
 
     try:
-        embedding = embed_text(query, model=EMBED_MODEL)
-    except EmbeddingUnavailableError as exc:
-        raise MemoryRecallUnavailable(f"Semantic recall is unavailable: {exc}") from exc
-    generation_id = validated_index_generation(
-        manifest,
-        atoms_dir=ATOMS_DIR,
-        collection_name="atoms",
-        embedding_model=EMBED_MODEL,
-        embedding_dimensions=len(embedding),
-    )
-    candidate_count = max(options.n_results, options.n_results * max(1, options.candidate_multiplier))
-    try:
-        results = collection.query(
-            query_embeddings=[embedding],
-            n_results=candidate_count,
-            where={
-                "$and": [
-                    {"embedding_model": EMBED_MODEL},
-                    {"index_generation": generation_id},
-                ]
-            },
+        try:
+            embedding = embed_text(query, model=EMBED_MODEL)
+        except EmbeddingUnavailableError as exc:
+            raise MemoryRecallUnavailable(f"Semantic recall is unavailable: {exc}") from exc
+        generation_id = validated_index_generation(
+            manifest,
+            atoms_dir=ATOMS_DIR,
+            collection_name="atoms",
+            embedding_model=EMBED_MODEL,
+            embedding_dimensions=len(embedding),
         )
-    except Exception as exc:
-        raise MemoryRecallUnavailable(f"Semantic recall query failed: {exc}") from exc
+        candidate_count = max(options.n_results, options.n_results * max(1, options.candidate_multiplier))
+        try:
+            results = collection.query(
+                query_embeddings=[embedding],
+                n_results=candidate_count,
+                where={
+                    "$and": [
+                        {"embedding_model": EMBED_MODEL},
+                        {"index_generation": generation_id},
+                    ]
+                },
+            )
+        except Exception as exc:
+            raise MemoryRecallUnavailable(f"Semantic recall query failed: {exc}") from exc
+    finally:
+        close_vector_collection(collection)
     direct = rerank_candidates(results, options, query=query)
 
     neighbors = []
@@ -512,37 +580,65 @@ def search_lexical_memory(
     return direct, sorted(neighbors, key=lambda item: item.score, reverse=True)
 
 
+def _tag_degraded_results(
+    direct: list[RecallResult],
+    neighbors: list[RecallResult],
+) -> tuple[list[RecallResult], list[RecallResult]]:
+    tagged_direct = [
+        replace(item, match_reasons=item.match_reasons + ("degraded:lexical_fallback",))
+        for item in direct
+    ]
+    tagged_neighbors = [
+        replace(item, match_reasons=item.match_reasons + ("degraded:lexical_fallback",))
+        for item in neighbors
+    ]
+    return tagged_direct, tagged_neighbors
+
+
 def search_hybrid_rrf_memory(
     query: str,
     options: RecallOptions | None = None,
     *,
     atoms_dir: str = ATOMS_DIR,
+    index_path: str = LEXICAL_INDEX_PATH,
     k_constant: int = 60,
 ) -> tuple[list[RecallResult], list[RecallResult]]:
     """Reciprocal Rank Fusion (RRF) combining SQLite FTS5 (lexical) and Chroma (dense)."""
     options = options or RecallOptions()
-    lex_direct, _ = search_lexical_memory(query, options, atoms_dir=atoms_dir)
+    lex_direct, lex_neighbors = search_lexical_memory(
+        query, options, atoms_dir=atoms_dir, index_path=index_path
+    )
     try:
         dense_direct, _ = search_semantic_memory(query, options)
-    except Exception:
-        # Graceful dynamic fallback to pure lexical when Ollama/Chroma is unavailable
-        return lex_direct, []
+    except MemoryRecallUnavailable as exc:
+        emit_degradation_warning(str(exc))
+        return _tag_degraded_results(lex_direct, lex_neighbors)
 
     rrf_scores: dict[str, float] = {}
     candidate_map: dict[str, RecallResult] = {}
+    lex_ranks: dict[str, int] = {}
+    dense_ranks: dict[str, int] = {}
 
     for rank, res in enumerate(lex_direct):
         rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
         candidate_map[res.filename] = res
+        lex_ranks[res.filename] = rank + 1
 
     for rank, res in enumerate(dense_direct):
         rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
+        dense_ranks[res.filename] = rank + 1
         if res.filename not in candidate_map:
             candidate_map[res.filename] = res
 
     fused: list[RecallResult] = []
     for filename, rrf_score in sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)[: options.n_results]:
         base = candidate_map[filename]
+        extra = [f"retrieval:rrf_hybrid", f"rrf_score:{round(rrf_score, 6)}"]
+        if filename in lex_ranks:
+            extra.append(f"lexical_rank:{lex_ranks[filename]}")
+        if filename in dense_ranks:
+            extra.append(f"dense_rank:{dense_ranks[filename]}")
+        base_reasons = tuple(r for r in base.match_reasons if not r.startswith("retrieval:"))
         fused.append(
             RecallResult(
                 filename=base.filename,
@@ -555,7 +651,7 @@ def search_hybrid_rrf_memory(
                 confidence=base.confidence,
                 importance=base.importance,
                 contexts=base.contexts,
-                match_reasons=base.match_reasons + (f"rrf_score:{round(rrf_score, 6)}",),
+                match_reasons=base_reasons + tuple(extra),
             )
         )
 
@@ -579,9 +675,12 @@ def search_memory(query: str, options: RecallOptions | None = None) -> tuple[lis
     if options.retrieval_mode == "dense":
         try:
             return search_semantic_memory(query, options)
-        except MemoryRecallUnavailable:
-            # Dynamic fallback to lexical if dense unavailable
-            return search_lexical_memory(query, options)
+        except MemoryRecallUnavailable as exc:
+            if os.path.exists(LEXICAL_INDEX_PATH):
+                emit_degradation_warning(str(exc))
+                lex_direct, lex_neighbors = search_lexical_memory(query, options)
+                return _tag_degraded_results(lex_direct, lex_neighbors)
+            raise
     if options.retrieval_mode == "lexical":
         return search_lexical_memory(query, options)
 
@@ -589,6 +688,70 @@ def search_memory(query: str, options: RecallOptions | None = None) -> tuple[lis
     if os.path.exists(LEXICAL_INDEX_PATH):
         return search_lexical_memory(query, options)
     return search_semantic_memory(query, options)
+
+
+def suggest_duplicate_atoms(atoms_dir: str = ATOMS_DIR, min_jaccard: float = 0.35) -> list[dict]:
+    """Read-only review aid: identify candidate duplicate atoms without mutating files or trust."""
+    if not os.path.isdir(atoms_dir):
+        return []
+    entries = []
+    for filename in sorted(os.listdir(atoms_dir)):
+        if not is_content_markdown(filename):
+            continue
+        path = safe_file_in_dir(atoms_dir, filename, allowed_exts={".md"})
+        if not path:
+            continue
+        try:
+            with open(path, "rb") as file_obj:
+                raw_bytes = file_obj.read()
+            content = raw_bytes.decode("utf-8")
+            record = parse_atom_record(path)
+        except Exception:
+            continue
+        if record.get("review_status") in EXCLUDED_RECALL_STATUSES or record.get("superseded_by"):
+            continue
+        parsed = split_frontmatter(content)
+        body = "\n".join(parsed[1]) if parsed else content
+        claim = record.get("claim", "")
+        evidence = section_text(body, "Evidence")
+        tokens = {
+            t.casefold()
+            for t in TOKEN_PATTERN.findall(f"{claim}\n{evidence}")
+            if t.casefold() not in QUERY_STOP_WORDS and len(t) > 2
+        }
+        if not tokens:
+            continue
+        entries.append({
+            "filename": filename,
+            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            "claim": claim,
+            "review_status": record.get("review_status", "pending"),
+            "origin": record.get("origin", "imported_unknown"),
+            "tokens": tokens,
+        })
+
+    suggestions = []
+    for idx, left in enumerate(entries):
+        for right in entries[idx + 1 :]:
+            union = left["tokens"] | right["tokens"]
+            if not union:
+                continue
+            jaccard = len(left["tokens"] & right["tokens"]) / len(union)
+            if jaccard >= min_jaccard:
+                suggestions.append({
+                    "atom_a": left["filename"],
+                    "atom_b": right["filename"],
+                    "jaccard_similarity": round(jaccard, 4),
+                    "atom_a_sha256": left["sha256"],
+                    "atom_b_sha256": right["sha256"],
+                    "atom_a_status": left["review_status"],
+                    "atom_b_status": right["review_status"],
+                    "atom_a_origin": left["origin"],
+                    "atom_b_origin": right["origin"],
+                    "atom_a_claim": left["claim"],
+                    "atom_b_claim": right["claim"],
+                })
+    return sorted(suggestions, key=lambda item: item["jaccard_similarity"], reverse=True)
 
 
 def format_context(results: list[RecallResult]) -> str:
