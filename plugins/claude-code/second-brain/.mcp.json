@@ -4,14 +4,16 @@
       "command": "uv",
       "args": [
         "--directory",
-        "${CLAUDE_PLUGIN_ROOT}",
+        "${CLAUDE_PLUGIN_ROOT}/../../..",
         "run",
         "--frozen",
         "python",
         "scripts/mcp_server.py"
       ],
       "env": {
-        "BRAIN_MCP_TRUSTED_STDIO": "1"
+        "BRAIN_ENABLE_LOCAL_MCP": "1",
+        "BRAIN_MCP_TRUSTED_STDIO": "1",
+        "BRAIN_MCP_CLIENT_TOKEN": "${BRAIN_MCP_CLIENT_TOKEN}"
       }
     }
   }

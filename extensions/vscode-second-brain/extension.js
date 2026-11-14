@@ -3,6 +3,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 
 function getSecurityDir() {
   if (process.platform === "win32") {
@@ -15,7 +16,15 @@ function getSecurityDir() {
 
 function readApiToken() {
   const tokenPath = path.join(getSecurityDir(), "memory-api-token");
-  return fs.existsSync(tokenPath) ? fs.readFileSync(tokenPath, "utf8").trim() : "";
+  try {
+    const st = fs.lstatSync(tokenPath);
+    if (!st.isFile() || st.isSymbolicLink() || st.size > 4096) {
+      return "";
+    }
+    return fs.readFileSync(tokenPath, "utf8").trim();
+  } catch {
+    return "";
+  }
 }
 
 function getPort() {
@@ -127,7 +136,10 @@ function activate(context) {
           tags: ["vscode"],
         });
         if (res.ok) {
-          vscode.window.showInformationMessage(`Remembered in Second Brain (${res.data.tier || "notes"}).`);
+          const statusLabel = res.data?.status === "quarantined"
+            ? "quarantined in inbox for owner review"
+            : (res.data?.status || res.data?.tier || "notes");
+          vscode.window.showInformationMessage(`Remembered in Second Brain (${statusLabel}).`);
           treeProvider.refresh();
         } else {
           vscode.window.showErrorMessage(`Second Brain remember failed: ${res.data?.error || res.status}`);
@@ -165,13 +177,14 @@ function activate(context) {
     }),
 
     vscode.commands.registerCommand("secondBrain.openChat", () => {
+      const nonce = crypto.randomBytes(16).toString("base64");
       const panel = vscode.window.createWebviewPanel(
         "secondBrainChat",
         "Second Brain Chat",
         vscode.ViewColumn.Beside,
         { enableScripts: true }
       );
-      panel.webview.html = `<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';" /></head><body style="font-family:sans-serif;padding:14px;background:#0d1117;color:#e6edf3;">
+      panel.webview.html = `<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" /></head><body style="font-family:sans-serif;padding:14px;background:#0d1117;color:#e6edf3;">
         <h3>Second Brain Streaming Chat</h3>
         <div style="display:flex;gap:8px;margin-bottom:10px;">
           <input id="q" style="flex:1;padding:8px;background:#161b22;color:#fff;border:1px solid #30363d;border-radius:6px;" placeholder="Ask your vault..." />
@@ -183,7 +196,7 @@ function activate(context) {
           <button id="go" style="padding:8px 14px;background:#7c5cff;color:#fff;border:none;border-radius:6px;cursor:pointer;">Ask</button>
         </div>
         <pre id="out" style="white-space:pre-wrap;line-height:1.5;background:#161b22;padding:12px;border-radius:8px;min-height:220px;"></pre>
-        <script>
+        <script nonce="${nonce}">
           const vscode = acquireVsCodeApi();
           document.getElementById("go").onclick = () => {
             document.getElementById("out").textContent = "Retrieving...";
@@ -231,6 +244,8 @@ function activate(context) {
                     const data = JSON.parse(line.slice(5).trim());
                     if (ev === "token") panel.webview.postMessage({ type: "append", text: data.text ?? data.token ?? "" });
                     else if (ev === "verified_answer") panel.webview.postMessage({ type: "reset", text: data.text || data.answer || "" });
+                    else if (ev === "abstain") panel.webview.postMessage({ type: "reset", text: `Abstained: ${data.reason || data.text || ""}` });
+                    else if (ev === "error") panel.webview.postMessage({ type: "reset", text: `Error: ${data.error || ""}` });
                     else if (ev === "context" && mode === "instant") {
                       const summary = (data.sources || []).map((s) => `- ${s.title || s.filename}: ${s.excerpt || s.claim || ""}`).join("\n");
                       panel.webview.postMessage({ type: "reset", text: summary || "No matches." });

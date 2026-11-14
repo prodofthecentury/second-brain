@@ -101,8 +101,8 @@ def get_owner_token(path: Path | None = None) -> str | None:
     return value if len(value) >= MIN_OWNER_TOKEN_LEN else None
 
 
-def owner_authorized(header_value: str | None) -> bool:
-    expected = get_owner_token()
+def owner_authorized(header_value: str | None, token_path: Path | None = None) -> bool:
+    expected = get_owner_token(token_path)
     supplied = (header_value or "").strip()
     return bool(expected and supplied) and hmac.compare_digest(supplied.encode(), expected.encode())
 
@@ -191,7 +191,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
     rt = handler.server.runtime
     paths = _paths(rt)
     q = parse_qs(query or "")
-    is_owner = owner_authorized(handler.headers.get(OWNER_HEADER))
+    is_owner = owner_authorized(handler.headers.get(OWNER_HEADER), getattr(rt, "owner_token_path", None))
     _api_mod = sys.modules.get("memory_api") or sys.modules.get("scripts.memory_api") or sys.modules.get("__main__")
     _audit_fn = getattr(_api_mod, "_audit_api_event", None)
     if _audit_fn is None:
@@ -302,7 +302,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/chat/warmup" and method == "POST":
             from streaming_chat import warmup
 
-            return send(200, warmup(rt.policy_path))
+            try:
+                return send(200, warmup(rt.policy_path))
+            except HostConsentError:
+                raise
+            except Exception as exc:
+                return send(503, {"error": f"Local model warmup unavailable: {exc.__class__.__name__}"})
 
         # ── One-click review (owner) ──
         if path == "/v1/review/queue" and method == "GET":
@@ -348,6 +353,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, {"status": action, "atom": _atom_card(atom_path, rt), "decision": record})
 
         # ── Inbox triage (owner) ──
+        if path == "/v1/inbox/queue" and method == "GET":
+            if not owner_only():
+                return True
+            from dataclasses import asdict
+            from inbox_workflow import list_inbox_items
+
+            items = [{**asdict(i), "risk_flags": list(i.risk_flags)} for i in list_inbox_items(rt.inbox_dir)]
+            return send(200, {"total": len(items), "items": items})
+
         if path in {"/v1/inbox/promote", "/v1/inbox/reject"} and method == "POST":
             if not owner_only():
                 return True

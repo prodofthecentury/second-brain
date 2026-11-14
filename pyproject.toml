@@ -44,8 +44,8 @@ all = [
 second-brain = "scripts.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["scripts", "dashboard"]
-only-include = ["scripts", "dashboard"]
+packages = ["scripts", "dashboard", "plugins"]
+only-include = ["scripts", "dashboard", "plugins"]
 
 [tool.uv]
 default-groups = []

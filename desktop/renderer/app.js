@@ -46,7 +46,7 @@ async function loadNotes(query = "") {
   if (!res.ok) return;
   notesCache = res.data?.items || res.data?.notes || [];
   const listEl = document.getElementById("notesList");
-  listEl.innerHTML = "";
+  listEl.replaceChildren();
   for (const note of notesCache) {
     const item = document.createElement("div");
     item.className = "note-item" + (activeNote && activeNote.filename === note.filename ? " active" : "");
@@ -100,7 +100,7 @@ async function saveActiveNote() {
       { title, tags, body, expected_sha256: activeNote.sha256 }
     );
     if (res.ok) {
-      activeNote = res.data.note || res.data;
+      activeNote = { ...(activeNote || {}), title, tags, body, ...(res.data.note || res.data) };
       banner.textContent = `Saved ${activeNote.filename} (${activeNote.sha256.slice(0, 12)})`;
       await loadNotes(document.getElementById("noteSearchInput").value);
       refreshHealth();
@@ -110,7 +110,7 @@ async function saveActiveNote() {
   } else {
     const res = await window.secondBrain.request("POST", "/v1/notes", { title, tags, body });
     if (res.ok) {
-      activeNote = res.data.note || res.data;
+      activeNote = { ...(activeNote || {}), title, tags, body, ...(res.data.note || res.data) };
       banner.textContent = `Created ${activeNote.filename}`;
       await loadNotes(document.getElementById("noteSearchInput").value);
       refreshHealth();
@@ -187,7 +187,7 @@ window.secondBrain.onChatEvent(({ event, data }) => {
   if (event === "context") {
     const ms = data.retrieval_ms !== undefined ? `${data.retrieval_ms} ms` : "instant";
     chatBannerEl.textContent = `Retrieved ${(data.sources || []).length} sources in ${ms}`;
-    chatSourcesEl.innerHTML = "";
+    chatSourcesEl.replaceChildren();
     for (const src of data.sources || []) {
       const card = document.createElement("div");
       card.className = "source-card";
@@ -226,7 +226,7 @@ async function sendChat() {
   const mode = document.getElementById("chatModeSelect").value;
   const project_scope = document.getElementById("chatScopeInput").value.trim() || undefined;
   chatOutputEl.textContent = "";
-  chatSourcesEl.innerHTML = "";
+  chatSourcesEl.replaceChildren();
   chatBannerEl.textContent = "Retrieving...";
   await window.secondBrain.streamChat({ query, mode, project_scope });
 }
@@ -244,12 +244,16 @@ document.getElementById("chatWarmupBtn").addEventListener("click", async () => {
 // ─── Inbox & Review ──────────────────────────────────────────────────────────
 async function loadReviewQueue() {
   const grid = document.getElementById("reviewGrid");
-  grid.innerHTML = "Loading...";
+  grid.replaceChildren();
+  const loadingBanner = document.createElement("div");
+  loadingBanner.className = "status-banner";
+  loadingBanner.textContent = "Loading...";
+  grid.appendChild(loadingBanner);
   const [inboxRes, reviewRes] = await Promise.all([
     window.secondBrain.request("GET", "/v1/inbox/queue"),
     window.secondBrain.request("GET", "/v1/review/queue"),
   ]);
-  grid.innerHTML = "";
+  grid.replaceChildren();
 
   for (const item of inboxRes.data?.items || []) {
     const card = document.createElement("div");
@@ -301,7 +305,7 @@ async function loadReviewQueue() {
     claim.textContent = atom.claim || atom.title || "";
     const meta = document.createElement("div");
     meta.className = "note-item-meta";
-    meta.textContent = `Status: ${atom.status}`;
+    meta.textContent = `Status: ${atom.review_status || atom.status || "pending"}`;
     const row = document.createElement("div");
     row.className = "toolbar";
     for (const [act, cls, label] of [
@@ -329,7 +333,10 @@ async function loadReviewQueue() {
     grid.appendChild(card);
   }
   if (!grid.children.length) {
-    grid.innerHTML = '<div class="status-banner">Inbox and review queues are clear.</div>';
+    const emptyBanner = document.createElement("div");
+    emptyBanner.className = "status-banner";
+    emptyBanner.textContent = "Inbox and review queues are clear.";
+    grid.appendChild(emptyBanner);
   }
 }
 document.getElementById("refreshReviewBtn").addEventListener("click", loadReviewQueue);
@@ -354,15 +361,19 @@ document.getElementById("runImportBtn").addEventListener("click", async () => {
 // ─── IDE Hub ─────────────────────────────────────────────────────────────────
 async function loadIdeStatus() {
   const grid = document.getElementById("ideGrid");
-  grid.innerHTML = "Checking IDE integrations...";
+  grid.replaceChildren();
+  const checkingBanner = document.createElement("div");
+  checkingBanner.className = "status-banner";
+  checkingBanner.textContent = "Checking IDE integrations...";
+  grid.appendChild(checkingBanner);
   try {
     const status = await window.secondBrain.ideAction("status");
-    grid.innerHTML = "";
+    grid.replaceChildren();
     const targets = status.targets || status;
     for (const [key, info] of Object.entries(targets)) {
       const card = document.createElement("div");
       card.className = "card";
-      const connected = Boolean(info.connected || info.installed);
+      const connected = Boolean(info.connected);
       const titleEl = document.createElement("strong");
       titleEl.textContent = info.name || info.label || key;
       const pathEl = document.createElement("div");
@@ -371,7 +382,7 @@ async function loadIdeStatus() {
       const pillWrap = document.createElement("div");
       const pill = document.createElement("span");
       pill.className = "pill";
-      pill.textContent = connected ? "Connected" : "Not connected";
+      pill.textContent = connected ? "Connected" : (info.installed ? "Available" : "Not installed");
       pillWrap.appendChild(pill);
       card.appendChild(titleEl);
       card.appendChild(pathEl);
@@ -387,7 +398,11 @@ async function loadIdeStatus() {
       grid.appendChild(card);
     }
   } catch (err) {
-    grid.innerHTML = `<div class="status-banner">IDE status error: ${err.message}</div>`;
+    grid.replaceChildren();
+    const errBanner = document.createElement("div");
+    errBanner.className = "status-banner";
+    errBanner.textContent = `IDE status error: ${err?.message || String(err)}`;
+    grid.appendChild(errBanner);
   }
 }
 document.getElementById("refreshIdeBtn").addEventListener("click", loadIdeStatus);
@@ -395,7 +410,11 @@ document.getElementById("refreshIdeBtn").addEventListener("click", loadIdeStatus
 // ─── System View ─────────────────────────────────────────────────────────────
 async function loadSystemView() {
   const grid = document.getElementById("systemGrid");
-  grid.innerHTML = "Loading...";
+  grid.replaceChildren();
+  const loadingBanner = document.createElement("div");
+  loadingBanner.className = "status-banner";
+  loadingBanner.textContent = "Loading...";
+  grid.appendChild(loadingBanner);
   const [health, profile, playbooks] = await Promise.all([
     window.secondBrain.request("GET", "/v1/health"),
     window.secondBrain.request("GET", "/v1/profile"),

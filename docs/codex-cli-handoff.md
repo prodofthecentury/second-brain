@@ -1,8 +1,10 @@
 # Codex CLI Handoff — Second Brain
 
-**Last refreshed:** 2026-10-27 (Pacific/Auckland)
+**Last refreshed:** 2026-11-15 (Pacific/Auckland)
 
-**Current runtime follow-up:** 2026-10-27. Native Chroma imports and queries
+**2026-11-15 Milestone Completion Note:** Goals 0–16 (`tasks/plan.md`, `tasks/todo.md`) are now implemented, adversarially audited across Phases 1, 2, 3A, and 4, and verified at `10/10 PASS` in `scripts/test_all.py` (see `docs/system-sweep-2026-11-15.md`, `docs/phase2-architecture-and-sweep-2026-11-15.md`, and `docs/phase3a-and-phase4-architecture-2026-11-15.md`). Both `master` and the history-scrubbed `release-code-only` branch are synchronized.
+
+**Current runtime follow-up (historical):** 2026-10-27. Native Chroma imports and queries
 the current 14-atom cosine generation after installing the official signed
 Microsoft Visual C++ v14 x64 runtime. Scout pins connections to validated
 public DNS results. The owner approved `structured-logging.md` and
@@ -300,14 +302,6 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:11434/api/embed' -ContentT
 
 ## Current completion status
 
-Architecture and review work is complete enough to guide implementation. A safety implementation pass on 2026-10-24 added loopback-only dashboard binding, model-trust resets, evidence anchors, owner-decision hash checks, a shared writer lock for canonical mutations, create-only threads/captures, stable-file checks, cosine vector manifests/scoring, and readiness warnings for optional model services. See [the 2026-10-24 system sweep](system-sweep-2026-10-24.md) for exact scope and verification.
+Architecture, local pilot, Phase 2 universal plugin/API, Phase 3A Cognitive Core (`skill_playbooks.py`, `executive_planner.py`), and Phase 4 scale/notes/product surfaces (`index_manifest.py`, `lexical_store.py`, `notes_store.py`, `streaming_chat.py`, `bulk_import.py`, `api_product.py`, `ide_connector.py`, `desktop/`, `extensions/vscode-second-brain/`, `plugins/`) are implemented, adversarially audited across Phases 1, 2, 3A, and 4, and verified across all Goals 0–16 (`tasks/plan.md`, `tasks/todo.md`). See [system-sweep-2026-11-15.md](system-sweep-2026-11-15.md), [phase2-architecture-and-sweep-2026-11-15.md](phase2-architecture-and-sweep-2026-11-15.md), and [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md) for full details and audit reconciliations.
 
-The **local pilot implementation and release gate are not complete**. The current
-local runtime has a verified Chroma generation, owner-reviewed evidence,
-lexical/dense retrieval measurements, empty-context abstention, and hardened
-Scout fetching. It still lacks answer-level claim/citation validation, a broad
-held-out evaluation, dashboard/MCP identity controls, reproducible dependency
-locking, complete merge/source-change review workflows, and independent final
-review. Historical findings above describe earlier audit states; use the
-2026-10-27 system sweep, current source, and reconciled plan/task queue for
-present status.
+The unified release gate (`scripts/test_all.py`) passes all **10/10** suites (`doctor`, `evaluation_dataset`, `audit_sources`, `system_safety_tests`, `phase2_safety_tests`, `phase3_cognitive_tests`, `phase4_product_tests` with 25 tests, `scale_benchmark_1500`, `chroma_rebuild_canary`, and `smoke_test`). Historical findings above describe earlier audit states; remaining deferred items are OS-signed MSI/DMG/AppImage GUI installers and external multi-hundred-atom comparative SOTA benchmarks.

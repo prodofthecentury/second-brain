@@ -286,8 +286,6 @@ def _quarantine_agent_capture(paths: NotePaths, title: str, body: str, risks: tu
     os.makedirs(paths.inbox_dir, exist_ok=True)
     if _is_reparse_or_link(paths.inbox_dir):
         raise PermissionError(f"Refusing to quarantine capture into symlinked inbox directory: {paths.inbox_dir}")
-    if _is_reparse_or_link(paths.inbox_dir):
-        raise PermissionError("Refusing to write to symlinked inbox directory.")
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     safe_source = re.sub(r"-{2,}", "-", re.sub(r"[^A-Za-z0-9._:-]", "", str(source or "")))[:64].strip("-") or "agent"
     payload = (

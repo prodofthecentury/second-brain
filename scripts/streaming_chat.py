@@ -40,6 +40,7 @@ from config import ATOMS_DIR, BRAIN_DIR, CHROMA_PATH, LEXICAL_INDEX_PATH  # noqa
 from host_adapters import (  # noqa: E402
     HostConsentError,
     _audit_outbound_call,
+    filter_atoms_for_host,
     inspect_and_redact_outbound,
     load_host_policies,
     validate_endpoint_network_boundary,
@@ -90,7 +91,7 @@ def default_stream_fn(endpoint: str) -> StreamFn:
     def _stream(prompt: str, model: str) -> Iterator[str]:
         import ollama
 
-        client = ollama.Client(host=endpoint)
+        client = ollama.Client(host=endpoint, timeout=45.0, follow_redirects=False, trust_env=False)
         for part in client.chat(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -109,7 +110,7 @@ def default_json_fn(endpoint: str) -> JsonFn:
     def _json(prompt: str, model: str, schema: dict) -> str:
         import ollama
 
-        client = ollama.Client(host=endpoint)
+        client = ollama.Client(host=endpoint, timeout=45.0, follow_redirects=False, trust_env=False)
         resp = client.chat(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -129,7 +130,9 @@ def warmup(policy_path: Path | None = None) -> dict[str, object]:
     import ollama
 
     t0 = time.perf_counter()
-    ollama.Client(host=rule.endpoint_url).generate(model=model, prompt="", keep_alive=KEEP_ALIVE)
+    ollama.Client(host=rule.endpoint_url, timeout=45.0, follow_redirects=False, trust_env=False).generate(
+        model=model, prompt="", keep_alive=KEEP_ALIVE
+    )
     return {"model": model, "warmup_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
 
@@ -354,20 +357,28 @@ def chat_events(
         yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
         return
     model = validate_model_identifier((model_override or "").strip() or rule.default_model, provider=rule.provider)
-    shared_ids = [str(v["atom_id"]) for v in verified] + [f"note:{n['filename']}" for n in notes]
+    allowed_records = filter_atoms_for_host(
+        ctx["_records"],
+        rule,
+        mode="standard" if mode == "verified" else None,
+    )
+    allowed_atom_ids = {str(r["filename"]) for r in allowed_records}
+    model_verified = [v for v in verified if str(v["atom_id"]) in allowed_atom_ids]
+    verified_atom_ids = [str(v["atom_id"]) for v in model_verified]
+    shared_ids = verified_atom_ids + [f"note:{n['filename']}" for n in notes]
 
     if mode == "verified":
-        if not verified:
+        if not model_verified:
             msg = "No owner-verified claim matches this question."
             yield {"type": "verified_answer", "answerable": False, "text": msg, "answer": msg, "claims": []}
         else:
-            sel_prompt = build_claim_selection_prompt(query, verified)
+            sel_prompt = build_claim_selection_prompt(query, model_verified)
             blocked_events = _outbound_secret_block_events(
                 sel_prompt,
                 brain_dir=paths.brain_dir,
                 rule=rule,
                 model=model,
-                atom_ids=shared_ids[: len(verified)],
+                atom_ids=verified_atom_ids,
                 started=started,
             )
             if blocked_events:
@@ -377,15 +388,15 @@ def chat_events(
             t0 = time.perf_counter()
             outcome = "abstained"
             try:
-                raw = fn(sel_prompt, model, claim_selection_schema(len(verified)))
+                raw = fn(sel_prompt, model, claim_selection_schema(len(model_verified)))
                 ids = json.loads(raw).get("claim_ids", [])
                 chosen = []
                 for i in ids if isinstance(ids, list) else []:
-                    if isinstance(i, int) and 0 <= i < len(verified) and verified[i]["claim"] not in chosen:
-                        chosen.append(verified[i]["claim"])
+                    if isinstance(i, int) and 0 <= i < len(model_verified) and model_verified[i]["claim"] not in chosen:
+                        chosen.append(model_verified[i]["claim"])
                 if chosen:
                     result = validate_standard_answer(
-                        json.dumps({"claims": chosen}), ctx["_records"], atoms_dir=paths.atoms_dir
+                        json.dumps({"claims": chosen}), allowed_records, atoms_dir=paths.atoms_dir
                     )
                 else:
                     result = None
@@ -428,14 +439,20 @@ def chat_events(
                     "answer": text_val,
                     "claims": [],
                 }
-            _audit_outbound_call(brain_dir=paths.brain_dir, rule=rule, model=model, atom_ids=shared_ids[: len(verified)],
+            _audit_outbound_call(brain_dir=paths.brain_dir, rule=rule, model=model, atom_ids=verified_atom_ids,
                                  pii_redactions=0, outcome=outcome)
         elapsed = round((time.perf_counter() - started) * 1000, 1)
         yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
         return
 
     # mode == "stream"
-    prompt = build_synthesis_prompt(query, verified, notes)
+    if not model_verified and not notes:
+        msg = "No host-eligible memory or notes match this question under the active host sharing policy."
+        yield {"type": "abstain", "text": msg, "reason": msg}
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
+        return
+    prompt = build_synthesis_prompt(query, model_verified, notes)
     blocked_events = _outbound_secret_block_events(
         prompt,
         brain_dir=paths.brain_dir,
@@ -464,7 +481,7 @@ def chat_events(
         _audit_outbound_call(brain_dir=paths.brain_dir, rule=rule, model=model, atom_ids=shared_ids, pii_redactions=0,
                              outcome=outcome)
     full_text = "".join(pieces)
-    grounding = check_citations(full_text, verified, notes)
+    grounding = check_citations(full_text, model_verified, notes)
     grounding["first_token_ms"] = first_token_ms
     yield grounding
     elapsed = round((time.perf_counter() - started) * 1000, 1)

@@ -43,16 +43,24 @@ function getSecurityDir() {
   return path.join(stateHome, "SecondBrain", "security");
 }
 
+function readSafeTokenFile(filePath) {
+  try {
+    const st = fs.lstatSync(filePath);
+    if (!st.isFile() || st.isSymbolicLink() || st.size > 4096) {
+      return "";
+    }
+    return fs.readFileSync(filePath, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
 function readTokens() {
   const secDir = getSecurityDir();
   const apiTokenPath = path.join(secDir, "memory-api-token");
   const ownerTokenPath = path.join(secDir, "owner-token");
-  const apiToken = fs.existsSync(apiTokenPath)
-    ? fs.readFileSync(apiTokenPath, "utf8").trim()
-    : "";
-  const ownerToken = fs.existsSync(ownerTokenPath)
-    ? fs.readFileSync(ownerTokenPath, "utf8").trim()
-    : "";
+  const apiToken = readSafeTokenFile(apiTokenPath);
+  const ownerToken = readSafeTokenFile(ownerTokenPath);
   return { apiToken, ownerToken };
 }
 

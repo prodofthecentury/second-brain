@@ -29,7 +29,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
-from config import _is_reparse_or_link  # noqa: E402
+from config import _is_reparse_or_link, safe_file_in_dir  # noqa: E402
 from lexical_store import sync_lexical_index  # noqa: E402
 from notes_store import (  # noqa: E402
     DEFAULT_PATHS,
@@ -41,7 +41,21 @@ from notes_store import (  # noqa: E402
     slugify,
 )
 
-SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules", ".venv", "__pycache__", ".sidecar", ".chroma", ".history"}
+SKIP_DIRS = {
+    ".obsidian",
+    ".git",
+    ".trash",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    ".sidecar",
+    ".chroma",
+    ".history",
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+}
 IMPORT_EXTS = {".md", ".markdown", ".txt"}
 MANIFEST_NAME = "notes-import-manifest.json"
 
@@ -75,6 +89,7 @@ def _load_manifest(paths: NotePaths) -> dict[str, dict[str, str]]:
 
 
 def iter_source_files(root: Path):
+    root_abs = os.path.abspath(str(root))
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(
             d
@@ -86,8 +101,14 @@ def iter_source_files(root: Path):
         for name in sorted(filenames):
             if Path(name).suffix.lower() in IMPORT_EXTS and not name.startswith("."):
                 path = Path(dirpath) / name
-                if not path.is_symlink() and not _is_reparse_or_link(str(path)):
-                    yield path
+                if path.is_symlink() or _is_reparse_or_link(str(path)):
+                    continue
+                try:
+                    if os.path.commonpath([root_abs, os.path.abspath(os.path.realpath(str(path)))]) != root_abs:
+                        continue
+                except ValueError:
+                    continue
+                yield path
 
 
 def _note_name_for(rel: Path, used: set[str], notes_dir: Path) -> str:
@@ -95,7 +116,11 @@ def _note_name_for(rel: Path, used: set[str], notes_dir: Path) -> str:
     base = "--".join(parts)[:120].strip("-") or "note"
     name = f"{base}.md"
     n = 2
-    while name in used or (notes_dir / name).exists():
+    while (
+        name in used
+        or safe_file_in_dir(str(notes_dir), name, allowed_exts={".md"}, must_exist=False) is None
+        or (notes_dir / name).exists()
+    ):
         name = f"{base}-{n}.md"
         n += 1
     return name
@@ -119,6 +144,8 @@ def import_folder(
     if root == brain or brain in root.parents or root in brain.parents:
         raise ValueError("Refusing to import the Second Brain vault into itself (or a folder containing it).")
     notes_dir.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_link(str(notes_dir)):
+        raise PermissionError("Refusing to import into a symlink/junction notes directory.")
     stats = ImportStats()
     started = time.perf_counter()
     root_tag = f"import:{slugify(root.name, max_len=40)}"
@@ -141,9 +168,15 @@ def import_folder(
                 continue
             src_sha = hashlib.sha256(raw).hexdigest()
             entry = manifest.get(key)
-            if entry and entry.get("source_sha256") == src_sha and (notes_dir / entry["note"]).exists():
+            existing_note_path = (
+                safe_file_in_dir(str(notes_dir), str(entry.get("note", "")), allowed_exts={".md"}, must_exist=True)
+                if isinstance(entry, dict) and isinstance(entry.get("note"), str)
+                else None
+            )
+            if entry and entry.get("source_sha256") == src_sha and existing_note_path:
+                note_basename = os.path.basename(existing_note_path)
                 stats.unchanged += 1
-                used.add(entry["note"])
+                used.add(note_basename)
                 continue
             rel = src.relative_to(root)
             meta, body = parse_note(text, src.name)
@@ -160,21 +193,24 @@ def import_folder(
                 source_path=rel.as_posix(),
             ).encode("utf-8")
             if dry_run:
-                stats.created += 0 if entry else 1
-                stats.updated += 1 if entry else 0
+                stats.created += 0 if existing_note_path else 1
+                stats.updated += 1 if existing_note_path else 0
                 continue
-            if entry and (notes_dir / entry["note"]).exists():
-                dest_note = str(notes_dir / entry["note"])
-                if _is_reparse_or_link(dest_note):
-                    raise PermissionError(f"Refusing to overwrite symlinked note file: {entry['note']}")
-                atomic_write_bytes(dest_note, rendered)
+            if existing_note_path:
+                if _is_reparse_or_link(existing_note_path):
+                    raise PermissionError(
+                        f"Refusing to overwrite symlinked note file: {os.path.basename(existing_note_path)}"
+                    )
+                atomic_write_bytes(existing_note_path, rendered)
                 stats.updated += 1
-                note_name = entry["note"]
+                note_name = os.path.basename(existing_note_path)
             else:
                 note_name = _note_name_for(rel, used, notes_dir)
                 fd = os.open(notes_dir / note_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
                 try:
-                    os.write(fd, rendered)
+                    if os.write(fd, rendered) != len(rendered):
+                        raise OSError("Incomplete imported note write.")
+                    os.fsync(fd)
                 finally:
                     os.close(fd)
                 stats.created += 1

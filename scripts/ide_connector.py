@@ -109,6 +109,8 @@ def ensure_mcp_token() -> str:
 
 
 def _load_json(path: Path) -> dict:
+    if os.path.lexists(path) and _is_reparse_or_link(str(path)):
+        raise PermissionError(f"Refusing to read config through symlink or junction: {path}")
     if not path.exists():
         return {}
     text = path.read_text(encoding="utf-8").strip()
@@ -154,18 +156,25 @@ def _atomic_write_json(path: Path, data: dict) -> Path | None:
 def _write_antigravity_bundle(plugin_dir: Path) -> None:
     """Antigravity plugin = plugin.json + mcp_config.json + skill + rules (copied from repo template)."""
     template = REPO_ROOT / "plugins" / "antigravity" / "second-brain"
+    if not template.is_dir():
+        raise FileNotFoundError(f"Antigravity plugin template missing: {template}")
     plugin_dir.mkdir(parents=True, exist_ok=True)
-    if template.is_dir():
-        for src in template.rglob("*"):
-            rel = src.relative_to(template)
-            if rel.name == "mcp_config.json":
-                continue  # generated with the live token below
-            dest = plugin_dir / rel
-            if src.is_dir():
-                dest.mkdir(parents=True, exist_ok=True)
-            else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest)
+    if _is_reparse_or_link(str(plugin_dir)):
+        raise PermissionError(f"Refusing to write Antigravity plugin bundle through symlink or junction: {plugin_dir}")
+    for src in template.rglob("*"):
+        if src.is_symlink() or _is_reparse_or_link(str(src)):
+            continue
+        rel = src.relative_to(template)
+        if rel.name == "mcp_config.json":
+            continue  # generated with the live token below
+        dest = plugin_dir / rel
+        if os.path.lexists(dest) and _is_reparse_or_link(str(dest)):
+            raise PermissionError(f"Refusing to overwrite symlinked Antigravity bundle file: {dest}")
+        if src.is_dir():
+            dest.mkdir(parents=True, exist_ok=True)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
 
 
 def connect(host_id: str, *, dry_run: bool = False, home: Path | None = None) -> dict:
