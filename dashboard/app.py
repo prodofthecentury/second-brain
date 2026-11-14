@@ -14,8 +14,8 @@ A beautiful, Tokyo Night-themed, fully interactive Streamlit web dashboard.
 Provides chat with memory, 2D/3D knowledge graph, vault browser & editor,
 Web Scout control, and system action triggers with live streaming logs.
 
-Run it with:
-    uv run --locked --extra dashboard streamlit run dashboard/app.py --server.address 127.0.0.1
+Install dependencies with `uv sync --frozen`, then run:
+    uv run --frozen streamlit run dashboard/app.py --server.address 127.0.0.1
 """
 
 import os
@@ -38,7 +38,7 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts"))
 
 from scripts.config import (
-    ATOMS_DIR, THREADS_DIR, RAW_DIR, SOURCES_DIR, BRIEFINGS_DIR, SIDECAR_DIR,
+    ATOMS_DIR, THREADS_DIR, RAW_DIR, INBOX_DIR, SOURCES_DIR, BRIEFINGS_DIR, SIDECAR_DIR,
     GEN_MODEL, READING_LIST,
     ensure_dirs, read_house_rules, today, now_slug,
     is_content_markdown,
@@ -173,9 +173,10 @@ def get_counts():
     return counts
 
 def run_script_process(script_rel_path, extra_args=[]):
-    """Launch a python script in project root using uv run."""
+    """Launch a Python script using the active interpreter (wheel- and checkout-safe)."""
     try:
-        cmd = ["uv", "run", script_rel_path] + extra_args
+        script_abs = os.path.join(PROJECT_ROOT, script_rel_path)
+        cmd = [sys.executable, script_abs] + list(extra_args)
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -542,6 +543,7 @@ if nav_selection == "💬 Chat with Memory":
         with c2:
             rag_follow = st.checkbox("Follow Graph Links (Graph RAG)", value=True)
             rag_cross_project = st.checkbox("Allow Cross-Project Links", value=False)
+            rag_answer_mode = st.selectbox("Answer Contract Mode", ["standard", "preference"], index=0)
         with c3:
             installed_models = get_ollama_model_names()
             model_options = list(dict.fromkeys([
@@ -566,7 +568,10 @@ if nav_selection == "💬 Chat with Memory":
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant" and msg.get("claims"):
                 replay = validate_standard_answer(
-                    msg["draft_json"], msg["retrieved_atoms"], atoms_dir=ATOMS_DIR
+                    msg["draft_json"],
+                    msg["retrieved_atoms"],
+                    atoms_dir=ATOMS_DIR,
+                    mode=msg.get("answer_mode", "standard"),
                 )
                 st.text(replay.text)
             elif msg["role"] == "assistant":
@@ -600,7 +605,7 @@ if nav_selection == "💬 Chat with Memory":
 
             if all_refs:
                 ref_text = build_grounding_prompt(
-                    AnswerRequest(query=user_prompt, result_limit=rag_n_results),
+                    AnswerRequest(query=user_prompt, mode=rag_answer_mode, result_limit=rag_n_results),
                     all_refs,
                 )
                 st.info(f"📚 Retrieved {len(direct_refs)} direct atoms and {len(neighbor_refs)} linked atoms.")
@@ -625,8 +630,10 @@ if nav_selection == "💬 Chat with Memory":
                         ollama_msgs.append({"role": "user", "content": past_msg.get("content", "")})
                     elif past_msg.get("claims"):
                         replay = validate_standard_answer(
-                            past_msg.get("draft_json", ""), past_msg.get("retrieved_atoms", []),
+                            past_msg.get("draft_json", ""),
+                            past_msg.get("retrieved_atoms", []),
                             atoms_dir=ATOMS_DIR,
+                            mode=past_msg.get("answer_mode", "standard"),
                         )
                         if replay.answerable:
                             ollama_msgs.append({"role": "assistant", "content": replay.text})
@@ -639,7 +646,9 @@ if nav_selection == "💬 Chat with Memory":
                         content = chunk["message"]["content"]
                         full_response += content
                     model_draft_json = full_response
-                    answer = validate_standard_answer(full_response, all_refs, atoms_dir=ATOMS_DIR)
+                    answer = validate_standard_answer(
+                        full_response, all_refs, atoms_dir=ATOMS_DIR, mode=rag_answer_mode
+                    )
                     full_response = answer.text
                     response_container.text(full_response)
                     st.session_state.chat_history.append({
@@ -648,6 +657,7 @@ if nav_selection == "💬 Chat with Memory":
                         "claims": answer.claims,
                         "draft_json": model_draft_json if answer.answerable else "",
                         "retrieved_atoms": all_refs if answer.answerable else [],
+                        "answer_mode": rag_answer_mode,
                     })
                 except Exception as e:
                     st.error(f"Error connecting to Ollama: {e}")
@@ -700,7 +710,7 @@ elif nav_selection == "🕸️ Knowledge Graph":
                 col_n1, col_n2 = st.columns([2, 1])
                 with col_n1:
                     st.markdown(f"#### Content of `{selected_node}`")
-                    st.markdown(content)
+                    st.code(content, language="markdown")
                 with col_n2:
                     st.markdown("#### Metadata & Relations")
                     st.json({
@@ -718,14 +728,24 @@ elif nav_selection == "🗄️ Vault Explorer":
     st.title("🗄️ Vault Explorer")
     st.subheader("Inspect the vault; atom edits return to pending review")
     
-    vault_tab = st.selectbox("Vault Category", ["2-atoms (Atoms)", "3-threads (Threads)", "sources (Web Pages)", "0-raw (Inbox)"])
+    vault_tab = st.selectbox(
+        "Vault Category",
+        [
+            "2-atoms (Atoms)",
+            "3-threads (Threads)",
+            "sources (Web Pages)",
+            "0-raw (Inbox)",
+            "0-raw/inbox (Quarantined MCP Inbox)",
+        ],
+    )
     
     # Map category to folder path
     folder_map = {
         "2-atoms (Atoms)": ATOMS_DIR,
         "3-threads (Threads)": THREADS_DIR,
         "sources (Web Pages)": SOURCES_DIR,
-        "0-raw (Inbox)": RAW_DIR
+        "0-raw (Inbox)": RAW_DIR,
+        "0-raw/inbox (Quarantined MCP Inbox)": INBOX_DIR,
     }
     dir_path = folder_map[vault_tab]
     
@@ -733,7 +753,7 @@ elif nav_selection == "🗄️ Vault Explorer":
         st.info("This vault category has no files yet.")
     else:
         files = sorted([f for f in os.listdir(dir_path) if f.endswith(".md") or f.endswith(".intake")])
-        if dir_path == ATOMS_DIR:
+        if dir_path in (ATOMS_DIR, INBOX_DIR):
             files = [filename for filename in files if filename != "README.md"]
         search_query = st.text_input("🔍 Search filenames", "")
         
@@ -763,13 +783,16 @@ elif nav_selection == "🗄️ Vault Explorer":
                     # Only canonical atom revisions may be edited in this UI.
                     if dir_path == ATOMS_DIR:
                         preview_mode = st.radio("View Mode", ["Preview", "Edit Source Code"], horizontal=True)
+                    elif dir_path == INBOX_DIR:
+                        preview_mode = "Preview"
+                        st.caption("Quarantined MCP captures in `0-raw/inbox/` are read-only here; inspect raw source before promoting to `0-raw/`.")
                     else:
                         preview_mode = "Preview"
                         st.caption("Raw captures, source evidence, and generated threads are read-only here.")
                     
                     if preview_mode == "Preview":
                         st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
-                        st.markdown(file_content)
+                        st.code(file_content, language="markdown")
                         st.markdown("</div>", unsafe_allow_html=True)
                     else:
                         edited_content = st.text_area("Source Code", file_content, height=450)
@@ -1095,4 +1118,4 @@ elif nav_selection == "⚙️ System Control":
                     st.error("Selected briefing path is invalid.")
                     st.stop()
                 with open(brief_path, "r", encoding="utf-8") as f:
-                    st.markdown(f.read())
+                    st.code(f.read(), language="markdown")
