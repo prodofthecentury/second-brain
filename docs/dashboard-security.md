@@ -17,8 +17,11 @@ LAN exposure, and cloud deployment are unsupported.
   loopback UI URL, and WebSocket host validation allows only `127.0.0.1`.
 - **Guessing the owner password:** the verifier uses a random 128-bit salt,
   scrypt (`N=32768`, `r=8`, `p=1`), constant-time digest comparison, and a
-  per-session lock after five failed attempts. Sessions expire after 30 minutes
-  without app activity and can be locked manually.
+  cross-session 60-second lockout after five failed attempts. Authenticated
+  session state lives strictly server-side inside Tornado's origin-gated
+  WebSocket `st.session_state` (never serialized into a custom client cookie or
+  exposed to browser JavaScript), expires after 30 minutes without app activity,
+  and can be locked manually.
 - **Same-account malware or local process:** out of scope. A process running as
   the owner can read the vault, inspect/replace the app, or access the local
   browser session. The password gate is not a sandbox or OS account boundary.
@@ -36,11 +39,17 @@ to start if setup fails. The verifier is not stored in the vault or Git.
 ## Verification and remaining limits
 
 Unit and live boundary tests cover missing/malformed verifier behavior, salt
-uniqueness, correct and incorrect passwords, cross-session rate-limiting and
-automated 60-second lockout, `HttpOnly` + `SameSite=Strict` session/XSRF cookie
-flags, strict `127.0.0.1` loopback binding (rejecting `0.0.0.0` or external
-interfaces), cross-origin HTTP/WebSocket rejection (`403 Forbidden`), and the
-session gate before vault reads. MCP remains disabled by default, enforces
-bearer token authorization and granular tool scoping when enabled, restricts
-reads to `review_status == accepted` atoms, and isolates untrusted captures in
-`brain/0-raw/inbox/`; do not connect it to a cloud client.
+uniqueness, correct and incorrect passwords, thread-safe cross-session
+rate-limiting and automated 60-second lockout, server-side `st.session_state`
+authentication inside Tornado's origin-gated WebSocket (never exposed to browser
+JavaScript) paired with Streamlit's `SameSite=Strict` XSRF cookie
+(`--server.xsrfCookieSameSite=strict`), strict `127.0.0.1` loopback binding
+(rejecting `0.0.0.0` or external interfaces), cross-origin HTTP/WebSocket
+rejection (`403 Forbidden`), and the session gate before vault reads. MCP
+remains disabled by default (`BRAIN_ENABLE_LOCAL_MCP=1`), fails closed without a
+configured local bearer token (`--generate-token`) supplied via MCP request
+`_meta` (`authorization: Bearer <token>`, never via tool `arguments`), enforces
+granular tool scoping (`BRAIN_MCP_ALLOWED_TOOLS`), restricts reads to
+`review_status == accepted` atoms, and isolates untrusted captures in
+`brain/0-raw/inbox/` requiring explicit owner promotion into `brain/0-raw/`
+before extraction; do not connect it to a cloud client.

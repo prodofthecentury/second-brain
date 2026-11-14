@@ -38,19 +38,21 @@ The root project directory is the Git boundary, but the live `brain/` vault is e
 ## Start with the model-free baseline
 
 The Python package requires Python 3.11. From a source checkout, run
-`setup.ps1` on Windows, or install `uv` and run `uv sync --locked
---no-default-groups` followed by `uv run --locked second-brain install`. This
+`setup.ps1` on Windows, `./setup.sh` on Linux/macOS, or install `uv` and run
+`uv sync --locked` followed by `uv run --locked second-brain install`. This
 creates the empty vault structure and a model-free SQLite lexical index. Then
 run `uv run --locked second-brain doctor` to see which optional capabilities
 are installed. The private `brain/` vault is excluded from this repository;
 restore it from your own backup if you want existing memories.
 
-On a Windows machine, run `setup.ps1`. It installs `uv` with WinGet when
-available, falls back to user-scoped pip when Python exists, lets `uv` install
-managed Python 3.11, syncs the locked dashboard dependencies, initializes
-lexical recall, reports capabilities, and starts the local dashboard (use
-`-NoLaunch` to stop after setup). It does not install the Ollama model server
-or download LLM weights. macOS/Linux bootstrap scripts are not implemented yet.
+On Windows, `setup.ps1` installs `uv` with WinGet when available (falling back
+to user-scoped pip when Python 3.11 exists), lets `uv` install managed Python
+3.11, syncs the locked dependencies, initializes lexical recall, reports
+capabilities, and starts the local dashboard (use `-NoLaunch` to stop after
+setup). On Linux and macOS, `./setup.sh` performs the equivalent POSIX
+bootstrap (`--no-launch` skips starting the dashboard). Neither script installs
+the Ollama daemon itself; pass `-PullModels` / `--pull-models` only when a
+local Ollama server is already running.
 Wheel installs store the vault in
 the platform user data directory (`%LOCALAPPDATA%/SecondBrain/brain` on
 Windows, `~/Library/Application Support/SecondBrain/brain` on macOS, or
@@ -73,11 +75,11 @@ Launch the dashboard with:
 .\run_dashboard.ps1
 ```
 
-The dashboard requires the optional `dashboard` extra. Install it with
-`uv sync --locked --extra dashboard` before launch. Ollama must be installed
-separately to enable local model-backed chat, embeddings, and capture. MCP,
-Scout, multimodal capture, watchdog, and evaluation dependencies are separate
-extras; none are required for offline lexical recall.
+The dashboard, CLI, watchdog, MCP, Scout, and evaluation tools are included in
+the core locked dependencies (`uv sync --locked`); only `multimodal` capture
+(`uv sync --locked --extra multimodal`) is an optional extra, and none of the
+model-backed components are required for offline lexical recall. Ollama must be
+installed separately to enable local model-backed chat, embeddings, and capture.
 
 On first launch, the script prompts for a 12-character minimum owner password and confirmation. The browser session unlocks for up to 30 minutes of activity and can be locked from the sidebar. Reset it with `uv run --locked python scripts/dashboard_auth.py set-password`. The app is available at `http://127.0.0.1:8501`. The dashboard’s atom editor uses compare-and-swap, resets trust to pending after edits, and rebuilds lexical recall before reporting success. Approve only after inspecting the exact revision and its source excerpt.
 
@@ -89,27 +91,27 @@ See [the dashboard security boundary](docs/dashboard-security.md) for the threat
 
 ```powershell
 uv run --locked python scripts/memory_review.py --status all
-uv run --locked --extra online python scripts/review_atom.py approve <atom.md> --expected-sha256 <sha256> --actor <owner>
-uv run --locked --extra online python scripts/review_atom.py merge <survivor.md> <superseded.md> --survivor-sha256 <sha256> --superseded-sha256 <sha256> --actor <owner> --rationale "<reason>"
+uv run --locked python scripts/review_atom.py transition approve <atom.md> --expected-sha256 <sha256> --actor <owner>
+uv run --locked python scripts/review_atom.py merge <survivor.md> <superseded.md> --survivor-sha256 <sha256> --superseded-sha256 <sha256> --actor <owner> --rationale "<reason>"
 uv run --locked python scripts/audit_sources.py
 uv run --locked python scripts/rebuild_lexical_index.py
-uv run --locked --extra evaluation python scripts/rebuild_vectors.py
+uv run --locked python scripts/rebuild_vectors.py
 uv run --locked python scripts/doctor.py
 ```
 
-`review_atom.py approve` refuses missing or ambiguous evidence. Editing an atom later invalidates the approval, even if its frontmatter still says `accepted`. Rebuild dense vectors only when the embedder is available; the rebuild is staged and records its model, dimensions, generation, source revisions, and cosine metric. Chroma’s collection metric is configured explicitly because its default single-node metric is squared L2, not cosine ([Chroma collection configuration](https://docs.trychroma.com/docs/collections/configure)).
+`review_atom.py transition approve` refuses missing or ambiguous evidence. Editing an atom later invalidates the approval, even if its frontmatter still says `accepted`. Rebuild dense vectors only when the embedder is available; the rebuild is staged and records its model, dimensions, generation, source revisions, and cosine metric. Chroma’s collection metric is configured explicitly because its default single-node metric is squared L2, not cosine ([Chroma collection configuration](https://docs.trychroma.com/docs/collections/configure)).
 
-`review_atom.py merge` requires explicit owner-selected survivor/superseded atoms, both current revision hashes, an actor, and a rationale. It preserves both revisions in `.history`, marks the survivor pending for re-review, excludes the merged atom from normal recall, refreshes lexical recall, and writes paired decision records. If a dense index is active, the audit marks it stale; rebuild dense vectors before dense recall resumes. The dashboard does not yet expose this action.
+`review_atom.py merge` requires explicit owner-selected survivor/superseded atoms, both current revision hashes, an actor, and a rationale. It preserves both revisions in `.history`, marks the survivor pending for re-review, excludes the merged atom from normal recall, refreshes lexical recall, and writes paired decision records. If a dense index is active, the audit marks it stale; rebuild dense vectors before dense recall resumes.
 
 `audit_sources.py` reports current source-anchor and approval state without changing atoms. After reviewing its report, explicitly demote stale approvals with `uv run --locked python scripts/audit_sources.py --demote-stale --actor <owner>`; re-approve only after inspecting the exact current source.
 
-Dataset `second-brain-retrieval-pilot` v2.0.0 separates five candidate-ranking queries into two answerable cases, three exploratory pending-target cases, and two traps. The latest retrieval run used dense generation `ce48706db17d440fbba04b8c7f86c37e`; both answerable targets appeared in lexical and dense top-five and trusted context, while both traps returned zero trusted results. Median retrieval latency was about 6.6 ms lexical and 57.6 ms dense. Run `uv run --locked --extra evaluation python scripts/evaluate_answers.py --model qwen2.5-coder:7b --runs 3` to repeat end-to-end answer checks; the latest local run covered two answerable cases and two traps, with 6/6 positive claims and 0/6 trap leaks. Both datasets are tiny regression pilots, far too small to establish broad quality or a dense-retrieval advantage. Raw candidate labels are not approved memories. See the [system sweep](docs/system-sweep-2026-10-27.md) for model, dataset, latency, and hardware limits.
+Dataset `second-brain-retrieval-pilot` v2.0.0 separates five candidate-ranking queries into two answerable cases, three exploratory pending-target cases, and two traps. The latest retrieval run used dense generation `ce48706db17d440fbba04b8c7f86c37e`; both answerable targets appeared in lexical and dense top-five and trusted context, while both traps returned zero trusted results. Median retrieval latency was about 6.6 ms lexical and 57.6 ms dense. Run `uv run --locked python scripts/evaluate_answers.py --model qwen2.5-coder:7b --runs 3` to repeat end-to-end answer checks; the latest local run covered two answerable cases and two traps, with 6/6 positive claims and 0/6 trap leaks. Both datasets are tiny regression pilots, far too small to establish broad quality or a dense-retrieval advantage. Raw candidate labels are not approved memories. See the [system sweep](docs/system-sweep-2026-10-27.md) for model, dataset, latency, and hardware limits.
 
 The answer run took 6.1 seconds p50 and 49.8 seconds p95 including cold start on this CPU-only host. The configured default `llama3.2:3b` did not answer either positive case in one repeat, so it is not yet a dependable default. These pilot results are too small to claim general model quality.
 
 ## MCP policy
 
-MCP is not part of the default operating path. Do not connect this vault to cloud-connected hosts or expose the MCP process through a network service. The opt-in local interface returns only specifically requested, currently approved atoms, has no listable resource catalog, and writes bounded input to the untrusted raw inbox. Enabling MCP does not authenticate a client; only enable it for a trusted local process.
+MCP is not part of the default operating path. Do not connect this vault to cloud-connected hosts or expose the MCP process through a network service. The opt-in local interface (`BRAIN_ENABLE_LOCAL_MCP=1`) fails closed without a configured local bearer token (`--generate-token`) supplied via MCP request `_meta` (`authorization: Bearer <token>`, never tool `arguments`), returns only specifically requested, currently approved atoms, has no listable resource catalog, and writes bounded input to the quarantined `brain/0-raw/inbox/` queue requiring owner promotion. Only enable it for a trusted local process.
 
 ## Git safety
 

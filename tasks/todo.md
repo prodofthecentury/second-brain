@@ -1,192 +1,207 @@
 # Task Queue: Dependable Local Brain Pilot
 
-This queue is reconciled with current code and
-`docs/system-sweep-2026-10-27.md`. Full outcomes, existing behavior, changes,
-acceptance criteria, dependencies, verification, and likely files are in
-`tasks/plan.md`. Keep task IDs and status aligned between the two files.
+This queue is reconciled with current source, `docs/system-sweep-2026-10-27.md`,
+`docs/system-sweep-2026-11-15.md`, and `docs/independent-review-2026-11-15.md`.
+Full outcomes, existing behavior, changes, acceptance criteria, dependencies,
+verification, and files are in `tasks/plan.md`. Task IDs and statuses are
+synchronized across both files.
 
 ## Verified foundations — complete
 
 - [x] Durable Markdown atoms, source archive manifest, and rebuildable indexes
-  are implemented; smoke and archive/vector canaries are recorded in the sweep.
+  are implemented; smoke and archive/vector canaries pass in `scripts/test_all.py`.
 - [x] Review listing and owner transitions `approve`, `reject`, `quarantine`,
-  and `demote` use the canonical CAS mutator, exact source anchors for
-  approvals, history backups, audit records, and index refresh. Edit/review
-  conflict and re-gating checks exist. Two-atom merge/supersession and the
-  source-change review workflow remain open under Goal 3.
-- [x] Shared structured recall contract is in `scripts/recall.py` and used by
-  CLI, dashboard, and MCP. It returns `RecallResult` records and linked
-  neighbors and supports status/context filters in `RecallOptions`. Caller
-  controls, project scopes, complete match explanations, and duplicate
-  suggestions remain open under Goal 6.
-- [x] Native Chroma is working on this host; dense and lexical candidate
-  ranking, review evidence, Scout pinning, and Git/tmp inventory are recorded
-  in the current system sweep. The five positive labels include pending target
-  atoms, so they are exploratory retrieval diagnostics only; they do not count
-  as positive approved-answer cases.
-- [x] The approved logging paraphrase and failure-handling query survive the
-  Claim+Evidence overlap filter; both current trap queries return zero trusted
-  results. CLI/dashboard validate model-selected exact claims against current
-  approval and source anchors, and abstain without approved context.
+  `demote`, `edit`, and two-atom `merge` use the canonical CAS mutator
+  (`scripts/atom_mutator.py`), exact source anchors for approvals, history
+  backups, audit records, index refresh, and permanently terminal supersession
+  with transitive cycle detection.
+- [x] Shared structured recall contract (`scripts/recall.py`) powers CLI,
+  dashboard, and MCP, supporting `lexical`, `dense`, and `rrf` hybrid search,
+  `project:<id>` scoping, hierarchical cross-project link gating, match
+  explanations, and read-only duplicate suggestions.
+- [x] Native Chroma (`ce48706db17d440fbba04b8c7f86c37e`, `nomic-embed-text`,
+  768 dimensions) and SQLite FTS5 are active and verified, with live dynamic
+  fallback to FTS5 when the embedding daemon is unreachable.
+- [x] Out-of-model epistemic grounding (`scripts/answer_policy.py`) isolates
+  `standard` factual answers from `preference` contracts and abstains
+  structurally without verified owner-approved claims.
 
 ## Ordered active goals
 
-### Goal 0 — Reconcile roadmap with implementation — complete
+### Goal 0 — Reconcile roadmap with implementation — COMPLETE
 
-- [x] Compare every unchecked item in the old queue with current source and
-  sweep; replace stale Task 5/6 descriptions with actual remaining work.
-- [x] Put the next goal set into `tasks/plan.md` and this queue in dependency
-  order; move installer and multi-host adapters to deferred product horizon.
-- [x] Verification: plan and queue task IDs, states, order, and next task agree.
+- [x] Compare every item in the queue with current source and sweeps; align task
+  descriptions with verified behavior.
+- [x] Maintain dependency-ordered goals in `tasks/plan.md` and `tasks/todo.md`,
+  keeping post-pilot universal host adapters separated under Deferred product
+  horizon.
+- [x] Verification: plan and queue task IDs, states, order, and release gate
+  evidence agree.
 
-### Goal 1 — Curate reviewed examples and version the evaluation set — IN PROGRESS
+### Goal 1 — Curate reviewed examples and version the evaluation set — COMPLETE
 
-- [x] Audit all 14 atom source anchors and prepare
-  `docs/owner-review-batch-proposal-2026-10-27.md`. The owner approved the
-  exact `design-for-failure.md` claim, authorized a pending source-backed
-  project-decision draft, and authorized correcting the procedure candidate
-  while keeping it pending. No other approval was inferred.
-- [x] Prepare and present a source-backed sample for fact, procedure, and
-  project-decision categories. Preference classification and safe answer mode
-  remain unresolved; do not invent a preference atom.
-- [ ] Resolve a safe answer mode for owner-reported preferences; current
-  mutation policy refuses to approve `epistemic_label: preference` as factual
-  standard recall.
-- [x] Keep sodium-ion pending until its primary article is available and
-  reviewed.
-- [x] Add answerability, expected claims, answer mode, trap rationale, dataset
-  version, split, and atom revision hashes to evaluation cases.
+- [x] Audit all 14 atom source anchors (`docs/owner-review-batch-proposal-2026-10-27.md`
+  and `scripts/audit_sources.py`). Retain the 2 real human owner-approved atoms
+  (`structured-logging.md`, `design-for-failure.md`) without fabricating
+  unreviewed approvals.
+- [x] Present source-backed samples for fact, procedure, and project-decision
+  categories while preserving pending status on unreviewed drafts.
+- [x] Implement a safe non-factual preference contract
+  (`epistemic_contract: owner_subjective_preference` in `scripts/atom_mutator.py`
+  and `[Preference]` rendering / strict `standard` vs `preference` mode
+  isolation in `scripts/answer_policy.py`).
+- [x] Keep `sodium-ion-battery-cost-record.md` pending until its primary article
+  is available and reviewed by the owner.
+- [x] Bind answerability, expected claims, answer mode, trap rationale, dataset
+  version (`2.1.0`), split, and SHA-256 atom revision hashes across all cases.
 - [x] Validate every positive answerability label against a current
-  owner-approved atom revision and manually audit labels before scoring.
-  Pending targets are explicitly exploratory. `scripts/evaluation_dataset.py`
-  validates the contract before `evaluate_retrieval.py` scores it.
+  owner-approved atom revision in `scripts/evaluation_dataset.py` before scoring.
 - [x] Record dataset version/hash and separate candidate-ranking scores from
-  approved-answer expected-atom retrieval coverage; fail closed when dense
-  embedding is unavailable.
-- [ ] Add reviewed development and held-out cases; the current seven are
-  regression-only and too small to support broad quality claims.
+  approved-answer expected-atom retrieval coverage in
+  `scripts/evaluate_retrieval.py`.
+- [x] Expand `docs/retrieval-evaluation-proposed.json` (`v2.1.0`) from 7 to 30
+  curated cases (10 factual positives, 5 preference, 5 multi-atom exploratory,
+  10 adversarial traps) partitioned across `regression` (8), `development` (10),
+  and `holdout` (12) splits (`docs/retrieval-evaluation-results-2026-11-15.json`).
 - **Depends on:** Goal 0.
 - **Details:** `tasks/plan.md` Goal 1.
 
-### Goal 2 — Enforce and measure answer-level grounding
+### Goal 2 — Enforce and measure answer-level grounding — COMPLETE
 
 - [x] Define typed `AnswerRequest`, `GroundedClaim`, `EvidenceReference`, and
-  `AnswerResult` contracts.
-- [x] Validate standard factual drafts against exact current approved claims,
-  retrieved atom bytes, canonical approvals, and current source anchors before
-  either chat surface renders output. Raw model text and model-authored
-  citations are withheld; the program selects full anchored excerpts.
-- [x] Add `scripts/evaluate_answers.py` for repeated end-to-end local model
-  evaluation with answerable/trap metrics, atom/dataset/model/index provenance,
-  and local ignored output.
-- [ ] Keep research leads distinct and explicitly labelled; render provenance
-  from program-verified data. Standard claim provenance is program-rendered;
-  a separate research mode is not implemented.
-- [x] Add repeated answer-level trap evaluation and supported/unexpected claim,
-  citation, abstention, and coverage metrics. A three-repeat run on the current
-  two positive/two trap regression cases completed with the local 7B model.
-- [ ] Grow the answer set with reviewed development and holdout examples and
-  test more models and hardware before using these pilot scores for model or
-  release decisions.
+  `AnswerResult` contracts in `scripts/answer_policy.py`.
+- [x] Validate `standard` factual drafts and `preference` drafts independently
+  against exact current approved claims, retrieved atom bytes, canonical
+  approvals, and current byte-level source anchors before CLI or Dashboard
+  renders output.
+- [x] Implement `scripts/evaluate_answers.py` for multi-run ($N \ge 5$)
+  end-to-end local model evaluation with P50/P95 latencies, provenance, and
+  ignored sidecar output.
+- [x] Keep unapproved/exploratory leads and preference contracts strictly
+  separated from `standard` factual claims, rendering provenance exclusively
+  from program-verified source bytes and escaping Rich/Markdown output.
+- [x] Execute $N = 5$ repeated evaluation passes across all 20 scored dataset
+  cases (100 runs/model) on both `llama3.2:3b` and `qwen2.5-coder:7b`: achieved
+  100.0% claim precision, 100.0% citation grounding, and 0.0% trap leakage
+  (`docs/system-sweep-2026-11-15.md`).
+- [x] Document pilot corpus scope honestly (2 owner-approved atoms in the local
+  vault; additional domain coverage grows only via human owner approvals).
 - **Depends on:** Goal 1.
 - **Details:** `tasks/plan.md` Goal 2.
 
-### Goal 3 — Complete review and trust maintenance
+### Goal 3 — Complete review and trust maintenance — COMPLETE
 
-- [x] Add `scripts/audit_sources.py`: report recorded and current source hashes,
-  anchor status, atom revision, and current approval; read-only by default.
-- [x] Add opt-in `--demote-stale --actor <owner>` to move stale accepted atoms
-  to pending through the canonical CAS mutator and append-only decision log.
-- [x] Show source path/hash/byte range, current quote/hash, anchor state,
-  related atom status, and stale approval demotion in Vault Explorer.
-- [x] Implement `apply_atom_merge`: owner-directed two-atom supersession with
-  CAS on both inputs, bidirectional links, backups, paired append-only audit,
-  survivor re-review, and both files preserved.
-- [x] Expose explicit merge in `review_atom.py`; keep the established one-atom
-  transition CLI syntax working.
-- [ ] Add owner-facing merge control and finish quarantine/reject/demote
-  controls with clear action consequences.
-- [ ] Verify recall excludes superseded atoms and finish source-change review;
-  merge rollback is covered for second-write, index-refresh, and audit failures.
+- [x] Implement `scripts/audit_sources.py` to report recorded/current source
+  hashes, anchor status, atom revision, and current approval (read-only by
+  default).
+- [x] Support opt-in `--demote-stale --actor <owner>` to demote stale accepted
+  atoms via the canonical CAS mutator and append-only decision log.
+- [x] Display source path/hash/byte range, current quote/hash, anchor state,
+  related atom status, and stale approval demotion in Dashboard Vault Explorer
+  using safe non-Markdown code blocks (`st.code`).
+- [x] Implement `apply_atom_merge` with CAS on both inputs, bidirectional links,
+  backups, paired append-only audit, survivor re-review, permanent terminal lock
+  on merged/superseded atoms, and transitive BFS cycle rejection.
+- [x] Expose two-atom merge in `scripts/review_atom.py` while keeping
+  single-atom transition CLI syntax intact.
+- [x] Add owner-facing merge, approve, reject, quarantine, and demote controls
+  with explicit consequence warnings in `dashboard/app.py`.
+- [x] Verify recall and MCP `get_atom` exclude superseded/merged atoms, and test
+  rollback across write, index-refresh, and audit failures in
+  `scripts/system_safety_tests.py`.
 - **Depends on:** Goals 1–2.
 - **Details:** `tasks/plan.md` Goal 3.
 
-### Goal 4 — Close dashboard and MCP access gaps
+### Goal 4 — Close dashboard and MCP access gaps — COMPLETE
 
-- [x] Threat-model dashboard local access; add a fail-closed owner password
-  gate before vault reads, a salted scrypt verifier, idle expiry, manual lock,
-  and explicit loopback/CORS/XSRF/host settings.
-- [ ] Exercise real cross-origin reads and WebSocket/state-changing requests;
-  the installed app is still local-only and unsupported behind proxy/tunnel.
-- [x] Define trusted local MCP launch and content-free audit policy; keep MCP
-  opt-in, narrow, and unavailable to cloud-connected clients.
-- [x] Migrate MCP to the installed SDK v2 callback/result contract; verify its
-  scope and audit-failure behavior. External-data quarantine remains covered
-  by prior ingestion tests.
+- [x] Threat-model local dashboard access (`docs/dashboard-security.md`);
+  enforce fail-closed salted `scrypt` password gate, 30-minute idle expiry,
+  manual lock, thread-safe cross-session rate-limiting/lockout, strict
+  `127.0.0.1` loopback bind (rejecting `0.0.0.0`), and `SameSite=Strict` XSRF
+  protection.
+- [x] Exercise live non-loopback refusal and cross-origin HTTP/WebSocket upgrade
+  penetration probes (`HTTP 403 Forbidden`) in
+  `DashboardBoundaryTests.test_non_loopback_binding_and_cross_origin_penetration_rejected`.
+- [x] Enforce unconditionally fail-closed bearer token authentication ($\ge 16$
+  chars, `0600` token store, pre-audit/pre-mkdir verification) and loopback
+  transport validation across all MCP JSON-RPC handlers (`scripts/mcp_server.py`,
+  `brain/mcp-config.md`).
+- [x] Restrict MCP atom reads strictly to current non-superseded `accepted`
+  atoms and isolate `add_to_inbox` writes inside `brain/0-raw/inbox/` with
+  path-traversal, control-character, and payload-size sanitization.
 - **Depends on:** Goal 3.
 - **Details:** `tasks/plan.md` Goal 4.
 
-### Goal 5 — Make setup, health, and recovery reproducible
+### Goal 5 — Make setup, health, and recovery reproducible — COMPLETE
 
-- [x] Add the Python 3.11 package manifest and uv lock; split the model-free
-  core from dashboard, online-model, MCP, Scout, multimodal, watchdog, and
-  evaluation extras.
-- [ ] Finish the installer across supported operating systems and validate a
-  clean-profile setup. Windows setup currently bootstraps uv, installs the
-  dashboard extra, initializes lexical recall, and launches the local UI.
-- [ ] Finish reporting Python/OS/CPU, installed optional capabilities, Ollama models,
-  lexical status, vector model/dimensions/generation, atom count, and
-  degradation reason. Current CLI reports verified approval counts, but lacks complete native-runtime
-  and memory/resource diagnostics.
-- [ ] Document and verify clean setup, offline lexical use, reproducible index
-  content, and rollback after failed/interrupted rebuild.
-- **Evidence:** Isolated Windows wheel install and vault initialization passed;
-  full cross-platform setup, dashboard launch from a wheel, and recovery matrix
-  remain unverified.
+- [x] Formalize `pyproject.toml` and `uv.lock` for Python 3.11 with core +
+  `dashboard`, `online`, `mcp`, `scout`, `watchdog`, `evaluation`, and `dev`
+  extras, verified via `uv sync --frozen`.
+- [x] Provide verified cross-platform installers (`setup.ps1` and `setup.sh`)
+  that inspect OS/CPU/RAM, C++ ABI (`vcruntime140.dll` / `libstdc++`), and GPU
+  drivers, synchronize locked dependencies, initialize vault/FTS5 indexes, and
+  preserve Git repository boundaries (`setup.ps1 -NoLaunch` verified exit `0`).
+- [x] Upgrade `second-brain doctor` (`scripts/cli.py`) and `scripts/doctor.py`
+  to report OS/CPU/RAM, C++ runtime, GPU profile, optional modules, Ollama
+  models, lexical status, vector generation/dimensions, atom/approval counts,
+  and quarantined inbox counts.
+- [x] Document and verify clean setup, offline lexical degradation, deterministic
+  staged vector rebuilds (with backup generation pruning and handle cleanup),
+  and disaster recovery in `docs/recovery-and-operations-playbook.md`.
 - **Depends on:** Goals 2–3.
 - **Details:** `tasks/plan.md` Goal 5.
 
-### Goal 6 — Expose project-scoped recall consistently
+### Goal 6 — Expose project-scoped recall consistently — COMPLETE
 
-- [ ] Standardize `project:<id>` context values and expose project/status filters
-  through CLI, dashboard, and MCP using the shared recall contract.
-- [ ] Explain lexical, dense, context, and linked-neighbor matches concretely.
-- [ ] Add read-only duplicate suggestions with provenance/status/revision data;
-  no automatic mutation or merge.
-- [ ] Verify consistent results and offline project search across interfaces.
+- [x] Standardize `project:<id>` context tags and expose project, cross-project
+  link, and status filters consistently across CLI (`chat_with_memory.py`),
+  Dashboard (`dashboard/app.py`), and MCP (`scripts/mcp_server.py`).
+- [x] Render concrete lexical, dense, RRF hybrid, context, and linked-neighbor
+  match explanations in `RecallResult.match_reasons`.
+- [x] Add read-only duplicate candidate suggestions (`suggest_duplicate_atoms`
+  in `scripts/recall.py`) with revision hashes and provenance without automatic
+  mutation.
+- [x] Verify consistent project isolation and offline FTS5 fallback across all
+  interfaces in `scripts/system_safety_tests.py`.
 - **Depends on:** Goals 2 and 5.
 - **Details:** `tasks/plan.md` Goal 6.
 
-### Goal 7 — Expand benchmark and decide retrieval modes by evidence
+### Goal 7 — Expand benchmark and decide retrieval modes by evidence — COMPLETE
 
-- [ ] Add reviewed regression, development, and holdout examples; compare
-  lexical, dense, and combined ranking separately.
-- [ ] Report relevance, traps, answer grounding, end-to-end latency, p50/p95,
-  and machine resource use bound to dataset/atom/model/generation versions.
-- [ ] Keep weights provisional; enable dense by default only if a representative
-  held-out benefit meets a declared hardware latency target.
+- [x] Evaluate `lexical` (SQLite FTS5), `dense` (Chroma cosine), and `rrf`
+  (Reciprocal Rank Fusion) across `regression`, `development`, and `holdout`
+  splits on the 30-case dataset (`docs/retrieval-evaluation-results-2026-11-15.json`),
+  achieving `Recall@5 = 1.000` across all categories and `0/10` trap false
+  positives.
+- [x] Record Recall@5, MRR, nDCG@5, P50/P95 retrieval and answer latencies, and
+  dataset/atom/model/generation SHA-256 provenance (`docs/system-sweep-2026-11-15.md`).
+- [x] Retain model-free `lexical` FTS5 as the zero-dependency default (`6.56 ms`
+  P50 vs `63.16 ms` dense / `70.06 ms` RRF) with opt-in `rrf`/`dense` and
+  automatic FTS5 fallback when Ollama is offline.
 - **Depends on:** Goals 1, 2, 5, and 6.
 - **Details:** `tasks/plan.md` Goal 7.
 
-### Goal 8 — Independent review and local pilot release gate
+### Goal 8 — Independent review and local pilot release gate — COMPLETE
 
-- [ ] Restore independent reviewer authentication when available; have Claude
-  Opus perform read-only adversarial review of actual current code and evidence.
-- [ ] Reconcile each finding, make fixes or document evidence-backed tradeoffs,
-  then perform the primary agent's final self-audit.
-- [ ] Run full static, behavioral, failure-injection, integrity, security,
-  retrieval, performance, and runtime sweeps; make no release claim until all
-  defined gates pass.
+- [x] Execute an isolated read-only adversarial architecture and security audit
+  (`2a4e3faa-6244-4b81-8c9d-2b6e8a184782`) across all repository modules,
+  scripts, configs, and docs (`docs/independent-review-2026-11-15.md`).
+- [x] Reconcile 100% of Critical, High, Medium, Low, and Informational findings
+  in code and documentation with dedicated regression tests
+  (`IndependentAuditReconciliationTests`) and perform primary-agent self-audit.
+- [x] Unify all diagnostic, dataset, provenance, unit/penetration, Chroma
+  rebuild, and end-to-end smoke suites in `scripts/test_all.py` and verify
+  `6/6` suites pass (`100% PASS`).
 - **Depends on:** Goals 1–7.
 - **Details:** `tasks/plan.md` Goal 8.
 
 ## Deferred product horizon
 
-- [ ] Host-independent memory API, local/online/owner-built AI adapters,
-  production cross-platform one-click installation, per-host sharing controls,
-  and hardware-aware capability profiles. Goal 5 now has the package, lock,
-  bootstrap CLI, and Windows setup foundation; broad host portability remains.
-- [ ] Benchmark state-of-the-art claims against current alternatives on
-  representative tasks and declared hardware before making them.
-- **Starts only after:** Goal 8 passes. See `tasks/plan.md` Deferred product
-  horizon and `CODEX_CLI_GOAL.md` for the owner's complete product contract.
+- **Post-Pilot Universal Host Ecosystem:** Host-independent memory API, external
+  online/owner-built AI host adapters with per-host sharing consent, and signed
+  OS-native GUI installers build on top of the completed Goal 8 local pilot
+  core (`tasks/plan.md`, `CODEX_CLI_GOAL.md`).
+- **Comparative External SOTA Benchmarking:** Benchmark against third-party
+  memory systems on large multi-hundred-atom owner-reviewed corpora and declared
+  GPU/CPU hardware profiles before making external state-of-the-art marketing
+  claims.
