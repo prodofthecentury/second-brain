@@ -491,6 +491,124 @@ class DashboardBoundaryTests(unittest.TestCase):
         self.assertLess(gate, vault_count)
         self.assertIn("if not dashboard_authenticated:\n    st.stop()", app)
 
+    def test_non_loopback_binding_and_cross_origin_penetration_rejected(self):
+        import http.client
+        import socket
+        import subprocess
+        import time
+        from dashboard_auth import SESSION_COOKIE_POLICY, assert_loopback_address, format_session_cookie
+        from mcp_server import assert_mcp_loopback_transport
+
+        # 1. Explicit loopback assertions reject 0.0.0.0, IPv6 wildcard, and LAN/public IPs
+        self.assertEqual(assert_loopback_address("127.0.0.1"), "127.0.0.1")
+        for forbidden in ("0.0.0.0", "::", "192.168.1.50", "10.0.0.5", "8.8.8.8"):
+            with self.assertRaisesRegex(PermissionError, "403 Forbidden"):
+                assert_loopback_address(forbidden)
+            with self.assertRaisesRegex(PermissionError, "403 Forbidden"):
+                assert_mcp_loopback_transport(forbidden)
+
+        # 2. Session cookie flags strictly enforce HttpOnly and SameSite=Strict
+        self.assertTrue(SESSION_COOKIE_POLICY["HttpOnly"])
+        self.assertEqual(SESSION_COOKIE_POLICY["SameSite"], "Strict")
+        cookie = format_session_cookie("deadbeef" * 4)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+
+        # 3. Live Tornado/Streamlit penetration probe on loopback ephemeral port
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
+            probe_sock.bind(("127.0.0.1", 0))
+            port = probe_sock.getsockname()[1]
+
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "streamlit", "run",
+                str(ROOT / "dashboard" / "app.py"),
+                "--server.headless=true",
+                "--server.address=127.0.0.1",
+                f"--server.port={port}",
+                "--server.enableCORS=true",
+                "--server.enableXsrfProtection=true",
+                "--server.xsrfCookieSameSite=strict",
+                "--server.allowedHosts=127.0.0.1",
+                f"--server.corsAllowedOrigins=http://127.0.0.1:{port}",
+                "--browser.gatherUsageStats=false",
+            ],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            ready = False
+            deadline = time.time() + 20.0
+            while time.time() < deadline:
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+                    conn.request("GET", "/_stcore/health", headers={"Host": f"127.0.0.1:{port}"})
+                    resp = conn.getresponse()
+                    resp.read()
+                    conn.close()
+                    if resp.status == 200:
+                        ready = True
+                        break
+                except OSError:
+                    time.sleep(0.25)
+            self.assertTrue(ready, "Streamlit loopback listener failed to become healthy within 20s")
+
+            # 3a. Cross-origin WebSocket upgrade to /_stcore/stream must fail with 403 Forbidden
+            ws_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+            ws_conn.request(
+                "GET",
+                "/_stcore/stream",
+                headers={
+                    "Host": f"127.0.0.1:{port}",
+                    "Origin": "https://evil-attacker.example",
+                    "Connection": "Upgrade",
+                    "Upgrade": "websocket",
+                    "Sec-WebSocket-Version": "13",
+                    "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                },
+            )
+            ws_resp = ws_conn.getresponse()
+            ws_resp.read()
+            ws_conn.close()
+            self.assertEqual(ws_resp.status, 403)
+
+            # 3b. Spoofed external Host header WebSocket upgrade must fail with 403 Forbidden
+            spoof_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+            spoof_conn.request(
+                "GET",
+                "/_stcore/stream",
+                headers={
+                    "Host": f"evil-host.example:{port}",
+                    "Origin": f"http://evil-host.example:{port}",
+                    "Connection": "Upgrade",
+                    "Upgrade": "websocket",
+                    "Sec-WebSocket-Version": "13",
+                    "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                },
+            )
+            spoof_resp = spoof_conn.getresponse()
+            spoof_resp.read()
+            spoof_conn.close()
+            self.assertEqual(spoof_resp.status, 403)
+
+            # 3c. Non-loopback LAN IP connection attempt must be refused immediately
+            try:
+                lan_ip = socket.gethostbyname(socket.gethostname())
+            except OSError:
+                lan_ip = "127.0.0.1"
+            if lan_ip and not lan_ip.startswith("127."):
+                with self.assertRaises(OSError):
+                    with socket.create_connection((lan_ip, port), timeout=1.5):
+                        pass
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
 
 class DashboardAuthTests(unittest.TestCase):
     def test_scrypt_verifier_accepts_only_matching_password_and_has_unique_salt(self):
@@ -627,6 +745,173 @@ class MCPBoundaryTests(unittest.TestCase):
 
         import asyncio
         asyncio.run(scenario())
+
+    def test_mcp_bearer_token_authorization(self):
+        import asyncio
+        import os
+        from unittest.mock import patch
+        import mcp_server
+        from mcp import types
+
+        test_token = "secret-mcp-bearer-token-123456"
+
+        async def run_auth_checks():
+            with patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": test_token, "BRAIN_MCP_REQUIRE_AUTH": "1"}):
+                # Request without token should fail
+                no_auth_call = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(name="search_memory", arguments={"query": "test"})
+                )
+                self.assertTrue(no_auth_call.is_error)
+                self.assertIn("Unauthorized", no_auth_call.content[0].text)
+
+                # Request with wrong token should fail
+                wrong_auth_call = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(name="search_memory", arguments={"query": "test", "bearer_token": "wrong"})
+                )
+                self.assertTrue(wrong_auth_call.is_error)
+                self.assertIn("Unauthorized", wrong_auth_call.content[0].text)
+
+                # Request with valid token should succeed
+                valid_auth_call = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(name="search_memory", arguments={"query": "test", "bearer_token": test_token})
+                )
+                self.assertFalse(valid_auth_call.is_error)
+
+        asyncio.run(run_auth_checks())
+
+    def test_mcp_granular_tool_permissions(self):
+        import asyncio
+        import os
+        from unittest.mock import patch
+        import mcp_server
+        from mcp import types
+
+        async def run_permission_checks():
+            # Restrict tools to only search_memory
+            with patch.dict(os.environ, {"BRAIN_MCP_ALLOWED_TOOLS": "search_memory"}):
+                listed = await mcp_server.handle_list_tools(None, None)
+                tool_names = {t.name for t in listed.tools}
+                self.assertEqual(tool_names, {"search_memory"})
+                self.assertNotIn("add_to_inbox", tool_names)
+
+                # Calling a forbidden tool returns permission error
+                denied_call = await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(name="add_to_inbox", arguments={"content": "hello"})
+                )
+                self.assertTrue(denied_call.is_error)
+                self.assertIn("Permission denied", denied_call.content[0].text)
+
+        asyncio.run(run_permission_checks())
+
+    def test_mcp_inbox_path_traversal_and_size_rejection(self):
+        import asyncio
+        import mcp_server
+        from mcp import types
+
+        async def run_ingestion_checks():
+            # Path traversal attempt in arguments raises descriptive ValueError
+            with self.assertRaisesRegex(ValueError, "Path traversal attempt detected"):
+                await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="add_to_inbox",
+                        arguments={"content": "malicious content", "source": "../../evil"}
+                    )
+                )
+
+            with self.assertRaisesRegex(ValueError, "Path traversal attempt detected"):
+                await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="add_to_inbox",
+                        arguments={"content": "malicious content", "filename": "../../../boot.ini"}
+                    )
+                )
+
+            # Oversized payload raises descriptive ValueError
+            oversized_content = "x" * (mcp_server.MAX_INBOX_CHARS + 10)
+            with self.assertRaisesRegex(ValueError, "Inbox content must contain"):
+                await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="add_to_inbox",
+                        arguments={"content": oversized_content}
+                    )
+                )
+
+            # Null byte injection raises descriptive ValueError
+            with self.assertRaisesRegex(ValueError, "null bytes detected"):
+                await mcp_server.handle_call_tool(
+                    None,
+                    types.CallToolRequestParams(
+                        name="add_to_inbox",
+                        arguments={"content": "data with \x00 null byte"}
+                    )
+                )
+
+        asyncio.run(run_ingestion_checks())
+
+    def test_mcp_get_atom_restricts_to_accepted_and_quarantines_inbox(self):
+        import asyncio
+        from unittest.mock import patch
+        import mcp_server
+        from mcp import types
+
+        async def run_atom_and_quarantine_checks():
+            # 1. Approved atom can be read
+            approved_res = await mcp_server.handle_call_tool(
+                None,
+                types.CallToolRequestParams(name="get_atom", arguments={"atom_id": "structured-logging.md"}),
+            )
+            self.assertIn("Logs should be structured (JSON)", approved_res.content[0].text)
+
+            # 2. Pending atom is strictly blocked from external reading
+            pending_res = await mcp_server.handle_call_tool(
+                None,
+                types.CallToolRequestParams(name="get_atom", arguments={"atom_id": "observability-o11y.md"}),
+            )
+            self.assertIn("not currently owner-approved", pending_res.content[0].text)
+
+            # 3. Path traversal in get_atom is rejected
+            trav_res = await mcp_server.handle_call_tool(
+                None,
+                types.CallToolRequestParams(name="get_atom", arguments={"atom_id": "../../pyproject.toml"}),
+            )
+            self.assertIn("not found or invalid", trav_res.content[0].text)
+
+            # 4. Valid add_to_inbox writes strictly to quarantined inbox (0-raw/inbox/) and never top-level 0-raw/
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                raw_dir = Path(tmp_dir) / "0-raw"
+                inbox_dir = raw_dir / "inbox"
+                audit_file = raw_dir / "archive" / "mcp-audit.jsonl"
+                raw_dir.mkdir(parents=True, exist_ok=True)
+                with (
+                    patch.object(mcp_server, "RAW_DIR", str(raw_dir)),
+                    patch.object(mcp_server, "INBOX_DIR", str(inbox_dir)),
+                    patch.object(mcp_server, "MCP_AUDIT_PATH", str(audit_file)),
+                    patch("mcp_server.audit_mcp_use", return_value={}),
+                ):
+                    inbox_res = await mcp_server.handle_call_tool(
+                        None,
+                        types.CallToolRequestParams(
+                            name="add_to_inbox",
+                            arguments={"content": "Quarantined capture test payload.", "source": "unit_test"},
+                        ),
+                    )
+                self.assertIn("quarantined inbox", inbox_res.content[0].text)
+                inbox_files = list(inbox_dir.glob("*.md"))
+                raw_root_files = list(raw_dir.glob("*.md"))
+                self.assertEqual(len(inbox_files), 1)
+                self.assertEqual(len(raw_root_files), 0)
+                stored_text = inbox_files[0].read_text(encoding="utf-8")
+                self.assertIn("<!-- second_brain_origin: mcp_local -->", stored_text)
+                self.assertIn("Quarantined capture test payload.", stored_text)
+
+        asyncio.run(run_atom_and_quarantine_checks())
 
 
 class ScoutPinningTests(unittest.TestCase):

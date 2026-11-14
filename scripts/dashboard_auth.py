@@ -30,6 +30,30 @@ SCRYPT_DKLEN = 32
 SESSION_IDLE_SECONDS = 30 * 60
 MAX_SESSION_FAILURES = 5
 SESSION_LOCK_SECONDS = 60
+ALLOWED_LOOPBACK_ADDRESS = "127.0.0.1"
+SESSION_COOKIE_POLICY = {
+    "HttpOnly": True,
+    "SameSite": "Strict",
+    "Path": "/",
+}
+_RATE_LIMIT_TRACKER: dict[str, dict[str, float | int]] = {}
+
+
+def assert_loopback_address(address: str | None) -> str:
+    """Enforce strict IPv4 loopback binding (127.0.0.1 only, reject 0.0.0.0 or external interfaces)."""
+    normalized = str(address or ALLOWED_LOOPBACK_ADDRESS).strip()
+    if normalized != ALLOWED_LOOPBACK_ADDRESS:
+        raise PermissionError(
+            f"403 Forbidden: Dashboard listener must bind strictly to {ALLOWED_LOOPBACK_ADDRESS} (got {normalized!r})."
+        )
+    return normalized
+
+
+def format_session_cookie(session_token: str) -> str:
+    """Format a hardened local session cookie header with HttpOnly and SameSite=Strict."""
+    if not session_token or any(ch in session_token for ch in (";", "\r", "\n", " ")):
+        raise ValueError("Invalid session token.")
+    return f"sb_session={session_token}; HttpOnly; SameSite=Strict; Path=/"
 
 
 def default_auth_path() -> Path:
@@ -149,6 +173,17 @@ def _record_fingerprint(record: dict) -> str:
 
 def require_dashboard_login(st, auth_path: str | Path | None = None) -> bool:
     """Render a fail-closed login screen; return true only for an authenticated session."""
+    get_opt = getattr(st, "get_option", None)
+    if callable(get_opt):
+        try:
+            assert_loopback_address(get_opt("server.address"))
+        except PermissionError as exc:
+            st.error(str(exc))
+            return False
+
+    resolved_key = str(Path(auth_path or default_auth_path()))
+    tracker = _RATE_LIMIT_TRACKER.setdefault(resolved_key, {"failures": 0, "locked_until": 0.0})
+
     record = load_password_record(auth_path)
     if record is None:
         st.title("Second Brain is locked")
@@ -168,18 +203,21 @@ def require_dashboard_login(st, auth_path: str | Path | None = None) -> bool:
             if st.sidebar.button("Lock dashboard", key="brain-dashboard-lock"):
                 state.pop("_brain_dashboard_auth_fingerprint", None)
                 state.pop("_brain_dashboard_last_activity", None)
+                state.pop("_brain_dashboard_session_cookie", None)
                 st.rerun()
             return True
         state.pop("_brain_dashboard_auth_fingerprint", None)
         state.pop("_brain_dashboard_last_activity", None)
+        state.pop("_brain_dashboard_session_cookie", None)
 
     st.title("Unlock Second Brain")
     st.caption("This dashboard is local-only. Unlocking lasts until logout or 30 minutes without activity.")
     error = state.pop("_brain_dashboard_login_error", None)
     if error:
         st.error(error)
-    locked_until = float(state.get("_brain_dashboard_locked_until", 0))
+    locked_until = max(float(state.get("_brain_dashboard_locked_until", 0)), float(tracker.get("locked_until", 0.0)))
     if time.time() < locked_until:
+        state["_brain_dashboard_locked_until"] = locked_until
         st.warning("Too many failed attempts. Wait one minute and try again.")
         return False
     with st.form("brain-dashboard-login", clear_on_submit=True):
@@ -189,16 +227,24 @@ def require_dashboard_login(st, auth_path: str | Path | None = None) -> bool:
         password = state.get("brain_dashboard_password", "")
         state["_brain_dashboard_clear_password"] = True
         if verify_password(password, record):
+            session_token = secrets.token_hex(32)
             state["_brain_dashboard_auth_fingerprint"] = fingerprint
             state["_brain_dashboard_last_activity"] = time.time()
+            state["_brain_dashboard_session_cookie"] = format_session_cookie(session_token)
             state["_brain_dashboard_login_failures"] = 0
+            tracker["failures"] = 0
+            tracker["locked_until"] = 0.0
             state.pop("_brain_dashboard_locked_until", None)
             st.rerun()
-        failures = int(state.get("_brain_dashboard_login_failures", 0)) + 1
+        failures = max(int(state.get("_brain_dashboard_login_failures", 0)), int(tracker.get("failures", 0))) + 1
         state["_brain_dashboard_login_failures"] = failures
+        tracker["failures"] = failures
         if failures >= MAX_SESSION_FAILURES:
-            state["_brain_dashboard_locked_until"] = time.time() + SESSION_LOCK_SECONDS
+            lock_deadline = time.time() + SESSION_LOCK_SECONDS
+            state["_brain_dashboard_locked_until"] = lock_deadline
+            tracker["locked_until"] = lock_deadline
             state["_brain_dashboard_login_failures"] = 0
+            tracker["failures"] = 0
         state["_brain_dashboard_login_error"] = "Password did not match."
         st.rerun()
     return False

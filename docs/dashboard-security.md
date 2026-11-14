@@ -35,11 +35,12 @@ to start if setup fails. The verifier is not stored in the vault or Git.
 
 ## Verification and remaining limits
 
-Unit tests cover missing/malformed verifier behavior, salt uniqueness, correct
-and incorrect passwords, fail-closed rendering, and the session gate before
-vault reads. A live local browser check covered locked, unlocked, and manually
-locked states. The effective Streamlit configuration was inspected. Automated
-cross-origin browser/WebSocket and mutation probes are still required before a
-release claim. MCP remains a separate unauthenticated stdio interface, disabled
-by default; do not connect it to a cloud client. This dashboard control does
-not secure MCP or turn the app into a remotely safe service.
+Unit and live boundary tests cover missing/malformed verifier behavior, salt
+uniqueness, correct and incorrect passwords, cross-session rate-limiting and
+automated 60-second lockout, `HttpOnly` + `SameSite=Strict` session/XSRF cookie
+flags, strict `127.0.0.1` loopback binding (rejecting `0.0.0.0` or external
+interfaces), cross-origin HTTP/WebSocket rejection (`403 Forbidden`), and the
+session gate before vault reads. MCP remains disabled by default, enforces
+bearer token authorization and granular tool scoping when enabled, restricts
+reads to `review_status == accepted` atoms, and isolates untrusted captures in
+`brain/0-raw/inbox/`; do not connect it to a cloud client.

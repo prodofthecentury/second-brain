@@ -17,4 +17,11 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "Dashboard remains locked because password setup did not complete." -ForegroundColor Red
     exit $LASTEXITCODE
 }
-uv run --locked streamlit run dashboard/app.py --server.address 127.0.0.1
+uv run --locked streamlit run dashboard/app.py `
+    --server.address 127.0.0.1 `
+    --server.port 8501 `
+    --server.enableCORS true `
+    --server.enableXsrfProtection true `
+    --server.xsrfCookieSameSite strict `
+    --server.allowedHosts 127.0.0.1 `
+    --server.corsAllowedOrigins http://127.0.0.1:8501

@@ -51,7 +51,7 @@ from scripts.review_atom import apply_review_transition, approved_revision_is_cu
 from scripts.memory_review import parse_atom_record
 from scripts.review_atom import review_lock
 from scripts.review_details import atom_review_details
-from scripts.dashboard_auth import require_dashboard_login
+from scripts.dashboard_auth import assert_loopback_address, require_dashboard_login
 
 ensure_dirs()
 
@@ -62,6 +62,13 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Enforce strict loopback interface binding (127.0.0.1 only, reject 0.0.0.0 or external interfaces).
+try:
+    assert_loopback_address(st.get_option("server.address"))
+except PermissionError as _bind_exc:
+    st.error(str(_bind_exc))
+    st.stop()
 
 # Do not inspect or render vault data until the local owner session is unlocked.
 dashboard_authenticated = require_dashboard_login(st)

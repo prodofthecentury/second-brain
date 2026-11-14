@@ -19,6 +19,7 @@ BRAIN_DIR    = os.path.abspath(os.environ.get("BRAIN_VAULT_DIR", os.path.join(RO
 
 # ─── Vault Folders ───────────────────────────────────────────────────────────
 RAW_DIR      = os.path.join(BRAIN_DIR, "0-raw")
+INBOX_DIR    = os.path.join(RAW_DIR, "inbox")
 DESK_DIR     = os.path.join(BRAIN_DIR, "1-desk")
 ATOMS_DIR    = os.path.join(BRAIN_DIR, "2-atoms")
 THREADS_DIR  = os.path.join(BRAIN_DIR, "3-threads")
@@ -55,7 +56,7 @@ VAULT_README = "README.md"
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def ensure_dirs():
     """Create all vault directories if they don't exist."""
-    for d in [RAW_DIR, DESK_DIR, ATOMS_DIR, THREADS_DIR, SOURCES_DIR, BRIEFINGS_DIR, CHROMA_PATH, SIDECAR_DIR]:
+    for d in [RAW_DIR, INBOX_DIR, DESK_DIR, ATOMS_DIR, THREADS_DIR, SOURCES_DIR, BRIEFINGS_DIR, CHROMA_PATH, SIDECAR_DIR]:
         os.makedirs(d, exist_ok=True)
     os.makedirs(os.path.dirname(ARCHIVE_MANIFEST), exist_ok=True)
 
