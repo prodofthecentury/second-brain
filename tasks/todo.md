@@ -225,9 +225,9 @@ synchronized across both files.
 
 - [x] Implement default-deny per-host sharing rules (`host-sharing-policy.json`
   with DACL/`0600` and symlink guards), multi-project `all(...)` scope
-  containment, outbound credential blocking, PII scrubbing (including `## Claim`
-  PII exclusion on online hosts), DNS-pinned `https://...:443` transport, and
-  outbound audit logging (`scripts/host_adapters.py`).
+  containment, outbound credential blocking, wire-level PII placeholder
+  scrubbing with strict local claim rehydration, DNS-pinned `https://...:443`
+  transport, and outbound audit logging (`scripts/host_adapters.py`).
 - [x] Route all local (`ollama_local`, `owner_custom_local`) and online
   (`openai_online`, `anthropic_online`, `gemini_online`) draft generations
   through `scripts/answer_policy.py` across CLI, Dashboard, and Loopback API.

@@ -909,12 +909,13 @@ class MCPBoundaryTests(unittest.TestCase):
                 desk_dir = brain_dir / "1-desk"
                 atoms_dir = brain_dir / "2-atoms"
                 threads_dir = brain_dir / "3-threads"
+                experiences_dir = brain_dir / "4-experiences"
                 sources_dir = brain_dir / "sources"
                 briefings_dir = brain_dir / "briefings"
                 chroma_dir = brain_dir / ".chroma"
                 sidecar_dir = brain_dir / ".sidecar"
                 for d in (
-                    raw_dir, inbox_dir, desk_dir, atoms_dir, threads_dir,
+                    raw_dir, inbox_dir, desk_dir, atoms_dir, threads_dir, experiences_dir,
                     sources_dir, briefings_dir, chroma_dir, sidecar_dir,
                 ):
                     d.mkdir(parents=True, exist_ok=True)
@@ -1030,10 +1031,14 @@ class MCPBoundaryTests(unittest.TestCase):
                     stack.enter_context(patch.object(mod, "THREADS_DIR", str(threads_dir), create=True))
                     stack.enter_context(patch.object(mod, "BRIEFINGS_DIR", str(briefings_dir), create=True))
                 stack.enter_context(patch.object(config, "DESK_DIR", str(desk_dir)))
+                stack.enter_context(patch.object(config, "EXPERIENCES_DIR", str(experiences_dir)))
                 stack.enter_context(patch.object(config, "SOURCES_DIR", str(sources_dir)))
                 stack.enter_context(patch.object(config, "CHROMA_PATH", str(chroma_dir)))
                 stack.enter_context(patch.object(config, "SIDECAR_DIR", str(sidecar_dir)))
                 stack.enter_context(patch.object(config, "LEXICAL_INDEX_PATH", str(lexical_index_path)))
+                stack.enter_context(
+                    patch.object(config, "TELEMETRY_DB_PATH", str(sidecar_dir / "telemetry.sqlite3"))
+                )
                 stack.enter_context(
                     patch.object(config, "ARCHIVE_MANIFEST", str(raw_dir / "archive" / "manifest.jsonl"))
                 )
@@ -2349,6 +2354,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
             stack.enter_context(patch.object(doctor, "INBOX_DIR", str(raw_dir / "inbox")))
             stack.enter_context(patch.object(doctor, "ATOMS_DIR", str(vault_root / "2-atoms")))
             stack.enter_context(patch.object(doctor, "THREADS_DIR", str(vault_root / "3-threads")))
+            stack.enter_context(patch.object(doctor, "EXPERIENCES_DIR", str(vault_root / "4-experiences")))
             stack.enter_context(patch.object(doctor, "SOURCES_DIR", str(vault_root / "sources")))
             stack.enter_context(patch.object(doctor, "BRIEFINGS_DIR", str(vault_root / "briefings")))
             stack.enter_context(patch.object(doctor, "CHROMA_PATH", str(vault_root / ".chroma")))
@@ -2378,6 +2384,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "1-desk",
                 "2-atoms",
                 "3-threads",
+                "4-experiences",
                 "sources",
                 "briefings",
                 ".chroma",

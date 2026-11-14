@@ -22,6 +22,9 @@ from urllib.parse import urlsplit
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if __name__ in ("hardware_profile", "scripts.hardware_profile"):
+    sys.modules.setdefault("hardware_profile", sys.modules[__name__])
+    sys.modules.setdefault("scripts.hardware_profile", sys.modules[__name__])
 
 from config import EMBED_MODEL, GEN_MODEL
 
@@ -206,7 +209,7 @@ def probe_gpu(total_ram_gib: float) -> tuple[str, str, float]:
 def probe_ollama_models(
     host: str | float | None = None,
     timeout: float = 3.0,
-) -> tuple[bool, tuple[str, ...]]:
+) -> tuple[bool, list[str]]:
     if isinstance(host, (int, float)):
         timeout = float(host)
         raw_host = None
@@ -214,18 +217,16 @@ def probe_ollama_models(
         raw_host = host
     base = loopback_ollama_base_url(raw_host)
     if not base:
-        return (False, ())
+        return (False, [])
     payload = fetch_loopback_json(f"{base}/api/tags", timeout=timeout, max_bytes=65536)
     if not isinstance(payload, dict):
-        return (False, ())
-    names = tuple(
-        sorted(
-            {
-                str(item.get("name") or item.get("model"))
-                for item in payload.get("models", [])
-                if isinstance(item, dict) and (item.get("name") or item.get("model"))
-            }
-        )
+        return (False, [])
+    names = sorted(
+        {
+            str(item.get("name") or item.get("model"))
+            for item in payload.get("models", [])
+            if isinstance(item, dict) and (item.get("name") or item.get("model"))
+        }
     )
     return (True, names)
 
@@ -258,9 +259,10 @@ def classify_hardware_tier(
     gpu_name: str,
     vram_gib: float,
     ollama_reachable: bool,
-    installed_ollama_models: tuple[str, ...],
+    installed_ollama_models: tuple[str, ...] | list[str],
 ) -> HardwareCapabilityProfile:
     """Deterministically classify host hardware into one of four truthful capability tiers."""
+    installed_ollama_models = tuple(installed_ollama_models)
     if not ollama_reachable or (total_ram_gib > 0 and total_ram_gib < 6.0):
         reason = (
             "Ollama daemon is unreachable; operating in zero-model SQLite FTS5 lexical mode."

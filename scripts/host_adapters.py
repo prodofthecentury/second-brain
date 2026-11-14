@@ -27,6 +27,9 @@ from urllib.parse import quote as url_quote, urlsplit
 import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if __name__ in ("host_adapters", "scripts.host_adapters"):
+    sys.modules.setdefault("host_adapters", sys.modules[__name__])
+    sys.modules.setdefault("scripts.host_adapters", sys.modules[__name__])
 
 from answer_policy import (
     ANSWER_DRAFT_SCHEMA,
@@ -590,17 +593,6 @@ def filter_atoms_for_host(
                 bool(project_tags_match((tag,), normalized_allowed_projects))
                 for tag in project_tags
             ):
-                continue
-
-        if rule.fail_on_secret_detection or rule.redact_pii:
-            body_text = "\n".join(parsed[1])
-            claim_text = section_text(body_text, "Claim")
-            claim_scan = inspect_and_redact_outbound(
-                claim_text,
-                redact_pii=rule.redact_pii,
-                fail_on_secret_detection=rule.fail_on_secret_detection,
-            )
-            if rule.redact_pii and claim_scan.pii_redaction_count > 0:
                 continue
 
         eligible.append(record)
