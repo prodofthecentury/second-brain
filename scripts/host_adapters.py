@@ -1,0 +1,956 @@
+# /// script
+# requires-python = ">=3.11,<3.12"
+# dependencies = [
+#     "httpx>=0.28,<1",
+#     "ollama>=0.6,<1",
+# ]
+# ///
+"""Per-host local, online, and owner-built AI model adapters with explicit consent and outbound redaction."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import datetime
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+from urllib.parse import quote as url_quote, urlsplit
+
+import httpx
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from answer_policy import (
+    ANSWER_DRAFT_SCHEMA,
+    AnswerRequest,
+    AnswerResult,
+    NO_APPROVED_MEMORY_RESPONSE,
+    build_grounding_prompt,
+    validate_standard_answer,
+)
+from config import ATOMS_DIR, BRAIN_DIR, GEN_MODEL, _is_reparse_or_link
+from memory_format import split_frontmatter
+from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
+from ollama_scout import (
+    PinnedHTTPTransport,
+    ValidatedRemoteTarget,
+    _normalized_hostname,
+    is_public_ip_address,
+)
+from recall import normalize_project_tag, project_tags_match
+
+OUTBOUND_AUDIT_FILENAME = "outbound-host-audit.jsonl"
+MAX_POLICY_FILE_BYTES = 65536
+MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+_PII_PLACEHOLDER_TOKEN_RE = re.compile(r"\[REDACTED_PII:[a-z0-9_]+:\d+\]")
+_AUDIT_LOCK = threading.Lock()
+_CACHED_WINDOWS_USER: str | None = None
+
+# Deterministic secret & PII patterns for outbound context gating
+_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("anthropic_api_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
+    ("openai_api_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("github_pat", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("aws_sts_key", re.compile(r"\bASIA[0-9A-Z]{16}\b")),
+    ("jwt_token", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("huggingface_token", re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
+    ("stripe_live_key", re.compile(r"\b(?:sk|rk)_live_[0-9a-zA-Z]{24,}\b")),
+    ("url_basic_auth", re.compile(r"https?://[^/\s:@\"']+:[^/\s@\"']+@")),
+    ("private_key_pem", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
+    ("bearer_header_secret", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b")),
+)
+
+_PII_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("email_address", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+    ("ipv4_private", re.compile(r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b")),
+    ("ipv4_cgnat", re.compile(r"\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b")),
+    ("ipv4_link_local", re.compile(r"\b169\.254\.\d{1,3}\.\d{1,3}\b")),
+    ("ipv6_ula", re.compile(r"\bfd[0-9a-fA-F]{2}:[0-9a-fA-F:]+(?:\b|(?<=:)(?![0-9a-fA-F:]))")),
+    ("windows_user_path", re.compile(r"(?i)\b[A-Z]:(?:\\\\|\\)Users(?:\\\\|\\)[^\\\s\"']+")),
+    ("posix_home_path", re.compile(r"(?<![A-Za-z0-9._-])/(?:home|Users)/[^/\s\"']+")),
+)
+
+
+class HostConsentError(PermissionError):
+    """Raised when a target host lacks explicit owner sharing consent or violates scope rules."""
+
+
+class OutboundSecretBlockedError(PermissionError):
+    """Raised when outbound redaction detects high-risk credential material in payload."""
+
+
+@dataclass(frozen=True)
+class HostSharingRule:
+    host_id: str
+    provider: str  # "ollama" | "openai_compatible" | "anthropic" | "gemini"
+    transport: str  # "local" | "online"
+    endpoint_url: str
+    default_model: str
+    api_key_env: str | None = None
+    enabled: bool = False
+    allowed_projects: tuple[str, ...] = ()  # e.g. ("project:second_brain",) or ("*",)
+    allow_unscoped_atoms: bool = False
+    allow_preference_atoms: bool = False
+    redact_pii: bool = True
+    fail_on_secret_detection: bool = True
+
+
+@dataclass(frozen=True)
+class RedactionReport:
+    sanitized_text: str
+    secret_hits: tuple[str, ...]
+    pii_redaction_count: int
+
+
+def default_host_policy_path() -> Path:
+    override = (os.environ.get("BRAIN_HOST_POLICY_FILE") or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        base = Path(os.environ["LOCALAPPDATA"])
+    elif os.environ.get("XDG_STATE_HOME"):
+        base = Path(os.environ["XDG_STATE_HOME"]).expanduser()
+    else:
+        base = Path.home() / ".local" / "state"
+    return base / "SecondBrain" / "security" / "host-sharing-policy.json"
+
+
+def builtin_default_policies() -> dict[str, HostSharingRule]:
+    """Fail-closed defaults: only local loopback Ollama is enabled out of the box."""
+    raw_ollama = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip().rstrip("/")
+    ollama_url = raw_ollama if raw_ollama.startswith(("http://", "https://")) else f"http://{raw_ollama}"
+    return {
+        "ollama_local": HostSharingRule(
+            host_id="ollama_local",
+            provider="ollama",
+            transport="local",
+            endpoint_url=ollama_url,
+            default_model=GEN_MODEL,
+            api_key_env=None,
+            enabled=True,
+            allowed_projects=("*",),
+            allow_unscoped_atoms=True,
+            allow_preference_atoms=True,
+            redact_pii=False,
+            fail_on_secret_detection=False,
+        ),
+        "openai_online": HostSharingRule(
+            host_id="openai_online",
+            provider="openai_compatible",
+            transport="online",
+            endpoint_url="https://api.openai.com/v1",
+            default_model="gpt-4o-mini",
+            api_key_env="OPENAI_API_KEY",
+            enabled=False,
+            allowed_projects=(),
+            allow_unscoped_atoms=False,
+            allow_preference_atoms=False,
+            redact_pii=True,
+            fail_on_secret_detection=True,
+        ),
+        "anthropic_online": HostSharingRule(
+            host_id="anthropic_online",
+            provider="anthropic",
+            transport="online",
+            endpoint_url="https://api.anthropic.com/v1",
+            default_model="claude-3-5-haiku-latest",
+            api_key_env="ANTHROPIC_API_KEY",
+            enabled=False,
+            allowed_projects=(),
+            allow_unscoped_atoms=False,
+            allow_preference_atoms=False,
+            redact_pii=True,
+            fail_on_secret_detection=True,
+        ),
+        "gemini_online": HostSharingRule(
+            host_id="gemini_online",
+            provider="gemini",
+            transport="online",
+            endpoint_url="https://generativelanguage.googleapis.com/v1beta",
+            default_model="gemini-2.5-flash",
+            api_key_env="GEMINI_API_KEY",
+            enabled=False,
+            allowed_projects=(),
+            allow_unscoped_atoms=False,
+            allow_preference_atoms=False,
+            redact_pii=True,
+            fail_on_secret_detection=True,
+        ),
+        "owner_custom_local": HostSharingRule(
+            host_id="owner_custom_local",
+            provider="openai_compatible",
+            transport="local",
+            endpoint_url="http://127.0.0.1:8080/v1",
+            default_model="local-model",
+            api_key_env="CUSTOM_HOST_API_KEY",
+            enabled=False,
+            allowed_projects=("*",),
+            allow_unscoped_atoms=True,
+            allow_preference_atoms=False,
+            redact_pii=False,
+            fail_on_secret_detection=True,
+        ),
+    }
+
+
+def _current_windows_principal() -> str | None:
+    global _CACHED_WINDOWS_USER
+    if _CACHED_WINDOWS_USER is not None:
+        return _CACHED_WINDOWS_USER or None
+    try:
+        proc = subprocess.run(
+            ["whoami"],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+        user = proc.stdout.strip()
+        _CACHED_WINDOWS_USER = user if proc.returncode == 0 and user else ""
+    except Exception:
+        _CACHED_WINDOWS_USER = ""
+    return _CACHED_WINDOWS_USER or None
+
+
+def restrict_security_file_permissions(path: Path) -> None:
+    """Enforce owner-only permissions on POSIX (0o700/0o600) and Windows NTFS DACLs."""
+    try:
+        if os.name != "nt":
+            os.chmod(path.parent, 0o700)
+            os.chmod(path, 0o600)
+            return
+        icacls_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
+        if not os.path.exists(icacls_exe):
+            return
+        principal = _current_windows_principal()
+        if not principal:
+            return
+        subprocess.run(
+            [
+                icacls_exe,
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(F)",
+                "*S-1-5-32-544:(F)",
+                f"{principal}:(F)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except OSError:
+        pass
+
+
+def read_bounded_security_file(path: Path, *, max_bytes: int = MAX_POLICY_FILE_BYTES) -> str:
+    """Read a security config/token file safely, rejecting symlinks/reparse points and oversized files."""
+    if os.path.lexists(str(path)) and _is_reparse_or_link(str(path)):
+        raise PermissionError(f"Refusing to read security file via symlink or reparse point: {path}")
+    if os.path.lexists(str(path.parent)) and _is_reparse_or_link(str(path.parent)):
+        raise PermissionError(f"Refusing to read security file under symlinked directory: {path.parent}")
+    stat_info = path.stat()
+    if stat_info.st_size > max_bytes:
+        raise PermissionError(f"Security file exceeds maximum allowed size ({max_bytes} bytes): {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def validate_model_identifier(model: str, *, provider: str | None = None) -> str:
+    """Validate model identifier against URL/path injection and control characters."""
+    cleaned = str(model or "").strip()
+    if (
+        not cleaned
+        or ".." in cleaned
+        or cleaned.startswith("/")
+        or any(ch in cleaned for ch in ("?", "#", "%", "\\"))
+        or not MODEL_ID_PATTERN.fullmatch(cleaned)
+    ):
+        raise ValueError(f"Invalid or unsafe model identifier: {model!r}")
+    if provider == "gemini" and ("/" in cleaned or ":" in cleaned):
+        raise ValueError(f"Invalid Gemini model identifier (path/action separators forbidden): {model!r}")
+    return cleaned
+
+
+def load_host_policies(policy_path: Path | None = None) -> dict[str, HostSharingRule]:
+    policies = builtin_default_policies()
+    target = policy_path or default_host_policy_path()
+    if not os.path.lexists(str(target)):
+        return policies
+    raw = json.loads(read_bounded_security_file(target, max_bytes=MAX_POLICY_FILE_BYTES))
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1 or not isinstance(raw.get("hosts"), dict):
+        raise ValueError(f"Invalid host sharing policy schema in {target}")
+    for host_id, entry in raw["hosts"].items():
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider", "")).strip()
+        transport = str(entry.get("transport", "")).strip()
+        if provider not in {"ollama", "openai_compatible", "anthropic", "gemini"}:
+            raise ValueError(f"Unsupported provider '{provider}' for host '{host_id}'")
+        if transport not in {"local", "online"}:
+            raise ValueError(f"Unsupported transport '{transport}' for host '{host_id}'")
+        default_model = validate_model_identifier(str(entry.get("default_model", "")).strip(), provider=provider)
+        policies[host_id] = HostSharingRule(
+            host_id=host_id,
+            provider=provider,
+            transport=transport,
+            endpoint_url=str(entry.get("endpoint_url", "")).strip().rstrip("/"),
+            default_model=default_model,
+            api_key_env=str(entry["api_key_env"]).strip() if entry.get("api_key_env") else None,
+            enabled=bool(entry.get("enabled", False)),
+            allowed_projects=tuple(str(p).strip() for p in entry.get("allowed_projects", []) if str(p).strip()),
+            allow_unscoped_atoms=bool(entry.get("allow_unscoped_atoms", False)),
+            allow_preference_atoms=bool(entry.get("allow_preference_atoms", False)),
+            redact_pii=True if transport == "online" else bool(entry.get("redact_pii", False)),
+            fail_on_secret_detection=True if transport == "online" else bool(entry.get("fail_on_secret_detection", True)),
+        )
+    return policies
+
+
+def save_host_policies(policies: dict[str, HostSharingRule], policy_path: Path | None = None) -> Path:
+    target = (policy_path or default_host_policy_path()).expanduser().resolve()
+    if os.path.lexists(str(target)) and _is_reparse_or_link(str(target)):
+        raise PermissionError(f"Refusing to overwrite symlinked policy file: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if _is_reparse_or_link(str(target.parent)):
+        raise PermissionError(f"Refusing to write policy under symlinked directory: {target.parent}")
+    payload = {
+        "schema_version": 1,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "hosts": {
+            hid: {
+                **asdict(rule),
+                "allowed_projects": list(rule.allowed_projects),
+            }
+            for hid, rule in sorted(policies.items())
+        },
+    }
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".host-policy-", suffix=".tmp")
+    fd_closed = False
+    try:
+        if os.name != "nt":
+            os.chmod(tmp_name, 0o600)
+        encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        if os.write(fd, encoded) != len(encoded):
+            raise OSError("Incomplete host policy write.")
+        os.fsync(fd)
+        os.close(fd)
+        fd_closed = True
+        os.replace(tmp_name, target)
+        restrict_security_file_permissions(target)
+    finally:
+        if not fd_closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if os.path.exists(tmp_name):
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+    return target
+
+
+def inspect_and_redact_outbound(
+    text: str,
+    *,
+    redact_pii: bool = True,
+    fail_on_secret_detection: bool = True,
+) -> RedactionReport:
+    """Scan outbound text for credentials and PII before any external transmission."""
+    secret_hits: list[str] = []
+    working = text
+    for name, pattern in _SECRET_PATTERNS:
+        if pattern.search(working):
+            secret_hits.append(name)
+            working = pattern.sub(f"[REDACTED_SECRET:{name}]", working)
+
+    if secret_hits and fail_on_secret_detection:
+        raise OutboundSecretBlockedError(
+            f"Outbound transmission blocked: detected credential pattern(s) {secret_hits} in prompt payload."
+        )
+
+    pii_count = 0
+    if redact_pii:
+        for name, pattern in _PII_PATTERNS:
+            working, count = pattern.subn(f"[REDACTED_PII:{name}]", working)
+            pii_count += count
+
+    return RedactionReport(
+        sanitized_text=working,
+        secret_hits=tuple(secret_hits),
+        pii_redaction_count=pii_count,
+    )
+
+
+def _redact_outbound_with_map(
+    text: str,
+    *,
+    redact_pii: bool = True,
+    fail_on_secret_detection: bool = True,
+) -> tuple[RedactionReport, dict[str, str]]:
+    """Scan outbound text and emit deterministic per-call PII placeholders with a local-only rehydration map."""
+    secret_hits: list[str] = []
+    working = text
+    for name, pattern in _SECRET_PATTERNS:
+        if pattern.search(working):
+            secret_hits.append(name)
+            working = pattern.sub(f"[REDACTED_SECRET:{name}]", working)
+
+    if secret_hits and fail_on_secret_detection:
+        raise OutboundSecretBlockedError(
+            f"Outbound transmission blocked: detected credential pattern(s) {secret_hits} in prompt payload."
+        )
+
+    pii_count = 0
+    placeholder_to_original: dict[str, str] = {}
+    value_to_placeholder: dict[tuple[str, str], str] = {}
+    next_index = 1
+    if redact_pii:
+        for name, pattern in _PII_PATTERNS:
+            def _replace_match(match: re.Match[str], kind: str = name) -> str:
+                nonlocal pii_count, next_index
+                pii_count += 1
+                raw_val = match.group(0)
+                canonical_val = raw_val.replace("\\\\", "\\") if kind == "windows_user_path" else raw_val
+                key = (kind, canonical_val)
+                placeholder = value_to_placeholder.get(key)
+                if placeholder is None:
+                    placeholder = f"[REDACTED_PII:{kind}:{next_index}]"
+                    next_index += 1
+                    value_to_placeholder[key] = placeholder
+                    placeholder_to_original[placeholder] = canonical_val
+                return placeholder
+
+            working = pattern.sub(_replace_match, working)
+
+    return (
+        RedactionReport(
+            sanitized_text=working,
+            secret_hits=tuple(secret_hits),
+            pii_redaction_count=pii_count,
+        ),
+        placeholder_to_original,
+    )
+
+
+def _rehydrate_draft_claims(draft_json: str, placeholder_map: dict[str, str]) -> str:
+    """Replace exact per-call PII placeholder tokens inside parsed draft claims locally before grounding validation."""
+    if not placeholder_map or not isinstance(draft_json, str) or len(draft_json) > 128_000:
+        return draft_json
+    try:
+        payload = json.loads(draft_json)
+    except (TypeError, json.JSONDecodeError):
+        return draft_json
+    if not isinstance(payload, dict) or not isinstance(payload.get("claims"), list):
+        return draft_json
+
+    changed = False
+    rehydrated_claims: list[object] = []
+    for item in payload["claims"]:
+        if isinstance(item, str) and "[REDACTED_PII:" in item:
+            updated = _PII_PLACEHOLDER_TOKEN_RE.sub(
+                lambda m: placeholder_map.get(m.group(0), m.group(0)),
+                item,
+            )
+            if updated != item:
+                changed = True
+            rehydrated_claims.append(updated)
+        else:
+            rehydrated_claims.append(item)
+    if not changed:
+        return draft_json
+    return json.dumps({**payload, "claims": rehydrated_claims}, ensure_ascii=False)
+
+
+def validate_endpoint_network_boundary(rule: HostSharingRule) -> ValidatedRemoteTarget | None:
+    """Enforce strict 127.0.0.1 loopback for local hosts and DNS-pinned HTTPS:443 public IPs for online hosts."""
+    try:
+        parsed = urlsplit(str(rule.endpoint_url or "").strip())
+    except ValueError as exc:
+        raise HostConsentError(f"Host '{rule.host_id}' has an invalid endpoint URL: {exc}") from exc
+
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise HostConsentError(
+            f"Host '{rule.host_id}' has an invalid or credential-bearing endpoint URL: {rule.endpoint_url!r}"
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise HostConsentError(f"Host '{rule.host_id}' has an invalid port: {exc}") from exc
+
+    if rule.transport == "local":
+        if parsed.scheme != "http" or hostname != "127.0.0.1":
+            raise HostConsentError(
+                f"Local host '{rule.host_id}' must bind strictly to http://127.0.0.1 (got {rule.endpoint_url!r})."
+            )
+        return None
+
+    # Online host: require HTTPS on port 443 and strictly public, DNS-pinned IP answers
+    if parsed.scheme != "https":
+        raise HostConsentError(
+            f"Online host '{rule.host_id}' must use HTTPS transport (got {rule.endpoint_url!r})."
+        )
+    if port is not None and port != 443:
+        raise HostConsentError(
+            f"Online host '{rule.host_id}' must use standard HTTPS port 443 (got port {port})."
+        )
+    effective_port = 443
+    try:
+        addr_infos = socket.getaddrinfo(hostname, effective_port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise HostConsentError(f"DNS resolution failed for online host '{hostname}': {exc}") from exc
+    if not addr_infos:
+        raise HostConsentError(f"DNS resolution returned no addresses for '{hostname}'.")
+
+    pinned_addresses: list[str] = []
+    for info in addr_infos:
+        ip_str = info[4][0]
+        try:
+            if not is_public_ip_address(str(ip_str)):
+                raise HostConsentError(
+                    f"SSRF blocked: online host '{hostname}' resolved to non-public IP {ip_str}."
+                )
+            normalized_ip = str(ipaddress.ip_address(str(ip_str)))
+        except ValueError as exc:
+            raise HostConsentError(
+                f"Invalid IP address '{ip_str}' resolved for online host '{hostname}': {exc}"
+            ) from exc
+        if normalized_ip not in pinned_addresses:
+            pinned_addresses.append(normalized_ip)
+    if not pinned_addresses:
+        raise HostConsentError(f"DNS resolution returned no public addresses for '{hostname}'.")
+
+    return ValidatedRemoteTarget(
+        url=rule.endpoint_url.rstrip("/"),
+        hostname=_normalized_hostname(hostname),
+        port=effective_port,
+        addresses=tuple(pinned_addresses),
+    )
+
+
+def filter_atoms_for_host(
+    retrieved_atoms: list,
+    rule: HostSharingRule,
+    *,
+    mode: str | None = None,
+) -> list:
+    """Filter retrieved atoms strictly to scopes and epistemic contracts permitted for this host."""
+    eligible = []
+    allow_all_projects = any(str(p).strip() == "*" for p in rule.allowed_projects)
+    normalized_allowed_projects = tuple(
+        norm
+        for p in rule.allowed_projects
+        if str(p).strip() and str(p).strip() != "*"
+        for norm in (normalize_project_tag(p),)
+        if norm
+    )
+
+    for record in retrieved_atoms or []:
+        content = record.get("content") if isinstance(record, dict) else getattr(record, "content", "")
+        if not isinstance(content, str):
+            continue
+        parsed = split_frontmatter(content)
+        if parsed is None:
+            continue
+        fm = parse_frontmatter_values(parsed[0])
+        epistemic_label = str(fm.get("epistemic_label", "claim"))
+        is_pref = epistemic_label == "preference" or bool(fm.get("epistemic_contract"))
+        if is_pref and not rule.allow_preference_atoms:
+            continue
+        if mode == "preference" and not is_pref:
+            continue
+        if mode == "standard" and is_pref:
+            continue
+
+        contexts_raw = fm.get("contexts") or []
+        if isinstance(contexts_raw, str):
+            contexts_raw = parse_scalar_list(contexts_raw)
+        project_tags = [str(c).strip() for c in contexts_raw if str(c).strip().lower().startswith("project:")]
+
+        if not project_tags:
+            if not rule.allow_unscoped_atoms:
+                continue
+        elif not allow_all_projects:
+            # Multi-project containment invariant: EVERY project tag on the atom must be permitted.
+            if not normalized_allowed_projects or not all(
+                bool(project_tags_match((tag,), normalized_allowed_projects))
+                for tag in project_tags
+            ):
+                continue
+
+        if rule.fail_on_secret_detection or rule.redact_pii:
+            body_text = "\n".join(parsed[1])
+            claim_text = section_text(body_text, "Claim")
+            claim_scan = inspect_and_redact_outbound(
+                claim_text,
+                redact_pii=rule.redact_pii,
+                fail_on_secret_detection=rule.fail_on_secret_detection,
+            )
+            if rule.redact_pii and claim_scan.pii_redaction_count > 0:
+                continue
+
+        eligible.append(record)
+    return eligible
+
+
+def _audit_outbound_call(
+    *,
+    brain_dir: str,
+    rule: HostSharingRule,
+    model: str,
+    atom_ids: list[str],
+    pii_redactions: int,
+    outcome: str,
+) -> None:
+    audit_path = os.path.join(brain_dir, ".sidecar", OUTBOUND_AUDIT_FILENAME)
+    record = {
+        "schema_version": 1,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "host_id": rule.host_id,
+        "provider": rule.provider,
+        "transport": rule.transport,
+        "model": model,
+        "shared_atom_count": len(atom_ids),
+        "shared_atom_ids": atom_ids,
+        "pii_redaction_count": pii_redactions,
+        "outcome": outcome,
+    }
+    line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    with _AUDIT_LOCK:
+        os.makedirs(os.path.dirname(audit_path), exist_ok=True)
+        if os.path.lexists(audit_path) and _is_reparse_or_link(audit_path):
+            raise PermissionError("Refusing to write outbound audit log through a symlink or reparse point.")
+        fd = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            if os.write(fd, line) != len(line):
+                raise OSError("Incomplete write to outbound host audit log.")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _invoke_provider_draft(
+    rule: HostSharingRule,
+    *,
+    model: str,
+    prompt: str,
+    timeout_s: float = 45.0,
+    http_transport: httpx.BaseTransport | None = None,
+    pinned_target: ValidatedRemoteTarget | None = None,
+) -> str:
+    """Invoke the configured model endpoint and return raw structured JSON text."""
+    safe_model = validate_model_identifier(model, provider=rule.provider)
+    if rule.provider == "ollama":
+        import ollama
+
+        client = ollama.Client(host=rule.endpoint_url)
+        resp = client.chat(
+            model=safe_model,
+            messages=[{"role": "user", "content": prompt}],
+            format=ANSWER_DRAFT_SCHEMA,
+            options={"temperature": 0},
+        )
+        return str(resp["message"]["content"])
+
+    api_key = ""
+    if rule.api_key_env:
+        api_key = (os.environ.get(rule.api_key_env) or "").strip()
+    if rule.transport == "online" and not api_key:
+        raise HostConsentError(
+            f"Missing API credential in environment variable '{rule.api_key_env}' for online host '{rule.host_id}'."
+        )
+
+    owned_pinned_transport: PinnedHTTPTransport | None = None
+    effective_transport = http_transport
+    if effective_transport is None and rule.transport == "online":
+        resolved_target = pinned_target if pinned_target is not None else validate_endpoint_network_boundary(rule)
+        if resolved_target is not None:
+            owned_pinned_transport = PinnedHTTPTransport(resolved_target)
+            effective_transport = owned_pinned_transport
+
+    client_kwargs: dict[str, object] = {
+        "timeout": timeout_s,
+        "follow_redirects": False,
+        "trust_env": False,
+    }
+    if effective_transport is not None:
+        client_kwargs["transport"] = effective_transport
+
+    client_entered = False
+    try:
+        with httpx.Client(**client_kwargs) as client:
+            client_entered = True
+            if rule.provider == "openai_compatible":
+                headers = {"Content-Type": "application/json"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                body = {
+                    "model": safe_model,
+                    "temperature": 0,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "grounded_claim_draft",
+                            "strict": True,
+                            "schema": ANSWER_DRAFT_SCHEMA,
+                        },
+                    },
+                }
+                resp = client.post(f"{rule.endpoint_url}/chat/completions", headers=headers, json=body)
+                resp.raise_for_status()
+                data = resp.json()
+                return str(data["choices"][0]["message"]["content"])
+
+            if rule.provider == "anthropic":
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                }
+                body = {
+                    "model": safe_model,
+                    "max_tokens": 1024,
+                    "temperature": 0,
+                    "tools": [
+                        {
+                            "name": "emit_grounded_claims",
+                            "description": "Emit exact verbatim claim strings supported by retrieved atoms.",
+                            "input_schema": ANSWER_DRAFT_SCHEMA,
+                        }
+                    ],
+                    "tool_choice": {"type": "tool", "name": "emit_grounded_claims"},
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                resp = client.post(f"{rule.endpoint_url}/messages", headers=headers, json=body)
+                resp.raise_for_status()
+                data = resp.json()
+                for block in data.get("content", []):
+                    if block.get("type") == "tool_use" and block.get("name") == "emit_grounded_claims":
+                        return json.dumps(block.get("input", {"claims": []}))
+                return '{"claims":[]}'
+
+            if rule.provider == "gemini":
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": api_key,
+                }
+                body = {
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "responseMimeType": "application/json",
+                        "responseSchema": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "claims": {
+                                    "type": "ARRAY",
+                                    "items": {"type": "STRING"},
+                                }
+                            },
+                            "required": ["claims"],
+                        },
+                    },
+                }
+                encoded_model = url_quote(safe_model, safe="._-")
+                resp = client.post(
+                    f"{rule.endpoint_url}/models/{encoded_model}:generateContent",
+                    headers=headers,
+                    json=body,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                parts = data["candidates"][0]["content"]["parts"]
+                return str(parts[0]["text"])
+    finally:
+        if owned_pinned_transport is not None and not client_entered:
+            owned_pinned_transport.close()
+
+    raise ValueError(f"Unsupported provider: {rule.provider}")
+
+
+def generate_grounded_answer_via_host(
+    request: AnswerRequest,
+    retrieved_atoms: list,
+    *,
+    host_id: str = "ollama_local",
+    model_override: str | None = None,
+    atoms_dir: str = ATOMS_DIR,
+    brain_dir: str = BRAIN_DIR,
+    policy_path: Path | None = None,
+    http_transport: httpx.BaseTransport | None = None,
+    skip_dns_check_for_mock_transport: bool = False,
+) -> AnswerResult:
+    """Execute consent check, scope filter, outbound redaction, DNS-pinned model call, and out-of-model grounding."""
+    policies = load_host_policies(policy_path)
+    if host_id not in policies:
+        raise HostConsentError(f"Unknown AI host '{host_id}'. Configure it in host-sharing-policy.json first.")
+    rule = policies[host_id]
+    if not rule.enabled:
+        raise HostConsentError(
+            f"Host '{host_id}' ({rule.transport}) is disabled by default. "
+            "Explicit owner opt-in is required before sharing vault context."
+        )
+    if request.mode == "preference" and not rule.allow_preference_atoms:
+        raise HostConsentError(
+            f"Host '{host_id}' is not authorized to receive owner subjective preference memories."
+        )
+
+    chosen_model = validate_model_identifier(
+        (model_override or "").strip() or rule.default_model,
+        provider=rule.provider,
+    )
+
+    pinned_target: ValidatedRemoteTarget | None = None
+    if not (http_transport is not None and skip_dns_check_for_mock_transport):
+        pinned_target = validate_endpoint_network_boundary(rule)
+
+    scoped_atoms = filter_atoms_for_host(retrieved_atoms, rule, mode=request.mode)
+    if not scoped_atoms:
+        return AnswerResult(False, NO_APPROVED_MEMORY_RESPONSE, reason="No eligible approved atoms permitted for this host.")
+
+    raw_prompt = build_grounding_prompt(request, scoped_atoms)
+    redaction, pii_placeholder_map = _redact_outbound_with_map(
+        raw_prompt,
+        redact_pii=rule.redact_pii,
+        fail_on_secret_detection=rule.fail_on_secret_detection,
+    )
+
+    atom_ids = [
+        str(r.get("filename") if isinstance(r, dict) else getattr(r, "filename", ""))
+        for r in scoped_atoms
+    ]
+
+    try:
+        draft_json = _invoke_provider_draft(
+            rule,
+            model=chosen_model,
+            prompt=redaction.sanitized_text,
+            http_transport=http_transport,
+            pinned_target=pinned_target,
+        )
+    except Exception:
+        _audit_outbound_call(
+            brain_dir=brain_dir,
+            rule=rule,
+            model=chosen_model,
+            atom_ids=atom_ids,
+            pii_redactions=redaction.pii_redaction_count,
+            outcome="transport_error",
+        )
+        raise
+
+    rehydrated_draft_json = _rehydrate_draft_claims(draft_json, pii_placeholder_map)
+    result = validate_standard_answer(
+        rehydrated_draft_json,
+        scoped_atoms,
+        atoms_dir=atoms_dir,
+        mode=request.mode,
+    )
+    _audit_outbound_call(
+        brain_dir=brain_dir,
+        rule=rule,
+        model=chosen_model,
+        atom_ids=atom_ids,
+        pii_redactions=redaction.pii_redaction_count,
+        outcome="grounded_answer" if result.answerable else "abstained",
+    )
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Inspect and manage per-host AI sharing policies.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    list_p = sub.add_parser("list", help="List configured AI host sharing rules.")
+    list_p.add_argument("--json", action="store_true")
+
+    grant_p = sub.add_parser("configure", help="Enable or update a host sharing policy.")
+    grant_p.add_argument("host_id")
+    grant_p.add_argument("--enable", action="store_true")
+    grant_p.add_argument("--disable", action="store_true")
+    grant_p.add_argument("--allow-project", action="append", default=[], help="Allow project:<id> (or '*' for all).")
+    grant_p.add_argument("--clear-projects", action="store_true", help="Clear all allowed project scopes.")
+    grant_p.add_argument("--allow-unscoped", action=argparse.BooleanOptionalAction, default=None)
+    grant_p.add_argument("--allow-preferences", action=argparse.BooleanOptionalAction, default=None)
+    grant_p.add_argument("--endpoint-url")
+    grant_p.add_argument("--default-model")
+
+    args = parser.parse_args(argv)
+    policies = load_host_policies()
+
+    if args.command == "list":
+        if args.json:
+            out = {k: {**asdict(v), "allowed_projects": list(v.allowed_projects)} for k, v in sorted(policies.items())}
+            print(json.dumps(out, indent=2, sort_keys=True))
+        else:
+            for hid, rule in sorted(policies.items()):
+                state = "ENABLED " if rule.enabled else "DISABLED"
+                scopes = ",".join(rule.allowed_projects) if rule.allowed_projects else "(none)"
+                print(f"[{state}] {hid:20} | {rule.transport:6} | {rule.provider:17} | model={rule.default_model:22} | scopes={scopes}")
+        return 0
+
+    if args.command == "configure":
+        if args.host_id not in policies:
+            print(f"Unknown host_id '{args.host_id}'. Available: {', '.join(sorted(policies))}", file=sys.stderr)
+            return 1
+        if args.enable and args.disable:
+            print("Cannot specify both --enable and --disable.", file=sys.stderr)
+            return 1
+        cur = policies[args.host_id]
+        enabled = True if args.enable else (False if args.disable else cur.enabled)
+        if args.clear_projects:
+            projects = tuple(
+                "*" if str(p).strip() == "*" else normalize_project_tag(p)
+                for p in args.allow_project
+                if str(p).strip()
+            )
+        elif args.allow_project:
+            projects = tuple(
+                "*" if str(p).strip() == "*" else normalize_project_tag(p)
+                for p in args.allow_project
+                if str(p).strip()
+            )
+        else:
+            projects = cur.allowed_projects
+        new_model = validate_model_identifier(args.default_model or cur.default_model, provider=cur.provider)
+        updated = HostSharingRule(
+            host_id=cur.host_id,
+            provider=cur.provider,
+            transport=cur.transport,
+            endpoint_url=(args.endpoint_url or cur.endpoint_url).rstrip("/"),
+            default_model=new_model,
+            api_key_env=cur.api_key_env,
+            enabled=enabled,
+            allowed_projects=projects,
+            allow_unscoped_atoms=cur.allow_unscoped_atoms if args.allow_unscoped is None else bool(args.allow_unscoped),
+            allow_preference_atoms=cur.allow_preference_atoms if args.allow_preferences is None else bool(args.allow_preferences),
+            redact_pii=True if cur.transport == "online" else cur.redact_pii,
+            fail_on_secret_detection=True if cur.transport == "online" else cur.fail_on_secret_detection,
+        )
+        if updated.enabled or args.endpoint_url is not None:
+            validate_endpoint_network_boundary(updated)
+        policies[args.host_id] = updated
+        saved_path = save_host_policies(policies)
+        print(f"Saved updated policy for '{args.host_id}' to {saved_path}")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

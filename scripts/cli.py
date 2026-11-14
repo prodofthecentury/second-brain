@@ -49,6 +49,19 @@ def _capability(module: str) -> bool:
     return importlib.util.find_spec(module) is not None
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "HTTP redirects are forbidden on loopback probes", headers, fp)
+
+
+def _ollama_tags_url(raw_host: str | None = None) -> str | None:
+    """Validate that OLLAMA_HOST targets strictly http://127.0.0.1 or http://[::1] and return /api/tags URL."""
+    from scripts.hardware_profile import loopback_ollama_base_url
+
+    base = loopback_ollama_base_url(raw_host)
+    return f"{base}/api/tags" if base else None
+
+
 def doctor() -> int:
     """Report runtime capabilities and locally reachable model services."""
     from scripts.doctor import gpu_driver_status, native_cpp_runtime_status, system_memory_summary
@@ -61,6 +74,16 @@ def doctor() -> int:
     cpp_ok, cpp_detail = native_cpp_runtime_status()
     print(f"C++ runtime: {'ready' if cpp_ok else 'missing'} ({cpp_detail})")
     print(f"Compute device: {gpu_driver_status()}")
+    try:
+        from scripts.hardware_profile import detect_hardware_profile
+
+        hw = detect_hardware_profile(ollama_timeout=2.0)
+        print(
+            f"Capability tier: {hw.tier_label} "
+            f"(recommended={hw.recommended_generation_model}, selected={hw.selected_installed_generation_model or 'none'})"
+        )
+    except Exception:
+        pass
     capabilities = {
         "lexical_search_engine": True,
         "online_model_adapter": _capability("ollama"),
@@ -89,10 +112,14 @@ def doctor() -> int:
     lexical_ready = lexical_index_is_current(_config.ATOMS_DIR, _config.LEXICAL_INDEX_PATH)
     print(f"Lexical index: {'current' if lexical_ready else 'missing or stale'}")
     try:
-        raw_host = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip().rstrip("/")
-        ollama_base = raw_host if raw_host.startswith(("http://", "https://")) else f"http://{raw_host}"
-        with urllib.request.urlopen(f"{ollama_base}/api/tags", timeout=5.0) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        tags_url = _ollama_tags_url()
+        if not tags_url:
+            raise urllib.error.URLError("OLLAMA_HOST must target http://127.0.0.1 or http://[::1]")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+        with opener.open(tags_url, timeout=5.0) as response:
+            payload = json.loads(response.read(65536).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise urllib.error.URLError("Ollama /api/tags unavailable")
         models = sorted(item.get("name", item.get("model", "unknown")) for item in payload.get("models", []))
         print(f"Ollama service: ready ({len(models)} model(s))")
         print(f"Ollama models: {', '.join(models) if models else 'none installed'}")
@@ -191,17 +218,92 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("dashboard", help="Start the local password-protected dashboard.")
     install_parser = subparsers.add_parser("install", help="Initialize the vault and model-free lexical index.")
     install_parser.add_argument("--no-index", action="store_true", help="Only create the vault folders.")
-    args = parser.parse_args(argv)
+
+    profile_parser = subparsers.add_parser("profile", help="Inspect host hardware tier and model recommendations.")
+    profile_parser.add_argument("--json", action="store_true", help="Output structured JSON hardware profile.")
+
+    serve_parser = subparsers.add_parser("serve", help="Start the loopback 127.0.0.1 HTTP JSON Memory API.")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="Loopback bind host (must be 127.0.0.1).")
+    serve_parser.add_argument("--port", type=int, default=8765, help="Loopback TCP port (default 8765).")
+    serve_parser.add_argument("--generate-token", action="store_true", help="Generate a 256-bit API bearer token and exit.")
+
+    adapter_parser = subparsers.add_parser("adapter-config", help="Print IDE and custom host adapter configuration JSON.")
+    adapter_parser.add_argument("--port", type=int, default=8765, help="Loopback API TCP port (default 8765).")
+
+    inbox_parser = subparsers.add_parser(
+        "inbox",
+        help="Inspect, promote, or reject quarantined 0-raw/inbox captures.",
+        add_help=False,
+    )
+    inbox_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
+
+    hosts_parser = subparsers.add_parser(
+        "hosts",
+        help="Inspect and configure per-host AI sharing consent policies.",
+        add_help=False,
+    )
+    hosts_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
+
+    cognitive_parser = subparsers.add_parser(
+        "cognitive",
+        help="Generate memory fitness reports, record feedback, and log experiences.",
+        add_help=False,
+    )
+    cognitive_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
+
+    args, remainder = parser.parse_known_args(argv)
     if args.command == "doctor":
+        if remainder:
+            parser.error(f"unrecognized arguments: {' '.join(remainder)}")
         return doctor()
     if args.command == "dashboard":
+        if remainder:
+            parser.error(f"unrecognized arguments: {' '.join(remainder)}")
         return launch_dashboard()
     if args.command == "install":
+        if remainder:
+            parser.error(f"unrecognized arguments: {' '.join(remainder)}")
         if args.no_index:
             ensure_dirs()
             print(f"Created/verified vault at {BRAIN_DIR}")
             return 0
         return install(args)
+    if args.command == "profile":
+        if remainder:
+            parser.error(f"unrecognized arguments: {' '.join(remainder)}")
+        from scripts.hardware_profile import main as profile_main
+
+        return profile_main(["--json"] if args.json else [])
+    if args.command == "serve":
+        if remainder:
+            parser.error(f"unrecognized arguments: {' '.join(remainder)}")
+        from scripts.memory_api import main as api_main
+
+        api_argv = ["--host", args.host, "--port", str(args.port)]
+        if args.generate_token:
+            api_argv.append("--generate-token")
+        return api_main(api_argv)
+    if args.command == "adapter-config":
+        if remainder:
+            parser.error(f"unrecognized arguments: {' '.join(remainder)}")
+        from scripts.memory_api import main as api_main
+
+        return api_main(["--port", str(args.port), "--print-adapter-config"])
+    if args.command in {"inbox", "hosts", "cognitive"}:
+        forwarded = list(getattr(args, "sub_argv", []) or []) + list(remainder)
+        if forwarded[:1] == ["--"]:
+            forwarded = forwarded[1:]
+        if args.command == "inbox":
+            from scripts.inbox_workflow import main as inbox_main
+
+            return inbox_main(forwarded)
+        if args.command == "hosts":
+            from scripts.host_adapters import main as hosts_main
+
+            return hosts_main(forwarded)
+        from scripts.cognitive_core import main as cognitive_main
+
+        return cognitive_main(forwarded)
     return 2
 
 

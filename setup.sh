@@ -190,6 +190,7 @@ elif [ "${CPP_FOUND}" -eq 1 ] && [ "${OLLAMA_REACHABLE}" -eq 1 ] && printf '%s' 
 fi
 
 echo "=== Running Environment & Health Verification ==="
+"${UV_EXE}" run --frozen second-brain profile
 "${UV_EXE}" run --frozen second-brain doctor
 "${UV_EXE}" run --frozen python scripts/doctor.py
 

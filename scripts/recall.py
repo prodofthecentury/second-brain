@@ -14,6 +14,7 @@ Markdown memory metadata before callers inject those memories into chat.
 
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass, field, replace
 import hashlib
 import math
@@ -95,26 +96,26 @@ class RecallOptions:
     retrieval_mode: str = "auto"  # 'auto', 'rrf', 'lexical', 'dense'
 
 
-_LAST_DEGRADATION_WARNING: str | None = None
+_LAST_DEGRADATION_WARNING: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "last_degradation_warning", default=None
+)
 
 
 def emit_degradation_warning(reason: str) -> str:
     """Emit an explicit warning banner when dense retrieval degrades to FTS5 lexical search."""
-    global _LAST_DEGRADATION_WARNING
     banner = (
         f"[WARNING] Dense embedding service unavailable ({reason}); "
         "dynamically degraded to FTS5 lexical retrieval."
     )
-    _LAST_DEGRADATION_WARNING = banner
+    _LAST_DEGRADATION_WARNING.set(banner)
     print(banner, file=sys.stderr)
     return banner
 
 
 def consume_last_degradation_warning() -> str | None:
-    """Return and clear the most recent degradation warning banner, if any."""
-    global _LAST_DEGRADATION_WARNING
-    warning = _LAST_DEGRADATION_WARNING
-    _LAST_DEGRADATION_WARNING = None
+    """Return and clear the most recent degradation warning banner for the current execution context."""
+    warning = _LAST_DEGRADATION_WARNING.get()
+    _LAST_DEGRADATION_WARNING.set(None)
     return warning
 
 
@@ -723,10 +724,25 @@ def search_memory(
     return search_semantic_memory(query, options, atoms_dir=atoms_dir, chroma_path=chroma_path)
 
 
-def suggest_duplicate_atoms(atoms_dir: str = ATOMS_DIR, min_jaccard: float = 0.35) -> list[dict]:
+def suggest_duplicate_atoms(
+    atoms_dir: str = ATOMS_DIR,
+    min_jaccard: float = 0.35,
+    *,
+    require_current_approval: bool = False,
+    projects: tuple[str, ...] = (),
+    brain_dir: str | None = None,
+) -> list[dict]:
     """Read-only review aid: identify candidate duplicate atoms without mutating files or trust."""
     if not os.path.isdir(atoms_dir):
         return []
+    if brain_dir is not None:
+        resolved_brain_dir = os.path.abspath(brain_dir)
+    elif os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR):
+        resolved_brain_dir = os.path.abspath(BRAIN_DIR)
+    else:
+        resolved_brain_dir = os.path.abspath(os.path.join(atoms_dir, os.pardir))
+    requested_projects = tuple(str(p).strip() for p in (projects or ()) if str(p or "").strip())
+
     entries = []
     for filename in sorted(os.listdir(atoms_dir)):
         if not is_content_markdown(filename):
@@ -743,6 +759,14 @@ def suggest_duplicate_atoms(atoms_dir: str = ATOMS_DIR, min_jaccard: float = 0.3
             continue
         if record.get("review_status") in EXCLUDED_RECALL_STATUSES or record.get("superseded_by"):
             continue
+        if require_current_approval:
+            if record.get("review_status") != "accepted" or record.get("claim_state") != "human_reviewed":
+                continue
+            if not approved_revision_is_current(path, brain_dir=resolved_brain_dir, atoms_dir=atoms_dir):
+                continue
+        if requested_projects:
+            if not project_tags_match(metadata_contexts(record), requested_projects):
+                continue
         parsed = split_frontmatter(content)
         body = "\n".join(parsed[1]) if parsed else content
         claim = record.get("claim", "")

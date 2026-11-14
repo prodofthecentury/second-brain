@@ -96,6 +96,7 @@ Every fenced memory document MUST include YAML frontmatter followed by these exa
 ## Claim
 ## Evidence
 ## Why It Matters
+Under ## Evidence, include an exact verbatim quote copied character-for-character from RAW CAPTURE so byte-offset provenance anchoring can verify it without manual repair.
 Output ONLY fenced Markdown memory documents. No introduction, no summary.
 Do not add prose before, between, or after the fenced Markdown memory documents.
 Do not add headings like "Memory 1" outside the fenced Markdown memory documents.
@@ -383,8 +384,9 @@ def process_raw_files():
     rules = get_house_rules()
     
     raw_files = [
-        f for f in os.listdir(RAW_DIR)
+        f for f in sorted(os.listdir(RAW_DIR))
         if f != "reading-list.md"
+        and os.path.isfile(os.path.join(RAW_DIR, f))
         and (os.path.splitext(f)[1].lower() in TEXT_EXTS or f.endswith(".intake"))
     ]
     

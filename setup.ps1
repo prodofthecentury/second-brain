@@ -165,6 +165,8 @@ try {
     }
 
     Write-Host '=== Running Environment & Health Verification ===' -ForegroundColor Cyan
+    & $UvExe run --frozen second-brain profile
+    if ($LASTEXITCODE -ne 0) { throw 'Hardware profile inspection failed.' }
     & $UvExe run --frozen second-brain doctor
     if ($LASTEXITCODE -ne 0) { throw 'CLI capability report failed.' }
     & $UvExe run --frozen python scripts/doctor.py

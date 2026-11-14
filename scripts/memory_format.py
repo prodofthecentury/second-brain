@@ -19,7 +19,23 @@ import re
 MEMORY_BOUNDARY = "<!-- MEMORY_BOUNDARY -->"
 VALID_MEMORY_TYPES = {"semantic", "episodic", "procedural", "self"}
 VALID_REVIEW_STATUSES = {"pending", "accepted", "needs_edit", "rejected", "merged"}
-VALID_ORIGINS = {"user_local", "mcp_local", "web_remote", "imported_unknown"}
+VALID_ORIGINS = {
+    "user_local",
+    "mcp_local",
+    "api_local",
+    "web_remote",
+    "cognitive_experience",
+    "untrusted_inbox",
+    "imported_unknown",
+}
+_NON_USER_ORIGINS = {
+    "mcp_local",
+    "api_local",
+    "web_remote",
+    "cognitive_experience",
+    "untrusted_inbox",
+    "imported_unknown",
+}
 VALID_CITATION_INTEGRITY = {"anchored", "missing", "hash_mismatch", "invalid_offset"}
 VALID_CLAIM_STATES = {
     "candidate",
@@ -263,12 +279,25 @@ def normalize_memory_document(
     return render_memory_document(frontmatter, body)
 
 
-def capture_origin(raw_content: str, source_filename: str) -> str:
+def capture_origin(raw_content: str, source_filename: str = "") -> str:
     """Derive provenance from the intake channel, never from generated atom YAML."""
     if str(source_filename).lower().endswith(".intake"):
         return "web_remote"
-    marker = re.search(r"^<!--\s*second_brain_origin:\s*(mcp_local|web_remote|imported_unknown)\s*-->\s*$", raw_content or "", re.MULTILINE)
-    return marker.group(1) if marker else "user_local"
+    text = (raw_content or "").lstrip("\ufeff")
+    comments = re.findall(
+        r"<!--\s*second_brain_origin\s*:(.*?)-->",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for raw_tag in comments:
+        tag = raw_tag.strip()
+        if tag in _NON_USER_ORIGINS:
+            return tag
+        if tag != "user_local":
+            return "imported_unknown"
+    if not comments and re.search(r"<!--[^>]*\bsecond_brain_origin\b[^>]*-->", text, flags=re.IGNORECASE):
+        return "imported_unknown"
+    return "user_local"
 
 
 def render_memory_document(frontmatter: list[str], body: list[str]) -> str:

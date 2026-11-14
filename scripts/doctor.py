@@ -26,6 +26,7 @@ from config import (
     BRIEFINGS_DIR,
     CHROMA_PATH,
     EMBED_MODEL,
+    EXPERIENCES_DIR,
     GEN_MODEL,
     INBOX_DIR,
     LEXICAL_INDEX_PATH,
@@ -36,6 +37,7 @@ from config import (
     VISION_MODEL,
     is_content_markdown,
 )
+from hardware_profile import _NoRedirectHandler, detect_hardware_profile, fetch_loopback_json, loopback_ollama_base_url
 from index_manifest import index_manifest_is_current, load_index_manifest
 from lexical_store import lexical_index_is_current
 from review_atom import approved_revision_is_current
@@ -55,17 +57,14 @@ def fail(area: str, detail: str) -> tuple[str, str, str]:
 
 
 def fetch_json(url: str, timeout: float = 5.0) -> dict | None:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
-        return None
+    return fetch_loopback_json(url, timeout=timeout)
 
 
 def fetch_text(url: str, timeout: float = 5.0) -> str | None:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            return response.read().decode("utf-8", errors="replace")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
+        with opener.open(url, timeout=timeout) as response:
+            return response.read(65536).decode("utf-8", errors="replace")
     except (OSError, urllib.error.URLError):
         return None
 
@@ -267,10 +266,13 @@ def run_checks() -> list[tuple[str, str, str]]:
     else:
         checks.append(warn("approved memories", "No atom has current verifiable owner approval; recall will return no memories"))
 
-    raw_ollama_host = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip().rstrip("/")
-    ollama_base = raw_ollama_host if raw_ollama_host.startswith(("http://", "https://")) else f"http://{raw_ollama_host}"
-    models_payload = fetch_json(f"{ollama_base}/api/tags")
-    if models_payload is None:
+    ollama_base = loopback_ollama_base_url()
+    models_payload = fetch_json(f"{ollama_base}/api/tags") if ollama_base else None
+    if ollama_base is None:
+        checks.append(warn("ollama", "OLLAMA_HOST is not bound to http://127.0.0.1; remote Ollama probe refused for safety"))
+        names = set()
+        vision_names = set()
+    elif models_payload is None:
         checks.append(warn("ollama", "Ollama is not reachable; local lexical recall remains available, generation and dense indexing are unavailable"))
         names = set()
         vision_names = set()
@@ -300,7 +302,17 @@ def run_checks() -> list[tuple[str, str, str]]:
 
     checks.append(ok("atoms", f"{count_files(ATOMS_DIR, ('.md',))} atom file(s)"))
     checks.append(ok("threads", f"{count_files(THREADS_DIR, ('.md',))} thread file(s)"))
+    checks.append(ok("experiences", f"{count_files(EXPERIENCES_DIR, ('.md',))} experience record(s)"))
     checks.append(ok("sources", f"{count_files(SOURCES_DIR, ('.md',))} source file(s)"))
+
+    hw_profile = detect_hardware_profile(ollama_timeout=2.0)
+    checks.append(
+        ok(
+            "capability tier",
+            f"{hw_profile.tier_label} (recommended={hw_profile.recommended_generation_model}, "
+            f"installed={hw_profile.selected_installed_generation_model or 'none'})",
+        )
+    )
 
     raw_count = count_files(RAW_DIR, (".md", ".txt", ".intake"))
     if os.path.exists(READING_LIST):
