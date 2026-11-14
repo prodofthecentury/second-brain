@@ -933,7 +933,14 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
 class MemoryApiClient:
     """Typed local Python client SDK for owner-built AI hosts and plugins."""
 
-    def __init__(self, *, port: int = DEFAULT_API_PORT, token: str | None = None, timeout: float = 45.0) -> None:
+    def __init__(
+        self,
+        *,
+        port: int = DEFAULT_API_PORT,
+        token: str | None = None,
+        owner_token: str | None = None,
+        timeout: float = 45.0,
+    ) -> None:
         resolved_token = (token or "").strip() or (get_configured_api_token() or "")
         if not resolved_token:
             raise PermissionError("MemoryApiClient requires a valid bearer token.")
@@ -943,6 +950,8 @@ class MemoryApiClient:
             "Content-Type": "application/json",
             "Host": f"{ALLOWED_API_BIND_HOST}:{port}",
         }
+        if owner_token and owner_token.strip():
+            self._headers[api_product.OWNER_HEADER] = owner_token.strip()
         self._timeout = timeout
 
     def _request(self, method: str, path: str, json_body: dict[str, object] | None = None) -> dict[str, object]:

@@ -37,6 +37,7 @@ class Phase2IsolatedTestCase(unittest.TestCase):
                 os.environ,
                 {
                     "BRAIN_MEMORY_API_TOKEN_FILE": str(sec_dir / "memory-api-token"),
+                    "BRAIN_OWNER_TOKEN_FILE": str(sec_dir / "owner-token"),
                     "BRAIN_HOST_POLICY_FILE": str(sec_dir / "host-sharing-policy.json"),
                     "BRAIN_MCP_TOKEN_FILE": str(sec_dir / "mcp-token"),
                 },
@@ -650,6 +651,7 @@ class CognitiveCoreTests(Phase2IsolatedTestCase):
 
 class MemoryLoopbackApiPenetrationAndContractTests(Phase2IsolatedTestCase):
     def test_loopback_bind_csrf_dns_rebinding_auth_lockout_and_sdk_contract(self):
+        from api_product import ensure_owner_token
         from host_adapters import HostSharingRule, save_host_policies
         from lexical_store import rebuild_lexical_index
         from memory_api import (
@@ -664,6 +666,7 @@ class MemoryLoopbackApiPenetrationAndContractTests(Phase2IsolatedTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
             token_file = Path(tmp) / "api-token"
+            owner_token_file = Path(tmp) / "owner-token"
             policy_file = Path(tmp) / "host-policy.json"
 
             _seed_anchored_atom(
@@ -738,6 +741,7 @@ class MemoryLoopbackApiPenetrationAndContractTests(Phase2IsolatedTestCase):
                 MemoryLoopbackHTTPServer("127.0.0.1", 0, rt_unauth)
 
             token, _ = generate_memory_api_token(token_file)
+            owner_token = ensure_owner_token(owner_token_file)
 
             # Rejects 0.0.0.0 and external interface binds immediately
             with self.assertRaises(PermissionError):
@@ -787,6 +791,7 @@ class MemoryLoopbackApiPenetrationAndContractTests(Phase2IsolatedTestCase):
                 chroma_path=str(brain / ".chroma"),
                 telemetry_db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
                 token_path=token_file,
+                owner_token_path=owner_token_file,
                 policy_path=policy_file,
                 http_transport=mock_transport,
                 skip_dns_check_for_mock_transport=True,
@@ -915,7 +920,11 @@ class MemoryLoopbackApiPenetrationAndContractTests(Phase2IsolatedTestCase):
                 self.assertTrue(inb["quarantined"])
                 self.assertIn("prompt_override_directive", inb["risk_flags"])
 
-                queue = sdk.inbox_queue()
+                with self.assertRaises(httpx.HTTPStatusError) as cm:
+                    sdk.inbox_queue()
+                self.assertEqual(cm.exception.response.status_code, 403)
+                owner_sdk = MemoryApiClient(port=port, token=token, owner_token=owner_token)
+                queue = owner_sdk.inbox_queue()
                 self.assertEqual(queue["count"], 1)
                 self.assertEqual(queue["items"][0]["filename"], inb["filename"])
                 self.assertEqual(queue["items"][0]["origin"], "api_local")
