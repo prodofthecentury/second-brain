@@ -52,6 +52,13 @@
         "to": "backend/README.md"
       },
       {
+        "from": "../dashboard",
+        "to": "backend/dashboard",
+        "filter": [
+          "**/*.py"
+        ]
+      },
+      {
         "from": "../plugins",
         "to": "backend/plugins"
       }

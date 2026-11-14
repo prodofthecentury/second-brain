@@ -26,6 +26,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from atom_mutator import approved_revision_is_current  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown  # noqa: E402
 from memory_format import split_frontmatter  # noqa: E402
 from memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list  # noqa: E402
@@ -60,10 +61,13 @@ def _extract_numbers(text: str) -> set[str]:
 
 
 def _matches_scope(contexts: list[str], project_scope: str | None) -> bool:
-    if not project_scope:
+    if not project_scope or not project_scope.strip():
         return True
-    target = project_scope.strip()
-    return target in contexts
+    target = project_scope.strip().casefold()
+    if not target.startswith("project:"):
+        target = f"project:{target}"
+    proj_tags = [str(c).strip().casefold() for c in contexts if str(c).strip().casefold().startswith("project:")]
+    return bool(proj_tags) and all(c == target for c in proj_tags)
 
 
 def build_knowledge_graph(
@@ -84,11 +88,19 @@ def build_knowledge_graph(
             path = os.path.join(atoms_dir, entry.name)
             if _is_reparse_or_link(path) or not os.path.isfile(path):
                 continue
-            raw = Path(path).read_text(encoding="utf-8")
-            rec = parse_atom_record(path)
-            if not include_pending and rec.get("review_status") != "accepted":
+            try:
+                raw = Path(path).read_text(encoding="utf-8")
+                rec = parse_atom_record(path)
+            except (OSError, UnicodeDecodeError, ValueError):
                 continue
-            if rec.get("review_status") == "rejected":
+            status = rec.get("review_status")
+            if status in ("rejected", "quarantined"):
+                continue
+            if not include_pending and (
+                status != "accepted"
+                or rec.get("superseded_by")
+                or not approved_revision_is_current(path, brain_dir=brain_dir, atoms_dir=atoms_dir)
+            ):
                 continue
             contexts = list(rec.get("contexts") or [])
             if not _matches_scope(contexts, project_scope):
@@ -248,7 +260,7 @@ def graph_neighbors(
 ) -> dict[str, Any]:
     """Return 1-hop neighbors and contradictions involving a specific atom."""
     graph = build_knowledge_graph(brain_dir=brain_dir, atoms_dir=atoms_dir, include_pending=include_pending)
-    radar = detect_contradictions(brain_dir=brain_dir, atoms_dir=atoms_dir, include_pending=True)
+    radar = detect_contradictions(brain_dir=brain_dir, atoms_dir=atoms_dir, include_pending=include_pending)
     node = next((n for n in graph["nodes"] if n["filename"] == atom_filename or n["atom_id"] == atom_filename), None)
     if node is None:
         raise FileNotFoundError(f"Atom not found in graph: {atom_filename}")

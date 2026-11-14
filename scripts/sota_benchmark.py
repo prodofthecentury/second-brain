@@ -254,7 +254,13 @@ def run_sota_benchmark(*, atoms: int = 300) -> dict[str, Any]:
                 # 1. Second Brain Verified
                 t0 = time.perf_counter()
                 opts = RecallOptions(n_results=5, retrieval_mode="lexical", projects=(q["project_scope"],))
-                hits, _ = search_memory(q["query"], opts, atoms_dir=str(atoms_dir), index_path=lexical_db)
+                hits, _ = search_memory(
+                    q["query"],
+                    opts,
+                    atoms_dir=str(atoms_dir),
+                    index_path=lexical_db,
+                    chroma_path=str(brain / ".chroma"),
+                )
                 candidate_claims = []
                 if hits:
                     raw_content = hits[0].content

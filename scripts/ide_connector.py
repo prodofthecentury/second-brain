@@ -31,7 +31,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import _is_reparse_or_link  # noqa: E402
+from config import _default_installed_vault, _is_reparse_or_link  # noqa: E402
 from host_adapters import restrict_security_file_permissions  # noqa: E402
 
 SERVER_KEY = "second-brain"
@@ -84,6 +84,7 @@ def server_entry(token: str, *, extra: dict | None = None) -> dict:
         command, args = uv, ["--directory", str(REPO_ROOT), "run", "--frozen", "python", "scripts/mcp_server.py"]
     else:
         command, args = sys.executable, ["-m", "scripts.mcp_server"]
+    vault_env = (os.environ.get("BRAIN_VAULT_DIR") or "").strip() or (_default_installed_vault() or "")
     entry = {
         **(extra or {}),
         "command": command,
@@ -92,7 +93,7 @@ def server_entry(token: str, *, extra: dict | None = None) -> dict:
             "BRAIN_ENABLE_LOCAL_MCP": "1",
             "BRAIN_MCP_TRUSTED_STDIO": "1",
             "BRAIN_MCP_CLIENT_TOKEN": token,
-            **({"BRAIN_VAULT_DIR": os.environ["BRAIN_VAULT_DIR"]} if os.environ.get("BRAIN_VAULT_DIR") else {}),
+            **({"BRAIN_VAULT_DIR": vault_env} if vault_env else {}),
         },
     }
     return entry

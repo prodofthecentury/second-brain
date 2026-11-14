@@ -1125,6 +1125,9 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
             "args": mcp_args,
             "env": {
                 "BRAIN_ENABLE_LOCAL_MCP": "1",
+                "BRAIN_MCP_TRUSTED_STDIO": "1",
+                "BRAIN_MCP_CLIENT_TOKEN": "<contents of mcp-token>",
+                **({"BRAIN_VAULT_DIR": BRAIN_DIR} if not (repo_root_path / "pyproject.toml").exists() else {}),
             },
             "token_path": str(_default_mcp_token_file()),
             "required_request_meta": {

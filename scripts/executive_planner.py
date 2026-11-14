@@ -492,7 +492,7 @@ def assemble_executive_plan(
         fm = parse_frontmatter_values(parsed[0])
         is_pref = (
             str(fm.get("epistemic_label", "")) == "preference"
-            or str(fm.get("epistemic_contract", "")) == "owner_subjective_preference"
+            or bool(fm.get("epistemic_contract"))
         )
         if is_pref:
             if request.include_preferences and (host_rule is None or host_rule.allow_preference_atoms):

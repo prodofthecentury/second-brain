@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -13,8 +14,44 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+class Phase5IsolatedTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        sec_root = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        stack.enter_context(
+            patch.dict(
+                os.environ,
+                {
+                    "BRAIN_MEMORY_API_TOKEN_FILE": str(sec_root / "memory-api-token"),
+                    "BRAIN_HOST_POLICY_FILE": str(sec_root / "host-sharing-policy.json"),
+                    "BRAIN_MCP_TOKEN_FILE": str(sec_root / "mcp-token"),
+                    "BRAIN_OWNER_TOKEN_FILE": str(sec_root / "owner-token"),
+                },
+                clear=False,
+            )
+        )
+        for var in (
+            "BRAIN_VAULT_DIR",
+            "BRAIN_MEMORY_API_TOKEN",
+            "BRAIN_MCP_BEARER_TOKEN",
+            "BRAIN_MCP_CLIENT_TOKEN",
+            "BRAIN_MCP_TRUSTED_STDIO",
+            "OLLAMA_HOST",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            os.environ.pop(var, None)
 
 
 def _seed_atom(
@@ -24,6 +61,7 @@ def _seed_atom(
     claim: str,
     evidence: str,
     project: str = "project:alpha",
+    memory_type: str = "semantic",
     approve: bool = True,
     links: list[str] | None = None,
 ) -> Path:
@@ -46,7 +84,7 @@ def _seed_atom(
         "---\n"
         f"id: {Path(filename).stem}\n"
         "type: atom\n"
-        "memory_type: semantic\n"
+        f"memory_type: {memory_type}\n"
         "epistemic_label: claim\n"
         "sources:\n"
         f"  - 0-raw/{src_name}\n"
@@ -75,7 +113,7 @@ def _seed_atom(
     return atom_path
 
 
-class DesktopInstallerAndTrayTests(unittest.TestCase):
+class DesktopInstallerAndTrayTests(Phase5IsolatedTestCase):
     def test_installer_targets_and_tray_lifecycle_present(self) -> None:
         root = Path(__file__).resolve().parents[1]
         pkg = json.loads((root / "desktop" / "package.json").read_text(encoding="utf-8"))
@@ -88,6 +126,8 @@ class DesktopInstallerAndTrayTests(unittest.TestCase):
         self.assertEqual(mac_targets, {"dmg", "zip"})
         linux_targets = {t["target"] for t in pkg["build"]["linux"]["target"]}
         self.assertEqual(linux_targets, {"AppImage", "deb"})
+        extra = pkg.get("build", {}).get("extraResources", [])
+        self.assertTrue(any(isinstance(x, dict) and x.get("from") == "../dashboard" for x in extra))
 
         main_js = (root / "desktop" / "main.js").read_text(encoding="utf-8")
         for sym in ("refreshTrayMenu", "stopApiSidecar", "getVaultDir", "setLoginItemSettings", "shell.openPath"):
@@ -97,7 +137,7 @@ class DesktopInstallerAndTrayTests(unittest.TestCase):
         self.assertTrue((root / "scripts" / "package_desktop.sh").is_file())
 
 
-class SotaBenchmarkTests(unittest.TestCase):
+class SotaBenchmarkTests(Phase5IsolatedTestCase):
     def test_sota_benchmark_outperforms_baselines_on_safety_and_grounding(self) -> None:
         from sota_benchmark import run_sota_benchmark
 
@@ -119,7 +159,7 @@ class SotaBenchmarkTests(unittest.TestCase):
         self.assertEqual(ungrounded["citation_grounding_pct"], 0.0)
 
 
-class VaultMerkleLedgerTests(unittest.TestCase):
+class VaultMerkleLedgerTests(Phase5IsolatedTestCase):
     def test_merkle_proof_chain_and_tamper_detection(self) -> None:
         from vault_ledger import (
             commit_ledger_checkpoint,
@@ -158,8 +198,91 @@ class VaultMerkleLedgerTests(unittest.TestCase):
             bad_ver = verify_vault_ledger(brain_dir=str(brain), atoms_dir=str(atoms_dir))
             self.assertFalse(bad_ver["chain_valid"])
 
+    def test_forged_atom_excluded_and_promoted_playbook_included(self) -> None:
+        from atom_mutator import content_sha256
+        from skill_playbooks import promote_skill_playbook
+        from vault_ledger import compute_vault_merkle, prove_atom_membership
 
-class KnowledgeGraphAndContradictionRadarTests(unittest.TestCase):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms_dir = brain / "2-atoms"
+            pb_dir = brain / "5-playbooks"
+            pb_dir.mkdir(parents=True, exist_ok=True)
+            proc_path = _seed_atom(
+                brain,
+                filename="proc1.md",
+                claim="Run smoke checks after build.",
+                evidence="Run smoke checks after build.",
+                memory_type="procedural",
+                approve=True,
+            )
+            promote_skill_playbook(
+                playbook_id="build-smoke",
+                title="Build Smoke",
+                backing_atoms=[("proc1.md", content_sha256(proc_path.read_bytes()))],
+                trigger="After build",
+                preconditions=["Clean workspace"],
+                steps=["Run smoke checks after build."],
+                expected_outputs=["Tests pass"],
+                failure_recovery=["Inspect logs"],
+                actor="owner",
+                rationale="phase5 verification test",
+                allow_early_owner_override=True,
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                playbooks_dir=str(pb_dir),
+                telemetry_db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
+            )
+            (atoms_dir / "forged.md").write_text(
+                "---\nid: forged\ntype: atom\nmemory_type: semantic\nreview_status: accepted\nclaim_state: human_reviewed\n---\n\n## Claim\nForged claim.\n",
+                encoding="utf-8",
+            )
+            (pb_dir / "forged-pb.md").write_text(
+                "---\nid: forged-pb\ntype: atom\nreview_status: accepted\nplaybook_status: invalid\n---\n",
+                encoding="utf-8",
+            )
+
+            merkle = compute_vault_merkle(brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+            self.assertEqual(merkle["approved_atoms"], 1)
+            self.assertEqual(merkle["accepted_playbooks"], 1)
+            self.assertEqual(merkle["leaf_count"], 2)
+            self.assertEqual(
+                {leaf["rel_path"] for leaf in merkle["leaves"]},
+                {"2-atoms/proc1.md", "5-playbooks/build-smoke.md"},
+            )
+            with self.assertRaises(PermissionError):
+                prove_atom_membership("forged.md", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+
+    def test_three_leaf_merkle_proofs_and_odd_domain_separation(self) -> None:
+        from vault_ledger import _build_merkle_levels, compute_vault_merkle, prove_atom_membership, verify_merkle_proof
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms_dir = brain / "2-atoms"
+            for name in ("a1.md", "a2.md", "a3.md"):
+                _seed_atom(
+                    brain,
+                    filename=name,
+                    claim=f"Verified canonical claim for {name}.",
+                    evidence=f"Verified canonical claim for {name}.",
+                    approve=True,
+                )
+
+            merkle = compute_vault_merkle(brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            leaves = [leaf["leaf_sha256"] for leaf in merkle["leaves"]]
+            self.assertEqual(len(leaves), 3)
+            root_3 = _build_merkle_levels(leaves)[-1][0]
+            root_4_dup = _build_merkle_levels([leaves[0], leaves[1], leaves[2], leaves[2]])[-1][0]
+            self.assertNotEqual(root_3, root_4_dup)
+
+            for name in ("a1.md", "a2.md", "a3.md"):
+                proof = prove_atom_membership(name, brain_dir=str(brain), atoms_dir=str(atoms_dir))
+                self.assertTrue(verify_merkle_proof(proof))
+                if name == "a3.md":
+                    self.assertTrue(any(step["position"] == "odd" for step in proof["siblings"]))
+
+
+class KnowledgeGraphAndContradictionRadarTests(Phase5IsolatedTestCase):
     def test_detects_polarity_and_numeric_contradictions_with_scope_gate(self) -> None:
         from knowledge_graph import detect_contradictions, graph_neighbors
 
@@ -222,11 +345,16 @@ class KnowledgeGraphAndContradictionRadarTests(unittest.TestCase):
             # Only accepted contradiction (keys-90 vs keys-30) visible when include_pending=False
             self.assertEqual(agent_radar["contradiction_count"], 1)
 
-            nbrs = graph_neighbors("tls-on.md", brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            nbrs = graph_neighbors("tls-on.md", brain_dir=str(brain), atoms_dir=str(atoms_dir), include_pending=True)
             self.assertGreaterEqual(nbrs["edge_count"], 1)
+            verified_nbrs = graph_neighbors("tls-on.md", brain_dir=str(brain), atoms_dir=str(atoms_dir), include_pending=False)
+            for al in verified_nbrs["contradictions"]:
+                self.assertEqual(al["atom_a"]["review_status"], "accepted")
+                self.assertEqual(al["atom_b"]["review_status"], "accepted")
+            self.assertLess(len(verified_nbrs["contradictions"]), len(nbrs["contradictions"]))
 
 
-class TimeTravelSnapshotAndApiTests(unittest.TestCase):
+class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
     def test_snapshots_semantic_diff_point_in_time_recall_and_api_routes(self) -> None:
         from api_product import ensure_owner_token
         from memory_api import MemoryApiRuntimeConfig, MemoryLoopbackHTTPServer, generate_memory_api_token, reset_api_rate_limiter
@@ -323,6 +451,58 @@ class TimeTravelSnapshotAndApiTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_snapshot_excludes_forged_atom_and_includes_promoted_playbook(self) -> None:
+        from atom_mutator import content_sha256
+        from skill_playbooks import promote_skill_playbook
+        from time_travel import create_snapshot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms_dir = brain / "2-atoms"
+            pb_dir = brain / "5-playbooks"
+            pb_dir.mkdir(parents=True, exist_ok=True)
+            proc_path = _seed_atom(
+                brain,
+                filename="proc1.md",
+                claim="Run smoke checks after build.",
+                evidence="Run smoke checks after build.",
+                memory_type="procedural",
+                approve=True,
+            )
+            promote_skill_playbook(
+                playbook_id="build-smoke",
+                title="Build Smoke",
+                backing_atoms=[("proc1.md", content_sha256(proc_path.read_bytes()))],
+                trigger="After build",
+                preconditions=["Clean workspace"],
+                steps=["Run smoke checks after build."],
+                expected_outputs=["Tests pass"],
+                failure_recovery=["Inspect logs"],
+                actor="owner",
+                rationale="phase5 snapshot verification test",
+                allow_early_owner_override=True,
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                playbooks_dir=str(pb_dir),
+                telemetry_db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
+            )
+            (atoms_dir / "forged.md").write_text(
+                "---\nid: forged\ntype: atom\nmemory_type: semantic\nreview_status: accepted\nclaim_state: human_reviewed\n---\n\n## Claim\nForged claim.\n",
+                encoding="utf-8",
+            )
+            (pb_dir / "forged-pb.md").write_text(
+                "---\nid: forged-pb\ntype: atom\nreview_status: accepted\nplaybook_status: invalid\n---\n",
+                encoding="utf-8",
+            )
+
+            snap = create_snapshot(actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+            self.assertEqual(snap["atom_count"], 1)
+            self.assertEqual(snap["playbook_count"], 1)
+            self.assertIn("proc1.md", snap["atoms"])
+            self.assertNotIn("forged.md", snap["atoms"])
+            self.assertIn("build-smoke.md", snap["playbooks"])
+            self.assertNotIn("forged-pb.md", snap["playbooks"])
 
 
 if __name__ == "__main__":

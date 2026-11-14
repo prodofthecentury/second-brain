@@ -25,7 +25,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import content_sha256  # noqa: E402
+from atom_mutator import approved_revision_is_current, content_sha256, review_lock  # noqa: E402
 from config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
@@ -35,6 +35,7 @@ from config import (  # noqa: E402
     safe_file_in_dir,
 )
 from memory_review import parse_atom_record  # noqa: E402
+from skill_playbooks import verify_playbook_integrity  # noqa: E402
 
 GENESIS_HASH = "0" * 64
 
@@ -59,6 +60,10 @@ def _pair_digest(left: str, right: str) -> str:
     return _sha256_text(f"node:{left}:{right}")
 
 
+def _odd_digest(node: str) -> str:
+    return _sha256_text(f"odd:{node}")
+
+
 def _collect_verified_leaves(
     *,
     brain_dir: str = BRAIN_DIR,
@@ -67,6 +72,7 @@ def _collect_verified_leaves(
 ) -> list[dict[str, str]]:
     """Collect sorted canonical leaves for all accepted atoms & playbooks."""
     pb_dir = playbooks_dir if playbooks_dir is not None else os.path.join(brain_dir, "5-playbooks")
+    telemetry_db = os.path.join(brain_dir, ".sidecar", "telemetry.sqlite3")
     leaves: list[dict[str, str]] = []
 
     if os.path.isdir(atoms_dir) and not _is_reparse_or_link(atoms_dir):
@@ -76,9 +82,16 @@ def _collect_verified_leaves(
             path = os.path.join(atoms_dir, entry.name)
             if _is_reparse_or_link(path) or not os.path.isfile(path):
                 continue
-            raw_bytes = Path(path).read_bytes()
-            rec = parse_atom_record(path)
-            if rec.get("review_status") != "accepted":
+            try:
+                raw_bytes = Path(path).read_bytes()
+                rec = parse_atom_record(path)
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            if (
+                rec.get("review_status") != "accepted"
+                or rec.get("superseded_by")
+                or not approved_revision_is_current(path, brain_dir=brain_dir, atoms_dir=atoms_dir)
+            ):
                 continue
             fhash = content_sha256(raw_bytes)
             rel = f"2-atoms/{entry.name}"
@@ -98,11 +111,22 @@ def _collect_verified_leaves(
             path = os.path.join(pb_dir, entry.name)
             if _is_reparse_or_link(path) or not os.path.isfile(path):
                 continue
-            raw_bytes = Path(path).read_bytes()
-            rec = parse_atom_record(path)
-            if rec.get("review_status") != "accepted":
+            pb_rep = verify_playbook_integrity(
+                path,
+                brain_dir=brain_dir,
+                atoms_dir=atoms_dir,
+                playbooks_dir=pb_dir,
+                telemetry_db_path=telemetry_db,
+            )
+            if not pb_rep.valid or pb_rep.status != "active":
                 continue
-            fhash = content_sha256(raw_bytes)
+            try:
+                raw_bytes = Path(path).read_bytes()
+            except OSError:
+                continue
+            fhash = pb_rep.sha256 or content_sha256(raw_bytes)
+            if content_sha256(raw_bytes) != fhash:
+                continue
             rel = f"5-playbooks/{entry.name}"
             leaves.append(
                 {
@@ -125,9 +149,10 @@ def _build_merkle_levels(leaf_hashes: list[str]) -> list[list[str]]:
     while len(cur) > 1:
         nxt: list[str] = []
         for idx in range(0, len(cur), 2):
-            left = cur[idx]
-            right = cur[idx + 1] if idx + 1 < len(cur) else cur[idx]
-            nxt.append(_pair_digest(left, right))
+            if idx + 1 < len(cur):
+                nxt.append(_pair_digest(cur[idx], cur[idx + 1]))
+            else:
+                nxt.append(_odd_digest(cur[idx]))
         levels.append(nxt)
         cur = nxt
     return levels
@@ -209,31 +234,34 @@ def commit_ledger_checkpoint(
     ):
         raise PermissionError("Refusing to write ledger through a symlink or junction.")
 
-    entries, errors = _read_ledger_entries(ledger_file)
-    if errors:
-        raise ValueError(f"Cannot append to tampered/corrupted vault ledger: {'; '.join(errors)}")
+    with review_lock(str(ledger_file.parent / "review.lock")):
+        if os.path.lexists(str(ledger_file)) and _is_reparse_or_link(str(ledger_file)):
+            raise PermissionError("Refusing to write ledger through a symlink or junction.")
+        entries, errors = _read_ledger_entries(ledger_file)
+        if errors:
+            raise ValueError(f"Cannot append to tampered/corrupted vault ledger: {'; '.join(errors)}")
 
-    merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
-    prev_hash = entries[-1]["entry_sha256"] if entries else GENESIS_HASH
-    payload: dict[str, Any] = {
-        "schema_version": 1,
-        "seq": len(entries) + 1,
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "actor": clean_actor,
-        "note": (note or "").strip()[:300],
-        "prev_entry_sha256": prev_hash,
-        "merkle_root": merkle["merkle_root"],
-        "leaf_count": merkle["leaf_count"],
-        "approved_atoms": merkle["approved_atoms"],
-        "accepted_playbooks": merkle["accepted_playbooks"],
-    }
-    payload["entry_sha256"] = _sha256_text(_canonical_json(payload))
+        merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
+        prev_hash = entries[-1]["entry_sha256"] if entries else GENESIS_HASH
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "seq": len(entries) + 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "actor": clean_actor,
+            "note": (note or "").strip()[:300],
+            "prev_entry_sha256": prev_hash,
+            "merkle_root": merkle["merkle_root"],
+            "leaf_count": merkle["leaf_count"],
+            "approved_atoms": merkle["approved_atoms"],
+            "accepted_playbooks": merkle["accepted_playbooks"],
+        }
+        payload["entry_sha256"] = _sha256_text(_canonical_json(payload))
 
-    with open(ledger_file, "a", encoding="utf-8") as fh:
-        fh.write(_canonical_json(payload) + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-    return payload
+        with open(ledger_file, "a", encoding="utf-8") as fh:
+            fh.write(_canonical_json(payload) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        return payload
 
 
 def verify_vault_ledger(
@@ -286,8 +314,10 @@ def prove_atom_membership(
     cur_idx = idx
     for level in levels[:-1]:
         if cur_idx % 2 == 0:
-            sib_idx = cur_idx + 1 if cur_idx + 1 < len(level) else cur_idx
-            siblings.append({"position": "right", "sha256": level[sib_idx]})
+            if cur_idx + 1 < len(level):
+                siblings.append({"position": "right", "sha256": level[cur_idx + 1]})
+            else:
+                siblings.append({"position": "odd", "sha256": level[cur_idx]})
         else:
             siblings.append({"position": "left", "sha256": level[cur_idx - 1]})
         cur_idx //= 2
@@ -328,6 +358,10 @@ def verify_merkle_proof(proof: dict[str, Any]) -> bool:
             cur = _pair_digest(cur, sib)
         elif pos == "left":
             cur = _pair_digest(sib, cur)
+        elif pos == "odd":
+            if sib != cur:
+                return False
+            cur = _odd_digest(cur)
         else:
             return False
     return cur == expected_root

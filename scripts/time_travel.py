@@ -27,9 +27,10 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import content_sha256  # noqa: E402
+from atom_mutator import approved_revision_is_current, content_sha256  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown, safe_file_in_dir  # noqa: E402
 from memory_review import parse_atom_record  # noqa: E402
+from skill_playbooks import verify_playbook_integrity  # noqa: E402
 from vault_ledger import compute_vault_merkle  # noqa: E402
 
 _SNAP_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -57,15 +58,23 @@ def _capture_live_state(
             path = os.path.join(atoms_dir, entry.name)
             if _is_reparse_or_link(path) or not os.path.isfile(path):
                 continue
-            raw_bytes = Path(path).read_bytes()
-            rec = parse_atom_record(path)
-            if rec.get("review_status") != "accepted":
+            try:
+                raw_bytes = Path(path).read_bytes()
+                rec = parse_atom_record(path)
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            if (
+                rec.get("review_status") != "accepted"
+                or rec.get("superseded_by")
+                or not approved_revision_is_current(path, brain_dir=brain_dir, atoms_dir=atoms_dir)
+            ):
                 continue
             atoms[entry.name] = {
                 "atom_id": rec.get("id", ""),
                 "filename": rec.get("filename", entry.name),
                 "file_sha256": content_sha256(raw_bytes),
                 "memory_type": rec.get("memory_type", ""),
+                "epistemic_label": rec.get("epistemic_label", "claim"),
                 "epistemic_contract": rec.get("epistemic_contract", ""),
                 "contexts": list(rec.get("contexts") or []),
                 "claim": rec.get("claim") or "",
@@ -73,20 +82,33 @@ def _capture_live_state(
 
     playbooks: dict[str, dict[str, Any]] = {}
     if os.path.isdir(pb_dir) and not _is_reparse_or_link(pb_dir):
+        telemetry_db = os.path.join(brain_dir, ".sidecar", "telemetry.sqlite3")
         for entry in sorted(os.scandir(pb_dir), key=lambda e: e.name):
             if not is_content_markdown(entry.name):
                 continue
             path = os.path.join(pb_dir, entry.name)
             if _is_reparse_or_link(path) or not os.path.isfile(path):
                 continue
-            raw_bytes = Path(path).read_bytes()
-            rec = parse_atom_record(path)
-            if rec.get("review_status") != "accepted":
+            pb_rep = verify_playbook_integrity(
+                path,
+                brain_dir=brain_dir,
+                atoms_dir=atoms_dir,
+                playbooks_dir=pb_dir,
+                telemetry_db_path=telemetry_db,
+            )
+            if not pb_rep.valid or pb_rep.status != "active":
+                continue
+            try:
+                raw_bytes = Path(path).read_bytes()
+            except OSError:
+                continue
+            fhash = pb_rep.sha256 or content_sha256(raw_bytes)
+            if content_sha256(raw_bytes) != fhash:
                 continue
             playbooks[entry.name] = {
-                "filename": rec.get("filename", entry.name),
-                "file_sha256": content_sha256(raw_bytes),
-                "contexts": list(rec.get("contexts") or []),
+                "filename": pb_rep.filename or entry.name,
+                "file_sha256": fhash,
+                "contexts": list(pb_rep.contexts),
             }
 
     return {
@@ -176,9 +198,13 @@ def load_snapshot(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> dict[str, 
     if not clean or not _SNAP_ID_RE.match(clean):
         raise ValueError(f"Invalid snapshot_id: {snapshot_id!r}")
     snap_dir = _snapshots_dir(brain_dir)
+    if _is_reparse_or_link(str(snap_dir)):
+        raise PermissionError("Refusing to load snapshot through a symlink or junction.")
     safe = safe_file_in_dir(str(snap_dir), f"{clean}.json", allowed_exts={".json"}, must_exist=True)
     if not safe:
         raise FileNotFoundError(f"Snapshot not found: {clean}")
+    if _is_reparse_or_link(safe):
+        raise PermissionError("Refusing to load snapshot through a symlink or junction.")
     return json.loads(Path(safe).read_text(encoding="utf-8"))
 
 
@@ -248,6 +274,7 @@ def recall_at_snapshot(
     snapshot_id: str,
     *,
     project_scope: str | None = None,
+    include_preferences: bool = False,
     top_k: int = 5,
     brain_dir: str = BRAIN_DIR,
 ) -> dict[str, Any]:
@@ -257,11 +284,23 @@ def recall_at_snapshot(
     if not q_tokens:
         return {"snapshot_id": snap["snapshot_id"], "results": []}
 
+    target: str | None = None
+    if project_scope and project_scope.strip():
+        target = project_scope.strip().casefold()
+        if not target.startswith("project:"):
+            target = f"project:{target}"
+
     scored: list[tuple[float, dict[str, Any]]] = []
     for fname, atom in snap.get("atoms", {}).items():
-        contexts = atom.get("contexts") or []
-        if project_scope and project_scope.strip() not in contexts:
+        if not include_preferences and (
+            atom.get("epistemic_label") == "preference" or bool(atom.get("epistemic_contract"))
+        ):
             continue
+        contexts = atom.get("contexts") or []
+        if target:
+            proj_tags = [str(c).strip().casefold() for c in contexts if str(c).strip().casefold().startswith("project:")]
+            if not proj_tags or not all(c == target for c in proj_tags):
+                continue
         claim = str(atom.get("claim") or "")
         c_tokens = set(_WORD_RE.findall(claim.lower()))
         overlap = len(q_tokens & c_tokens)

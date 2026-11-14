@@ -11,12 +11,33 @@ import os
 import datetime
 import hashlib
 import json
+from pathlib import Path
 import stat
+import sys
 
 # ─── Root Paths ──────────────────────────────────────────────────────────────
 SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR     = os.path.dirname(SCRIPTS_DIR)
-BRAIN_DIR    = os.path.abspath((os.environ.get("BRAIN_VAULT_DIR") or "").strip() or os.path.join(ROOT_DIR, "brain"))
+
+
+def _default_installed_vault() -> str | None:
+    """Keep wheel-installed user data outside the immutable Python package."""
+    if (Path(ROOT_DIR) / "pyproject.toml").exists():
+        return None  # editable checkout: preserve the repository's brain/ path
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return str(Path(base) / "SecondBrain" / "brain")
+    if sys.platform == "darwin":
+        return str(Path.home() / "Library" / "Application Support" / "SecondBrain" / "brain")
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return str(Path(base) / "second-brain" / "brain")
+
+
+BRAIN_DIR    = os.path.abspath(
+    (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
+    or _default_installed_vault()
+    or os.path.join(ROOT_DIR, "brain")
+)
 
 # ─── Vault Folders ───────────────────────────────────────────────────────────
 RAW_DIR      = os.path.join(BRAIN_DIR, "0-raw")

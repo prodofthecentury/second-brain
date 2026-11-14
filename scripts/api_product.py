@@ -155,11 +155,36 @@ def _atom_card(path: str, rt) -> dict[str, object]:
     }
 
 
+def _safe_atom_card(path: str, rt, fallback: dict | None = None) -> dict[str, object] | None:
+    try:
+        return _atom_card(path, rt)
+    except (OSError, UnicodeDecodeError, ValueError):
+        if fallback is None:
+            return None
+        status = str(fallback.get("review_status") or "needs_edit")
+        return {
+            "filename": str(fallback.get("filename") or os.path.basename(path)),
+            "claim": str(fallback.get("claim") or ""),
+            "evidence": "",
+            "review_status": status,
+            "status": status,
+            "memory_type": str(fallback.get("memory_type") or ""),
+            "origin": str(fallback.get("origin") or ""),
+            "sources": list(fallback.get("sources") or []),
+            "sha256": "",
+            "verified": False,
+        }
+
+
 # ─── SSE streaming ───────────────────────────────────────────────────────────
 
 def stream_sse(handler, events) -> None:
     """Write events as text/event-stream; connection closes at end (no chunked encoding needed)."""
     import time
+
+    it = iter(events)
+    sentinel = object()
+    first = next(it, sentinel)
 
     handler.close_connection = True
     handler.send_response(200)
@@ -169,16 +194,29 @@ def stream_sse(handler, events) -> None:
     handler.send_header("Connection", "close")
     handler.end_headers()
     deadline = time.monotonic() + MAX_SSE_SECONDS
+
+    def _emit(event: dict) -> None:
+        data = json.dumps(event, ensure_ascii=False)
+        handler.wfile.write(f"event: {event.get('type', 'message')}\ndata: {data}\n\n".encode("utf-8"))
+        handler.wfile.flush()
+
     try:
-        for event in events:
-            data = json.dumps(event, ensure_ascii=False)
-            handler.wfile.write(f"event: {event.get('type', 'message')}\ndata: {data}\n\n".encode("utf-8"))
-            handler.wfile.flush()
+        if first is not sentinel:
+            _emit(first)
+        for event in it:
+            _emit(event)
             if time.monotonic() > deadline:
                 handler.wfile.write(b'event: error\ndata: {"type":"error","error":"stream time limit reached"}\n\n')
+                handler.wfile.flush()
                 break
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
         return
+    except Exception as exc:
+        try:
+            _emit({"type": "error", "error": f"Stream aborted: {exc.__class__.__name__}"})
+            _emit({"type": "done", "total_ms": 0.0, "elapsed_ms": 0.0})
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
+            return
 
 
 # ─── Dispatcher ──────────────────────────────────────────────────────────────
@@ -287,6 +325,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             mode = _str(body, "mode", max_len=16, required=False, default="stream")
             if mode not in CHAT_MODES:
                 raise ValueError(f"mode must be one of {CHAT_MODES}")
+            query_str = _str(body, "query", max_len=2000)
             cp = ChatPaths(
                 brain_dir=rt.brain_dir,
                 atoms_dir=rt.atoms_dir,
@@ -296,7 +335,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             scope = body.get("project_scope") if isinstance(body.get("project_scope"), str) else None
             _audit_fn(rt.brain_dir, path, method, 200)
-            stream_sse(handler, chat_events(_str(body, "query", max_len=2000), mode=mode, paths=cp, project_scope=scope))
+            stream_sse(handler, chat_events(query_str, mode=mode, paths=cp, project_scope=scope))
             return True
 
         if path == "/v1/chat/warmup" and method == "POST":
@@ -317,20 +356,25 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             for rec in list_review_queue(rt.atoms_dir, {"pending", "needs_edit"}):
                 p = safe_file_in_dir(rt.atoms_dir, rec["filename"], allowed_exts={".md"}, must_exist=True)
                 if p:
-                    items.append(_atom_card(p, rt))
+                    card = _safe_atom_card(p, rt, fallback=rec)
+                    if card is not None:
+                        items.append(card)
             return send(200, {"items": items})
 
         if path == "/v1/atoms" and method == "GET":
+            limit = max(1, min(int((q.get("limit") or ["200"])[0]), 1000))
+            offset = max(0, int((q.get("offset") or ["0"])[0]))
             cards = []
             for name in sorted(os.listdir(rt.atoms_dir)) if os.path.isdir(rt.atoms_dir) else []:
                 if not is_content_markdown(name):
                     continue
                 p = safe_file_in_dir(rt.atoms_dir, name, allowed_exts={".md"}, must_exist=True)
                 if p:
-                    card = _atom_card(p, rt)
-                    if card["verified"] or is_owner:
+                    card = _safe_atom_card(p, rt)
+                    if card is not None and (card["verified"] or is_owner):
                         cards.append(card)
-            return send(200, {"total": len(cards), "items": cards, "atoms": cards})
+            page = cards[offset : offset + limit]
+            return send(200, {"total": len(cards), "items": page, "atoms": page})
 
         if path.startswith("/v1/atoms/") and method == "POST":
             if not owner_only():

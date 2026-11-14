@@ -936,6 +936,144 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
         ext_js = (repo_root / "extensions" / "vscode-second-brain" / "extension.js").read_text(encoding="utf-8")
         self.assertNotIn("script-src 'unsafe-inline'", ext_js)
 
+    def test_remediated_notes_pagination_and_chat_policy_contracts(self) -> None:
+        import http.client
+        import threading
+        from atom_mutator import apply_review_transition, content_sha256
+        from host_adapters import OUTBOUND_AUDIT_FILENAME, HostSharingRule, builtin_default_policies, save_host_policies
+        import memory_api
+        from notes_store import NoteError, backlinks, create_note
+        from streaming_chat import chat_events
+
+        # 1. Reserved Windows DOS stem prefixing + strict backlinks missing-file failure.
+        saved_con = create_note("CON", "Reserved device stem body.", paths=self.paths)
+        self.assertEqual(saved_con["filename"], "note-con.md")
+        create_note("Ref CON", "See [[CON]].", paths=self.paths)
+        self.assertEqual(len(backlinks("note-con.md", paths=self.paths)), 1)
+        with self.assertRaises(NoteError):
+            backlinks("CON.md", paths=self.paths)
+        with self.assertRaises(NoteError):
+            backlinks("missing.md", paths=self.paths)
+
+        # 2. Pagination and malformed .md tolerance on GET /v1/atoms.
+        atoms_dir = self.brain / "2-atoms"
+        (self.brain / "0-raw" / "src1.md").write_text("Primary fact one.\n", encoding="utf-8")
+        (self.brain / "0-raw" / "src2.md").write_text("Primary fact two.\n", encoding="utf-8")
+        for idx, (fname, claim, src) in enumerate(
+            [
+                ("a-one.md", "Primary fact one.", "0-raw/src1.md"),
+                ("b-two.md", "Primary fact two.", "0-raw/src2.md"),
+            ],
+            start=1,
+        ):
+            p = atoms_dir / fname
+            p.write_text(
+                "---\n"
+                f"id: a{idx}\n"
+                "type: atom\n"
+                "memory_type: semantic\n"
+                "epistemic_label: claim\n"
+                f"sources:\n  - {src}\n"
+                "contexts:\n  - project:alpha\n"
+                "review_status: pending\n"
+                "claim_state: candidate\n"
+                "citation_integrity: missing\n"
+                "---\n\n"
+                f"## Claim\n{claim}\n\n"
+                f"## Evidence\n{claim}\n",
+                encoding="utf-8",
+            )
+            apply_review_transition(
+                action="approve",
+                atom_path=str(p),
+                expected_sha256=content_sha256(p.read_bytes()),
+                actor="owner",
+                brain_dir=str(self.brain),
+                atoms_dir=str(atoms_dir),
+            )
+        self.rebuild_atoms_index()
+        (atoms_dir / "broken.md").write_bytes(b"\xff\xfe\xfd")
+
+        agent_token, agent_token_path = memory_api.generate_memory_api_token(self.root / "security" / "memory-api-token")
+        owner_token, owner_token_path = memory_api.generate_memory_api_token(self.root / "security" / "owner-token")
+        cfg = memory_api.MemoryApiRuntimeConfig(
+            brain_dir=str(self.brain),
+            atoms_dir=str(atoms_dir),
+            inbox_dir=str(self.brain / "0-raw" / "inbox"),
+            experiences_dir=str(self.brain / "4-experiences"),
+            lexical_index_path=str(self.brain / ".sidecar" / "lexical.sqlite3"),
+            chroma_path=str(self.brain / ".chroma"),
+            telemetry_db_path=str(self.brain / ".sidecar" / "telemetry.sqlite3"),
+            token_path=agent_token_path,
+            owner_token_path=owner_token_path,
+            policy_path=self.root / "security" / "host-sharing-policy.json",
+        )
+        server = memory_api.MemoryLoopbackHTTPServer("127.0.0.1", 0, runtime_config=cfg)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        def req_get(path: str) -> tuple[int, dict]:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", path, headers={"Authorization": f"Bearer {agent_token}", "X-Owner-Token": owner_token})
+            resp = conn.getresponse()
+            body = json.loads(resp.read().decode("utf-8"))
+            conn.close()
+            return resp.status, body
+
+        st1, page1 = req_get("/v1/atoms?limit=1")
+        st2, page2 = req_get("/v1/atoms?limit=1&offset=1")
+        self.assertEqual(st1, 200)
+        self.assertEqual(st2, 200)
+        self.assertEqual(page1["total"], 2)
+        self.assertEqual(len(page1["items"]), 1)
+        self.assertEqual(len(page2["items"]), 1)
+        self.assertNotEqual(page1["items"][0]["filename"], page2["items"][0]["filename"])
+
+        # 3. streaming_chat enforces allowed_projects/allow_unscoped_atoms on notes and rule.redact_pii.
+        policies = builtin_default_policies()
+        base_rule = policies["ollama_local"]
+        policies["ollama_local"] = HostSharingRule(
+            host_id=base_rule.host_id,
+            provider=base_rule.provider,
+            transport=base_rule.transport,
+            endpoint_url=base_rule.endpoint_url,
+            default_model=base_rule.default_model,
+            api_key_env=base_rule.api_key_env,
+            enabled=True,
+            allowed_projects=("project:alpha",),
+            allow_unscoped_atoms=False,
+            allow_preference_atoms=False,
+            redact_pii=True,
+            fail_on_secret_detection=True,
+        )
+        save_host_policies(policies, policy_path=self.root / "security" / "host-sharing-policy.json")
+
+        create_note("Alpha Note", "xylophone alpha contact Alice@example.com.", tags=("project:alpha",), paths=self.paths)
+        create_note("Beta Note", "xylophone beta secret context.", tags=("project:beta",), paths=self.paths)
+        create_note("Unscoped Note", "xylophone unscoped context.", tags=(), paths=self.paths)
+
+        captured_prompts: list[str] = []
+
+        def fake_stream(prompt: str, model: str):
+            captured_prompts.append(prompt)
+            yield "Grounded [N1]."
+
+        with patch("notes_store.DEFAULT_PATHS", self.paths):
+            events = list(chat_events("xylophone", mode="stream", paths=self.chat_paths(), stream_fn=fake_stream))
+
+        self.assertEqual(len(captured_prompts), 1)
+        self.assertIn("xylophone alpha", captured_prompts[0])
+        self.assertNotIn("Alice@example.com", captured_prompts[0])
+        self.assertNotIn("xylophone beta", captured_prompts[0])
+        self.assertNotIn("xylophone unscoped", captured_prompts[0])
+        self.assertTrue(any(e.get("type") == "done" for e in events))
+        audit_lines = (self.brain / ".sidecar" / OUTBOUND_AUDIT_FILENAME).read_text(encoding="utf-8").splitlines()
+        audit_rec = json.loads(audit_lines[-1])
+        self.assertGreaterEqual(int(audit_rec.get("pii_redaction_count", 0)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

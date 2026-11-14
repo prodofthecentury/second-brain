@@ -20,26 +20,13 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 
-def _default_installed_vault() -> str | None:
-    """Keep wheel-installed user data outside the immutable Python package."""
-    package_root = Path(__file__).resolve().parent.parent
-    if (package_root / "pyproject.toml").exists():
-        return None  # editable checkout: preserve the repository's brain/ path
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        return str(Path(base) / "SecondBrain" / "brain")
-    if sys.platform == "darwin":
-        return str(Path.home() / "Library" / "Application Support" / "SecondBrain" / "brain")
-    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return str(Path(base) / "second-brain" / "brain")
-
+from scripts import config as _config
+from scripts.config import _default_installed_vault
 
 if not os.environ.get("BRAIN_VAULT_DIR"):
     installed_vault = _default_installed_vault()
     if installed_vault:
         os.environ["BRAIN_VAULT_DIR"] = installed_vault
-
-from scripts import config as _config
 
 BRAIN_DIR = _config.BRAIN_DIR
 ensure_dirs = _config.ensure_dirs

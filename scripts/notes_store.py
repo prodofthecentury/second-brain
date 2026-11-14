@@ -49,6 +49,7 @@ from config import (  # noqa: E402
     NOTES_DIR,
     NOTES_INDEX_PATH,
     NOTE_SNAPSHOTS_DIR,
+    _WINDOWS_RESERVED_STEMS,
     _is_reparse_or_link,
     safe_file_in_dir,
 )
@@ -136,7 +137,10 @@ def _now_iso() -> str:
 
 def slugify(text: str, *, max_len: int = 64) -> str:
     slug = _SLUG_RE.sub("-", str(text or "").casefold()).strip("-")
-    return (slug[:max_len].rstrip("-")) or "note"
+    out = (slug[:max_len].rstrip("-")) or "note"
+    if out.split(".", 1)[0].lower() in _WINDOWS_RESERVED_STEMS:
+        out = f"note-{out}"
+    return out
 
 
 def _clean_line(value: str, max_len: int = 200) -> str:
@@ -267,7 +271,9 @@ def _create_exclusive(directory: str, stem: str, data: bytes) -> str:
     suffix = 1
     while True:
         name = f"{stem}.md" if suffix == 1 else f"{stem}-{suffix}.md"
-        path = os.path.join(directory, name)
+        path = safe_file_in_dir(directory, name, allowed_exts={".md"}, must_exist=False)
+        if not path:
+            raise NoteError(f"Invalid note filename: {name!r}")
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
         except FileExistsError:
@@ -454,11 +460,8 @@ def list_notes(
 
 def backlinks(filename: str, *, paths: NotePaths = DEFAULT_PATHS, limit: int = 50) -> list[NoteRecord]:
     """Notes linking to ``filename`` via [[wikilink]] (title or stem match)."""
+    title = get_note(filename, paths=paths).title
     stem = Path(filename).stem
-    try:
-        title = get_note(filename, paths=paths).title
-    except NoteError:
-        title = stem
     found: dict[str, NoteRecord] = {}
     for term in {stem, title}:
         for rec in search_notes(term.replace("-", " "), limit=limit, paths=paths):
@@ -493,7 +496,7 @@ def verify_note_excerpt(
         raise NoteError("Verification requires an explicit human owner actor.")
     if memory_type not in {"semantic", "episodic", "procedural", "self"}:
         raise NoteError(f"Unsupported memory_type: {memory_type!r}")
-    flat_excerpt = re.sub(r"\s+", " ", str(excerpt or "")).strip().lstrip("#>*- ").strip()
+    flat_excerpt = re.sub(r"\s+", " ", str(excerpt or "")).strip().lstrip("#> ").strip()
     if len(flat_excerpt) < 12:
         raise NoteError("Select at least 12 characters of the note to verify.")
     if len(flat_excerpt) > 4000:

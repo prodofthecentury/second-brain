@@ -30,6 +30,13 @@ esac
 
 if [ -d "$DIST_DIR" ]; then
   cd "$DIST_DIR"
-  find . -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.AppImage' -o -name '*.deb' \) \
-    -printf '%f\n' 2>/dev/null || ls -1 *.dmg *.zip *.AppImage *.deb 2>/dev/null | xargs -r sha256sum > SHA256SUMS.txt || true
+  shopt -s nullglob
+  artifacts=(*.dmg *.zip *.AppImage *.deb)
+  if [ "${#artifacts[@]}" -gt 0 ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "${artifacts[@]}" > SHA256SUMS.txt
+    elif command -v shasum >/dev/null 2>&1; then
+      shasum -a 256 "${artifacts[@]}" > SHA256SUMS.txt
+    fi
+  fi
 fi

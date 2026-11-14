@@ -85,11 +85,25 @@ function findFreePort(preferred = 8765) {
   });
 }
 
+function getDefaultPackagedVaultDir() {
+  if (process.platform === "win32") {
+    const localAppData =
+      process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    return path.join(localAppData, "SecondBrain", "brain");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "SecondBrain", "brain");
+  }
+  const dataHome =
+    process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+  return path.join(dataHome, "second-brain", "brain");
+}
+
 function spawnBackendCli(args) {
   const root = getBackendRoot();
   const env = { ...process.env, PYTHONUTF8: "1" };
   if (app.isPackaged && !env.BRAIN_VAULT_DIR) {
-    const userVault = path.join(app.getPath("userData"), "brain");
+    const userVault = getDefaultPackagedVaultDir();
     fs.mkdirSync(userVault, { recursive: true });
     env.BRAIN_VAULT_DIR = userVault;
   }
@@ -192,7 +206,7 @@ function getVaultDir() {
     return path.resolve(process.env.BRAIN_VAULT_DIR);
   }
   if (app.isPackaged) {
-    return path.join(app.getPath("userData"), "brain");
+    return getDefaultPackagedVaultDir();
   }
   return path.join(getBackendRoot(), "brain");
 }
