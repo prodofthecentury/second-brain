@@ -306,7 +306,7 @@ synchronized across both files.
   `plugins/claude-code/second-brain/`), Electron desktop app (`desktop/`), VS Code
   extension (`extensions/vscode-second-brain/`), Authenticode signing script
   (`scripts/sign_release.ps1`), custom planner schema support (`scripts/host_adapters.py`),
-  MCP notes/remember tools with `trusted_stdio_session()`, and 25 tests in
+  MCP notes/remember tools with `trusted_stdio_session()`, and 30 tests in
   `scripts/phase4_product_tests.py` (including Phase 4 audit remediations
   `P4-HIGH-01`..`P4-MED-04`) integrated into the 10-suite `scripts/test_all.py`
   release gate (`10/10 PASS`).

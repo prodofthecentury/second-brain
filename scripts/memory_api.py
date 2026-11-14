@@ -559,28 +559,6 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"hardware": hw_dict, "hosts": hosts_summary})
             return
 
-        if path == "/v1/inbox/queue":
-            items = list_inbox_items(rt.inbox_dir)
-            _audit_api_event(rt.brain_dir, path, "GET", 200)
-            self._send_json(
-                200,
-                {
-                    "count": len(items),
-                    "items": [
-                        {
-                            "filename": item.filename,
-                            "sha256": item.sha256,
-                            "size_bytes": item.size_bytes,
-                            "modified_at": item.modified_at,
-                            "origin": item.origin,
-                            "risk_flags": list(item.risk_flags),
-                        }
-                        for item in items
-                    ],
-                },
-            )
-            return
-
         if path == "/v1/cognitive/fitness":
             report = compute_memory_fitness_report(
                 atoms_dir=rt.atoms_dir,

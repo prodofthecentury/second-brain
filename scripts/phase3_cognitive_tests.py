@@ -1396,12 +1396,14 @@ class Phase3RemediationRegressionTests(Phase3IsolatedTestCase):
                 "playbook_id: bad-sem-pb\n"
                 "type: playbook\n"
                 "playbook_status: active\n"
-                "backing_atoms:\n  - sem-fact.md\n"
-                f"backing_atom_sha256:\n  sem-fact.md: {sem_sha}\n"
-                "contexts:\n  - project:second_brain\n"
+                'contexts: ["project:second_brain"]\n'
+                'backing_atoms: ["sem-fact.md"]\n'
+                f'backing_atom_sha256s: {{"sem-fact.md": "{sem_sha}"}}\n'
+                'acknowledged_corrections: {"sem-fact.md": 0}\n'
                 "---\n\n"
-                "## Trigger / Scope\nWhen debugging WAL\n\n"
-                "## Owner-Authored Preconditions\n- Lock acquired\n\n"
+                "# Bad Semantic Playbook\n\n"
+                "## Trigger & Applicability\nWhen debugging WAL\n\n"
+                "## Preconditions & Inputs\n- Lock acquired\n\n"
                 "## Ordered Steps\n1. SQLite WAL files grow during long transactions.\n\n"
                 "## Expected Outputs & Verification\n- WAL bounded\n\n"
                 "## Failure Modes & Rollback\n- Abort cleanly\n",
@@ -1446,12 +1448,14 @@ class Phase3RemediationRegressionTests(Phase3IsolatedTestCase):
                 "playbook_id: bad-pref-pb\n"
                 "type: playbook\n"
                 "playbook_status: active\n"
-                "backing_atoms:\n  - pref-rule.md\n"
-                f"backing_atom_sha256:\n  pref-rule.md: {pref_sha}\n"
-                "contexts:\n  - project:second_brain\n"
+                'contexts: ["project:second_brain"]\n'
+                'backing_atoms: ["pref-rule.md"]\n'
+                f'backing_atom_sha256s: {{"pref-rule.md": "{pref_sha}"}}\n'
+                'acknowledged_corrections: {"pref-rule.md": 0}\n'
                 "---\n\n"
-                "## Trigger / Scope\nWhen preparing release\n\n"
-                "## Owner-Authored Preconditions\n- Checklist open\n\n"
+                "# Bad Preference Playbook\n\n"
+                "## Trigger & Applicability\nWhen preparing release\n\n"
+                "## Preconditions & Inputs\n- Checklist open\n\n"
                 "## Ordered Steps\n1. Prefer concise checklists before deployments.\n\n"
                 "## Expected Outputs & Verification\n- Checklist done\n\n"
                 "## Failure Modes & Rollback\n- Halt release\n",
@@ -1506,8 +1510,9 @@ class Phase3RemediationRegressionTests(Phase3IsolatedTestCase):
                 telemetry_db_path=telemetry_db,
                 policy_path=policy_file,
             )
-            self.assertTrue(empty_plan.abstained)
             self.assertFalse(empty_plan.plan_ready)
+            self.assertEqual(empty_plan.steps, ())
+            self.assertIn("no verified active Playbooks or owner-approved memories match this goal", empty_plan.summary)
 
             # _count_unapproved_candidates skips superseded drafts.
             _seed_atom(
@@ -1581,7 +1586,7 @@ class Phase3RemediationRegressionTests(Phase3IsolatedTestCase):
                         goal="Run alpha-beta cross-check before deploy",
                         project_scope="project:alpha",
                         mode="model_assisted",
-                        host_id="ollama_local",
+                        host_id="openai_online",
                     ),
                     brain_dir=str(brain),
                     atoms_dir=str(atoms_dir),
@@ -1630,7 +1635,10 @@ class Phase3RemediationRegressionTests(Phase3IsolatedTestCase):
                     skip_dns_check_for_mock_transport=True,
                 )
             self.assertTrue(fb_plan.plan_ready)
-            self.assertIn("planner_transport_fallback", fb_plan.gaps)
+            self.assertEqual(fb_plan.mode_used, "deterministic_fallback")
+            self.assertTrue(any("Model-assisted ordering unavailable" in g for g in fb_plan.epistemic_gaps))
+            audit_text = (brain / ".sidecar" / "outbound-host-audit.jsonl").read_text(encoding="utf-8")
+            self.assertIn("planner_transport_fallback", audit_text)
 
     def test_lexical_recall_trusted_position_unaffected_by_unapproved_drafts(self):
         from lexical_store import rebuild_lexical_index

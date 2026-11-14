@@ -51,7 +51,7 @@ from host_adapters import (
     validate_endpoint_network_boundary,
     validate_model_identifier,
 )
-from lexical_store import TOKEN_PATTERN
+from lexical_store import LexicalIndexUnavailable, TOKEN_PATTERN
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 from recall import (
@@ -468,7 +468,7 @@ def assemble_executive_plan(
             index_path=lexical_index_path,
             chroma_path=chroma_path,
         )
-    except MemoryRecallUnavailable:
+    except (MemoryRecallUnavailable, LexicalIndexUnavailable):
         has_atom_files = os.path.isdir(atoms_dir) and any(is_content_markdown(n) for n in os.listdir(atoms_dir))
         if not os.path.exists(lexical_index_path) and not has_atom_files:
             direct, neighbors = [], []

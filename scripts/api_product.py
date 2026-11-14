@@ -360,7 +360,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             from inbox_workflow import list_inbox_items
 
             items = [{**asdict(i), "risk_flags": list(i.risk_flags)} for i in list_inbox_items(rt.inbox_dir)]
-            return send(200, {"total": len(items), "items": items})
+            return send(200, {"total": len(items), "count": len(items), "items": items})
 
         if path in {"/v1/inbox/promote", "/v1/inbox/reject"} and method == "POST":
             if not owner_only():

@@ -2,7 +2,7 @@
 
 ## 1. Executive Verdict
 
-All engineering milestones across Goals 0–16 for the **Second Brain** local pilot and Phase 2 / 3A / 4 product ecosystem are implemented, independently audited, reconciled, and verified at **100% pass rate** (`10/10` test suites in `scripts/test_all.py`: `72/72` tests in `scripts/system_safety_tests.py`, `10/10` tests in `scripts/phase2_safety_tests.py`, `10/10` tests in `scripts/phase3_cognitive_tests.py`, `25/25` tests in `scripts/phase4_product_tests.py`, plus `doctor`, `evaluation_dataset`, `audit_sources`, `scale_benchmark_1500`, `chroma_rebuild_canary`, and `smoke_test`). See [phase2-architecture-and-sweep-2026-11-15.md](phase2-architecture-and-sweep-2026-11-15.md) and [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md) for Phase 2–4 architecture and security audit reconciliations.
+All engineering milestones across Goals 0–16 for the **Second Brain** local pilot and Phase 2 / 3A / 4 product ecosystem are implemented, independently audited, reconciled, and verified at **100% pass rate** (`10/10` test suites in `scripts/test_all.py`: `72/72` tests in `scripts/system_safety_tests.py`, `10/10` tests in `scripts/phase2_safety_tests.py`, `13/13` tests in `scripts/phase3_cognitive_tests.py`, `30/30` tests in `scripts/phase4_product_tests.py`, plus `doctor`, `evaluation_dataset`, `audit_sources`, `scale_benchmark_1500`, `chroma_rebuild_canary`, and `smoke_test`). See [phase2-architecture-and-sweep-2026-11-15.md](phase2-architecture-and-sweep-2026-11-15.md) and [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md) for Phase 2–4 architecture and security audit reconciliations.
 
 Every Non-Negotiable System Invariant holds unconditionally across CLI, Streamlit Dashboard, MCP, Scout, and Refinery entrypoints:
 
@@ -91,8 +91,8 @@ Executed via `scripts/evaluate_answers.py` (`5` deterministic passes $\times$ `2
   3. `audit_sources` (`scripts/audit_sources.py`) — **PASS** (`0.71s`, all approved source byte offsets & SHA-256 hashes verified).
   4. `system_safety_tests` (`scripts/system_safety_tests.py`) — **PASS** (`22.85s`, `72` tests).
   5. `phase2_safety_tests` (`scripts/phase2_safety_tests.py`) — **PASS** (`4.21s`, `10/10` tests; see [phase2-architecture-and-sweep-2026-11-15.md](phase2-architecture-and-sweep-2026-11-15.md)).
-  6. `phase3_cognitive_tests` (`scripts/phase3_cognitive_tests.py`) — **PASS** (`5.43s`, `10/10` tests; see [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md)).
-  7. `phase4_product_tests` (`scripts/phase4_product_tests.py`) — **PASS** (`8.56s`, `25/25` tests; see [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md)).
+  6. `phase3_cognitive_tests` (`scripts/phase3_cognitive_tests.py`) — **PASS** (`5.43s`, `13/13` tests; see [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md)).
+  7. `phase4_product_tests` (`scripts/phase4_product_tests.py`) — **PASS** (`8.56s`, `30/30` tests; see [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md)).
   8. `scale_benchmark_1500` (`scripts/scale_benchmark.py`) — **PASS** (`3.38s`, 1,500-note synthetic corpus scale canary).
   9. `chroma_rebuild_canary` (`scripts/chroma_rebuild_canary.py`) — **PASS** (`2.13s`, real ChromaDB staged rebuild & cleanup canary).
   10. `smoke_test` (`scripts/smoke_test.py`) — **PASS** (`29.30s`, end-to-end vault intake, CAS, grounding, lexical & dense recall verified).
