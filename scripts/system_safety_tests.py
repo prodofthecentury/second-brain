@@ -2399,6 +2399,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
         self.assertIn("capabilities", areas)
         self.assertIn("vault dirs", areas)
         self.assertIn("lexical recall", areas)
+        self.assertIn("capability tier", areas)
         failures = [item for item in checks if item[0] == "FAIL"]
         self.assertEqual(failures, [])
 
@@ -2410,6 +2411,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "evaluation_dataset",
                 "audit_sources",
                 "system_safety_tests",
+                "phase2_safety_tests",
                 "chroma_rebuild_canary",
                 "smoke_test",
             },

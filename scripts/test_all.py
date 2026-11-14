@@ -49,6 +49,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "system_safety_tests.py")),
     ),
     (
+        "phase2_safety_tests",
+        "Phase 2 hardware tiers, inbox promotion, online consent/redaction, cognitive core & loopback API suite (scripts/phase2_safety_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "phase2_safety_tests.py")),
+    ),
+    (
         "chroma_rebuild_canary",
         "Real ChromaDB staged vector rebuild, cosine activation & handle cleanup canary (scripts/chroma_rebuild_canary.py)",
         (str(SCRIPTS_DIR / "chroma_rebuild_canary.py"),),

@@ -38,7 +38,7 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts"))
 
 from scripts.config import (
-    ATOMS_DIR, THREADS_DIR, RAW_DIR, INBOX_DIR, SOURCES_DIR, BRIEFINGS_DIR, SIDECAR_DIR,
+    BRAIN_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, RAW_DIR, INBOX_DIR, SOURCES_DIR, BRIEFINGS_DIR, SIDECAR_DIR,
     GEN_MODEL, READING_LIST,
     ensure_dirs, read_house_rules, today, now_slug,
     is_content_markdown,
@@ -50,13 +50,42 @@ from scripts.recall import (
     search_memory as recall_search_memory,
     suggest_duplicate_atoms,
 )
-from scripts.answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, answer_from_memory, build_grounding_prompt, validate_standard_answer
+from scripts.answer_policy import (
+    ANSWER_DRAFT_SCHEMA,
+    AnswerRequest,
+    NO_APPROVED_MEMORY_RESPONSE,
+    answer_from_memory,
+    build_grounding_prompt,
+    validate_standard_answer,
+)
 from scripts.atom_mutator import apply_atom_edit, apply_atom_merge
 from scripts.review_atom import apply_review_transition, approved_revision_is_current
 from scripts.memory_review import parse_atom_record
 from scripts.review_atom import review_lock
 from scripts.review_details import atom_review_details
 from scripts.dashboard_auth import assert_loopback_address, require_dashboard_login
+from scripts.hardware_profile import detect_hardware_profile
+from scripts.inbox_workflow import inspect_inbox_item, list_inbox_items, promote_inbox_item, reject_inbox_item
+from scripts.host_adapters import (
+    HostConsentError,
+    HostSharingRule,
+    _audit_outbound_call,
+    _redact_outbound_with_map,
+    _rehydrate_draft_claims,
+    filter_atoms_for_host,
+    load_host_policies,
+    save_host_policies,
+    validate_endpoint_network_boundary,
+    validate_model_identifier,
+)
+from scripts.cognitive_core import (
+    compute_memory_fitness_report,
+    peek_lexical_candidate_atom_ids,
+    record_atom_feedback,
+    record_grounded_answer_telemetry,
+    record_retrieval_telemetry,
+    save_experience_record,
+)
 
 ensure_dirs()
 
@@ -221,9 +250,35 @@ def make_slug(text: str, max_len: int = 60) -> str:
     slug = re.sub(r"\s+", "-", slug).strip("-")
     return slug[:max_len]
 
+def _stream_local_ollama_chat(*, endpoint_url: str, model: str, messages: list[dict], schema: dict):
+    chat_attr = getattr(ollama, "chat", None)
+    client_attr = getattr(ollama, "Client", None)
+    if (
+        chat_attr is not None
+        and not getattr(chat_attr, "__module__", "ollama").startswith("ollama")
+        and getattr(client_attr, "__module__", "ollama").startswith("ollama")
+    ):
+        return chat_attr(
+            model=model,
+            messages=messages,
+            format=schema,
+            stream=True,
+        )
+    client = ollama.Client(host=endpoint_url)
+    return client.chat(
+        model=model,
+        messages=messages,
+        format=schema,
+        stream=True,
+    )
+
 def get_ollama_model_names() -> list[str]:
     try:
-        response = ollama.list()
+        local_rule = load_host_policies().get("ollama_local")
+        if local_rule is None or not local_rule.enabled:
+            return []
+        validate_endpoint_network_boundary(local_rule)
+        response = ollama.Client(host=local_rule.endpoint_url).list()
     except Exception:
         return []
 
@@ -518,7 +573,14 @@ st.sidebar.markdown("<br>", unsafe_allow_html=True)
 # Navigation Menu
 nav_selection = st.sidebar.radio(
     "NAVIGATION",
-    ["💬 Chat with Memory", "🕸️ Knowledge Graph", "🗄️ Vault Explorer", "📥 Inbox & Web Scout", "⚙️ System Control"],
+    [
+        "💬 Chat with Memory",
+        "🕸️ Knowledge Graph",
+        "🗄️ Vault Explorer",
+        "📥 Inbox & Web Scout",
+        "🧬 Host API, Quarantine & Fitness",
+        "⚙️ System Control",
+    ],
     index=0
 )
 
@@ -602,65 +664,123 @@ if nav_selection == "💬 Chat with Memory":
                 )
                 
             all_refs = direct_refs + neighbor_refs
-
-            if all_refs:
-                ref_text = build_grounding_prompt(
-                    AnswerRequest(query=user_prompt, mode=rag_answer_mode, result_limit=rag_n_results),
-                    all_refs,
+            try:
+                record_retrieval_telemetry(
+                    [item["filename"] for item in direct_refs],
+                    candidate_atom_ids=peek_lexical_candidate_atom_ids(user_prompt),
+                    mode=rag_retrieval_mode,
                 )
-                st.info(f"📚 Retrieved {len(direct_refs)} direct atoms and {len(neighbor_refs)} linked atoms.")
+            except Exception:
+                pass
+
+            local_rule = load_host_policies().get("ollama_local")
+            policy_blocked_reason: str | None = None
+            if local_rule is None or not local_rule.enabled:
+                policy_blocked_reason = (
+                    "Host policy blocked: 'ollama_local' is disabled in `host-sharing-policy.json`. "
+                    "Enable it in the Host Consent tab before chatting."
+                )
             else:
-                ref_text = ""
-                st.warning("⚠ No relevant owner-approved memory found. The assistant will abstain.")
-                
-            response_container = st.empty()
-            full_response = ""
-            if not ref_text.strip():
-                full_response = answer_from_memory(ref_text, lambda: "")
-                response_container.text(full_response)
+                try:
+                    validate_endpoint_network_boundary(local_rule)
+                    if rag_answer_mode == "preference" and not local_rule.allow_preference_atoms:
+                        raise HostConsentError(
+                            "Host 'ollama_local' is not authorized to receive owner subjective preference memories."
+                        )
+                except HostConsentError as policy_exc:
+                    policy_blocked_reason = f"Host policy blocked: {policy_exc}"
+
+            if policy_blocked_reason is not None:
+                st.error(policy_blocked_reason)
+                try:
+                    record_grounded_answer_telemetry([], abstained=True, mode=rag_answer_mode)
+                except Exception:
+                    pass
                 st.session_state.chat_history.append({
                     "role": "assistant",
-                    "content": full_response,
+                    "content": policy_blocked_reason,
                     "claims": (),
                 })
             else:
-                ollama_msgs = [{"role": "system", "content": ref_text}]
-                for past_msg in st.session_state.chat_history[-10:]:
-                    if past_msg["role"] == "user":
-                        ollama_msgs.append({"role": "user", "content": past_msg.get("content", "")})
-                    elif past_msg.get("claims"):
-                        replay = validate_standard_answer(
-                            past_msg.get("draft_json", ""),
-                            past_msg.get("retrieved_atoms", []),
-                            atoms_dir=ATOMS_DIR,
-                            mode=past_msg.get("answer_mode", "standard"),
-                        )
-                        if replay.answerable:
-                            ollama_msgs.append({"role": "assistant", "content": replay.text})
+                assert local_rule is not None
+                scoped_refs = filter_atoms_for_host(all_refs, local_rule, mode=rag_answer_mode)
 
-                try:
-                    response_stream = ollama.chat(
-                        model=st_model, messages=ollama_msgs, format=ANSWER_DRAFT_SCHEMA, stream=True
+                if scoped_refs:
+                    ref_text = build_grounding_prompt(
+                        AnswerRequest(query=user_prompt, mode=rag_answer_mode, result_limit=rag_n_results),
+                        scoped_refs,
                     )
-                    for chunk in response_stream:
-                        content = chunk["message"]["content"]
-                        full_response += content
-                    model_draft_json = full_response
-                    answer = validate_standard_answer(
-                        full_response, all_refs, atoms_dir=ATOMS_DIR, mode=rag_answer_mode
-                    )
-                    full_response = answer.text
+                    st.info(f"📚 Retrieved {len(direct_refs)} direct atoms and {len(neighbor_refs)} linked atoms ({len(scoped_refs)} permitted by host policy).")
+                else:
+                    ref_text = ""
+                    st.warning("⚠ No relevant owner-approved memory permitted by host policy found. The assistant will abstain.")
+
+                response_container = st.empty()
+                full_response = ""
+                if not ref_text.strip():
+                    full_response = NO_APPROVED_MEMORY_RESPONSE if all_refs else answer_from_memory(ref_text, lambda: "")
+                    try:
+                        record_grounded_answer_telemetry([], abstained=True, mode=rag_answer_mode)
+                    except Exception:
+                        pass
                     response_container.text(full_response)
                     st.session_state.chat_history.append({
                         "role": "assistant",
-                        "content": full_response if not answer.answerable else "",
-                        "claims": answer.claims,
-                        "draft_json": model_draft_json if answer.answerable else "",
-                        "retrieved_atoms": all_refs if answer.answerable else [],
-                        "answer_mode": rag_answer_mode,
+                        "content": full_response,
+                        "claims": (),
                     })
-                except Exception as e:
-                    st.error(f"Error connecting to Ollama: {e}")
+                else:
+                    try:
+                        safe_st_model = validate_model_identifier(st_model, provider="ollama")
+                        redaction, pii_placeholder_map = _redact_outbound_with_map(
+                            ref_text,
+                            redact_pii=local_rule.redact_pii,
+                            fail_on_secret_detection=local_rule.fail_on_secret_detection,
+                        )
+                        response_stream = _stream_local_ollama_chat(
+                            endpoint_url=local_rule.endpoint_url,
+                            model=safe_st_model,
+                            messages=[{"role": "user", "content": redaction.sanitized_text}],
+                            schema=ANSWER_DRAFT_SCHEMA,
+                        )
+                        for chunk in response_stream:
+                            content = chunk["message"]["content"]
+                            full_response += content
+                        rehydrated_draft = _rehydrate_draft_claims(full_response, pii_placeholder_map)
+                        answer = validate_standard_answer(
+                            rehydrated_draft, scoped_refs, atoms_dir=ATOMS_DIR, mode=rag_answer_mode
+                        )
+                        _audit_outbound_call(
+                            brain_dir=BRAIN_DIR,
+                            rule=local_rule,
+                            model=safe_st_model,
+                            atom_ids=[str(r.get("filename", "")) for r in scoped_refs],
+                            pii_redactions=redaction.pii_redaction_count,
+                            outcome="grounded_answer" if answer.answerable else "abstained",
+                        )
+                        cited_atoms = [ev.atom_id for cl in answer.claims for ev in cl.evidence]
+                        try:
+                            record_grounded_answer_telemetry(
+                                cited_atoms,
+                                abstained=not answer.answerable,
+                                mode=rag_answer_mode,
+                            )
+                        except Exception:
+                            pass
+                        full_response = answer.text
+                        response_container.text(full_response)
+                        st.session_state.chat_history.append({
+                            "role": "assistant",
+                            "content": full_response if not answer.answerable else "",
+                            "claims": answer.claims,
+                            "draft_json": rehydrated_draft if answer.answerable else "",
+                            "retrieved_atoms": scoped_refs if answer.answerable else [],
+                            "answer_mode": rag_answer_mode,
+                        })
+                    except HostConsentError as e:
+                        st.error(f"Host policy blocked: {e}")
+                    except Exception as e:
+                        st.error(f"Error invoking AI host: {e}")
 
 
 # PAGE 2: KNOWLEDGE GRAPH
@@ -733,6 +853,7 @@ elif nav_selection == "🗄️ Vault Explorer":
         [
             "2-atoms (Atoms)",
             "3-threads (Threads)",
+            "4-experiences (Experience Records)",
             "sources (Web Pages)",
             "0-raw (Inbox)",
             "0-raw/inbox (Quarantined MCP Inbox)",
@@ -743,6 +864,7 @@ elif nav_selection == "🗄️ Vault Explorer":
     folder_map = {
         "2-atoms (Atoms)": ATOMS_DIR,
         "3-threads (Threads)": THREADS_DIR,
+        "4-experiences (Experience Records)": EXPERIENCES_DIR,
         "sources (Web Pages)": SOURCES_DIR,
         "0-raw (Inbox)": RAW_DIR,
         "0-raw/inbox (Quarantined MCP Inbox)": INBOX_DIR,
@@ -753,7 +875,7 @@ elif nav_selection == "🗄️ Vault Explorer":
         st.info("This vault category has no files yet.")
     else:
         files = sorted([f for f in os.listdir(dir_path) if f.endswith(".md") or f.endswith(".intake")])
-        if dir_path in (ATOMS_DIR, INBOX_DIR):
+        if dir_path in (ATOMS_DIR, INBOX_DIR, EXPERIENCES_DIR):
             files = [filename for filename in files if filename != "README.md"]
         search_query = st.text_input("🔍 Search filenames", "")
         
@@ -983,8 +1105,16 @@ elif nav_selection == "📥 Inbox & Web Scout":
                 filename = f"{now_slug()}-dashboard-{title_slug}.md"
                 filepath = os.path.join(RAW_DIR, filename)
                 
+                safe_inbox_source = (
+                    inbox_source.replace("--", "—")
+                    .replace(">", "")
+                    .replace("<", "")
+                    .replace("\r", " ")
+                    .replace("\n", " ")
+                    .strip()[:200]
+                )
                 content = f"""<!-- Capture via Dashboard on {today()} -->
-<!-- Source: {inbox_source} -->
+<!-- Source: {safe_inbox_source} -->
 
 {inbox_content}
 """
@@ -1057,6 +1187,154 @@ elif nav_selection == "📥 Inbox & Web Scout":
     if st.button("🕸️ Run Web Scout Now"):
         proc = run_script_process("scripts/ollama_scout.py")
         stream_logs_ui(proc, "Active Web Scout running")
+
+
+# PAGE 4B: HOST API, QUARANTINE & COGNITIVE FITNESS
+elif nav_selection == "🧬 Host API, Quarantine & Fitness":
+    st.title("🧬 Host Ecosystem, Quarantine & Cognitive Core")
+    tab_quarantine, tab_hosts, tab_fitness = st.tabs([
+        "🛡️ Quarantined Inbox (0-raw/inbox)",
+        "🔌 Hardware Tier & AI Host Consent",
+        "🧠 Cognitive Fitness & Experiences",
+    ])
+
+    with tab_quarantine:
+        st.subheader("Quarantined Captures Awaiting Owner Promotion")
+        st.caption("Captures from local MCP, Loopback Memory API, and Experience Proposals remain isolated in `0-raw/inbox/` until CAS-verified promotion.")
+        q_items = list_inbox_items(INBOX_DIR)
+        if not q_items:
+            st.success("Quarantined inbox is clean (0 pending captures).")
+        else:
+            selected_q = st.selectbox("Select Quarantined Capture", [item.filename for item in q_items])
+            if selected_q:
+                q_detail = inspect_inbox_item(selected_q, inbox_dir=INBOX_DIR)
+                st.write(f"**SHA-256:** `{q_detail['sha256']}` | **Origin:** `{q_detail['origin']}` | **Size:** `{q_detail['size_bytes']}` bytes")
+                if q_detail["risk_flags"]:
+                    st.warning(f"Security Risk Flags Detected: {', '.join(q_detail['risk_flags'])}")
+                st.code(str(q_detail["content"]), language="markdown")
+
+                actor_name = st.text_input("Owner Actor Identity", value="owner", key="inbox_actor_input")
+                ack_risks = False
+                if q_detail["risk_flags"]:
+                    ack_risks = st.checkbox("I have inspected the raw capture above and acknowledge the flagged risks (forged frontmatter and beacons will be stripped/defanged).")
+                col_p, col_r = st.columns(2)
+                with col_p:
+                    if st.button("✅ Promote to 0-raw/ (CAS-Verified)", key="btn_promote_inbox"):
+                        try:
+                            dec = promote_inbox_item(
+                                selected_q,
+                                expected_sha256=str(q_detail["sha256"]),
+                                actor=actor_name,
+                                acknowledge_risks=ack_risks,
+                            )
+                            st.success(f"Promoted to `0-raw/{dec['promoted_filename']}` (SHA-256 `{dec['promoted_sha256']}`).")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Promotion blocked: {exc}")
+                with col_r:
+                    if st.button("🗑️ Reject & Archive Capture", key="btn_reject_inbox"):
+                        try:
+                            reject_inbox_item(
+                                selected_q,
+                                expected_sha256=str(q_detail["sha256"]),
+                                actor=actor_name,
+                            )
+                            st.info(f"Rejected and archived `{selected_q}`.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Rejection failed: {exc}")
+
+    with tab_hosts:
+        st.subheader("Hardware Capability Profile")
+        hw = detect_hardware_profile(ollama_timeout=2.0, use_cache=True)
+        st.info(
+            f"**{hw.tier_label}** (`{hw.tier_id}`)\n\n"
+            f"- **Memory / Compute:** {hw.available_ram_gib:.1f} GiB free / {hw.total_ram_gib:.1f} GiB total | {hw.gpu_name}\n"
+            f"- **Recommended Model:** `{hw.recommended_generation_model}` (Installed match: `{hw.selected_installed_generation_model or 'none'}`)\n"
+            f"- **Recommended Retrieval:** `{hw.recommended_retrieval_mode}` (P95 target <= {hw.retrieval_p95_slo_ms:.0f} ms)\n"
+            f"- **Rationale:** {hw.rationale}"
+        )
+
+        st.divider()
+        st.subheader("Per-Host AI Data-Sharing Consent Policy")
+        st.caption("Online hosts are disabled by default, require HTTPS + public DNS validation, enforce PII/credential redaction, and undergo identical out-of-model grounding.")
+        policies = load_host_policies()
+        chosen_host = st.selectbox("Select AI Host Profile", sorted(policies.keys()))
+        if chosen_host:
+            rule = policies[chosen_host]
+            en_val = st.checkbox("Enable Context Sharing with this Host", value=rule.enabled, key=f"en_{chosen_host}")
+            scopes_text = st.text_input(
+                "Allowed Project Scopes (comma-separated, e.g. `project:second_brain` or `*`)",
+                value=", ".join(rule.allowed_projects),
+                key=f"sc_{chosen_host}",
+            )
+            unscoped_val = st.checkbox("Allow Unscoped Atoms", value=rule.allow_unscoped_atoms, key=f"un_{chosen_host}")
+            pref_val = st.checkbox("Allow Owner Subjective Preference Atoms", value=rule.allow_preference_atoms, key=f"pr_{chosen_host}")
+            model_val = st.text_input("Default Model Name", value=rule.default_model, key=f"md_{chosen_host}")
+            if st.button("💾 Save Host Sharing Policy", key=f"save_{chosen_host}"):
+                try:
+                    new_scopes = tuple(s.strip() for s in scopes_text.split(",") if s.strip())
+                    validated_model = validate_model_identifier(
+                        model_val.strip() or rule.default_model,
+                        provider=rule.provider,
+                    )
+                    policies[chosen_host] = HostSharingRule(
+                        host_id=rule.host_id,
+                        provider=rule.provider,
+                        transport=rule.transport,
+                        endpoint_url=rule.endpoint_url,
+                        default_model=validated_model,
+                        api_key_env=rule.api_key_env,
+                        enabled=en_val,
+                        allowed_projects=new_scopes,
+                        allow_unscoped_atoms=unscoped_val,
+                        allow_preference_atoms=pref_val,
+                        redact_pii=True if rule.transport == "online" else rule.redact_pii,
+                        fail_on_secret_detection=True if rule.transport == "online" else rule.fail_on_secret_detection,
+                    )
+                    saved_to = save_host_policies(policies)
+                    st.success(f"Updated policy for `{chosen_host}` at `{saved_to}`.")
+                except Exception as exc:
+                    st.error(f"Could not save policy: {exc}")
+
+    with tab_fitness:
+        st.subheader("Memory Fitness & Procedural Skill Maturity")
+        report = compute_memory_fitness_report()
+        qs = report["query_summary"]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Recall Queries", qs["total_recall_events"])
+        m2.metric("Answer Turns", qs["total_answer_events"])
+        m3.metric("High-Utility Atoms", len(report["high_utility_verified_atoms"]))
+        m4.metric("Pending Bottlenecks", len(report["pending_review_bottlenecks"]))
+
+        if report["high_utility_verified_atoms"]:
+            st.markdown("#### Verified High-Utility Memories")
+            st.dataframe(pd.DataFrame(report["high_utility_verified_atoms"]), use_container_width=True)
+        if report["pending_review_bottlenecks"]:
+            st.markdown("#### Highest-Priority Pending Atoms to Review")
+            st.dataframe(pd.DataFrame(report["pending_review_bottlenecks"]), use_container_width=True)
+        if report["procedure_maturity"]:
+            st.markdown("#### Procedural Maturity Stages (`procedural_draft -> verified_procedure -> skill_candidate`)")
+            st.dataframe(pd.DataFrame(report["procedure_maturity"]), use_container_width=True)
+
+        st.divider()
+        st.markdown("#### Log Completed Task Experience (`4-experiences/`)")
+        exp_goal = st.text_input("Task Goal", key="exp_goal")
+        exp_res = st.text_area("Outcome & Reflection Summary", key="exp_res")
+        exp_proc = st.text_input("Optional Candidate Procedure Title", key="exp_proc")
+        exp_prop = st.checkbox("Propose Candidate Procedure to Quarantined `0-raw/inbox/`", value=False, key="exp_prop")
+        if st.button("📝 Record Immutable Experience", key="btn_save_exp"):
+            try:
+                saved_exp = save_experience_record(
+                    goal=exp_goal,
+                    result_summary=exp_res,
+                    success=True,
+                    candidate_procedure_title=exp_proc or None,
+                    propose_to_inbox=exp_prop,
+                )
+                st.success(f"Saved `4-experiences/{saved_exp['filename']}` (SHA-256 `{saved_exp['sha256']}`).")
+            except Exception as exc:
+                st.error(f"Could not save experience: {exc}")
 
 
 # PAGE 5: SYSTEM CONTROL

@@ -17,8 +17,32 @@ from rich.console import Console
 from rich.markup import escape as rich_escape
 from rich.panel import Panel
 
-from scripts.config import ATOMS_DIR, GEN_MODEL
-from scripts.answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, answer_from_memory, build_grounding_prompt, validate_standard_answer
+from scripts.config import ATOMS_DIR, BRAIN_DIR, GEN_MODEL
+from scripts.answer_policy import (
+    ANSWER_DRAFT_SCHEMA,
+    AnswerRequest,
+    NO_APPROVED_MEMORY_RESPONSE,
+    answer_from_memory,
+    build_grounding_prompt,
+    validate_standard_answer,
+)
+from scripts.cognitive_core import (
+    peek_lexical_candidate_atom_ids,
+    record_grounded_answer_telemetry,
+    record_retrieval_telemetry,
+)
+from scripts.hardware_profile import detect_hardware_profile
+from scripts.host_adapters import (
+    HostConsentError,
+    _audit_outbound_call,
+    _redact_outbound_with_map,
+    _rehydrate_draft_claims,
+    filter_atoms_for_host,
+    generate_grounded_answer_via_host,
+    load_host_policies,
+    validate_endpoint_network_boundary,
+    validate_model_identifier,
+)
 from scripts.recall import (
     MemoryRecallUnavailable,
     RecallOptions,
@@ -27,6 +51,29 @@ from scripts.recall import (
 )
 
 console = Console()
+
+
+def _stream_local_ollama_chat(*, endpoint_url: str, model: str, messages: list[dict], schema: dict):
+    chat_attr = getattr(ollama, "chat", None)
+    client_attr = getattr(ollama, "Client", None)
+    if (
+        chat_attr is not None
+        and not getattr(chat_attr, "__module__", "ollama").startswith("ollama")
+        and getattr(client_attr, "__module__", "ollama").startswith("ollama")
+    ):
+        return chat_attr(
+            model=model,
+            messages=messages,
+            format=schema,
+            stream=True,
+        )
+    client = ollama.Client(host=endpoint_url)
+    return client.chat(
+        model=model,
+        messages=messages,
+        format=schema,
+        stream=True,
+    )
 
 
 def search_memory(
@@ -49,11 +96,11 @@ def search_memory(
             ),
         )
     except MemoryRecallUnavailable as exc:
-        console.print(f"[bold yellow]Memory recall unavailable: {exc}[/bold yellow]")
+        console.print(f"[bold yellow]Memory recall unavailable: {rich_escape(str(exc))}[/bold yellow]")
         return []
     degradation = consume_last_degradation_warning()
     if degradation:
-        console.print(Panel(f"[bold yellow]{degradation}[/bold yellow]", border_style="yellow"))
+        console.print(Panel(f"[bold yellow]{rich_escape(degradation)}[/bold yellow]", border_style="yellow"))
     return direct + neighbors
 
 
@@ -77,31 +124,51 @@ def chat_loop(argv: list[str] | None = None):
         default="standard",
         help="Epistemic answer contract mode ('standard' empirical facts or 'preference' owner preferences).",
     )
+    parser.add_argument(
+        "--host-id",
+        default="ollama_local",
+        help="Configured AI host profile ID (default: ollama_local; online hosts require explicit consent).",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Explicit model override for the selected host.",
+    )
+    parser.add_argument(
+        "--auto-model",
+        action="store_true",
+        help="Auto-select best installed local model from hardware capability profile.",
+    )
     args = parser.parse_args(argv)
     projects = tuple(p.strip() for p in args.project if p.strip())
+
+    selected_model = args.model
+    if not selected_model and args.auto_model and args.host_id == "ollama_local":
+        hw = detect_hardware_profile(ollama_timeout=2.0, use_cache=True)
+        selected_model = hw.selected_installed_generation_model or GEN_MODEL
 
     scope_label = f" | projects={','.join(projects)}" if projects else ""
     console.print(
         Panel.fit(
-            f"[bold cyan]Ollama Memory Interface (Graph RAG)[/bold cyan]\n"
-            f"mode={args.mode} | contract={args.answer_mode}{scope_label}\nType 'exit' to quit.",
+            f"[bold cyan]Second Brain Grounded Memory Interface[/bold cyan]\n"
+            f"host={rich_escape(args.host_id)} | model={rich_escape(selected_model or 'default')} | "
+            f"mode={rich_escape(args.mode)} | contract={rich_escape(args.answer_mode)}{rich_escape(scope_label)}\n"
+            "Type 'exit' to quit.",
             border_style="cyan",
         )
     )
-    
-    messages = []
-    
+
     while True:
         try:
             user_input = console.input("\n[bold green]You>[/bold green] ")
         except (KeyboardInterrupt, EOFError):
             break
-            
-        if user_input.lower() in ['exit', 'quit']:
+
+        if user_input.lower() in ["exit", "quit"]:
             break
         if not user_input.strip():
             continue
-            
+
         with console.status("[bold dark_gray]Searching semantic memory...[/bold dark_gray]"):
             retrieved_atoms = search_memory(
                 user_input,
@@ -109,51 +176,111 @@ def chat_loop(argv: list[str] | None = None):
                 retrieval_mode=args.mode,
                 allow_cross_project=args.allow_cross_project,
             )
-            
+
+        try:
+            candidate_ids = peek_lexical_candidate_atom_ids(user_input)
+            record_retrieval_telemetry(
+                [item.filename for item in retrieved_atoms],
+                candidate_atom_ids=candidate_ids,
+                mode=args.mode,
+            )
+        except Exception:
+            pass
+
         if retrieved_atoms:
             explanations = "; ".join(
                 f"{item.filename}[{','.join(item.match_reasons)}]" for item in retrieved_atoms
             )
-            console.print(f"[dim green]✓ Relevant memories retrieved: {explanations}[/dim green]")
+            console.print(f"[dim green]✓ Relevant memories retrieved: {rich_escape(explanations)}[/dim green]")
         else:
             console.print("[dim yellow]⚠ No relevant memories found.[/dim yellow]")
 
         if not retrieved_atoms:
             full_response = answer_from_memory("", lambda: "")
-            console.print(f"\n[bold blue]Ollama>[/bold blue]")
+            try:
+                record_grounded_answer_telemetry([], abstained=True, mode=args.answer_mode)
+            except Exception:
+                pass
+            console.print(f"\n[bold blue]{rich_escape(args.host_id)}>[/bold blue]")
             console.print(full_response, markup=False)
-            messages.append({"role": "user", "content": user_input})
-            messages.append({"role": "assistant", "content": full_response})
             continue
-            
-        system_prompt = build_grounding_prompt(
-            AnswerRequest(query=user_input, mode=args.answer_mode, result_limit=len(retrieved_atoms)),
-            retrieved_atoms,
-        )
-        
-        # Inject context invisibly for this turn
-        turn_messages = [{"role": "system", "content": system_prompt}] + messages + [{"role": "user", "content": user_input}]
-        
+
         full_response = ""
         try:
-            response_stream = ollama.chat(
-                model=GEN_MODEL, messages=turn_messages, format=ANSWER_DRAFT_SCHEMA, stream=True
-            )
-            for chunk in response_stream:
-                content = chunk["message"]["content"]
-                full_response += content
-            answer = validate_standard_answer(
-                full_response, retrieved_atoms, atoms_dir=ATOMS_DIR, mode=args.answer_mode
-            )
+            ans_req = AnswerRequest(query=user_input, mode=args.answer_mode, result_limit=len(retrieved_atoms))
+            if args.host_id != "ollama_local":
+                answer = generate_grounded_answer_via_host(
+                    ans_req,
+                    retrieved_atoms,
+                    host_id=args.host_id,
+                    model_override=selected_model,
+                    atoms_dir=ATOMS_DIR,
+                    brain_dir=BRAIN_DIR,
+                )
+            else:
+                policies = load_host_policies()
+                local_rule = policies.get("ollama_local")
+                if local_rule is None or not local_rule.enabled:
+                    raise HostConsentError("Host 'ollama_local' is disabled in host-sharing-policy.json.")
+                validate_endpoint_network_boundary(local_rule)
+                if args.answer_mode == "preference" and not local_rule.allow_preference_atoms:
+                    raise HostConsentError("Host 'ollama_local' is not authorized to receive preference atoms.")
+                effective_model = validate_model_identifier(
+                    (selected_model or "").strip() or local_rule.default_model or GEN_MODEL,
+                    provider="ollama",
+                )
+                scoped_atoms = filter_atoms_for_host(retrieved_atoms, local_rule, mode=args.answer_mode)
+                if not scoped_atoms:
+                    full_response = NO_APPROVED_MEMORY_RESPONSE
+                    try:
+                        record_grounded_answer_telemetry([], abstained=True, mode=args.answer_mode)
+                    except Exception:
+                        pass
+                    console.print(f"\n[bold blue]{rich_escape(args.host_id)}>[/bold blue]")
+                    console.print(full_response, markup=False)
+                    continue
+                grounding_prompt = build_grounding_prompt(ans_req, scoped_atoms)
+                redaction, pii_placeholder_map = _redact_outbound_with_map(
+                    grounding_prompt,
+                    redact_pii=local_rule.redact_pii,
+                    fail_on_secret_detection=local_rule.fail_on_secret_detection,
+                )
+                # Stateless single-turn prompt prevents prior-turn assistant claims from bleeding across turns.
+                response_stream = _stream_local_ollama_chat(
+                    endpoint_url=local_rule.endpoint_url,
+                    model=effective_model,
+                    messages=[{"role": "user", "content": redaction.sanitized_text}],
+                    schema=ANSWER_DRAFT_SCHEMA,
+                )
+                for chunk in response_stream:
+                    content = chunk["message"]["content"]
+                    full_response += content
+                rehydrated_draft = _rehydrate_draft_claims(full_response, pii_placeholder_map)
+                answer = validate_standard_answer(
+                    rehydrated_draft, scoped_atoms, atoms_dir=ATOMS_DIR, mode=args.answer_mode
+                )
+                _audit_outbound_call(
+                    brain_dir=BRAIN_DIR,
+                    rule=local_rule,
+                    model=effective_model,
+                    atom_ids=[item.filename for item in scoped_atoms],
+                    pii_redactions=redaction.pii_redaction_count,
+                    outcome="grounded_answer" if answer.answerable else "abstained",
+                )
+            cited_atoms = [ev.atom_id for cl in answer.claims for ev in cl.evidence]
+            try:
+                record_grounded_answer_telemetry(cited_atoms, abstained=not answer.answerable, mode=args.answer_mode)
+            except Exception:
+                pass
             full_response = answer.text
-            console.print(f"\n[bold blue]Ollama>[/bold blue] {rich_escape(full_response)}")
-        except Exception as e:
-            console.print(f"\n[bold red]Error connecting to Ollama: {e}[/bold red]")
+            console.print(f"\n[bold blue]{rich_escape(args.host_id)}>[/bold blue]")
+            console.print(full_response, markup=False)
+        except HostConsentError as e:
+            console.print(f"\n[bold yellow]Host policy blocked ({rich_escape(args.host_id)}): {rich_escape(str(e))}[/bold yellow]")
             continue
-            
-        # Append to history
-        messages.append({"role": "user", "content": user_input})
-        messages.append({"role": "assistant", "content": full_response})
+        except Exception as e:
+            console.print(f"\n[bold red]Error invoking AI host ({rich_escape(args.host_id)}): {rich_escape(str(e))}[/bold red]")
+            continue
 
 if __name__ == "__main__":
     chat_loop()
