@@ -32,6 +32,11 @@ SESSION_IDLE_SECONDS = 30 * 60
 MAX_SESSION_FAILURES = 5
 SESSION_LOCK_SECONDS = 60
 ALLOWED_LOOPBACK_ADDRESS = "127.0.0.1"
+SESSION_COOKIE_POLICY = {
+    "HttpOnly": True,
+    "SameSite": "Strict",
+    "Path": "/",
+}
 _RATE_LIMIT_TRACKER: dict[str, dict[str, float | int]] = {}
 _RATE_LIMIT_LOCK = threading.Lock()
 
@@ -43,6 +48,13 @@ def assert_loopback_address(address: str | None) -> str:
             f"403 Forbidden: Dashboard listener must bind strictly to {ALLOWED_LOOPBACK_ADDRESS} (got {address!r})."
         )
     return ALLOWED_LOOPBACK_ADDRESS
+
+
+def format_session_cookie(session_token: str) -> str:
+    """Format a hardened local session cookie header with HttpOnly and SameSite=Strict."""
+    if not session_token or any(ch in session_token for ch in (";", "\r", "\n", " ")):
+        raise ValueError("Invalid session token.")
+    return f"sb_session={session_token}; HttpOnly; SameSite=Strict; Path=/"
 
 
 def default_auth_path() -> Path:
