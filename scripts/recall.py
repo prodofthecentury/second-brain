@@ -86,8 +86,10 @@ class RecallOptions:
     include_statuses: set[str] | None = None
     exclude_statuses: set[str] = field(default_factory=lambda: set(EXCLUDED_RECALL_STATUSES))
     contexts: tuple[str, ...] = ()
+    projects: tuple[str, ...] = ()
     memory_types: tuple[str, ...] = ()
     candidate_multiplier: int = 4
+    retrieval_mode: str = "auto"  # 'auto', 'rrf', 'lexical', 'dense'
 
 
 @dataclass(frozen=True)
@@ -203,14 +205,29 @@ def should_include_record(record: dict, options: RecallOptions) -> bool:
         return False
     if include_statuses is None and status not in NORMAL_RECALL_STATUSES:
         return False
-    if claim_state != "human_reviewed":
-        return False
-    if record.get("approved_revision_current") is not True:
-        return False
+    if include_statuses is None:
+        if claim_state != "human_reviewed":
+            return False
+        if record.get("approved_revision_current") is not True:
+            return False
 
     if options.memory_types:
         memory_type = str(record.get("memory_type", "semantic"))
         if memory_type not in set(options.memory_types):
+            return False
+
+    if options.projects:
+        record_contexts = metadata_contexts(record)
+        proj_tags = {
+            c.lower().replace("-", "_")
+            for c in record_contexts
+            if c.lower().startswith("project:")
+        }
+        req_tags = {
+            p.lower().replace("-", "_") if p.lower().startswith("project:") else f"project:{p.lower().replace('-', '_')}"
+            for p in options.projects
+        }
+        if not proj_tags.intersection(req_tags):
             return False
 
     return True
@@ -495,8 +512,80 @@ def search_lexical_memory(
     return direct, sorted(neighbors, key=lambda item: item.score, reverse=True)
 
 
+def search_hybrid_rrf_memory(
+    query: str,
+    options: RecallOptions | None = None,
+    *,
+    atoms_dir: str = ATOMS_DIR,
+    k_constant: int = 60,
+) -> tuple[list[RecallResult], list[RecallResult]]:
+    """Reciprocal Rank Fusion (RRF) combining SQLite FTS5 (lexical) and Chroma (dense)."""
+    options = options or RecallOptions()
+    lex_direct, _ = search_lexical_memory(query, options, atoms_dir=atoms_dir)
+    try:
+        dense_direct, _ = search_semantic_memory(query, options)
+    except Exception:
+        # Graceful dynamic fallback to pure lexical when Ollama/Chroma is unavailable
+        return lex_direct, []
+
+    rrf_scores: dict[str, float] = {}
+    candidate_map: dict[str, RecallResult] = {}
+
+    for rank, res in enumerate(lex_direct):
+        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
+        candidate_map[res.filename] = res
+
+    for rank, res in enumerate(dense_direct):
+        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
+        if res.filename not in candidate_map:
+            candidate_map[res.filename] = res
+
+    fused: list[RecallResult] = []
+    for filename, rrf_score in sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)[: options.n_results]:
+        base = candidate_map[filename]
+        fused.append(
+            RecallResult(
+                filename=base.filename,
+                content=base.content,
+                source="rrf_hybrid",
+                score=round(rrf_score, 6),
+                similarity=base.similarity,
+                review_status=base.review_status,
+                memory_type=base.memory_type,
+                confidence=base.confidence,
+                importance=base.importance,
+                contexts=base.contexts,
+                match_reasons=base.match_reasons + (f"rrf_score:{round(rrf_score, 6)}",),
+            )
+        )
+
+    neighbors = []
+    seen = {item.filename for item in fused}
+    if options.follow_links:
+        for result in fused:
+            for neighbor in linked_neighbors(result, options, atoms_dir=atoms_dir, query=query):
+                if neighbor.filename not in seen:
+                    seen.add(neighbor.filename)
+                    neighbors.append(neighbor)
+
+    return fused, sorted(neighbors, key=lambda item: item.score, reverse=True)
+
+
 def search_memory(query: str, options: RecallOptions | None = None) -> tuple[list[RecallResult], list[RecallResult]]:
-    """Use lexical recall when its sidecar exists; otherwise preserve the semantic contract."""
+    """Retrieve memories using configured mode ('auto', 'rrf', 'lexical', or 'dense')."""
+    options = options or RecallOptions()
+    if options.retrieval_mode == "rrf":
+        return search_hybrid_rrf_memory(query, options)
+    if options.retrieval_mode == "dense":
+        try:
+            return search_semantic_memory(query, options)
+        except MemoryRecallUnavailable:
+            # Dynamic fallback to lexical if dense unavailable
+            return search_lexical_memory(query, options)
+    if options.retrieval_mode == "lexical":
+        return search_lexical_memory(query, options)
+
+    # auto mode: use lexical if sidecar exists, else dense
     if os.path.exists(LEXICAL_INDEX_PATH):
         return search_lexical_memory(query, options)
     return search_semantic_memory(query, options)
