@@ -1087,6 +1087,88 @@ class MemoryApiClient:
             },
         )
 
+    def list_notes(self, *, query: str = "", tag: str = "", limit: int = 50) -> dict[str, object]:
+        params: list[str] = [f"limit={int(limit)}"]
+        if query.strip():
+            params.append(f"q={url_quote(query.strip(), safe='')}")
+        if tag.strip():
+            params.append(f"tag={url_quote(tag.strip(), safe=':_/-')}")
+        return self._request("GET", f"/v1/notes?{'&'.join(params)}")
+
+    def remember(
+        self,
+        content: str,
+        *,
+        title: str = "",
+        tags: list[str] | None = None,
+        source: str = "sdk_client",
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/remember",
+            {"content": content, "title": title, "tags": tags or [], "source": source},
+        )
+
+    def verify_ledger(self) -> dict[str, object]:
+        return self._request("GET", "/v1/ledger/verify")
+
+    def commit_ledger(self, *, actor: str = "owner", note: str = "") -> dict[str, object]:
+        return self._request("POST", "/v1/ledger/commit", {"actor": actor, "note": note})
+
+    def prove_atom(self, atom_filename: str) -> dict[str, object]:
+        return self._request("GET", f"/v1/ledger/prove/{url_quote(atom_filename.strip(), safe='')}")
+
+    def graph_contradictions(
+        self,
+        *,
+        project_scope: str | None = None,
+        include_pending: bool = False,
+    ) -> dict[str, object]:
+        params: list[str] = []
+        if project_scope and project_scope.strip():
+            params.append(f"project={url_quote(project_scope.strip(), safe=':_/-')}")
+        if include_pending:
+            params.append("include_pending=1")
+        suffix = f"?{'&'.join(params)}" if params else ""
+        return self._request("GET", f"/v1/graph/contradictions{suffix}")
+
+    def graph_summary(self, *, project_scope: str | None = None) -> dict[str, object]:
+        if project_scope and project_scope.strip():
+            return self._request("GET", f"/v1/graph/summary?project={url_quote(project_scope.strip(), safe=':_/-')}")
+        return self._request("GET", "/v1/graph/summary")
+
+    def list_snapshots(self) -> dict[str, object]:
+        return self._request("GET", "/v1/snapshots")
+
+    def create_snapshot(self, *, actor: str = "owner", label: str = "") -> dict[str, object]:
+        return self._request("POST", "/v1/snapshots", {"actor": actor, "label": label})
+
+    def diff_snapshots(self, from_snapshot: str, to_snapshot: str = "live") -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/snapshots/diff",
+            {"from_snapshot": from_snapshot, "to_snapshot": to_snapshot},
+        )
+
+    def recall_snapshot(
+        self,
+        query: str,
+        snapshot_id: str,
+        *,
+        project_scope: str | None = None,
+        limit: int = 10,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/snapshots/recall",
+            {
+                "query": query,
+                "snapshot_id": snapshot_id,
+                "project_scope": project_scope,
+                "limit": int(limit),
+            },
+        )
+
 
 def _default_mcp_token_file() -> Path:
     override = (os.environ.get("BRAIN_MCP_TOKEN_FILE") or "").strip()

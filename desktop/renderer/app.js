@@ -230,7 +230,14 @@ async function sendChat() {
   chatOutputEl.textContent = "";
   chatSourcesEl.replaceChildren();
   chatBannerEl.textContent = "Retrieving...";
-  await window.secondBrain.streamChat({ query, mode, project_scope });
+  try {
+    const res = await window.secondBrain.streamChat({ query, mode, project_scope });
+    if (res && !res.ok && chatBannerEl.textContent === "Retrieving...") {
+      chatBannerEl.textContent = `Error: ${res.error || "HTTP " + res.status}`;
+    }
+  } catch (err) {
+    chatBannerEl.textContent = `Error: ${err?.message || String(err)}`;
+  }
 }
 
 document.getElementById("chatSendBtn").addEventListener("click", sendChat);

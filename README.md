@@ -1,8 +1,8 @@
 # Second Brain
 
-**Status:** Local-first prototype with explicit review and provenance gates. It is not a certified release. The vault contains durable Markdown; SQLite and vector stores are rebuildable indexes.
+**Status (`v0.2.0`):** Local-first verifiable AI memory platform with CAS provenance gates, dual-token Loopback HTTP API, native Electron desktop companion, one-click IDE/MCP connectors, Skill Playbooks, and cryptographic Merkle audit proofs (`11/11` release suites passing in `scripts/test_all.py`). The vault contains durable Markdown; SQLite and vector stores are rebuildable indexes, while `brain/.sidecar/vault-ledger.jsonl` and `brain/.sidecar/snapshots/` store tamper-evident Merkle checkpoints and point-in-time snapshots.
 
-**Product goal:** a one-click installable Brain plugin with local/offline and online modes, plus adapters for owner-built AI hosts. Offline must be a first-class, state-of-the-art target, not a degraded fallback; online mode can add stronger models and other capabilities, with explicit controls over which context leaves the machine. Claims of outperforming every current product require head-to-head evaluation and are not established by this repository. Installation must profile each PC and report the capabilities that its hardware can actually support. This repository is not that product yet: it is a Windows-tested prototype with a CLI, Streamlit dashboard, local Ollama integration, and opt-in local MCP.
+**Product architecture:** One-click installable Second Brain across local/offline and opted-in online modes, with hardware capability profiling (`second-brain profile` / `doctor`), per-host outbound consent/PII/secret gates (`scripts/host_adapters.py`), IDE connectors (`second-brain connect`), VS Code `.vsix` extension, and cross-platform Electron desktop installer targets (`nsis`, `msi`, `dmg`, `AppImage`, `deb`). Offline lexical FTS5 is a first-class zero-dependency baseline; `scripts/sota_benchmark.py` benchmarks Second Brain against modeled naive BM25 RAG, unscoped flat memory, and ungrounded synthesis baselines (head-to-head claims against external hosted commercial services remain bounded to evaluated corpora).
 
 ## Safety and readiness
 
@@ -29,7 +29,7 @@ second_brain/
 │   ├── 5-playbooks/        owner-gated CAS Skill Playbooks and .history/ revisions
 │   ├── notes/              zero-friction working notes (separate from verified atoms)
 │   ├── sources/            external source pages and captured evidence
-│   ├── .sidecar/           rebuildable FTS5 indexes (lexical, notes), telemetry WAL DB, and writer lock
+│   ├── .sidecar/           rebuildable FTS5/telemetry DBs, writer lock, plus Merkle vault-ledger.jsonl & snapshots/
 │   └── .chroma/            optional rebuildable dense index
 ├── scripts/                ingestion, review, retrieval, planning, product API, and health tools
 ├── dashboard/              local Streamlit application

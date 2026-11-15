@@ -36,7 +36,13 @@ if ($Thumbprint) {
     if (-not $signCert) {
         $signCert = Get-ChildItem -Path Cert:\LocalMachine\My\$Thumbprint -ErrorAction SilentlyContinue
     }
-} elseif ($PfxPath -and (Test-Path $PfxPath)) {
+    if (-not $signCert) {
+        throw "Code-signing certificate with thumbprint '$Thumbprint' not found in CurrentUser\My or LocalMachine\My."
+    }
+} elseif ($PfxPath) {
+    if (-not (Test-Path $PfxPath)) {
+        throw "PFX certificate file not found: $PfxPath"
+    }
     $secPass = if ($PfxPassword) { ConvertTo-SecureString -String $PfxPassword -AsPlainText -Force } else { $null }
     $signCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
     if ($secPass) {
@@ -66,6 +72,9 @@ if ($signCert -and $exeTargets) {
             $sigParams["TimestampServer"] = $TimestampUrl
         }
         $res = Set-AuthenticodeSignature @sigParams
+        if (-not $res.SignerCertificate -or $res.Status -in @("NotSigned", "HashMismatch")) {
+            throw "Authenticode signing failed for $($file.Name): $($res.Status) ($($res.StatusMessage))"
+        }
         Write-Host "  Signature status: $($res.Status) ($($res.StatusMessage))"
     }
 } else {

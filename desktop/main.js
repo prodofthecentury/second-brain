@@ -58,9 +58,12 @@ function readSafeTokenFile(filePath) {
 
 function readTokens() {
   const secDir = getSecurityDir();
-  const apiTokenPath = path.join(secDir, "memory-api-token");
-  const ownerTokenPath = path.join(secDir, "owner-token");
-  const apiToken = readSafeTokenFile(apiTokenPath);
+  const apiTokenPath = (process.env.BRAIN_MEMORY_API_TOKEN_FILE || "").trim()
+    || path.join(secDir, "memory-api-token");
+  const ownerTokenPath = (process.env.BRAIN_OWNER_TOKEN_FILE || "").trim()
+    || path.join(secDir, "owner-token");
+  const apiToken = (process.env.BRAIN_MEMORY_API_TOKEN || "").trim()
+    || readSafeTokenFile(apiTokenPath);
   const ownerToken = readSafeTokenFile(ownerTokenPath);
   return { apiToken, ownerToken };
 }
@@ -99,15 +102,99 @@ function getDefaultPackagedVaultDir() {
   return path.join(dataHome, "second-brain", "brain");
 }
 
+function getPackagedVenvDir() {
+  return path.join(path.dirname(getDefaultPackagedVaultDir()), "venv");
+}
+
+function resolveConfiguredVaultPointer() {
+  const pointerFile = path.join(path.dirname(getDefaultPackagedVaultDir()), "vault-path.txt");
+  const raw = readSafeTokenFile(pointerFile);
+  if (!raw) return "";
+  try {
+    const resolved = path.resolve(raw);
+    const st = fs.lstatSync(resolved);
+    if (st.isDirectory() && !st.isSymbolicLink()) {
+      return resolved;
+    }
+  } catch {}
+  return "";
+}
+
+function resolveUvBinary() {
+  const explicit = (process.env.UV_BIN || "").trim();
+  if (explicit && fs.existsSync(explicit)) return explicit;
+  const home = os.homedir();
+  const candidates = process.platform === "win32"
+    ? [
+        path.join(home, ".local", "bin", "uv.exe"),
+        path.join(home, ".cargo", "bin", "uv.exe"),
+        path.join(process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"), "Microsoft", "WinGet", "Links", "uv.exe"),
+        path.join(process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"), "Programs", "uv", "uv.exe"),
+      ]
+    : [
+        path.join(home, ".local", "bin", "uv"),
+        path.join(home, ".cargo", "bin", "uv"),
+        "/opt/homebrew/bin/uv",
+        "/usr/local/bin/uv",
+        "/usr/bin/uv",
+      ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {}
+  }
+  return "uv";
+}
+
+function getVenvPythonPath() {
+  const venvRoot = app.isPackaged ? getPackagedVenvDir() : path.join(getBackendRoot(), ".venv");
+  return process.platform === "win32"
+    ? path.join(venvRoot, "Scripts", "python.exe")
+    : path.join(venvRoot, "bin", "python");
+}
+
+function buildBackendEnv() {
+  const env = { ...process.env, PYTHONUTF8: "1" };
+  if (app.isPackaged) {
+    env.UV_PROJECT_ENVIRONMENT = getPackagedVenvDir();
+    if (!env.BRAIN_VAULT_DIR) {
+      const configuredVault = resolveConfiguredVaultPointer() || getDefaultPackagedVaultDir();
+      fs.mkdirSync(configuredVault, { recursive: true });
+      env.BRAIN_VAULT_DIR = configuredVault;
+    }
+  }
+  return env;
+}
+
+function killProcessTree(proc) {
+  if (!proc) return;
+  const pid = proc.pid;
+  if (process.platform === "win32" && pid) {
+    try {
+      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+    } catch (_) {}
+  }
+  try {
+    proc.kill();
+  } catch (_) {}
+}
+
 function spawnBackendCli(args) {
   const root = getBackendRoot();
-  const env = { ...process.env, PYTHONUTF8: "1" };
-  if (app.isPackaged && !env.BRAIN_VAULT_DIR) {
-    const userVault = getDefaultPackagedVaultDir();
-    fs.mkdirSync(userVault, { recursive: true });
-    env.BRAIN_VAULT_DIR = userVault;
+  const env = buildBackendEnv();
+  const venvPy = getVenvPythonPath();
+  if (fs.existsSync(venvPy)) {
+    return spawn(venvPy, args, {
+      cwd: root,
+      env,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
   }
-  return spawn("uv", ["--directory", root, "run", "--frozen", "python", ...args], {
+  return spawn(resolveUvBinary(), ["--directory", root, "run", "--frozen", "python", ...args], {
     cwd: root,
     env,
     windowsHide: true,
@@ -148,20 +235,16 @@ function runSpawnPromise(cmd, args, cwd, env) {
 
 async function ensureBackendBootstrapped() {
   const root = getBackendRoot();
-  const venvPy = process.platform === "win32"
-    ? path.join(root, ".venv", "Scripts", "python.exe")
-    : path.join(root, ".venv", "bin", "python");
+  const venvPy = getVenvPythonPath();
   if (fs.existsSync(venvPy)) {
     return;
   }
-  const env = { ...process.env, PYTHONUTF8: "1" };
-  if (app.isPackaged && !env.BRAIN_VAULT_DIR) {
-    const userVault = getDefaultPackagedVaultDir();
-    fs.mkdirSync(userVault, { recursive: true });
-    env.BRAIN_VAULT_DIR = userVault;
+  const env = buildBackendEnv();
+  if (app.isPackaged) {
+    fs.mkdirSync(path.dirname(getPackagedVenvDir()), { recursive: true });
   }
   try {
-    await runSpawnPromise("uv", ["--directory", root, "sync", "--frozen"], root, env);
+    await runSpawnPromise(resolveUvBinary(), ["--directory", root, "sync", "--frozen"], root, env);
   } catch (err) {
     if (err && err.code === "ENOENT") {
       if (process.platform === "win32") {
@@ -193,9 +276,7 @@ async function startApiSidecar() {
   }
   apiReady = false;
   if (apiProcess) {
-    try {
-      apiProcess.kill();
-    } catch (_) {}
+    killProcessTree(apiProcess);
     apiProcess = null;
   }
 
@@ -260,16 +341,14 @@ function getVaultDir() {
     return path.resolve(process.env.BRAIN_VAULT_DIR);
   }
   if (app.isPackaged) {
-    return getDefaultPackagedVaultDir();
+    return resolveConfiguredVaultPointer() || getDefaultPackagedVaultDir();
   }
   return path.join(getBackendRoot(), "brain");
 }
 
 function stopApiSidecar() {
   if (apiProcess) {
-    try {
-      apiProcess.kill();
-    } catch (_) {}
+    killProcessTree(apiProcess);
     apiProcess = null;
   }
   apiReady = false;
@@ -353,6 +432,20 @@ function streamChat(sender, payload) {
       },
       (res) => {
         res.setEncoding("utf8");
+        if ((res.statusCode || 500) < 200 || (res.statusCode || 500) >= 300) {
+          let errRaw = "";
+          res.on("data", (chunk) => (errRaw += chunk));
+          res.on("end", () => {
+            let errMsg = `HTTP ${res.statusCode || 500}`;
+            try {
+              const parsedErr = errRaw ? JSON.parse(errRaw) : {};
+              if (parsedErr && parsedErr.error) errMsg = String(parsedErr.error);
+            } catch {}
+            sender.send("chat:event", { event: "error", data: { error: errMsg, status: res.statusCode } });
+            resolve({ ok: false, status: res.statusCode, error: errMsg });
+          });
+          return;
+        }
         let buffer = "";
         let currentEvent = "message";
         res.on("data", (chunk) => {
@@ -612,8 +705,7 @@ app.on("before-quit", () => {
   isQuitting = true;
   globalShortcut.unregisterAll();
   if (apiProcess) {
-    try {
-      apiProcess.kill();
-    } catch (_) {}
+    killProcessTree(apiProcess);
+    apiProcess = null;
   }
 });

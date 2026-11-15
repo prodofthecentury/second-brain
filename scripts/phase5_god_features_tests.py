@@ -594,6 +594,205 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
             self.assertFalse(ver["chain_valid"])
             self.assertTrue(any("non-sequential seq=" in err for err in ver["errors"]))
 
+    def test_audit_remediations_quarantined_graph_wikilinks_ledger_corrupt_stopword_and_sdk(self) -> None:
+        from api_product import ensure_owner_token
+        from atom_mutator import apply_atom_merge, apply_review_transition, content_sha256
+        from knowledge_graph import build_knowledge_graph, detect_contradictions
+        from memory_api import (
+            MemoryApiClient,
+            MemoryApiRuntimeConfig,
+            MemoryLoopbackHTTPServer,
+            generate_memory_api_token,
+            reset_api_rate_limiter,
+        )
+        from time_travel import create_snapshot, recall_at_snapshot
+        from vault_ledger import prove_atom_membership, verify_merkle_proof, verify_vault_ledger
+        import httpx
+
+        root = Path(__file__).resolve().parents[1]
+        main_js = (root / "desktop" / "main.js").read_text(encoding="utf-8")
+        self.assertIn("UV_PROJECT_ENVIRONMENT", main_js)
+        self.assertIn("killProcessTree", main_js)
+        icon_bytes = (root / "desktop" / "assets" / "icon.png").read_bytes()
+        self.assertEqual(icon_bytes[:8], b"\x89PNG\r\n\x1a\n")
+        width = int.from_bytes(icon_bytes[16:20], "big")
+        height = int.from_bytes(icon_bytes[20:24], "big")
+        self.assertGreaterEqual(width, 512)
+        self.assertGreaterEqual(height, 512)
+
+        reset_api_rate_limiter()
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms_dir = brain / "2-atoms"
+
+            # 1. Wikilinks + merge lineage prevent false orphans; quarantined atoms are excluded from graph/radar.
+            a1 = _seed_atom(
+                brain,
+                filename="anchor-rule.md",
+                claim="Cryptographic source anchors verify exact byte offsets.",
+                evidence="Cryptographic source anchors verify exact byte offsets.",
+                project="project:alpha",
+                approve=True,
+            )
+            # Add a Markdown [[wikilink]] to peer-rule inside a2 and re-approve
+            a2 = _seed_atom(
+                brain,
+                filename="peer-rule.md",
+                claim="Retention window for audit archives is 365 days. Related: [[anchor-rule]]",
+                evidence="Retention window for audit archives is 365 days. Related: [[anchor-rule]]",
+                project="project:alpha",
+                approve=True,
+            )
+            q_atom = _seed_atom(
+                brain,
+                filename="quarantined-trap.md",
+                claim="Never verify cryptographic source anchors or byte offsets.",
+                evidence="Never verify cryptographic source anchors or byte offsets.",
+                project="project:alpha",
+                approve=False,
+            )
+            apply_review_transition(
+                action="quarantine",
+                atom_path=str(q_atom),
+                expected_sha256=content_sha256(q_atom.read_bytes()),
+                actor="owner",
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+            )
+            draft_atom = _seed_atom(
+                brain,
+                filename="unapproved-secret.md",
+                claim="Pending unapproved draft claim.",
+                evidence="Pending unapproved draft claim.",
+                project="project:alpha",
+                approve=False,
+            )
+
+            g = build_knowledge_graph(brain_dir=str(brain), atoms_dir=str(atoms_dir), include_pending=True)
+            node_files = {n["filename"] for n in g["nodes"]}
+            self.assertNotIn("quarantined-trap.md", node_files)
+            self.assertEqual(g["orphan_approved_atoms"], [])
+            radar = detect_contradictions(brain_dir=str(brain), atoms_dir=str(atoms_dir), include_pending=True)
+            self.assertEqual(radar["contradiction_count"], 0)
+
+            # Merge lineage edge emission when survivor supersedes old atom
+            old_dup = _seed_atom(
+                brain,
+                filename="old-dup.md",
+                claim="Legacy retention rule.",
+                evidence="Legacy retention rule.",
+                project="project:alpha",
+                approve=False,
+            )
+            surv = _seed_atom(
+                brain,
+                filename="survivor-dup.md",
+                claim="Unified retention rule.",
+                evidence="Unified retention rule.",
+                project="project:alpha",
+                approve=False,
+            )
+            apply_atom_merge(
+                survivor_path=str(surv),
+                superseded_path=str(old_dup),
+                survivor_expected_sha256=content_sha256(surv.read_bytes()),
+                superseded_expected_sha256=content_sha256(old_dup.read_bytes()),
+                actor="owner",
+                rationale="dedup test",
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+            )
+            g_merged = build_knowledge_graph(brain_dir=str(brain), atoms_dir=str(atoms_dir), include_pending=True)
+            self.assertTrue(
+                any(
+                    e["from"] == "old-dup.md" and e["to"] == "survivor-dup.md" and e["kind"] == "superseded_by"
+                    for e in g_merged["edges"]
+                )
+            )
+
+            # 2. Stem normalization in prove_atom_membership, malformed proof hardening, and corrupt UTF-8 ledger handling.
+            stem_proof = prove_atom_membership("anchor-rule", brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            self.assertTrue(verify_merkle_proof(stem_proof))
+            self.assertFalse(verify_merkle_proof("not-a-dict"))  # type: ignore[arg-type]
+            self.assertFalse(verify_merkle_proof({**stem_proof, "merkle_root": "not-hex"}))
+            self.assertFalse(verify_merkle_proof({**stem_proof, "siblings": [{"position": "middle", "sha256": "0" * 64}]}))
+
+            ledger_file = brain / ".sidecar" / "vault-ledger.jsonl"
+            ledger_file.write_bytes(b"\xff\xfe\x00corrupt-utf8")
+            corrupt_ver = verify_vault_ledger(brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            self.assertFalse(corrupt_ver["chain_valid"])
+            ledger_file.unlink()
+
+            # 3. Stopword filtering in recall_at_snapshot prevents false matches on "is"/"for".
+            snap = create_snapshot(label="stopword-check", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            no_false_hit = recall_at_snapshot("what is for the", snap["snapshot_id"], brain_dir=str(brain))
+            self.assertEqual(no_false_hit["results"], [])
+            real_hit = recall_at_snapshot(
+                "what is the retention window for audit archives?",
+                snap["snapshot_id"],
+                brain_dir=str(brain),
+            )
+            self.assertEqual([r["filename"] for r in real_hit["results"]], ["peer-rule.md"])
+            self.assertEqual(a1.name, "anchor-rule.md")
+            self.assertEqual(a2.name, "peer-rule.md")
+            self.assertEqual(draft_atom.name, "unapproved-secret.md")
+
+            # 4. Uniform 404 for non-owner prove requests on unapproved/missing atoms + MemoryApiClient Phase 5 SDK parity.
+            tok_path = Path(tmp) / "api-token"
+            own_path = Path(tmp) / "owner-token"
+            agent_tok, _ = generate_memory_api_token(tok_path)
+            owner_tok = ensure_owner_token(own_path)
+            rt = MemoryApiRuntimeConfig(
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                inbox_dir=str(brain / "0-raw" / "inbox"),
+                experiences_dir=str(brain / "4-experiences"),
+                lexical_index_path=str(brain / ".sidecar" / "lexical.sqlite3"),
+                chroma_path=str(brain / ".chroma"),
+                telemetry_db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
+                token_path=tok_path,
+                owner_token_path=own_path,
+                policy_path=Path(tmp) / "policy.json",
+            )
+            server = MemoryLoopbackHTTPServer("127.0.0.1", 0, rt)
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            try:
+                base = f"http://127.0.0.1:{port}"
+                agent_h = {"Authorization": f"Bearer {agent_tok}", "Host": f"127.0.0.1:{port}"}
+                owner_h = {**agent_h, "X-Owner-Token": owner_tok}
+                with httpx.Client(trust_env=False, timeout=15) as c:
+                    r_unapproved_agent = c.get(f"{base}/v1/ledger/prove/unapproved-secret.md", headers=agent_h)
+                    r_missing_agent = c.get(f"{base}/v1/ledger/prove/nonexistent-atom.md", headers=agent_h)
+                    self.assertEqual(r_unapproved_agent.status_code, 404)
+                    self.assertEqual(r_missing_agent.status_code, 404)
+                    self.assertEqual(r_unapproved_agent.json(), r_missing_agent.json())
+                    r_unapproved_owner = c.get(f"{base}/v1/ledger/prove/unapproved-secret.md", headers=owner_h)
+                    self.assertEqual(r_unapproved_owner.status_code, 403)
+
+                sdk_owner = MemoryApiClient(port=port, token=agent_tok, owner_token=owner_tok)
+                committed = sdk_owner.commit_ledger(actor="sdk-owner", note="sdk-checkpoint")
+                self.assertEqual(committed["seq"], 1)
+                verified = sdk_owner.verify_ledger()
+                self.assertTrue(verified["chain_valid"])
+                proof = sdk_owner.prove_atom("anchor-rule")
+                self.assertTrue(verify_merkle_proof(proof))
+                summary = sdk_owner.graph_summary(project_scope="project:alpha")
+                self.assertEqual(summary["node_count"], 2)
+                contradictions = sdk_owner.graph_contradictions(project_scope="project:alpha")
+                self.assertEqual(contradictions["contradiction_count"], 0)
+                snap2 = sdk_owner.create_snapshot(actor="sdk-owner", label="sdk-snap")
+                snaps = sdk_owner.list_snapshots()
+                self.assertGreaterEqual(len(snaps["snapshots"]), 2)
+                diff = sdk_owner.diff_snapshots(snap["snapshot_id"], str(snap2["snapshot_id"]))
+                self.assertEqual(diff["added_atoms"], [])
+                recalled = sdk_owner.recall_snapshot("retention window audit archives", str(snap2["snapshot_id"]))
+                self.assertEqual([r["filename"] for r in recalled["results"]], ["peer-rule.md"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
