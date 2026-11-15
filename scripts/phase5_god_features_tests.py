@@ -789,6 +789,23 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
                 self.assertEqual(diff["added_atoms"], [])
                 recalled = sdk_owner.recall_snapshot("retention window audit archives", str(snap2["snapshot_id"]))
                 self.assertEqual([r["filename"] for r in recalled["results"]], ["peer-rule.md"])
+
+                rem1 = sdk_owner.remember("Use uv sync --frozen for reproducible Python builds.", title="UV Rule", tags=["python", "ci"])
+                self.assertEqual(rem1["status"], "saved")
+                sdk_owner.remember("Frontend styles live in styles.css.", title="CSS Rule", tags=["frontend"])
+                by_q_and_tag = sdk_owner.list_notes(query="reproducible", tag="python")
+                self.assertEqual(by_q_and_tag["total"], 1)
+                self.assertEqual(by_q_and_tag["items"][0]["title"], "UV Rule")
+                by_wrong_tag = sdk_owner.list_notes(query="reproducible", tag="frontend")
+                self.assertEqual(by_wrong_tag["total"], 0)
+
+                dash_py = (root / "dashboard" / "app.py").read_text(encoding="utf-8")
+                self.assertIn("📝 Working Notes & Import", dash_py)
+                self.assertIn("🛡️ Vault Proof & Time-Travel", dash_py)
+                ext_js = (root / "extensions" / "vscode-second-brain" / "extension.js").read_text(encoding="utf-8")
+                self.assertIn("secondBrain.verifyLedger", ext_js)
+                self.assertIn("secondBrain.scanContradictions", ext_js)
+                self.assertIn("secondBrain.assemblePlan", ext_js)
             finally:
                 server.shutdown()
                 server.server_close()

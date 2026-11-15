@@ -79,6 +79,8 @@ class VaultTreeProvider {
       return [
         new vscode.TreeItem("Notes", vscode.TreeItemCollapsibleState.Expanded),
         new vscode.TreeItem("Verified Atoms", vscode.TreeItemCollapsibleState.Collapsed),
+        new vscode.TreeItem("Playbooks", vscode.TreeItemCollapsibleState.Collapsed),
+        new vscode.TreeItem("Snapshots", vscode.TreeItemCollapsibleState.Collapsed),
       ];
     }
     try {
@@ -99,6 +101,30 @@ class VaultTreeProvider {
           const item = new vscode.TreeItem(a.filename, vscode.TreeItemCollapsibleState.None);
           item.description = a.review_status || a.status || "";
           item.tooltip = a.claim || "";
+          return item;
+        });
+      }
+      if (element.label === "Playbooks") {
+        const res = await apiRequest("GET", "/v1/playbooks");
+        if (!res.ok) return [new vscode.TreeItem("API offline")];
+        const pbs = res.data?.playbooks || [];
+        if (!pbs.length) return [new vscode.TreeItem("No promoted playbooks yet")];
+        return pbs.map((pb) => {
+          const item = new vscode.TreeItem(pb.title || pb.filename, vscode.TreeItemCollapsibleState.None);
+          item.description = pb.status || "accepted";
+          item.tooltip = pb.trigger || pb.filename;
+          return item;
+        });
+      }
+      if (element.label === "Snapshots") {
+        const res = await apiRequest("GET", "/v1/snapshots");
+        if (!res.ok) return [new vscode.TreeItem("API offline")];
+        const snaps = res.data?.snapshots || [];
+        if (!snaps.length) return [new vscode.TreeItem("No snapshots recorded yet")];
+        return snaps.map((s) => {
+          const item = new vscode.TreeItem(s.snapshot_id, vscode.TreeItemCollapsibleState.None);
+          item.description = `${s.atom_count || 0} atoms`;
+          item.tooltip = `Merkle: ${s.merkle_root || ""}`;
           return item;
         });
       }
@@ -153,23 +179,55 @@ function activate(context) {
       const query = await vscode.window.showInputBox({ prompt: "Search Second Brain notes & verified atoms" });
       if (!query) return;
       try {
-        const res = await apiRequest("GET", `/v1/notes?query=${encodeURIComponent(query)}&limit=10`);
-        const notes = res.ok ? (res.data?.items || res.data?.notes || []) : [];
-        if (!notes.length) {
-          vscode.window.showInformationMessage("No matching notes found.");
+        const [recallRes, notesRes] = await Promise.all([
+          apiRequest("POST", "/v1/recall", { query, n_results: 8, retrieval_mode: "auto" }),
+          apiRequest("GET", `/v1/notes?query=${encodeURIComponent(query)}&limit=10`),
+        ]);
+        const atoms = recallRes.ok ? (recallRes.data?.results || []) : [];
+        const notes = notesRes.ok ? (notesRes.data?.items || notesRes.data?.notes || []) : [];
+        const choices = [
+          ...atoms.map((a) => ({
+            label: `[Verified Atom] ${a.filename}`,
+            description: a.filename,
+            detail: a.claim || "",
+            kind: "atom",
+            claim: a.claim || "",
+            contexts: a.contexts || [],
+          })),
+          ...notes.map((n) => ({
+            label: `[Note] ${n.title || n.filename}`,
+            description: n.filename,
+            detail: n.snippet || "",
+            kind: "note",
+          })),
+        ];
+        if (!choices.length) {
+          vscode.window.showInformationMessage("No matching verified atoms or working notes found.");
           return;
         }
-        const picked = await vscode.window.showQuickPick(
-          notes.map((n) => ({ label: n.title || n.filename, description: n.filename, detail: n.snippet || "" })),
-          { placeHolder: "Select a note to preview" }
-        );
+        const picked = await vscode.window.showQuickPick(choices, { placeHolder: "Select a verified atom or note to preview" });
         if (picked) {
-          const full = await apiRequest("GET", `/v1/notes/${encodeURIComponent(picked.description)}`);
-          const doc = await vscode.workspace.openTextDocument({
-            content: full.data?.note?.body || full.data?.body || "",
-            language: "markdown",
-          });
-          await vscode.window.showTextDocument(doc, { preview: true });
+          if (picked.kind === "atom") {
+            const proofRes = await apiRequest("GET", `/v1/ledger/prove/${encodeURIComponent(picked.description)}`);
+            const md = [
+              `# Verified Atom: ${picked.description}`,
+              "",
+              `**Contexts:** ${(picked.contexts || []).join(", ") || "none"}`,
+              proofRes.ok ? `**Merkle Root:** \`${proofRes.data?.merkle_root || ""}\`` : "",
+              "",
+              "## Claim",
+              picked.claim,
+            ].filter(Boolean).join("\n");
+            const doc = await vscode.workspace.openTextDocument({ content: md, language: "markdown" });
+            await vscode.window.showTextDocument(doc, { preview: true });
+          } else {
+            const full = await apiRequest("GET", `/v1/notes/${encodeURIComponent(picked.description)}`);
+            const doc = await vscode.workspace.openTextDocument({
+              content: full.data?.note?.body || full.data?.body || "",
+              language: "markdown",
+            });
+            await vscode.window.showTextDocument(doc, { preview: true });
+          }
         }
       } catch (err) {
         vscode.window.showErrorMessage(`Second Brain API unreachable: ${err.message}`);
@@ -261,6 +319,59 @@ function activate(context) {
         req.write(body);
         req.end();
       });
+    }),
+
+    vscode.commands.registerCommand("secondBrain.assemblePlan", async () => {
+      const goal = await vscode.window.showInputBox({ prompt: "Enter task goal for grounded Executive Plan" });
+      if (!goal) return;
+      try {
+        const res = await apiRequest("POST", "/v1/plan", { goal, mode: "deterministic" });
+        const doc = await vscode.workspace.openTextDocument({
+          content: JSON.stringify(res.data, null, 2),
+          language: "json",
+        });
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain plan failed: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.verifyLedger", async () => {
+      try {
+        const res = await apiRequest("GET", "/v1/ledger/verify");
+        if (!res.ok) {
+          vscode.window.showErrorMessage(`Ledger verify failed: ${res.data?.error || res.status}`);
+          return;
+        }
+        const valid = res.data?.chain_valid ? "VALID" : "INVALID";
+        vscode.window.showInformationMessage(
+          `Vault Merkle Ledger: ${valid} · ${res.data?.approved_atoms || 0} approved atoms · root ${(res.data?.live_merkle_root || "").slice(0, 16)}…`
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API unreachable: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.scanContradictions", async () => {
+      try {
+        const res = await apiRequest("GET", "/v1/graph/contradictions");
+        if (!res.ok) {
+          vscode.window.showErrorMessage(`Contradiction scan failed: ${res.data?.error || res.status}`);
+          return;
+        }
+        const count = res.data?.contradiction_count || 0;
+        if (count === 0) {
+          vscode.window.showInformationMessage("Contradiction Radar: 0 conflicts detected across vault.");
+        } else {
+          const doc = await vscode.workspace.openTextDocument({
+            content: JSON.stringify(res.data, null, 2),
+            language: "json",
+          });
+          await vscode.window.showTextDocument(doc, { preview: true });
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API unreachable: ${err.message}`);
+      }
     })
   );
 }

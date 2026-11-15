@@ -1,0 +1,77 @@
+{
+  "generated_at": "2026-11-15T08:43:41+00:00",
+  "corpus_atoms": 200,
+  "query_count": 34,
+  "hardware_profile": {
+    "os_name": "Windows",
+    "os_release": "10",
+    "architecture": "AMD64",
+    "cpu_threads": 8,
+    "total_ram_gib": 15.91,
+    "available_ram_gib": 9.15,
+    "cpp_runtime_ready": true,
+    "cpp_runtime_detail": "MSVC C++ runtime (vcruntime140.dll) present",
+    "gpu_backend": "cpu",
+    "gpu_name": "CPU inference mode (no CUDA/Metal accelerator)",
+    "vram_gib": 0.0,
+    "ollama_reachable": true,
+    "installed_ollama_models": [
+      "llama3.2:3b",
+      "llava:latest",
+      "nomic-embed-text:latest",
+      "qwen2.5-coder:7b",
+      "qwen3.6:latest"
+    ],
+    "tier_id": "tier_2_cpu_balanced",
+    "tier_label": "Tier 2 \u2014 Balanced CPU 7B Intelligence",
+    "recommended_generation_model": "qwen2.5-coder:7b",
+    "selected_installed_generation_model": "qwen2.5-coder:7b",
+    "recommended_embedding_model": "nomic-embed-text",
+    "recommended_retrieval_mode": "lexical",
+    "retrieval_p95_slo_ms": 15.0,
+    "answer_p95_slo_ms": 35000.0,
+    "rationale": "CPU host with 15.9 GiB RAM comfortably fits quantized 7B models (94% benchmarked positive coverage on qwen2.5-coder:7b); lexical FTS5 stays default for sub-10ms recall, with RRF opt-in."
+  },
+  "systems": {
+    "second_brain_verified": {
+      "positive_recall_pct": 100.0,
+      "claim_precision_pct": 100.0,
+      "citation_grounding_pct": 100.0,
+      "trap_leakage_pct": 0.0,
+      "abstention_accuracy_pct": 100.0,
+      "cross_project_leak_pct": 0.0,
+      "latency_p50_ms": 104.183,
+      "latency_p95_ms": 113.091
+    },
+    "naive_bm25_rag_no_trust_gate": {
+      "positive_recall_pct": 100.0,
+      "claim_precision_pct": 100.0,
+      "citation_grounding_pct": 100.0,
+      "trap_leakage_pct": 71.4,
+      "abstention_accuracy_pct": 28.6,
+      "cross_project_leak_pct": 0.0,
+      "latency_p50_ms": 0.354,
+      "latency_p95_ms": 0.492
+    },
+    "unscoped_flat_memory": {
+      "positive_recall_pct": 100.0,
+      "claim_precision_pct": 100.0,
+      "citation_grounding_pct": 100.0,
+      "trap_leakage_pct": 71.4,
+      "abstention_accuracy_pct": 28.6,
+      "cross_project_leak_pct": 100.0,
+      "latency_p50_ms": 0.268,
+      "latency_p95_ms": 0.36
+    },
+    "ungrounded_synthesis": {
+      "positive_recall_pct": 100.0,
+      "claim_precision_pct": 100.0,
+      "citation_grounding_pct": 0.0,
+      "trap_leakage_pct": 100.0,
+      "abstention_accuracy_pct": 0.0,
+      "cross_project_leak_pct": 0.0,
+      "latency_p50_ms": 0.256,
+      "latency_p95_ms": 0.318
+    }
+  }
+}

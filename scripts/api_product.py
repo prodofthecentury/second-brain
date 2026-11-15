@@ -255,7 +255,25 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/notes" and method == "GET":
             limit = max(1, min(int((q.get("limit") or ["100"])[0]), 500))
             offset = max(0, int((q.get("offset") or ["0"])[0]))
-            items, total = list_notes(query=(q.get("query") or [""])[0][:500], limit=limit, offset=offset, paths=paths)
+            note_query = (q.get("query") or q.get("q") or [""])[0][:500]
+            note_tag = (q.get("tag") or [""])[0].strip().casefold()
+            if note_tag:
+                filtered = []
+                scan_offset = 0
+                while True:
+                    batch, raw_total = list_notes(query=note_query, limit=1000, offset=scan_offset, paths=paths)
+                    if not batch:
+                        break
+                    for item in batch:
+                        if any(str(t).casefold() == note_tag for t in (item.tags or ())):
+                            filtered.append(item)
+                    scan_offset += len(batch)
+                    if scan_offset >= raw_total:
+                        break
+                total = len(filtered)
+                items = filtered[offset : offset + limit]
+            else:
+                items, total = list_notes(query=note_query, limit=limit, offset=offset, paths=paths)
             items_payload = [i.as_dict() for i in items]
             return send(200, {"total": total, "items": items_payload, "notes": items_payload})
 

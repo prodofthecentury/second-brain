@@ -97,6 +97,30 @@ from scripts.executive_planner import (
     ExecutivePlanRequest,
     assemble_executive_plan,
 )
+from scripts.notes_store import (
+    NoteError,
+    create_note,
+    delete_note,
+    get_note,
+    list_notes,
+    update_note,
+    verify_note_excerpt,
+)
+from scripts.bulk_import import import_folder
+from scripts.ide_connector import status as ide_connector_status
+from scripts.vault_ledger import (
+    commit_ledger_checkpoint,
+    prove_atom_membership,
+    verify_merkle_proof,
+    verify_vault_ledger,
+)
+from scripts.knowledge_graph import build_knowledge_graph, detect_contradictions
+from scripts.time_travel import (
+    create_snapshot,
+    diff_snapshots,
+    list_snapshots,
+    recall_at_snapshot,
+)
 
 ensure_dirs()
 
@@ -590,10 +614,12 @@ nav_selection = st.sidebar.radio(
     "NAVIGATION",
     [
         "💬 Chat with Memory",
+        "📝 Working Notes & Import",
         "🕸️ Knowledge Graph",
         "🗄️ Vault Explorer",
         "📥 Inbox & Web Scout",
         "🧬 Host API, Quarantine & Fitness",
+        "🛡️ Vault Proof & Time-Travel",
         "⚙️ System Control",
     ],
     index=0
@@ -1518,6 +1544,237 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                     st.error(f"Executive planning failed: {exc}")
 
 
+# PAGE: WORKING NOTES & IMPORT (PHASE 4)
+elif nav_selection == "📝 Working Notes & Import":
+    st.title("📝 Working Notes & Bulk Import")
+    st.caption(
+        "Zero-friction owner notes stored in `brain/notes/` (separate from verified atoms). "
+        "Promote an exact excerpt into an immutable snapshot + SHA-256 anchored approved atom at any time."
+    )
+    tab_notes_browse, tab_notes_create, tab_notes_import = st.tabs([
+        "📚 Browse, Edit & Verify Excerpt",
+        "➕ New Working Note",
+        "📦 Bulk Markdown / Obsidian Import",
+    ])
+
+    with tab_notes_browse:
+        note_q = st.text_input("Search Working Notes (FTS5)", value="", key="notes_fts_q")
+        note_items, note_total = list_notes(query=note_q.strip(), limit=100, offset=0)
+        st.caption(f"Showing {len(note_items)} of {note_total} working note(s).")
+        if not note_items:
+            st.info("No working notes match the current filter.")
+        else:
+            note_choices = {f"{n.title} ({n.filename})": n.filename for n in note_items}
+            chosen_label = st.selectbox("Select Working Note", list(note_choices.keys()), key="sel_working_note")
+            chosen_fn = note_choices[chosen_label]
+            full_note = get_note(chosen_fn)
+            st.caption(f"SHA-256: `{full_note.sha256}` | Origin: `{full_note.origin}` | Tags: `{', '.join(full_note.tags) or 'none'}`")
+            edited_title = st.text_input("Title", value=full_note.title, key=f"nt_title_{chosen_fn}")
+            edited_tags = st.text_input("Tags (comma-separated)", value=", ".join(full_note.tags), key=f"nt_tags_{chosen_fn}")
+            edited_body = st.text_area("Markdown Body", value=full_note.body or "", height=260, key=f"nt_body_{chosen_fn}")
+            nc1, nc2 = st.columns(2)
+            with nc1:
+                if st.button("💾 Save Note (CAS)", key=f"btn_save_nt_{chosen_fn}"):
+                    try:
+                        res = update_note(
+                            chosen_fn,
+                            edited_body,
+                            expected_sha256=full_note.sha256,
+                            title=edited_title,
+                            tags=[t.strip() for t in edited_tags.split(",") if t.strip()],
+                        )
+                        st.success(f"Saved `{res['filename']}` (SHA-256 `{res['sha256'][:16]}…`).")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Note update blocked: {exc}")
+            with nc2:
+                if st.button("🗑️ Delete Note (CAS)", key=f"btn_del_nt_{chosen_fn}"):
+                    try:
+                        delete_note(chosen_fn, expected_sha256=full_note.sha256)
+                        st.info(f"Deleted `{chosen_fn}`.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Delete blocked: {exc}")
+
+            with st.expander("✅ Verify Excerpt into Canonical Approved Atom", expanded=False):
+                ver_excerpt = st.text_area(
+                    "Exact Excerpt from Saved Note (min 12 chars)",
+                    placeholder="Paste exact sentence/clause from the saved note above...",
+                    height=90,
+                    key=f"ver_exc_{chosen_fn}",
+                )
+                ver_claim = st.text_input("Optional Distilled Claim (defaults to excerpt)", value="", key=f"ver_clm_{chosen_fn}")
+                ver_actor = st.text_input("Human Owner Actor", value="local_dashboard_owner", key=f"ver_act_{chosen_fn}")
+                if st.button("🔒 Snapshot & Verify Excerpt", key=f"btn_ver_nt_{chosen_fn}"):
+                    try:
+                        vres = verify_note_excerpt(
+                            chosen_fn,
+                            ver_excerpt,
+                            actor=ver_actor,
+                            expected_note_sha256=full_note.sha256,
+                            claim=ver_claim.strip() or None,
+                        )
+                        st.success(
+                            f"Promoted approved atom `2-atoms/{vres['atom_filename']}` anchored to immutable snapshot `{vres['snapshot_rel_path']}`."
+                        )
+                    except Exception as exc:
+                        st.error(f"Excerpt verification blocked: {exc}")
+
+    with tab_notes_create:
+        new_nt_title = st.text_input("Note Title", placeholder="e.g. Architecture Decision — Local Queue", key="new_nt_title")
+        new_nt_tags = st.text_input("Tags (comma-separated)", placeholder="project:second_brain, architecture", key="new_nt_tags")
+        new_nt_body = st.text_area("Note Body", height=220, key="new_nt_body")
+        if st.button("➕ Create Working Note", key="btn_create_nt"):
+            try:
+                created = create_note(
+                    new_nt_title,
+                    new_nt_body,
+                    tags=[t.strip() for t in new_nt_tags.split(",") if t.strip()],
+                )
+                st.success(f"Created `brain/notes/{created['filename']}` (SHA-256 `{created['sha256'][:16]}…`).")
+            except NoteError as exc:
+                st.error(f"Could not create note: {exc}")
+
+    with tab_notes_import:
+        st.caption("Idempotently import an Obsidian vault or Markdown folder into `brain/notes/` (`owner_import` origin, never auto-approved).")
+        imp_folder = st.text_input("Source Folder Path", placeholder=r"C:\Users\you\Documents\ObsidianVault", key="imp_folder_path")
+        imp_tags = st.text_input("Optional Tags to Apply (comma-separated)", value="imported", key="imp_folder_tags")
+        imp_dry = st.checkbox("Dry Run (preview counts without writing files)", value=True, key="imp_dry_run")
+        if st.button("📦 Run Bulk Import", key="btn_bulk_import"):
+            if not imp_folder.strip():
+                st.warning("Provide a local folder path to import.")
+            else:
+                try:
+                    stats = import_folder(
+                        imp_folder.strip(),
+                        tags=tuple(t.strip() for t in imp_tags.split(",") if t.strip()),
+                        dry_run=imp_dry,
+                    )
+                    st.json(stats.as_dict())
+                except Exception as exc:
+                    st.error(f"Bulk import blocked: {exc}")
+
+
+# PAGE: VAULT PROOF, CONTRADICTION RADAR & TIME-TRAVEL (PHASE 5)
+elif nav_selection == "🛡️ Vault Proof & Time-Travel":
+    st.title("🛡️ Vault Proof, Contradiction Radar & Time-Travel")
+    st.caption(
+        "Cryptographic Merkle inclusion proofs & hash-chained audit ledger, deterministic Contradiction & Drift Radar, "
+        "and point-in-time Vault Snapshots with semantic diffs."
+    )
+    tab_merkle, tab_radar, tab_timetravel = st.tabs([
+        "🔐 Merkle Audit Ledger & Proofs",
+        "📡 Contradiction & Drift Radar",
+        "⏳ Time-Travel Snapshots & Diff",
+    ])
+
+    with tab_merkle:
+        ledger_state = verify_vault_ledger()
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Hash Chain Valid", "YES" if ledger_state["chain_valid"] else "TAMPERED / ERROR")
+        mc2.metric("Ledger Entries", ledger_state["entry_count"])
+        mc3.metric("Verified Merkle Leaves", ledger_state["leaf_count"])
+        st.code(
+            f"Live Merkle Root : {ledger_state['live_merkle_root']}\n"
+            f"Matches Latest   : {ledger_state['matches_latest_checkpoint']}\n"
+            f"Approved Atoms   : {ledger_state['approved_atoms']} | Accepted Playbooks: {ledger_state['accepted_playbooks']}",
+            language="text",
+        )
+        if ledger_state.get("errors"):
+            st.error("Ledger verification errors: " + "; ".join(ledger_state["errors"]))
+
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            ckpt_actor = st.text_input("Owner Actor", value="local_dashboard_owner", key="ldg_actor")
+            ckpt_note = st.text_input("Checkpoint Note", placeholder="e.g. Post-review release checkpoint", key="ldg_note")
+            if st.button("🔏 Commit Signed Merkle Checkpoint", key="btn_commit_ledger"):
+                try:
+                    entry = commit_ledger_checkpoint(actor=ckpt_actor, note=ckpt_note)
+                    st.success(f"Committed checkpoint #{entry['seq']} (`{entry['entry_sha256'][:16]}…`).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Checkpoint commit failed: {exc}")
+        with lc2:
+            prove_target = st.text_input("Generate Portable Merkle Proof for Approved Atom", placeholder="e.g. structured-logging.md", key="ldg_prove_atom")
+            if st.button("🧾 Prove Atom Membership", key="btn_prove_atom"):
+                if not prove_target.strip():
+                    st.warning("Enter an approved atom filename.")
+                else:
+                    try:
+                        proof = prove_atom_membership(prove_target.strip())
+                        proof["verified_offline"] = verify_merkle_proof(proof)
+                        st.json(proof)
+                    except Exception as exc:
+                        st.error(f"Proof generation blocked: {exc}")
+
+    with tab_radar:
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            radar_proj = st.text_input("Optional Project Scope", placeholder="e.g. project:second_brain", key="radar_proj")
+        with rc2:
+            radar_inc_pending = st.checkbox("Include Pending Drafts in Contradiction Scan", value=True, key="radar_pending")
+        if st.button("📡 Scan Vault for Contradictions & Orphans", key="btn_scan_radar"):
+            graph_info = build_knowledge_graph(project_scope=radar_proj.strip() or None, include_pending=False)
+            radar_info = detect_contradictions(project_scope=radar_proj.strip() or None, include_pending=radar_inc_pending)
+            gc1, gc2, gc3, gc4 = st.columns(4)
+            gc1.metric("Approved Graph Nodes", graph_info["node_count"])
+            gc2.metric("Graph Edges", graph_info["edge_count"])
+            gc3.metric("Contradictions", radar_info["contradiction_count"])
+            gc4.metric("High Severity", radar_info["high_severity_count"])
+            if radar_info["alerts"]:
+                for alert in radar_info["alerts"]:
+                    st.code(
+                        f"[{alert['severity'].upper()}] {', '.join(alert['reasons'])} (jaccard={alert['jaccard']})\n"
+                        f"  Atom A: {alert['atom_a']['filename']} ({alert['atom_a']['review_status']}) -> {alert['atom_a']['claim']}\n"
+                        f"  Atom B: {alert['atom_b']['filename']} ({alert['atom_b']['review_status']}) -> {alert['atom_b']['claim']}",
+                        language="text",
+                    )
+            else:
+                st.success("Zero claim polarity or numeric contradictions detected in selected scope.")
+            if radar_info["orphan_approved_atoms"]:
+                st.caption("Orphan approved atoms (no explicit `[[wikilink]]` or `links:` edges): " + ", ".join(radar_info["orphan_approved_atoms"]))
+
+    with tab_timetravel:
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            snap_label = st.text_input("Snapshot Label", placeholder="e.g. pre-refactor", key="tt_label")
+            snap_actor = st.text_input("Owner Actor", value="local_dashboard_owner", key="tt_actor")
+            if st.button("📸 Capture Vault Snapshot", key="btn_take_snap"):
+                try:
+                    snap_doc = create_snapshot(label=snap_label, actor=snap_actor)
+                    st.success(f"Created snapshot `{snap_doc['snapshot_id']}` ({snap_doc['atom_count']} approved atoms, Merkle `{snap_doc['merkle_root'][:16]}…`).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Snapshot failed: {exc}")
+
+        snaps = list_snapshots()
+        with sc2:
+            st.caption(f"Recorded snapshots: {len(snaps)}")
+            if snaps:
+                st.dataframe(pd.DataFrame(snaps), use_container_width=True)
+
+        if snaps:
+            snap_ids = [s["snapshot_id"] for s in snaps]
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                from_snap = st.selectbox("From Snapshot", snap_ids, key="tt_from")
+                to_snap = st.selectbox("To Snapshot (or `live`)", ["live", *snap_ids], key="tt_to")
+                if st.button("🔍 Semantic Diff", key="btn_diff_snap"):
+                    try:
+                        st.json(diff_snapshots(from_snap, to_snap))
+                    except Exception as exc:
+                        st.error(f"Snapshot diff failed: {exc}")
+            with dc2:
+                pit_snap = st.selectbox("Point-in-Time Snapshot", snap_ids, key="tt_pit_snap")
+                pit_query = st.text_input("Historical Recall Query", placeholder="What was approved at this snapshot?", key="tt_pit_q")
+                pit_proj = st.text_input("Optional Project Scope", value="", key="tt_pit_proj")
+                if st.button("⏪ Recall at Snapshot", key="btn_pit_recall"):
+                    try:
+                        st.json(recall_at_snapshot(pit_query, pit_snap, project_scope=pit_proj.strip() or None))
+                    except Exception as exc:
+                        st.error(f"Point-in-time recall failed: {exc}")
+
+
 # PAGE 5: SYSTEM CONTROL
 elif nav_selection == "⚙️ System Control":
     st.title("⚙️ System Control")
@@ -1541,6 +1798,10 @@ elif nav_selection == "⚙️ System Control":
         if st.button("Run System Doctor"):
             proc = run_script_process("scripts/doctor.py")
             stream_logs_ui(proc, "Second Brain system doctor running")
+
+        if st.button("📊 Run Comparative SOTA Benchmark"):
+            proc = run_script_process("scripts/sota_benchmark.py")
+            stream_logs_ui(proc, "Comparative SOTA benchmark running")
             
         st.markdown("</div>", unsafe_allow_html=True)
         
@@ -1552,6 +1813,10 @@ elif nav_selection == "⚙️ System Control":
         # We can write run_daemon launcher check
         daemon_status = st.empty()
         daemon_status.info("ℹ️ Launch the daemon via terminal launcher: `run_daemon.ps1`")
+
+        st.markdown("### 🔌 Local IDE & Agent Connector Status")
+        if st.checkbox("Show IDE Connector Status"):
+            st.dataframe(pd.DataFrame(ide_connector_status()), use_container_width=True)
         
         st.markdown("### 📜 System Instruction Rules")
         if st.checkbox("View `house-rules.md`"):

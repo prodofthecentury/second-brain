@@ -48,6 +48,18 @@
         "title": "Second Brain: Open Streaming Chat"
       },
       {
+        "command": "secondBrain.assemblePlan",
+        "title": "Second Brain: Assemble Executive Plan"
+      },
+      {
+        "command": "secondBrain.verifyLedger",
+        "title": "Second Brain: Verify Vault Merkle Ledger"
+      },
+      {
+        "command": "secondBrain.scanContradictions",
+        "title": "Second Brain: Scan Contradiction Radar"
+      },
+      {
         "command": "secondBrain.refreshVault",
         "title": "Second Brain: Refresh Vault"
       }
