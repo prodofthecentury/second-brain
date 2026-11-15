@@ -313,9 +313,9 @@ synchronized across both files.
 - **Depends on:** Goals 13–15.
 - **Details:** `tasks/plan.md` Goal 16.
 
-### Goal 17 — OS-Signed Desktop Installers, SOTA Benchmark & Phase 5 Verifiable Vault Suite — COMPLETE
+### Goal 17 — OS-Signed Desktop Installers, SOTA Benchmark & Phase 5 Verifiable Vault Suite (`v0.2.0`) — COMPLETE
 
-- [x] Add cross-platform OS-signed desktop installer targets (`nsis`, `msi`, `dmg`/`zip`, `AppImage`/`deb`) in `desktop/package.json`, build/signing scripts (`scripts/package_desktop.ps1`, `scripts/package_desktop.sh`), and live tray lifecycle controls (`Start`/`Restart`/`Stop Memory API`, `Open Vault Folder`, `Launch at Login`) in `desktop/main.js`.
+- [x] Add cross-platform OS-signed desktop installer targets (`nsis`, `msi`, `dmg`/`zip`, `AppImage`/`deb`) in `desktop/package.json`, unified `.exe`/`.msi`/`.whl`/`.vsix` build + signing pipeline (`scripts/package_desktop.ps1`, `scripts/package_desktop.sh`, `scripts/sign_release.ps1`), automatic first-run `.venv` bootstrap (`ensureBackendBootstrapped` + bundled `setup.ps1`/`setup.sh`), 8-tab Electron UI (`Playbooks & Plan` + `Vault Proof & Radar`), and live tray lifecycle controls (`Start`/`Restart`/`Stop Memory API`, `Open Vault Folder`, `Launch at Login`) in `desktop/main.js`.
 - [x] Implement comparative SOTA benchmark harness (`scripts/sota_benchmark.py`, `second-brain sota-benchmark`) comparing Second Brain against external RAG/memory baselines on multi-hundred-atom owner-reviewed corpora with declared hardware profiles.
 - [x] Implement Cryptographic Vault Merkle Proof & Audit Ledger (`scripts/vault_ledger.py`, `second-brain ledger`, `/v1/ledger/*`), Contradiction & Drift Radar + Knowledge Graph (`scripts/knowledge_graph.py`, `second-brain graph`, `/v1/graph/*`), and Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Recall (`scripts/time_travel.py`, `second-brain snapshot`, `/v1/snapshots/*`), verified by `scripts/phase5_god_features_tests.py` (9 tests) in the 11-suite `scripts/test_all.py` release gate (`11/11 PASS`).
 

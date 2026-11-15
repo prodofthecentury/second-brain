@@ -627,7 +627,11 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if api_product.dispatch(self, "GET", path, urlparse(self.path).query, None):
+        try:
+            if api_product.dispatch(self, "GET", path, urlparse(self.path).query, None):
+                return
+        except Exception:
+            self._send_json(500, {"error": "Internal server error while processing request."})
             return
         self._send_json(404, {"error": f"Unknown endpoint: {path}"})
 
@@ -638,8 +642,11 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
         if raw_json is None:
             return
         path = urlparse(self.path).path
-        if not api_product.dispatch(self, method, path, urlparse(self.path).query, raw_json):
-            self._send_json(404, {"error": f"Unknown endpoint: {path}"})
+        try:
+            if not api_product.dispatch(self, method, path, urlparse(self.path).query, raw_json):
+                self._send_json(404, {"error": f"Unknown endpoint: {path}"})
+        except Exception:
+            self._send_json(500, {"error": "Internal server error while processing request."})
 
     def do_PUT(self) -> None:
         self._dispatch_body_method("PUT")
@@ -1118,6 +1125,17 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "GET /v1/inbox/queue",
                 "GET /v1/cognitive/fitness",
                 "POST /v1/cognitive/experiences",
+                "GET /v1/notes",
+                "POST /v1/remember",
+                "POST /v1/chat/stream",
+                "GET /v1/ledger/verify",
+                "POST /v1/ledger/commit",
+                "GET /v1/ledger/prove/<atom>",
+                "GET /v1/graph/contradictions",
+                "GET /v1/graph/summary",
+                "GET /v1/snapshots",
+                "POST /v1/snapshots/diff",
+                "POST /v1/snapshots/recall",
             ],
         },
         "local_ide_mcp_stdio": {

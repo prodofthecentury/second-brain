@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -34,10 +35,13 @@ from config import (  # noqa: E402
     is_content_markdown,
     safe_file_in_dir,
 )
+from host_adapters import restrict_security_file_permissions  # noqa: E402
 from memory_review import parse_atom_record  # noqa: E402
 from skill_playbooks import verify_playbook_integrity  # noqa: E402
 
 GENESIS_HASH = "0" * 64
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 def _sha256_text(text: str) -> str:
@@ -177,15 +181,22 @@ def compute_vault_merkle(
 
 
 def _read_ledger_entries(ledger_file: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    if os.path.lexists(str(ledger_file.parent)) and _is_reparse_or_link(str(ledger_file.parent)):
+        return [], ["Ledger parent directory is a symlink or junction (rejected fail-closed)."]
+    if os.path.lexists(str(ledger_file)) and _is_reparse_or_link(str(ledger_file)):
+        return [], ["Ledger file is a symlink or junction (rejected fail-closed)."]
     if not ledger_file.exists():
         return [], []
-    if _is_reparse_or_link(str(ledger_file)):
-        return [], ["Ledger file is a symlink or junction (rejected fail-closed)."]
+
+    try:
+        raw_text = ledger_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [], [f"Ledger unreadable or corrupted: {exc}"]
 
     entries: list[dict[str, Any]] = []
     errors: list[str] = []
     expected_prev = GENESIS_HASH
-    for idx, line in enumerate(ledger_file.read_text(encoding="utf-8").splitlines(), start=1):
+    for idx, line in enumerate(raw_text.splitlines(), start=1):
         stripped = line.strip()
         if not stripped:
             continue
@@ -258,10 +269,17 @@ def commit_ledger_checkpoint(
         }
         payload["entry_sha256"] = _sha256_text(_canonical_json(payload))
 
-        with open(ledger_file, "a", encoding="utf-8") as fh:
-            fh.write(_canonical_json(payload) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        existed_before = ledger_file.exists()
+        encoded_line = (_canonical_json(payload) + "\n").encode("utf-8")
+        fd = os.open(str(ledger_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o600)
+        try:
+            if os.write(fd, encoded_line) != len(encoded_line):
+                raise OSError("Incomplete write to vault-ledger.jsonl.")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if not existed_before:
+            restrict_security_file_permissions(ledger_file)
         return payload
 
 
@@ -299,7 +317,9 @@ def prove_atom_membership(
     playbooks_dir: str | None = None,
 ) -> dict[str, Any]:
     """Generate a portable Merkle inclusion proof for an accepted atom."""
-    safe_path = safe_file_in_dir(atoms_dir, atom_filename, allowed_exts={".md"}, must_exist=True)
+    raw_name = str(atom_filename or "").strip()
+    norm_name = raw_name if raw_name.lower().endswith(".md") else f"{raw_name}.md"
+    safe_path = safe_file_in_dir(atoms_dir, norm_name, allowed_exts={".md"}, must_exist=True)
     if not safe_path:
         raise FileNotFoundError(f"Atom not found: {atom_filename}")
     target_rel = f"2-atoms/{os.path.basename(safe_path)}"
@@ -337,12 +357,23 @@ def prove_atom_membership(
 
 def verify_merkle_proof(proof: dict[str, Any]) -> bool:
     """Offline stateless verification of a Merkle inclusion proof bundle."""
+    if not isinstance(proof, dict):
+        return False
     rel_path = str(proof.get("rel_path") or "")
-    file_sha256 = str(proof.get("file_sha256") or "")
-    leaf_sha256 = str(proof.get("leaf_sha256") or "")
-    expected_root = str(proof.get("merkle_root") or "")
-    siblings = proof.get("siblings") or []
-    if not rel_path or not file_sha256 or not expected_root:
+    file_sha256 = str(proof.get("file_sha256") or "").lower()
+    leaf_sha256 = str(proof.get("leaf_sha256") or "").lower()
+    expected_root = str(proof.get("merkle_root") or "").lower()
+    siblings = proof.get("siblings")
+    if siblings is None:
+        siblings = []
+    if not isinstance(siblings, list):
+        return False
+    if (
+        not rel_path
+        or not _HEX64_RE.fullmatch(file_sha256)
+        or not _HEX64_RE.fullmatch(leaf_sha256)
+        or not _HEX64_RE.fullmatch(expected_root)
+    ):
         return False
     if _leaf_digest(rel_path, file_sha256) != leaf_sha256:
         return False
@@ -352,8 +383,8 @@ def verify_merkle_proof(proof: dict[str, Any]) -> bool:
         if not isinstance(step, dict):
             return False
         pos = step.get("position")
-        sib = str(step.get("sha256") or "")
-        if len(sib) != 64:
+        sib = str(step.get("sha256") or "").lower()
+        if not _HEX64_RE.fullmatch(sib):
             return False
         if pos == "right":
             cur = _pair_digest(cur, sib)

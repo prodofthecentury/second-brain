@@ -26,11 +26,11 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import approved_revision_is_current  # noqa: E402
+from atom_mutator import approved_revision_is_current, latest_decisions_by_atom  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown  # noqa: E402
 from memory_format import split_frontmatter  # noqa: E402
 from memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list  # noqa: E402
-from recall import normalize_project_tag, project_tags_match  # noqa: E402
+from recall import normalize_project_tag, project_tags_match, wikilinks  # noqa: E402
 
 _STOPWORDS = frozenset(
     {
@@ -81,6 +81,13 @@ def build_knowledge_graph(
     """Build deterministic nodes and edges across vault atoms."""
     nodes: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, Any]] = {}
+    latest_decisions: dict[str, dict[str, Any]] = {}
+    dlog = os.path.join(brain_dir, "0-raw", "archive", "decision-record.jsonl")
+    if os.path.isfile(dlog) and not _is_reparse_or_link(dlog):
+        try:
+            latest_decisions = latest_decisions_by_atom(dlog)
+        except (OSError, ValueError, TypeError):
+            latest_decisions = {}
 
     if os.path.isdir(atoms_dir) and not _is_reparse_or_link(atoms_dir):
         for entry in sorted(os.scandir(atoms_dir), key=lambda e: e.name):
@@ -94,8 +101,16 @@ def build_knowledge_graph(
                 rec = parse_atom_record(path)
             except (OSError, UnicodeDecodeError, ValueError):
                 continue
+            fm_parsed = split_frontmatter(raw)
+            fm_vals = parse_frontmatter_values(fm_parsed[0]) if fm_parsed else {}
             status = rec.get("review_status")
-            if status in ("rejected", "quarantined"):
+            claim_state = str(fm_vals.get("claim_state") or rec.get("claim_state") or "").strip().lower()
+            latest_action = str((latest_decisions.get(entry.name) or {}).get("action") or "").strip().lower()
+            if (
+                status in ("rejected", "quarantined")
+                or claim_state in ("rejected", "quarantined")
+                or latest_action in ("reject", "quarantine")
+            ):
                 continue
             sup_list = list(rec.get("superseded_by") or [])
             is_approved_current = bool(
@@ -108,13 +123,27 @@ def build_knowledge_graph(
             contexts = list(rec.get("contexts") or [])
             if not _matches_scope(contexts, project_scope):
                 continue
-            fm_text, _ = split_frontmatter(raw)
-            fm_vals = parse_frontmatter_values(fm_text) if fm_text else {}
             raw_links = fm_vals.get("links", "")
-            links = (
+            fm_links = (
                 [str(x).strip() for x in raw_links if str(x).strip()]
                 if isinstance(raw_links, list)
                 else parse_scalar_list(str(raw_links or ""))
+            )
+            links_dedup: list[str] = []
+            seen_links: set[str] = set()
+            for raw_target in [*fm_links, *wikilinks(raw)]:
+                cleaned = str(raw_target or "").strip()
+                if cleaned.startswith("[[") and cleaned.endswith("]]"):
+                    cleaned = cleaned[2:-2].split("|", 1)[0].strip()
+                if cleaned and cleaned not in seen_links:
+                    seen_links.add(cleaned)
+                    links_dedup.append(cleaned)
+            links = links_dedup
+            raw_supersedes = fm_vals.get("supersedes", "")
+            supersedes_list = (
+                [str(x).strip() for x in raw_supersedes if str(x).strip()]
+                if isinstance(raw_supersedes, list)
+                else parse_scalar_list(str(raw_supersedes or ""))
             )
             superseded_by = sup_list[0] if sup_list else ""
             claim_text = rec.get("claim") or ""
@@ -133,6 +162,7 @@ def build_knowledge_graph(
                 "memory_type": rec.get("memory_type", ""),
                 "contexts": contexts,
                 "links": links,
+                "supersedes": supersedes_list,
                 "superseded_by": superseded_by,
                 "claim": claim_text,
                 "negative_polarity": _is_negative_claim(claim_text),
@@ -143,15 +173,39 @@ def build_knowledge_graph(
             by_id[atom_id] = node
             by_id[node["filename"]] = node
 
+    def _resolve_target(target_ref: str) -> dict[str, Any] | None:
+        if target_ref in by_id:
+            return by_id[target_ref]
+        if not target_ref.lower().endswith(".md") and f"{target_ref}.md" in by_id:
+            return by_id[f"{target_ref}.md"]
+        if target_ref.lower().endswith(".md") and Path(target_ref).stem in by_id:
+            return by_id[Path(target_ref).stem]
+        return None
+
     edges: list[dict[str, Any]] = []
+    seen_edges: set[tuple[str, str, str]] = set()
     for node in nodes:
         for target in node["links"]:
-            if target in by_id:
-                edges.append({"from": node["filename"], "to": by_id[target]["filename"], "kind": "link"})
-        if node["superseded_by"] and node["superseded_by"] in by_id:
-            edges.append(
-                {"from": node["filename"], "to": by_id[node["superseded_by"]]["filename"], "kind": "superseded_by"}
-            )
+            resolved = _resolve_target(target)
+            if resolved and resolved["filename"] != node["filename"]:
+                ek = (node["filename"], resolved["filename"], "link")
+                if ek not in seen_edges:
+                    seen_edges.add(ek)
+                    edges.append({"from": node["filename"], "to": resolved["filename"], "kind": "link"})
+        if node["superseded_by"]:
+            resolved = _resolve_target(node["superseded_by"])
+            if resolved and resolved["filename"] != node["filename"]:
+                ek = (node["filename"], resolved["filename"], "superseded_by")
+                if ek not in seen_edges:
+                    seen_edges.add(ek)
+                    edges.append({"from": node["filename"], "to": resolved["filename"], "kind": "superseded_by"})
+        for old_ref in node.get("supersedes") or ():
+            resolved = _resolve_target(old_ref)
+            if resolved and resolved["filename"] != node["filename"]:
+                ek = (resolved["filename"], node["filename"], "superseded_by")
+                if ek not in seen_edges:
+                    seen_edges.add(ek)
+                    edges.append({"from": resolved["filename"], "to": node["filename"], "kind": "superseded_by"})
 
     # Compute topic-similarity edges
     for i in range(len(nodes)):

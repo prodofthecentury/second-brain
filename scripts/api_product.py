@@ -452,7 +452,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 brain_dir=rt.brain_dir,
                 atoms_dir=rt.atoms_dir,
                 playbooks_dir=rt.playbooks_dir,
-                actor=_str(body, "actor", max_len=120) or "owner",
+                actor=_str(body, "actor", max_len=120, required=False) or "owner",
                 note=_str(body, "note", max_len=300, required=False),
             )
             return send(201, entry)
@@ -461,10 +461,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             from vault_ledger import prove_atom_membership
 
             atom_name = unquote(path[len("/v1/ledger/prove/"):])
-            return send(
-                200,
-                prove_atom_membership(atom_name, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir, playbooks_dir=rt.playbooks_dir),
-            )
+            try:
+                proof = prove_atom_membership(
+                    atom_name, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir, playbooks_dir=rt.playbooks_dir
+                )
+            except (FileNotFoundError, PermissionError):
+                if not is_owner:
+                    return send(404, {"error": "Verified atom proof not found."})
+                raise
+            return send(200, proof)
 
         # ── Contradiction & Drift Radar + Knowledge Graph ──
         if path == "/v1/graph/contradictions" and method == "GET":
@@ -508,7 +513,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
             doc = create_snapshot(
                 label=_str(body, "label", max_len=160, required=False),
-                actor=_str(body, "actor", max_len=120) or "owner",
+                actor=_str(body, "actor", max_len=120, required=False) or "owner",
                 brain_dir=rt.brain_dir,
                 atoms_dir=rt.atoms_dir,
                 playbooks_dir=rt.playbooks_dir,

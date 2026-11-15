@@ -4,7 +4,7 @@
 
 Phase 3A and Phase 4 extend Second Brain from the Phase 2 Host-Independent Loopback API & Cognitive Telemetry foundation into full **Procedural Skill Playbooks**, **Grounded Executive Planning**, **Corpus-Scale FTS5 Indexing**, **Zero-Friction Owner Notes**, **Streaming / Instant / Verified Chat**, and **One-Click IDE & Agent Connectors**, while preserving all **5 Non-Negotiable System Invariants**:
 
-1. **Durable Storage Invariance:** Owner-verified knowledge lives exclusively in canonical Markdown atoms (`brain/2-atoms/*.md`), owner-gated Playbooks (`brain/5-playbooks/*.md`), immutable evidence artifacts (`brain/0-raw/*`, `brain/sources/*`), and create-only episodes (`brain/4-experiences/*.md`). Unverified working notes live separately in `brain/notes/*.md` with immutable snapshots taken on verification under `brain/0-raw/note-snapshots/`. All SQLite (`lexical.sqlite3`, `notes.sqlite3`, `telemetry.sqlite3`) and Chroma (`.chroma/`) sidecars under `brain/.sidecar/` remain rebuildable projections.
+1. **Durable Storage Invariance:** Owner-verified knowledge lives exclusively in canonical Markdown atoms (`brain/2-atoms/*.md`), owner-gated Playbooks (`brain/5-playbooks/*.md`), immutable evidence artifacts (`brain/0-raw/*`, `brain/sources/*`), and create-only episodes (`brain/4-experiences/*.md`). Unverified working notes live separately in `brain/notes/*.md` with immutable snapshots taken on verification under `brain/0-raw/note-snapshots/`. SQLite (`lexical.sqlite3`, `notes.sqlite3`, `telemetry.sqlite3`) and Chroma (`.chroma/`) sidecars under `brain/` remain rebuildable projections, while `brain/.sidecar/vault-ledger.jsonl` and `brain/.sidecar/snapshots/` store tamper-evident Merkle checkpoints and point-in-time vault snapshots that should be preserved alongside vault backups when clearing index caches.
 2. **Deterministic Compare-and-Swap (CAS):** Canonical atoms (`scripts/atom_mutator.py`) and Skill Playbooks (`scripts/skill_playbooks.py`) require `writer.lock` and explicit `expected_sha256` / `expected_playbook_sha256` preconditions alongside append-only SHA-256 decision logs (`atom-decisions.jsonl`, `playbook-decisions.jsonl`).
 3. **Cryptographic Source Anchoring:** Every approved atom requires an exact byte-offset + raw-byte SHA-256 anchor (`scripts/audit_sources.py`). Promoting a note excerpt (`verify_note_excerpt`) snapshots exact bytes into `brain/0-raw/note-snapshots/` before anchoring and approval.
 4. **Out-of-Model Epistemic & Procedural Grounding:** Standard answers (`scripts/answer_policy.py`), Playbook step grounding (`_claim_grounding_units`), and Executive Plans (`scripts/executive_planner.py`) validate claims, steps, and scopes outside the model. `model_assisted` planning expands selected `PB_*` Playbooks into complete authored sequences so models cannot drop or reorder steps.
@@ -124,9 +124,21 @@ Following initial Phase 4 implementation, a full security and contract audit (`P
 
 ---
 
-## 5. Unified 10-Suite Release Verification (`scripts/test_all.py`)
+## 5. Phase 5 Verifiable Vault Suite, OS-Signed Installers & SOTA Benchmark (`Goal 17`, `v0.2.0`)
 
-The unified gate runs **10/10** suites end-to-end (`doctor`, `evaluation_dataset`, `audit_sources`, `system_safety_tests`, `phase2_safety_tests`, `phase3_cognitive_tests`, `phase4_product_tests`, `scale_benchmark_1500`, `chroma_rebuild_canary`, `smoke_test`) against an isolated runtime and temp vaults:
+Phase 5 closes the remaining product horizon items (`CODEX_CLI_GOAL.md`) across cryptographic verification, contradiction/drift detection, point-in-time snapshots, comparative external SOTA benchmarking, and cross-platform OS-signed installers:
+
+- **Cryptographic Vault Merkle Proof & Audit Ledger (`scripts/vault_ledger.py`, `second-brain ledger`, `/v1/ledger/*`):** Computes deterministic domain-separated SHA-256 Merkle trees (`leaf:`, `node:`, `odd:`) strictly over verified `accepted` non-superseded atoms (`approved_revision_is_current`) and active verified Playbooks (`verify_playbook_integrity`), appends hash-chained checkpoints under `writer.lock` to `brain/.sidecar/vault-ledger.jsonl` (`0600` / NTFS owner DACL, symlink/reparse fail-closed), and exports offline-verifiable Merkle inclusion proofs (`prove_atom_membership`, `verify_merkle_proof`).
+- **Contradiction & Drift Radar + Temporal Knowledge Graph (`scripts/knowledge_graph.py`, `second-brain graph`, `/v1/graph/*`):** Builds an explainable graph across frontmatter `links:`, Markdown `[[wikilinks]]`, `supersedes` / `superseded_by` lineage, and shared-topic Jaccard overlap while excluding rejected/quarantined atoms and preventing forged `accepted` frontmatter from escalating alert severity or entering `orphan_approved_atoms`.
+- **Time-Travel Vault Snapshots & Point-in-Time Recall (`scripts/time_travel.py`, `second-brain snapshot`, `/v1/snapshots/*`):** Persists collision-free, atomic point-in-time snapshots under `brain/.sidecar/snapshots/`, supports semantic diffs between snapshots or `live`, and serves stopword-filtered point-in-time recall (`recall_at_snapshot`) without leakage from later edits or unapproved drafts.
+- **Comparative External SOTA Benchmark (`scripts/sota_benchmark.py`, `second-brain sota-benchmark`):** Evaluates Second Brain head-to-head against naive BM25 RAG, unscoped flat memory, and ungrounded synthesis on multi-hundred-atom corpora (including pending and superseded traps) alongside declared hardware profiles.
+- **OS-Signed Cross-Platform Desktop Installers (`desktop/package.json`, `desktop/main.js`, `scripts/package_desktop.ps1`, `scripts/package_desktop.sh`, `scripts/sign_release.ps1`):** Ships NSIS + MSI (Windows), DMG + zip (macOS), and AppImage + deb (Linux) targets, unified `.exe`/`.msi`/`.whl`/`.vsix` packaging with Authenticode signature verification and `dist/SHA256SUMS.txt`, user-writable packaged runtime bootstrap (`UV_PROJECT_ENVIRONMENT`), 8-tab Electron UI (`Playbooks & Plan`, `Vault Proof & Radar`), and live tray lifecycle controls.
+
+---
+
+## 6. Unified 11-Suite Release Verification (`scripts/test_all.py`)
+
+The unified gate runs **11/11** suites end-to-end (`doctor`, `evaluation_dataset`, `audit_sources`, `system_safety_tests`, `phase2_safety_tests`, `phase3_cognitive_tests`, `phase4_product_tests`, `phase5_god_features_tests`, `scale_benchmark_1500`, `chroma_rebuild_canary`, `smoke_test`) against an isolated runtime and temp vaults:
 
 - `doctor` (CLI/environment/ABI/index health)
 - `evaluation_dataset` (30-case dataset schema & SHA-256 binding)
@@ -134,7 +146,8 @@ The unified gate runs **10/10** suites end-to-end (`doctor`, `evaluation_dataset
 - `system_safety_tests` (CAS, grounding, RRF/project scoping & security penetration suite)
 - `phase2_safety_tests` (Phase 2 hardware tiers, inbox triage, consent/PII adapters, telemetry & API)
 - `phase3_cognitive_tests` (13 tests: Phase 3A fitness/ranking, Playbooks, Executive Planner & H1/H2/M1–M4/L1–L7 regressions)
-- `phase4_product_tests` (30 tests: Scale engine, notes, one-click verify, streaming chat, dual-token API, Obsidian import, IDE connectors, MCP auth & Phase 4 security/contract audit regressions)
+- `phase4_product_tests` (32 tests: Scale engine, notes, one-click verify, streaming chat, dual-token API, Obsidian import, IDE connectors, MCP auth & Phase 4–5 security/contract audit regressions)
+- `phase5_god_features_tests` (Desktop installers/tray, comparative SOTA benchmark, Merkle vault ledger, Contradiction Radar, Time-Travel snapshots & Phase 5 security regressions)
 - `scale_benchmark_1500` (1,500-note synthetic corpus correctness & latency canary)
 - `chroma_rebuild_canary` (real ChromaDB staged rebuild, cosine activation, rollback & handle cleanup canary)
 - `smoke_test` (end-to-end intake, grounding, lexical & dense recall smoke test)

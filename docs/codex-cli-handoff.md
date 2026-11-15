@@ -2,7 +2,7 @@
 
 **Last refreshed:** 2026-11-15 (Pacific/Auckland)
 
-**2026-11-15 Milestone Completion Note:** Goals 0–16 (`tasks/plan.md`, `tasks/todo.md`) are now implemented, adversarially audited across Phases 1, 2, 3A, and 4, and verified at `10/10 PASS` in `scripts/test_all.py` (see `docs/system-sweep-2026-11-15.md`, `docs/phase2-architecture-and-sweep-2026-11-15.md`, and `docs/phase3a-and-phase4-architecture-2026-11-15.md`). Both `master` and the history-scrubbed `release-code-only` branch are synchronized.
+**2026-11-15 Milestone Completion Note:** Goals 0–17 (`v0.2.0`, `tasks/plan.md`, `tasks/todo.md`) are now implemented, adversarially audited across Phases 1, 2, 3A, 4, and 5, and verified at `11/11 PASS` in `scripts/test_all.py` (see `docs/system-sweep-2026-11-15.md`, `docs/phase2-architecture-and-sweep-2026-11-15.md`, and `docs/phase3a-and-phase4-architecture-2026-11-15.md`). Both `master` and the history-scrubbed `release-code-only` branch are synchronized.
 
 **Current runtime follow-up (historical):** 2026-10-27. Native Chroma imports and queries
 the current 14-atom cosine generation after installing the official signed

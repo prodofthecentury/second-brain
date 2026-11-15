@@ -11,6 +11,8 @@ function switchView(name) {
   if (name === "review") loadReviewQueue();
   if (name === "ide") loadIdeStatus();
   if (name === "system") loadSystemView();
+  if (name === "planner") loadPlannerView();
+  if (name === "proof") loadProofView();
 }
 
 document.querySelectorAll(".nav-btn").forEach((btn) => {
@@ -442,14 +444,161 @@ async function loadSystemView() {
 }
 document.getElementById("refreshSystemBtn").addEventListener("click", loadSystemView);
 
+// ─── Playbooks & Grounded Executive Planner ──────────────────────────────────
+async function loadPlannerView() {
+  const scope = document.getElementById("planScopeInput").value.trim();
+  const q = scope ? `?project=${encodeURIComponent(scope)}` : "";
+  const res = await window.secondBrain.request("GET", `/v1/playbooks${q}`);
+  const grid = document.getElementById("playbooksGrid");
+  grid.replaceChildren();
+  const items = res.data?.playbooks || res.data?.items || [];
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "status-banner";
+    empty.textContent = "No verified playbooks found for this scope yet.";
+    grid.appendChild(empty);
+    return;
+  }
+  for (const pb of items) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const title = document.createElement("strong");
+    title.textContent = pb.title || pb.playbook_id || pb.filename || "Playbook";
+    const meta = document.createElement("div");
+    meta.className = "note-item-meta";
+    meta.textContent = `${pb.filename || ""} · ${(pb.contexts || []).join(", ")}`;
+    const trig = document.createElement("div");
+    trig.textContent = pb.trigger || "";
+    card.appendChild(title);
+    card.appendChild(meta);
+    card.appendChild(trig);
+    grid.appendChild(card);
+  }
+}
+
+async function runExecutivePlan() {
+  const goal = document.getElementById("planGoalInput").value.trim();
+  const banner = document.getElementById("plannerBanner");
+  const out = document.getElementById("planOutput");
+  if (!goal) {
+    banner.textContent = "Enter a goal to assemble an Executive Plan.";
+    return;
+  }
+  const project_scope = document.getElementById("planScopeInput").value.trim() || undefined;
+  const mode = document.getElementById("planModeSelect").value;
+  banner.textContent = "Assembling grounded plan...";
+  const res = await window.secondBrain.request("POST", "/v1/plan", { goal, project_scope, mode });
+  if (res.ok) {
+    banner.textContent = res.data?.plan_ready
+      ? `Plan ready (${res.data.mode_used || mode})`
+      : "Abstained: insufficient verified playbooks/atoms for this goal.";
+    out.textContent = JSON.stringify(res.data, null, 2);
+  } else {
+    banner.textContent = `Plan error: ${res.data?.error || res.status}`;
+    out.textContent = JSON.stringify(res.data, null, 2);
+  }
+}
+
+document.getElementById("runPlanBtn").addEventListener("click", runExecutivePlan);
+document.getElementById("refreshPlaybooksBtn").addEventListener("click", loadPlannerView);
+
+// ─── Vault Merkle Ledger, Contradiction Radar & Time-Travel Snapshots ────────
+async function loadLedgerStatus() {
+  const res = await window.secondBrain.request("GET", "/v1/ledger/verify");
+  document.getElementById("ledgerOutput").textContent = JSON.stringify(res.data, null, 2);
+}
+
+async function scanContradictions() {
+  const scope = document.getElementById("radarScopeInput").value.trim();
+  const q = scope ? `?project=${encodeURIComponent(scope)}` : "";
+  const [radarRes, summaryRes] = await Promise.all([
+    window.secondBrain.request("GET", `/v1/graph/contradictions${q}`),
+    window.secondBrain.request("GET", `/v1/graph/summary${q}`),
+  ]);
+  const grid = document.getElementById("radarGrid");
+  grid.replaceChildren();
+  const summaryCard = document.createElement("div");
+  summaryCard.className = "status-banner";
+  const nodes = summaryRes.data?.node_count ?? 0;
+  const edges = summaryRes.data?.edge_count ?? 0;
+  const alerts = radarRes.data?.alerts || [];
+  summaryCard.textContent = `Graph: ${nodes} approved node(s), ${edges} edge(s) · Contradiction alerts: ${alerts.length}`;
+  grid.appendChild(summaryCard);
+
+  for (const al of alerts) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const head = document.createElement("strong");
+    head.textContent = `[${String(al.severity || "").toUpperCase()}] ${(al.reasons || []).join(", ")}`;
+    const pair = document.createElement("div");
+    pair.className = "note-item-meta";
+    pair.textContent = `${al.atom_a?.filename || ""} vs ${al.atom_b?.filename || ""} · shared: ${(al.shared_terms || []).join(", ")}`;
+    const body = document.createElement("div");
+    body.textContent = `A: ${al.atom_a?.claim || ""} | B: ${al.atom_b?.claim || ""}`;
+    card.appendChild(head);
+    card.appendChild(pair);
+    card.appendChild(body);
+    grid.appendChild(card);
+  }
+}
+
+async function loadSnapshotsList() {
+  const res = await window.secondBrain.request("GET", "/v1/snapshots");
+  const sel = document.getElementById("snapshotSelect");
+  sel.replaceChildren();
+  for (const s of res.data?.snapshots || []) {
+    const opt = document.createElement("option");
+    opt.value = s.snapshot_id;
+    opt.textContent = `${s.snapshot_id} (${s.label || s.atom_count + " atoms"})`;
+    sel.appendChild(opt);
+  }
+}
+
+async function loadProofView() {
+  await Promise.all([loadLedgerStatus(), scanContradictions(), loadSnapshotsList()]);
+}
+
+document.getElementById("refreshProofBtn").addEventListener("click", loadProofView);
+document.getElementById("commitLedgerBtn").addEventListener("click", async () => {
+  const note = document.getElementById("ledgerNoteInput").value.trim();
+  const res = await window.secondBrain.request("POST", "/v1/ledger/commit", { actor: "desktop-owner", note });
+  document.getElementById("ledgerOutput").textContent = JSON.stringify(res.data, null, 2);
+});
+document.getElementById("proveAtomBtn").addEventListener("click", async () => {
+  const atom = document.getElementById("proveAtomInput").value.trim();
+  if (!atom) return;
+  const res = await window.secondBrain.request("GET", `/v1/ledger/prove/${encodeURIComponent(atom)}`);
+  document.getElementById("ledgerOutput").textContent = JSON.stringify(res.data, null, 2);
+});
+document.getElementById("scanRadarBtn").addEventListener("click", scanContradictions);
+document.getElementById("createSnapshotBtn").addEventListener("click", async () => {
+  const label = document.getElementById("snapshotLabelInput").value.trim();
+  const res = await window.secondBrain.request("POST", "/v1/snapshots", { actor: "desktop-owner", label });
+  document.getElementById("snapshotOutput").textContent = JSON.stringify(res.data, null, 2);
+  await loadSnapshotsList();
+});
+document.getElementById("diffSnapshotBtn").addEventListener("click", async () => {
+  const from_snapshot = document.getElementById("snapshotSelect").value;
+  if (!from_snapshot) return;
+  const res = await window.secondBrain.request("POST", "/v1/snapshots/diff", { from_snapshot, to_snapshot: "live" });
+  document.getElementById("snapshotOutput").textContent = JSON.stringify(res.data, null, 2);
+});
+document.getElementById("recallSnapshotBtn").addEventListener("click", async () => {
+  const snapshot_id = document.getElementById("snapshotSelect").value;
+  const query = document.getElementById("snapshotQueryInput").value.trim();
+  if (!snapshot_id || !query) return;
+  const res = await window.secondBrain.request("POST", "/v1/snapshots/recall", { snapshot_id, query });
+  document.getElementById("snapshotOutput").textContent = JSON.stringify(res.data, null, 2);
+});
+
 // ─── Global Shortcuts & Init ─────────────────────────────────────────────────
 window.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
     e.preventDefault();
     saveActiveNote();
   }
-  const tabs = ["notes", "chat", "review", "import", "ide", "system"];
-  if ((e.ctrlKey || e.metaKey) && e.key >= "1" && e.key <= "6") {
+  const tabs = ["notes", "chat", "review", "import", "ide", "system", "planner", "proof"];
+  if ((e.ctrlKey || e.metaKey) && e.key >= "1" && e.key <= "8") {
     e.preventDefault();
     switchView(tabs[Number(e.key) - 1]);
   }

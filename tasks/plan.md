@@ -280,7 +280,7 @@ unified CI gate (`scripts/test_all.py`).
 **What was built:**
 1. Context-profile and fitness-aware ranking (`scripts/recall.py`: `best_bm25` over validated candidates, utility excluding raw `retrieval_hits`, direct `item.content` hashing in `assemble_bounded_working_context`) plus durable correction logging in `brain/0-raw/archive/atom-corrections.jsonl` (`scripts/cognitive_core.py`).
 2. Owner-gated Skill Playbooks (`scripts/skill_playbooks.py`, `brain/5-playbooks/`, `playbook-decisions.jsonl`, `.history/` backups): CAS re-promotion (`expected_playbook_sha256`), per-atom project scope containment (`allow_multi_project`, `playbook_visible_in_scope`), whole-Claim step grounding (`_claim_grounding_units`), fail-closed `verify_playbook_integrity`, and frontmatter-only deprecation.
-3. Grounded Executive Planner (`scripts/executive_planner.py`, `POST /v1/plan`, `GET /v1/playbooks`, `second-brain playbooks` / `plan`, Dashboard tabs): per-atom host scope containment, scoped pending candidate counts, full-Playbook expansion in `model_assisted` mode (`EXECUTIVE_PLAN_DRAFT_SCHEMA`), and regression tests for `H1`, `H2`, `M1`–`M4`, `L1`–`L7` in `scripts/phase3_cognitive_tests.py` (10 tests).
+3. Grounded Executive Planner (`scripts/executive_planner.py`, `POST /v1/plan`, `GET /v1/playbooks`, `second-brain playbooks` / `plan`, Dashboard tabs): per-atom host scope containment, scoped pending candidate counts, full-Playbook expansion in `model_assisted` mode (`EXECUTIVE_PLAN_DRAFT_SCHEMA`), and regression tests for `H1`, `H2`, `M1`–`M4`, `L1`–`L7` in `scripts/phase3_cognitive_tests.py` (13 tests).
 
 **Files:** `scripts/recall.py`, `scripts/cognitive_core.py`, `scripts/skill_playbooks.py`, `scripts/executive_planner.py`, `scripts/memory_api.py`, `scripts/cli.py`, `scripts/doctor.py`, `dashboard/app.py`, `scripts/phase3_cognitive_tests.py`, `docs/phase3a-and-phase4-architecture-2026-11-15.md`.
 
@@ -302,21 +302,26 @@ unified CI gate (`scripts/test_all.py`).
 **What was built:**
 1. Streaming/instant/verified chat (`scripts/streaming_chat.py`, `second-brain chat`, `POST /v1/chat/stream`, `POST /v1/chat/warmup`) with out-of-model citation checks and claim validation.
 2. Dual-token Loopback Product API (`scripts/api_product.py` dispatched from `scripts/memory_api.py`): gating notes write/verify, review approvals, inbox triage, and bulk imports behind `owner_authorized` while allowing agent tokens read recall/notes and quarantined `/v1/remember` capture.
-3. One-click host connector (`scripts/ide_connector.py`, `second-brain connect`), plugin bundles (`plugins/antigravity/second-brain/`, `plugins/claude-code/second-brain/`), Electron desktop companion (`desktop/`), VS Code / Cursor / Windsurf extension (`extensions/vscode-second-brain/`), Windows release signing script (`scripts/sign_release.ps1`), custom planner schema support (`scripts/host_adapters.py`), MCP note/remember tools paired with `trusted_stdio_session()` (`scripts/mcp_server.py`), and 30 product/connector/security regression tests in `scripts/phase4_product_tests.py` (including Phase 4 audit remediations `P4-HIGH-01`..`P4-MED-04`) inside the **10-suite unified test gate** (`scripts/test_all.py`).
+3. One-click host connector (`scripts/ide_connector.py`, `second-brain connect`), plugin bundles (`plugins/antigravity/second-brain/`, `plugins/claude-code/second-brain/`), Electron desktop companion (`desktop/`), VS Code / Cursor / Windsurf extension (`extensions/vscode-second-brain/`), Windows release signing script (`scripts/sign_release.ps1`), custom planner schema support (`scripts/host_adapters.py`), MCP note/remember tools paired with `trusted_stdio_session()` (`scripts/mcp_server.py`), and 32 product/connector/security regression tests in `scripts/phase4_product_tests.py` (including Phase 4 audit remediations `P4-HIGH-01`..`P4-MED-04` and Phase 5 follow-ups) inside the **11-suite unified test gate** (`scripts/test_all.py`).
 
 **Files:** `scripts/streaming_chat.py`, `scripts/api_product.py`, `scripts/ide_connector.py`, `scripts/mcp_server.py`, `scripts/host_adapters.py`, `scripts/sign_release.ps1`, `desktop/`, `extensions/vscode-second-brain/`, `plugins/`, `scripts/phase4_product_tests.py`, `scripts/test_all.py`, `scripts/system_safety_tests.py`.
 
-## Deferred product horizon
+### Goal 17 — OS-Signed Desktop Installers, SOTA Benchmark & Phase 5 Verifiable Vault Suite (`v0.2.0`) — COMPLETE
 
-Goals 1–16 complete the local pilot, universal loopback API, per-host online
-consent/redaction adapters, quarantined inbox promotion workflow, hardware-tiered
-profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated
-Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine,
-zero-friction notes with one-click excerpt verification, streaming chat, bulk
-Obsidian importer, IDE/Antigravity connectors, and the 10-suite unified release
-gate (`scripts/test_all.py`, 10/10 PASS). Remaining deferred items are OS-signed
-desktop GUI installers (MSI/DMG/AppImage) and large-corpus comparative external
-SOTA benchmarks (`CODEX_CLI_GOAL.md`).
+**Why:** Close the remaining product horizon items (`CODEX_CLI_GOAL.md`) with native cross-platform OS-signed desktop installers, comparative external SOTA benchmarking on multi-hundred-atom corpora, and cryptographic Merkle proofs, Contradiction Radar, and Time-Travel snapshots over verified vault state.
+
+**What was built:**
+1. Cross-platform OS-signed desktop installer pipeline (`nsis`, `msi`, `dmg`/`zip`, `AppImage`/`deb` in `desktop/package.json`), unified `.exe`/`.msi`/`.whl`/`.vsix` packaging & Authenticode signing (`scripts/package_desktop.ps1`, `scripts/package_desktop.sh`, `scripts/sign_release.ps1`), user-writable packaged runtime bootstrap (`ensureBackendBootstrapped` + bundled `setup.ps1`/`setup.sh`), 8-tab Electron UI (`Playbooks & Plan` + `Vault Proof & Radar`), and live tray lifecycle controls (`Start`/`Restart`/`Stop Memory API`, `Open Vault Folder`, `Launch at Login`) in `desktop/main.js`.
+2. Comparative SOTA benchmark harness (`scripts/sota_benchmark.py`, `second-brain sota-benchmark`) evaluating Second Brain against naive BM25 RAG, unscoped flat memory, and ungrounded LLM synthesis across positive recall, claim precision, citation grounding, pending/superseded trap leakage, cross-project isolation, and abstention accuracy with declared hardware profiles.
+3. Cryptographic Vault Merkle Proof & Audit Ledger (`scripts/vault_ledger.py`, `second-brain ledger`, `/v1/ledger/*`), Contradiction & Drift Radar + Knowledge Graph (`scripts/knowledge_graph.py`, `second-brain graph`, `/v1/graph/*`), and Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Recall (`scripts/time_travel.py`, `second-brain snapshot`, `/v1/snapshots/*`), verified by `scripts/phase5_god_features_tests.py` inside the **11-suite unified release gate** (`scripts/test_all.py`, `11/11 PASS`).
+
+**Verification:** `uv run --locked python scripts/test_all.py` (`11/11 PASS`, `100% PASS`).
+
+**Files:** `desktop/package.json`, `desktop/main.js`, `desktop/renderer/index.html`, `desktop/renderer/app.js`, `desktop/renderer/styles.css`, `scripts/package_desktop.ps1`, `scripts/package_desktop.sh`, `scripts/sign_release.ps1`, `scripts/sota_benchmark.py`, `scripts/vault_ledger.py`, `scripts/knowledge_graph.py`, `scripts/time_travel.py`, `scripts/api_product.py`, `scripts/memory_api.py`, `scripts/cli.py`, `scripts/phase5_god_features_tests.py`.
+
+## Completed product horizon (closed in Goal 17)
+
+Goals 0–17 complete the entire local pilot and `v0.2.0` verifiable Second Brain product: durable CAS Markdown vault, cryptographic byte-offset source anchoring, out-of-model epistemic grounding, universal loopback API + SDK, per-host online consent/redaction adapters, quarantined inbox promotion, hardware-tiered profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine, zero-friction notes with one-click excerpt verification, streaming chat, bulk Obsidian importer, IDE/Antigravity/Claude/VS Code connectors, OS-signed cross-platform desktop installers (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), comparative SOTA benchmark harness (`scripts/sota_benchmark.py`), Merkle audit ledger & proofs (`scripts/vault_ledger.py`), Contradiction & Drift Radar (`scripts/knowledge_graph.py`), Time-Travel snapshots (`scripts/time_travel.py`), and the 11-suite unified release gate (`scripts/test_all.py`, `11/11 PASS`).
 
 ## Checkpoints
 
@@ -328,6 +333,9 @@ SOTA benchmarks (`CODEX_CLI_GOAL.md`).
   offline FTS5 degradation verified.
 - **Goal 8 (Passed):** Independent adversarial review reconciled and
   `scripts/test_all.py` achieves 100% pass rate.
+- **Goals 9–17 (Passed):** Phase 2–5 product ecosystem, OS-signed desktop
+  installers, SOTA benchmark, Merkle ledger, Contradiction Radar, Time-Travel
+  snapshots, and all adversarial security audits verified (`11/11` suites PASS).
 
 ## Risks
 

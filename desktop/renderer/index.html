@@ -23,6 +23,8 @@
       <button class="nav-btn" data-view="import">Bulk Import <span class="kbd">Ctrl+4</span></button>
       <button class="nav-btn" data-view="ide">IDE Hub <span class="kbd">Ctrl+5</span></button>
       <button class="nav-btn" data-view="system">System <span class="kbd">Ctrl+6</span></button>
+      <button class="nav-btn" data-view="planner">Playbooks &amp; Plan <span class="kbd">Ctrl+7</span></button>
+      <button class="nav-btn" data-view="proof">Vault Proof &amp; Radar <span class="kbd">Ctrl+8</span></button>
 
       <div class="sidebar-footer">
         <div>Quick Capture: <span class="kbd">Ctrl+Shift+Space</span></div>
@@ -127,6 +129,69 @@
           <button class="btn" id="refreshSystemBtn" style="margin-left:auto;">Refresh</button>
         </div>
         <div class="cards-grid" id="systemGrid"></div>
+      </section>
+
+      <!-- PLANNER & PLAYBOOKS VIEW -->
+      <section class="view" id="view-planner">
+        <div class="toolbar">
+          <input type="text" id="planGoalInput" placeholder="Goal for grounded Executive Plan..." style="flex:1; min-width:220px;" />
+          <input type="text" id="planScopeInput" placeholder="Scope (e.g. project:alpha)" style="width:170px;" />
+          <select id="planModeSelect">
+            <option value="deterministic">Deterministic (Model-Free)</option>
+            <option value="model_assisted">Model-Assisted (Consented)</option>
+          </select>
+          <button class="btn primary" id="runPlanBtn">Assemble Plan</button>
+          <button class="btn" id="refreshPlaybooksBtn">Refresh Playbooks</button>
+        </div>
+        <div class="status-banner" id="plannerBanner">Owner-gated Skill Playbooks &amp; Grounded Executive Planner — every step binds to approved atoms.</div>
+        <div class="card" style="margin-bottom:12px;">
+          <strong>Executive Plan Output</strong>
+          <pre id="planOutput" style="white-space:pre-wrap; font-size:12px; margin-top:8px;">Enter a goal above to assemble a citation-verified execution plan.</pre>
+        </div>
+        <div class="cards-grid" id="playbooksGrid"></div>
+      </section>
+
+      <!-- VAULT PROOF, RADAR & SNAPSHOTS VIEW -->
+      <section class="view" id="view-proof">
+        <div class="toolbar">
+          <h3 style="margin:0;">Cryptographic Ledger, Contradiction Radar &amp; Time-Travel</h3>
+          <button class="btn" id="refreshProofBtn" style="margin-left:auto;">Refresh All</button>
+        </div>
+
+        <div class="card" style="margin-bottom:12px;">
+          <div class="toolbar">
+            <strong>Merkle Audit Ledger</strong>
+            <input type="text" id="ledgerNoteInput" placeholder="Checkpoint note (optional)" style="flex:1;" />
+            <button class="btn good" id="commitLedgerBtn">Commit Checkpoint</button>
+            <input type="text" id="proveAtomInput" placeholder="Atom filename (e.g. structured-logging.md)" style="width:240px;" />
+            <button class="btn" id="proveAtomBtn">Prove Atom</button>
+          </div>
+          <pre id="ledgerOutput" style="white-space:pre-wrap; font-size:12px; margin-top:6px;">Loading Merkle ledger state...</pre>
+        </div>
+
+        <div class="card" style="margin-bottom:12px;">
+          <div class="toolbar">
+            <strong>Contradiction &amp; Drift Radar</strong>
+            <input type="text" id="radarScopeInput" placeholder="Filter scope (optional)" style="width:190px; margin-left:auto;" />
+            <button class="btn primary" id="scanRadarBtn">Scan Contradictions</button>
+          </div>
+          <div class="cards-grid" id="radarGrid" style="margin-top:8px;"></div>
+        </div>
+
+        <div class="card">
+          <div class="toolbar">
+            <strong>Time-Travel Snapshots</strong>
+            <input type="text" id="snapshotLabelInput" placeholder="Snapshot label..." style="width:180px;" />
+            <button class="btn good" id="createSnapshotBtn">Create Snapshot</button>
+            <select id="snapshotSelect" style="min-width:210px;"></select>
+            <button class="btn" id="diffSnapshotBtn">Diff vs Live</button>
+          </div>
+          <div class="toolbar" style="margin-top:6px;">
+            <input type="text" id="snapshotQueryInput" placeholder="Point-in-time recall query..." style="flex:1;" />
+            <button class="btn primary" id="recallSnapshotBtn">Recall at Snapshot</button>
+          </div>
+          <pre id="snapshotOutput" style="white-space:pre-wrap; font-size:12px; margin-top:6px;">Select or create a snapshot to diff or time-travel recall.</pre>
+        </div>
       </section>
     </main>
   </div>

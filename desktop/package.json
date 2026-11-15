@@ -61,6 +61,14 @@
       {
         "from": "../plugins",
         "to": "backend/plugins"
+      },
+      {
+        "from": "../setup.ps1",
+        "to": "backend/setup.ps1"
+      },
+      {
+        "from": "../setup.sh",
+        "to": "backend/setup.sh"
       }
     ],
     "win": {
@@ -96,7 +104,11 @@
       "perMachine": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Second Brain"
+      "shortcutName": "Second Brain",
+      "warningsAsErrors": false,
+      "additionalLightArgs": [
+        "-sval"
+      ]
     },
     "mac": {
       "category": "public.app-category.productivity",

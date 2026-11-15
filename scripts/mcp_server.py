@@ -596,7 +596,7 @@ async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) ->
 
 app = Server(
     "second-brain",
-    version="0.1.0",
+    version="0.2.0",
     on_list_tools=handle_list_tools,
     on_call_tool=handle_call_tool,
     on_list_resources=handle_list_resources,

@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from atom_mutator import approved_revision_is_current, content_sha256, review_lock  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown, safe_file_in_dir  # noqa: E402
 from memory_review import parse_atom_record  # noqa: E402
-from recall import normalize_project_tag, project_tags_match  # noqa: E402
+from recall import QUERY_STOP_WORDS, normalize_project_tag, project_tags_match  # noqa: E402
 from skill_playbooks import verify_playbook_integrity  # noqa: E402
 from vault_ledger import _build_merkle_levels, _leaf_digest  # noqa: E402
 
@@ -296,10 +296,17 @@ def recall_at_snapshot(
 ) -> dict[str, Any]:
     """Deterministic point-in-time recall over only the atoms approved in snapshot_id."""
     snap = load_snapshot(snapshot_id, brain_dir=brain_dir)
-    q_tokens = set(_WORD_RE.findall((query or "").lower()))
+    raw_tokens = set(_WORD_RE.findall((query or "").lower()))
+    q_tokens = {tok for tok in raw_tokens if tok not in QUERY_STOP_WORDS}
     if not q_tokens:
-        return {"snapshot_id": snap["snapshot_id"], "results": []}
+        return {
+            "snapshot_id": snap["snapshot_id"],
+            "created_at": snap["created_at"],
+            "merkle_root": snap["merkle_root"],
+            "results": [],
+        }
 
+    min_overlap = 2 if len(q_tokens) >= 2 else 1
     target = normalize_project_tag(project_scope) if (project_scope and project_scope.strip()) else ""
 
     scored: list[tuple[float, dict[str, Any]]] = []
@@ -314,9 +321,9 @@ def recall_at_snapshot(
             if not proj_tags or not all(bool(project_tags_match((c,), (target,))) for c in proj_tags):
                 continue
         claim = str(atom.get("claim") or "")
-        c_tokens = set(_WORD_RE.findall(claim.lower()))
+        c_tokens = {tok for tok in _WORD_RE.findall(claim.lower()) if tok not in QUERY_STOP_WORDS}
         overlap = len(q_tokens & c_tokens)
-        if overlap == 0:
+        if overlap < min_overlap:
             continue
         score = overlap / max(1, len(q_tokens))
         scored.append(

@@ -161,6 +161,15 @@ def _seed_corpus(brain: Path, total_atoms: int) -> list[dict[str, Any]]:
             approve=False,
             superseded_by="approved-0000",
         )
+        if idx < 4:
+            queries.append(
+                {
+                    "kind": "adversarial_trap",
+                    "query": f"Does Legacy cluster {idx:03d} use unencrypted HTTP transport?",
+                    "project_scope": proj,
+                    "trap_filename": f"stale-{idx:04d}.md",
+                }
+            )
 
     # 4. Cross-project confidential atoms
     for idx in range(cross_proj_count):
@@ -397,7 +406,9 @@ def main(argv: list[str] | None = None) -> int:
 
     result = run_sota_benchmark(atoms=max(80, args.atoms))
     if args.json_output:
-        Path(args.json_output).write_text(json.dumps(result, indent=2), encoding="utf-8")
+        out_path = Path(args.json_output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     if args.json:
         print(json.dumps(result, indent=2))
         return 0

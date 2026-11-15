@@ -226,9 +226,10 @@ def _current_windows_principal() -> str | None:
     return _CACHED_WINDOWS_USER or None
 
 
-def restrict_security_file_permissions(path: Path) -> None:
+def restrict_security_file_permissions(path: Path | str) -> None:
     """Enforce owner-only permissions on POSIX (0o700/0o600) and Windows NTFS DACLs."""
     try:
+        path = Path(path)
         if os.name != "nt":
             os.chmod(path.parent, 0o700)
             os.chmod(path, 0o600)

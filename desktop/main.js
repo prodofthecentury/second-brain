@@ -133,7 +133,61 @@ function runBackendCli(args) {
   });
 }
 
+function runSpawnPromise(cmd, args, cwd, env) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { cwd, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(stderr || `${cmd} exited with code ${code}`));
+    });
+  });
+}
+
+async function ensureBackendBootstrapped() {
+  const root = getBackendRoot();
+  const venvPy = process.platform === "win32"
+    ? path.join(root, ".venv", "Scripts", "python.exe")
+    : path.join(root, ".venv", "bin", "python");
+  if (fs.existsSync(venvPy)) {
+    return;
+  }
+  const env = { ...process.env, PYTHONUTF8: "1" };
+  if (app.isPackaged && !env.BRAIN_VAULT_DIR) {
+    const userVault = getDefaultPackagedVaultDir();
+    fs.mkdirSync(userVault, { recursive: true });
+    env.BRAIN_VAULT_DIR = userVault;
+  }
+  try {
+    await runSpawnPromise("uv", ["--directory", root, "sync", "--frozen"], root, env);
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      if (process.platform === "win32") {
+        const ps1 = path.join(root, "setup.ps1");
+        if (fs.existsSync(ps1)) {
+          await runSpawnPromise(
+            "powershell.exe",
+            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-NoLaunch"],
+            root,
+            env
+          );
+        }
+      } else {
+        const sh = path.join(root, "setup.sh");
+        if (fs.existsSync(sh)) {
+          await runSpawnPromise("bash", [sh, "--no-launch"], root, env);
+        }
+      }
+    } else {
+      throw err;
+    }
+  }
+}
+
 async function startApiSidecar() {
+  await ensureBackendBootstrapped();
   if (!apiPort) {
     apiPort = await findFreePort(8765);
   }

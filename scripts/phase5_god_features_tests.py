@@ -130,8 +130,20 @@ class DesktopInstallerAndTrayTests(Phase5IsolatedTestCase):
         self.assertTrue(any(isinstance(x, dict) and x.get("from") == "../dashboard" for x in extra))
 
         main_js = (root / "desktop" / "main.js").read_text(encoding="utf-8")
-        for sym in ("refreshTrayMenu", "stopApiSidecar", "getVaultDir", "setLoginItemSettings", "shell.openPath"):
+        for sym in ("refreshTrayMenu", "stopApiSidecar", "getVaultDir", "setLoginItemSettings", "shell.openPath", "ensureBackendBootstrapped"):
             self.assertIn(sym, main_js)
+
+        index_html = (root / "desktop" / "renderer" / "index.html").read_text(encoding="utf-8")
+        for view_id in ("view-planner", "view-proof", "commitLedgerBtn", "scanRadarBtn", "createSnapshotBtn"):
+            self.assertIn(view_id, index_html)
+
+        app_js = (root / "desktop" / "renderer" / "app.js").read_text(encoding="utf-8")
+        for fn_name in ("loadPlannerView", "runExecutivePlan", "loadProofView", "scanContradictions"):
+            self.assertIn(fn_name, app_js)
+
+        extra_to = {item["to"] for item in pkg["build"]["extraResources"]}
+        self.assertIn("backend/setup.ps1", extra_to)
+        self.assertIn("backend/setup.sh", extra_to)
 
         self.assertTrue((root / "scripts" / "package_desktop.ps1").is_file())
         self.assertTrue((root / "scripts" / "package_desktop.sh").is_file())

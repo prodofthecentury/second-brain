@@ -91,6 +91,11 @@ def content_sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def decision_log_path(brain_dir: str) -> str:
+    """Return canonical append-only owner decision log path under brain_dir."""
+    return os.path.join(os.path.abspath(brain_dir), "0-raw", "archive", "decision-record.jsonl")
+
+
 _DECISION_CACHE_LOCK = threading.Lock()
 # Maps abs_log_path -> (mtime_ns, size_bytes, prefix_sha256, latest_by_atom_filename_dict)
 _DECISION_LOG_CACHE: dict[str, tuple[int, int, str, dict[str, dict]]] = {}

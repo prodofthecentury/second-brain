@@ -24,9 +24,9 @@ if (-not (Test-Path $DistDir)) {
     throw "Dist directory not found: $DistDir"
 }
 
-$targets = Get-ChildItem -Path $DistDir -File | Where-Object { $_.Extension -in @(".exe", ".msi", ".vsix") }
+$targets = Get-ChildItem -Path $DistDir -File | Where-Object { $_.Extension -in @(".exe", ".msi", ".vsix", ".whl") }
 if (-not $targets) {
-    Write-Warning "No .exe, .msi, or .vsix artifacts found in $DistDir"
+    Write-Warning "No .exe, .msi, .vsix, or .whl artifacts found in $DistDir"
     exit 0
 }
 
