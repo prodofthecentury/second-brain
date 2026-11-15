@@ -34,8 +34,10 @@ if command -v uv >/dev/null 2>&1; then
   uv build --wheel --out-dir "$DIST_DIR"
   uv run --frozen python - <<'PY'
 import json, pathlib, zipfile
+from xml.sax.saxutils import escape
 root = pathlib.Path("extensions/vscode-second-brain")
 pkg = json.loads((root / "package.json").read_text(encoding="utf-8"))
+esc = lambda v: escape(str(v), {'"': "&quot;", "'": "&apos;"})
 ver = pkg["version"]
 out = pathlib.Path("dist") / f"second-brain-vscode-{ver}.vsix"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
@@ -53,16 +55,17 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         "extension.vsixmanifest",
         '<?xml version="1.0" encoding="utf-8"?>'
         '<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">'
-        f'<Metadata><Identity Language="en-US" Id="{pkg["name"]}" Version="{ver}" Publisher="{pkg["publisher"]}"/>'
-        f'<DisplayName>{pkg["displayName"]}</DisplayName>'
-        f'<Description>{pkg["description"]}</Description></Metadata>'
+        f'<Metadata><Identity Language="en-US" Id="{esc(pkg["name"])}" Version="{esc(ver)}" Publisher="{esc(pkg["publisher"])}"/>'
+        f'<DisplayName>{esc(pkg["displayName"])}</DisplayName>'
+        f'<Description>{esc(pkg["description"])}</Description></Metadata>'
         '<Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation>'
         '<Assets><Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json"/></Assets>'
         "</PackageManifest>",
     )
     for p in sorted(root.rglob("*")):
-        if p.is_file():
-            z.write(p, f"extension/{p.relative_to(root).as_posix()}")
+        rel = p.relative_to(root).as_posix()
+        if p.is_file() and not rel.startswith("node_modules/") and p.suffix.lower() != ".vsix":
+            z.write(p, f"extension/{rel}")
 PY
 fi
 
