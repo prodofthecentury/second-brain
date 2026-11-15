@@ -275,7 +275,7 @@ synchronized across both files.
   Dashboard Playbooks & Planner tabs (`dashboard/app.py`).
 - [x] Complete independent `security-auditor` review (`dda00b6d-652b-41d6-adb9-2fc45492e3cf`)
   and lock down `H1`, `H2`, `M1`–`M4`, `L1`–`L7` in `scripts/phase3_cognitive_tests.py`
-  (10 tests passing).
+  (13 tests passing).
 - **Depends on:** Goals 12–13.
 - **Details:** `tasks/plan.md` Goal 14.
 
@@ -306,10 +306,10 @@ synchronized across both files.
   `plugins/claude-code/second-brain/`), Electron desktop app (`desktop/`), VS Code
   extension (`extensions/vscode-second-brain/`), Authenticode signing script
   (`scripts/sign_release.ps1`), custom planner schema support (`scripts/host_adapters.py`),
-  MCP notes/remember tools with `trusted_stdio_session()`, and 30 tests in
+  MCP notes/remember tools with `trusted_stdio_session()`, and 32 tests in
   `scripts/phase4_product_tests.py` (including Phase 4 audit remediations
-  `P4-HIGH-01`..`P4-MED-04`) integrated into the 10-suite `scripts/test_all.py`
-  release gate (`10/10 PASS`).
+  `P4-HIGH-01`..`P4-MED-04` and Phase 5 follow-ups) integrated into the 11-suite
+  `scripts/test_all.py` release gate (`11/11 PASS`).
 - **Depends on:** Goals 13–15.
 - **Details:** `tasks/plan.md` Goal 16.
 
@@ -317,13 +317,12 @@ synchronized across both files.
 
 - [x] Add cross-platform OS-signed desktop installer targets (`nsis`, `msi`, `dmg`/`zip`, `AppImage`/`deb`) in `desktop/package.json`, build/signing scripts (`scripts/package_desktop.ps1`, `scripts/package_desktop.sh`), and live tray lifecycle controls (`Start`/`Restart`/`Stop Memory API`, `Open Vault Folder`, `Launch at Login`) in `desktop/main.js`.
 - [x] Implement comparative SOTA benchmark harness (`scripts/sota_benchmark.py`, `second-brain sota-benchmark`) comparing Second Brain against external RAG/memory baselines on multi-hundred-atom owner-reviewed corpora with declared hardware profiles.
-- [x] Implement Cryptographic Vault Merkle Proof & Audit Ledger (`scripts/vault_ledger.py`, `second-brain ledger`, `/v1/ledger/*`), Contradiction & Drift Radar + Knowledge Graph (`scripts/knowledge_graph.py`, `second-brain graph`, `/v1/graph/*`), and Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Recall (`scripts/time_travel.py`, `second-brain snapshot`, `/v1/snapshots/*`), verified by `scripts/phase5_god_features_tests.py` (5 tests) in the 11-suite `scripts/test_all.py` release gate.
+- [x] Implement Cryptographic Vault Merkle Proof & Audit Ledger (`scripts/vault_ledger.py`, `second-brain ledger`, `/v1/ledger/*`), Contradiction & Drift Radar + Knowledge Graph (`scripts/knowledge_graph.py`, `second-brain graph`, `/v1/graph/*`), and Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Recall (`scripts/time_travel.py`, `second-brain snapshot`, `/v1/snapshots/*`), verified by `scripts/phase5_god_features_tests.py` (9 tests) in the 11-suite `scripts/test_all.py` release gate (`11/11 PASS`).
 
-## Deferred product horizon
+## Completed product horizon (closed in Goal 17)
 
-- **OS-Signed Desktop Installers:** Native code-signed MSI / DMG / AppImage GUI
-  bundles wrapping `setup.ps1` / `setup.sh` and system tray lifecycle controls.
-- **Comparative External SOTA Benchmarking:** Benchmark against third-party
-  memory systems on large multi-hundred-atom owner-reviewed corpora and declared
-  GPU/CPU hardware profiles before making external state-of-the-art marketing
-  claims.
+- [x] **OS-Signed Desktop Installers:** Native code-signed NSIS / MSI / DMG / AppImage / deb
+  targets (`desktop/package.json`, `scripts/package_desktop.ps1`, `scripts/package_desktop.sh`)
+  with system tray lifecycle controls (`desktop/main.js`).
+- [x] **Comparative External SOTA Benchmarking:** `scripts/sota_benchmark.py` benchmarks Second Brain
+  against lexical/vector baselines on multi-hundred-atom owner-reviewed corpora with declared hardware profiles.

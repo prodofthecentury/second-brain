@@ -14,7 +14,7 @@ param(
     [string]$PfxPath = $env:SECOND_BRAIN_PFX_PATH,
     [string]$PfxPassword = $env:SECOND_BRAIN_PFX_PASSWORD,
     [string]$Thumbprint = $env:SECOND_BRAIN_CERT_THUMBPRINT,
-    [string]$TimestampUrl = "http://timestamp.digicert.com",
+    [string]$TimestampUrl = "https://timestamp.digicert.com",
     [switch]$SelfSigned
 )
 

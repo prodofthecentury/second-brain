@@ -21,17 +21,19 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sys
 import tempfile
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import approved_revision_is_current, content_sha256  # noqa: E402
+from atom_mutator import approved_revision_is_current, content_sha256, review_lock  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown, safe_file_in_dir  # noqa: E402
 from memory_review import parse_atom_record  # noqa: E402
+from recall import normalize_project_tag, project_tags_match  # noqa: E402
 from skill_playbooks import verify_playbook_integrity  # noqa: E402
-from vault_ledger import compute_vault_merkle  # noqa: E402
+from vault_ledger import _build_merkle_levels, _leaf_digest  # noqa: E402
 
 _SNAP_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _WORD_RE = re.compile(r"[a-z0-9_]{2,}")
@@ -48,7 +50,7 @@ def _capture_live_state(
     playbooks_dir: str | None = None,
 ) -> dict[str, Any]:
     pb_dir = playbooks_dir if playbooks_dir is not None else os.path.join(brain_dir, "5-playbooks")
-    merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=pb_dir)
+    leaves: list[tuple[str, str]] = []
 
     atoms: dict[str, dict[str, Any]] = {}
     if os.path.isdir(atoms_dir) and not _is_reparse_or_link(atoms_dir):
@@ -69,10 +71,13 @@ def _capture_live_state(
                 or not approved_revision_is_current(path, brain_dir=brain_dir, atoms_dir=atoms_dir)
             ):
                 continue
+            fhash = content_sha256(raw_bytes)
+            rel_path = f"2-atoms/{entry.name}"
+            leaves.append((rel_path, _leaf_digest(rel_path, fhash)))
             atoms[entry.name] = {
                 "atom_id": rec.get("id", ""),
                 "filename": rec.get("filename", entry.name),
-                "file_sha256": content_sha256(raw_bytes),
+                "file_sha256": fhash,
                 "memory_type": rec.get("memory_type", ""),
                 "epistemic_label": rec.get("epistemic_label", "claim"),
                 "epistemic_contract": rec.get("epistemic_contract", ""),
@@ -105,14 +110,18 @@ def _capture_live_state(
             fhash = pb_rep.sha256 or content_sha256(raw_bytes)
             if content_sha256(raw_bytes) != fhash:
                 continue
+            rel_path = f"5-playbooks/{entry.name}"
+            leaves.append((rel_path, _leaf_digest(rel_path, fhash)))
             playbooks[entry.name] = {
                 "filename": pb_rep.filename or entry.name,
                 "file_sha256": fhash,
                 "contexts": list(pb_rep.contexts),
             }
 
+    leaves.sort(key=lambda item: item[0])
+    merkle_root = _build_merkle_levels([leaf_hash for _, leaf_hash in leaves])[-1][0]
     return {
-        "merkle_root": merkle["merkle_root"],
+        "merkle_root": merkle_root,
         "atoms": atoms,
         "playbooks": playbooks,
     }
@@ -133,41 +142,48 @@ def create_snapshot(
 
     snap_dir = _snapshots_dir(brain_dir)
     snap_dir.mkdir(parents=True, exist_ok=True)
-    if _is_reparse_or_link(str(snap_dir)):
+    if _is_reparse_or_link(str(snap_dir.parent)) or _is_reparse_or_link(str(snap_dir)):
         raise PermissionError("Refusing to write snapshot through a symlink or junction.")
 
-    state = _capture_live_state(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
-    now = datetime.now(timezone.utc)
-    stamp = now.strftime("%Y%m%dT%H%M%SZ")
-    nonce = hashlib.sha256(f"{stamp}:{state['merkle_root']}:{label}".encode("utf-8")).hexdigest()[:8]
-    snapshot_id = f"snap-{stamp}-{nonce}"
+    with review_lock(str(snap_dir.parent / "writer.lock")):
+        if _is_reparse_or_link(str(snap_dir.parent)) or _is_reparse_or_link(str(snap_dir)):
+            raise PermissionError("Refusing to write snapshot through a symlink or junction.")
+        state = _capture_live_state(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
+        now = datetime.now(timezone.utc)
+        stamp = now.strftime("%Y%m%dT%H%M%SZ")
+        while True:
+            entropy = secrets.token_hex(8)
+            nonce = hashlib.sha256(f"{stamp}:{state['merkle_root']}:{label}:{entropy}".encode("utf-8")).hexdigest()[:8]
+            snapshot_id = f"snap-{stamp}-{nonce}"
+            target = snap_dir / f"{snapshot_id}.json"
+            if not target.exists():
+                break
 
-    doc: dict[str, Any] = {
-        "schema_version": 1,
-        "snapshot_id": snapshot_id,
-        "created_at": now.isoformat(timespec="seconds"),
-        "actor": clean_actor,
-        "label": (label or "").strip()[:160],
-        "merkle_root": state["merkle_root"],
-        "atom_count": len(state["atoms"]),
-        "playbook_count": len(state["playbooks"]),
-        "atoms": state["atoms"],
-        "playbooks": state["playbooks"],
-    }
-    target = snap_dir / f"{snapshot_id}.json"
-    fd, tmp_path = tempfile.mkstemp(dir=str(snap_dir), prefix=".snap-", suffix=".tmp")
-    try:
-        os.write(fd, json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp_path, target)
-    return doc
+        doc: dict[str, Any] = {
+            "schema_version": 1,
+            "snapshot_id": snapshot_id,
+            "created_at": now.isoformat(timespec="seconds"),
+            "actor": clean_actor,
+            "label": (label or "").strip()[:160],
+            "merkle_root": state["merkle_root"],
+            "atom_count": len(state["atoms"]),
+            "playbook_count": len(state["playbooks"]),
+            "atoms": state["atoms"],
+            "playbooks": state["playbooks"],
+        }
+        fd, tmp_path = tempfile.mkstemp(dir=str(snap_dir), prefix=".snap-", suffix=".tmp")
+        try:
+            os.write(fd, json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, target)
+        return doc
 
 
 def list_snapshots(*, brain_dir: str = BRAIN_DIR) -> list[dict[str, Any]]:
     snap_dir = _snapshots_dir(brain_dir)
-    if not snap_dir.is_dir() or _is_reparse_or_link(str(snap_dir)):
+    if not snap_dir.is_dir() or _is_reparse_or_link(str(snap_dir.parent)) or _is_reparse_or_link(str(snap_dir)):
         return []
     out: list[dict[str, Any]] = []
     for entry in sorted(os.scandir(snap_dir), key=lambda e: e.name, reverse=True):
@@ -198,7 +214,7 @@ def load_snapshot(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> dict[str, 
     if not clean or not _SNAP_ID_RE.match(clean):
         raise ValueError(f"Invalid snapshot_id: {snapshot_id!r}")
     snap_dir = _snapshots_dir(brain_dir)
-    if _is_reparse_or_link(str(snap_dir)):
+    if _is_reparse_or_link(str(snap_dir.parent)) or _is_reparse_or_link(str(snap_dir)):
         raise PermissionError("Refusing to load snapshot through a symlink or junction.")
     safe = safe_file_in_dir(str(snap_dir), f"{clean}.json", allowed_exts={".json"}, must_exist=True)
     if not safe:
@@ -284,11 +300,7 @@ def recall_at_snapshot(
     if not q_tokens:
         return {"snapshot_id": snap["snapshot_id"], "results": []}
 
-    target: str | None = None
-    if project_scope and project_scope.strip():
-        target = project_scope.strip().casefold()
-        if not target.startswith("project:"):
-            target = f"project:{target}"
+    target = normalize_project_tag(project_scope) if (project_scope and project_scope.strip()) else ""
 
     scored: list[tuple[float, dict[str, Any]]] = []
     for fname, atom in snap.get("atoms", {}).items():
@@ -298,8 +310,8 @@ def recall_at_snapshot(
             continue
         contexts = atom.get("contexts") or []
         if target:
-            proj_tags = [str(c).strip().casefold() for c in contexts if str(c).strip().casefold().startswith("project:")]
-            if not proj_tags or not all(c == target for c in proj_tags):
+            proj_tags = [str(c).strip() for c in contexts if str(c).strip().lower().startswith("project:")]
+            if not proj_tags or not all(bool(project_tags_match((c,), (target,))) for c in proj_tags):
                 continue
         claim = str(atom.get("claim") or "")
         c_tokens = set(_WORD_RE.findall(claim.lower()))

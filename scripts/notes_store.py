@@ -496,15 +496,22 @@ def verify_note_excerpt(
         raise NoteError("Verification requires an explicit human owner actor.")
     if memory_type not in {"semantic", "episodic", "procedural", "self"}:
         raise NoteError(f"Unsupported memory_type: {memory_type!r}")
-    flat_excerpt = re.sub(r"\s+", " ", str(excerpt or "")).strip().lstrip("#> ").strip()
-    if len(flat_excerpt) < 12:
+    raw_excerpt = re.sub(r"\s+", " ", str(excerpt or "")).strip()
+    md_stripped_excerpt = re.sub(r"^(?:>+\s*|#{1,6}\s+)+", "", raw_excerpt).strip()
+    candidates: list[str] = []
+    if not re.match(r"^##\s+", raw_excerpt) and len(raw_excerpt) >= 12:
+        candidates.append(raw_excerpt)
+    if len(md_stripped_excerpt) >= 12 and md_stripped_excerpt not in candidates:
+        candidates.append(md_stripped_excerpt)
+    if not candidates:
         raise NoteError("Select at least 12 characters of the note to verify.")
-    if len(flat_excerpt) > 4000:
+    if max(len(c) for c in candidates) > 4000:
         raise NoteError("Verified excerpts are limited to 4,000 characters; select a single claim.")
-    flat_claim = re.sub(r"\s+", " ", str(claim or flat_excerpt)).strip().lstrip("#>*- ").strip()
+    raw_claim = re.sub(r"\s+", " ", str(claim or candidates[0])).strip()
+    flat_claim = re.sub(r"^(?:>+\s*|#{1,6}\s+|[-*]\s+)+", "", raw_claim).strip() or raw_claim
     if not flat_claim or len(flat_claim) > 2000:
         raise NoteError("Claim must be between 1 and 2,000 characters.")
-    risks = scan_inbox_payload_risks(f"{flat_claim}\n{flat_excerpt}")
+    risks = scan_inbox_payload_risks(flat_claim + "\n" + "\n".join(candidates))
     if risks:
         raise NoteError(f"Cannot verify excerpt containing security risk flags: {', '.join(risks)}")
 
@@ -536,38 +543,49 @@ def verify_note_excerpt(
         rel_source = Path(os.path.relpath(snap_path, paths.brain_dir)).as_posix()
         today = datetime.date.today().isoformat()
         clean_tags = _clean_tags(tags)
-        atom_text = (
-            "---\n"
-            f"id: note-{stem}-{hashlib.sha256(flat_excerpt.encode('utf-8')).hexdigest()[:8]}\n"
-            "type: atom\n"
-            f"memory_type: {memory_type}\n"
-            "certainty: established\n"
-            f"created: {today}\n"
-            f"last-reviewed: {today}\n"
-            "importance: 0.70\n"
-            "confidence: 0.90\n"
-            "sources:\n"
-            f"  - {rel_source}\n"
-            f"links: [{json.dumps(stem)}]\n"
-            f"tags: {json.dumps(list(clean_tags))}\n"
-            "contexts: []\n"
-            "supersedes: []\n"
-            "superseded_by: []\n"
-            "contested_by: []\n"
-            "origin: user_local\n"
-            "citation_integrity: missing\n"
-            "claim_state: candidate\n"
-            "epistemic_label: claim\n"
-            "review_status: pending\n"
-            "---\n\n"
-            f"## Claim\n{flat_claim}\n\n"
-            f"## Evidence\n{flat_excerpt}\n\n"
-            f"## Why It Matters\nVerified by the owner from note [[{stem}]].\n"
-        )
-        try:
-            find_evidence_anchor(atom_text, paths.brain_dir)
-        except EvidenceValidationError as exc:
-            raise NoteError(f"Could not anchor the excerpt in the note: {exc}") from exc
+
+        def _build_note_atom_text(excerpt_val: str) -> str:
+            return (
+                "---\n"
+                f"id: note-{stem}-{hashlib.sha256(excerpt_val.encode('utf-8')).hexdigest()[:8]}\n"
+                "type: atom\n"
+                f"memory_type: {memory_type}\n"
+                "certainty: established\n"
+                f"created: {today}\n"
+                f"last-reviewed: {today}\n"
+                "importance: 0.70\n"
+                "confidence: 0.90\n"
+                "sources:\n"
+                f"  - {rel_source}\n"
+                f"links: [{json.dumps(stem)}]\n"
+                f"tags: {json.dumps(list(clean_tags))}\n"
+                "contexts: []\n"
+                "supersedes: []\n"
+                "superseded_by: []\n"
+                "contested_by: []\n"
+                "origin: user_local\n"
+                "citation_integrity: missing\n"
+                "claim_state: candidate\n"
+                "epistemic_label: claim\n"
+                "review_status: pending\n"
+                "---\n\n"
+                f"## Claim\n{flat_claim}\n\n"
+                f"## Evidence\n{excerpt_val}\n\n"
+                f"## Why It Matters\nVerified by the owner from note [[{stem}]].\n"
+            )
+
+        atom_text = ""
+        last_exc: EvidenceValidationError | None = None
+        for candidate_excerpt in candidates:
+            candidate_text = _build_note_atom_text(candidate_excerpt)
+            try:
+                find_evidence_anchor(candidate_text, paths.brain_dir)
+                atom_text = candidate_text
+                break
+            except EvidenceValidationError as exc:
+                last_exc = exc
+        if not atom_text:
+            raise NoteError(f"Could not anchor the excerpt in the note: {last_exc}") from last_exc
         atom_bytes = atom_text.encode("utf-8")
         atom_name = _create_exclusive(paths.atoms_dir, f"note-{slugify(flat_claim, max_len=48)}", atom_bytes)
         atom_path = os.path.join(paths.atoms_dir, atom_name)

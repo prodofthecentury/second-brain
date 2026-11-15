@@ -504,6 +504,84 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
             self.assertIn("build-smoke.md", snap["playbooks"])
             self.assertNotIn("forged-pb.md", snap["playbooks"])
 
+    def test_p2_p3_snapshot_collision_single_pass_radar_and_ledger_seq(self) -> None:
+        from datetime import datetime, timezone
+        from knowledge_graph import build_knowledge_graph, detect_contradictions
+        from time_travel import create_snapshot, list_snapshots, recall_at_snapshot
+        from vault_ledger import GENESIS_HASH, _canonical_json, _sha256_text, compute_vault_merkle, verify_vault_ledger
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms_dir = brain / "2-atoms"
+            _seed_atom(
+                brain,
+                filename="sb-rule.md",
+                claim="Second Brain enforces single writer lock semantics for ledger and snapshots.",
+                evidence="Second Brain enforces single writer lock semantics for ledger and snapshots.",
+                project="project:second_brain",
+                approve=True,
+            )
+
+            # 1. Freeze UTC timestamp to force same-second identical-label snapshot calls -> must never collide/overwrite.
+            fixed_now = datetime(2026, 11, 15, 19, 15, 0, tzinfo=timezone.utc)
+            with patch("time_travel.datetime") as mock_dt:
+                mock_dt.now.return_value = fixed_now
+                mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+                s1 = create_snapshot(label="same-sec", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir))
+                s2 = create_snapshot(label="same-sec", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            self.assertNotEqual(s1["snapshot_id"], s2["snapshot_id"])
+            self.assertEqual(len(list_snapshots(brain_dir=str(brain))), 2)
+            self.assertEqual(
+                s1["merkle_root"],
+                compute_vault_merkle(brain_dir=str(brain), atoms_dir=str(atoms_dir))["merkle_root"],
+            )
+
+            # 2. Hyphen/underscore normalization in project_scope across recall_at_snapshot and knowledge_graph.
+            recalled = recall_at_snapshot(
+                "writer lock semantics",
+                s1["snapshot_id"],
+                project_scope="second-brain",
+                brain_dir=str(brain),
+            )
+            self.assertEqual([r["filename"] for r in recalled["results"]], ["sb-rule.md"])
+            g = build_knowledge_graph(brain_dir=str(brain), atoms_dir=str(atoms_dir), project_scope="second-brain")
+            self.assertEqual([n["filename"] for n in g["nodes"]], ["sb-rule.md"])
+
+            # 3. Forged "accepted" atom with no current decision record cannot escalate to high severity or orphan_approved_atoms.
+            (atoms_dir / "forged-accepted.md").write_text(
+                "---\nid: forged-acc\ntype: atom\nmemory_type: semantic\nreview_status: accepted\n"
+                "contexts:\n  - project:second_brain\n---\n\n"
+                "## Claim\nSecond Brain must never enforce writer lock semantics for ledger and snapshots.\n",
+                encoding="utf-8",
+            )
+            radar = detect_contradictions(brain_dir=str(brain), atoms_dir=str(atoms_dir), include_pending=True)
+            self.assertEqual(radar["contradiction_count"], 1)
+            self.assertEqual(radar["high_severity_count"], 0)
+            self.assertEqual(radar["alerts"][0]["severity"], "medium")
+            self.assertNotIn("forged-accepted.md", radar["orphan_approved_atoms"])
+            self.assertIn("sb-rule.md", radar["orphan_approved_atoms"])
+
+            # 4. Non-int/bool ledger seq must fail verification cleanly even with recomputed hash.
+            ledger_file = brain / ".sidecar" / "vault-ledger.jsonl"
+            ledger_file.parent.mkdir(parents=True, exist_ok=True)
+            bad_entry = {
+                "schema_version": 1,
+                "seq": True,
+                "timestamp": "2026-11-15T19:15:00+00:00",
+                "actor": "owner",
+                "note": "bool seq attack",
+                "prev_entry_sha256": GENESIS_HASH,
+                "merkle_root": s1["merkle_root"],
+                "leaf_count": 1,
+                "approved_atoms": 1,
+                "accepted_playbooks": 0,
+            }
+            bad_entry["entry_sha256"] = _sha256_text(_canonical_json(bad_entry))
+            ledger_file.write_text(_canonical_json(bad_entry) + "\n", encoding="utf-8")
+            ver = verify_vault_ledger(brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            self.assertFalse(ver["chain_valid"])
+            self.assertTrue(any("non-sequential seq=" in err for err in ver["errors"]))
+
 
 if __name__ == "__main__":
     unittest.main()

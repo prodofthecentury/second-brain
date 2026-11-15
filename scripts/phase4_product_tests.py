@@ -1074,6 +1074,161 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
         audit_rec = json.loads(audit_lines[-1])
         self.assertGreaterEqual(int(audit_rec.get("pii_redaction_count", 0)), 1)
 
+    def test_p2_p3_note_scope_preference_ids_excerpt_and_sse_audit(self) -> None:
+        import http.client
+        import threading
+        from atom_mutator import apply_review_transition, content_sha256
+        from evidence import find_evidence_anchor
+        from host_adapters import HostSharingRule, builtin_default_policies, save_host_policies
+        import memory_api
+        from notes_store import create_note, get_note, verify_note_excerpt
+        import streaming_chat
+
+        # 1. Mixed-case & hyphen/sub-scope note filtering even when allow_unscoped_atoms=True, plus [P1] source-card parity.
+        atoms_dir = self.brain / "2-atoms"
+        (self.brain / "0-raw" / "fact-alpha.md").write_text("Alpha runtime uses strict timeouts.\n", encoding="utf-8")
+        (self.brain / "0-raw" / "pref-alpha.md").write_text("Prefer crisp architectural diagrams.\n", encoding="utf-8")
+        fact_path = atoms_dir / "fact-alpha.md"
+        fact_path.write_text(
+            "---\nid: fact-alpha\ntype: atom\nmemory_type: semantic\nepistemic_label: claim\n"
+            "sources:\n  - 0-raw/fact-alpha.md\ncontexts:\n  - project:alpha\nreview_status: pending\ncitation_integrity: missing\n---\n\n"
+            "## Claim\nAlpha runtime uses strict timeouts.\n\n## Evidence\nAlpha runtime uses strict timeouts.\n",
+            encoding="utf-8",
+        )
+        pref_draft = (
+            "---\nid: pref-alpha\ntype: atom\nmemory_type: semantic\nepistemic_label: preference\n"
+            "sources:\n  - 0-raw/pref-alpha.md\ncontexts:\n  - project:alpha\nreview_status: pending\ncitation_integrity: missing\n---\n\n"
+            "## Claim\nPrefer crisp architectural diagrams.\n\n## Evidence\nPrefer crisp architectural diagrams.\n"
+        )
+        pref_anchor = find_evidence_anchor(pref_draft, str(self.brain))
+        p_parts = pref_draft.split("---", 2)
+        p_fm = (p_parts[1] + "".join(f"{k}: {v}\n" for k, v in pref_anchor.items())).replace(
+            "citation_integrity: missing", "citation_integrity: anchored"
+        )
+        pref_path = atoms_dir / "pref-alpha.md"
+        pref_path.write_text(f"---{p_fm}---{p_parts[2]}", encoding="utf-8")
+        for p in (fact_path, pref_path):
+            apply_review_transition(
+                action="approve",
+                atom_path=str(p),
+                expected_sha256=content_sha256(p.read_bytes()),
+                actor="owner",
+                brain_dir=str(self.brain),
+                atoms_dir=str(atoms_dir),
+            )
+        self.rebuild_atoms_index()
+
+        create_note(
+            "Alpha Diagrams Sub",
+            "quasarboard alpha runtime note on crisp diagrams.",
+            tags=("Project:Alpha/Sub",),
+            paths=self.paths,
+        )
+        create_note(
+            "Mixed Secret Note",
+            "quasarboard secret note on crisp diagrams.",
+            tags=("Project:Secret-Ops",),
+            paths=self.paths,
+        )
+
+        policies = builtin_default_policies()
+        base_rule = policies["ollama_local"]
+        policies["ollama_local"] = HostSharingRule(
+            host_id=base_rule.host_id,
+            provider=base_rule.provider,
+            transport=base_rule.transport,
+            endpoint_url=base_rule.endpoint_url,
+            default_model=base_rule.default_model,
+            api_key_env=base_rule.api_key_env,
+            enabled=True,
+            allowed_projects=("alpha",),
+            allow_unscoped_atoms=True,
+            allow_preference_atoms=True,
+            redact_pii=True,
+            fail_on_secret_detection=True,
+        )
+        save_host_policies(policies, policy_path=self.root / "security" / "host-sharing-policy.json")
+
+        captured_prompts: list[str] = []
+
+        def fake_stream(prompt: str, model: str):
+            captured_prompts.append(prompt)
+            yield "Alpha runtime uses strict timeouts [V1] and prefers crisp diagrams [P1]."
+
+        events = list(
+            streaming_chat.chat_events(
+                "alpha runtime crisp diagrams quasarboard",
+                mode="stream",
+                paths=self.chat_paths(),
+                project_scope="project:alpha",
+                stream_fn=fake_stream,
+            )
+        )
+        ctx = events[0]
+        self.assertEqual([s["citation_id"] for s in ctx["sources"] if s["tier"] == "verified"], ["V1"])
+        self.assertEqual([s["citation_id"] for s in ctx["sources"] if s["tier"] == "preference"], ["P1"])
+        self.assertEqual(len(captured_prompts), 1)
+        self.assertIn("quasarboard alpha", captured_prompts[0])
+        self.assertNotIn("quasarboard secret", captured_prompts[0])
+        grounding = next(e for e in events if e["type"] == "grounding")
+        self.assertTrue(grounding["fully_cited"])
+        self.assertEqual(grounding["cited_sources"], ["P1", "V1"])
+
+        # 2. verify_note_excerpt preserves legitimate leading '#' identifiers (e.g. '#define').
+        saved_code = create_note("Macros", "Header rule:\n#define MAX_RETRIES 5 // retry cap\nEnd.", paths=self.paths)
+        code_note = get_note(saved_code["filename"], paths=self.paths)
+        verified_code = verify_note_excerpt(
+            saved_code["filename"],
+            "#define MAX_RETRIES 5 // retry cap",
+            actor="camer",
+            expected_note_sha256=code_note.sha256,
+            paths=self.paths,
+        )
+        self.assertEqual(verified_code["claim"], "#define MAX_RETRIES 5 // retry cap")
+
+        # 3. Pre-header SSE failure does not write a speculative HTTP 200 entry to memory-api-audit.jsonl.
+        agent_token, agent_token_path = memory_api.generate_memory_api_token(self.root / "security" / "memory-api-token")
+        _owner_token, owner_token_path = memory_api.generate_memory_api_token(self.root / "security" / "owner-token")
+        cfg = memory_api.MemoryApiRuntimeConfig(
+            brain_dir=str(self.brain),
+            atoms_dir=str(atoms_dir),
+            inbox_dir=str(self.brain / "0-raw" / "inbox"),
+            experiences_dir=str(self.brain / "4-experiences"),
+            lexical_index_path=str(self.brain / ".sidecar" / "lexical.sqlite3"),
+            chroma_path=str(self.brain / ".chroma"),
+            telemetry_db_path=str(self.brain / ".sidecar" / "telemetry.sqlite3"),
+            token_path=agent_token_path,
+            owner_token_path=owner_token_path,
+            policy_path=self.root / "security" / "host-sharing-policy.json",
+        )
+        server = memory_api.MemoryLoopbackHTTPServer("127.0.0.1", 0, runtime_config=cfg)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        def failing_stream(*_args, **_kwargs):
+            if False:
+                yield {}
+            raise PermissionError("stream denied before first event")
+
+        with patch.object(streaming_chat, "chat_events", side_effect=failing_stream):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/v1/chat/stream",
+                body=json.dumps({"query": "test", "mode": "instant"}),
+                headers={"Authorization": f"Bearer {agent_token}", "Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+        self.assertEqual(resp.status, 403)
+        api_audit_lines = (self.brain / ".sidecar" / "memory-api-audit.jsonl").read_text(encoding="utf-8").splitlines()
+        stream_audits = [json.loads(ln) for ln in api_audit_lines if json.loads(ln).get("endpoint") == "/v1/chat/stream"]
+        self.assertEqual([rec["status_code"] for rec in stream_audits], [403])
+
 
 if __name__ == "__main__":
     unittest.main()

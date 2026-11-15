@@ -47,9 +47,9 @@ from host_adapters import (  # noqa: E402
     validate_model_identifier,
 )
 from memory_format import split_frontmatter  # noqa: E402
-from memory_review import section_text  # noqa: E402
+from memory_review import parse_frontmatter_values, section_text  # noqa: E402
 from notes_store import NotePaths, search_notes  # noqa: E402
-from recall import MemoryRecallUnavailable, RecallOptions, search_memory  # noqa: E402
+from recall import MemoryRecallUnavailable, RecallOptions, normalize_project_tag, project_tags_match, search_memory  # noqa: E402
 
 CHAT_MODES = ("instant", "verified", "stream")
 MAX_VERIFIED = 6
@@ -158,6 +158,7 @@ def _note_excerpt(body: str, query: str) -> str:
 def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None = None) -> dict[str, object]:
     t0 = time.perf_counter()
     verified: list[dict[str, object]] = []
+    preferences: list[dict[str, object]] = []
     records: list[dict[str, str]] = []
     warning = None
     try:
@@ -174,7 +175,13 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
             claim, evidence = _claim_and_evidence(result.content)
             if not claim:
                 continue
-            verified.append({"id": f"V{len(verified) + 1}", "atom_id": result.filename, "claim": claim, "evidence": evidence})
+            parsed_fm = split_frontmatter(result.content)
+            fm = parse_frontmatter_values(parsed_fm[0]) if parsed_fm else {}
+            is_pref = str(fm.get("epistemic_label", "claim")) == "preference" or bool(fm.get("epistemic_contract"))
+            if is_pref:
+                preferences.append({"id": f"P{len(preferences) + 1}", "atom_id": result.filename, "claim": claim, "evidence": evidence})
+            else:
+                verified.append({"id": f"V{len(verified) + 1}", "atom_id": result.filename, "claim": claim, "evidence": evidence})
             records.append({"filename": result.filename, "content": result.content})
     except (MemoryRecallUnavailable, RuntimeError) as exc:
         warning = f"Verified memory unavailable: {exc}"
@@ -182,14 +189,12 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
     note_bodies: dict[str, str] = {}
     note_tags: dict[str, tuple[str, ...]] = {}
     scope_raw = (project_scope or "").strip()
-    scope_tag = ""
-    if scope_raw:
-        scope_tag = f"project:{scope_raw.casefold().removeprefix('project:')}"
+    scope_tag = normalize_project_tag(scope_raw) if scope_raw else ""
     try:
         for rec in search_notes(query, limit=MAX_NOTES * 3 if scope_raw else MAX_NOTES, paths=paths.notes):
             if scope_tag:
-                proj_tags = [t.casefold() for t in rec.tags if t.casefold().startswith("project:")]
-                if not proj_tags or not all(t == scope_tag for t in proj_tags):
+                proj_tags = [str(t).strip() for t in rec.tags if str(t).strip().lower().startswith("project:")]
+                if not proj_tags or not all(bool(project_tags_match((t,), (scope_tag,))) for t in proj_tags):
                     continue
             from notes_store import get_note
 
@@ -215,6 +220,16 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
         for v in verified
     ] + [
         {
+            "tier": "preference",
+            "citation_id": p["id"],
+            "filename": p["atom_id"],
+            "title": p["atom_id"],
+            "claim": p["claim"],
+            "excerpt": p["evidence"],
+        }
+        for p in preferences
+    ] + [
+        {
             "tier": "note",
             "citation_id": n["id"],
             "filename": n["filename"],
@@ -226,6 +241,7 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
     return {
         "type": "context",
         "verified": verified,
+        "preferences": preferences,
         "notes": notes,
         "sources": sources,
         "retrieval_ms": round((time.perf_counter() - t0) * 1000, 1),
@@ -264,14 +280,25 @@ def _filter_notes_for_host(
     note_tags: dict[str, tuple[str, ...]],
     rule,
 ) -> list[dict[str, object]]:
+    allow_all_projects = any(str(p).strip() == "*" for p in rule.allowed_projects)
+    normalized_allowed = tuple(
+        norm
+        for p in rule.allowed_projects
+        if str(p).strip() and str(p).strip() != "*"
+        for norm in (normalize_project_tag(p),)
+        if norm
+    )
     allowed: list[dict[str, object]] = []
     for note in notes:
         tags = note_tags.get(str(note["id"]), ())
-        proj_tags = [str(t).strip() for t in tags if str(t).strip().startswith("project:")]
+        proj_tags = [str(t).strip() for t in tags if str(t).strip().lower().startswith("project:")]
         if not proj_tags:
             if rule.allow_unscoped_atoms:
                 allowed.append(note)
-        elif "*" in rule.allowed_projects or all(p in rule.allowed_projects for p in proj_tags):
+        elif allow_all_projects or (
+            normalized_allowed
+            and all(bool(project_tags_match((tag,), normalized_allowed)) for tag in proj_tags)
+        ):
             allowed.append(note)
     return allowed
 
@@ -385,10 +412,11 @@ def chat_events(
     ctx = retrieve_context(query, paths, project_scope=project_scope)
     yield _public(ctx)
     verified = ctx["verified"]
+    preferences = ctx["preferences"]
     notes = ctx["notes"]
 
-    if mode == "instant" or (not verified and not notes):
-        if not verified and not notes:
+    if mode == "instant" or (not verified and not preferences and not notes):
+        if not verified and not preferences and not notes:
             msg = "Nothing in your verified memory or notes matches this question yet."
             yield {"type": "abstain", "text": msg, "reason": msg}
         elapsed = round((time.perf_counter() - started) * 1000, 1)
@@ -498,12 +526,12 @@ def chat_events(
     model_preferences: list[dict[str, object]] = []
     pref_atom_ids: list[str] = []
     if rule.allow_preference_atoms:
-        all_allowed_records = filter_atoms_for_host(ctx["_records"], rule, mode=None)
-        all_allowed_ids = {str(r["filename"]) for r in all_allowed_records}
-        for v in verified:
-            aid = str(v["atom_id"])
-            if aid in all_allowed_ids and aid not in factual_ids:
-                model_preferences.append({"id": f"P{len(model_preferences) + 1}", "atom_id": aid, "claim": v["claim"]})
+        pref_records = filter_atoms_for_host(ctx["_records"], rule, mode="preference")
+        pref_ids = {str(r["filename"]) for r in pref_records}
+        for p in preferences:
+            aid = str(p["atom_id"])
+            if aid in pref_ids:
+                model_preferences.append(p)
                 pref_atom_ids.append(aid)
 
     shared_ids = verified_atom_ids + pref_atom_ids + [f"note:{n['filename']}" for n in model_notes]
@@ -572,6 +600,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"── sources in {event['retrieval_ms']} ms ──")
             for v in event["verified"]:
                 print(f"  ✔ [{v['id']}] {v['claim']}  ({v['atom_id']})")
+            for p in event.get("preferences", ()):
+                print(f"  ★ [{p['id']}] {p['claim']}  ({p['atom_id']})")
             for n in event["notes"]:
                 print(f"  ✎ [{n['id']}] {n['title']}  ({n['filename']})")
             if event.get("warning"):

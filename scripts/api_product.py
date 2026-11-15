@@ -16,6 +16,7 @@ Two credentials, two capability tiers:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import hmac
 import json
 import os
@@ -178,13 +179,15 @@ def _safe_atom_card(path: str, rt, fallback: dict | None = None) -> dict[str, ob
 
 # ─── SSE streaming ───────────────────────────────────────────────────────────
 
-def stream_sse(handler, events) -> None:
+def stream_sse(handler, events, *, on_open: Callable[[], None] | None = None) -> None:
     """Write events as text/event-stream; connection closes at end (no chunked encoding needed)."""
     import time
 
     it = iter(events)
     sentinel = object()
     first = next(it, sentinel)
+    if on_open is not None:
+        on_open()
 
     handler.close_connection = True
     handler.send_response(200)
@@ -334,8 +337,11 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 policy_path=rt.policy_path,
             )
             scope = body.get("project_scope") if isinstance(body.get("project_scope"), str) else None
-            _audit_fn(rt.brain_dir, path, method, 200)
-            stream_sse(handler, chat_events(query_str, mode=mode, paths=cp, project_scope=scope))
+            stream_sse(
+                handler,
+                chat_events(query_str, mode=mode, paths=cp, project_scope=scope),
+                on_open=lambda: _audit_fn(rt.brain_dir, path, method, 200),
+            )
             return True
 
         if path == "/v1/chat/warmup" and method == "POST":

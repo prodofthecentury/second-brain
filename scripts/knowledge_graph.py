@@ -30,6 +30,7 @@ from atom_mutator import approved_revision_is_current  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown  # noqa: E402
 from memory_format import split_frontmatter  # noqa: E402
 from memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list  # noqa: E402
+from recall import normalize_project_tag, project_tags_match  # noqa: E402
 
 _STOPWORDS = frozenset(
     {
@@ -63,11 +64,11 @@ def _extract_numbers(text: str) -> set[str]:
 def _matches_scope(contexts: list[str], project_scope: str | None) -> bool:
     if not project_scope or not project_scope.strip():
         return True
-    target = project_scope.strip().casefold()
-    if not target.startswith("project:"):
-        target = f"project:{target}"
-    proj_tags = [str(c).strip().casefold() for c in contexts if str(c).strip().casefold().startswith("project:")]
-    return bool(proj_tags) and all(c == target for c in proj_tags)
+    target = normalize_project_tag(project_scope)
+    if not target:
+        return True
+    proj_tags = [str(c).strip() for c in contexts if str(c).strip().lower().startswith("project:")]
+    return bool(proj_tags) and all(bool(project_tags_match((c,), (target,))) for c in proj_tags)
 
 
 def build_knowledge_graph(
@@ -96,11 +97,13 @@ def build_knowledge_graph(
             status = rec.get("review_status")
             if status in ("rejected", "quarantined"):
                 continue
-            if not include_pending and (
-                status != "accepted"
-                or rec.get("superseded_by")
-                or not approved_revision_is_current(path, brain_dir=brain_dir, atoms_dir=atoms_dir)
-            ):
+            sup_list = list(rec.get("superseded_by") or [])
+            is_approved_current = bool(
+                status == "accepted"
+                and not sup_list
+                and approved_revision_is_current(path, brain_dir=brain_dir, atoms_dir=atoms_dir)
+            )
+            if not include_pending and not is_approved_current:
                 continue
             contexts = list(rec.get("contexts") or [])
             if not _matches_scope(contexts, project_scope):
@@ -113,14 +116,20 @@ def build_knowledge_graph(
                 if isinstance(raw_links, list)
                 else parse_scalar_list(str(raw_links or ""))
             )
-            sup_list = list(rec.get("superseded_by") or [])
             superseded_by = sup_list[0] if sup_list else ""
             claim_text = rec.get("claim") or ""
             atom_id = rec.get("id") or Path(entry.name).stem
+            effective_status = (
+                "unverified_accepted"
+                if (status == "accepted" and not sup_list and not is_approved_current)
+                else str(status or "")
+            )
             node = {
                 "atom_id": atom_id,
                 "filename": rec.get("filename", entry.name),
                 "review_status": rec.get("review_status", ""),
+                "effective_status": effective_status,
+                "approved_current": is_approved_current,
                 "memory_type": rec.get("memory_type", ""),
                 "contexts": contexts,
                 "links": links,
@@ -168,7 +177,7 @@ def build_knowledge_graph(
                 )
 
     linked_files = {e["from"] for e in edges if e["kind"] == "link"} | {e["to"] for e in edges if e["kind"] == "link"}
-    orphans = [n["filename"] for n in nodes if n["review_status"] == "accepted" and n["filename"] not in linked_files]
+    orphans = [n["filename"] for n in nodes if n.get("approved_current") and n["filename"] not in linked_files]
     return {
         "node_count": len(nodes),
         "edge_count": len(edges),
@@ -220,7 +229,7 @@ def detect_contradictions(
             if not reasons:
                 continue
 
-            both_accepted = a["review_status"] == "accepted" and b["review_status"] == "accepted"
+            both_accepted = bool(a.get("approved_current") and b.get("approved_current"))
             alerts.append(
                 {
                     "severity": "high" if both_accepted else "medium",
@@ -230,11 +239,13 @@ def detect_contradictions(
                     "atom_a": {
                         "filename": a["filename"],
                         "review_status": a["review_status"],
+                        "approved_current": bool(a.get("approved_current")),
                         "claim": a["claim"],
                     },
                     "atom_b": {
                         "filename": b["filename"],
                         "review_status": b["review_status"],
+                        "approved_current": bool(b.get("approved_current")),
                         "claim": b["claim"],
                     },
                     "recommended_action": "owner_review_merge_or_demote",

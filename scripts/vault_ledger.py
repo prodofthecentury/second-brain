@@ -203,8 +203,9 @@ def _read_ledger_entries(ledger_file: Path) -> tuple[list[dict[str, Any]], list[
         if recorded_hash != computed_hash:
             errors.append(f"Line {idx}: entry_sha256 mismatch (recorded={recorded_hash[:12]}, computed={computed_hash[:12]})")
             break
-        if int(obj.get("seq", -1)) != len(entries) + 1:
-            errors.append(f"Line {idx}: non-sequential seq={obj.get('seq')}")
+        seq_val = obj.get("seq")
+        if isinstance(seq_val, bool) or not isinstance(seq_val, int) or seq_val != len(entries) + 1:
+            errors.append(f"Line {idx}: non-sequential seq={seq_val!r}")
             break
         if str(obj.get("prev_entry_sha256") or "") != expected_prev:
             errors.append(f"Line {idx}: broken prev_entry_sha256 chain")
@@ -234,7 +235,7 @@ def commit_ledger_checkpoint(
     ):
         raise PermissionError("Refusing to write ledger through a symlink or junction.")
 
-    with review_lock(str(ledger_file.parent / "review.lock")):
+    with review_lock(str(ledger_file.parent / "writer.lock")):
         if os.path.lexists(str(ledger_file)) and _is_reparse_or_link(str(ledger_file)):
             raise PermissionError("Refusing to write ledger through a symlink or junction.")
         entries, errors = _read_ledger_entries(ledger_file)
