@@ -1229,6 +1229,134 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
         stream_audits = [json.loads(ln) for ln in api_audit_lines if json.loads(ln).get("endpoint") == "/v1/chat/stream"]
         self.assertEqual([rec["status_code"] for rec in stream_audits], [403])
 
+    def test_sweep_secret_quarantine_citation_bullets_scout_watchdog_import_and_cli(self) -> None:
+        from contextlib import redirect_stdout
+        import io
+        from bulk_import import import_folder
+        from scripts import cli
+        import ide_connector
+        from inbox_workflow import scan_inbox_payload_risks
+        from index_manifest import atom_revisions, record_known_atom_hash
+        from notes_store import create_note, get_note, update_note
+        import ollama_scout
+        from streaming_chat import check_citations
+        import watchdog_daemon
+
+        # 1. Expanded secret scanner catches cloud/API/PEM secrets and quarantines agent remember() captures.
+        secret_samples = [
+            "AWS key AKIAIOSFODNN7EXAMPLE leaked",
+            "GitHub token ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD",
+            "Anthropic key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789",
+            "Google key AIzaSyA1234567890abcdefghijklmnopqrstuvwxyz",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA",
+        ]
+        for sample in secret_samples:
+            risks = scan_inbox_payload_risks(sample)
+            self.assertTrue(any(r.startswith("secret_credential:") for r in risks), (sample, risks))
+
+        quarantined = create_note(
+            "Leaked Token",
+            " Bearer ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD ",
+            origin="agent_capture",
+            paths=self.paths,
+        )
+        self.assertEqual(quarantined["status"], "quarantined")
+        self.assertTrue(any(r.startswith("secret_credential:") for r in quarantined["risk_flags"]))
+
+        # 2. _DIR_MEMO invalidation immediately reflects same-nanosecond content edits after record_known_atom_hash.
+        atoms_dir = self.brain / "2-atoms"
+        memo_atom = atoms_dir / "memo-check.md"
+        memo_atom.write_text("v1 content", encoding="utf-8")
+        rev1 = {r["filename"]: r["content_sha256"] for r in atom_revisions(str(atoms_dir))}
+        memo_atom.write_text("v2 updated content with different length", encoding="utf-8")
+        new_sha = hashlib.sha256(memo_atom.read_bytes()).hexdigest()
+        record_known_atom_hash(str(memo_atom), new_sha)
+        rev2 = {r["filename"]: r["content_sha256"] for r in atom_revisions(str(atoms_dir))}
+        self.assertEqual(rev2["memo-check.md"], new_sha)
+        self.assertNotEqual(rev1["memo-check.md"], rev2["memo-check.md"])
+        memo_atom.unlink()
+
+        # 3. Markdown bullet lists without trailing periods and abstention notices pass check_citations cleanly.
+        bullet_check = check_citations(
+            "## Summary\n- Enforces strict loopback binding [V1]\n- Uses SQLite FTS5 BM25 [N1]",
+            [{"id": "V1", "claim": "Loopback"}],
+            [{"id": "N1", "title": "FTS5", "excerpt": "SQLite"}],
+        )
+        self.assertTrue(bullet_check["fully_cited"])
+        self.assertEqual(bullet_check["uncited_sentences"], [])
+
+        abstain_check = check_citations(
+            "The provided sources do not answer this question.",
+            [{"id": "V1", "claim": "Loopback"}],
+            [],
+        )
+        self.assertTrue(abstain_check["fully_cited"])
+        self.assertEqual(abstain_check["uncited_sentences"], [])
+
+        # 4. Bulk import preserves local edits unless overwrite_modified=True, and dry_run=True writes nothing.
+        obs_dir = self.root / "obsidian_sweep"
+        obs_dir.mkdir(parents=True, exist_ok=True)
+        obs_file = obs_dir / "design.md"
+        obs_file.write_text("# Design\nInitial imported body.", encoding="utf-8")
+
+        dry_stats = import_folder(obs_dir, dry_run=True, paths=self.paths)
+        self.assertEqual(dry_stats.created, 1)
+        self.assertTrue(dry_stats.dry_run)
+        self.assertFalse((self.brain / ".sidecar" / "notes-import-manifest.json").exists())
+
+        imp1 = import_folder(obs_dir, paths=self.paths)
+        self.assertEqual(imp1.created, 1)
+        manifest_data = json.loads((self.brain / ".sidecar" / "notes-import-manifest.json").read_text(encoding="utf-8"))
+        self.assertIn("obsidian_sweep/design.md", manifest_data)
+
+        imported_fname = manifest_data["obsidian_sweep/design.md"]["note"]
+        cur_note = get_note(imported_fname, paths=self.paths)
+        update_note(imported_fname, "Locally edited by owner.", expected_sha256=cur_note.sha256, paths=self.paths)
+        obs_file.write_text("# Design\nUpstream external modification.", encoding="utf-8")
+
+        imp_preserve = import_folder(obs_dir, overwrite_modified=False, paths=self.paths)
+        self.assertEqual(imp_preserve.conflicts_preserved, 1)
+        self.assertIn("Locally edited by owner.", get_note(imported_fname, paths=self.paths).body)
+
+        imp_overwrite = import_folder(obs_dir, overwrite_modified=True, paths=self.paths)
+        self.assertEqual(imp_overwrite.updated, 1)
+        self.assertIn("Upstream external modification.", get_note(imported_fname, paths=self.paths).body)
+
+        # 5. Scout anchored reading-list update + XXE-blocked RSS/Atom parser + Watchdog ignore rules.
+        rl_path = self.root / "reading-list-test.md"
+        tricky_url = r"https://example.com/path?q=\1\g<0>"
+        rl_path.write_text(f"- [ ] {tricky_url}\n", encoding="utf-8")
+        with patch.object(ollama_scout, "READING_LIST", str(rl_path)), patch.object(
+            ollama_scout, "SIDECAR_DIR", str(self.brain / ".sidecar")
+        ):
+            ollama_scout.update_reading_list(tricky_url, "ok", "Saved: saved.md")
+        self.assertIn(f"- [x] {tricky_url}", rl_path.read_text(encoding="utf-8"))
+
+        with self.assertRaises(ValueError):
+            ollama_scout.parse_feed_links("<?xml version='1.0'?><!DOCTYPE foo [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]><rss/>")
+        rss_links = ollama_scout.parse_feed_links(
+            "<rss><channel><item><link>https://example.com/a</link></item><item><link>javascript:alert(1)</link></item></channel></rss>"
+        )
+        self.assertEqual(rss_links, ["https://example.com/a"])
+
+        self.assertTrue(watchdog_daemon.should_ignore_watchdog_path(str(self.brain / ".sidecar" / "lexical.sqlite3"), raw_dir=str(self.brain / "0-raw"), brain_dir=str(self.brain)))
+        self.assertTrue(watchdog_daemon.should_ignore_watchdog_path(str(self.brain / "0-raw" / "inbox" / "item.md"), raw_dir=str(self.brain / "0-raw"), brain_dir=str(self.brain)))
+        self.assertFalse(watchdog_daemon.should_ignore_watchdog_path(str(self.brain / "0-raw" / "fresh-capture.md"), raw_dir=str(self.brain / "0-raw"), brain_dir=str(self.brain)))
+
+        # 6. Claude Code connector installs SKILL.md + CLI capture subcommand creates a working note.
+        fake_home = self.root / "fake_home"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        res_cc = ide_connector.connect("claude-code", home=fake_home)
+        self.assertEqual(res_cc["status"], "connected")
+        self.assertTrue((fake_home / ".claude" / "skills" / "second-brain-memory" / "SKILL.md").is_file())
+
+        cap_out = io.StringIO()
+        with patch.dict(os.environ, {"BRAIN_VAULT_DIR": str(self.brain)}), redirect_stdout(cap_out):
+            rc_cap = cli.main(["capture", "Quick CLI note body", "--title", "CLI Quick", "--tag", "cli", "--json"])
+        self.assertEqual(rc_cap, 0)
+        cap_payload = json.loads(cap_out.getvalue())
+        self.assertEqual(cap_payload["status"], "saved")
+
 
 if __name__ == "__main__":
     unittest.main()

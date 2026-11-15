@@ -79,6 +79,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (str(SCRIPTS_DIR / "chroma_rebuild_canary.py"),),
     ),
     (
+        "archive_manifest_canary",
+        "Refinery archive manifest SHA-256 lineage & sticky origin canary (scripts/archive_manifest_canary.py)",
+        (str(SCRIPTS_DIR / "archive_manifest_canary.py"),),
+    ),
+    (
         "smoke_test",
         "End-to-end vault intake, grounding, lexical & dense recall smoke test (scripts/smoke_test.py)",
         (str(SCRIPTS_DIR / "smoke_test.py"),),

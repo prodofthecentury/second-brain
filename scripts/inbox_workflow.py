@@ -17,7 +17,20 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import BRAIN_DIR, INBOX_DIR, RAW_DIR, SIDECAR_DIR, _is_reparse_or_link, file_sha256, resolve_under, safe_file_in_dir
+from atom_mutator import ReviewConflictError, atomic_write_bytes
+from config import (
+    BRAIN_DIR,
+    INBOX_DIR,
+    RAW_DIR,
+    SIDECAR_DIR,
+    _is_reparse_or_link,
+    file_sha256,
+    resolve_under,
+    safe_file_in_dir,
+    safe_vault_reference,
+)
+from host_adapters import restrict_security_file_permissions
+from refinery_targets import intake_status
 from review_atom import review_lock
 
 INBOX_AUDIT_FILENAME = "inbox-decisions.jsonl"
@@ -75,11 +88,31 @@ def _extract_origin_tag(text: str) -> str:
     return "untrusted_inbox"
 
 
+_SECRET_CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("anthropic_api_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
+    ("openai_api_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35,}\b")),
+    ("github_pat", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("aws_sts_key", re.compile(r"\bASIA[0-9A-Z]{16}\b")),
+    ("jwt_token", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("huggingface_token", re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
+    ("stripe_live_key", re.compile(r"\b(?:sk|rk)_live_[0-9a-zA-Z]{24,}\b")),
+    ("url_basic_auth", re.compile(r"https?://[^/\s:@\"']+:[^/\s@\"']+@")),
+    ("private_key_pem", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
+    ("bearer_header_secret", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b")),
+)
+
+
 def scan_inbox_payload_risks(content: str) -> tuple[str, ...]:
     flags: list[str] = []
     for code, pattern in _FORGED_TRUST_PATTERNS:
         if pattern.search(content):
             flags.append(code)
+    for label, pattern in _SECRET_CREDENTIAL_PATTERNS:
+        if pattern.search(content):
+            flags.append(f"secret_credential:{label}")
     if any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in content):
         flags.append("control_characters_present")
     if len(content.encode("utf-8")) > MAX_PROMOTED_BYTES:
@@ -88,8 +121,9 @@ def scan_inbox_payload_risks(content: str) -> tuple[str, ...]:
 
 
 def _unique_archive_destination(inbox_dir: str, subdir: str, prefix_sha: str, basename: str) -> str:
-    if subdir not in {"promoted", "rejected"}:
+    if subdir not in {"promoted", "rejected", ".rejected"}:
         raise ValueError(f"Unsupported inbox archive subdirectory: {subdir}")
+    os.makedirs(inbox_dir, exist_ok=True)
     resolved_subdir = resolve_under(inbox_dir, subdir, must_exist=False)
     if not resolved_subdir:
         raise PermissionError(f"Refusing to archive into unsafe or symlinked inbox directory: {subdir}")
@@ -98,7 +132,7 @@ def _unique_archive_destination(inbox_dir: str, subdir: str, prefix_sha: str, ba
         raise PermissionError(f"Refusing to archive through symlink or junction: {subdir}")
 
     stem, ext = os.path.splitext(basename)
-    if ext.lower() not in {".md", ".txt"}:
+    if ext.lower() not in {".md", ".txt", ".intake"}:
         raise ValueError(f"Unsupported inbox archive extension: {ext}")
     candidate_name = f"{prefix_sha}-{basename}"
     suffix = 2
@@ -111,6 +145,116 @@ def _unique_archive_destination(inbox_dir: str, subdir: str, prefix_sha: str, ba
             return dest
         candidate_name = f"{prefix_sha}-{stem}-{suffix}{ext}"
         suffix += 1
+
+
+def _resolve_raw_and_brain(
+    inbox_dir: str,
+    raw_dir: str | None = None,
+    brain_dir: str | None = None,
+) -> tuple[str, str]:
+    abs_inbox = os.path.abspath(inbox_dir)
+    if raw_dir is not None:
+        resolved_raw = os.path.abspath(raw_dir)
+    elif os.path.basename(abs_inbox) == "inbox":
+        resolved_raw = os.path.dirname(abs_inbox)
+    else:
+        resolved_raw = os.path.abspath(RAW_DIR)
+
+    if brain_dir is not None:
+        resolved_brain = os.path.abspath(brain_dir)
+    else:
+        resolved_brain = os.path.dirname(resolved_raw)
+    return resolved_raw, resolved_brain
+
+
+def _extract_intake_origin(content: str) -> str:
+    tagged = _extract_origin_tag(content)
+    if tagged != "untrusted_inbox":
+        return tagged
+    origin_match = re.search(r"^origin:\s*([a-zA-Z0-9_.-]+)\s*$", content or "", re.MULTILINE)
+    if origin_match:
+        cand = origin_match.group(1).strip()
+        if cand in ALLOWED_INBOX_ORIGINS:
+            return cand
+    return "web_remote"
+
+
+def _resolve_intake_source(pointer_text: str, brain_dir: str) -> tuple[str | None, str | None, str]:
+    """Return (source_ref, resolved_source_path, source_text) for a .intake pointer."""
+    source_match = re.search(r"^source:\s*(.+)$", pointer_text or "", re.MULTILINE)
+    if not source_match:
+        return None, None, ""
+    source_ref = source_match.group(1).strip()
+    if os.path.splitext(source_ref)[1].lower() != ".md":
+        return source_ref, None, ""
+    if os.path.abspath(brain_dir) == os.path.abspath(BRAIN_DIR):
+        source_path = safe_vault_reference(source_ref, allowed_exts={".md"})
+    else:
+        source_path = resolve_under(brain_dir, source_ref, must_exist=True)
+    if not source_path or not os.path.isfile(source_path) or _is_reparse_or_link(source_path):
+        return source_ref, None, ""
+    try:
+        with open(source_path, "r", encoding="utf-8", errors="replace") as handle:
+            return source_ref, source_path, handle.read()
+    except OSError:
+        return source_ref, None, ""
+
+
+def _scan_intake_risks(pointer_text: str, brain_dir: str) -> tuple[tuple[str, ...], str | None, str]:
+    source_ref, source_path, article_text = _resolve_intake_source(pointer_text, brain_dir)
+    combined = pointer_text if not article_text else f"{pointer_text}\n{article_text}"
+    flags = list(scan_inbox_payload_risks(combined))
+    if source_ref and not source_path and "invalid_or_missing_intake_source" not in flags:
+        flags.append("invalid_or_missing_intake_source")
+    return tuple(flags), source_ref, article_text
+
+
+def _sanitize_actor_header_value(actor: str) -> str:
+    safe_actor = (
+        str(actor)
+        .replace("--", "—")
+        .replace("\r", " ")
+        .replace("\n", " ")
+        .strip()[:120]
+        or "owner"
+    )
+    while "--" in safe_actor:
+        safe_actor = safe_actor.replace("--", "—")
+    return safe_actor
+
+
+def _rewrite_intake_pointer(
+    pointer_text: str,
+    *,
+    new_status: str,
+    actor: str,
+    timestamp: str,
+) -> str:
+    safe_actor = _sanitize_actor_header_value(actor)
+    lines: list[str] = []
+    saw_status = False
+    actor_key = "promoted_by" if new_status == "approved" else "rejected_by"
+    time_key = "promoted_at" if new_status == "approved" else "rejected_at"
+    skip_keys = {"promoted_by", "promoted_at", "rejected_by", "rejected_at"}
+    for raw_line in (pointer_text or "").replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        key_part = stripped.split(":", 1)[0].strip() if ":" in stripped else ""
+        if key_part == "intake_status":
+            lines.append(f"intake_status: {new_status}")
+            saw_status = True
+        elif key_part == "requires_owner_promotion" and new_status == "approved":
+            lines.append("requires_owner_promotion: false")
+        elif key_part in skip_keys:
+            continue
+        else:
+            lines.append(raw_line)
+    if not saw_status:
+        lines.append(f"intake_status: {new_status}")
+    lines.append(f"{actor_key}: {safe_actor}")
+    lines.append(f"{time_key}: {timestamp}")
+    return "\n".join(lines) + "\n"
 
 
 def sanitize_promoted_content(content: str, *, origin: str, promoted_by: str, original_sha256: str) -> str:
@@ -183,46 +327,132 @@ def sanitize_promoted_content(content: str, *, origin: str, promoted_by: str, or
     return header + cleaned.lstrip() + "\n"
 
 
-def list_inbox_items(inbox_dir: str = INBOX_DIR) -> list[QuarantinedInboxItem]:
-    if not os.path.isdir(inbox_dir):
-        return []
+def list_inbox_items(
+    inbox_dir: str = INBOX_DIR,
+    *,
+    raw_dir: str | None = None,
+    brain_dir: str | None = None,
+) -> list[QuarantinedInboxItem]:
+    resolved_raw, resolved_brain = _resolve_raw_and_brain(inbox_dir, raw_dir=raw_dir, brain_dir=brain_dir)
     items: list[QuarantinedInboxItem] = []
-    for entry in sorted(os.listdir(inbox_dir)):
-        safe_path = safe_file_in_dir(inbox_dir, entry, allowed_exts={".md", ".txt"}, must_exist=True)
-        if not safe_path or not os.path.isfile(safe_path):
-            continue
-        sha = file_sha256(safe_path)
-        if not sha:
-            continue
-        stat = os.stat(safe_path)
-        with open(safe_path, "r", encoding="utf-8", errors="replace") as handle:
-            content = handle.read()
-        items.append(
-            QuarantinedInboxItem(
-                filename=entry,
-                sha256=sha,
-                size_bytes=stat.st_size,
-                modified_at=datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
-                origin=_extract_origin_tag(content),
-                risk_flags=scan_inbox_payload_risks(content),
-                preview=content[:600],
+    seen_names: set[str] = set()
+
+    if os.path.isdir(inbox_dir):
+        for entry in sorted(os.listdir(inbox_dir)):
+            safe_path = safe_file_in_dir(inbox_dir, entry, allowed_exts={".md", ".txt", ".intake"}, must_exist=True)
+            if not safe_path or not os.path.isfile(safe_path) or _is_reparse_or_link(safe_path):
+                continue
+            sha = file_sha256(safe_path)
+            if not sha:
+                continue
+            stat = os.stat(safe_path)
+            with open(safe_path, "r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read()
+            if entry.lower().endswith(".intake"):
+                risk_flags, _src_ref, article_text = _scan_intake_risks(content, resolved_brain)
+                origin = _extract_intake_origin(content)
+                preview_text = f"{content.strip()}\n\n{article_text[:400]}".strip()[:600] if article_text else content[:600]
+            else:
+                risk_flags = scan_inbox_payload_risks(content)
+                origin = _extract_origin_tag(content)
+                preview_text = content[:600]
+            seen_names.add(entry)
+            items.append(
+                QuarantinedInboxItem(
+                    filename=entry,
+                    sha256=sha,
+                    size_bytes=stat.st_size,
+                    modified_at=datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                    origin=origin,
+                    risk_flags=risk_flags,
+                    preview=preview_text,
+                )
             )
-        )
+
+    if os.path.isdir(resolved_raw) and os.path.abspath(resolved_raw) != os.path.abspath(inbox_dir):
+        for entry in sorted(os.listdir(resolved_raw)):
+            if not entry.lower().endswith(".intake") or entry in seen_names:
+                continue
+            safe_path = safe_file_in_dir(resolved_raw, entry, allowed_exts={".intake"}, must_exist=True)
+            if not safe_path or not os.path.isfile(safe_path) or _is_reparse_or_link(safe_path):
+                continue
+            with open(safe_path, "r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read()
+            if intake_status(content) != "quarantined":
+                continue
+            sha = file_sha256(safe_path)
+            if not sha:
+                continue
+            stat = os.stat(safe_path)
+            risk_flags, _src_ref, article_text = _scan_intake_risks(content, resolved_brain)
+            preview_text = f"{content.strip()}\n\n{article_text[:400]}".strip()[:600] if article_text else content[:600]
+            items.append(
+                QuarantinedInboxItem(
+                    filename=entry,
+                    sha256=sha,
+                    size_bytes=stat.st_size,
+                    modified_at=datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                    origin=_extract_intake_origin(content),
+                    risk_flags=risk_flags,
+                    preview=preview_text,
+                )
+            )
+
+    items.sort(key=lambda item: item.filename)
     return items
 
 
-def inspect_inbox_item(filename: str, *, inbox_dir: str = INBOX_DIR) -> dict[str, object]:
-    safe_path = safe_file_in_dir(inbox_dir, filename, allowed_exts={".md", ".txt"}, must_exist=True)
-    if not safe_path or not os.path.isfile(safe_path):
-        raise FileNotFoundError(f"Quarantined inbox file not found or invalid: {filename}")
+def _locate_quarantined_file(filename: str, inbox_dir: str, raw_dir: str) -> tuple[str, bool]:
+    """Locate a quarantined file in inbox_dir or (for quarantined .intake) raw_dir. Returns (safe_path, from_raw_dir)."""
+    safe_path = safe_file_in_dir(inbox_dir, filename, allowed_exts={".md", ".txt", ".intake"}, must_exist=False)
+    if safe_path and os.path.isfile(safe_path) and not _is_reparse_or_link(safe_path):
+        return safe_path, False
+    if str(filename or "").lower().endswith(".intake") and os.path.isdir(raw_dir):
+        raw_path = safe_file_in_dir(raw_dir, filename, allowed_exts={".intake"}, must_exist=False)
+        if raw_path and os.path.isfile(raw_path) and not _is_reparse_or_link(raw_path):
+            with open(raw_path, "r", encoding="utf-8", errors="replace") as handle:
+                if intake_status(handle.read()) == "quarantined":
+                    return raw_path, True
+    raise FileNotFoundError(f"Quarantined inbox file not found or invalid: {filename}")
+
+
+def inspect_inbox_item(
+    filename: str,
+    *,
+    inbox_dir: str = INBOX_DIR,
+    raw_dir: str | None = None,
+    brain_dir: str | None = None,
+) -> dict[str, object]:
+    resolved_raw, resolved_brain = _resolve_raw_and_brain(inbox_dir, raw_dir=raw_dir, brain_dir=brain_dir)
+    safe_path, _from_raw = _locate_quarantined_file(filename, inbox_dir, resolved_raw)
     sha = file_sha256(safe_path)
     if not sha:
         raise OSError(f"Unable to hash quarantined inbox file: {filename}")
     with open(safe_path, "r", encoding="utf-8", errors="replace") as handle:
         content = handle.read()
+    basename = os.path.basename(safe_path)
+    if basename.lower().endswith(".intake"):
+        risks, source_ref, article_text = _scan_intake_risks(content, resolved_brain)
+        combined_display = (
+            f"{content.strip()}\n\n--- Referenced Source ({source_ref}) ---\n{article_text}"
+            if article_text
+            else content
+        )
+        return {
+            "filename": basename,
+            "sha256": sha,
+            "size_bytes": len(content.encode("utf-8")),
+            "origin": _extract_intake_origin(content),
+            "risk_flags": list(risks),
+            "requires_acknowledge_risks": bool(risks),
+            "pointer_metadata": content,
+            "source_reference": source_ref,
+            "article_preview": article_text[:1000] if article_text else "",
+            "content": combined_display,
+        }
     risks = scan_inbox_payload_risks(content)
     return {
-        "filename": os.path.basename(safe_path),
+        "filename": basename,
         "sha256": sha,
         "size_bytes": len(content.encode("utf-8")),
         "origin": _extract_origin_tag(content),
@@ -234,9 +464,11 @@ def inspect_inbox_item(filename: str, *, inbox_dir: str = INBOX_DIR) -> dict[str
 
 def _append_inbox_decision(record: dict[str, object], *, brain_dir: str) -> None:
     audit_path = _inbox_audit_path(brain_dir)
-    os.makedirs(os.path.dirname(audit_path), exist_ok=True)
-    if os.path.lexists(audit_path) and _is_reparse_or_link(audit_path):
+    audit_parent = os.path.dirname(os.path.abspath(audit_path))
+    os.makedirs(audit_parent, exist_ok=True)
+    if _is_reparse_or_link(audit_parent) or (os.path.lexists(audit_path) and _is_reparse_or_link(audit_path)):
         raise PermissionError("Refusing to write inbox audit log through a symlink or reparse point.")
+    existed_before = os.path.exists(audit_path)
     line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
     fd = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
@@ -245,6 +477,8 @@ def _append_inbox_decision(record: dict[str, object], *, brain_dir: str) -> None
         os.fsync(fd)
     finally:
         os.close(fd)
+    if not existed_before:
+        restrict_security_file_permissions(audit_path)
 
 
 def promote_inbox_item(
@@ -254,10 +488,10 @@ def promote_inbox_item(
     actor: str,
     acknowledge_risks: bool = False,
     inbox_dir: str = INBOX_DIR,
-    raw_dir: str = RAW_DIR,
-    brain_dir: str = BRAIN_DIR,
+    raw_dir: str | None = None,
+    brain_dir: str | None = None,
 ) -> dict[str, object]:
-    """CAS-verified promotion from quarantined 0-raw/inbox/ into 0-raw/ for Refinery processing."""
+    """CAS-verified promotion from quarantined 0-raw/inbox/ (or 0-raw/*.intake) into 0-raw/ for Refinery processing."""
     actor_clean = str(actor or "").strip()
     if not actor_clean:
         raise ValueError("Actor identity is required to promote quarantined inbox captures.")
@@ -265,21 +499,87 @@ def promote_inbox_item(
     if len(expected) != 64:
         raise ValueError("A 64-character expected_sha256 is required for CAS inbox promotion.")
 
-    lock_path = os.path.join(brain_dir, ".sidecar", "writer.lock")
+    resolved_raw, resolved_brain = _resolve_raw_and_brain(inbox_dir, raw_dir=raw_dir, brain_dir=brain_dir)
+    lock_path = os.path.join(resolved_brain, ".sidecar", "writer.lock")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with review_lock(lock_path):
-        safe_src = safe_file_in_dir(inbox_dir, filename, allowed_exts={".md", ".txt"}, must_exist=True)
-        if not safe_src or not os.path.isfile(safe_src):
-            raise FileNotFoundError(f"Quarantined inbox file not found or invalid: {filename}")
+        safe_src, from_raw = _locate_quarantined_file(filename, inbox_dir, resolved_raw)
         current_sha = file_sha256(safe_src)
         if current_sha != expected:
-            raise RuntimeError(
+            raise ReviewConflictError(
                 f"CAS mismatch on quarantined file '{filename}': expected {expected}, found {current_sha}."
             )
         with open(safe_src, "r", encoding="utf-8", errors="strict") as handle:
             raw_text = handle.read()
         if len(raw_text.encode("utf-8")) > MAX_PROMOTED_BYTES:
             raise ValueError(f"Quarantined capture exceeds {MAX_PROMOTED_BYTES} byte promotion ceiling.")
+
+        basename = os.path.basename(safe_src)
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+        if basename.lower().endswith(".intake"):
+            risks, source_ref, _article_text = _scan_intake_risks(raw_text, resolved_brain)
+            if risks and not acknowledge_risks:
+                raise PermissionError(
+                    f"Quarantined intake '{filename}' triggered security risk flags {list(risks)}; "
+                    "inspect the payload and pass acknowledge_risks=True (--acknowledge-risks) to promote."
+                )
+            origin = _extract_intake_origin(raw_text)
+            approved_pointer = _rewrite_intake_pointer(
+                raw_text,
+                new_status="approved",
+                actor=actor_clean,
+                timestamp=now_iso,
+            )
+            os.makedirs(resolved_raw, exist_ok=True)
+            if from_raw:
+                dest_path = safe_src
+                dest_name = basename
+            else:
+                dest_name = basename
+                candidate = safe_file_in_dir(resolved_raw, dest_name, allowed_exts={".intake"}, must_exist=False)
+                if not candidate:
+                    raise ValueError("Invalid destination .intake filename in 0-raw.")
+                stem, ext = os.path.splitext(basename)
+                suffix = 2
+                while os.path.lexists(candidate):
+                    dest_name = f"{stem}-{suffix}{ext}"
+                    candidate = safe_file_in_dir(resolved_raw, dest_name, allowed_exts={".intake"}, must_exist=False)
+                    if not candidate:
+                        raise ValueError("Invalid destination .intake filename in 0-raw.")
+                    suffix += 1
+                dest_path = candidate
+
+            atomic_write_bytes(dest_path, approved_pointer.encode("utf-8"))
+            if not from_raw:
+                archived_inbox_path = _unique_archive_destination(
+                    inbox_dir,
+                    "promoted",
+                    current_sha[:12],
+                    basename,
+                )
+                shutil.move(safe_src, archived_inbox_path)
+
+            promoted_sha = file_sha256(dest_path)
+            decision = {
+                "schema_version": 1,
+                "timestamp": now_iso,
+                "action": "promote_inbox",
+                "actor": actor_clean,
+                "filename": basename,
+                "promoted_to": os.path.basename(dest_path),
+                "sha256": promoted_sha,
+                "inbox_filename": basename,
+                "inbox_sha256": current_sha,
+                "promoted_filename": os.path.basename(dest_path),
+                "promoted_sha256": promoted_sha,
+                "source_reference": source_ref,
+                "origin": origin,
+                "risk_flags": list(risks),
+                "acknowledged_risks": bool(acknowledge_risks),
+            }
+            _append_inbox_decision(decision, brain_dir=resolved_brain)
+            return decision
 
         risks = scan_inbox_payload_risks(raw_text)
         if risks and not acknowledge_risks:
@@ -296,13 +596,13 @@ def promote_inbox_item(
             original_sha256=current_sha,
         )
 
-        os.makedirs(raw_dir, exist_ok=True)
-        stem, ext = os.path.splitext(os.path.basename(safe_src))
+        os.makedirs(resolved_raw, exist_ok=True)
+        stem, ext = os.path.splitext(basename)
         target_ext = ".md" if ext.lower() == ".md" else ".txt"
         dest_name = f"promoted-{stem}{target_ext}"
         suffix = 2
         while True:
-            dest_path = safe_file_in_dir(raw_dir, dest_name, allowed_exts={".md", ".txt"}, must_exist=False)
+            dest_path = safe_file_in_dir(resolved_raw, dest_name, allowed_exts={".md", ".txt"}, must_exist=False)
             if not dest_path:
                 raise ValueError("Invalid destination filename in 0-raw.")
             try:
@@ -323,17 +623,20 @@ def promote_inbox_item(
             inbox_dir,
             "promoted",
             current_sha[:12],
-            os.path.basename(safe_src),
+            basename,
         )
         shutil.move(safe_src, archived_inbox_path)
 
         promoted_sha = file_sha256(dest_path)
         decision = {
             "schema_version": 1,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "timestamp": now_iso,
             "action": "promote_inbox",
             "actor": actor_clean,
-            "inbox_filename": os.path.basename(safe_src),
+            "filename": basename,
+            "promoted_to": dest_name,
+            "sha256": promoted_sha,
+            "inbox_filename": basename,
             "inbox_sha256": current_sha,
             "promoted_filename": dest_name,
             "promoted_sha256": promoted_sha,
@@ -341,7 +644,7 @@ def promote_inbox_item(
             "risk_flags": list(risks),
             "acknowledged_risks": bool(acknowledge_risks),
         }
-        _append_inbox_decision(decision, brain_dir=brain_dir)
+        _append_inbox_decision(decision, brain_dir=resolved_brain)
         return decision
 
 
@@ -352,7 +655,8 @@ def reject_inbox_item(
     actor: str,
     rationale: str = "Rejected during inbox quarantine review",
     inbox_dir: str = INBOX_DIR,
-    brain_dir: str = BRAIN_DIR,
+    raw_dir: str | None = None,
+    brain_dir: str | None = None,
 ) -> dict[str, object]:
     actor_clean = str(actor or "").strip()
     if not actor_clean:
@@ -361,35 +665,57 @@ def reject_inbox_item(
     if len(expected) != 64:
         raise ValueError("A 64-character expected_sha256 is required for CAS inbox rejection.")
 
-    lock_path = os.path.join(brain_dir, ".sidecar", "writer.lock")
+    resolved_raw, resolved_brain = _resolve_raw_and_brain(inbox_dir, raw_dir=raw_dir, brain_dir=brain_dir)
+    lock_path = os.path.join(resolved_brain, ".sidecar", "writer.lock")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with review_lock(lock_path):
-        safe_src = safe_file_in_dir(inbox_dir, filename, allowed_exts={".md", ".txt"}, must_exist=True)
-        if not safe_src or not os.path.isfile(safe_src):
-            raise FileNotFoundError(f"Quarantined inbox file not found or invalid: {filename}")
+        safe_src, _from_raw = _locate_quarantined_file(filename, inbox_dir, resolved_raw)
         current_sha = file_sha256(safe_src)
         if current_sha != expected:
-            raise RuntimeError(
+            raise ReviewConflictError(
                 f"CAS mismatch on quarantined file '{filename}': expected {expected}, found {current_sha}."
             )
-        archived_rejected = _unique_archive_destination(
-            inbox_dir,
-            "rejected",
-            current_sha[:12],
-            os.path.basename(safe_src),
-        )
-        shutil.move(safe_src, archived_rejected)
+        basename = os.path.basename(safe_src)
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+        if basename.lower().endswith(".intake"):
+            with open(safe_src, "r", encoding="utf-8", errors="replace") as handle:
+                pointer_text = handle.read()
+            rejected_pointer = _rewrite_intake_pointer(
+                pointer_text,
+                new_status="rejected",
+                actor=actor_clean,
+                timestamp=now_iso,
+            )
+            archived_rejected = _unique_archive_destination(
+                inbox_dir,
+                ".rejected",
+                current_sha[:12],
+                basename,
+            )
+            atomic_write_bytes(archived_rejected, rejected_pointer.encode("utf-8"))
+            os.remove(safe_src)
+        else:
+            archived_rejected = _unique_archive_destination(
+                inbox_dir,
+                "rejected",
+                current_sha[:12],
+                basename,
+            )
+            shutil.move(safe_src, archived_rejected)
 
         decision = {
             "schema_version": 1,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "timestamp": now_iso,
             "action": "reject_inbox",
             "actor": actor_clean,
-            "inbox_filename": os.path.basename(safe_src),
+            "filename": basename,
+            "inbox_filename": basename,
             "inbox_sha256": current_sha,
+            "archived_to": os.path.relpath(archived_rejected, inbox_dir).replace("\\", "/"),
             "rationale": str(rationale or "").strip()[:500],
         }
-        _append_inbox_decision(decision, brain_dir=brain_dir)
+        _append_inbox_decision(decision, brain_dir=resolved_brain)
         return decision
 
 

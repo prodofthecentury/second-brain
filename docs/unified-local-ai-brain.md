@@ -2,7 +2,7 @@
 
 > **Document status:** Architecture proposal, not the current deployment
 > contract. MCP is an opt-in local stdio interface; do not register it with
-> cloud-connected clients. See [the local-use policy](../brain/mcp-config.md).
+> cloud-connected clients. See [Dashboard & Local Interface Security](dashboard-security.md).
 
 ## Objective
 

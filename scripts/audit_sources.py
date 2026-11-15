@@ -23,7 +23,7 @@ from atom_mutator import (
     approved_revision_is_current,
     review_lock,
 )
-from config import ATOMS_DIR, BRAIN_DIR, is_content_markdown
+from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown
 from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values
@@ -38,9 +38,12 @@ def _source_snapshot(brain_root: Path, anchor: dict[str, Any]) -> tuple[str, str
     if relative.is_absolute() or ".." in relative.parts:
         return "unsafe_path", None, "Stored evidence path is absolute or traverses parent directories."
     try:
-        path = (brain_root / relative).resolve(strict=True)
+        candidate = brain_root / relative
+        if _is_reparse_or_link(str(candidate)):
+            return "unsafe_path", None, "Stored evidence source is a symlink or reparse point."
+        path = candidate.resolve(strict=True)
         allowed_roots = [(brain_root / "0-raw").resolve(), (brain_root / "sources").resolve()]
-        if not path.is_file() or not any(path.is_relative_to(root) for root in allowed_roots):
+        if not path.is_file() or _is_reparse_or_link(str(path)) or not any(path.is_relative_to(root) for root in allowed_roots):
             return "outside_allowed_sources", None, "Stored evidence source is outside durable source directories."
         return "present", hashlib.sha256(path.read_bytes()).hexdigest(), None
     except OSError as exc:
@@ -73,8 +76,10 @@ def audit_sources(
 
     reports: list[dict[str, Any]] = []
     lock_path = brain_root / ".sidecar" / "writer.lock"
+    if _is_reparse_or_link(str(atoms_root)):
+        raise ValueError("Refusing to audit a symlinked atoms directory.")
     for atom_path in sorted(atoms_root.iterdir()) if atoms_root.is_dir() else []:
-        if not atom_path.is_file() or not is_content_markdown(atom_path.name):
+        if _is_reparse_or_link(str(atom_path)) or not atom_path.is_file() or not is_content_markdown(atom_path.name):
             continue
         entry: dict[str, Any] = {
             "atom_id": atom_path.name,

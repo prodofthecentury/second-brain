@@ -14,6 +14,7 @@ from dataclasses import asdict
 import datetime
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import inspect
 import json
 import os
 from pathlib import Path
@@ -71,10 +72,11 @@ from host_adapters import (
 )
 from inbox_workflow import list_inbox_items, scan_inbox_payload_risks
 from index_manifest import index_manifest_is_current, load_index_manifest
-from lexical_store import lexical_index_is_current
+from lexical_store import LexicalIndexUnavailable, lexical_index_is_current, rebuild_lexical_index
 from memory_format import split_frontmatter
 from memory_review import section_text
 from recall import (
+    MemoryRecallUnavailable,
     RecallOptions,
     consume_last_degradation_warning,
     project_tags_match,
@@ -90,13 +92,16 @@ def _extract_claim_text(content: str) -> str:
     body = "\n".join(parsed[1]) if parsed else content
     return section_text(body, "Claim")
 
+
 ALLOWED_API_BIND_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8765
 MIN_API_TOKEN_LEN = 24
 MAX_API_BODY_BYTES = 65536
+MAX_API_LARGE_BODY_BYTES = 2_200_000
 MAX_INBOX_API_CHARS = 16000
 API_MAX_AUTH_FAILURES = 5
 API_LOCKOUT_SECONDS = 60
+RECALL_REMEDIATION_MESSAGE = "Run 'second-brain rebuild-lexical' or start local Ollama."
 
 _API_RATE_LOCK = threading.Lock()
 _API_AUDIT_LOCK = threading.Lock()
@@ -168,6 +173,10 @@ def get_configured_api_token(token_path: Path | None = None) -> str | None:
     target = token_path or default_api_token_path()
     if not os.path.lexists(str(target)):
         return None
+    if _is_reparse_or_link(str(target)) or (
+        os.path.lexists(str(Path(target).parent)) and _is_reparse_or_link(str(Path(target).parent))
+    ):
+        return None
     try:
         content = read_bounded_security_file(target, max_bytes=4096).strip()
     except OSError:
@@ -178,6 +187,7 @@ def get_configured_api_token(token_path: Path | None = None) -> str | None:
 def reset_api_rate_limiter() -> None:
     with _API_RATE_LOCK:
         _API_AUTH_FAILURES.clear()
+    api_product.reset_owner_rate_limiter()
 
 
 def _check_and_record_auth(client_key: str, provided_header: str | None, expected_token: str | None) -> tuple[bool, int]:
@@ -223,11 +233,21 @@ def _check_and_record_auth(client_key: str, provided_header: str | None, expecte
         return (False, 429 if new_locked_until > 0.0 else 401)
 
 
+def _max_body_bytes_for_route(method: str, path: str, *, is_owner: bool = False) -> int:
+    if not is_owner:
+        return MAX_API_BODY_BYTES
+    if method == "POST" and path == "/v1/notes":
+        return MAX_API_LARGE_BODY_BYTES
+    if method == "PUT" and path.startswith("/v1/notes/") and not path.endswith(("/verify", "/backlinks")):
+        return MAX_API_LARGE_BODY_BYTES
+    if method == "PUT" and path.startswith("/v1/atoms/"):
+        return MAX_API_LARGE_BODY_BYTES
+    return MAX_API_BODY_BYTES
+
+
 # ─── Typed API Schemas (Pydantic v2) ─────────────────────────────────────────
 
 BoundedExperienceItem = Annotated[str, Field(min_length=1, max_length=500)]
-
-
 BoundedContextTag = Annotated[str, Field(min_length=1, max_length=64)]
 
 
@@ -240,6 +260,7 @@ class ApiRecallRequest(BaseModel):
     allow_cross_project: bool = False
     follow_links: bool = True
     include_duplicates: bool = False
+    include_preferences: bool = False
     enable_fitness_boost: bool = False
     active_context_profile: list[BoundedContextTag] = Field(default_factory=list, max_length=16)
 
@@ -364,6 +385,13 @@ class MemoryApiRuntimeConfig:
         self.http_transport = http_transport
         self.skip_dns_check_for_mock_transport = skip_dns_check_for_mock_transport
 
+    @property
+    def owner_token(self) -> str | None:
+        return api_product.get_owner_token(self.owner_token_path)
+
+
+MemoryApiRuntime = MemoryApiRuntimeConfig
+
 
 class MemoryLoopbackHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = os.name != "nt"
@@ -376,6 +404,8 @@ class MemoryLoopbackHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, host: str, port: int, runtime_config: MemoryApiRuntimeConfig | None = None) -> None:
         verified_host = assert_api_loopback_bind(host)
+        if isinstance(port, bool) or not isinstance(port, int) or not (0 <= port <= 65535):
+            raise ValueError(f"Invalid loopback TCP port {port!r}; expected 0..65535.")
         self.runtime = runtime_config or MemoryApiRuntimeConfig()
         expected = get_configured_api_token(self.runtime.token_path)
         if not expected:
@@ -383,11 +413,48 @@ class MemoryLoopbackHTTPServer(ThreadingHTTPServer):
                 "Memory API startup aborted: no valid (>=24 char) bearer token configured. "
                 "Run `second-brain serve --generate-token` first."
             )
+        if not os.path.exists(self.runtime.lexical_index_path):
+            try:
+                if not (os.path.lexists(self.runtime.brain_dir) and _is_reparse_or_link(self.runtime.brain_dir)):
+                    os.makedirs(self.runtime.atoms_dir, exist_ok=True)
+                    os.makedirs(os.path.dirname(self.runtime.lexical_index_path), exist_ok=True)
+                    if os.path.isdir(self.runtime.atoms_dir) and not _is_reparse_or_link(self.runtime.atoms_dir):
+                        rebuild_lexical_index(self.runtime.atoms_dir, self.runtime.lexical_index_path)
+            except Exception:
+                # Ignore benign errors on read-only or synthetic test harnesses.
+                pass
         super().__init__((verified_host, port), MemoryApiRequestHandler)
 
 
+def create_memory_api_server(
+    host: str = ALLOWED_API_BIND_HOST,
+    port: int = DEFAULT_API_PORT,
+    runtime_config: MemoryApiRuntimeConfig | None = None,
+) -> MemoryLoopbackHTTPServer:
+    return MemoryLoopbackHTTPServer(host, port, runtime_config)
+
+
+def serve_memory_api(
+    host: str = ALLOWED_API_BIND_HOST,
+    port: int = DEFAULT_API_PORT,
+    runtime_config: MemoryApiRuntimeConfig | None = None,
+) -> int:
+    server = create_memory_api_server(host, port, runtime_config)
+    bound_host, actual_port = server.server_address[0], server.server_address[1]
+    print(f"SECOND_BRAIN_API_READY http://{bound_host}:{actual_port} port={actual_port}", flush=True)
+    print(f"Second Brain Loopback Memory API listening on http://{bound_host}:{actual_port}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def _audit_api_event(brain_dir: str, endpoint: str, method: str, status_code: int) -> None:
-    audit_path = os.path.join(brain_dir, ".sidecar", "memory-api-audit.jsonl")
+    sidecar_dir = os.path.join(brain_dir, ".sidecar")
+    audit_path = os.path.join(sidecar_dir, "memory-api-audit.jsonl")
     record = {
         "schema_version": 1,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -397,9 +464,16 @@ def _audit_api_event(brain_dir: str, endpoint: str, method: str, status_code: in
     }
     line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
     with _API_AUDIT_LOCK:
-        os.makedirs(os.path.dirname(audit_path), exist_ok=True)
-        if os.path.lexists(audit_path) and _is_reparse_or_link(audit_path):
+        if (
+            (os.path.lexists(brain_dir) and _is_reparse_or_link(brain_dir))
+            or (os.path.lexists(sidecar_dir) and _is_reparse_or_link(sidecar_dir))
+            or (os.path.lexists(audit_path) and _is_reparse_or_link(audit_path))
+        ):
             raise PermissionError("Refusing to write API audit log through a symlink or reparse point.")
+        os.makedirs(sidecar_dir, exist_ok=True)
+        if _is_reparse_or_link(sidecar_dir) or (os.path.lexists(audit_path) and _is_reparse_or_link(audit_path)):
+            raise PermissionError("Refusing to write API audit log through a symlink or reparse point.")
+        existed_before = os.path.exists(audit_path)
         fd = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             if os.write(fd, line) != len(line):
@@ -407,6 +481,8 @@ def _audit_api_event(brain_dir: str, endpoint: str, method: str, status_code: in
             os.fsync(fd)
         finally:
             os.close(fd)
+        if not existed_before:
+            restrict_security_file_permissions(Path(audit_path))
 
 
 class MemoryApiRequestHandler(BaseHTTPRequestHandler):
@@ -431,9 +507,12 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            if getattr(self, "close_connection", False):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(raw)
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
             return
 
     def _verify_security_envelope(self) -> bool:
@@ -466,30 +545,69 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             expected,
         )
         if not auth_ok:
-            msg = "Too Many Requests: authentication rate limit exceeded." if fail_code == 429 else "Unauthorized: invalid or missing bearer token."
+            msg = (
+                "Too Many Requests: authentication rate limit exceeded."
+                if fail_code == 429
+                else "Unauthorized: invalid or missing bearer token."
+            )
             self._send_json(fail_code, {"error": msg})
             return False
         return True
 
-    def _read_json_body(self) -> dict[str, object] | None:
+    def _drain_rejected_request_body(self, clen: int) -> None:
+        if clen <= 0:
+            return
+        budget = min(clen, MAX_API_LARGE_BODY_BYTES + 65536)
+        prev_timeout = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(0.25)
+            remaining = budget
+            read_fn = self.rfile.read1 if hasattr(self.rfile, "read1") else self.rfile.read
+            while remaining > 0:
+                chunk = read_fn(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except (TimeoutError, socket.timeout, OSError, ValueError):
+            pass
+        finally:
+            try:
+                self.connection.settimeout(prev_timeout)
+            except OSError:
+                pass
+
+    def _read_json_body(self, *, max_bytes: int = MAX_API_BODY_BYTES) -> dict[str, object] | None:
         if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
             self._send_json(400, {"error": "Transfer-Encoding is not supported; send Content-Length."})
             return None
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/json":
+            self.close_connection = True
             self._send_json(415, {"error": "Unsupported Media Type: expected application/json."})
             return None
         clen_raw = self.headers.get("Content-Length")
         if clen_raw is None:
+            self.close_connection = True
             self._send_json(411, {"error": "Length Required."})
             return None
+        clen_trimmed = clen_raw.strip()
+        if len(clen_trimmed) > 9:
+            self.close_connection = True
+            self._send_json(413, {"error": f"Payload Too Large: max {max_bytes} bytes."})
+            self._drain_rejected_request_body(MAX_API_LARGE_BODY_BYTES)
+            return None
         try:
-            clen = int(clen_raw)
+            clen = int(clen_trimmed)
         except ValueError:
+            self.close_connection = True
             self._send_json(400, {"error": "Invalid Content-Length."})
             return None
-        if clen < 0 or clen > MAX_API_BODY_BYTES:
-            self._send_json(413, {"error": f"Payload Too Large: max {MAX_API_BODY_BYTES} bytes."})
+        if clen < 0 or clen > max_bytes:
+            self.close_connection = True
+            self._send_json(413, {"error": f"Payload Too Large: max {max_bytes} bytes."})
+            if clen > 0:
+                self._drain_rejected_request_body(clen)
             return None
         body_bytes = self.rfile.read(clen) if clen > 0 else b"{}"
         try:
@@ -502,151 +620,240 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             return None
         return parsed
 
+    def _handle_route_exception(self, method: str, path: str, exc: Exception) -> None:
+        rt = self.server.runtime
+        if isinstance(exc, (MemoryRecallUnavailable, LexicalIndexUnavailable)):
+            try:
+                _audit_api_event(rt.brain_dir, path, method, 503)
+            except Exception:
+                pass
+            self._send_json(503, {"error": str(exc), "remediation": RECALL_REMEDIATION_MESSAGE})
+            return
+        if isinstance(exc, (PermissionError, HostConsentError, OutboundSecretBlockedError)):
+            try:
+                _audit_api_event(rt.brain_dir, path, method, 403)
+            except Exception:
+                pass
+            self._send_json(403, {"error": str(exc)})
+            return
+        if isinstance(exc, FileNotFoundError):
+            try:
+                _audit_api_event(rt.brain_dir, path, method, 404)
+            except Exception:
+                pass
+            self._send_json(404, {"error": str(exc)})
+            return
+        if exc.__class__.__name__ == "ValidationError" or isinstance(exc, ValueError):
+            try:
+                _audit_api_event(rt.brain_dir, path, method, 422)
+            except Exception:
+                pass
+            self._send_json(422, {"error": str(exc)})
+            return
+        self._send_json(500, {"error": "Internal server error while processing request."})
+
     def do_GET(self) -> None:
         if not self._verify_security_envelope():
             return
         rt = self.server.runtime
-        path = urlparse(self.path).path
-
-        if path == "/v1/health":
-            atom_files = [
-                f for f in (os.listdir(rt.atoms_dir) if os.path.isdir(rt.atoms_dir) else [])
-                if is_content_markdown(f)
-            ]
-            approved = sum(
-                1 for f in atom_files
-                if approved_revision_is_current(os.path.join(rt.atoms_dir, f), brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir)
-            )
-            lex_ok = lexical_index_is_current(rt.atoms_dir, rt.lexical_index_path)
-            manifest = load_index_manifest(rt.chroma_path) if os.path.isdir(rt.chroma_path) else None
-            dense_ok = bool(manifest and index_manifest_is_current(manifest, rt.atoms_dir))
-            hw = detect_hardware_profile(ollama_timeout=1.5, use_cache=True)
-            _audit_api_event(rt.brain_dir, path, "GET", 200)
-            self._send_json(
-                200,
-                {
-                    "status": "ok",
-                    "api_version": "1.0.0",
-                    "atom_count": len(atom_files),
-                    "approved_atom_count": approved,
-                    "lexical_index_current": lex_ok,
-                    "dense_index_current": dense_ok,
-                    "dense_generation_id": manifest.get("generation_id") if manifest else None,
-                    "hardware_tier": hw.tier_id,
-                },
-            )
-            return
-
-        if path == "/v1/profile":
-            hw = detect_hardware_profile(ollama_timeout=1.5, use_cache=True)
-            policies = load_host_policies(rt.policy_path)
-            hw_dict = asdict(hw)
-            hw_dict["installed_ollama_models"] = list(hw.installed_ollama_models)
-            hosts_summary = {
-                hid: {
-                    "provider": rule.provider,
-                    "transport": rule.transport,
-                    "endpoint_url": rule.endpoint_url,
-                    "default_model": rule.default_model,
-                    "enabled": rule.enabled,
-                    "allowed_projects": list(rule.allowed_projects),
-                    "allow_preference_atoms": rule.allow_preference_atoms,
-                    "redact_pii": rule.redact_pii,
-                }
-                for hid, rule in sorted(policies.items())
-            }
-            _audit_api_event(rt.brain_dir, path, "GET", 200)
-            self._send_json(200, {"hardware": hw_dict, "hosts": hosts_summary})
-            return
-
-        if path == "/v1/cognitive/fitness":
-            report = compute_memory_fitness_report(
-                atoms_dir=rt.atoms_dir,
-                brain_dir=rt.brain_dir,
-                db_path=rt.telemetry_db_path,
-            )
-            raw_pending = list(report.get("pending_review_bottlenecks") or [])
-            raw_proc = list(report.get("procedure_maturity") or [])
-            sanitized_report = {
-                **report,
-                "pending_review_bottleneck_count": len(raw_pending),
-                "pending_review_bottlenecks": [
-                    {k: v for k, v in item.items() if k != "atom_id"}
-                    for item in raw_pending
-                    if isinstance(item, dict)
-                ],
-                "procedure_maturity": [
-                    item if item.get("approved_current") else {k: v for k, v in item.items() if k != "atom_id"}
-                    for item in raw_proc
-                    if isinstance(item, dict)
-                ],
-            }
-            _audit_api_event(rt.brain_dir, path, "GET", 200)
-            self._send_json(200, sanitized_report)
-            return
-
-        if path == "/v1/playbooks":
-            parsed_url = urlparse(self.path)
-            qs = parse_qs(parsed_url.query)
-            proj_raw = (qs.get("project") or [""])[0].strip()
-            if len(proj_raw) > 120:
-                self._send_json(422, {"error": "Invalid project query filter."})
-                return
-            active_pbs = list_playbooks(
-                playbooks_dir=rt.playbooks_dir,
-                brain_dir=rt.brain_dir,
-                atoms_dir=rt.atoms_dir,
-                telemetry_db_path=rt.telemetry_db_path,
-                active_only=True,
-            )
-            if proj_raw:
-                # Require EVERY backing atom to individually match the scope (no merged-union laundering).
-                active_pbs = [p for p in active_pbs if playbook_visible_in_scope(p, (proj_raw,))]
-            _audit_api_event(rt.brain_dir, path, "GET", 200)
-            self._send_json(
-                200,
-                {
-                    "count": len(active_pbs),
-                    "playbooks": [
-                        {
-                            "playbook_id": p.playbook_id,
-                            "filename": p.filename,
-                            "title": p.title,
-                            "sha256": p.sha256,
-                            "contexts": list(p.contexts),
-                            "backing_atoms": list(p.backing_atoms),
-                            "trigger": p.trigger,
-                            "preconditions": list(p.preconditions),
-                            "steps": list(p.steps),
-                            "expected_outputs": list(p.expected_outputs),
-                            "failure_recovery": list(p.failure_recovery),
-                        }
-                        for p in active_pbs
-                    ],
-                },
-            )
-            return
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
 
         try:
-            if api_product.dispatch(self, "GET", path, urlparse(self.path).query, None):
+            is_owner, throttled_429, had_failed_owner_hdr = api_product.evaluate_request_owner_auth(
+                self, rt, path=path, method="GET", audit_fn=_audit_api_event
+            )
+            if throttled_429:
+                self._send_json(429, {"error": "Too Many Requests: owner token authentication rate limit exceeded."})
                 return
-        except Exception:
-            self._send_json(500, {"error": "Internal server error while processing request."})
-            return
-        self._send_json(404, {"error": f"Unknown endpoint: {path}"})
+
+            if path == "/v1/health":
+                if had_failed_owner_hdr:
+                    _audit_api_event(rt.brain_dir, path, "GET", 403)
+                atom_files = [
+                    f
+                    for f in (
+                        os.listdir(rt.atoms_dir)
+                        if (os.path.isdir(rt.atoms_dir) and not _is_reparse_or_link(rt.atoms_dir))
+                        else []
+                    )
+                    if is_content_markdown(f)
+                ]
+                approved = sum(
+                    1
+                    for f in atom_files
+                    if approved_revision_is_current(os.path.join(rt.atoms_dir, f), brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir)
+                )
+                lex_ok = lexical_index_is_current(rt.atoms_dir, rt.lexical_index_path)
+                manifest = load_index_manifest(rt.chroma_path) if os.path.isdir(rt.chroma_path) else None
+                dense_ok = bool(manifest and index_manifest_is_current(manifest, rt.atoms_dir))
+                hw = detect_hardware_profile(ollama_timeout=1.5, use_cache=True)
+                _audit_api_event(rt.brain_dir, path, "GET", 200)
+                self._send_json(
+                    200,
+                    {
+                        "status": "ok",
+                        "api_version": "1.0.0",
+                        "atom_count": len(atom_files),
+                        "approved_atom_count": approved,
+                        "lexical_index_current": lex_ok,
+                        "dense_index_current": dense_ok,
+                        "dense_generation_id": manifest.get("generation_id") if manifest else None,
+                        "hardware_tier": hw.tier_id,
+                    },
+                )
+                return
+
+            if path == "/v1/profile":
+                if had_failed_owner_hdr:
+                    _audit_api_event(rt.brain_dir, path, "GET", 403)
+                hw = detect_hardware_profile(ollama_timeout=1.5, use_cache=True)
+                policies = load_host_policies(rt.policy_path)
+                hw_dict = asdict(hw)
+                hw_dict["installed_ollama_models"] = list(hw.installed_ollama_models)
+                hw_dict["cpu_logical_cores"] = hw.cpu_threads
+                hw_dict["ram_total_gb"] = hw.total_ram_gib
+                hw_dict["vram_gb"] = hw.vram_gib
+                hw_dict["has_gpu"] = bool(hw.gpu_backend and hw.gpu_backend != "cpu")
+                hw_dict["recommended_chat_model"] = hw.recommended_generation_model
+                hosts_summary = {
+                    hid: {
+                        "provider": rule.provider,
+                        "transport": rule.transport,
+                        "endpoint_url": rule.endpoint_url,
+                        "default_model": rule.default_model,
+                        "enabled": rule.enabled,
+                        "allowed_projects": list(rule.allowed_projects),
+                        "allow_unscoped_atoms": rule.allow_unscoped_atoms,
+                        "allow_preference_atoms": rule.allow_preference_atoms,
+                        "redact_pii": rule.redact_pii,
+                        "fail_on_secret_detection": rule.fail_on_secret_detection,
+                    }
+                    for hid, rule in sorted(policies.items())
+                }
+                _audit_api_event(rt.brain_dir, path, "GET", 200)
+                self._send_json(200, {"hardware": hw_dict, "hosts": hosts_summary})
+                return
+
+            if path == "/v1/cognitive/fitness":
+                if had_failed_owner_hdr:
+                    _audit_api_event(rt.brain_dir, path, "GET", 403)
+                report = compute_memory_fitness_report(
+                    atoms_dir=rt.atoms_dir,
+                    brain_dir=rt.brain_dir,
+                    db_path=rt.telemetry_db_path,
+                )
+                raw_pending = list(report.get("pending_review_bottlenecks") or [])
+                raw_proc = list(report.get("procedure_maturity") or [])
+                raw_high = list(report.get("high_utility_verified_atoms") or [])
+                raw_cold = list(report.get("cold_verified_atoms") or [])
+                if not is_owner:
+                    pref_files = {
+                        name
+                        for name in (os.listdir(rt.atoms_dir) if os.path.isdir(rt.atoms_dir) else [])
+                        if is_content_markdown(name)
+                        and api_product._is_preference_atom_file(os.path.join(rt.atoms_dir, name))
+                    }
+                    if pref_files:
+                        raw_high = [it for it in raw_high if isinstance(it, dict) and it.get("atom_id") not in pref_files]
+                        raw_cold = [it for it in raw_cold if isinstance(it, dict) and it.get("atom_id") not in pref_files]
+                        raw_proc = [it for it in raw_proc if isinstance(it, dict) and it.get("atom_id") not in pref_files]
+                sanitized_report = {
+                    **report,
+                    "high_utility_verified_atoms": raw_high,
+                    "high_fitness_atoms": raw_high,
+                    "cold_verified_atoms": raw_cold,
+                    "dormant_atoms": raw_cold,
+                    "pending_review_bottleneck_count": len(raw_pending),
+                    "pending_review_bottlenecks": (
+                        raw_pending
+                        if is_owner
+                        else [
+                            {k: v for k, v in item.items() if k != "atom_id"}
+                            for item in raw_pending
+                            if isinstance(item, dict)
+                        ]
+                    ),
+                    "procedure_maturity": (
+                        raw_proc
+                        if is_owner
+                        else [
+                            item if item.get("approved_current") else {k: v for k, v in item.items() if k != "atom_id"}
+                            for item in raw_proc
+                            if isinstance(item, dict)
+                        ]
+                    ),
+                }
+                _audit_api_event(rt.brain_dir, path, "GET", 200)
+                self._send_json(200, sanitized_report)
+                return
+
+            if path == "/v1/playbooks":
+                if had_failed_owner_hdr:
+                    _audit_api_event(rt.brain_dir, path, "GET", 403)
+                qs = parse_qs(parsed_url.query)
+                proj_raw = (qs.get("project") or [""])[0].strip()
+                if len(proj_raw) > 120:
+                    raise ValueError("Invalid project query filter.")
+                inc_inactive = bool(is_owner and (qs.get("include_inactive") or ["0"])[0] in {"1", "true", "yes"})
+                pbs = list_playbooks(
+                    playbooks_dir=rt.playbooks_dir,
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                    telemetry_db_path=rt.telemetry_db_path,
+                    active_only=not inc_inactive,
+                )
+                if proj_raw:
+                    # Require EVERY backing atom to individually match the scope (no merged-union laundering).
+                    pbs = [p for p in pbs if playbook_visible_in_scope(p, (proj_raw,))]
+                _audit_api_event(rt.brain_dir, path, "GET", 200)
+                pb_list = [
+                    {
+                        "playbook_id": p.playbook_id,
+                        "filename": p.filename,
+                        "title": p.title,
+                        "status": p.status,
+                        "valid": p.valid,
+                        "sha256": p.sha256,
+                        "contexts": list(p.contexts),
+                        "backing_atoms": list(p.backing_atoms),
+                        "trigger": p.trigger,
+                        "preconditions": list(p.preconditions),
+                        "steps": list(p.steps),
+                        "expected_outputs": list(p.expected_outputs),
+                        "failure_recovery": list(p.failure_recovery),
+                    }
+                    for p in pbs
+                ]
+                self._send_json(200, {"count": len(pb_list), "playbooks": pb_list, "items": pb_list})
+                return
+
+            if api_product.dispatch(self, "GET", path, parsed_url.query, None):
+                return
+            self._send_json(404, {"error": f"Unknown endpoint: {path}"})
+        except Exception as exc:
+            self._handle_route_exception("GET", path, exc)
 
     def _dispatch_body_method(self, method: str) -> None:
         if not self._verify_security_envelope():
             return
-        raw_json = self._read_json_body()
+        rt = self.server.runtime
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        is_owner, throttled_429, _ = api_product.evaluate_request_owner_auth(
+            self, rt, path=path, method=method, audit_fn=_audit_api_event
+        )
+        if throttled_429:
+            self._send_json(429, {"error": "Too Many Requests: owner token authentication rate limit exceeded."})
+            return
+        raw_json = self._read_json_body(max_bytes=_max_body_bytes_for_route(method, path, is_owner=is_owner))
         if raw_json is None:
             return
-        path = urlparse(self.path).path
         try:
-            if not api_product.dispatch(self, method, path, urlparse(self.path).query, raw_json):
+            if not api_product.dispatch(self, method, path, parsed_url.query, raw_json):
                 self._send_json(404, {"error": f"Unknown endpoint: {path}"})
-        except Exception:
-            self._send_json(500, {"error": "Internal server error while processing request."})
+        except Exception as exc:
+            self._handle_route_exception(method, path, exc)
 
     def do_PUT(self) -> None:
         self._dispatch_body_method("PUT")
@@ -657,27 +864,48 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._verify_security_envelope():
             return
-        raw_json = self._read_json_body()
+        rt = self.server.runtime
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        is_owner, throttled_429, had_failed_owner_hdr = api_product.evaluate_request_owner_auth(
+            self, rt, path=path, method="POST", audit_fn=_audit_api_event
+        )
+        if throttled_429:
+            self._send_json(429, {"error": "Too Many Requests: owner token authentication rate limit exceeded."})
+            return
+        raw_json = self._read_json_body(max_bytes=_max_body_bytes_for_route("POST", path, is_owner=is_owner))
         if raw_json is None:
             return
-        rt = self.server.runtime
-        path = urlparse(self.path).path
 
         try:
+
             if path == "/v1/recall":
+                if had_failed_owner_hdr:
+                    _audit_api_event(rt.brain_dir, path, "POST", 403)
                 req = ApiRecallRequest.model_validate(raw_json)
                 projects = (req.project_scope.strip(),) if req.project_scope and req.project_scope.strip() else ()
-                opts = RecallOptions(
-                    n_results=req.n_results,
-                    follow_links=req.follow_links,
-                    include_statuses={"accepted"},
-                    projects=projects,
-                    allow_cross_project=req.allow_cross_project,
-                    retrieval_mode=req.retrieval_mode,
-                    enable_fitness_boost=req.enable_fitness_boost,
-                    active_context_profile=tuple(req.active_context_profile),
-                    telemetry_db_path=rt.telemetry_db_path,
-                )
+                effective_include_prefs = bool(req.include_preferences) if is_owner else False
+                if req.include_duplicates and not is_owner and not projects:
+                    raise PermissionError(
+                        "403 Forbidden: unscoped include_duplicates requires owner authorization or an explicit project_scope."
+                    )
+
+                fetch_n = min(25, req.n_results * 2) if not effective_include_prefs else req.n_results
+                recall_kwargs: dict[str, object] = {
+                    "n_results": fetch_n,
+                    "follow_links": req.follow_links,
+                    "include_statuses": {"accepted"},
+                    "projects": projects,
+                    "allow_cross_project": req.allow_cross_project,
+                    "retrieval_mode": req.retrieval_mode,
+                    "enable_fitness_boost": req.enable_fitness_boost,
+                    "active_context_profile": tuple(req.active_context_profile),
+                    "telemetry_db_path": rt.telemetry_db_path,
+                }
+                if "include_preferences" in inspect.signature(RecallOptions).parameters:
+                    recall_kwargs["include_preferences"] = effective_include_prefs
+                opts = RecallOptions(**recall_kwargs)
+
                 consume_last_degradation_warning()
                 t0 = time.perf_counter()
                 direct, neighbors = search_memory(
@@ -687,6 +915,12 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     index_path=rt.lexical_index_path,
                     chroma_path=rt.chroma_path,
                 )
+                if not effective_include_prefs:
+                    direct = [r for r in direct if not api_product.is_preference_atom_content(r.content)][: req.n_results]
+                    neighbors = [r for r in neighbors if not api_product.is_preference_atom_content(r.content)]
+                else:
+                    direct = direct[: req.n_results]
+
                 elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
                 degradation_banner = consume_last_degradation_warning()
                 try:
@@ -704,6 +938,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     )
                 except Exception:
                     pass
+
                 duplicates = (
                     suggest_duplicate_atoms(
                         rt.atoms_dir,
@@ -714,6 +949,20 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     if req.include_duplicates
                     else []
                 )
+                if duplicates and not effective_include_prefs:
+                    pref_files = {
+                        name
+                        for name in (os.listdir(rt.atoms_dir) if os.path.isdir(rt.atoms_dir) else [])
+                        if is_content_markdown(name)
+                        and api_product._is_preference_atom_file(os.path.join(rt.atoms_dir, name))
+                    }
+                    if pref_files:
+                        duplicates = [
+                            d
+                            for d in duplicates
+                            if d.get("atom_a") not in pref_files and d.get("atom_b") not in pref_files
+                        ]
+
                 _audit_api_event(rt.brain_dir, path, "POST", 200)
                 self._send_json(
                     200,
@@ -747,6 +996,8 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/v1/answer":
+                if had_failed_owner_hdr:
+                    _audit_api_event(rt.brain_dir, path, "POST", 403)
                 req = ApiAnswerRequest.model_validate(raw_json)
                 projects = (req.project_scope.strip(),) if req.project_scope and req.project_scope.strip() else ()
                 opts = RecallOptions(
@@ -817,6 +1068,16 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/v1/inbox":
+                if had_failed_owner_hdr:
+                    _audit_api_event(rt.brain_dir, path, "POST", 403)
+                client_ip = self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1"
+                if not api_product.check_capture_rate_limit(client_ip):
+                    _audit_api_event(rt.brain_dir, path, "POST", 429)
+                    self._send_json(
+                        429,
+                        {"error": "Too Many Requests: capture write rate limit exceeded (max 180 per minute)."},
+                    )
+                    return
                 req = ApiInboxCaptureRequest.model_validate(raw_json)
                 cleaned = "".join(ch for ch in req.content if ch in ("\n", "\r", "\t") or ord(ch) >= 32).strip()
                 if not cleaned:
@@ -831,6 +1092,8 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     .strip()[:200]
                 )
                 os.makedirs(rt.inbox_dir, exist_ok=True)
+                if _is_reparse_or_link(rt.inbox_dir):
+                    raise PermissionError("Refusing to write inbox capture through a symlink or reparse point.")
                 slug = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m%d-%H%M%S")
                 fname = f"{slug}-api-note.md"
                 suffix = 1
@@ -871,6 +1134,8 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/v1/cognitive/experiences":
+                if had_failed_owner_hdr:
+                    _audit_api_event(rt.brain_dir, path, "POST", 403)
                 req = ApiExperienceCreateRequest.model_validate(raw_json)
                 saved = save_experience_record(
                     goal=req.goal,
@@ -892,6 +1157,8 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/v1/plan":
+                if had_failed_owner_hdr:
+                    _audit_api_event(rt.brain_dir, path, "POST", 403)
                 req = ApiExecutivePlanRequest.model_validate(raw_json)
                 plan_req = ExecutivePlanRequest(
                     goal=req.goal,
@@ -899,7 +1166,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     allow_cross_project=req.allow_cross_project,
                     active_context_profile=tuple(req.active_context_profile),
                     retrieval_mode=req.retrieval_mode,
-                    include_preferences=req.include_preferences,
+                    include_preferences=bool(req.include_preferences) if is_owner else False,
                     mode=req.mode,
                     host_id=req.host_id,
                     model_override=req.model_override,
@@ -923,22 +1190,15 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, plan_res.as_dict())
                 return
 
-            if api_product.dispatch(self, "POST", path, urlparse(self.path).query, raw_json):
+            if api_product.dispatch(self, "POST", path, parsed_url.query, raw_json):
                 return
             self._send_json(404, {"error": f"Unknown endpoint: {path}"})
-        except (HostConsentError, OutboundSecretBlockedError) as exc:
-            _audit_api_event(rt.brain_dir, path, "POST", 403)
-            self._send_json(403, {"error": str(exc)})
         except Exception as exc:
-            # Pydantic ValidationError or ValueError
-            if exc.__class__.__name__ == "ValidationError" or isinstance(exc, ValueError):
-                self._send_json(422, {"error": str(exc)})
-            else:
-                self._send_json(500, {"error": f"Internal error: {exc.__class__.__name__}"})
+            self._handle_route_exception("POST", path, exc)
 
 
 class MemoryApiClient:
-    """Typed local Python client SDK for owner-built AI hosts and plugins."""
+    """Typed local Python client SDK for owner-built AI hosts, CLI scripts, and plugins."""
 
     def __init__(
         self,
@@ -952,20 +1212,24 @@ class MemoryApiClient:
         if not resolved_token:
             raise PermissionError("MemoryApiClient requires a valid bearer token.")
         self.base_url = f"http://{ALLOWED_API_BIND_HOST}:{port}"
+        self._owner_token = owner_token.strip() if (owner_token and owner_token.strip()) else None
         self._headers = {
             "Authorization": f"Bearer {resolved_token}",
             "Content-Type": "application/json",
             "Host": f"{ALLOWED_API_BIND_HOST}:{port}",
         }
-        if owner_token and owner_token.strip():
-            self._headers[api_product.OWNER_HEADER] = owner_token.strip()
+        if self._owner_token:
+            self._headers[api_product.OWNER_HEADER] = self._owner_token
         self._timeout = timeout
 
     def _request(self, method: str, path: str, json_body: dict[str, object] | None = None) -> dict[str, object]:
+        payload = json_body if json_body is not None else ({} if method in {"POST", "PUT", "DELETE"} else None)
         with httpx.Client(timeout=self._timeout, follow_redirects=False, trust_env=False) as client:
-            resp = client.request(method, f"{self.base_url}{path}", headers=self._headers, json=json_body)
+            resp = client.request(method, f"{self.base_url}{path}", headers=self._headers, json=payload)
             resp.raise_for_status()
             return dict(resp.json())
+
+    # ─── System & Recall ─────────────────────────────────────────────────────
 
     def health(self) -> dict[str, object]:
         return self._request("GET", "/v1/health")
@@ -982,19 +1246,24 @@ class MemoryApiClient:
         project_scope: str | None = None,
         allow_cross_project: bool = False,
         include_duplicates: bool = False,
+        include_preferences: bool = False,
+        follow_links: bool = True,
+        enable_fitness_boost: bool = False,
+        active_context_profile: list[str] | None = None,
     ) -> dict[str, object]:
-        return self._request(
-            "POST",
-            "/v1/recall",
-            {
-                "query": query,
-                "retrieval_mode": retrieval_mode,
-                "n_results": n_results,
-                "project_scope": project_scope,
-                "allow_cross_project": allow_cross_project,
-                "include_duplicates": include_duplicates,
-            },
-        )
+        body: dict[str, object] = {
+            "query": query,
+            "retrieval_mode": retrieval_mode,
+            "n_results": int(n_results),
+            "project_scope": project_scope,
+            "allow_cross_project": bool(allow_cross_project),
+            "follow_links": bool(follow_links),
+            "include_duplicates": bool(include_duplicates),
+            "include_preferences": bool(include_preferences),
+            "enable_fitness_boost": bool(enable_fitness_boost),
+            "active_context_profile": list(active_context_profile or []),
+        }
+        return self._request("POST", "/v1/recall", body)
 
     def answer(
         self,
@@ -1019,19 +1288,384 @@ class MemoryApiClient:
             },
         )
 
+    # ─── Notes & Agent Capture ───────────────────────────────────────────────
+
+    def list_notes(
+        self,
+        *,
+        query: str = "",
+        tag: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, object]:
+        params: list[str] = [f"limit={int(limit)}", f"offset={int(offset)}"]
+        if query.strip():
+            params.append(f"q={url_quote(query.strip(), safe='')}")
+        if tag.strip():
+            params.append(f"tag={url_quote(tag.strip(), safe=':_/-')}")
+        return self._request("GET", f"/v1/notes?{'&'.join(params)}")
+
+    def get_note(self, filename: str) -> dict[str, object]:
+        return self._request("GET", f"/v1/notes/{url_quote(filename.strip(), safe='')}")
+
+    def create_note(
+        self,
+        title: str = "",
+        body: str = "",
+        *,
+        tags: list[str] | None = None,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/notes",
+            {"title": title, "body": body, "tags": list(tags or [])},
+        )
+
+    def update_note(
+        self,
+        filename: str,
+        body: str,
+        *,
+        expected_sha256: str,
+        title: str | None = None,
+        tags: list[str] | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {"body": body, "expected_sha256": expected_sha256}
+        if title is not None:
+            payload["title"] = title
+        if tags is not None:
+            payload["tags"] = list(tags)
+        return self._request("PUT", f"/v1/notes/{url_quote(filename.strip(), safe='')}", payload)
+
+    def delete_note(self, filename: str, *, expected_sha256: str) -> dict[str, object]:
+        return self._request(
+            "DELETE",
+            f"/v1/notes/{url_quote(filename.strip(), safe='')}",
+            {"expected_sha256": expected_sha256},
+        )
+
+    def verify_note_excerpt(
+        self,
+        filename: str,
+        excerpt: str,
+        *,
+        actor: str,
+        expected_sha256: str,
+        claim: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "excerpt": excerpt,
+            "actor": actor,
+            "expected_sha256": expected_sha256,
+        }
+        if claim is not None:
+            payload["claim"] = claim
+        return self._request(
+            "POST",
+            f"/v1/notes/{url_quote(filename.strip(), safe='')}/verify",
+            payload,
+        )
+
+    def note_backlinks(self, filename: str) -> dict[str, object]:
+        return self._request("GET", f"/v1/notes/{url_quote(filename.strip(), safe='')}/backlinks")
+
+    def remember(
+        self,
+        content: str,
+        *,
+        title: str = "",
+        tags: list[str] | None = None,
+        source: str = "sdk_client",
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/remember",
+            {"content": content, "title": title, "tags": tags or [], "source": source},
+        )
+
+    def bulk_import(
+        self,
+        source_dir: str,
+        *,
+        tags: list[str] | None = None,
+        dry_run: bool = False,
+        overwrite_modified: bool = False,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/import",
+            {
+                "source_dir": source_dir,
+                "tags": list(tags or []),
+                "dry_run": bool(dry_run),
+                "overwrite_modified": bool(overwrite_modified),
+            },
+        )
+
+    # ─── Inbox & Owner Review / Atom Governance ──────────────────────────────
+
     def add_to_inbox(self, content: str, *, source: str = "owner_host_sdk") -> dict[str, object]:
         return self._request("POST", "/v1/inbox", {"content": content, "source": source})
 
     def inbox_queue(self) -> dict[str, object]:
         return self._request("GET", "/v1/inbox/queue")
 
+    def list_inbox(self) -> dict[str, object]:
+        return self.inbox_queue()
+
+    def inspect_inbox_item(self, filename: str) -> dict[str, object]:
+        return self._request("GET", f"/v1/inbox/{url_quote(filename.strip(), safe='')}")
+
+    def promote_inbox_item(
+        self,
+        filename: str,
+        *,
+        expected_sha256: str,
+        actor: str,
+        acknowledge_risks: bool = False,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/inbox/promote",
+            {
+                "filename": filename,
+                "expected_sha256": expected_sha256,
+                "actor": actor,
+                "acknowledge_risks": bool(acknowledge_risks),
+            },
+        )
+
+    def reject_inbox_item(
+        self,
+        filename: str,
+        *,
+        expected_sha256: str,
+        actor: str,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/inbox/reject",
+            {"filename": filename, "expected_sha256": expected_sha256, "actor": actor},
+        )
+
+    def list_review_queue(self) -> dict[str, object]:
+        return self._request("GET", "/v1/review/queue")
+
+    def list_atoms(self, *, limit: int = 200, offset: int = 0) -> dict[str, object]:
+        return self._request("GET", f"/v1/atoms?limit={int(limit)}&offset={int(offset)}")
+
+    def get_atom(self, filename: str) -> dict[str, object]:
+        return self._request("GET", f"/v1/atoms/{url_quote(filename.strip(), safe='')}")
+
+    def transition_atom(
+        self,
+        filename: str,
+        action: str,
+        *,
+        expected_sha256: str,
+        actor: str,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            f"/v1/atoms/{url_quote(filename.strip(), safe='')}/{url_quote(action.strip(), safe='')}",
+            {"expected_sha256": expected_sha256, "actor": actor},
+        )
+
+    def edit_atom(
+        self,
+        filename: str,
+        *,
+        expected_sha256: str,
+        actor: str,
+        edited_content: str | None = None,
+        claim: str | None = None,
+        why_it_matters: str | None = None,
+        contexts: list[str] | None = None,
+        memory_type: str | None = None,
+        epistemic_label: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "expected_sha256": expected_sha256,
+            "actor": actor,
+        }
+        if edited_content is not None:
+            payload["edited_content"] = edited_content
+        if claim is not None:
+            payload["claim"] = claim
+        if why_it_matters is not None:
+            payload["why_it_matters"] = why_it_matters
+        if contexts is not None:
+            payload["contexts"] = list(contexts)
+        if memory_type is not None:
+            payload["memory_type"] = memory_type
+        if epistemic_label is not None:
+            payload["epistemic_label"] = epistemic_label
+        return self._request("PUT", f"/v1/atoms/{url_quote(filename.strip(), safe='')}", payload)
+
+    def merge_atoms(
+        self,
+        survivor_filename: str,
+        superseded_filename: str,
+        *,
+        survivor_expected_sha256: str,
+        superseded_expected_sha256: str,
+        actor: str,
+        rationale: str,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/atoms/merge",
+            {
+                "survivor_filename": survivor_filename,
+                "survivor_expected_sha256": survivor_expected_sha256,
+                "superseded_filename": superseded_filename,
+                "superseded_expected_sha256": superseded_expected_sha256,
+                "actor": actor,
+                "rationale": rationale,
+            },
+        )
+
+    # ─── Cognitive, Playbooks, Planner & Hosts ───────────────────────────────
+
     def fitness(self) -> dict[str, object]:
         return self._request("GET", "/v1/cognitive/fitness")
 
-    def playbooks(self, *, project_scope: str | None = None) -> dict[str, object]:
+    def record_feedback(
+        self,
+        atom_filename: str,
+        *,
+        helpful: bool = True,
+        feedback: str | None = None,
+    ) -> dict[str, object]:
+        signal = feedback if feedback is not None else ("endorsed" if helpful else "corrected")
+        return self._request(
+            "POST",
+            "/v1/cognitive/feedback",
+            {"atom_filename": atom_filename, "feedback": signal, "helpful": bool(helpful)},
+        )
+
+    def atom_duplicates(self) -> dict[str, object]:
+        return self._request("GET", "/v1/atoms/duplicates")
+
+    def playbooks(
+        self,
+        *,
+        project_scope: str | None = None,
+        include_inactive: bool = False,
+    ) -> dict[str, object]:
+        params: list[str] = []
         if project_scope and project_scope.strip():
-            return self._request("GET", f"/v1/playbooks?project={url_quote(project_scope.strip(), safe=':_/-')}")
-        return self._request("GET", "/v1/playbooks")
+            params.append(f"project={url_quote(project_scope.strip(), safe=':_/-')}")
+        if include_inactive:
+            params.append("include_inactive=1")
+        suffix = f"?{'&'.join(params)}" if params else ""
+        return self._request("GET", f"/v1/playbooks{suffix}")
+
+    def list_playbooks(
+        self,
+        *,
+        project_scope: str | None = None,
+        include_inactive: bool = False,
+    ) -> dict[str, object]:
+        return self.playbooks(project_scope=project_scope, include_inactive=include_inactive)
+
+    def list_playbook_candidates(self) -> dict[str, object]:
+        return self._request("GET", "/v1/playbooks/candidates")
+
+    playbook_candidates = list_playbook_candidates
+
+    def promote_playbook(
+        self,
+        *,
+        playbook_id: str,
+        title: str,
+        backing_atoms: list[tuple[str, str]] | list[list[str]],
+        trigger: str,
+        steps: list[str],
+        actor: str,
+        preconditions: list[str] | None = None,
+        expected_outputs: list[str] | None = None,
+        failure_recovery: list[str] | None = None,
+        rationale: str = "",
+        allow_early_owner_override: bool = False,
+        acknowledge_corrections: bool = False,
+        expected_playbook_sha256: str | None = None,
+        allow_multi_project: bool = False,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "playbook_id": playbook_id,
+            "title": title,
+            "backing_atoms": [[str(fn), str(sha)] for fn, sha in backing_atoms],
+            "trigger": trigger,
+            "preconditions": list(preconditions or []),
+            "steps": list(steps),
+            "expected_outputs": list(expected_outputs or []),
+            "failure_recovery": list(failure_recovery or []),
+            "actor": actor,
+            "rationale": rationale,
+            "allow_early_owner_override": bool(allow_early_owner_override),
+            "acknowledge_corrections": bool(acknowledge_corrections),
+            "allow_multi_project": bool(allow_multi_project),
+        }
+        if expected_playbook_sha256 is not None:
+            payload["expected_playbook_sha256"] = expected_playbook_sha256
+        return self._request("POST", "/v1/playbooks/promote", payload)
+
+    def deprecate_playbook(
+        self,
+        filename: str,
+        *,
+        expected_sha256: str,
+        actor: str,
+        rationale: str,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            f"/v1/playbooks/{url_quote(filename.strip(), safe='')}/deprecate",
+            {
+                "expected_sha256": expected_sha256,
+                "actor": actor,
+                "rationale": rationale,
+            },
+        )
+
+    def list_hosts(self) -> dict[str, object]:
+        return self._request("GET", "/v1/hosts")
+
+    def update_host_policy(
+        self,
+        host_id: str,
+        *,
+        enabled: bool | None = None,
+        endpoint_url: str | None = None,
+        default_model: str | None = None,
+        allowed_projects: list[str] | None = None,
+        allow_unscoped_atoms: bool | None = None,
+        allow_preference_atoms: bool | None = None,
+        redact_pii: bool | None = None,
+        fail_on_secret_detection: bool | None = None,
+        api_key_env: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        if enabled is not None:
+            payload["enabled"] = bool(enabled)
+        if endpoint_url is not None:
+            payload["endpoint_url"] = endpoint_url
+        if default_model is not None:
+            payload["default_model"] = default_model
+        if allowed_projects is not None:
+            payload["allowed_projects"] = list(allowed_projects)
+        if allow_unscoped_atoms is not None:
+            payload["allow_unscoped_atoms"] = bool(allow_unscoped_atoms)
+        if allow_preference_atoms is not None:
+            payload["allow_preference_atoms"] = bool(allow_preference_atoms)
+        if redact_pii is not None:
+            payload["redact_pii"] = bool(redact_pii)
+        if fail_on_secret_detection is not None:
+            payload["fail_on_secret_detection"] = bool(fail_on_secret_detection)
+        if api_key_env is not None:
+            payload["api_key_env"] = api_key_env
+        return self._request("PUT", f"/v1/hosts/{url_quote(host_id.strip(), safe='')}", payload)
 
     def plan(
         self,
@@ -1087,27 +1721,7 @@ class MemoryApiClient:
             },
         )
 
-    def list_notes(self, *, query: str = "", tag: str = "", limit: int = 50) -> dict[str, object]:
-        params: list[str] = [f"limit={int(limit)}"]
-        if query.strip():
-            params.append(f"q={url_quote(query.strip(), safe='')}")
-        if tag.strip():
-            params.append(f"tag={url_quote(tag.strip(), safe=':_/-')}")
-        return self._request("GET", f"/v1/notes?{'&'.join(params)}")
-
-    def remember(
-        self,
-        content: str,
-        *,
-        title: str = "",
-        tags: list[str] | None = None,
-        source: str = "sdk_client",
-    ) -> dict[str, object]:
-        return self._request(
-            "POST",
-            "/v1/remember",
-            {"content": content, "title": title, "tags": tags or [], "source": source},
-        )
+    # ─── Ledger, Knowledge Graph & Time-Travel Snapshots ─────────────────────
 
     def verify_ledger(self) -> dict[str, object]:
         return self._request("GET", "/v1/ledger/verify")
@@ -1117,6 +1731,9 @@ class MemoryApiClient:
 
     def prove_atom(self, atom_filename: str) -> dict[str, object]:
         return self._request("GET", f"/v1/ledger/prove/{url_quote(atom_filename.strip(), safe='')}")
+
+    def verify_proof(self, proof: dict[str, object]) -> dict[str, object]:
+        return self._request("POST", "/v1/ledger/verify-proof", {"proof": proof})
 
     def graph_contradictions(
         self,
@@ -1137,6 +1754,15 @@ class MemoryApiClient:
             return self._request("GET", f"/v1/graph/summary?project={url_quote(project_scope.strip(), safe=':_/-')}")
         return self._request("GET", "/v1/graph/summary")
 
+    def graph_neighbors(self, atom_filename: str, *, include_pending: bool = False) -> dict[str, object]:
+        suffix = "?include_pending=1" if include_pending else ""
+        return self._request("GET", f"/v1/graph/neighbors/{url_quote(atom_filename.strip(), safe='')}{suffix}")
+
+    def audit_sources(self, *, demote_stale: bool = False, actor: str = "sdk_owner") -> dict[str, object]:
+        if demote_stale:
+            return self._request("POST", "/v1/audit/sources/demote-stale", {"actor": actor})
+        return self._request("GET", "/v1/audit/sources")
+
     def list_snapshots(self) -> dict[str, object]:
         return self._request("GET", "/v1/snapshots")
 
@@ -1156,7 +1782,7 @@ class MemoryApiClient:
         snapshot_id: str,
         *,
         project_scope: str | None = None,
-        limit: int = 10,
+        limit: int = 5,
     ) -> dict[str, object]:
         return self._request(
             "POST",
@@ -1168,6 +1794,17 @@ class MemoryApiClient:
                 "limit": int(limit),
             },
         )
+
+    def verify_snapshot(self, snapshot_id: str) -> dict[str, object]:
+        return self._request("POST", "/v1/snapshots/verify", {"snapshot_id": snapshot_id})
+
+    # Convenience SDK method aliases
+    inbox_item = inspect_inbox_item
+    review_queue = list_review_queue
+    atoms = list_atoms
+    atom = get_atom
+    playbook_candidates = list_playbook_candidates
+    hosts = list_hosts
 
 
 def _default_mcp_token_file() -> Path:
@@ -1195,29 +1832,60 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
         "loopback_http_api": {
             "base_url": f"http://{ALLOWED_API_BIND_HOST}:{port}",
             "auth_header": "Authorization: Bearer <contents of memory-api-token>",
+            "owner_header": "X-Owner-Token: <contents of owner-token> (owner governance routes only)",
             "token_path": str(default_api_token_path()),
             "endpoints": [
                 "GET /v1/health",
                 "GET /v1/profile",
+                "GET /v1/hosts",
+                "PUT /v1/hosts/<host_id>",
                 "GET /v1/playbooks",
+                "GET /v1/playbooks/candidates",
+                "POST /v1/playbooks/promote",
+                "POST /v1/playbooks/<filename>/deprecate",
                 "POST /v1/recall",
                 "POST /v1/answer",
                 "POST /v1/plan",
                 "POST /v1/inbox",
                 "GET /v1/inbox/queue",
+                "GET /v1/inbox/<filename>",
+                "POST /v1/inbox/promote",
+                "POST /v1/inbox/reject",
+                "GET /v1/review/queue",
+                "GET /v1/atoms",
+                "GET /v1/atoms/duplicates",
+                "GET /v1/atoms/<filename>",
+                "PUT /v1/atoms/<filename>",
+                "POST /v1/atoms/merge",
+                "POST /v1/atoms/<filename>/<action>",
                 "GET /v1/cognitive/fitness",
+                "POST /v1/cognitive/feedback",
                 "POST /v1/cognitive/experiences",
                 "GET /v1/notes",
+                "POST /v1/notes",
+                "GET /v1/notes/<filename>",
+                "PUT /v1/notes/<filename>",
+                "DELETE /v1/notes/<filename>",
+                "POST /v1/notes/<filename>/verify",
+                "GET /v1/notes/<filename>/backlinks",
                 "POST /v1/remember",
+                "POST /v1/import",
                 "POST /v1/chat/stream",
+                "POST /v1/chat/warmup",
                 "GET /v1/ledger/verify",
                 "POST /v1/ledger/commit",
+                "POST /v1/ledger/verify-proof",
                 "GET /v1/ledger/prove/<atom>",
+                "GET /v1/audit/sources",
+                "POST /v1/audit/sources/demote-stale",
                 "GET /v1/graph/contradictions",
                 "GET /v1/graph/summary",
+                "GET /v1/graph/neighbors/<filename>",
                 "GET /v1/snapshots",
+                "POST /v1/snapshots",
                 "POST /v1/snapshots/diff",
                 "POST /v1/snapshots/recall",
+                "POST /v1/snapshots/verify",
             ],
         },
         "local_ide_mcp_stdio": {
@@ -1240,7 +1908,12 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the Second Brain loopback HTTP JSON Memory API.")
     parser.add_argument("--host", default=ALLOWED_API_BIND_HOST, help="Bind interface (strictly 127.0.0.1).")
-    parser.add_argument("--port", type=int, default=DEFAULT_API_PORT, help=f"Loopback TCP port (default {DEFAULT_API_PORT}).")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_API_PORT,
+        help=f"Loopback TCP port (0..65535; 0 assigns an ephemeral port; default {DEFAULT_API_PORT}).",
+    )
     parser.add_argument("--generate-token", action="store_true", help="Generate and save a fresh 256-bit API bearer token.")
     parser.add_argument("--print-adapter-config", action="store_true", help="Output IDE and custom host adapter JSON.")
     parser.add_argument(
@@ -1249,6 +1922,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Create the agent API token and owner token if missing (used by the desktop app on first run).",
     )
     args = parser.parse_args(argv)
+
+    if not (0 <= args.port <= 65535):
+        parser.error("--port must be between 0 and 65535.")
 
     if args.ensure_tokens:
         if not get_configured_api_token():
@@ -1265,17 +1941,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     ensure_dirs()
-    server = MemoryLoopbackHTTPServer(args.host, args.port)
-    # Machine-readable readiness line for the desktop app supervisor.
-    print(f"SECOND_BRAIN_API_READY port={args.port}", flush=True)
-    print(f"Second Brain Loopback Memory API listening on http://{ALLOWED_API_BIND_HOST}:{args.port}", flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-    return 0
+    return serve_memory_api(args.host, args.port)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # Second Brain
 
-**Status (`v0.2.0`):** Local-first verifiable AI memory platform with CAS provenance gates, dual-token Loopback HTTP API, native Electron desktop companion, one-click IDE/MCP connectors, Skill Playbooks, and cryptographic Merkle audit proofs (`11/11` release suites passing in `scripts/test_all.py`). The vault contains durable Markdown; SQLite and vector stores are rebuildable indexes, while `brain/.sidecar/vault-ledger.jsonl` and `brain/.sidecar/snapshots/` store tamper-evident Merkle checkpoints and point-in-time snapshots.
+**Status (`v0.2.0`):** Local-first verifiable AI memory platform with CAS provenance gates, dual-token Loopback HTTP API, native Electron desktop companion, one-click IDE/MCP connectors, Skill Playbooks, and cryptographic Merkle audit proofs (`12/12` release suites passing in `scripts/test_all.py`). The vault contains durable Markdown; SQLite and vector stores are rebuildable indexes, while `brain/.sidecar/vault-ledger.jsonl` and `brain/.sidecar/snapshots/` store tamper-evident Merkle checkpoints and point-in-time snapshots.
 
 **Product architecture:** One-click installable Second Brain across local/offline and opted-in online modes, with hardware capability profiling (`second-brain profile` / `doctor`), per-host outbound consent/PII/secret gates (`scripts/host_adapters.py`), IDE connectors (`second-brain connect`), VS Code `.vsix` extension, and cross-platform Electron desktop installer targets (`nsis`, `msi`, `dmg`, `AppImage`, `deb`). Offline lexical FTS5 is a first-class zero-dependency baseline; `scripts/sota_benchmark.py` benchmarks Second Brain against modeled naive BM25 RAG, unscoped flat memory, and ungrounded synthesis baselines (head-to-head claims against external hosted commercial services remain bounded to evaluated corpora).
 
@@ -10,8 +10,8 @@
 - MCP is disabled unless `BRAIN_ENABLE_LOCAL_MCP=1` is explicitly set. Do not register it with cloud-connected clients. See [the current system sweep](docs/system-sweep-2026-11-15.md).
 - Model-generated atoms are candidates. The model cannot grant owner approval or citation status. Approval checks an exact evidence excerpt against a named local source and records the reviewed atom hash.
 - Recall returns only the current atom revision whose latest owner decision is approval and whose source evidence still verifies. Clean checkouts start with zero atoms until notes or captures are verified and owner-approved; benchmark trap targets remain unapproved (`pending`) until reviewed by the owner.
-- Chat surfaces buffer schema-constrained model drafts and render only exact current approved Claim text with a source-derived excerpt and program-generated citation. Approval uses the canonical decision log; dashboard history is revalidated before replay, and raw retrieval bodies are not shown in the factual chat. Unsupported paraphrases or invalid/stale references are withheld. A small three-repeat pilot answer run passed on `qwen2.5-coder:7b`; the configured default remains `llama3.2:3b`, which failed to answer either positive in one repeat. This is not broad model-quality evidence, and research leads are not supported.
-- Trusted retrieval also requires at least two meaningful query terms to occur in the atom's Claim section. This conservative literal-overlap check blocks the current owner-personal trap queries, but it can miss valid synonym-only matches. It is a relevance guard, not proof that a claim answers a question.
+- Chat surfaces (`second-brain chat`, Electron Desktop, VS Code, and Streamlit Dashboard) offer interactive Phase 4 modes—`instant` (`<20ms` direct verified claim & note cards with zero model call), `stream` (progressive live token synthesis over `[V#]`/`[N#]`/`[P#]` sources followed by an out-of-model `check_citations` grounding audit), and `verified` (structured claim selection validated via `scripts/answer_policy.py`)—alongside strict schema-constrained audit answers (`generate_grounded_answer_via_host` + `answer_policy.py`), which buffer model drafts and render only exact current approved Claim text with a source-derived excerpt and program-generated citation. Approval uses the canonical decision log; dashboard strict-audit history is revalidated before replay, and unsupported paraphrases or invalid/stale references are withheld. On our 30-case multi-model evaluation (`N=5` passes, 100 runs/model), out-of-model validation achieved `100.0%` claim precision and `0.0%` trap leakage across both `qwen2.5-coder:7b` (`94.0%` positive coverage) and `llama3.2:3b` (`30.0%` positive coverage).
+- Trusted retrieval also requires meaningful literal query-term overlap in the atom's `Claim` or `Evidence` section (at least two meaningful query terms when the query contains two or more terms). This conservative literal-overlap check blocks the current owner-personal trap queries, though it can miss purely synonym-based matches. It is a relevance guard, not proof that a claim answers a question.
 - The SQLite FTS index is the model-free recall path. Dense recall is optional and requires a current cosine-distance index manifest. This Windows installation also needs Microsoft's Visual C++ v14 x64 runtime for Chroma's native bindings. Ollama is required for generation, embeddings, and model-assisted capture, not for lexical recall.
 - The watchdog waits for stable files. Canonical ingestion writes share an OS lock, recheck the source hash before commit, and create new atom files without overwriting existing ones. Generated threads are also create-only.
 - External web captures stay `web_remote` and quarantined until an owner action. The Scout rejects private targets and redirects and caps downloads.
@@ -39,7 +39,7 @@ second_brain/
 └── docs/                   architecture and operational notes
 ```
 
-The root project directory is the Git boundary, but the live `brain/` vault is excluded from the code baseline because it contains owner-specific captures and memories. Back it up separately using an owner-controlled method. The existing local Git history still contains 18 old-layout vault files in its initial commit; there is no remote configured. Do not add a remote or push this history until those historical files have been reviewed or removed from history.
+The root project directory is the Git boundary, but the live `brain/` vault is excluded from the code baseline because it contains owner-specific captures and memories. Back it up separately using an owner-controlled method. On `master`, the initial local commit (`bffca9e`) still contains 18 old-layout vault files (with zero credentials or keys) and no remote is configured; an orphaned history-scrubbed branch `release-code-only` is maintained for safe external code-only distribution without rewriting local recovery history. Do not push `master` to a remote unless those historical files have been reviewed or scrubbed; push `release-code-only` instead for code-only sharing.
 
 ## Start with the model-free baseline
 
@@ -95,32 +95,50 @@ See [the dashboard security boundary](docs/dashboard-security.md) for the threat
 
 ## Common commands
 
+The unified `second-brain` CLI exposes daily capture, notes, chat, review, auditing, planning, Merkle proofs, IDE connectors, and Loopback API operations:
+
 ```powershell
+# Health, hardware capability tier, bootstrap & local dashboard
 uv run --locked second-brain doctor
 uv run --locked second-brain profile
+uv run --locked second-brain install
+uv run --locked second-brain dashboard
+
+# Zero-friction working notes, quick capture, bulk import & interactive chat
+uv run --locked second-brain capture "<thought or note>" --tags "project:second_brain"
+uv run --locked second-brain notes add --title "<title>" --body "<markdown>"
+uv run --locked second-brain notes list
+uv run --locked second-brain notes search "<query>"
+uv run --locked second-brain notes verify <note.md> --excerpt "<exact excerpt>" --actor <owner>
+uv run --locked second-brain import <obsidian_or_markdown_dir>
+uv run --locked second-brain chat "<question>" --mode stream   # modes: instant | stream | verified
+
+# Loopback HTTP API, IDE/MCP connectors & host sharing policies
 uv run --locked second-brain serve --port 8765
+uv run --locked second-brain connect status                    # add/remove: claude-code, antigravity, cursor, windsurf, vscode, claude-desktop
 uv run --locked second-brain adapter-config --port 8765
+uv run --locked second-brain hosts list
+
+# Canonical CAS review, source anchor audit, Skill Playbooks & Executive Planner
+uv run --locked second-brain review transition approve <atom.md> --expected-sha256 <sha256> --actor <owner>
+uv run --locked second-brain review merge <survivor.md> <superseded.md> --survivor-sha256 <sha256> --superseded-sha256 <sha256> --actor <owner> --rationale "<reason>"
+uv run --locked second-brain audit
+uv run --locked second-brain inbox list
+uv run --locked second-brain cognitive fitness
 uv run --locked second-brain playbooks list
 uv run --locked second-brain plan --goal "<task goal>"
-uv run --locked second-brain notes list
-uv run --locked second-brain import <obsidian_or_markdown_dir>
-uv run --locked second-brain chat "<question>" --mode verified
-uv run --locked second-brain connect status
-uv run --locked second-brain benchmark --notes 1500 --queries 20
-uv run --locked second-brain sota-benchmark --atoms 300
+
+# Cryptographic Merkle ledger, Contradiction Radar, Time-Travel snapshots & benchmarks
 uv run --locked second-brain ledger verify
 uv run --locked second-brain ledger commit --actor <owner> --note "<checkpoint>"
 uv run --locked second-brain graph contradictions
 uv run --locked second-brain snapshot create --actor <owner> --label "<milestone>"
 uv run --locked second-brain snapshot list
+uv run --locked second-brain benchmark --notes 1500 --queries 20
+uv run --locked second-brain sota-benchmark --atoms 300
+
+# Desktop installer packaging, index rebuilds & full 12-suite verification gate
 .\scripts\package_desktop.ps1 -Target nsis -SelfSigned
-uv run --locked python scripts/memory_review.py --status all
-uv run --locked python scripts/review_atom.py transition approve <atom.md> --expected-sha256 <sha256> --actor <owner>
-uv run --locked python scripts/review_atom.py merge <survivor.md> <superseded.md> --survivor-sha256 <sha256> --superseded-sha256 <sha256> --actor <owner> --rationale "<reason>"
-uv run --locked python scripts/inbox_workflow.py list
-uv run --locked python scripts/host_adapters.py list
-uv run --locked python scripts/cognitive_core.py fitness
-uv run --locked python scripts/audit_sources.py
 uv run --locked python scripts/rebuild_lexical_index.py
 uv run --locked python scripts/rebuild_vectors.py
 uv run --locked python scripts/test_all.py
@@ -132,14 +150,14 @@ uv run --locked python scripts/test_all.py
 
 `audit_sources.py` reports current source-anchor and approval state without changing atoms. After reviewing its report, explicitly demote stale approvals with `uv run --locked python scripts/audit_sources.py --demote-stale --actor <owner>`; re-approve only after inspecting the exact current source.
 
-Dataset `second-brain-retrieval-curated-30` (`v2.1.0`) evaluates 30 cases across `regression`, `development`, and `holdout` splits (see the [system sweep](docs/system-sweep-2026-11-15.md) and [200-atom SOTA benchmark results](docs/sota-benchmark-results-2026-11-15.json) for full metrics, baseline comparisons, model evaluation results, and hardware limits). Previously, pilot dataset `second-brain-retrieval-pilot` (`v2.0.0`) separated five candidate-ranking queries into two answerable cases, three exploratory pending-target cases, and two traps using dense generation `ce48706db17d440fbba04b8c7f86c37e`. Run `uv run --locked python scripts/evaluate_answers.py --model qwen2.5-coder:7b --runs 3` to repeat end-to-end answer checks. Raw candidate labels are not approved memories.
+Dataset `second-brain-retrieval-curated-30` (`v2.1.0`) evaluates 30 cases across `regression`, `development`, and `holdout` splits (see the [system sweep](docs/system-sweep-2026-11-15.md) and [300-atom SOTA benchmark results](docs/sota-benchmark-results-2026-11-15.json) for full metrics, baseline comparisons, model evaluation results, and hardware limits). Previously, pilot dataset `second-brain-retrieval-pilot` (`v2.0.0`) separated five candidate-ranking queries into two answerable cases, three exploratory pending-target cases, and two traps using dense generation `ce48706db17d440fbba04b8c7f86c37e`. Run `uv run --locked python scripts/evaluate_answers.py --model qwen2.5-coder:7b --runs 3` to repeat end-to-end answer checks. Raw candidate labels are not approved memories.
 
 The answer run took 6.1 seconds p50 and 49.8 seconds p95 including cold start on this CPU-only host. The configured default `llama3.2:3b` did not answer either positive case in one repeat, so it is not yet a dependable default. These pilot results are too small to claim general model quality.
 
 ## Loopback Memory API, Host Adapters, and MCP policy
 
 - **Loopback Memory API (`second-brain serve` / `scripts/memory_api.py` + `scripts/api_product.py`):** Binds strictly to `127.0.0.1` (default port `8765`), requires a 256-bit Bearer token (`--generate-token` or auto-provisioned under the OS user security state directory), enforces `Host`, `Origin`, and `Sec-Fetch-Site` browser rebinding/CSRF guards, exposes read-only approved recall (`POST /v1/recall`), grounded answers (`POST /v1/answer`), quarantined inbox capture (`POST /v1/inbox`), fitness telemetry (`GET /v1/cognitive/fitness`), episode logging (`POST /v1/cognitive/experiences`), owner-gated Skill Playbooks (`GET /v1/playbooks`), grounded Executive Planner (`POST /v1/plan`), zero-friction notes & SSE chat (`GET /v1/notes`, `POST /v1/remember`, `POST /v1/chat/stream`, `POST /v1/chat/warmup`), cryptographic Merkle audit ledger & proofs (`GET /v1/ledger/verify`, `GET /v1/ledger/prove/<atom>`), Contradiction & Drift Radar (`GET /v1/graph/contradictions`, `GET /v1/graph/summary`), Time-Travel snapshot diffs & point-in-time recall (`GET /v1/snapshots`, `POST /v1/snapshots/diff`, `POST /v1/snapshots/recall`), and owner-token-gated mutations (`/v1/notes` CRUD, `/v1/notes/<filename>/verify`, `/v1/review/queue`, `/v1/atoms/<filename>/{approve,reject,demote,quarantine}`, `/v1/inbox/{promote,reject}`, `/v1/import`, `POST /v1/ledger/commit`, `POST /v1/snapshots`), alongside the typed `MemoryApiClient` SDK. See [Phase 2 Architecture & Adversarial Security Sweep](docs/phase2-architecture-and-sweep-2026-11-15.md) and [Phase 3A & Phase 4 Architecture, Security Sweep & Scale Verification](docs/phase3a-and-phase4-architecture-2026-11-15.md).
-- **Desktop Companion & VS Code Extension (`desktop/`, `extensions/vscode-second-brain/`, `scripts/package_desktop.ps1`):** Electron local UI (`Notes`, `Streaming Chat`, `Inbox & Review`, `Bulk Import`, `IDE Hub`, `System`, `Playbooks & Plan`, and `Vault Proof & Radar`) with global quick capture (`Ctrl+Shift+Space`), tray lifecycle controls (`Start`/`Restart`/`Stop Memory API`, `Open Vault Folder`, `Launch at Login`), automatic first-run `.venv` bootstrap, cross-platform installer targets (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), and Windows Authenticode signing + `dist/SHA256SUMS.txt`. All 11 automated verification suites run via `uv run --locked python scripts/test_all.py`.
+- **Desktop Companion & VS Code Extension (`desktop/`, `extensions/vscode-second-brain/`, `scripts/package_desktop.ps1`):** Electron local UI (`Notes`, `Streaming Chat`, `Inbox & Review`, `Bulk Import`, `IDE Hub`, `System`, `Playbooks & Plan`, and `Vault Proof & Radar`) with global quick capture (`Ctrl+Shift+Space`), tray lifecycle controls (`Start`/`Restart`/`Stop Memory API`, `Open Vault Folder`, `Launch at Login`), automatic first-run `.venv` bootstrap, cross-platform installer targets (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), and Windows Authenticode signing + `dist/SHA256SUMS.txt`. All 12 automated verification suites run via `uv run --locked python scripts/test_all.py`.
 - **Per-Host Online & Custom AI Adapters (`scripts/host_adapters.py`):** Local loopback Ollama (`ollama_local`) is the only host enabled out of the box. Online providers (`openai_online`, `anthropic_online`, `gemini_online`) and `owner_custom_local` are disabled by default (`enabled: false`), require explicit owner consent and `project:<id>` allowlists in `host-sharing-policy.json`, scrub PII and block outbound secrets before opening any socket, enforce DNS-pinned `https://...:443` transport, and validate every draft claim outside the model via `scripts/answer_policy.py`.
 - **MCP & IDE Connectors (`scripts/mcp_server.py`, `scripts/ide_connector.py`, `plugins/`):** MCP is not enabled globally by default; `second-brain connect` configures local IDEs/hosts (with timestamped backups and the Antigravity bundle under `plugins/antigravity/second-brain/`, alongside `plugins/claude-code/second-brain/`) using `BRAIN_MCP_TRUSTED_STDIO=1` paired with a constant-time `BRAIN_MCP_CLIENT_TOKEN` check (or HTTP `_meta` Bearer auth). Do not connect this vault to untrusted cloud hosts or expose the MCP process through a network service. Reads return verified approved atoms (`search_memory`, `get_atom`) or clearly separated `<owner_notes untrusted="true">` note results (`search_notes`, `get_note`), have no listable resource catalog, and route untrusted or risky `remember` / `add_to_inbox` inputs to the quarantined `brain/0-raw/inbox/` queue requiring owner promotion (`scripts/inbox_workflow.py`).
 

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Orchestrates the Second Brain Python night shift using uv.
 
@@ -9,10 +9,9 @@ leveraging local Ollama models and ChromaDB.
 
 $ScriptPath = $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptPath
-$BrainDir = if ($env:BRAIN_VAULT_DIR -and $env:BRAIN_VAULT_DIR.Trim()) { $env:BRAIN_VAULT_DIR.Trim() } else { Join-Path $ProjectRoot "brain" }
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Starting Python Night Shift (Ollama + Vector RAG)" -ForegroundColor Cyan
+Write-Host "Starting Second Brain Night & Morning Shifts" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
 # Ensure uv is installed
@@ -22,7 +21,7 @@ if (!(Get-Command uv -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-Write-Host "`n[1/2] Executing Vector Refinery Run..." -ForegroundColor Yellow
+Write-Host "`n[1/2] Second Brain Night Shift — Refinery" -ForegroundColor Yellow
 Set-Location -LiteralPath $ProjectRoot
 uv run --locked python scripts/ollama_refinery.py
 if ($LASTEXITCODE -ne 0) {
@@ -30,7 +29,7 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-Write-Host "`n[2/2] Executing Vector Editor Run..." -ForegroundColor Yellow
+Write-Host "`n[2/2] Second Brain Morning Shift — Thread Synthesis" -ForegroundColor Yellow
 uv run --locked python scripts/ollama_editor.py
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`nEditor failed." -ForegroundColor Red

@@ -36,10 +36,12 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from answer_policy import validate_standard_answer  # noqa: E402
+from cognitive_core import record_grounded_answer_telemetry, record_retrieval_telemetry  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, CHROMA_PATH, LEXICAL_INDEX_PATH  # noqa: E402
 from host_adapters import (  # noqa: E402
     HostConsentError,
     _audit_outbound_call,
+    builtin_default_policies,
     filter_atoms_for_host,
     inspect_and_redact_outbound,
     load_host_policies,
@@ -58,6 +60,14 @@ NOTE_EXCERPT_CHARS = 700
 KEEP_ALIVE = "30m"
 CITATION_RE = re.compile(r"\[([VNP])(\d+)\]")
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
+_BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+")
+_HEADING_OR_RULE_RE = re.compile(r"^\s*(?:#{1,6}\s+|---+\s*$|```)")
+_ABSTENTION_STATEMENT_RE = re.compile(
+    r"(?i)\b(?:the\s+(?:provided\s+)?sources?\s+do\s+not\s+(?:answer|mention|contain)|"
+    r"none\s+of\s+the\s+(?:provided\s+)?sources?\s+(?:answer|mention)|"
+    r"insufficient\s+(?:verified\s+)?(?:sources?|information|memory)|"
+    r"cannot\s+answer\s+from\s+the\s+provided\s+sources)\b"
+)
 
 StreamFn = Callable[[str, str], Iterator[str]]
 JsonFn = Callable[[str, str, dict], str]
@@ -70,6 +80,7 @@ class ChatPaths:
     lexical_index_path: str = LEXICAL_INDEX_PATH
     chroma_path: str = CHROMA_PATH
     policy_path: Path | None = None
+    telemetry_db_path: str | None = None
 
     @property
     def notes(self) -> NotePaths:
@@ -161,17 +172,29 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
     preferences: list[dict[str, object]] = []
     records: list[dict[str, str]] = []
     warning = None
+    telemetry_db = paths.telemetry_db_path or os.path.join(paths.brain_dir, ".sidecar", "telemetry.sqlite3")
     try:
         opts = RecallOptions(
             n_results=MAX_VERIFIED,
+            follow_links=True,
             include_statuses={"accepted"},
             retrieval_mode="lexical",
+            enable_fitness_boost=True,
+            telemetry_db_path=telemetry_db,
             projects=(project_scope,) if project_scope else (),
         )
-        direct, _neighbors = search_memory(
+        direct, neighbors = search_memory(
             query, opts, atoms_dir=paths.atoms_dir, index_path=paths.lexical_index_path, chroma_path=paths.chroma_path
         )
-        for result in direct[:MAX_VERIFIED]:
+        combined = list(direct)
+        seen_fnames = {r.filename for r in combined}
+        for nb in neighbors:
+            if len(combined) >= MAX_VERIFIED:
+                break
+            if nb.filename not in seen_fnames:
+                seen_fnames.add(nb.filename)
+                combined.append(nb)
+        for result in combined[:MAX_VERIFIED]:
             claim, evidence = _claim_and_evidence(result.content)
             if not claim:
                 continue
@@ -183,6 +206,15 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
             else:
                 verified.append({"id": f"V{len(verified) + 1}", "atom_id": result.filename, "claim": claim, "evidence": evidence})
             records.append({"filename": result.filename, "content": result.content})
+        try:
+            record_retrieval_telemetry(
+                [r["filename"] for r in records],
+                mode="chat_lexical",
+                latency_ms=(time.perf_counter() - t0) * 1000.0,
+                db_path=telemetry_db,
+            )
+        except Exception:
+            pass
     except (MemoryRecallUnavailable, RuntimeError) as exc:
         warning = f"Verified memory unavailable: {exc}"
     notes: list[dict[str, object]] = []
@@ -341,21 +373,172 @@ def check_citations(
         | {str(p["id"]) for p in (preferences or ())}
     )
     cited = [f"{m.group(1)}{int(m.group(2))}" for m in CITATION_RE.finditer(text)]
+    valid_cited = sorted({c for c in cited if c in valid_ids})
     invalid = sorted({c for c in cited if c not in valid_ids})
-    sentences = [s.strip() for s in SENTENCE_RE.split(text.strip()) if s.strip()]
-    uncited = [s for s in sentences if len(s) >= 25 and not CITATION_RE.search(s)]
+
+    segments: list[str] = []
+    for raw_line in (text or "").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or _HEADING_OR_RULE_RE.match(stripped):
+            continue
+        cleaned_line = _BULLET_PREFIX_RE.sub("", stripped).strip()
+        if not cleaned_line:
+            continue
+        for sentence in SENTENCE_RE.split(cleaned_line):
+            seg = sentence.strip()
+            if seg:
+                segments.append(seg)
+
+    uncited = [
+        s
+        for s in segments
+        if len(s) >= 25 and not CITATION_RE.search(s) and not _ABSTENTION_STATEMENT_RE.search(s)
+    ]
+    pure_abstention = bool(segments) and not cited and all(_ABSTENTION_STATEMENT_RE.search(s) for s in segments)
     return {
         "type": "grounding",
         "label": "synthesis",
-        "cited_sources": sorted({c for c in cited if c in valid_ids}),
+        "cited_sources": valid_cited,
+        "verified_citation_count": sum(1 for c in valid_cited if c.startswith("V")),
+        "note_citation_count": sum(1 for c in valid_cited if c.startswith("N")),
         "invalid_citations": invalid,
         "uncited_sentences": uncited,
-        "fully_cited": not invalid and not uncited and bool(cited),
+        "fully_cited": (not invalid and not uncited and bool(valid_cited)) or pure_abstention,
     }
 
 
 def _public(event: dict[str, object]) -> dict[str, object]:
     return {k: v for k, v in event.items() if not k.startswith("_")}
+
+
+def _filter_and_redact_context(ctx: dict[str, object], rule) -> dict[str, object]:
+    """Filter retrieved atoms/notes for host scope/epistemic policy and redact outbound secrets/PII before emitting context."""
+    records = list(ctx.get("_records") or [])
+    factual_records = filter_atoms_for_host(records, rule, mode="standard")
+    factual_ids = {str(r["filename"]) for r in factual_records}
+
+    pref_records = filter_atoms_for_host(records, rule, mode="preference") if rule.allow_preference_atoms else []
+    pref_ids = {str(r["filename"]) for r in pref_records}
+
+    filtered_notes_raw = _filter_notes_for_host(
+        list(ctx.get("notes") or []),
+        dict(ctx.get("_note_tags") or {}),
+        rule,
+    )
+
+    pre_pii_count = 0
+    pre_secret_hits: list[str] = []
+
+    def _scrub(value: object) -> str:
+        nonlocal pre_pii_count
+        rep = inspect_and_redact_outbound(
+            str(value or ""),
+            redact_pii=bool(rule.redact_pii),
+            fail_on_secret_detection=False,
+        )
+        pre_pii_count += rep.pii_redaction_count
+        for hit in rep.secret_hits:
+            if hit not in pre_secret_hits:
+                pre_secret_hits.append(hit)
+        return rep.sanitized_text
+
+    sanitized_verified: list[dict[str, object]] = []
+    raw_claims_by_vid: dict[str, str] = {}
+    for item in list(ctx.get("verified") or []):
+        aid = str(item.get("atom_id", ""))
+        if aid not in factual_ids:
+            continue
+        vid = f"V{len(sanitized_verified) + 1}"
+        orig_claim = str(item.get("claim", ""))
+        raw_claims_by_vid[vid] = orig_claim
+        sanitized_verified.append(
+            {
+                "id": vid,
+                "atom_id": aid,
+                "claim": _scrub(orig_claim),
+                "evidence": _scrub(item.get("evidence", "")),
+            }
+        )
+
+    sanitized_preferences: list[dict[str, object]] = []
+    for item in list(ctx.get("preferences") or []):
+        aid = str(item.get("atom_id", ""))
+        if aid not in pref_ids:
+            continue
+        pid = f"P{len(sanitized_preferences) + 1}"
+        sanitized_preferences.append(
+            {
+                "id": pid,
+                "atom_id": aid,
+                "claim": _scrub(item.get("claim", "")),
+                "evidence": _scrub(item.get("evidence", "")),
+            }
+        )
+
+    sanitized_notes: list[dict[str, object]] = []
+    sanitized_note_tags: dict[str, tuple[str, ...]] = {}
+    old_note_tags = dict(ctx.get("_note_tags") or {})
+    for note in filtered_notes_raw:
+        old_nid = str(note.get("id", ""))
+        nid = f"N{len(sanitized_notes) + 1}"
+        sanitized_notes.append(
+            {
+                "id": nid,
+                "filename": note.get("filename", ""),
+                "title": _scrub(note.get("title", "")),
+                "origin": note.get("origin", ""),
+                "excerpt": _scrub(note.get("excerpt", "")),
+            }
+        )
+        sanitized_note_tags[nid] = old_note_tags.get(old_nid, ())
+
+    sources = (
+        [
+            {
+                "tier": "verified",
+                "citation_id": v["id"],
+                "filename": v["atom_id"],
+                "title": v["atom_id"],
+                "claim": v["claim"],
+                "excerpt": v["evidence"],
+            }
+            for v in sanitized_verified
+        ]
+        + [
+            {
+                "tier": "preference",
+                "citation_id": p["id"],
+                "filename": p["atom_id"],
+                "title": p["atom_id"],
+                "claim": p["claim"],
+                "excerpt": p["evidence"],
+            }
+            for p in sanitized_preferences
+        ]
+        + [
+            {
+                "tier": "note",
+                "citation_id": n["id"],
+                "filename": n["filename"],
+                "title": n["title"],
+                "excerpt": n["excerpt"],
+            }
+            for n in sanitized_notes
+        ]
+    )
+
+    return {
+        **ctx,
+        "verified": sanitized_verified,
+        "preferences": sanitized_preferences,
+        "notes": sanitized_notes,
+        "sources": sources,
+        "_factual_records": factual_records,
+        "_raw_claims_by_vid": raw_claims_by_vid,
+        "_note_tags": sanitized_note_tags,
+        "_pre_pii_count": pre_pii_count,
+        "_pre_secret_hits": tuple(pre_secret_hits),
+    }
 
 
 def _prepare_outbound_prompt(
@@ -366,6 +549,8 @@ def _prepare_outbound_prompt(
     model: str,
     atom_ids: list[str],
     started: float,
+    pre_pii_count: int = 0,
+    pre_secret_hits: tuple[str, ...] = (),
 ) -> tuple[str, int, list[dict[str, object]]]:
     """Scan/redact an outbound prompt; return (sanitized_prompt, pii_count, error_events)."""
     res = inspect_and_redact_outbound(
@@ -373,22 +558,24 @@ def _prepare_outbound_prompt(
         redact_pii=bool(rule.redact_pii),
         fail_on_secret_detection=False,
     )
-    if not res.secret_hits:
-        return res.sanitized_text, res.pii_redaction_count, []
+    total_pii = int(pre_pii_count) + res.pii_redaction_count
+    combined_secrets = tuple(dict.fromkeys([*pre_secret_hits, *res.secret_hits]))
+    if not combined_secrets:
+        return res.sanitized_text, total_pii, []
     _audit_outbound_call(
         brain_dir=brain_dir,
         rule=rule,
         model=model,
         atom_ids=atom_ids,
-        pii_redactions=res.pii_redaction_count,
+        pii_redactions=total_pii,
         outcome="blocked_secret",
     )
     elapsed = round((time.perf_counter() - started) * 1000, 1)
     return (
         "",
-        res.pii_redaction_count,
+        total_pii,
         [
-            {"type": "error", "error": f"Outbound secret blocked: {', '.join(res.secret_hits)}"},
+            {"type": "error", "error": f"Outbound secret blocked: {', '.join(combined_secrets)}"},
             {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed},
         ],
     )
@@ -403,19 +590,38 @@ def chat_events(
     stream_fn: StreamFn | None = None,
     json_fn: JsonFn | None = None,
     model_override: str | None = None,
+    include_preferences: bool = True,
 ) -> Iterator[dict[str, object]]:
     """Yield chat events: context → (tokens|verified_answer) → grounding → done."""
     if mode not in CHAT_MODES:
         raise ValueError(f"mode must be one of {CHAT_MODES}")
     paths = paths or ChatPaths()
     started = time.perf_counter()
-    ctx = retrieve_context(query, paths, project_scope=project_scope)
+    try:
+        policies = load_host_policies(paths.policy_path)
+        context_rule = policies.get("ollama_local") or builtin_default_policies()["ollama_local"]
+    except (ValueError, OSError) as exc:
+        if isinstance(exc, PermissionError) and mode == "instant":
+            raise
+        yield {"type": "error", "error": str(exc)}
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
+        return
+
+    raw_ctx = retrieve_context(query, paths, project_scope=project_scope)
+    ctx = _filter_and_redact_context(raw_ctx, context_rule)
+    if not include_preferences:
+        ctx = {
+            **ctx,
+            "preferences": [],
+            "sources": [s for s in ctx["sources"] if s.get("tier") != "preference"],
+        }
     yield _public(ctx)
     verified = ctx["verified"]
     preferences = ctx["preferences"]
     notes = ctx["notes"]
 
-    if mode == "instant" or (not verified and not preferences and not notes):
+    if mode == "instant":
         if not verified and not preferences and not notes:
             msg = "Nothing in your verified memory or notes matches this question yet."
             yield {"type": "abstain", "text": msg, "reason": msg}
@@ -432,9 +638,11 @@ def chat_events(
         yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
         return
 
-    factual_records = filter_atoms_for_host(ctx["_records"], rule, mode="standard")
-    factual_ids = {str(r["filename"]) for r in factual_records}
-    model_verified = [v for v in verified if str(v["atom_id"]) in factual_ids]
+    factual_records = list(ctx.get("_factual_records") or [])
+    raw_claims_by_vid = dict(ctx.get("_raw_claims_by_vid") or {})
+    pre_pii_count = int(ctx.get("_pre_pii_count", 0))
+    pre_secret_hits = tuple(ctx.get("_pre_secret_hits") or ())
+    model_verified = list(verified)
     verified_atom_ids = [str(v["atom_id"]) for v in model_verified]
 
     if mode == "verified":
@@ -450,6 +658,8 @@ def chat_events(
                 model=model,
                 atom_ids=verified_atom_ids,
                 started=started,
+                pre_pii_count=pre_pii_count,
+                pre_secret_hits=pre_secret_hits,
             )
             if blocked_events:
                 yield from blocked_events
@@ -462,8 +672,11 @@ def chat_events(
                 ids = json.loads(raw).get("claim_ids", [])
                 chosen = []
                 for i in ids if isinstance(ids, list) else []:
-                    if isinstance(i, int) and 0 <= i < len(model_verified) and model_verified[i]["claim"] not in chosen:
-                        chosen.append(model_verified[i]["claim"])
+                    if isinstance(i, int) and 0 <= i < len(model_verified):
+                        vid = str(model_verified[i]["id"])
+                        canonical_claim = raw_claims_by_vid.get(vid, str(model_verified[i]["claim"]))
+                        if canonical_claim not in chosen:
+                            chosen.append(canonical_claim)
                 if chosen:
                     result = validate_standard_answer(
                         json.dumps({"claims": chosen}), factual_records, atoms_dir=paths.atoms_dir
@@ -476,19 +689,36 @@ def chat_events(
             model_ms = round((time.perf_counter() - t0) * 1000, 1)
             if result is not None and result.answerable:
                 outcome = "grounded_answer"
+                try:
+                    record_grounded_answer_telemetry(
+                        sorted({e.atom_id for c in result.claims for e in c.evidence}),
+                        abstained=False,
+                        mode="chat_verified",
+                        latency_ms=model_ms,
+                        db_path=os.path.join(paths.brain_dir, ".sidecar", "telemetry.sqlite3"),
+                    )
+                except Exception:
+                    pass
+                safe_ans_text = inspect_and_redact_outbound(
+                    result.text, redact_pii=bool(rule.redact_pii), fail_on_secret_detection=False
+                ).sanitized_text
                 yield {
                     "type": "verified_answer",
                     "answerable": True,
-                    "text": result.text,
-                    "answer": result.text,
+                    "text": safe_ans_text,
+                    "answer": safe_ans_text,
                     "model_ms": model_ms,
                     "claims": [
                         {
-                            "text": c.text,
+                            "text": inspect_and_redact_outbound(
+                                c.text, redact_pii=bool(rule.redact_pii), fail_on_secret_detection=False
+                            ).sanitized_text,
                             "evidence": [
                                 {
                                     "atom_id": e.atom_id,
-                                    "quote": e.evidence_quote,
+                                    "quote": inspect_and_redact_outbound(
+                                        e.evidence_quote, redact_pii=bool(rule.redact_pii), fail_on_secret_detection=False
+                                    ).sanitized_text,
                                     "source": e.evidence_source,
                                     "source_sha256": e.evidence_sha256,
                                     "bytes": [e.evidence_start, e.evidence_end],
@@ -522,17 +752,9 @@ def chat_events(
         return
 
     # mode == "stream"
-    model_notes = _filter_notes_for_host(notes, ctx.get("_note_tags", {}), rule)
-    model_preferences: list[dict[str, object]] = []
-    pref_atom_ids: list[str] = []
-    if rule.allow_preference_atoms:
-        pref_records = filter_atoms_for_host(ctx["_records"], rule, mode="preference")
-        pref_ids = {str(r["filename"]) for r in pref_records}
-        for p in preferences:
-            aid = str(p["atom_id"])
-            if aid in pref_ids:
-                model_preferences.append(p)
-                pref_atom_ids.append(aid)
+    model_notes = list(notes)
+    model_preferences = list(preferences)
+    pref_atom_ids = [str(p["atom_id"]) for p in model_preferences]
 
     shared_ids = verified_atom_ids + pref_atom_ids + [f"note:{n['filename']}" for n in model_notes]
     if not model_verified and not model_preferences and not model_notes:
@@ -549,6 +771,8 @@ def chat_events(
         model=model,
         atom_ids=shared_ids,
         started=started,
+        pre_pii_count=pre_pii_count,
+        pre_secret_hits=pre_secret_hits,
     )
     if blocked_events:
         yield from blocked_events
@@ -575,6 +799,10 @@ def chat_events(
             pii_redactions=pii_count,
             outcome=outcome,
         )
+    if outcome == "transport_error":
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
+        return
     full_text = "".join(pieces)
     grounding = check_citations(full_text, model_verified, model_notes, model_preferences)
     grounding["first_token_ms"] = first_token_ms
@@ -589,9 +817,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Chat with your Second Brain (streaming).")
     parser.add_argument("query")
     parser.add_argument("--mode", choices=CHAT_MODES, default="stream")
+    parser.add_argument("--project", default=None, help="Optional project:<id> scope filter.")
+    parser.add_argument("--model", default=None, help="Optional local Ollama model override.")
+    parser.add_argument("--no-preferences", action="store_true", help="Exclude subjective preference atoms.")
     parser.add_argument("--json", action="store_true", help="Emit raw JSON events (one per line).")
     args = parser.parse_args(argv)
-    for event in chat_events(args.query, mode=args.mode):
+    for event in chat_events(
+        args.query,
+        mode=args.mode,
+        project_scope=args.project,
+        model_override=args.model,
+        include_preferences=not args.no_preferences,
+    ):
         if args.json:
             print(json.dumps(event, ensure_ascii=False), flush=True)
             continue

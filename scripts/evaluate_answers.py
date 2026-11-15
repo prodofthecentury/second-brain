@@ -20,10 +20,18 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, build_grounding_prompt, validate_standard_answer
-from atom_mutator import approved_revision_is_current
-from config import ATOMS_DIR, CHROMA_PATH, GEN_MODEL, LEXICAL_INDEX_PATH, SIDECAR_DIR
+from atom_mutator import approved_revision_is_current, review_lock
+from config import ATOMS_DIR, CHROMA_PATH, GEN_MODEL, LEXICAL_INDEX_PATH, SIDECAR_DIR, _is_reparse_or_link
 from evaluation_dataset import validate_dataset
+from host_adapters import (
+    _redact_outbound_with_map,
+    _rehydrate_draft_claims,
+    restrict_security_file_permissions,
+    validate_model_identifier,
+)
 from index_manifest import load_index_manifest
+from lexical_store import lexical_index_is_current
+from ollama_utils import _DEFAULT_OLLAMA_CHAT, _is_monkeypatched_ollama_fn, _resolve_local_ollama_rule_and_url, ollama_base_url
 from recall import RecallOptions, search_memory
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -163,21 +171,30 @@ def evaluate_quality_gate(metrics: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_json_atomically(output_path: Path, payload: dict[str, Any]) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, staging = tempfile.mkstemp(prefix=".answer-eval-", suffix=".tmp", dir=output_path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(staging, output_path)
-    except Exception:
+    target = Path(os.path.abspath(str(output_path)))
+    if os.path.lexists(str(target)) and _is_reparse_or_link(str(target)):
+        raise PermissionError(f"Refusing to overwrite symlinked evaluation output: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_link(str(target.parent)):
+        raise PermissionError(f"Refusing to write evaluation output under symlinked directory: {target.parent}")
+
+    lock_path = os.path.join(SIDECAR_DIR, "writer.lock")
+    with review_lock(lock_path):
+        descriptor, staging = tempfile.mkstemp(prefix=".answer-eval-", suffix=".tmp", dir=target.parent)
         try:
-            os.unlink(staging)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(staging, target)
+            restrict_security_file_permissions(target)
+        except Exception:
+            try:
+                os.unlink(staging)
+            except OSError:
+                pass
+            raise
 
 
 def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) -> dict[str, Any]:
@@ -186,8 +203,17 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
         raise EvaluationRunError("runs must be an integer from 1 through 50.")
     if not isinstance(model, str) or not model.strip():
         raise EvaluationRunError("A non-empty Ollama model name is required.")
+    model = validate_model_identifier(model, provider="ollama")
 
-    from ollama import chat
+    import ollama
+
+    rule, base_url = _resolve_local_ollama_rule_and_url()
+    ollama_client = ollama.Client(
+        host=base_url,
+        timeout=90.0,
+        follow_redirects=False,
+        trust_env=False,
+    )
 
     decision_log = Path(ATOMS_DIR).parent / "0-raw" / "archive" / "decision-record.jsonl"
     dataset_bytes = dataset_path.read_bytes()
@@ -203,9 +229,11 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
     for run_number in range(1, runs + 1):
         for case in scored_cases:
             started = time.perf_counter()
+            case_projects = (str(case["project_scope"]).strip(),) if case.get("project_scope") else ()
             try:
                 direct, neighbors = search_memory(
-                    case["query"], RecallOptions(n_results=5, follow_links=True),
+                    case["query"],
+                    RecallOptions(n_results=5, follow_links=True, projects=case_projects),
                 )
             except Exception as exc:
                 raise EvaluationRunError(f"Trusted recall failed for {case['id']}: {exc}") from exc
@@ -220,15 +248,31 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                 })
                 continue
 
-            prompt = build_grounding_prompt(AnswerRequest(query=case["query"], result_limit=5), retrieved)
+            prompt = build_grounding_prompt(
+                AnswerRequest(query=case["query"], result_limit=5, projects=case_projects),
+                retrieved,
+            )
+            redaction, pii_placeholder_map = _redact_outbound_with_map(
+                prompt,
+                redact_pii=rule.redact_pii,
+                fail_on_secret_detection=rule.fail_on_secret_detection,
+            )
             try:
-                response = chat(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    format=ANSWER_DRAFT_SCHEMA,
-                    stream=False,
-                )
-                draft_json = response["message"]["content"]
+                if _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
+                    response = ollama.chat(
+                        model=model,
+                        messages=[{"role": "user", "content": redaction.sanitized_text}],
+                        format=ANSWER_DRAFT_SCHEMA,
+                        stream=False,
+                    )
+                else:
+                    response = ollama_client.chat(
+                        model=model,
+                        messages=[{"role": "user", "content": redaction.sanitized_text}],
+                        format=ANSWER_DRAFT_SCHEMA,
+                        stream=False,
+                    )
+                draft_json = _rehydrate_draft_claims(response["message"]["content"], pii_placeholder_map)
             except Exception as exc:
                 raise EvaluationRunError(f"Generation failed for {case['id']} run {run_number}: {exc}") from exc
             try:
@@ -255,6 +299,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
             })
 
     manifest = load_index_manifest(CHROMA_PATH)
+    lexical_current = lexical_index_is_current(ATOMS_DIR, LEXICAL_INDEX_PATH)
     payload = {
         "schema_version": 1,
         "evaluation_type": "repeated_answer_grounding",
@@ -262,7 +307,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
         "dataset_version": corpus["dataset_version"],
         "dataset_sha256": hashlib.sha256(dataset_bytes).hexdigest(),
         "model": model,
-        "retrieval_backend": "lexical" if os.path.exists(LEXICAL_INDEX_PATH) else "semantic",
+        "retrieval_backend": "lexical" if lexical_current else "semantic",
         "index_generation": manifest.get("generation_id") if isinstance(manifest, dict) else None,
         "requested_runs_per_case": runs,
         "scored_case_count": len(scored_cases),

@@ -27,14 +27,37 @@ if (-not $SkipBuild) {
         if (-not (Test-Path (Join-Path $DesktopDir "node_modules"))) {
             npm ci
         }
+        $buildStartedAt = (Get-Date).AddSeconds(-2)
         switch ($Target) {
             "pack" { npm run pack }
             "nsis" { npm run dist }
             "msi"  { npm run dist:msi }
             "win"  { npm run dist:win }
         }
-        if ($LASTEXITCODE -ne 0) {
-            throw "electron-builder exited with code $LASTEXITCODE"
+        $ebExit = $LASTEXITCODE
+        if ($ebExit -ne 0) {
+            # Windows Defender occasionally holds a transient scan handle on *.nsis.7z during final unlink
+            # after all installer artifacts (.exe, .blockmap, .msi, win-unpacked) have completed writing.
+            $nsisTemp = Get-ChildItem -Path $DistDir -Filter "*.nsis.7z" -ErrorAction SilentlyContinue
+            $expectedOk = (Test-Path (Join-Path $DistDir "win-unpacked\Second Brain.exe"))
+            if ($Target -in @("nsis", "win")) {
+                $exeOut = Get-ChildItem -Path $DistDir -Filter "*-Setup-*.exe" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -ge $buildStartedAt -and $_.Length -gt 1048576 }
+                $blockOut = Get-ChildItem -Path $DistDir -Filter "*-Setup-*.exe.blockmap" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -ge $buildStartedAt -and $_.Length -gt 1024 }
+                $expectedOk = $expectedOk -and ($null -ne $exeOut) -and ($null -ne $blockOut)
+            }
+            if ($Target -in @("msi", "win")) {
+                $msiOut = Get-ChildItem -Path $DistDir -Filter "*-Setup-*.msi" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -ge $buildStartedAt -and $_.Length -gt 1048576 }
+                $expectedOk = $expectedOk -and ($null -ne $msiOut)
+            }
+            if ($expectedOk -and $nsisTemp) {
+                Write-Warning "electron-builder hit transient Windows file lock unlinking $($nsisTemp.Name) after completing artifacts; cleaning up."
+                Start-Sleep -Seconds 2
+            } else {
+                throw "electron-builder exited with code $ebExit"
+            }
         }
     } finally {
         Pop-Location
@@ -42,6 +65,8 @@ if (-not $SkipBuild) {
 }
 
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+Get-ChildItem -Path $DistDir -Filter "*.nsis.7z" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+Remove-Item -Path (Join-Path $DistDir "builder-debug.yml") -Force -ErrorAction SilentlyContinue
 
 Push-Location $RepoRoot
 try {
@@ -64,6 +89,8 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
         '<Default Extension="json" ContentType="application/json"/>'
         '<Default Extension="js" ContentType="application/javascript"/>'
+        '<Default Extension="css" ContentType="text/css"/>'
+        '<Default Extension="html" ContentType="text/html"/>'
         '<Default Extension="md" ContentType="text/markdown"/>'
         '<Default Extension="vsixmanifest" ContentType="text/xml"/>'
         "</Types>",

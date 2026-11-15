@@ -1,7 +1,7 @@
 {
   "name": "second-brain-vscode",
   "displayName": "Second Brain — Local AI Memory",
-  "description": "Zero-friction notes, SHA-256 verified atoms, instant recall, and streaming chat inside VS Code, Cursor, and Windsurf.",
+  "description": "Zero-friction notes, SHA-256 verified atoms, Merkle inclusion proofs, contradiction radar, instant recall, and streaming chat inside VS Code, Cursor, and Windsurf.",
   "version": "0.2.0",
   "publisher": "second-brain",
   "license": "MIT",
@@ -16,6 +16,15 @@
     "onStartupFinished"
   ],
   "main": "./extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "restrictedConfigurations": [
+        "secondBrain.apiPort",
+        "secondBrain.ownerTokenPath"
+      ]
+    }
+  },
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -45,7 +54,8 @@
       },
       {
         "command": "secondBrain.openChat",
-        "title": "Second Brain: Open Streaming Chat"
+        "title": "Second Brain: Open Streaming Chat",
+        "icon": "$(comment-discussion)"
       },
       {
         "command": "secondBrain.assemblePlan",
@@ -56,14 +66,62 @@
         "title": "Second Brain: Verify Vault Merkle Ledger"
       },
       {
+        "command": "secondBrain.proveAtom",
+        "title": "Second Brain: Prove Verified Atom Membership"
+      },
+      {
         "command": "secondBrain.scanContradictions",
-        "title": "Second Brain: Scan Contradiction Radar"
+        "title": "Second Brain: Scan Contradiction & Drift Radar"
+      },
+      {
+        "command": "secondBrain.createSnapshot",
+        "title": "Second Brain: Create Vault Snapshot"
+      },
+      {
+        "command": "secondBrain.diffSnapshot",
+        "title": "Second Brain: Diff Snapshot vs Live Vault"
+      },
+      {
+        "command": "secondBrain.recordExperience",
+        "title": "Second Brain: Record Episodic Experience"
       },
       {
         "command": "secondBrain.refreshVault",
-        "title": "Second Brain: Refresh Vault"
+        "title": "Second Brain: Refresh Vault",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "secondBrain.openTreeItem",
+        "title": "Second Brain: Open Vault Item"
       }
     ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "secondBrain.rememberSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@1"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "secondBrain.openChat",
+          "when": "view == secondBrain.vaultView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "secondBrain.refreshVault",
+          "when": "view == secondBrain.vaultView",
+          "group": "navigation@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "secondBrain.openTreeItem",
+          "when": "false"
+        }
+      ]
+    },
     "keybindings": [
       {
         "command": "secondBrain.rememberSelection",
@@ -83,7 +141,14 @@
         "secondBrain.apiPort": {
           "type": "number",
           "default": 8765,
-          "description": "Loopback port of the local Second Brain HTTP API."
+          "scope": "application",
+          "description": "Loopback port of the local Second Brain HTTP API (user/application scope only; ignored in workspace settings)."
+        },
+        "secondBrain.ownerTokenPath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Optional explicit path to the local Second Brain owner token file (user/application scope only)."
         }
       }
     }

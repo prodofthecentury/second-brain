@@ -40,6 +40,7 @@ from answer_policy import (
     validate_standard_answer,
 )
 from config import ATOMS_DIR, BRAIN_DIR, GEN_MODEL, _is_reparse_or_link
+from hardware_profile import loopback_ollama_base_url
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 from ollama_scout import (
@@ -132,7 +133,11 @@ def default_host_policy_path() -> Path:
 def builtin_default_policies() -> dict[str, HostSharingRule]:
     """Fail-closed defaults: only local loopback Ollama is enabled out of the box."""
     raw_ollama = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip().rstrip("/")
-    ollama_url = raw_ollama if raw_ollama.startswith(("http://", "https://")) else f"http://{raw_ollama}"
+    normalized_loopback = loopback_ollama_base_url(raw_ollama)
+    if normalized_loopback is not None:
+        ollama_url = normalized_loopback
+    else:
+        ollama_url = raw_ollama if raw_ollama.startswith(("http://", "https://")) else f"http://{raw_ollama}"
     return {
         "ollama_local": HostSharingRule(
             host_id="ollama_local",
@@ -211,18 +216,27 @@ def _current_windows_principal() -> str | None:
     global _CACHED_WINDOWS_USER
     if _CACHED_WINDOWS_USER is not None:
         return _CACHED_WINDOWS_USER or None
-    try:
-        proc = subprocess.run(
-            ["whoami"],
-            capture_output=True,
-            text=True,
-            timeout=3.0,
-            check=False,
-        )
-        user = proc.stdout.strip()
-        _CACHED_WINDOWS_USER = user if proc.returncode == 0 and user else ""
-    except Exception:
+    if os.name != "nt":
         _CACHED_WINDOWS_USER = ""
+        return None
+    whoami_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "whoami.exe")
+    user = ""
+    if os.path.isfile(whoami_exe):
+        try:
+            proc = subprocess.run(
+                [whoami_exe],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                user = proc.stdout.strip()
+        except Exception:
+            user = ""
+    if not user:
+        user = (os.environ.get("USERNAME") or "").strip()
+    _CACHED_WINDOWS_USER = user
     return _CACHED_WINDOWS_USER or None
 
 
@@ -230,9 +244,15 @@ def restrict_security_file_permissions(path: Path | str) -> None:
     """Enforce owner-only permissions on POSIX (0o700/0o600) and Windows NTFS DACLs."""
     try:
         path = Path(path)
+        if _is_reparse_or_link(str(path)):
+            return
+        parent = path.parent
+        parent_is_link = os.path.lexists(str(parent)) and _is_reparse_or_link(str(parent))
         if os.name != "nt":
-            os.chmod(path.parent, 0o700)
-            os.chmod(path, 0o600)
+            if not parent_is_link and parent.exists():
+                os.chmod(parent, 0o700)
+            if path.exists():
+                os.chmod(path, 0o600)
             return
         icacls_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
         if not os.path.exists(icacls_exe):
@@ -240,21 +260,38 @@ def restrict_security_file_permissions(path: Path | str) -> None:
         principal = _current_windows_principal()
         if not principal:
             return
-        subprocess.run(
-            [
-                icacls_exe,
-                str(path),
-                "/inheritance:r",
-                "/grant:r",
-                "*S-1-5-18:(F)",
-                "*S-1-5-32-544:(F)",
-                f"{principal}:(F)",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            check=False,
-        )
+        if not parent_is_link and parent.exists() and parent.name in {"security", ".sidecar", "snapshots"}:
+            subprocess.run(
+                [
+                    icacls_exe,
+                    str(parent),
+                    "/inheritance:r",
+                    "/grant:r",
+                    "*S-1-5-18:(OI)(CI)(F)",
+                    "*S-1-5-32-544:(OI)(CI)(F)",
+                    f"{principal}:(OI)(CI)(F)",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        if path.exists():
+            subprocess.run(
+                [
+                    icacls_exe,
+                    str(path),
+                    "/inheritance:r",
+                    "/grant:r",
+                    "*S-1-5-18:(F)",
+                    "*S-1-5-32-544:(F)",
+                    f"{principal}:(F)",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
     except OSError:
         pass
 
@@ -497,9 +534,9 @@ def validate_endpoint_network_boundary(rule: HostSharingRule) -> ValidatedRemote
         raise HostConsentError(f"Host '{rule.host_id}' has an invalid port: {exc}") from exc
 
     if rule.transport == "local":
-        if parsed.scheme != "http" or hostname != "127.0.0.1":
+        if parsed.scheme != "http" or hostname not in {"127.0.0.1", "::1", "localhost"}:
             raise HostConsentError(
-                f"Local host '{rule.host_id}' must bind strictly to http://127.0.0.1 (got {rule.endpoint_url!r})."
+                f"Local host '{rule.host_id}' must bind strictly to loopback http://127.0.0.1, ::1, or localhost (got {rule.endpoint_url!r})."
             )
         return None
 
@@ -624,9 +661,11 @@ def _audit_outbound_call(
     }
     line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
     with _AUDIT_LOCK:
-        os.makedirs(os.path.dirname(audit_path), exist_ok=True)
-        if os.path.lexists(audit_path) and _is_reparse_or_link(audit_path):
+        audit_parent = os.path.dirname(os.path.abspath(audit_path))
+        os.makedirs(audit_parent, exist_ok=True)
+        if _is_reparse_or_link(audit_parent) or (os.path.lexists(audit_path) and _is_reparse_or_link(audit_path)):
             raise PermissionError("Refusing to write outbound audit log through a symlink or reparse point.")
+        existed_before = os.path.exists(audit_path)
         fd = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             if os.write(fd, line) != len(line):
@@ -634,6 +673,8 @@ def _audit_outbound_call(
             os.fsync(fd)
         finally:
             os.close(fd)
+        if not existed_before:
+            restrict_security_file_permissions(audit_path)
 
 
 def _invoke_provider_draft(
@@ -661,7 +702,8 @@ def _invoke_provider_draft(
         }
         if http_transport is not None:
             client_kwargs["transport"] = http_transport
-        client = ollama.Client(host=rule.endpoint_url, **client_kwargs)
+        target_host = loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url
+        client = ollama.Client(host=target_host, **client_kwargs)
         resp = client.chat(
             model=safe_model,
             messages=[{"role": "user", "content": prompt}],

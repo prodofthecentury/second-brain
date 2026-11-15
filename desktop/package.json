@@ -59,6 +59,10 @@
         ]
       },
       {
+        "from": "../.streamlit/config.toml",
+        "to": "backend/.streamlit/config.toml"
+      },
+      {
         "from": "../plugins",
         "to": "backend/plugins"
       },
@@ -115,6 +119,8 @@
       "icon": "assets/icon.png",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
+      "entitlements": "entitlements.mac.plist",
+      "entitlementsInherit": "entitlements.mac.plist",
       "target": [
         {
           "target": "dmg",

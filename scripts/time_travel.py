@@ -2,22 +2,26 @@
 # requires-python = ">=3.11,<3.12"
 # dependencies = []
 # ///
-"""Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Recall.
+"""Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Okapi BM25 Recall.
 
 Creates immutable, content-addressed checkpoints under brain/.sidecar/snapshots/
-recording the exact SHA-256 hashes, claims, and contexts of all owner-approved
-atoms and playbooks at timestamp T. Supports:
-  * Semantic diff between any two snapshots (or snapshot vs live vault)
-  * Point-in-time recall ("what did my verified brain know at snapshot T?")
-    with zero leakage from later edits or unapproved drafts.
+recording the exact SHA-256 hashes, claims, evidence, and contexts of all
+owner-approved atoms and playbooks at timestamp T. Supports:
+  * Semantic diff between any two snapshots (or snapshot vs live vault), including
+    atom claim/evidence diffs and playbook step/backing-atom diffs
+  * Point-in-time field-weighted Okapi BM25 + corpus IDF recall ("what did my
+    verified brain know at snapshot T?") with zero leakage from later edits or
+    unapproved drafts.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -30,17 +34,63 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import approved_revision_is_current, content_sha256, review_lock  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown, safe_file_in_dir  # noqa: E402
+from host_adapters import restrict_security_file_permissions  # noqa: E402
+from lexical_store import tokenize  # noqa: E402
 from memory_review import parse_atom_record  # noqa: E402
 from recall import QUERY_STOP_WORDS, normalize_project_tag, project_tags_match  # noqa: E402
 from skill_playbooks import verify_playbook_integrity  # noqa: E402
 from vault_ledger import _build_merkle_levels, _leaf_digest  # noqa: E402
 
 _SNAP_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-_WORD_RE = re.compile(r"[a-z0-9_]{2,}")
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_BM25_K1 = 1.5
+_BM25_B = 0.75
 
 
 def _snapshots_dir(brain_dir: str) -> Path:
     return Path(brain_dir) / ".sidecar" / "snapshots"
+
+
+def _light_stem(token: str) -> str:
+    t = token.casefold()
+    if len(t) <= 3:
+        return t
+    if t.endswith("tion") and len(t) >= 6:
+        t = t[:-3]
+    elif t.endswith("ing") and len(t) >= 6:
+        t = t[:-3]
+    elif t.endswith("ed") and len(t) >= 5:
+        t = t[:-2]
+    elif t.endswith("es") and len(t) >= 5:
+        t = t[:-2]
+    elif t.endswith("s") and not t.endswith("ss") and len(t) >= 4:
+        t = t[:-1]
+    if t.endswith("e") and len(t) >= 5:
+        t = t[:-1]
+    return t
+
+
+def _meaningful_tokens(text: str) -> list[str]:
+    return [tok for tok in tokenize(str(text or "")) if len(tok) >= 2 and tok not in QUERY_STOP_WORDS]
+
+
+def _matched_snippet(text: str, matched_terms: set[str], max_chars: int = 220) -> str:
+    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(flat) <= max_chars:
+        return flat
+    lower = flat.casefold()
+    best_pos = 0
+    for term in sorted(matched_terms, key=len, reverse=True):
+        idx = lower.find(term.casefold())
+        if idx >= 0:
+            best_pos = max(0, idx - max_chars // 4)
+            break
+    window = flat[best_pos : best_pos + max_chars].strip()
+    if best_pos > 0:
+        window = "..." + window
+    if best_pos + max_chars < len(flat):
+        window = window + "..."
+    return window
 
 
 def _capture_live_state(
@@ -81,8 +131,11 @@ def _capture_live_state(
                 "memory_type": rec.get("memory_type", ""),
                 "epistemic_label": rec.get("epistemic_label", "claim"),
                 "epistemic_contract": rec.get("epistemic_contract", ""),
+                "confidence": rec.get("confidence") or "",
+                "importance": rec.get("importance") if rec.get("importance") is not None else "",
                 "contexts": list(rec.get("contexts") or []),
                 "claim": rec.get("claim") or "",
+                "evidence": rec.get("evidence") or "",
             }
 
     playbooks: dict[str, dict[str, Any]] = {}
@@ -113,9 +166,14 @@ def _capture_live_state(
             rel_path = f"5-playbooks/{entry.name}"
             leaves.append((rel_path, _leaf_digest(rel_path, fhash)))
             playbooks[entry.name] = {
+                "playbook_id": pb_rep.playbook_id or Path(entry.name).stem,
                 "filename": pb_rep.filename or entry.name,
+                "title": pb_rep.title or "",
+                "trigger": pb_rep.trigger or "",
                 "file_sha256": fhash,
                 "contexts": list(pb_rep.contexts),
+                "backing_atoms": list(pb_rep.backing_atoms),
+                "steps": list(pb_rep.steps),
             }
 
     leaves.sort(key=lambda item: item[0])
@@ -160,7 +218,7 @@ def create_snapshot(
                 break
 
         doc: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "snapshot_id": snapshot_id,
             "created_at": now.isoformat(timespec="seconds"),
             "actor": clean_actor,
@@ -178,6 +236,7 @@ def create_snapshot(
         finally:
             os.close(fd)
         os.replace(tmp_path, target)
+        restrict_security_file_permissions(target)
         return doc
 
 
@@ -207,7 +266,69 @@ def list_snapshots(*, brain_dir: str = BRAIN_DIR) -> list[dict[str, Any]]:
     return out
 
 
-def load_snapshot(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> dict[str, Any]:
+def _verify_snapshot_doc(data: Any, fallback_id: str = "") -> dict[str, Any]:
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return {
+            "valid": False,
+            "snapshot_id": fallback_id,
+            "recorded_merkle_root": "",
+            "computed_merkle_root": "",
+            "atom_count": 0,
+            "playbook_count": 0,
+            "errors": ["Snapshot document is not a JSON object."],
+        }
+    snap_id = str(data.get("snapshot_id") or fallback_id)
+    recorded_root = str(data.get("merkle_root") or "")
+    atoms = data.get("atoms")
+    playbooks = data.get("playbooks")
+    if not isinstance(atoms, dict):
+        errors.append("Snapshot 'atoms' map is missing or invalid.")
+        atoms = {}
+    if not isinstance(playbooks, dict):
+        errors.append("Snapshot 'playbooks' map is missing or invalid.")
+        playbooks = {}
+
+    leaves: list[tuple[str, str]] = []
+    for k, v in atoms.items():
+        fhash = str(v.get("file_sha256") or "") if isinstance(v, dict) else ""
+        if not _HEX64_RE.fullmatch(fhash):
+            errors.append(f"Invalid atom file_sha256 for 2-atoms/{k}.")
+        rel_path = f"2-atoms/{k}"
+        leaves.append((rel_path, _leaf_digest(rel_path, fhash)))
+    for k, v in playbooks.items():
+        fhash = str(v.get("file_sha256") or "") if isinstance(v, dict) else ""
+        if not _HEX64_RE.fullmatch(fhash):
+            errors.append(f"Invalid playbook file_sha256 for 5-playbooks/{k}.")
+        rel_path = f"5-playbooks/{k}"
+        leaves.append((rel_path, _leaf_digest(rel_path, fhash)))
+
+    leaves.sort(key=lambda item: item[0])
+    computed_root = _build_merkle_levels([d for _, d in leaves])[-1][0]
+    if recorded_root != computed_root:
+        errors.append(
+            f"Merkle root mismatch (recorded={recorded_root[:12]}, computed={computed_root[:12]})."
+        )
+
+    rec_atom_count = data.get("atom_count")
+    if isinstance(rec_atom_count, bool) or not isinstance(rec_atom_count, int) or rec_atom_count != len(atoms):
+        errors.append(f"atom_count mismatch (recorded={rec_atom_count!r}, actual={len(atoms)}).")
+    rec_pb_count = data.get("playbook_count")
+    if isinstance(rec_pb_count, bool) or not isinstance(rec_pb_count, int) or rec_pb_count != len(playbooks):
+        errors.append(f"playbook_count mismatch (recorded={rec_pb_count!r}, actual={len(playbooks)}).")
+
+    return {
+        "valid": len(errors) == 0,
+        "snapshot_id": snap_id,
+        "recorded_merkle_root": recorded_root,
+        "computed_merkle_root": computed_root,
+        "atom_count": len(atoms),
+        "playbook_count": len(playbooks),
+        "errors": errors,
+    }
+
+
+def _resolve_snapshot_file(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> tuple[str, str]:
     clean = (snapshot_id or "").strip()
     if clean.endswith(".json"):
         clean = clean[:-5]
@@ -221,7 +342,162 @@ def load_snapshot(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> dict[str, 
         raise FileNotFoundError(f"Snapshot not found: {clean}")
     if _is_reparse_or_link(safe):
         raise PermissionError("Refusing to load snapshot through a symlink or junction.")
-    return json.loads(Path(safe).read_text(encoding="utf-8"))
+    return clean, safe
+
+
+def verify_snapshot(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> dict[str, Any]:
+    """Recompute and verify cryptographic Merkle integrity of a saved snapshot."""
+    clean, safe = _resolve_snapshot_file(snapshot_id, brain_dir=brain_dir)
+    try:
+        data = json.loads(Path(safe).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {
+            "valid": False,
+            "snapshot_id": clean,
+            "recorded_merkle_root": "",
+            "computed_merkle_root": "",
+            "atom_count": 0,
+            "playbook_count": 0,
+            "errors": [f"Unreadable or malformed snapshot JSON: {exc}"],
+        }
+    return _verify_snapshot_doc(data, fallback_id=clean)
+
+
+def load_snapshot(
+    snapshot_id: str,
+    *,
+    brain_dir: str = BRAIN_DIR,
+    verify_integrity: bool = True,
+) -> dict[str, Any]:
+    clean, safe = _resolve_snapshot_file(snapshot_id, brain_dir=brain_dir)
+    data = json.loads(Path(safe).read_text(encoding="utf-8"))
+    if verify_integrity:
+        rep = _verify_snapshot_doc(data, fallback_id=clean)
+        if not rep["valid"]:
+            raise ValueError(
+                f"Snapshot Merkle integrity check failed for {clean}: {'; '.join(rep['errors'])}"
+            )
+    return data
+
+
+def _write_export_file_atomic(target: Path, text: str) -> None:
+    if os.path.lexists(str(target)) and _is_reparse_or_link(str(target)):
+        raise PermissionError(f"Refusing to write snapshot export through symlink: {target}")
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".export-", suffix=".tmp")
+    fd_closed = False
+    try:
+        encoded = text.replace("\r\n", "\n").encode("utf-8")
+        if os.write(fd, encoded) != len(encoded):
+            raise OSError(f"Incomplete export write: {target}")
+        os.fsync(fd)
+        os.close(fd)
+        fd_closed = True
+        os.replace(tmp_name, target)
+        restrict_security_file_permissions(target)
+    finally:
+        if not fd_closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if os.path.exists(tmp_name):
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+
+
+def export_snapshot(
+    snapshot_id: str,
+    out_dir: str,
+    *,
+    brain_dir: str = BRAIN_DIR,
+) -> dict[str, Any]:
+    """Verify snapshot cryptographic integrity and export Markdown manifest + atom claim cards."""
+    if not out_dir or not str(out_dir).strip():
+        raise ValueError("A non-empty export target directory is required.")
+    raw_out = Path(str(out_dir).strip()).expanduser()
+    if os.path.lexists(str(raw_out)) and _is_reparse_or_link(str(raw_out)):
+        raise PermissionError(f"Refusing to export snapshot into symlinked directory: {raw_out}")
+    out_path = raw_out.resolve()
+    if os.path.lexists(str(out_path.parent)) and _is_reparse_or_link(str(out_path.parent)):
+        raise PermissionError(f"Refusing to export snapshot under symlinked parent directory: {out_path.parent}")
+    if out_path.exists():
+        if not out_path.is_dir() or _is_reparse_or_link(str(out_path)):
+            raise PermissionError(f"Export target is not a safe directory: {out_path}")
+        if any(out_path.iterdir()):
+            raise ValueError(f"Refusing to export snapshot into non-empty directory: {out_path}")
+    else:
+        out_path.mkdir(parents=True, exist_ok=False, mode=0o700)
+
+    snap = load_snapshot(snapshot_id, brain_dir=brain_dir, verify_integrity=True)
+    atoms_map: dict[str, dict[str, Any]] = snap.get("atoms", {})
+    playbooks_map: dict[str, dict[str, Any]] = snap.get("playbooks", {})
+
+    atoms_out = out_path / "atoms"
+    atoms_out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    exported_files: list[str] = []
+
+    manifest_lines = [
+        f"# Snapshot Export: `{snap['snapshot_id']}`",
+        "",
+        f"- **Created At**: `{snap.get('created_at', '')}`",
+        f"- **Actor**: `{snap.get('actor', '')}`",
+        f"- **Label**: {snap.get('label', '') or '(none)'}",
+        f"- **Merkle Root**: `{snap.get('merkle_root', '')}`",
+        f"- **Verified Atoms**: {len(atoms_map)}",
+        f"- **Accepted Playbooks**: {len(playbooks_map)}",
+        "",
+        "## Verified Atoms",
+        "",
+    ]
+
+    for fname in sorted(atoms_map.keys()):
+        atom = atoms_map[fname]
+        safe_card = safe_file_in_dir(str(atoms_out), fname, allowed_exts={".md"}, must_exist=False)
+        if not safe_card:
+            raise ValueError(f"Unsafe atom filename in snapshot during export: {fname!r}")
+        card_lines = [
+            "---",
+            f"id: {atom.get('atom_id', Path(fname).stem)}",
+            f"snapshot_id: {snap['snapshot_id']}",
+            f"file_sha256: {atom.get('file_sha256', '')}",
+            f"memory_type: {atom.get('memory_type', '')}",
+            f"epistemic_label: {atom.get('epistemic_label', 'claim')}",
+            "---",
+            "",
+            "## Claim",
+            str(atom.get("claim") or ""),
+            "",
+            "## Evidence",
+            str(atom.get("evidence") or ""),
+            "",
+        ]
+        _write_export_file_atomic(Path(safe_card), "\n".join(card_lines))
+        exported_files.append(f"atoms/{os.path.basename(safe_card)}")
+        manifest_lines.append(
+            f"- `{fname}` (`{str(atom.get('file_sha256', ''))[:12]}`): {str(atom.get('claim') or '').strip()}"
+        )
+
+    if playbooks_map:
+        manifest_lines.extend(["", "## Accepted Playbooks", ""])
+        for pb_fname in sorted(playbooks_map.keys()):
+            pb = playbooks_map[pb_fname]
+            manifest_lines.append(
+                f"- `{pb_fname}` (`{str(pb.get('file_sha256', ''))[:12]}`): {pb.get('title') or pb_fname}"
+            )
+
+    manifest_path = out_path / "MANIFEST.md"
+    _write_export_file_atomic(manifest_path, "\n".join(manifest_lines) + "\n")
+    return {
+        "snapshot_id": snap["snapshot_id"],
+        "out_dir": str(out_path),
+        "manifest_path": str(manifest_path),
+        "merkle_root": snap["merkle_root"],
+        "atom_count": len(atoms_map),
+        "playbook_count": len(playbooks_map),
+        "exported_files": exported_files,
+    }
 
 
 def diff_snapshots(
@@ -257,6 +533,12 @@ def diff_snapshots(
             "new_sha256": a_after[k]["file_sha256"],
             "old_claim": a_before[k].get("claim", ""),
             "new_claim": a_after[k].get("claim", ""),
+            "old_evidence": a_before[k].get("evidence", ""),
+            "new_evidence": a_after[k].get("evidence", ""),
+            "old_contexts": list(a_before[k].get("contexts") or []),
+            "new_contexts": list(a_after[k].get("contexts") or []),
+            "before_epistemic_label": a_before[k].get("epistemic_label", "claim"),
+            "after_epistemic_label": a_after[k].get("epistemic_label", "claim"),
         }
         for k in sorted(a_before.keys() & a_after.keys())
         if a_before[k]["file_sha256"] != a_after[k]["file_sha256"]
@@ -269,6 +551,52 @@ def diff_snapshots(
     modified_playbooks = [
         k for k in sorted(p_before.keys() & p_after.keys()) if p_before[k]["file_sha256"] != p_after[k]["file_sha256"]
     ]
+    pb_added_items = [
+        {
+            "change_type": "added",
+            "filename": k,
+            "playbook_id": p_after[k].get("playbook_id", Path(k).stem),
+            "title": p_after[k].get("title", ""),
+            "old_sha256": None,
+            "new_sha256": p_after[k].get("file_sha256", ""),
+            "steps": list(p_after[k].get("steps") or []),
+            "backing_atoms": list(p_after[k].get("backing_atoms") or []),
+        }
+        for k in added_playbooks
+    ]
+    pb_removed_items = [
+        {
+            "change_type": "removed",
+            "filename": k,
+            "playbook_id": p_before[k].get("playbook_id", Path(k).stem),
+            "title": p_before[k].get("title", ""),
+            "old_sha256": p_before[k].get("file_sha256", ""),
+            "new_sha256": None,
+            "steps": list(p_before[k].get("steps") or []),
+            "backing_atoms": list(p_before[k].get("backing_atoms") or []),
+        }
+        for k in removed_playbooks
+    ]
+    pb_modified_items = [
+        {
+            "change_type": "modified",
+            "filename": k,
+            "playbook_id": p_after[k].get("playbook_id") or p_before[k].get("playbook_id", Path(k).stem),
+            "title": p_after[k].get("title") or p_before[k].get("title", ""),
+            "old_sha256": p_before[k].get("file_sha256", ""),
+            "new_sha256": p_after[k].get("file_sha256", ""),
+            "old_steps": list(p_before[k].get("steps") or []),
+            "new_steps": list(p_after[k].get("steps") or []),
+            "old_backing_atoms": list(p_before[k].get("backing_atoms") or []),
+            "new_backing_atoms": list(p_after[k].get("backing_atoms") or []),
+        }
+        for k in modified_playbooks
+    ]
+    playbook_changes: dict[str, list[dict[str, Any]]] = {
+        "added": pb_added_items,
+        "removed": pb_removed_items,
+        "modified": pb_modified_items,
+    }
 
     return {
         "from_snapshot": before["snapshot_id"],
@@ -282,6 +610,12 @@ def diff_snapshots(
         "added_playbooks": added_playbooks,
         "removed_playbooks": removed_playbooks,
         "modified_playbooks": modified_playbooks,
+        "playbook_changes": playbook_changes,
+        "summary": {
+            "added": len(added_atoms),
+            "removed": len(removed_atoms),
+            "modified": len(modified_atoms),
+        },
     }
 
 
@@ -292,13 +626,13 @@ def recall_at_snapshot(
     project_scope: str | None = None,
     include_preferences: bool = False,
     top_k: int = 5,
+    include_playbooks: bool = True,
     brain_dir: str = BRAIN_DIR,
 ) -> dict[str, Any]:
-    """Deterministic point-in-time recall over only the atoms approved in snapshot_id."""
+    """Field-weighted Okapi BM25 + phrase/bigram + light-stem point-in-time recall over snapshot_id."""
     snap = load_snapshot(snapshot_id, brain_dir=brain_dir)
-    raw_tokens = set(_WORD_RE.findall((query or "").lower()))
-    q_tokens = {tok for tok in raw_tokens if tok not in QUERY_STOP_WORDS}
-    if not q_tokens:
+    q_seq = _meaningful_tokens(query)
+    if not q_seq:
         return {
             "snapshot_id": snap["snapshot_id"],
             "created_at": snap["created_at"],
@@ -306,45 +640,164 @@ def recall_at_snapshot(
             "results": [],
         }
 
-    min_overlap = 2 if len(q_tokens) >= 2 else 1
+    q_stems: list[str] = []
+    stem_to_surface: dict[str, str] = {}
+    for tok in q_seq:
+        st = _light_stem(tok)
+        stem_to_surface.setdefault(st, tok)
+        if st not in q_stems:
+            q_stems.append(st)
+    q_stem_set = set(q_stems)
+    q_bigrams = {f"{q_seq[i]} {q_seq[i + 1]}" for i in range(len(q_seq) - 1)}
+    q_phrase = " ".join(q_seq) if len(q_seq) >= 2 else ""
+
+    min_overlap = 2 if len(q_stem_set) >= 2 else 1
     target = normalize_project_tag(project_scope) if (project_scope and project_scope.strip()) else ""
 
-    scored: list[tuple[float, dict[str, Any]]] = []
-    for fname, atom in snap.get("atoms", {}).items():
+    docs: list[tuple[str, str, dict[str, Any], Counter[str], float, set[str], str]] = []
+    df_counts: Counter[str] = Counter()
+
+    def _matches_proj(contexts: list[Any]) -> bool:
+        if not target:
+            return True
+        proj_tags = [str(c).strip() for c in contexts if str(c).strip().lower().startswith("project:")]
+        return bool(proj_tags) and all(bool(project_tags_match((c,), (target,))) for c in proj_tags)
+
+    for fname, atom in sorted(snap.get("atoms", {}).items()):
         if not include_preferences and (
             atom.get("epistemic_label") == "preference" or bool(atom.get("epistemic_contract"))
         ):
             continue
-        contexts = atom.get("contexts") or []
-        if target:
-            proj_tags = [str(c).strip() for c in contexts if str(c).strip().lower().startswith("project:")]
-            if not proj_tags or not all(bool(project_tags_match((c,), (target,))) for c in proj_tags):
-                continue
-        claim = str(atom.get("claim") or "")
-        c_tokens = {tok for tok in _WORD_RE.findall(claim.lower()) if tok not in QUERY_STOP_WORDS}
-        overlap = len(q_tokens & c_tokens)
-        if overlap < min_overlap:
+        contexts = list(atom.get("contexts") or [])
+        if not _matches_proj(contexts):
             continue
-        score = overlap / max(1, len(q_tokens))
+
+        claim_str = str(atom.get("claim") or "")
+        ev_str = str(atom.get("evidence") or "")
+        claim_toks = _meaningful_tokens(claim_str)
+        evidence_toks = _meaningful_tokens(ev_str)
+        id_toks = _meaningful_tokens(f"{Path(fname).stem} {atom.get('atom_id', '')}")
+        ctx_toks = _meaningful_tokens(" ".join(str(c) for c in contexts))
+
+        weighted_tf: Counter[str] = Counter()
+        for t in claim_toks:
+            weighted_tf[_light_stem(t)] += 3.0
+        for t in evidence_toks:
+            weighted_tf[_light_stem(t)] += 1.5
+        for t in id_toks:
+            weighted_tf[_light_stem(t)] += 1.5
+        for t in ctx_toks:
+            weighted_tf[_light_stem(t)] += 1.0
+
+        doc_vocab = set(weighted_tf.keys())
+        for st in doc_vocab:
+            df_counts[st] += 1
+        doc_len = float(sum(weighted_tf.values())) or 1.0
+        full_text = f"{claim_str}\n{ev_str}".strip()
+        docs.append(("atom", fname, atom, weighted_tf, doc_len, doc_vocab, full_text))
+
+    if include_playbooks:
+        for pb_fname, pb in sorted(snap.get("playbooks", {}).items()):
+            contexts = list(pb.get("contexts") or [])
+            if not _matches_proj(contexts):
+                continue
+            title_str = str(pb.get("title") or "").strip()
+            trigger_str = str(pb.get("trigger") or "").strip()
+            steps_list = [str(s).strip() for s in (pb.get("steps") or []) if str(s).strip()]
+            steps_str = " ".join(steps_list)
+            if not (title_str or trigger_str or steps_str):
+                continue
+            pb_claim = f"{title_str}: {trigger_str}".strip(": ") if (title_str or trigger_str) else steps_list[0]
+            head_toks = _meaningful_tokens(f"{title_str} {trigger_str}")
+            step_toks = _meaningful_tokens(steps_str)
+            id_toks = _meaningful_tokens(f"{Path(pb_fname).stem} {pb.get('playbook_id', '')}")
+            ctx_toks = _meaningful_tokens(" ".join(str(c) for c in contexts))
+
+            weighted_tf = Counter()
+            for t in head_toks:
+                weighted_tf[_light_stem(t)] += 1.8
+            for t in step_toks:
+                weighted_tf[_light_stem(t)] += 1.0
+            for t in id_toks:
+                weighted_tf[_light_stem(t)] += 1.2
+            for t in ctx_toks:
+                weighted_tf[_light_stem(t)] += 0.8
+
+            doc_vocab = set(weighted_tf.keys())
+            if not doc_vocab:
+                continue
+            for st in doc_vocab:
+                df_counts[st] += 1
+            doc_len = float(sum(weighted_tf.values())) or 1.0
+            pb_record = {
+                "atom_id": str(pb.get("playbook_id") or Path(pb_fname).stem),
+                "playbook_id": str(pb.get("playbook_id") or Path(pb_fname).stem),
+                "claim": pb_claim,
+                "evidence": "\n".join(steps_list),
+                "contexts": contexts,
+                "file_sha256": pb.get("file_sha256", ""),
+            }
+            full_text = f"{pb_claim}\n{steps_str}".strip()
+            docs.append(("playbook", pb_fname, pb_record, weighted_tf, doc_len, doc_vocab, full_text))
+
+    if not docs:
+        return {
+            "snapshot_id": snap["snapshot_id"],
+            "created_at": snap["created_at"],
+            "merkle_root": snap["merkle_root"],
+            "results": [],
+        }
+
+    n_docs = len(docs)
+    avgdl = sum(d[4] for d in docs) / max(1, n_docs)
+    idf: dict[str, float] = {
+        st: math.log(1.0 + (n_docs - df_counts[st] + 0.5) / (df_counts[st] + 0.5))
+        for st in q_stem_set
+    }
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for kind, fname, rec, weighted_tf, doc_len, doc_vocab, full_text in docs:
+        matched_stems = q_stem_set & doc_vocab
+        if len(matched_stems) < min_overlap:
+            continue
+        bm25 = 0.0
+        norm_factor = _BM25_K1 * (1.0 - _BM25_B + _BM25_B * (doc_len / max(1.0, avgdl)))
+        for st in matched_stems:
+            tf_val = weighted_tf[st]
+            bm25 += idf[st] * ((tf_val * (_BM25_K1 + 1.0)) / (tf_val + norm_factor))
+
+        norm_doc_words = " ".join(_meaningful_tokens(full_text))
+        phrase_boost = 0.6 if (q_phrase and q_phrase in norm_doc_words) else 0.0
+        bigram_hits = sum(1 for bg in q_bigrams if bg in norm_doc_words) if q_bigrams else 0
+        bigram_boost = 0.25 * (bigram_hits / len(q_bigrams)) if q_bigrams else 0.0
+        coverage_bonus = 0.25 * (len(matched_stems) / max(1, len(q_stem_set)))
+        atom_bonus = 0.5 if kind == "atom" else 0.0
+        score = bm25 + coverage_bonus + phrase_boost + bigram_boost + atom_bonus
+
+        matched_surface = {stem_to_surface.get(st, st) for st in matched_stems}
         scored.append(
             (
                 score,
                 {
+                    "kind": kind,
                     "filename": fname,
-                    "atom_id": atom.get("atom_id", ""),
-                    "claim": claim,
-                    "contexts": contexts,
-                    "file_sha256": atom.get("file_sha256", ""),
+                    "atom_id": rec.get("atom_id", ""),
+                    "claim": str(rec.get("claim") or ""),
+                    "evidence": str(rec.get("evidence") or ""),
+                    "snippet": _matched_snippet(full_text, matched_surface),
+                    "contexts": list(rec.get("contexts") or []),
+                    "file_sha256": rec.get("file_sha256", ""),
+                    "matched_terms": sorted(matched_surface),
                     "score": round(score, 4),
                 },
             )
         )
-    scored.sort(key=lambda item: (-item[0], item[1]["filename"]))
+    scored.sort(key=lambda item: (-item[0], 0 if item[1]["kind"] == "atom" else 1, item[1]["filename"]))
     return {
         "snapshot_id": snap["snapshot_id"],
         "created_at": snap["created_at"],
         "merkle_root": snap["merkle_root"],
-        "results": [item[1] for item in scored[: max(1, min(top_k, 25))]],
+        "results": [item[1] for item in scored[: max(1, min(int(top_k), 25))]],
     }
 
 
@@ -365,11 +818,23 @@ def main(argv: list[str] | None = None) -> int:
     p_diff.add_argument("to_snapshot", nargs="?", default="live")
     p_diff.add_argument("--json", action="store_true")
 
-    p_recall = sub.add_parser("recall", help="Recall only verified atoms as of snapshot_id")
+    p_recall = sub.add_parser("recall", help="Recall only verified atoms/playbooks as of snapshot_id")
     p_recall.add_argument("snapshot_id")
     p_recall.add_argument("query")
     p_recall.add_argument("--project", default=None)
+    p_recall.add_argument("--limit", "--top-k", dest="top_k", type=int, default=5)
+    p_recall.add_argument("--include-preferences", action="store_true")
+    p_recall.add_argument("--no-playbooks", action="store_true")
     p_recall.add_argument("--json", action="store_true")
+
+    p_verify = sub.add_parser("verify", help="Verify cryptographic Merkle integrity of a snapshot")
+    p_verify.add_argument("snapshot_id")
+    p_verify.add_argument("--json", action="store_true")
+
+    p_export = sub.add_parser("export", help="Export verified snapshot Markdown manifest and claim cards")
+    p_export.add_argument("snapshot_id")
+    p_export.add_argument("out_dir")
+    p_export.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
     if args.cmd == "create":
@@ -382,11 +847,38 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "diff":
         res = diff_snapshots(args.from_snapshot, args.to_snapshot)
-        print(json.dumps(res, indent=2) if args.json else f"added={len(res['added_atoms'])} removed={len(res['removed_atoms'])} modified={len(res['modified_atoms'])}")
+        print(
+            json.dumps(res, indent=2)
+            if args.json
+            else f"added={len(res['added_atoms'])} removed={len(res['removed_atoms'])} modified={len(res['modified_atoms'])}"
+        )
         return 0
     if args.cmd == "recall":
-        res = recall_at_snapshot(args.query, args.snapshot_id, project_scope=args.project)
+        res = recall_at_snapshot(
+            args.query,
+            args.snapshot_id,
+            project_scope=args.project,
+            top_k=args.top_k,
+            include_preferences=args.include_preferences,
+            include_playbooks=not args.no_playbooks,
+        )
         print(json.dumps(res, indent=2) if args.json else f"{len(res['results'])} result(s) at {res['snapshot_id']}")
+        return 0
+    if args.cmd == "verify":
+        res = verify_snapshot(args.snapshot_id)
+        print(
+            json.dumps(res, indent=2)
+            if args.json
+            else f"snapshot={res['snapshot_id']} valid={res['valid']} merkle={res['computed_merkle_root'][:12]}"
+        )
+        return 0 if res["valid"] else 1
+    if args.cmd == "export":
+        res = export_snapshot(args.snapshot_id, args.out_dir)
+        print(
+            json.dumps(res, indent=2)
+            if args.json
+            else f"Exported {res['snapshot_id']} ({res['atom_count']} atom(s)) -> {res['out_dir']}"
+        )
         return 0
     return 1
 

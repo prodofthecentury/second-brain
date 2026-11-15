@@ -269,7 +269,6 @@ def commit_ledger_checkpoint(
         }
         payload["entry_sha256"] = _sha256_text(_canonical_json(payload))
 
-        existed_before = ledger_file.exists()
         encoded_line = (_canonical_json(payload) + "\n").encode("utf-8")
         fd = os.open(str(ledger_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o600)
         try:
@@ -278,8 +277,7 @@ def commit_ledger_checkpoint(
             os.fsync(fd)
         finally:
             os.close(fd)
-        if not existed_before:
-            restrict_security_file_permissions(ledger_file)
+        restrict_security_file_permissions(ledger_file)
         return payload
 
 
@@ -305,7 +303,11 @@ def verify_vault_ledger(
         "head_merkle_root": latest["merkle_root"] if latest else None,
         "live_merkle_root": merkle["merkle_root"],
         "live_leaf_count": merkle["leaf_count"],
+        "leaf_count": merkle["leaf_count"],
+        "approved_atoms": merkle["approved_atoms"],
+        "accepted_playbooks": merkle["accepted_playbooks"],
         "synced_with_head": synced_with_head,
+        "matches_latest_checkpoint": synced_with_head,
     }
 
 

@@ -2,7 +2,7 @@
 
 ## 1. Executive Verdict
 
-All engineering milestones across Goals 0–17 (`v0.2.0`) for the **Second Brain** local pilot and Phase 2 / 3A / 4 / 5 product ecosystem are implemented, independently audited, reconciled, and verified at **100% pass rate** (`11/11` test suites in `scripts/test_all.py`: `72/72` tests in `scripts/system_safety_tests.py`, `10/10` tests in `scripts/phase2_safety_tests.py`, `13/13` tests in `scripts/phase3_cognitive_tests.py`, `32/32` tests in `scripts/phase4_product_tests.py`, `10/10` tests in `scripts/phase5_god_features_tests.py`, plus `doctor`, `evaluation_dataset`, `audit_sources`, `scale_benchmark_1500`, `chroma_rebuild_canary`, and `smoke_test`). See [phase2-architecture-and-sweep-2026-11-15.md](phase2-architecture-and-sweep-2026-11-15.md), [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md), and [sota-benchmark-results-2026-11-15.json](sota-benchmark-results-2026-11-15.json) for Phase 2–5 architecture, comparative SOTA benchmark metrics, and security audit reconciliations.
+All engineering milestones across Goals 0–17 (`v0.2.0`) for the **Second Brain** local pilot and Phase 2 / 3A / 4 / 5 product ecosystem are implemented, independently audited, reconciled, and verified at **100% pass rate** (`12/12` test suites in `scripts/test_all.py`: `72/72` tests in `scripts/system_safety_tests.py`, `10/10` tests in `scripts/phase2_safety_tests.py`, `13/13` tests in `scripts/phase3_cognitive_tests.py`, `33/33` tests in `scripts/phase4_product_tests.py`, `11/11` tests in `scripts/phase5_god_features_tests.py`, plus `doctor`, `evaluation_dataset`, `audit_sources`, `scale_benchmark_1500`, `chroma_rebuild_canary`, `archive_manifest_canary`, and `smoke_test`). See [phase2-architecture-and-sweep-2026-11-15.md](phase2-architecture-and-sweep-2026-11-15.md), [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md), and [sota-benchmark-results-2026-11-15.json](sota-benchmark-results-2026-11-15.json) for Phase 2–5 architecture, comparative SOTA benchmark metrics, and security audit reconciliations.
 
 Every Non-Negotiable System Invariant holds unconditionally across CLI, Streamlit Dashboard, MCP, Scout, and Refinery entrypoints:
 
@@ -18,7 +18,7 @@ Every Non-Negotiable System Invariant holds unconditionally across CLI, Streamli
 
 - **Git Hygiene & History Audit (Milestone 1):**
   - Active branch `master` tracks code, lockfiles, tests, installers, and documentation cleanly (`brain/` and `tmp/` remain gitignored).
-  - Historical commit `bffca9e` (containing 18 legacy vault files with zero credentials/keys) was audited (`docs/git-history-audit-2026-11-15.md`), and an orphaned history-scrubbed branch `release-code-only` was verified for safe external distribution without rewriting local recovery history. No Git remote is configured (`git remote -v` is empty).
+  - Historical commit `bffca9e` (containing 18 legacy vault files with zero credentials/keys) was audited (see [codex-cli-handoff.md](codex-cli-handoff.md) and the Git safety/history note in [../README.md](../README.md)), and an orphaned history-scrubbed branch `release-code-only` was verified for safe external distribution without rewriting local recovery history. No Git remote is configured (`git remote -v` is empty).
 - **Locked Environment:** Python `3.11.15` on Windows x64 (`8` logical threads, `15.9 GiB` RAM, signed MSVC `vcruntime140.dll` verified), locked via `pyproject.toml` and `uv.lock` (`124` packages across core + `dashboard`, `online`, `mcp`, `scout`, `watchdog`, `evaluation`, and `dev` extras).
 - **Local Vault & Disposable Projections:**
   - `14` canonical atoms in `brain/2-atoms/`; `2` hold current, verifiable human owner approval (`structured-logging.md` SHA-256 `eced2407...`, `design-for-failure.md` SHA-256 `48a4570a...`). Per Operating Instruction #2 (*Never Fabricate Approvals or Citations*), unreviewed atoms (`sodium-ion-battery-cost-record.md` and pending drafts) remain `pending` until human owner sign-off.
@@ -76,7 +76,7 @@ Executed via `scripts/evaluate_answers.py` (`5` deterministic passes $\times$ `2
 ## 5. Milestone 4 & 6 — Security Hardening & Independent Adversarial Review
 
 ### Security Controls Verified by Live Penetration & Unit Tests
-- **MCP Boundary (`scripts/mcp_server.py`):** Unconditionally fail-closed `_meta`-only bearer token verification (`hmac.compare_digest`, $\ge 16$ chars, `0600` atomic token store, startup abort if unconfigured) runs *prior* to `audit_mcp_use()` and `ensure_dirs()`; loopback transport check blocks non-`127.0.0.1` environment variables; `get_atom` and `handle_read_resource` reject `pending`, `rejected`, `quarantined`, `merged`, and `superseded` atoms; `add_to_inbox` writes exclusively to `brain/0-raw/inbox/` (`O_CREAT | O_EXCL`, max `100,000` chars, control-byte & path-traversal sanitization).
+- **MCP Boundary (`scripts/mcp_server.py`):** Unconditionally fail-closed bearer token verification (`hmac.compare_digest`, $\ge 16$ chars, `0600` atomic token store, startup abort if unconfigured—authenticated via request `_meta` or `second-brain connect`'s `BRAIN_MCP_TRUSTED_STDIO=1` + `BRAIN_MCP_CLIENT_TOKEN` stdio handshake) runs *prior* to `audit_mcp_use()` and `ensure_dirs()`; loopback transport check blocks non-`127.0.0.1` environment variables; `get_atom` and `handle_read_resource` reject `pending`, `rejected`, `quarantined`, `merged`, and `superseded` atoms; working-note reads (`search_notes`, `get_note`) tag output as `<owner_notes untrusted="true">`; `add_to_inbox` (and risky `remember` captures) write exclusively to `brain/0-raw/inbox/` (`O_CREAT | O_EXCL`, max `100,000` chars, control-byte & path-traversal sanitization).
 - **Dashboard Boundary (`scripts/dashboard_auth.py`, `dashboard/app.py`):** Rejects `None`, `0.0.0.0`, and non-loopback binds (`assert_loopback_address`); enforces salted `scrypt` password verification, 30-minute idle timeout, manual lock, and thread-safe cross-session rate-limiting (`5` failures -> `60s` lockout); live penetration test (`test_non_loopback_binding_and_cross_origin_penetration_rejected`) launches Tornado/Streamlit and confirms `Origin: https://evil-attacker.example` WebSocket upgrades and forged `Host` headers receive `HTTP 403 Forbidden`. Untrusted vault/briefing/inbox previews render via `st.code` rather than raw Markdown to prevent outbound image beacons.
 - **Independent Adversarial Audit (`docs/independent-review-2026-11-15.md`):** Isolated read-only auditor `2a4e3faa-6244-4b81-8c9d-2b6e8a184782` performed a full-repo review. All `1` Critical, `3` High, `4` Medium, `4` Low, and `3` Informational findings were reconciled in code/docs and locked with dedicated regression tests (`IndependentAuditReconciliationTests` in `scripts/system_safety_tests.py`).
 
@@ -84,16 +84,18 @@ Executed via `scripts/evaluate_answers.py` (`5` deterministic passes $\times$ `2
 
 ## 6. Verification Ledger (2026-11-15)
 
-- `uv sync --reinstall-package second-brain --frozen` — **PASS** (`124` packages locked and verified).
-- `uv run --frozen python scripts/test_all.py --json-output brain/.sidecar/test-all-latest.json` — **10/10 SUITES PASS (`100% PASS` in `81.01s`)**:
-  1. `doctor` (`scripts/doctor.py`) — **PASS** (`4.20s`, `0` `FAIL` checks).
-  2. `evaluation_dataset` (`scripts/evaluation_dataset.py`) — **PASS** (`0.25s`, `30` cases across `regression`/`development`/`holdout`, SHA-256 revision bindings verified).
-  3. `audit_sources` (`scripts/audit_sources.py`) — **PASS** (`0.71s`, all approved source byte offsets & SHA-256 hashes verified).
-  4. `system_safety_tests` (`scripts/system_safety_tests.py`) — **PASS** (`22.85s`, `72` tests).
-  5. `phase2_safety_tests` (`scripts/phase2_safety_tests.py`) — **PASS** (`4.21s`, `10/10` tests; see [phase2-architecture-and-sweep-2026-11-15.md](phase2-architecture-and-sweep-2026-11-15.md)).
-  6. `phase3_cognitive_tests` (`scripts/phase3_cognitive_tests.py`) — **PASS** (`5.43s`, `13/13` tests; see [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md)).
-  7. `phase4_product_tests` (`scripts/phase4_product_tests.py`) — **PASS** (`8.56s`, `30/30` tests; see [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md)).
-  8. `scale_benchmark_1500` (`scripts/scale_benchmark.py`) — **PASS** (`3.38s`, 1,500-note synthetic corpus scale canary).
-  9. `chroma_rebuild_canary` (`scripts/chroma_rebuild_canary.py`) — **PASS** (`2.13s`, real ChromaDB staged rebuild & cleanup canary).
-  10. `smoke_test` (`scripts/smoke_test.py`) — **PASS** (`29.30s`, end-to-end vault intake, CAS, grounding, lexical & dense recall verified).
-- `powershell -ExecutionPolicy Bypass -File .\setup.ps1 -NoLaunch` — **PASS** (exit code `0`; verified OS/RAM/CPU/MSVC/GPU inspection, locked `uv` sync, Ollama check, vault/FTS5 init, `second-brain doctor`, and `scripts/doctor.py` with zero Git mutations).
+- `uv sync --locked --extra multimodal` — **PASS** (`127` packages locked and verified).
+- `uv run --frozen python scripts/test_all.py --json-output brain/.sidecar/test-all-latest.json` — **12/12 SUITES PASS (`100% PASS`)**:
+  1. `doctor` (`scripts/doctor.py`) — **PASS** (`0` `FAIL` checks).
+  2. `evaluation_dataset` (`scripts/evaluation_dataset.py`) — **PASS** (`30` cases across `regression`/`development`/`holdout`, SHA-256 revision bindings verified).
+  3. `audit_sources` (`scripts/audit_sources.py`) — **PASS** (all approved source byte offsets & SHA-256 hashes verified).
+  4. `system_safety_tests` (`scripts/system_safety_tests.py`) — **PASS** (`72/72` tests).
+  5. `phase2_safety_tests` (`scripts/phase2_safety_tests.py`) — **PASS** (`10/10` tests; see [phase2-architecture-and-sweep-2026-11-15.md](phase2-architecture-and-sweep-2026-11-15.md)).
+  6. `phase3_cognitive_tests` (`scripts/phase3_cognitive_tests.py`) — **PASS** (`13/13` tests; see [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md)).
+  7. `phase4_product_tests` (`scripts/phase4_product_tests.py`) — **PASS** (`33/33` tests; see [phase3a-and-phase4-architecture-2026-11-15.md](phase3a-and-phase4-architecture-2026-11-15.md)).
+  8. `phase5_god_features_tests` (`scripts/phase5_god_features_tests.py`) — **PASS** (`11/11` tests; desktop installers/tray, comparative SOTA benchmark, Merkle vault ledger, Contradiction & Drift Radar, Time-Travel BM25 snapshots & SDK parity).
+  9. `scale_benchmark_1500` (`scripts/scale_benchmark.py`) — **PASS** (1,500-note synthetic corpus scale canary).
+  10. `chroma_rebuild_canary` (`scripts/chroma_rebuild_canary.py`) — **PASS** (real ChromaDB staged rebuild & cleanup canary).
+  11. `archive_manifest_canary` (`scripts/archive_manifest_canary.py`) — **PASS** (immutable raw archive & manifest integrity canary).
+  12. `smoke_test` (`scripts/smoke_test.py`) — **PASS** (end-to-end vault intake, CAS, grounding, lexical & dense recall verified).
+- `powershell -ExecutionPolicy Bypass -File .\setup.ps1 -NoLaunch` — **PASS** (exit code `0`; verified OS/RAM/CPU/MSVC/GPU inspection, locked `uv` sync, Ollama check, vault/FTS5 init, `second-brain profile`, and `scripts/doctor.py` with zero Git mutations).

@@ -4,10 +4,20 @@ contextBridge.exposeInMainWorld("secondBrain", {
   getStatus: () => ipcRenderer.invoke("app:status"),
   request: (method, path, body = null) =>
     ipcRenderer.invoke("api:request", { method, path, body }),
-  streamChat: (payload) => ipcRenderer.invoke("api:streamChat", payload),
-  pickFolder: () => ipcRenderer.invoke("dialog:pickFolder"),
-  ideAction: (action, target = null) =>
-    ipcRenderer.invoke("ide:action", { action, target }),
+  api: (method, path, body = null) =>
+    ipcRenderer.invoke("api:request", { method, path, body }),
+  streamChat: (payload) => ipcRenderer.invoke("chat:stream", payload),
+  abortChat: () => ipcRenderer.invoke("chat:abort"),
+  cancelChat: () => ipcRenderer.invoke("chat:abort"),
+  pickFolder: () => ipcRenderer.invoke("dialog:pick-folder"),
+  switchVault: () => ipcRenderer.invoke("vault:switch"),
+  chooseVault: () => ipcRenderer.invoke("vault:switch"),
+  ideAction: (action, target = null, options = {}) =>
+    ipcRenderer.invoke("ide:action", {
+      action,
+      target,
+      options: options && typeof options === "object" ? options : {},
+    }),
   closeCapture: () => ipcRenderer.invoke("capture:close"),
   notifyMainRefresh: () => ipcRenderer.invoke("capture:saved"),
   onChatEvent: (callback) => {
@@ -17,7 +27,17 @@ contextBridge.exposeInMainWorld("secondBrain", {
   },
   onRefresh: (callback) => {
     const listener = () => callback();
-    ipcRenderer.on("vault:refresh", listener);
-    return () => ipcRenderer.removeListener("vault:refresh", listener);
+    ipcRenderer.on("app:refresh", listener);
+    return () => ipcRenderer.removeListener("app:refresh", listener);
+  },
+  onBackendStatus: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("sb:backend-status", listener);
+    return () => ipcRenderer.removeListener("sb:backend-status", listener);
+  },
+  onCaptureFocus: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("sb:capture-focus", listener);
+    return () => ipcRenderer.removeListener("sb:capture-focus", listener);
   },
 });

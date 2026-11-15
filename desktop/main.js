@@ -14,9 +14,18 @@ const fs = require("fs");
 const os = require("os");
 const net = require("net");
 const http = require("http");
+const { fileURLToPath } = require("url");
 const { spawn } = require("child_process");
 
-const isSmokeTest = process.argv.includes("--smoke-test");
+const IS_SMOKE_TEST = process.argv.includes("--smoke-test");
+const isSmokeTest = IS_SMOKE_TEST;
+const RENDERER_DIR = path.resolve(__dirname, "renderer");
+const EXPLICIT_ENV_VAULT_DIR = (process.env.BRAIN_VAULT_DIR || "").trim();
+
+const IDE_PRIVACY_NOTICE =
+  "When this host's AI uses Second Brain tools, the recalled verified memories and notes are sent to " +
+  "that host's model provider (for example Anthropic, OpenAI, or Google). Your vault itself stays on this " +
+  "machine, and agents can only add risk-scanned notes; they cannot verify or approve memories.";
 
 let mainWindow = null;
 let captureWindow = null;
@@ -25,6 +34,13 @@ let apiProcess = null;
 let apiPort = Number(process.env.SECOND_BRAIN_PORT || 0);
 let apiReady = false;
 let isQuitting = false;
+let activeChatReq = null;
+let activeVaultOverride = "";
+let backendStatus = {
+  state: "starting",
+  message: "Initializing Second Brain...",
+  apiPort: 0,
+};
 
 function getBackendRoot() {
   if (app.isPackaged) {
@@ -44,10 +60,14 @@ function getSecurityDir() {
   return path.join(stateHome, "SecondBrain", "security");
 }
 
-function readSafeTokenFile(filePath) {
+function readSafeSecurityFile(filePath, maxBytes = 4096) {
   try {
+    const parentStat = fs.lstatSync(path.dirname(filePath));
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+      return "";
+    }
     const st = fs.lstatSync(filePath);
-    if (!st.isFile() || st.isSymbolicLink() || st.size > 4096) {
+    if (!st.isFile() || st.isSymbolicLink() || st.size > maxBytes) {
       return "";
     }
     return fs.readFileSync(filePath, "utf8").trim();
@@ -58,17 +78,25 @@ function readSafeTokenFile(filePath) {
 
 function readTokens() {
   const secDir = getSecurityDir();
-  const apiTokenPath = (process.env.BRAIN_MEMORY_API_TOKEN_FILE || "").trim()
-    || path.join(secDir, "memory-api-token");
-  const ownerTokenPath = (process.env.BRAIN_OWNER_TOKEN_FILE || "").trim()
-    || path.join(secDir, "owner-token");
-  const apiToken = (process.env.BRAIN_MEMORY_API_TOKEN || "").trim()
-    || readSafeTokenFile(apiTokenPath);
-  const ownerToken = readSafeTokenFile(ownerTokenPath);
+  const apiTokenPath =
+    (process.env.BRAIN_MEMORY_API_TOKEN_FILE || "").trim() ||
+    path.join(secDir, "memory-api-token");
+  const ownerTokenPath =
+    (process.env.BRAIN_OWNER_TOKEN_FILE || "").trim() ||
+    path.join(secDir, "owner-token");
+  const ownerAltTokenPath = path.join(secDir, "owner-api-token");
+  const apiToken =
+    (process.env.BRAIN_MEMORY_API_TOKEN || "").trim() ||
+    readSafeSecurityFile(apiTokenPath);
+  const ownerToken =
+    (process.env.BRAIN_OWNER_TOKEN || "").trim() ||
+    (process.env.BRAIN_OWNER_API_TOKEN || "").trim() ||
+    readSafeSecurityFile(ownerTokenPath) ||
+    readSafeSecurityFile(ownerAltTokenPath);
   return { apiToken, ownerToken };
 }
 
-function findFreePort(preferred = 8765) {
+function findFreePort(preferred = 0) {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
     srv.unref();
@@ -95,7 +123,13 @@ function getDefaultPackagedVaultDir() {
     return path.join(localAppData, "SecondBrain", "brain");
   }
   if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", "SecondBrain", "brain");
+    return path.join(
+      os.homedir(),
+      "Library",
+      "Application Support",
+      "SecondBrain",
+      "brain"
+    );
   }
   const dataHome =
     process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
@@ -106,38 +140,100 @@ function getPackagedVenvDir() {
   return path.join(path.dirname(getDefaultPackagedVaultDir()), "venv");
 }
 
+function getVaultPointerPath() {
+  return path.join(getSecurityDir(), "vault-path.txt");
+}
+
 function resolveConfiguredVaultPointer() {
-  const pointerFile = path.join(path.dirname(getDefaultPackagedVaultDir()), "vault-path.txt");
-  const raw = readSafeTokenFile(pointerFile);
+  const pointerFile = getVaultPointerPath();
+  const raw = readSafeSecurityFile(pointerFile, 4096);
   if (!raw) return "";
   try {
     const resolved = path.resolve(raw);
-    const st = fs.lstatSync(resolved);
-    if (st.isDirectory() && !st.isSymbolicLink()) {
-      return resolved;
+    if (fs.existsSync(resolved)) {
+      const st = fs.lstatSync(resolved);
+      if (!st.isDirectory() || st.isSymbolicLink()) {
+        return "";
+      }
     }
-  } catch {}
-  return "";
+    return resolved;
+  } catch {
+    return "";
+  }
+}
+
+function getVaultDir() {
+  if (activeVaultOverride) {
+    return activeVaultOverride;
+  }
+  if (IS_SMOKE_TEST && EXPLICIT_ENV_VAULT_DIR) {
+    return path.resolve(EXPLICIT_ENV_VAULT_DIR);
+  }
+  if (!IS_SMOKE_TEST) {
+    const configured = resolveConfiguredVaultPointer();
+    if (configured) return configured;
+  }
+  if (EXPLICIT_ENV_VAULT_DIR) {
+    return path.resolve(EXPLICIT_ENV_VAULT_DIR);
+  }
+  if (app.isPackaged) {
+    return getDefaultPackagedVaultDir();
+  }
+  return path.join(getBackendRoot(), "brain");
+}
+
+function emitBackendStatus(state, message = "") {
+  backendStatus = {
+    state,
+    message,
+    apiPort,
+    ready: state === "ready",
+    vaultDir: getVaultDir(),
+  };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("sb:backend-status", backendStatus);
+  }
+  if (captureWindow && !captureWindow.isDestroyed()) {
+    captureWindow.webContents.send("sb:backend-status", backendStatus);
+  }
+}
+
+function notifyMainWindowRefresh() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("app:refresh");
+  }
 }
 
 function resolveUvBinary() {
   const explicit = (process.env.UV_BIN || "").trim();
   if (explicit && fs.existsSync(explicit)) return explicit;
   const home = os.homedir();
-  const candidates = process.platform === "win32"
-    ? [
-        path.join(home, ".local", "bin", "uv.exe"),
-        path.join(home, ".cargo", "bin", "uv.exe"),
-        path.join(process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"), "Microsoft", "WinGet", "Links", "uv.exe"),
-        path.join(process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"), "Programs", "uv", "uv.exe"),
-      ]
-    : [
-        path.join(home, ".local", "bin", "uv"),
-        path.join(home, ".cargo", "bin", "uv"),
-        "/opt/homebrew/bin/uv",
-        "/usr/local/bin/uv",
-        "/usr/bin/uv",
-      ];
+  const candidates =
+    process.platform === "win32"
+      ? [
+          path.join(home, ".local", "bin", "uv.exe"),
+          path.join(home, ".cargo", "bin", "uv.exe"),
+          path.join(
+            process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"),
+            "Microsoft",
+            "WinGet",
+            "Links",
+            "uv.exe"
+          ),
+          path.join(
+            process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"),
+            "Programs",
+            "uv",
+            "uv.exe"
+          ),
+        ]
+      : [
+          path.join(home, ".local", "bin", "uv"),
+          path.join(home, ".cargo", "bin", "uv"),
+          "/opt/homebrew/bin/uv",
+          "/usr/local/bin/uv",
+          "/usr/bin/uv",
+        ];
   for (const candidate of candidates) {
     try {
       if (fs.existsSync(candidate)) return candidate;
@@ -147,39 +243,93 @@ function resolveUvBinary() {
 }
 
 function getVenvPythonPath() {
-  const venvRoot = app.isPackaged ? getPackagedVenvDir() : path.join(getBackendRoot(), ".venv");
+  const venvRoot = app.isPackaged
+    ? getPackagedVenvDir()
+    : path.join(getBackendRoot(), ".venv");
   return process.platform === "win32"
     ? path.join(venvRoot, "Scripts", "python.exe")
     : path.join(venvRoot, "bin", "python");
 }
 
 function buildBackendEnv() {
-  const env = { ...process.env, PYTHONUTF8: "1" };
+  const activeVaultDir = getVaultDir();
+  try {
+    if (!fs.existsSync(activeVaultDir)) {
+      fs.mkdirSync(activeVaultDir, { recursive: true });
+    }
+  } catch {}
+  const env = {
+    ...process.env,
+    PYTHONUTF8: "1",
+    PYTHONDONTWRITEBYTECODE: "1",
+    BRAIN_VAULT_DIR: activeVaultDir,
+  };
   if (app.isPackaged) {
     env.UV_PROJECT_ENVIRONMENT = getPackagedVenvDir();
-    if (!env.BRAIN_VAULT_DIR) {
-      const configuredVault = resolveConfiguredVaultPointer() || getDefaultPackagedVaultDir();
-      fs.mkdirSync(configuredVault, { recursive: true });
-      env.BRAIN_VAULT_DIR = configuredVault;
-    }
   }
   return env;
 }
 
 function killProcessTree(proc) {
-  if (!proc) return;
-  const pid = proc.pid;
-  if (process.platform === "win32" && pid) {
+  apiReady = false;
+  if (!proc) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(fallbackTimer);
+        resolve();
+      }
+    };
+    const fallbackTimer = setTimeout(finish, 3000);
+
+    const waitClose = new Promise((resClose) => {
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        resClose();
+        return;
+      }
+      proc.once("close", () => resClose());
+      proc.once("exit", () => resClose());
+    });
+
+    const pid = proc.pid;
+    if (process.platform === "win32" && pid && proc.exitCode === null) {
+      let killerDone = false;
+      const onKillerExit = () => {
+        if (killerDone) return;
+        killerDone = true;
+        try {
+          if (proc.exitCode === null) proc.kill();
+        } catch {}
+        waitClose.then(finish);
+      };
+      try {
+        const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: "ignore",
+        });
+        killer.once("close", onKillerExit);
+        killer.once("error", onKillerExit);
+      } catch {
+        onKillerExit();
+      }
+      return;
+    }
+
     try {
-      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        windowsHide: true,
-        stdio: "ignore",
-      });
-    } catch (_) {}
-  }
-  try {
-    proc.kill();
-  } catch (_) {}
+      if (proc.exitCode === null) {
+        proc.kill("SIGTERM");
+        setTimeout(() => {
+          try {
+            if (proc.exitCode === null) proc.kill("SIGKILL");
+          } catch {}
+        }, 1200);
+      }
+    } catch {}
+    waitClose.then(finish);
+  });
 }
 
 function spawnBackendCli(args) {
@@ -194,12 +344,16 @@ function spawnBackendCli(args) {
       stdio: ["ignore", "pipe", "pipe"],
     });
   }
-  return spawn(resolveUvBinary(), ["--directory", root, "run", "--frozen", "python", ...args], {
-    cwd: root,
-    env,
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  return spawn(
+    resolveUvBinary(),
+    ["--directory", root, "run", "--frozen", "python", ...args],
+    {
+      cwd: root,
+      env,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  );
 }
 
 function runBackendCli(args) {
@@ -214,7 +368,9 @@ function runBackendCli(args) {
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
-        reject(new Error(stderr || stdout || `CLI exited with code ${code}`));
+        reject(
+          new Error((stderr || stdout || `CLI exited with code ${code}`).trim())
+        );
       }
     });
   });
@@ -222,13 +378,19 @@ function runBackendCli(args) {
 
 function runSpawnPromise(cmd, args, cwd, env) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args, { cwd, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(cmd, args, {
+      cwd,
+      env,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stderr = "";
     proc.stderr.on("data", (d) => (stderr += d.toString("utf8")));
     proc.on("error", reject);
     proc.on("close", (code) => {
       if (code === 0) resolve();
-      else reject(new Error(stderr || `${cmd} exited with code ${code}`));
+      else
+        reject(new Error((stderr || `${cmd} exited with code ${code}`).trim()));
     });
   });
 }
@@ -236,123 +398,278 @@ function runSpawnPromise(cmd, args, cwd, env) {
 async function ensureBackendBootstrapped() {
   const root = getBackendRoot();
   const venvPy = getVenvPythonPath();
-  if (fs.existsSync(venvPy)) {
-    return;
-  }
-  const env = buildBackendEnv();
-  if (app.isPackaged) {
-    fs.mkdirSync(path.dirname(getPackagedVenvDir()), { recursive: true });
-  }
-  try {
-    await runSpawnPromise(resolveUvBinary(), ["--directory", root, "sync", "--frozen"], root, env);
-  } catch (err) {
-    if (err && err.code === "ENOENT") {
-      if (process.platform === "win32") {
-        const ps1 = path.join(root, "setup.ps1");
-        if (fs.existsSync(ps1)) {
-          await runSpawnPromise(
-            "powershell.exe",
-            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-NoLaunch"],
-            root,
-            env
-          );
+  let freshlySynced = false;
+
+  if (!fs.existsSync(venvPy)) {
+    emitBackendStatus(
+      "bootstrapping",
+      "Preparing isolated Python environment..."
+    );
+    const env = buildBackendEnv();
+    if (app.isPackaged) {
+      fs.mkdirSync(path.dirname(getPackagedVenvDir()), { recursive: true });
+    }
+    try {
+      await runSpawnPromise(
+        resolveUvBinary(),
+        ["--directory", root, "sync", "--frozen"],
+        root,
+        env
+      );
+      freshlySynced = true;
+    } catch (err) {
+      if (err && err.code === "ENOENT") {
+        if (process.platform === "win32") {
+          const ps1 = path.join(root, "setup.ps1");
+          if (fs.existsSync(ps1)) {
+            await runSpawnPromise(
+              "powershell.exe",
+              [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                ps1,
+                "-NoLaunch",
+              ],
+              root,
+              env
+            );
+            freshlySynced = true;
+          }
+        } else {
+          const sh = path.join(root, "setup.sh");
+          if (fs.existsSync(sh)) {
+            await runSpawnPromise("bash", [sh, "--no-launch"], root, env);
+            freshlySynced = true;
+          }
         }
       } else {
-        const sh = path.join(root, "setup.sh");
-        if (fs.existsSync(sh)) {
-          await runSpawnPromise("bash", [sh, "--no-launch"], root, env);
-        }
+        throw err;
       }
-    } else {
-      throw err;
+    }
+  }
+
+  const lexicalDb = path.join(getVaultDir(), ".sidecar", "lexical.sqlite3");
+  if (freshlySynced || !fs.existsSync(lexicalDb)) {
+    try {
+      await runBackendCli(["scripts/cli.py", "install"]);
+    } catch {
+      // Non-fatal fallback: memory_api.py ensure_dirs() will still initialize core folders.
     }
   }
 }
 
-async function startApiSidecar() {
-  await ensureBackendBootstrapped();
-  if (!apiPort) {
-    apiPort = await findFreePort(8765);
-  }
-  apiReady = false;
-  if (apiProcess) {
-    killProcessTree(apiProcess);
-    apiProcess = null;
-  }
-
+function spawnMemoryApiOnce(requestedPort) {
   return new Promise((resolve, reject) => {
     const proc = spawnBackendCli([
       "scripts/memory_api.py",
+      "--host",
+      "127.0.0.1",
       "--port",
-      String(apiPort),
+      String(requestedPort),
       "--ensure-tokens",
     ]);
     apiProcess = proc;
 
     let settled = false;
+    let stdoutBuf = "";
+    let stderrTail = "";
     const timeout = setTimeout(() => {
       if (!settled) {
         settled = true;
-        reject(new Error("Timed out waiting for Second Brain API sidecar."));
+        const msg = "Timed out waiting for Second Brain API sidecar.";
+        emitBackendStatus("error", msg);
+        reject(new Error(msg));
       }
-    }, 20000);
+    }, 25000);
 
-    const checkLine = (chunk) => {
-      const text = chunk.toString("utf8");
-      if (text.includes("SECOND_BRAIN_API_READY") && !settled) {
-        settled = true;
-        apiReady = true;
-        clearTimeout(timeout);
-        refreshTrayMenu();
-        resolve(apiPort);
+    const inspectReadyLine = (line) => {
+      if (!line.includes("SECOND_BRAIN_API_READY") || settled) return;
+      const portMatch =
+        line.match(/\bport=(\d+)/) || line.match(/127\.0\.0\.1:(\d+)/);
+      const boundPort =
+        Number(portMatch?.[1] || 0) ||
+        (requestedPort > 0 ? Number(requestedPort) : 0);
+      settled = true;
+      clearTimeout(timeout);
+      if (!boundPort || boundPort <= 0) {
+        resolve({ proc, boundPort: 0 });
+        return;
+      }
+      apiPort = boundPort;
+      apiReady = true;
+      refreshTrayMenu();
+      emitBackendStatus(
+        "ready",
+        `Loopback Memory API ready on 127.0.0.1:${apiPort}`
+      );
+      resolve({ proc, boundPort });
+    };
+
+    const onStdoutChunk = (chunk) => {
+      stdoutBuf += chunk.toString("utf8");
+      const lines = stdoutBuf.split(/\r?\n/);
+      stdoutBuf = lines.pop() || "";
+      for (const ln of lines) {
+        inspectReadyLine(ln);
+      }
+      if (!settled && stdoutBuf.includes("SECOND_BRAIN_API_READY")) {
+        const portMatch = stdoutBuf.match(/\bport=(\d+)/);
+        if (portMatch) inspectReadyLine(stdoutBuf);
       }
     };
 
-    proc.stdout.on("data", checkLine);
+    proc.stdout.on("data", onStdoutChunk);
     proc.stderr.on("data", (chunk) => {
-      if (!settled && chunk.toString("utf8").includes("SECOND_BRAIN_API_READY")) {
-        checkLine(chunk);
+      const text = chunk.toString("utf8");
+      stderrTail = (stderrTail + text).slice(-600);
+      for (const ln of text.split(/\r?\n/)) {
+        if (!settled && ln.includes("SECOND_BRAIN_API_READY")) {
+          inspectReadyLine(ln);
+        }
       }
     });
     proc.on("error", (err) => {
       if (!settled) {
         settled = true;
         clearTimeout(timeout);
+        const msg = err?.message || String(err);
+        emitBackendStatus("error", `API sidecar failed to spawn: ${msg}`);
         reject(err);
       }
     });
     proc.on("close", (code) => {
-      apiReady = false;
+      const wasReady = apiReady && apiProcess === proc;
       if (apiProcess === proc) {
+        apiReady = false;
         apiProcess = null;
       }
       refreshTrayMenu();
+      const detail = stderrTail.trim()
+        ? ` (${stderrTail.trim().split(/\r?\n/).pop()})`
+        : "";
       if (!settled) {
         settled = true;
         clearTimeout(timeout);
-        reject(new Error(`API sidecar exited early with code ${code}`));
+        const msg = `API sidecar exited early with code ${code}${detail}`;
+        emitBackendStatus("error", msg);
+        reject(new Error(msg));
+      } else if (wasReady && !isQuitting) {
+        emitBackendStatus(
+          "error",
+          `Memory API stopped (exit code ${code})${detail}`
+        );
       }
     });
   });
 }
 
-function getVaultDir() {
-  if (process.env.BRAIN_VAULT_DIR) {
-    return path.resolve(process.env.BRAIN_VAULT_DIR);
-  }
-  if (app.isPackaged) {
-    return resolveConfiguredVaultPointer() || getDefaultPackagedVaultDir();
-  }
-  return path.join(getBackendRoot(), "brain");
-}
-
-function stopApiSidecar() {
+async function startApiSidecar() {
   if (apiProcess) {
-    killProcessTree(apiProcess);
+    const prev = apiProcess;
     apiProcess = null;
+    await killProcessTree(prev);
   }
   apiReady = false;
   refreshTrayMenu();
+
+  try {
+    await ensureBackendBootstrapped();
+  } catch (err) {
+    const msg = err?.message || String(err);
+    emitBackendStatus("error", `Bootstrap failed: ${msg}`);
+    throw err;
+  }
+
+  const configuredPort = Number(process.env.SECOND_BRAIN_PORT || 0);
+  const initialPortArg = configuredPort === 0 ? 0 : configuredPort;
+  apiPort = configuredPort > 0 ? configuredPort : 0;
+  emitBackendStatus(
+    "starting",
+    configuredPort > 0
+      ? `Starting loopback Memory API on 127.0.0.1:${configuredPort}...`
+      : "Starting loopback Memory API on ephemeral loopback port..."
+  );
+
+  const firstAttempt = await spawnMemoryApiOnce(initialPortArg);
+  if (firstAttempt.boundPort > 0) {
+    return firstAttempt.boundPort;
+  }
+
+  // Fallback if an older memory_api.py printed port=0 without reporting its ephemeral socket port
+  if (firstAttempt.proc) {
+    apiProcess = null;
+    await killProcessTree(firstAttempt.proc);
+  }
+  const fallbackPort = await findFreePort(0);
+  const secondAttempt = await spawnMemoryApiOnce(fallbackPort);
+  return secondAttempt.boundPort;
+}
+
+async function stopApiSidecar() {
+  apiReady = false;
+  if (apiProcess) {
+    const proc = apiProcess;
+    apiProcess = null;
+    await killProcessTree(proc);
+  }
+  apiPort = Number(process.env.SECOND_BRAIN_PORT || 0);
+  refreshTrayMenu();
+  if (!isQuitting) {
+    emitBackendStatus("error", "Memory API stopped by owner.");
+  }
+}
+
+const startApiServer = startApiSidecar;
+const stopApiServer = stopApiSidecar;
+
+async function chooseVaultDirectory() {
+  const res = await dialog.showOpenDialog(mainWindow || undefined, {
+    title: "Select Second Brain Vault Folder",
+    defaultPath: getVaultDir(),
+    properties: ["openDirectory", "createDirectory"],
+  });
+  if (res.canceled || !res.filePaths || !res.filePaths[0]) {
+    return { ok: false, canceled: true, vaultDir: getVaultDir() };
+  }
+  const vaultDir = path.resolve(res.filePaths[0]);
+  const st = fs.lstatSync(vaultDir);
+  if (!st.isDirectory() || st.isSymbolicLink()) {
+    throw new Error(
+      "Selected vault path must be a real folder (not a symlink)."
+    );
+  }
+  const pointerFile = getVaultPointerPath();
+  const secDir = path.dirname(pointerFile);
+  fs.mkdirSync(secDir, { recursive: true, mode: 0o700 });
+  if (fs.lstatSync(secDir).isSymbolicLink()) {
+    throw new Error("Refusing to write vault-path.txt under a symlinked security directory.");
+  }
+  if (fs.existsSync(pointerFile) && fs.lstatSync(pointerFile).isSymbolicLink()) {
+    throw new Error("Refusing to write vault-path.txt through a symlink.");
+  }
+  fs.writeFileSync(pointerFile, `${vaultDir}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  activeVaultOverride = vaultDir;
+
+  await stopApiServer();
+  try {
+    await startApiServer();
+  } catch (err) {
+    const msg = err?.message || String(err);
+    emitBackendStatus(
+      "error",
+      `Switched vault folder, but API restart failed: ${msg}`
+    );
+    refreshTrayMenu();
+    return { ok: false, error: msg, vaultDir };
+  }
+  refreshTrayMenu();
+  notifyMainWindowRefresh();
+  return { ok: true, vaultDir, port: apiPort };
 }
 
 const ALLOWED_HTTP_METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
@@ -362,14 +679,33 @@ function apiRequest(method, apiPath, body = null) {
   if (!ALLOWED_HTTP_METHODS.has(safeMethod)) {
     return Promise.reject(new Error(`Disallowed HTTP method: ${String(method)}`));
   }
-  if (typeof apiPath !== "string" || !apiPath.startsWith("/v1/") || /[\s\r\n]/.test(apiPath)) {
+  if (
+    typeof apiPath !== "string" ||
+    !apiPath.startsWith("/v1/") ||
+    /[\s\r\n]/.test(apiPath)
+  ) {
     return Promise.reject(new Error(`Disallowed API path: ${String(apiPath)}`));
   }
-  method = safeMethod;
+  if (
+    !apiReady ||
+    !apiProcess ||
+    apiProcess.exitCode !== null ||
+    isQuitting ||
+    !apiPort
+  ) {
+    return Promise.resolve({
+      ok: false,
+      status: 503,
+      data: { error: "Memory API sidecar is not running." },
+    });
+  }
+
+  const targetPort = apiPort;
   const { apiToken, ownerToken } = readTokens();
-  const payload = body !== null && body !== undefined ? JSON.stringify(body) : null;
+  const payload =
+    body !== null && body !== undefined ? JSON.stringify(body) : null;
   const headers = {
-    Host: `127.0.0.1:${apiPort}`,
+    Host: `127.0.0.1:${targetPort}`,
     Accept: "application/json",
   };
   if (apiToken) headers["Authorization"] = `Bearer ${apiToken}`;
@@ -379,13 +715,13 @@ function apiRequest(method, apiPath, body = null) {
     headers["Content-Length"] = Buffer.byteLength(payload, "utf8");
   }
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const req = http.request(
       {
         hostname: "127.0.0.1",
-        port: apiPort,
+        port: targetPort,
         path: apiPath,
-        method,
+        method: safeMethod,
         headers,
       },
       (res) => {
@@ -399,21 +735,79 @@ function apiRequest(method, apiPath, body = null) {
           } catch {
             data = { raw };
           }
-          resolve({ status: res.statusCode || 500, ok: res.statusCode >= 200 && res.statusCode < 300, data });
+          resolve({
+            status: res.statusCode || 500,
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            data,
+          });
         });
       }
     );
-    req.on("error", reject);
+    req.setTimeout(45000, () => {
+      req.destroy(new Error("API request timed out after 45s."));
+    });
+    req.on("error", (err) => {
+      if (isQuitting || !apiReady || !apiProcess || apiProcess.exitCode !== null) {
+        resolve({
+          ok: false,
+          status: 503,
+          data: { error: "Memory API sidecar is not running." },
+        });
+        return;
+      }
+      resolve({
+        ok: false,
+        status: 503,
+        data: { error: err?.message || "Local Memory API request failed." },
+      });
+    });
     if (payload !== null) req.write(payload);
     req.end();
   });
 }
 
+function abortActiveChatStream() {
+  if (activeChatReq) {
+    activeChatReq._cancelled = true;
+    try {
+      activeChatReq.destroy();
+    } catch {}
+    activeChatReq = null;
+    return { ok: true, cancelled: true };
+  }
+  return { ok: true, cancelled: false };
+}
+
 function streamChat(sender, payload) {
+  if (
+    !apiReady ||
+    !apiProcess ||
+    apiProcess.exitCode !== null ||
+    isQuitting ||
+    !apiPort
+  ) {
+    const errMsg = "Memory API sidecar is not running.";
+    if (sender && !sender.isDestroyed()) {
+      sender.send("chat:event", {
+        event: "error",
+        data: { error: errMsg, status: 503 },
+      });
+    }
+    return Promise.resolve({
+      ok: false,
+      status: 503,
+      data: { error: errMsg },
+      error: errMsg,
+    });
+  }
+  if (activeChatReq) {
+    abortActiveChatStream();
+  }
+  const targetPort = apiPort;
   const { apiToken, ownerToken } = readTokens();
-  const rawBody = JSON.stringify(payload);
+  const rawBody = JSON.stringify(payload || {});
   const headers = {
-    Host: `127.0.0.1:${apiPort}`,
+    Host: `127.0.0.1:${targetPort}`,
     Accept: "text/event-stream",
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(rawBody, "utf8"),
@@ -421,11 +815,11 @@ function streamChat(sender, payload) {
   if (apiToken) headers["Authorization"] = `Bearer ${apiToken}`;
   if (ownerToken) headers["X-Owner-Token"] = ownerToken;
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const req = http.request(
       {
         hostname: "127.0.0.1",
-        port: apiPort,
+        port: targetPort,
         path: "/v1/chat/stream",
         method: "POST",
         headers,
@@ -436,13 +830,24 @@ function streamChat(sender, payload) {
           let errRaw = "";
           res.on("data", (chunk) => (errRaw += chunk));
           res.on("end", () => {
+            if (activeChatReq === req) activeChatReq = null;
             let errMsg = `HTTP ${res.statusCode || 500}`;
             try {
               const parsedErr = errRaw ? JSON.parse(errRaw) : {};
               if (parsedErr && parsedErr.error) errMsg = String(parsedErr.error);
             } catch {}
-            sender.send("chat:event", { event: "error", data: { error: errMsg, status: res.statusCode } });
-            resolve({ ok: false, status: res.statusCode, error: errMsg });
+            if (!sender.isDestroyed()) {
+              sender.send("chat:event", {
+                event: "error",
+                data: { error: errMsg, status: res.statusCode },
+              });
+            }
+            resolve({
+              ok: false,
+              status: res.statusCode,
+              data: { error: errMsg },
+              error: errMsg,
+            });
           });
           return;
         }
@@ -461,18 +866,93 @@ function streamChat(sender, payload) {
               try {
                 parsed = JSON.parse(rawData);
               } catch {}
-              sender.send("chat:event", { event: currentEvent, data: parsed });
+              if (!sender.isDestroyed()) {
+                sender.send("chat:event", {
+                  event: currentEvent,
+                  data: parsed,
+                });
+              }
               currentEvent = "message";
             }
           }
         });
-        res.on("end", () => resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode }));
+        res.on("end", () => {
+          if (activeChatReq === req) activeChatReq = null;
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+          });
+        });
       }
     );
-    req.on("error", reject);
+
+    activeChatReq = req;
+    req.setTimeout(90000, () => {
+      req._timedOut = true;
+      req.destroy(new Error("Chat stream timed out after 90 seconds."));
+    });
+
+    req.on("error", (err) => {
+      if (activeChatReq === req) activeChatReq = null;
+      if (req._cancelled) {
+        if (!sender.isDestroyed()) {
+          sender.send("chat:event", {
+            event: "cancelled",
+            data: { cancelled: true },
+          });
+        }
+        resolve({ ok: false, cancelled: true });
+        return;
+      }
+      const errMsg = req._timedOut
+        ? "Chat stream timed out after 90 seconds."
+        : err?.message || String(err);
+      if (!sender.isDestroyed()) {
+        sender.send("chat:event", {
+          event: "error",
+          data: { error: errMsg },
+        });
+      }
+      resolve({ ok: false, status: 503, data: { error: errMsg }, error: errMsg });
+    });
+
     req.write(rawBody);
     req.end();
   });
+}
+
+function assertTrustedRenderer(event, { allowCapture = false } = {}) {
+  const frameUrl = event?.senderFrame?.url || "";
+  if (typeof frameUrl !== "string" || !frameUrl.startsWith("file://")) {
+    throw new Error("403 Forbidden: untrusted IPC sender origin.");
+  }
+  let resolvedFile = "";
+  try {
+    resolvedFile = path.resolve(fileURLToPath(frameUrl));
+  } catch {
+    throw new Error("403 Forbidden: invalid IPC sender file URL.");
+  }
+  const normFile =
+    process.platform === "win32" ? resolvedFile.toLowerCase() : resolvedFile;
+  const normRendererRoot =
+    (process.platform === "win32" ? RENDERER_DIR.toLowerCase() : RENDERER_DIR) +
+    path.sep;
+  if (!normFile.startsWith(normRendererRoot)) {
+    throw new Error(
+      "403 Forbidden: IPC sender must reside inside desktop/renderer/."
+    );
+  }
+  const isFromCapture = Boolean(
+    captureWindow &&
+      !captureWindow.isDestroyed() &&
+      event.sender === captureWindow.webContents
+  );
+  if (isFromCapture && !allowCapture) {
+    throw new Error(
+      "403 Forbidden: IPC action is restricted from Quick Capture window."
+    );
+  }
+  return { isFromCapture };
 }
 
 function hardenWindowNavigation(win) {
@@ -484,12 +964,13 @@ function hardenWindowNavigation(win) {
 
 function createMainWindow() {
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 820,
-    minWidth: 960,
-    minHeight: 640,
+    width: 1320,
+    height: 860,
+    minWidth: 980,
+    minHeight: 660,
     title: "Second Brain",
     backgroundColor: "#0d1117",
+    show: !IS_SMOKE_TEST,
     icon: path.join(__dirname, "assets", "icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -499,21 +980,27 @@ function createMainWindow() {
     },
   });
 
-  mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
   hardenWindowNavigation(mainWindow);
+  mainWindow.webContents.on("did-finish-load", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("sb:backend-status", backendStatus);
+    }
+  });
   mainWindow.on("close", (event) => {
     if (!isQuitting && !isSmokeTest) {
       event.preventDefault();
       mainWindow.hide();
     }
   });
+  mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
+  return mainWindow;
 }
 
 function toggleCaptureWindow() {
   if (!captureWindow) {
     captureWindow = new BrowserWindow({
-      width: 560,
-      height: 300,
+      width: 580,
+      height: 380,
       frame: false,
       resizable: false,
       alwaysOnTop: true,
@@ -526,11 +1013,21 @@ function toggleCaptureWindow() {
         sandbox: true,
       },
     });
-    captureWindow.loadFile(path.join(__dirname, "renderer", "capture.html"));
     hardenWindowNavigation(captureWindow);
+    captureWindow.webContents.on("did-finish-load", () => {
+      if (captureWindow && !captureWindow.isDestroyed()) {
+        captureWindow.webContents.send("sb:backend-status", backendStatus);
+        captureWindow.webContents.send("sb:capture-focus");
+      }
+    });
     captureWindow.on("closed", () => {
       captureWindow = null;
     });
+    captureWindow.loadFile(path.join(__dirname, "renderer", "capture.html"));
+    captureWindow.center();
+    captureWindow.show();
+    captureWindow.focus();
+    return;
   }
   if (captureWindow.isVisible()) {
     captureWindow.hide();
@@ -538,18 +1035,24 @@ function toggleCaptureWindow() {
     captureWindow.center();
     captureWindow.show();
     captureWindow.focus();
+    captureWindow.webContents.send("sb:backend-status", backendStatus);
+    captureWindow.webContents.send("sb:capture-focus");
   }
 }
 
 function refreshTrayMenu() {
   if (!tray) return;
-  const statusLabel = apiReady && apiPort
-    ? `Memory API: Running (127.0.0.1:${apiPort})`
-    : "Memory API: Stopped";
+  const statusLabel =
+    apiReady && apiPort
+      ? `Memory API: Running (127.0.0.1:${apiPort})`
+      : backendStatus.state === "starting" ||
+        backendStatus.state === "bootstrapping"
+      ? "Memory API: Starting..."
+      : "Memory API: Stopped";
   let openAtLogin = false;
   try {
     openAtLogin = Boolean(app.getLoginItemSettings().openAtLogin);
-  } catch (_) {}
+  } catch {}
 
   const contextMenu = Menu.buildFromTemplate([
     { label: statusLabel, enabled: false },
@@ -575,19 +1078,39 @@ function refreshTrayMenu() {
         shell.openPath(vaultPath);
       },
     },
+    {
+      label: "Switch Vault Folder…",
+      click: () => {
+        chooseVaultDirectory().catch((err) => {
+          emitBackendStatus(
+            "error",
+            `Vault switch failed: ${err?.message || String(err)}`
+          );
+        });
+      },
+    },
     { type: "separator" },
     {
       label: apiReady ? "Restart Memory API" : "Start Memory API",
       click: async () => {
-        await startApiSidecar().catch(() => {});
-        refreshTrayMenu();
-        if (mainWindow) mainWindow.webContents.send("vault:refresh");
+        try {
+          await stopApiServer();
+          await startApiServer();
+          refreshTrayMenu();
+          notifyMainWindowRefresh();
+        } catch (err) {
+          const msg = err?.message || String(err);
+          emitBackendStatus("error", `Restart failed: ${msg}`);
+          refreshTrayMenu();
+        }
       },
     },
     {
       label: "Stop Memory API",
       enabled: Boolean(apiProcess || apiReady),
-      click: () => stopApiSidecar(),
+      click: () => {
+        stopApiSidecar().catch(() => {});
+      },
     },
     {
       label: "Launch at Login",
@@ -596,7 +1119,7 @@ function refreshTrayMenu() {
       click: (menuItem) => {
         try {
           app.setLoginItemSettings({ openAtLogin: Boolean(menuItem.checked) });
-        } catch (_) {}
+        } catch {}
         refreshTrayMenu();
       },
     },
@@ -614,7 +1137,9 @@ function refreshTrayMenu() {
 }
 
 function createTray() {
-  const icon = nativeImage.createFromPath(path.join(__dirname, "assets", "icon.png"));
+  const icon = nativeImage.createFromPath(
+    path.join(__dirname, "assets", "icon.png")
+  );
   tray = new Tray(icon.resize({ width: 16, height: 16 }));
   refreshTrayMenu();
   tray.on("double-click", () => {
@@ -625,87 +1150,190 @@ function createTray() {
   });
 }
 
-ipcMain.handle("app:status", () => ({
-  port: apiPort,
-  ready: apiReady,
-  apiUrl: `http://127.0.0.1:${apiPort}`,
-  backendRoot: getBackendRoot(),
-}));
-
-ipcMain.handle("api:request", async (_event, { method, path: apiPath, body }) => {
-  return apiRequest(method, apiPath, body);
+ipcMain.handle("app:status", (event) => {
+  assertTrustedRenderer(event, { allowCapture: true });
+  return {
+    port: apiPort,
+    ready: Boolean(
+      apiReady && apiProcess && apiProcess.exitCode === null && !isQuitting
+    ),
+    apiUrl: apiPort ? `http://127.0.0.1:${apiPort}` : "",
+    backendRoot: getBackendRoot(),
+    vaultDir: getVaultDir(),
+    backendStatus,
+  };
 });
 
-ipcMain.handle("api:streamChat", async (event, payload) => {
+ipcMain.handle("api:request", async (event, payload = {}) => {
+  const { isFromCapture } = assertTrustedRenderer(event, { allowCapture: true });
+  const { method, path: apiPath, body } =
+    payload && typeof payload === "object" ? payload : {};
+  const safeMethod = String(method || "").toUpperCase();
+  if (isFromCapture) {
+    if (
+      safeMethod !== "POST" ||
+      (apiPath !== "/v1/notes" && apiPath !== "/v1/inbox")
+    ) {
+      throw new Error(
+        "403 Forbidden: Quick Capture window may only invoke POST /v1/notes or POST /v1/inbox."
+      );
+    }
+  }
+  return apiRequest(safeMethod, apiPath, body);
+});
+
+const handleStreamChatIpc = async (event, payload) => {
+  assertTrustedRenderer(event, { allowCapture: false });
   return streamChat(event.sender, payload);
-});
+};
+ipcMain.handle("chat:stream", handleStreamChatIpc);
+ipcMain.handle("api:streamChat", handleStreamChatIpc);
 
-ipcMain.handle("dialog:pickFolder", async () => {
-  const res = await dialog.showOpenDialog(mainWindow, {
+const handleAbortChatIpc = (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  return abortActiveChatStream();
+};
+ipcMain.handle("chat:abort", handleAbortChatIpc);
+ipcMain.handle("sb:cancel-stream", handleAbortChatIpc);
+
+const handleSwitchVaultIpc = async (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  return chooseVaultDirectory();
+};
+ipcMain.handle("vault:switch", handleSwitchVaultIpc);
+ipcMain.handle("sb:choose-vault", handleSwitchVaultIpc);
+
+const handlePickFolderIpc = async (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  const res = await dialog.showOpenDialog(mainWindow || undefined, {
     properties: ["openDirectory"],
   });
   return res.canceled ? null : res.filePaths[0];
-});
+};
+ipcMain.handle("dialog:pick-folder", handlePickFolderIpc);
+ipcMain.handle("dialog:pickFolder", handlePickFolderIpc);
 
 const ALLOWED_IDE_ACTIONS = new Set(["status", "add", "remove"]);
 const IDE_TARGET_RE = /^[a-z0-9-]+$/;
 
-ipcMain.handle("ide:action", async (_event, payload = {}) => {
-  const { action, target } = payload && typeof payload === "object" ? payload : {};
+ipcMain.handle("ide:action", async (event, payload = {}) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  const safePayload = payload && typeof payload === "object" ? payload : {};
+  const { action, target } = safePayload;
+  const options =
+    safePayload.options && typeof safePayload.options === "object"
+      ? safePayload.options
+      : safePayload;
+  const confirmPrivacy = options?.confirmPrivacy === true;
+
   if (!ALLOWED_IDE_ACTIONS.has(action)) {
     throw new Error(`Disallowed IDE action: ${String(action)}`);
   }
   if (action === "add" || action === "remove") {
-    if (typeof target !== "string" || target.startsWith("-") || !IDE_TARGET_RE.test(target)) {
+    if (
+      typeof target !== "string" ||
+      target.startsWith("-") ||
+      !IDE_TARGET_RE.test(target)
+    ) {
       throw new Error(`Invalid IDE target: ${String(target)}`);
     }
   } else if (target !== undefined && target !== null && target !== "") {
-    if (typeof target !== "string" || target.startsWith("-") || !IDE_TARGET_RE.test(target)) {
+    if (
+      typeof target !== "string" ||
+      target.startsWith("-") ||
+      !IDE_TARGET_RE.test(target)
+    ) {
       throw new Error(`Invalid IDE target: ${String(target)}`);
     }
   }
+  if (action === "add" && !confirmPrivacy) {
+    throw new Error(
+      "Privacy notice confirmation is required before connecting an external IDE host."
+    );
+  }
   const args = ["scripts/ide_connector.py", action];
   if (target && action !== "status") args.push(target);
-  if (action === "add") args.push("--yes");
+  if (action === "add" && options?.confirmPrivacy === true) {
+    args.push("--yes");
+  }
   args.push("--json");
   const { stdout } = await runBackendCli(args);
-  return JSON.parse(stdout);
+  const parsed = JSON.parse(stdout);
+  if (action === "status" && parsed && typeof parsed === "object") {
+    parsed.privacy_notice = IDE_PRIVACY_NOTICE;
+  }
+  return parsed;
 });
 
-ipcMain.handle("capture:close", () => {
-  if (captureWindow) captureWindow.hide();
+ipcMain.handle("capture:close", (event) => {
+  assertTrustedRenderer(event, { allowCapture: true });
+  if (captureWindow && !captureWindow.isDestroyed()) {
+    captureWindow.hide();
+  }
 });
 
-ipcMain.handle("capture:saved", () => {
-  if (mainWindow) mainWindow.webContents.send("vault:refresh");
+ipcMain.handle("capture:saved", (event) => {
+  assertTrustedRenderer(event, { allowCapture: true });
+  notifyMainWindowRefresh();
 });
 
 app.whenReady().then(async () => {
-  try {
-    await startApiSidecar();
-  } catch (err) {
-    console.error("Failed to start API sidecar:", err);
+  if (IS_SMOKE_TEST) {
+    try {
+      await startApiSidecar();
+    } catch (err) {
+      console.error("Failed to start API sidecar:", err);
+    }
+    const win = createMainWindow();
+    await new Promise((resolve) => {
+      if (!win || win.isDestroyed() || !win.webContents.isLoading()) {
+        resolve();
+      } else {
+        win.webContents.once("did-finish-load", resolve);
+      }
+    });
+    const health = await apiRequest("GET", "/v1/health").catch((e) => ({
+      ok: false,
+      error: String(e),
+    }));
+    console.log(
+      "ELECTRON_SMOKE_RESULT",
+      JSON.stringify({ apiPort, apiReady, health })
+    );
+    isQuitting = true;
+    apiReady = false;
+    abortActiveChatStream();
+    if (apiProcess) {
+      const proc = apiProcess;
+      apiProcess = null;
+      await killProcessTree(proc);
+    }
+    app.exit(0);
+    return;
   }
 
   createMainWindow();
-  if (!isSmokeTest) {
-    createTray();
-    globalShortcut.register("CommandOrControl+Shift+Space", toggleCaptureWindow);
-  }
+  createTray();
+  globalShortcut.register("CommandOrControl+Shift+Space", toggleCaptureWindow);
 
-  if (isSmokeTest) {
-    const health = await apiRequest("GET", "/v1/health").catch((e) => ({ ok: false, error: String(e) }));
-    console.log("ELECTRON_SMOKE_RESULT", JSON.stringify({ apiPort, apiReady, health }));
-    isQuitting = true;
-    app.quit();
-  }
+  startApiSidecar()
+    .then(() => {
+      notifyMainWindowRefresh();
+    })
+    .catch((err) => {
+      console.error("Failed to start API sidecar:", err);
+      emitBackendStatus("error", err?.message || String(err));
+    });
 });
 
 app.on("before-quit", () => {
   isQuitting = true;
+  apiReady = false;
+  abortActiveChatStream();
   globalShortcut.unregisterAll();
   if (apiProcess) {
-    killProcessTree(apiProcess);
+    const proc = apiProcess;
     apiProcess = null;
+    killProcessTree(proc).catch(() => {});
   }
 });

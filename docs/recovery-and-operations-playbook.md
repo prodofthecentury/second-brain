@@ -155,13 +155,15 @@ uv run --frozen python scripts/review_atom.py transition quarantine <atom>.md --
 
 ### 6.2 MCP Fail-Closed Bearer Token & Quarantined Inbox
 - MCP is disabled unless `BRAIN_ENABLE_LOCAL_MCP=1` is set and **fails closed** without a configured local bearer token (`>= 16` chars, generated as 64-hex CSPRNG and compared via `hmac.compare_digest`).
-- Clients must present the bearer token exclusively via MCP request `_meta` (`authorization: Bearer <token>`), **never** inside tool `arguments`.
+- Clients authenticate via one of two constant-time paths (**never** inside tool `arguments`):
+  1. **Per-request MCP `_meta` bearer header:** `authorization: Bearer <token>` inside request `_meta`.
+  2. **Phase 4 local stdio handshake (`second-brain connect`):** `BRAIN_MCP_TRUSTED_STDIO=1` paired with `BRAIN_MCP_CLIENT_TOKEN=<token>` injected into the local IDE's stdio server environment (`second-brain connect {add,remove,status}`).
 - Generate a 256-bit local bearer token (stored with `0600` permissions in `%LOCALAPPDATA%/SecondBrain/security/mcp-token` on Windows or `$XDG_STATE_HOME/SecondBrain/security/mcp-token`, defaulting to `~/.local/state/SecondBrain/security/mcp-token`, on Linux):
   ```bash
   BRAIN_ENABLE_LOCAL_MCP=1 uv run --frozen python scripts/mcp_server.py --generate-token
   ```
 - Scope allowed MCP tools via `BRAIN_MCP_ALLOWED_TOOLS` (e.g., `search_memory,get_atom`).
-- All `add_to_inbox` captures write exclusively to `brain/0-raw/inbox/` with sticky `<!-- second_brain_origin: mcp_local -->` provenance, path-traversal blocking, null-byte rejection, and a 100,000-character limit. Quarantined inbox captures remain isolated from automatic Refinery runs until explicitly reviewed and promoted by the owner into `brain/0-raw/`.
+- All `add_to_inbox` captures (and risky/secret `remember` payloads) write exclusively to `brain/0-raw/inbox/` with sticky provenance, path-traversal blocking, null-byte rejection, and a 100,000-character limit. Quarantined inbox captures remain isolated from automatic Refinery runs until explicitly reviewed and promoted by the owner into `brain/0-raw/`.
 
 ---
 
@@ -169,7 +171,7 @@ uv run --frozen python scripts/review_atom.py transition quarantine <atom>.md --
 
 Run the complete verification gate before any release tag or schema change:
 ```bash
-# 1. Unified 11-suite CI test orchestrator (doctor, dataset schema, source audit, Phase 1-5 safety/cognitive/product/Merkle suites, 1,500-note scale canary, Chroma canary, live smoke test)
+# 1. Unified 12-suite CI test orchestrator (doctor, dataset schema, source audit, Phase 1-5 safety/cognitive/product/Merkle suites, 1,500-note scale canary, Chroma canary, archive manifest canary, live smoke test)
 uv run --frozen python scripts/test_all.py
 
 # 2. Verify cryptographic Merkle audit ledger & Contradiction Radar

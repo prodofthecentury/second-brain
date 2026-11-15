@@ -31,7 +31,7 @@ from scripts.cognitive_core import (
     record_grounded_answer_telemetry,
     record_retrieval_telemetry,
 )
-from scripts.hardware_profile import detect_hardware_profile
+from scripts.hardware_profile import detect_hardware_profile, loopback_ollama_base_url
 from scripts.host_adapters import (
     HostConsentError,
     _audit_outbound_call,
@@ -54,6 +54,11 @@ console = Console()
 
 
 def _stream_local_ollama_chat(*, endpoint_url: str, model: str, messages: list[dict], schema: dict):
+    safe_base = loopback_ollama_base_url(endpoint_url)
+    if not safe_base:
+        raise HostConsentError(
+            f"403 Forbidden: local Ollama streaming requires a loopback endpoint (http://127.0.0.1 or http://[::1]); got {endpoint_url!r}."
+        )
     chat_attr = getattr(ollama, "chat", None)
     client_attr = getattr(ollama, "Client", None)
     if (
@@ -67,7 +72,10 @@ def _stream_local_ollama_chat(*, endpoint_url: str, model: str, messages: list[d
             format=schema,
             stream=True,
         )
-    client = ollama.Client(host=endpoint_url)
+    if getattr(client_attr, "__module__", "ollama").startswith("ollama"):
+        client = ollama.Client(host=safe_base, timeout=120.0, follow_redirects=False, trust_env=False)
+    else:
+        client = ollama.Client(host=safe_base)
     return client.chat(
         model=model,
         messages=messages,

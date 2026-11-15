@@ -62,6 +62,7 @@ if ($UvCommand) {
     $UvCommand = Get-Command uv -ErrorAction SilentlyContinue
     $UvCandidates = @(
         (Join-Path $env:USERPROFILE '.local\bin\uv.exe'),
+        (Join-Path $env:USERPROFILE '.cargo\bin\uv.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\uv\uv.exe'),
         (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\uv.exe')
     )
@@ -167,8 +168,6 @@ try {
     Write-Host '=== Running Environment & Health Verification ===' -ForegroundColor Cyan
     & $UvExe run --frozen second-brain profile
     if ($LASTEXITCODE -ne 0) { throw 'Hardware profile inspection failed.' }
-    & $UvExe run --frozen second-brain doctor
-    if ($LASTEXITCODE -ne 0) { throw 'CLI capability report failed.' }
     & $UvExe run --frozen python scripts/doctor.py
     if ($LASTEXITCODE -ne 0) { throw 'Health validation failed.' }
 

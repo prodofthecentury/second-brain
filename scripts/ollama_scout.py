@@ -30,13 +30,20 @@ import socket
 import ssl
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+import xml.etree.ElementTree as ET
 import httpx
 import httpcore
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
-    BRIEFINGS_DIR, READING_LIST, SOURCES_DIR, RAW_DIR, SIDECAR_DIR,
-    today, ensure_dirs
+    BRIEFINGS_DIR,
+    READING_LIST,
+    SOURCES_DIR,
+    RAW_DIR,
+    SIDECAR_DIR,
+    _is_reparse_or_link,
+    today,
+    ensure_dirs,
 )
 from review_atom import atomic_write_bytes, review_lock
 
@@ -225,8 +232,8 @@ def make_slug(text: str, max_len: int = 60) -> str:
     return slug[:max_len]
 
 
-def fetch_article(url: str) -> dict | None:
-    """Fetch and extract full article text from a URL."""
+def _fetch_validated_bytes(url: str) -> tuple[str, str, str, bytes] | None:
+    """Fetch raw bytes from a DNS-pinned public HTTP(S) URL without redirects or proxy leakage."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -234,7 +241,6 @@ def fetch_article(url: str) -> dict | None:
             "Chrome/120.0.0.0 Safari/537.36"
         )
     }
-
     try:
         target = validate_remote_url(url)
         checked_url = target.url
@@ -252,9 +258,6 @@ def fetch_article(url: str) -> dict | None:
                     return None
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "").lower()
-                if content_type and not any(kind in content_type for kind in ("text/html", "application/xhtml+xml")):
-                    print(f"  [!] Unsupported content type: {content_type}")
-                    return None
                 declared_length = response.headers.get("content-length")
                 if declared_length and int(declared_length) > MAX_RESPONSE_BYTES:
                     print("  [!] Response exceeds the 5 MiB Scout limit.")
@@ -268,10 +271,86 @@ def fetch_article(url: str) -> dict | None:
                         return None
                     chunks.append(chunk)
                 raw_body = b"".join(chunks)
-                html = raw_body.decode(response.encoding or "utf-8", errors="replace")
+                encoding = response.encoding or "utf-8"
+                return checked_url, content_type, encoding, raw_body
     except Exception as e:
         print(f"  [!] Fetch failed: {e}")
         return None
+
+
+def parse_feed_links(xml_text: str, *, max_items: int = 15) -> list[str]:
+    """Extract item/entry HTTP(S) URLs from RSS 2.0 or Atom XML while rejecting DTD/XXE constructs."""
+    upper_head = xml_text[:8192].upper()
+    if "<!DOCTYPE" in upper_head or "<!ENTITY" in upper_head:
+        raise ValueError("Refusing XML feed containing DOCTYPE or ENTITY declarations.")
+    try:
+        root = ET.fromstring(xml_text.lstrip())
+    except ET.ParseError as exc:
+        raise ValueError(f"Invalid RSS/Atom XML: {exc}") from exc
+
+    def _local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1].lower() if "}" in tag else tag.lower()
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for elem in root.iter():
+        lname = _local_name(elem.tag)
+        if lname not in {"item", "entry"}:
+            continue
+        candidate = ""
+        for child in elem:
+            cname = _local_name(child.tag)
+            if cname != "link":
+                continue
+            href = (child.attrib.get("href") or "").strip()
+            rel = (child.attrib.get("rel") or "alternate").strip().lower()
+            text_val = (child.text or "").strip()
+            if href and rel in {"alternate", ""}:
+                candidate = href
+                break
+            if text_val and not candidate:
+                candidate = text_val
+        if candidate.startswith(("http://", "https://")) and candidate not in seen:
+            seen.add(candidate)
+            urls.append(candidate)
+            if len(urls) >= max_items:
+                break
+    return urls
+
+
+def fetch_feed(url: str, *, max_items: int = 15) -> list[str] | None:
+    """Fetch and parse an RSS/Atom feed over the SSRF-pinned transport."""
+    fetched = _fetch_validated_bytes(url)
+    if fetched is None:
+        return None
+    _, _, encoding, raw_body = fetched
+    xml_text = raw_body.decode(encoding, errors="replace")
+    try:
+        return parse_feed_links(xml_text, max_items=max_items)
+    except ValueError as exc:
+        print(f"  [!] Feed parse failed: {exc}")
+        return None
+
+
+def fetch_article(url: str) -> dict | None:
+    """Fetch and extract full article text (or detect RSS/Atom XML) from a URL."""
+    fetched = _fetch_validated_bytes(url)
+    if fetched is None:
+        return None
+    checked_url, content_type, encoding, raw_body = fetched
+    xml_media_types = ("application/rss+xml", "application/atom+xml", "application/xml", "text/xml")
+    if any(kind in content_type for kind in xml_media_types):
+        xml_text = raw_body.decode(encoding, errors="replace")
+        try:
+            feed_urls = parse_feed_links(xml_text)
+            return {"kind": "feed", "url": checked_url, "feed_urls": feed_urls}
+        except ValueError as exc:
+            print(f"  [!] Feed XML rejected: {exc}")
+            return None
+    if content_type and not any(kind in content_type for kind in ("text/html", "application/xhtml+xml")):
+        print(f"  [!] Unsupported content type: {content_type}")
+        return None
+    html = raw_body.decode(encoding, errors="replace")
 
     title = "Unknown"
     content = ""
@@ -325,20 +404,24 @@ def fetch_article(url: str) -> dict | None:
 
 def save_source(article: dict) -> str:
     """Save article to sources/ and return filename."""
-    slug     = make_slug(article["title"]) or "web-source"
+    if _is_reparse_or_link(SOURCES_DIR):
+        raise PermissionError(f"Refusing to write into symlinked sources directory: {SOURCES_DIR}")
+    slug = make_slug(article["title"]) or "web-source"
     url_hash = hashlib.sha256(article["url"].encode("utf-8")).hexdigest()[:12]
-    filename = f"{today()}-{slug}-{url_hash}.md"
-    filepath = os.path.join(SOURCES_DIR, filename)
+    base_stem = f"{today()}-{slug}-{url_hash}"
     evidence_dir = os.path.join(SOURCES_DIR, "evidence")
     evidence_filename = f"{article['response_sha256']}.html"
     evidence_path = os.path.join(evidence_dir, evidence_filename)
 
     os.makedirs(evidence_dir, exist_ok=True)
+    if _is_reparse_or_link(evidence_dir):
+        raise PermissionError(f"Refusing to write into symlinked evidence directory: {evidence_dir}")
     if not os.path.exists(evidence_path):
-        with open(evidence_path, "xb") as evidence_file:
-            evidence_file.write(article["raw_body"])
-    if os.path.exists(filepath):
-        raise RuntimeError(f"Refusing to overwrite existing external source: {filename}")
+        try:
+            with open(evidence_path, "xb") as evidence_file:
+                evidence_file.write(article["raw_body"])
+        except FileExistsError:
+            pass
 
     frontmatter = f"""---
 url: {article['url']}
@@ -355,8 +438,25 @@ scout_status: fetched
 ---
 
 """
-    with open(filepath, "x", encoding="utf-8") as f:
-        f.write(frontmatter + article["content"])
+    payload = (frontmatter + article["content"]).replace("\r\n", "\n")
+    counter = 1
+    while True:
+        filename = f"{base_stem if counter == 1 else f'{base_stem}-{counter}'}.md"
+        filepath = os.path.join(SOURCES_DIR, filename)
+        if os.path.isfile(filepath) and not _is_reparse_or_link(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as existing:
+                    head = existing.read(2048)
+                if f"response_sha256: {article['response_sha256']}" in head:
+                    return filename
+            except OSError:
+                pass
+        try:
+            with open(filepath, "x", encoding="utf-8", newline="\n") as f:
+                f.write(payload)
+            break
+        except FileExistsError:
+            counter += 1
 
     print(f"  [✓] Saved → sources/{filename}  ({article['word_count']} words)")
     return filename
@@ -364,10 +464,12 @@ scout_status: fetched
 
 def create_intake_pointer(source_filename: str, raw_dir: str = RAW_DIR) -> str:
     """Create a quarantined pointer that cannot enter the Refinery without owner promotion."""
+    if os.path.lexists(raw_dir) and _is_reparse_or_link(raw_dir):
+        raise PermissionError(f"Refusing to write intake pointer into symlinked raw directory: {raw_dir}")
     pointer_name = source_filename.replace(".md", ".intake")
     pointer_path = os.path.join(raw_dir, pointer_name)
     try:
-        with open(pointer_path, "x", encoding="utf-8") as f:
+        with open(pointer_path, "x", encoding="utf-8", newline="\n") as f:
             f.write(
                 f"source: sources/{source_filename}\n"
                 "origin: web_remote\n"
@@ -384,63 +486,142 @@ def create_intake_pointer(source_filename: str, raw_dir: str = RAW_DIR) -> str:
 # ─── Reading List Parser ──────────────────────────────────────────────────────
 
 def parse_reading_list() -> list[dict]:
-    """Return list of uncompleted entries from reading-list.md."""
+    """Return list of uncompleted URL and RSS/Atom feed entries from reading-list.md."""
     if not os.path.exists(READING_LIST):
         print("[!] reading-list.md not found.")
         return []
+    if _is_reparse_or_link(READING_LIST):
+        raise PermissionError(f"Refusing to read symlinked reading list: {READING_LIST}")
 
     with open(READING_LIST, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Find lines like: - [ ] https://...
-    pattern = re.compile(r"^- \[ \] (https?://\S+)", re.MULTILINE)
-    matches = pattern.findall(content)
-    return [{"url": url} for url in matches]
+    entries: list[dict] = []
+    for line in content.splitlines():
+        feed_persist = re.match(r"^\s*-\s*\[feed\]\s+(https?://\S+)", line, re.IGNORECASE)
+        if feed_persist:
+            entries.append({"url": feed_persist.group(1), "kind": "feed_persistent"})
+            continue
+        feed_once = re.match(r"^\s*-\s*\[\s\]\s+feed:\s*(https?://\S+)", line, re.IGNORECASE)
+        if feed_once:
+            entries.append({"url": feed_once.group(1), "kind": "feed_once"})
+            continue
+        article_match = re.match(r"^\s*-\s*\[\s\]\s+(https?://\S+)", line)
+        if article_match:
+            entries.append({"url": article_match.group(1)})
+    return entries
+
+
+def enqueue_discovered_urls(urls: list[str], *, max_new: int = 10) -> list[str]:
+    """Append newly discovered RSS/Atom item URLs as uncompleted reading-list items."""
+    if not urls or not os.path.exists(READING_LIST):
+        return []
+    with review_lock(os.path.join(SIDECAR_DIR, "writer.lock")):
+        if _is_reparse_or_link(READING_LIST):
+            raise PermissionError(f"Refusing to modify symlinked reading list: {READING_LIST}")
+        with open(READING_LIST, "r", encoding="utf-8") as f:
+            content = f.read().replace("\r\n", "\n")
+        added: list[str] = []
+        for candidate in urls:
+            clean = str(candidate or "").strip()
+            if not clean.startswith(("http://", "https://")):
+                continue
+            if re.search(rf"(?m)^\s*-\s*\[[^\]]+\]\s+(?:feed:\s*)?{re.escape(clean)}(?=\s|$)", content):
+                continue
+            added.append(clean)
+            if len(added) >= max_new:
+                break
+        if added:
+            suffix = "" if content.endswith("\n") or not content else "\n"
+            appended = "\n".join(f"- [ ] {u}" for u in added) + "\n"
+            atomic_write_bytes(READING_LIST, (content + suffix + appended).encode("utf-8"))
+        return added
 
 
 def update_reading_list(url: str, status: str, note: str = ""):
-    """Mark a URL as [x] (fetched) or [!] (failed) in reading-list.md."""
+    """Mark a URL as [x] (fetched) or [!] (failed) in reading-list.md without regex escape/prefix hazards."""
     with review_lock(os.path.join(SIDECAR_DIR, "writer.lock")):
+        if _is_reparse_or_link(READING_LIST):
+            raise PermissionError(f"Refusing to modify symlinked reading list: {READING_LIST}")
         with open(READING_LIST, "r", encoding="utf-8") as f:
-            content = f.read()
+            content = f.read().replace("\r\n", "\n")
 
         marker = "[x]" if status == "ok" else "[!]"
-        note_line = f"\n  ↳ {note}" if note else ""
-        escaped = re.escape(url)
-        content = re.sub(
-            rf"- \[ \] ({escaped})",
-            f"- {marker} \\1{note_line}",
-            content
+        clean_note = str(note or "").replace("\r", " ").replace("\n", " ").strip()
+        note_line = f"\n  ↳ {clean_note}" if clean_note else ""
+        pattern = re.compile(
+            rf"^(\s*)-\s*\[\s\]\s+(?:feed:\s*)?({re.escape(url)})(?=\s|$)",
+            re.MULTILINE,
         )
-        atomic_write_bytes(READING_LIST, content.encode("utf-8"))
+        updated = pattern.sub(
+            lambda m: f"{m.group(1)}- {marker} {m.group(2)}{note_line}",
+            content,
+            count=1,
+        )
+        atomic_write_bytes(READING_LIST, updated.encode("utf-8"))
+
+
+mark_url_status = update_reading_list
 
 
 # ─── Scout Run ────────────────────────────────────────────────────────────────
 
 def run_scout():
     ensure_dirs()
-    entries = parse_reading_list()
+    initial_entries = parse_reading_list()
 
-    if not entries:
+    if not initial_entries:
         print("[*] No URLs queued in reading-list.md.")
         return
 
-    print(f"[*] Scout found {len(entries)} URL(s) to fetch.\n")
     fetched, failed = 0, 0
+    feed_entries = [e for e in initial_entries if e.get("kind") in {"feed_persistent", "feed_once"}]
+    for entry in feed_entries:
+        url = entry["url"]
+        print(f"[→ Feed] {url}")
+        discovered = fetch_feed(url)
+        if discovered is not None:
+            added = enqueue_discovered_urls(discovered)
+            print(f"  [✓] Feed polled: {len(added)} new item(s) queued.")
+            if entry.get("kind") == "feed_once":
+                update_reading_list(url, "ok", f"Feed polled — queued {len(added)} item(s)")
+        else:
+            if entry.get("kind") == "feed_once":
+                update_reading_list(url, "fail", "Feed fetch failed")
+            failed += 1
+        print()
+
+    entries = [e for e in parse_reading_list() if e.get("kind") not in {"feed_persistent", "feed_once"}]
+    if not entries and not feed_entries:
+        print("[*] No URLs queued in reading-list.md.")
+        return
+
+    if entries:
+        print(f"[*] Scout found {len(entries)} URL(s) to fetch.\n")
 
     for entry in entries:
         url = entry["url"]
         print(f"[→] {url}")
         article = fetch_article(url)
 
-        if article:
-            source_file = save_source(article)
-            create_intake_pointer(source_file)
-            update_reading_list(
-                url, "ok",
-                f"Saved: sources/{source_file} — {article['word_count']} words"
-            )
+        if article and article.get("kind") == "feed":
+            added = enqueue_discovered_urls(article.get("feed_urls") or [])
+            update_reading_list(url, "ok", f"Feed XML detected — queued {len(added)} item(s)")
             fetched += 1
+        elif article:
+            try:
+                source_file = save_source(article)
+                create_intake_pointer(source_file)
+                update_reading_list(
+                    url,
+                    "ok",
+                    f"Saved: sources/{source_file} — {article['word_count']} words",
+                )
+                fetched += 1
+            except Exception as exc:
+                print(f"  [!] Saving source failed: {exc}")
+                update_reading_list(url, "fail", f"Save error — {exc}")
+                failed += 1
         else:
             update_reading_list(url, "fail", "Failed — manual fetch needed")
             failed += 1
@@ -449,17 +630,18 @@ def run_scout():
 
     # Write scout log to configured BRIEFINGS_DIR
     os.makedirs(BRIEFINGS_DIR, exist_ok=True)
-    log_path = os.path.join(BRIEFINGS_DIR, f"scout-log-{today()}.md")
-    suffix = 1
-    base, ext = os.path.splitext(log_path)
-    while os.path.exists(log_path):
-        log_path = f"{base}-{suffix}{ext}"
-        suffix += 1
-    with open(log_path, "x", encoding="utf-8") as f:
-        f.write(
-            f"# Scout Log — {today()}\n\n"
-            f"Fetched: {fetched}  |  Failed: {failed}\n"
-        )
+    if not _is_reparse_or_link(BRIEFINGS_DIR):
+        log_path = os.path.join(BRIEFINGS_DIR, f"scout-log-{today()}.md")
+        suffix = 1
+        base, ext = os.path.splitext(log_path)
+        while os.path.exists(log_path):
+            log_path = f"{base}-{suffix}{ext}"
+            suffix += 1
+        with open(log_path, "x", encoding="utf-8", newline="\n") as f:
+            f.write(
+                f"# Scout Log — {today()}\n\n"
+                f"Fetched: {fetched}  |  Failed: {failed}\n"
+            )
 
     print(f"[*] Scout complete. Fetched: {fetched}, Failed: {failed}")
 

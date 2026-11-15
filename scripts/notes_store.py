@@ -57,6 +57,7 @@ from evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
 from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
 from lexical_store import (  # noqa: E402
     LexicalIndexUnavailable,
+    lexical_index_is_current,
     list_indexed_atoms_fast,
     rebuild_lexical_index,
     search_lexical_index,
@@ -449,7 +450,7 @@ def search_notes(query: str, *, limit: int = 8, paths: NotePaths = DEFAULT_PATHS
 def list_notes(
     *, query: str = "", limit: int = 100, offset: int = 0, paths: NotePaths = DEFAULT_PATHS
 ) -> tuple[list[NoteRecord], int]:
-    if not os.path.isfile(paths.index_path):
+    if not os.path.isfile(paths.index_path) or not lexical_index_is_current(paths.notes_dir, paths.index_path):
         ensure_notes_index(paths)
     items, total = _search_with_heal(
         lambda: list_indexed_atoms_fast(paths.index_path, query=query, limit=limit, offset=offset),
@@ -459,19 +460,34 @@ def list_notes(
 
 
 def backlinks(filename: str, *, paths: NotePaths = DEFAULT_PATHS, limit: int = 50) -> list[NoteRecord]:
-    """Notes linking to ``filename`` via [[wikilink]] (title or stem match)."""
-    title = get_note(filename, paths=paths).title
-    stem = Path(filename).stem
-    found: dict[str, NoteRecord] = {}
-    for term in {stem, title}:
-        for rec in search_notes(term.replace("-", " "), limit=limit, paths=paths):
-            if rec.filename == filename:
-                continue
-            full = get_note(rec.filename, paths=paths)
-            targets = {t.casefold() for t in full.links}
-            if stem.casefold() in targets or title.casefold() in targets:
-                found[rec.filename] = rec
-    return list(found.values())
+    """Notes linking to ``filename`` via [[wikilink]] (title, stem, [[target|alias]], or [[target#heading]])."""
+    target_note = get_note(filename, paths=paths)
+    title_cf = target_note.title.strip().casefold()
+    stem_cf = Path(filename).stem.strip().casefold()
+    valid_targets = {stem_cf, title_cf}
+    if not os.path.isfile(paths.index_path) or not lexical_index_is_current(paths.notes_dir, paths.index_path):
+        ensure_notes_index(paths)
+    indexed, _ = _search_with_heal(
+        lambda: list_indexed_atoms_fast(paths.index_path, query="", limit=100_000, offset=0),
+        paths,
+    )
+    found: list[NoteRecord] = []
+    for item in indexed:
+        if item.filename == filename:
+            continue
+        if "[[" not in item.content:
+            continue
+        rec = _record_from_text(item.filename, item.content, item.content_sha256)
+        targets = {
+            t.split("|", 1)[0].split("#", 1)[0].strip().removesuffix(".md").casefold()
+            for t in rec.links
+            if t.strip()
+        }
+        if targets & valid_targets:
+            found.append(rec)
+            if len(found) >= max(1, limit):
+                break
+    return found
 
 
 def verify_note_excerpt(
@@ -617,6 +633,7 @@ def verify_note_excerpt(
         "atom_sha256": record["content_sha256_after"],
         "evidence_source": rel_source,
         "claim": flat_claim,
+        "memory_type": memory_type,
     }
 
 
@@ -646,6 +663,8 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("excerpt")
     v.add_argument("--actor", required=True)
     v.add_argument("--claim")
+    v.add_argument("--memory-type", default="semantic", choices=["semantic", "episodic", "procedural", "self"])
+    v.add_argument("--tag", action="append", default=[])
     args = parser.parse_args(argv)
 
     if args.cmd == "add":
@@ -661,7 +680,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "verify":
         note = get_note(args.filename)
         print(json.dumps(
-            verify_note_excerpt(args.filename, args.excerpt, actor=args.actor, claim=args.claim, expected_note_sha256=note.sha256),
+            verify_note_excerpt(
+                args.filename,
+                args.excerpt,
+                actor=args.actor,
+                claim=args.claim,
+                memory_type=args.memory_type,
+                tags=args.tag,
+                expected_note_sha256=note.sha256,
+            ),
             indent=2,
         ))
     return 0

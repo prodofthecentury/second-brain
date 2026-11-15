@@ -61,7 +61,7 @@ def loopback_ollama_base_url(raw_host_override: str | None = None) -> str | None
     hostname = (parsed.hostname or "").strip().lower()
     if (
         parsed.scheme != "http"
-        or hostname not in {"127.0.0.1", "::1"}
+        or hostname not in {"127.0.0.1", "localhost", "::1"}
         or parsed.username
         or parsed.password
         or parsed.query

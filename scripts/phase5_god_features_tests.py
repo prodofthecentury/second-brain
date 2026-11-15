@@ -810,6 +810,434 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_sweep_radar_antonyms_units_drift_bm25_snapshots_and_sdk_parity(self) -> None:
+        import threading
+        import httpx
+        from api_product import ensure_owner_token
+        from atom_mutator import content_sha256
+        from executive_planner import ExecutivePlanRequest, assemble_executive_plan
+        from knowledge_graph import build_knowledge_graph, detect_contradictions
+        from lexical_store import rebuild_lexical_index
+        from memory_api import (
+            MemoryApiClient,
+            MemoryApiRuntimeConfig,
+            MemoryLoopbackHTTPServer,
+            generate_memory_api_token,
+        )
+        from skill_playbooks import promote_skill_playbook
+        from time_travel import create_snapshot, diff_snapshots, recall_at_snapshot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms_dir = brain / "2-atoms"
+            pb_dir = brain / "5-playbooks"
+            pb_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1. Double-negation ("is not invalid" vs "is valid") & equivalent units ("5000ms" vs "5s") produce 0 false alerts.
+            _seed_atom(
+                brain,
+                filename="timeout-ms.md",
+                claim="Gateway request timeout is 5000ms for internal RPC calls.",
+                evidence="Gateway request timeout is 5000ms for internal RPC calls.",
+                project="project:core",
+                approve=True,
+            )
+            _seed_atom(
+                brain,
+                filename="timeout-sec-equal.md",
+                claim="Gateway request timeout is 5s for internal RPC calls.",
+                evidence="Gateway request timeout is 5s for internal RPC calls.",
+                project="project:core",
+                approve=True,
+            )
+            _seed_atom(
+                brain,
+                filename="cert-valid-a.md",
+                claim="Mutual TLS client certificate chain is valid during rotation.",
+                evidence="Mutual TLS client certificate chain is valid during rotation.",
+                project="project:core",
+                approve=True,
+            )
+            _seed_atom(
+                brain,
+                filename="cert-valid-b.md",
+                claim="Mutual TLS client certificate chain is not invalid during rotation.",
+                evidence="Mutual TLS client certificate chain is not invalid during rotation.",
+                project="project:core",
+                approve=True,
+            )
+            radar_clean = detect_contradictions(brain_dir=str(brain), atoms_dir=str(atoms_dir), project_scope="project:core")
+            self.assertEqual(radar_clean["contradiction_count"], 0, radar_clean["alerts"])
+            self.assertEqual(radar_clean["drift_count"], 0)
+
+            # 2. Curated antonym pair ("synchronous" vs "asynchronous") & conflicting unit-normalized duration ("15s" vs "5000ms").
+            _seed_atom(
+                brain,
+                filename="timeout-conflict.md",
+                claim="Gateway request timeout is 15s for internal RPC calls.",
+                evidence="Gateway request timeout is 15s for internal RPC calls.",
+                project="project:core",
+                approve=True,
+            )
+            _seed_atom(
+                brain,
+                filename="dispatch-sync.md",
+                claim="Audit event dispatcher uses synchronous writes on every request.",
+                evidence="Audit event dispatcher uses synchronous writes on every request.",
+                project="project:core",
+                approve=True,
+            )
+            _seed_atom(
+                brain,
+                filename="dispatch-async.md",
+                claim="Audit event dispatcher uses asynchronous writes on every request.",
+                evidence="Audit event dispatcher uses asynchronous writes on every request.",
+                project="project:core",
+                approve=True,
+            )
+            radar_conflicts = detect_contradictions(brain_dir=str(brain), atoms_dir=str(atoms_dir), project_scope="project:core")
+            reasons = {r for a in radar_conflicts["alerts"] for r in a["reasons"]}
+            self.assertIn("numeric_value_conflict", reasons)
+            self.assertIn("antonym_conflict", reasons)
+
+            # 3. Source tampering triggers drift_alerts in Contradiction & Drift Radar; contested_by emits graph edges.
+            tamper_src = brain / "0-raw" / "src-dispatch-async.md"
+            orig_src_bytes = tamper_src.read_bytes()
+            tamper_src.write_bytes(b"TAMPERED SOURCE BYTES ON DISK")
+            radar_drift = detect_contradictions(brain_dir=str(brain), atoms_dir=str(atoms_dir), project_scope="project:core")
+            self.assertGreaterEqual(radar_drift["drift_count"], 1)
+            self.assertTrue(any(d["filename"] == "dispatch-async.md" for d in radar_drift["drift_alerts"]))
+            tamper_src.write_bytes(orig_src_bytes)
+
+            contested_path = _seed_atom(
+                brain,
+                filename="contested-claim.md",
+                claim="Legacy cache layer is stateless.",
+                evidence="Legacy cache layer is stateless.",
+                project="project:core",
+                approve=False,
+            )
+            contested_txt = contested_path.read_text(encoding="utf-8").replace(
+                "review_status: pending",
+                "contested_by:\n  - dispatch-sync.md\nreview_status: pending",
+            )
+            contested_path.write_text(contested_txt, encoding="utf-8")
+            kg = build_knowledge_graph(brain_dir=str(brain), atoms_dir=str(atoms_dir), include_pending=True)
+            self.assertTrue(any(e["kind"] == "contested_by" and e["to"] == "dispatch-sync.md" for e in kg["edges"]))
+
+            # 4. BM25 snapshot recall + playbook_changes diff + preference privacy + full SDK parity.
+            pref_atom = _seed_atom(
+                brain,
+                filename="owner-pref.md",
+                claim="Prefer dark solarized terminal themes for local debugging.",
+                evidence="Prefer dark solarized terminal themes for local debugging.",
+                project="project:core",
+                approve=True,
+            )
+            # Re-seed a real preference atom so non-owner snapshot diff/recall filters it out.
+            pref_src = brain / "0-raw" / "pref-real.src.md"
+            pref_src.write_text("Prefer Concise Mermaid Sequence Diagrams.", encoding="utf-8")
+            from evidence import find_evidence_anchor
+            from atom_mutator import apply_review_transition
+
+            pref_draft = (
+                "---\nid: pref-mermaid\ntype: atom\nmemory_type: semantic\nepistemic_label: preference\n"
+                "sources:\n  - 0-raw/pref-real.src.md\ncontexts:\n  - project:core\nreview_status: pending\ncitation_integrity: anchored\n---\n\n"
+                "## Claim\nPrefer Concise Mermaid Sequence Diagrams.\n\n## Evidence\nPrefer Concise Mermaid Sequence Diagrams.\n"
+            )
+            pref_anc = find_evidence_anchor(pref_draft, str(brain))
+            p_parts = pref_draft.split("---", 2)
+            p_fm = p_parts[1] + "".join(f"{k}: {v}\n" for k, v in pref_anc.items())
+            pref_real_path = atoms_dir / "pref-mermaid.md"
+            pref_real_path.write_text(f"---{p_fm}---{p_parts[2]}", encoding="utf-8")
+            apply_review_transition(
+                action="approve",
+                atom_path=str(pref_real_path),
+                expected_sha256=content_sha256(pref_real_path.read_bytes()),
+                actor="owner",
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+            )
+
+            snap_before_pb = create_snapshot(label="before-pb", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+            self.assertEqual(snap_before_pb["schema_version"], 2)
+
+            proc_atom = _seed_atom(
+                brain,
+                filename="deploy-canary.md",
+                claim="Verify Merkle ledger root before cutting release artifacts.",
+                evidence="Verify Merkle ledger root before cutting release artifacts.",
+                memory_type="procedural",
+                project="project:core",
+                approve=True,
+            )
+            promote_skill_playbook(
+                playbook_id="merkle-release-gate",
+                title="Merkle Release Gate",
+                backing_atoms=[("deploy-canary.md", content_sha256(proc_atom.read_bytes()))],
+                trigger="Cutting a production release",
+                preconditions=["Clean git status"],
+                steps=["Verify Merkle ledger root before cutting release artifacts."],
+                expected_outputs=["Signed SHA256SUMS.txt"],
+                failure_recovery=["Abort release"],
+                actor="owner",
+                rationale="sweep test",
+                allow_early_owner_override=True,
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                playbooks_dir=str(pb_dir),
+                telemetry_db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
+            )
+            snap_after_pb = create_snapshot(label="after-pb", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+            pb_diff = diff_snapshots(snap_before_pb["snapshot_id"], snap_after_pb["snapshot_id"], brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+            self.assertEqual([p["filename"] for p in pb_diff["playbook_changes"]["added"]], ["merkle-release-gate.md"])
+
+            bm25_res = recall_at_snapshot("Merkle ledger root release artifacts", snap_after_pb["snapshot_id"], brain_dir=str(brain))
+            self.assertEqual(bm25_res["results"][0]["filename"], "deploy-canary.md")
+
+            lex_db = str(brain / ".sidecar" / "lexical.sqlite3")
+            rebuild_lexical_index(str(atoms_dir), lex_db)
+            plan = assemble_executive_plan(
+                ExecutivePlanRequest(
+                    goal="Cutting a production release with Merkle ledger verification",
+                    project_scope="project:core",
+                    active_context_profile=("project:core",),
+                ),
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                playbooks_dir=str(pb_dir),
+                lexical_index_path=lex_db,
+                chroma_path=str(brain / ".chroma"),
+                telemetry_db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
+                save_briefing=False,
+            )
+            self.assertEqual(plan.matched_playbook_ids[0], "merkle-release-gate")
+
+            # 5. Live HTTP API & SDK verification for newly added routes and non-owner guards.
+            tok_path = Path(tmp) / "api-tok"
+            own_path = Path(tmp) / "own-tok"
+            agent_tok, _ = generate_memory_api_token(tok_path)
+            owner_tok = ensure_owner_token(own_path)
+            rt = MemoryApiRuntimeConfig(
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                inbox_dir=str(brain / "0-raw" / "inbox"),
+                experiences_dir=str(brain / "4-experiences"),
+                playbooks_dir=str(pb_dir),
+                lexical_index_path=lex_db,
+                chroma_path=str(brain / ".chroma"),
+                telemetry_db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
+                token_path=tok_path,
+                owner_token_path=own_path,
+                policy_path=Path(tmp) / "policy.json",
+            )
+            server = MemoryLoopbackHTTPServer("127.0.0.1", 0, rt)
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            try:
+                sdk_owner = MemoryApiClient(port=port, token=agent_tok, owner_token=owner_tok)
+                sdk_agent = MemoryApiClient(port=port, token=agent_tok)
+
+                sdk_owner.commit_ledger(actor="owner", note="sweep")
+                proof = sdk_owner.prove_atom("deploy-canary.md")
+                self.assertTrue(sdk_owner.verify_proof(proof)["valid"])
+
+                audit_rep = sdk_owner.audit_sources()
+                self.assertEqual(audit_rep["stale_count"], 0)
+
+                fb_ok = sdk_owner.record_feedback("deploy-canary.md", helpful=True)
+                self.assertEqual(fb_ok["status"], "recorded")
+                with self.assertRaises(httpx.HTTPStatusError) as missing_fb:
+                    sdk_owner.record_feedback("does-not-exist.md", helpful=False)
+                self.assertEqual(missing_fb.exception.response.status_code, 404)
+
+                dups = sdk_owner.atom_duplicates()
+                self.assertIn("duplicates", dups)
+                for d in dups["duplicates"]:
+                    self.assertIn("similarity", d)
+
+                cands = sdk_owner.playbook_candidates()
+                self.assertTrue(any(c["atom_id"] == "deploy-canary.md" and c["claim"] for c in cands["candidates"]))
+
+                # Agent snapshot recall must never leak preference atoms.
+                agent_snap_recall = sdk_agent.recall_snapshot("Mermaid Sequence Diagrams", snap_after_pb["snapshot_id"])
+                self.assertEqual(agent_snap_recall["results"], [])
+                owner_snap_recall = sdk_owner.recall_snapshot("Mermaid Sequence Diagrams", snap_after_pb["snapshot_id"])
+                self.assertEqual([r["filename"] for r in owner_snap_recall["results"]], ["pref-mermaid.md"])
+
+                # Non-owner oversized POST to /v1/notes is rejected at 64 KiB (413) before body allocation.
+                with httpx.Client(trust_env=False, timeout=10) as raw_c:
+                    r_big_agent = raw_c.post(
+                        f"http://127.0.0.1:{port}/v1/notes",
+                        headers={"Authorization": f"Bearer {agent_tok}", "Host": f"127.0.0.1:{port}"},
+                        json={"title": "Big", "body": "x" * 70_000},
+                    )
+                    self.assertEqual(r_big_agent.status_code, 413)
+                big_owner_note = sdk_owner.create_note("Big Owner Note", "x" * 70_000)
+                self.assertEqual(big_owner_note["status"], "saved")
+            finally:
+                server.shutdown()
+                server.server_close()
+                _ = pref_atom
+
+    def test_system_sweep_security_intake_revocation_offset_and_client_guards(self) -> None:
+        import httpx
+        from api_product import ensure_owner_token
+        from atom_mutator import ReviewConflictError, apply_review_transition, content_sha256
+        from inbox_workflow import inspect_inbox_item, list_inbox_items, promote_inbox_item
+        from memory_api import (
+            MemoryApiClient,
+            MemoryApiRuntimeConfig,
+            MemoryLoopbackHTTPServer,
+            generate_memory_api_token,
+            reset_api_rate_limiter,
+        )
+        from ollama_scout import create_intake_pointer
+        from refinery_targets import intake_status
+        from sota_benchmark import run_sota_benchmark
+        from time_travel import create_snapshot, verify_snapshot
+
+        root = Path(__file__).resolve().parents[1]
+
+        # 1. VS Code Workspace-Trust apiPort exfiltration guard & Electron sidecar readiness guard
+        vscode_pkg = json.loads((root / "extensions" / "vscode-second-brain" / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            vscode_pkg["contributes"]["configuration"]["properties"]["secondBrain.apiPort"].get("scope"),
+            "application",
+        )
+        restricted = vscode_pkg.get("capabilities", {}).get("untrustedWorkspaces", {}).get("restrictedConfigurations", [])
+        self.assertIn("secondBrain.apiPort", restricted)
+        vscode_ext = (root / "extensions" / "vscode-second-brain" / "extension.js").read_text(encoding="utf-8")
+        self.assertIn('inspect("apiPort")', vscode_ext)
+        self.assertNotIn("innerHTML", vscode_ext)
+
+        main_js = (root / "desktop" / "main.js").read_text(encoding="utf-8")
+        self.assertIn("SECOND_BRAIN_API_READY", main_js)
+        self.assertIn("apiProcess.exitCode !== null", main_js)
+        app_js = (root / "desktop" / "renderer" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("acknowledge_risks: true", app_js)
+        self.assertNotIn("innerHTML", app_js)
+
+        # 2. SOTA benchmark upgraded baselines & statistical metrics
+        bench = run_sota_benchmark(atoms=80)
+        self.assertIn("tfidf_cosine_rag", bench["systems"])
+        sb_sys = bench["systems"]["second_brain_verified"]
+        for metric_key in ("mrr_at_5", "ndcg_at_5", "p99_latency_ms", "recall_ci95"):
+            self.assertIn(metric_key, sb_sys)
+
+        # 3. Web Scout .intake quarantine -> inspect -> CAS conflict -> promote + revoked snapshot redaction + offset bound
+        reset_api_rate_limiter()
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            raw_dir = brain / "0-raw"
+            inbox_dir = raw_dir / "inbox"
+            sources_dir = brain / "sources"
+            atoms_dir = brain / "2-atoms"
+            for d in (raw_dir, inbox_dir, sources_dir, atoms_dir, brain / ".sidecar"):
+                d.mkdir(parents=True, exist_ok=True)
+
+            (sources_dir / "2026-11-15-scout-doc.md").write_text(
+                "---\nurl: https://example.com/a\norigin: web_remote\n---\n\nClean technical article content on Merkle trees.\n",
+                encoding="utf-8",
+            )
+            ptr_path = Path(create_intake_pointer("2026-11-15-scout-doc.md", raw_dir=str(raw_dir)))
+            self.assertEqual(intake_status(ptr_path.read_text(encoding="utf-8")), "quarantined")
+
+            queued = list_inbox_items(inbox_dir=str(inbox_dir))
+            self.assertTrue(any(item.filename == ptr_path.name for item in queued))
+            inspected = inspect_inbox_item(ptr_path.name, inbox_dir=str(inbox_dir))
+            self.assertIn("Merkle trees", str(inspected["content"]))
+
+            with self.assertRaises(ReviewConflictError):
+                promote_inbox_item(
+                    ptr_path.name,
+                    expected_sha256="0" * 64,
+                    actor="owner",
+                    inbox_dir=str(inbox_dir),
+                    raw_dir=str(raw_dir),
+                    brain_dir=str(brain),
+                )
+
+            promoted = promote_inbox_item(
+                ptr_path.name,
+                expected_sha256=str(inspected["sha256"]),
+                actor="owner",
+                inbox_dir=str(inbox_dir),
+                raw_dir=str(raw_dir),
+                brain_dir=str(brain),
+            )
+            self.assertEqual(promoted["filename"], ptr_path.name)
+            self.assertEqual(intake_status(ptr_path.read_text(encoding="utf-8")), "approved")
+
+            # Snapshot revocation isolation + tamper check + SQLite offset overflow clamping
+            rev_atom = _seed_atom(
+                brain,
+                filename="revoked-later.md",
+                claim="Temporary staging credential rotation token window is 7 hours.",
+                evidence="Temporary staging credential rotation token window is 7 hours.",
+                project="project:sec",
+                approve=True,
+            )
+            snap1 = create_snapshot(label="pre-revoke", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            self.assertTrue(verify_snapshot(snap1["snapshot_id"], brain_dir=str(brain))["valid"])
+
+            # Quarantine the atom AFTER snap1 was recorded
+            apply_review_transition(
+                action="quarantine",
+                atom_path=str(rev_atom),
+                expected_sha256=content_sha256(rev_atom.read_bytes()),
+                actor="owner",
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+            )
+
+            tok_path = Path(tmp) / "api-token"
+            own_path = Path(tmp) / "owner-token"
+            agent_tok, _ = generate_memory_api_token(tok_path)
+            owner_tok = ensure_owner_token(own_path)
+            rt = MemoryApiRuntimeConfig(
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                inbox_dir=str(inbox_dir),
+                experiences_dir=str(brain / "4-experiences"),
+                lexical_index_path=str(brain / ".sidecar" / "lexical.sqlite3"),
+                chroma_path=str(brain / ".chroma"),
+                telemetry_db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
+                token_path=tok_path,
+                owner_token_path=own_path,
+                policy_path=Path(tmp) / "policy.json",
+            )
+            server = MemoryLoopbackHTTPServer("127.0.0.1", 0, rt)
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            try:
+                sdk_agent = MemoryApiClient(port=port, token=agent_tok)
+                sdk_owner = MemoryApiClient(port=port, token=agent_tok, owner_token=owner_tok)
+
+                # Agent must NOT recall or see claim text of a subsequently quarantined atom!
+                self.assertEqual(sdk_agent.recall_snapshot("staging credential rotation", snap1["snapshot_id"])["results"], [])
+                agent_diff = sdk_agent.diff_snapshots(snap1["snapshot_id"], "live")
+                self.assertEqual(agent_diff["removed_atoms"][0]["claim"], "")
+                self.assertTrue(agent_diff["removed_atoms"][0].get("redacted_revoked"))
+
+                # Owner retains full point-in-time historical recall & snapshot verification
+                owner_recall = sdk_owner.recall_snapshot("staging credential rotation", snap1["snapshot_id"])
+                self.assertEqual([r["filename"] for r in owner_recall["results"]], ["revoked-later.md"])
+                self.assertTrue(sdk_owner.verify_snapshot(snap1["snapshot_id"])["valid"])
+
+                # Huge 128-bit offset query param must never 500 with SQLite OverflowError
+                with httpx.Client(trust_env=False, timeout=10) as raw_c:
+                    r_huge_offset = raw_c.get(
+                        f"http://127.0.0.1:{port}/v1/atoms?offset=999999999999999999999999999",
+                        headers={"Authorization": f"Bearer {agent_tok}", "Host": f"127.0.0.1:{port}"},
+                    )
+                    self.assertIn(r_huge_offset.status_code, (200, 422))
+            finally:
+                server.shutdown()
+                server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

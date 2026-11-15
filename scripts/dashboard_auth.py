@@ -60,7 +60,7 @@ def format_session_cookie(session_token: str) -> str:
 def default_auth_path() -> Path:
     override = os.environ.get("BRAIN_DASHBOARD_AUTH_FILE")
     if override:
-        return Path(override).expanduser().resolve()
+        return Path(os.path.abspath(str(Path(override).expanduser())))
     if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
         base = Path(os.environ["LOCALAPPDATA"])
     elif os.environ.get("XDG_STATE_HOME"):
@@ -127,10 +127,20 @@ def verify_password(password: str, record: object) -> bool:
 
 
 def save_password_record(record: dict, auth_path: str | Path | None = None) -> Path:
+    from config import _is_reparse_or_link
+    from host_adapters import restrict_security_file_permissions
+
     if not _valid_record(record):
         raise ValueError("Refusing to save an invalid dashboard password record.")
-    path = Path(auth_path or default_auth_path()).expanduser().resolve()
+    raw_path = Path(auth_path or default_auth_path()).expanduser()
+    path = Path(os.path.abspath(str(raw_path)))
+    if (os.path.lexists(str(path)) and _is_reparse_or_link(str(path))) or (
+        os.path.lexists(str(path.parent)) and _is_reparse_or_link(str(path.parent))
+    ):
+        raise PermissionError("Refusing to write dashboard auth record through a symlink or reparse point.")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if _is_reparse_or_link(str(path.parent)) or (os.path.lexists(str(path)) and _is_reparse_or_link(str(path))):
+        raise PermissionError("Refusing to write dashboard auth record through a symlink or reparse point.")
     try:
         if os.name != "nt":
             os.chmod(path.parent, 0o700)
@@ -138,7 +148,7 @@ def save_password_record(record: dict, auth_path: str | Path | None = None) -> P
         pass
     descriptor, temporary = tempfile.mkstemp(prefix=".dashboard-auth-", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
             json.dump(record, file, sort_keys=True)
             file.write("\n")
             file.flush()
@@ -149,6 +159,7 @@ def save_password_record(record: dict, auth_path: str | Path | None = None) -> P
         except OSError:
             pass
         os.replace(temporary, path)
+        restrict_security_file_permissions(path)
     finally:
         if os.path.exists(temporary):
             os.remove(temporary)
@@ -156,8 +167,12 @@ def save_password_record(record: dict, auth_path: str | Path | None = None) -> P
 
 
 def load_password_record(auth_path: str | Path | None = None) -> dict | None:
+    from config import _is_reparse_or_link
+
     path = Path(auth_path or default_auth_path())
     try:
+        if not os.path.lexists(str(path)) or _is_reparse_or_link(str(path)) or _is_reparse_or_link(str(path.parent)):
+            return None
         if path.stat().st_size > 4096:
             return None
         with path.open("r", encoding="utf-8") as file:

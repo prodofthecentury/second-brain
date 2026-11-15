@@ -36,6 +36,7 @@ from host_adapters import restrict_security_file_permissions  # noqa: E402
 
 SERVER_KEY = "second-brain"
 REPO_ROOT = Path(__file__).resolve().parent.parent
+MCP_SCRIPT = Path(__file__).resolve().with_name("mcp_server.py")
 
 
 @dataclass(frozen=True)
@@ -78,23 +79,49 @@ def host_targets(home: Path | None = None) -> dict[str, HostTarget]:
     }
 
 
+def _venv_python_from_env(uv_proj_env: str) -> Path | None:
+    if not uv_proj_env:
+        return None
+    env_root = Path(uv_proj_env).expanduser()
+    candidates = (
+        (env_root / "Scripts" / "python.exe", env_root / "python.exe")
+        if os.name == "nt"
+        else (env_root / "bin" / "python", env_root / "bin" / "python3")
+    )
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
 def server_entry(token: str, *, extra: dict | None = None) -> dict:
-    if (REPO_ROOT / "pyproject.toml").exists():
+    uv_proj_env = (os.environ.get("UV_PROJECT_ENVIRONMENT") or "").strip()
+    venv_python = _venv_python_from_env(uv_proj_env)
+    if venv_python is not None and MCP_SCRIPT.is_file():
+        command, args = str(venv_python), [str(MCP_SCRIPT)]
+    elif (REPO_ROOT / "pyproject.toml").exists():
         uv = shutil.which("uv") or "uv"
         command, args = uv, ["--directory", str(REPO_ROOT), "run", "--frozen", "python", "scripts/mcp_server.py"]
+    elif MCP_SCRIPT.is_file():
+        command, args = sys.executable, [str(MCP_SCRIPT)]
     else:
         command, args = sys.executable, ["-m", "scripts.mcp_server"]
     vault_env = (os.environ.get("BRAIN_VAULT_DIR") or "").strip() or (_default_installed_vault() or "")
+    env = {
+        "BRAIN_ENABLE_LOCAL_MCP": "1",
+        "BRAIN_MCP_TRUSTED_STDIO": "1",
+        "BRAIN_MCP_CLIENT_TOKEN": token,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    if vault_env:
+        env["BRAIN_VAULT_DIR"] = vault_env
+    if uv_proj_env:
+        env["UV_PROJECT_ENVIRONMENT"] = uv_proj_env
     entry = {
         **(extra or {}),
         "command": command,
         "args": args,
-        "env": {
-            "BRAIN_ENABLE_LOCAL_MCP": "1",
-            "BRAIN_MCP_TRUSTED_STDIO": "1",
-            "BRAIN_MCP_CLIENT_TOKEN": token,
-            **({"BRAIN_VAULT_DIR": vault_env} if vault_env else {}),
-        },
+        "env": env,
     }
     return entry
 
@@ -178,8 +205,27 @@ def _write_antigravity_bundle(plugin_dir: Path) -> None:
             shutil.copy2(src, dest)
 
 
+def _write_claude_code_skill(home_dir: Path) -> None:
+    """Install the Second Brain skill into ~/.claude/skills/second-brain-memory/SKILL.md."""
+    template = REPO_ROOT / "plugins" / "claude-code" / "second-brain" / "skills" / "second-brain-memory" / "SKILL.md"
+    if not template.is_file() or template.is_symlink() or _is_reparse_or_link(str(template)):
+        return
+    claude_dir = home_dir / ".claude"
+    skills_dir = claude_dir / "skills"
+    dest_dir = skills_dir / "second-brain-memory"
+    dest_file = dest_dir / "SKILL.md"
+    for candidate in (claude_dir, skills_dir, dest_dir, dest_file):
+        if os.path.lexists(str(candidate)) and _is_reparse_or_link(str(candidate)):
+            raise PermissionError(f"Refusing to write Claude Code skill through symlink or junction: {candidate}")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_link(str(dest_dir)) or (os.path.lexists(str(dest_file)) and _is_reparse_or_link(str(dest_file))):
+        raise PermissionError(f"Refusing to write Claude Code skill through symlink or junction: {dest_file}")
+    shutil.copy2(template, dest_file)
+
+
 def connect(host_id: str, *, dry_run: bool = False, home: Path | None = None) -> dict:
-    targets = host_targets(home)
+    resolved_home = home or Path.home()
+    targets = host_targets(resolved_home)
     if host_id not in targets:
         raise ValueError(f"Unknown host '{host_id}'. Choose one of: {', '.join(sorted(targets))}")
     target = targets[host_id]
@@ -197,6 +243,8 @@ def connect(host_id: str, *, dry_run: bool = False, home: Path | None = None) ->
         return {"host": host_id, "config_path": str(target.config_path), "entry": redacted, "dry_run": True}
     if host_id == "antigravity":
         _write_antigravity_bundle(target.config_path.parent)
+    elif host_id == "claude-code":
+        _write_claude_code_skill(resolved_home)
     backup = _atomic_write_json(target.config_path, data)
     return {
         "host": host_id,
@@ -225,7 +273,7 @@ def status(home: Path | None = None) -> list[dict]:
         try:
             data = _load_json(target.config_path)
             connected = SERVER_KEY in (data.get(target.servers_key) or {})
-        except ValueError:
+        except (ValueError, OSError):
             connected = False
         rows.append({
             "host": host_id,

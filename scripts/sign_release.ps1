@@ -31,54 +31,60 @@ if (-not $targets) {
 }
 
 $signCert = $null
-if ($Thumbprint) {
-    $signCert = Get-ChildItem -Path Cert:\CurrentUser\My\$Thumbprint -ErrorAction SilentlyContinue
-    if (-not $signCert) {
-        $signCert = Get-ChildItem -Path Cert:\LocalMachine\My\$Thumbprint -ErrorAction SilentlyContinue
+try {
+    if ($Thumbprint) {
+        $signCert = Get-ChildItem -Path Cert:\CurrentUser\My\$Thumbprint -ErrorAction SilentlyContinue
+        if (-not $signCert) {
+            $signCert = Get-ChildItem -Path Cert:\LocalMachine\My\$Thumbprint -ErrorAction SilentlyContinue
+        }
+        if (-not $signCert) {
+            throw "Code-signing certificate with thumbprint '$Thumbprint' not found in CurrentUser\My or LocalMachine\My."
+        }
+    } elseif ($PfxPath) {
+        if (-not (Test-Path $PfxPath)) {
+            throw "PFX certificate file not found: $PfxPath"
+        }
+        $secPass = if ($PfxPassword) { ConvertTo-SecureString -String $PfxPassword -AsPlainText -Force } else { $null }
+        $signCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+        if ($secPass) {
+            $signCert.Import($PfxPath, $secPass, "EphemeralKeySet")
+        } else {
+            $signCert.Import($PfxPath, [string]$null, "EphemeralKeySet")
+        }
+    } elseif ($SelfSigned) {
+        $existing = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.Subject -eq "CN=Second Brain Dev Signing" } | Select-Object -First 1
+        if ($existing) {
+            $signCert = $existing
+        } else {
+            $signCert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=Second Brain Dev Signing" -CertStoreLocation "Cert:\CurrentUser\My"
+        }
     }
-    if (-not $signCert) {
-        throw "Code-signing certificate with thumbprint '$Thumbprint' not found in CurrentUser\My or LocalMachine\My."
-    }
-} elseif ($PfxPath) {
-    if (-not (Test-Path $PfxPath)) {
-        throw "PFX certificate file not found: $PfxPath"
-    }
-    $secPass = if ($PfxPassword) { ConvertTo-SecureString -String $PfxPassword -AsPlainText -Force } else { $null }
-    $signCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
-    if ($secPass) {
-        $signCert.Import($PfxPath, $secPass, "Exportable,PersistKeySet")
-    } else {
-        $signCert.Import($PfxPath)
-    }
-} elseif ($SelfSigned) {
-    $existing = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.Subject -eq "CN=Second Brain Dev Signing" } | Select-Object -First 1
-    if ($existing) {
-        $signCert = $existing
-    } else {
-        $signCert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=Second Brain Dev Signing" -CertStoreLocation "Cert:\CurrentUser\My"
-    }
-}
 
-$exeTargets = $targets | Where-Object { $_.Extension -in @(".exe", ".msi") }
-if ($signCert -and $exeTargets) {
-    foreach ($file in $exeTargets) {
-        Write-Host "Signing $($file.Name)..."
-        $sigParams = @{
-            FilePath = $file.FullName
-            Certificate = $signCert
-            HashAlgorithm = "SHA256"
+    $exeTargets = $targets | Where-Object { $_.Extension -in @(".exe", ".msi") }
+    if ($signCert -and $exeTargets) {
+        foreach ($file in $exeTargets) {
+            Write-Host "Signing $($file.Name)..."
+            $sigParams = @{
+                FilePath = $file.FullName
+                Certificate = $signCert
+                HashAlgorithm = "SHA256"
+            }
+            if (-not $SelfSigned -and $TimestampUrl) {
+                $sigParams["TimestampServer"] = $TimestampUrl
+            }
+            $res = Set-AuthenticodeSignature @sigParams
+            if (-not $res.SignerCertificate -or $res.Status -in @("NotSigned", "HashMismatch")) {
+                throw "Authenticode signing failed for $($file.Name): $($res.Status) ($($res.StatusMessage))"
+            }
+            Write-Host "  Signature status: $($res.Status) ($($res.StatusMessage))"
         }
-        if (-not $SelfSigned -and $TimestampUrl) {
-            $sigParams["TimestampServer"] = $TimestampUrl
-        }
-        $res = Set-AuthenticodeSignature @sigParams
-        if (-not $res.SignerCertificate -or $res.Status -in @("NotSigned", "HashMismatch")) {
-            throw "Authenticode signing failed for $($file.Name): $($res.Status) ($($res.StatusMessage))"
-        }
-        Write-Host "  Signature status: $($res.Status) ($($res.StatusMessage))"
+    } else {
+        Write-Host "No signing certificate configured; skipping Authenticode signing (pass -SelfSigned or -PfxPath)."
     }
-} else {
-    Write-Host "No signing certificate configured; skipping Authenticode signing (pass -SelfSigned or -PfxPath)."
+} finally {
+    if ($PfxPath -and $signCert -is [System.IDisposable]) {
+        $signCert.Dispose()
+    }
 }
 
 $manifestPath = Join-Path $DistDir "SHA256SUMS.txt"

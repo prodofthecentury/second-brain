@@ -107,7 +107,11 @@ def queued_reading_items() -> int:
     if not os.path.exists(READING_LIST):
         return 0
     with open(READING_LIST, "r", encoding="utf-8") as file:
-        return sum(1 for line in file if line.startswith("- [ ] http"))
+        return sum(
+            1
+            for line in file
+            if line.lstrip().startswith(("- [ ] http", "- [feed] http"))
+        )
 
 
 def system_memory_summary() -> str:
@@ -212,12 +216,21 @@ def run_checks() -> list[tuple[str, str, str]]:
     else:
         checks.append(fail("uv", "uv is not available on PATH"))
 
-    required_dirs = [RAW_DIR, INBOX_DIR, ATOMS_DIR, THREADS_DIR, SOURCES_DIR, BRIEFINGS_DIR]
+    required_dirs = [
+        RAW_DIR,
+        INBOX_DIR,
+        ATOMS_DIR,
+        THREADS_DIR,
+        EXPERIENCES_DIR,
+        PLAYBOOKS_DIR,
+        SOURCES_DIR,
+        BRIEFINGS_DIR,
+    ]
     missing = [path for path in required_dirs if not os.path.isdir(path)]
     if missing:
         checks.append(fail("vault dirs", f"Missing directories: {', '.join(missing)}"))
     else:
-        checks.append(ok("vault dirs", "All vault directories exist (including quarantined inbox)"))
+        checks.append(ok("vault dirs", "All vault directories exist (including quarantined inbox, experiences, playbooks)"))
 
     index_manifest = load_index_manifest(CHROMA_PATH)
     json_fallback_file = json_collection_path(CHROMA_PATH, "atoms")
@@ -321,6 +334,36 @@ def run_checks() -> list[tuple[str, str, str]]:
             active_playbooks = 0
     checks.append(ok("playbooks", f"{playbook_total} playbook file(s) ({active_playbooks} active)"))
     checks.append(ok("sources", f"{count_files(SOURCES_DIR, ('.md',))} source file(s)"))
+
+    notes_dir = os.path.join(BRAIN_DIR, "notes")
+    notes_index = os.path.join(BRAIN_DIR, ".sidecar", "notes.sqlite3")
+    if os.path.isdir(notes_dir):
+        idx_state = "indexed" if os.path.isfile(notes_index) else "index created on demand"
+        checks.append(ok("notes", f"{count_files(notes_dir, ('.md',))} working note(s) ({idx_state})"))
+    else:
+        checks.append(warn("notes", "Working notes directory not yet initialized; run `second-brain install`"))
+
+    try:
+        from vault_ledger import verify_vault_ledger
+
+        ledger_status = verify_vault_ledger(
+            brain_dir=BRAIN_DIR,
+            atoms_dir=ATOMS_DIR,
+            playbooks_dir=PLAYBOOKS_DIR,
+        )
+        if ledger_status.get("chain_valid", False):
+            cp_count = int(ledger_status.get("entry_count", 0))
+            synced = "synced" if ledger_status.get("synced_with_head") else "live ahead of last checkpoint"
+            checks.append(
+                ok(
+                    "vault ledger",
+                    f"chain valid ({cp_count} checkpoint(s), {synced})" if cp_count else "chain valid (no checkpoints committed yet)",
+                )
+            )
+        else:
+            checks.append(fail("vault ledger", f"Tamper or hash-chain error: {ledger_status.get('issues')}"))
+    except Exception as exc:
+        checks.append(warn("vault ledger", f"Could not verify vault ledger: {exc}"))
 
     hw_profile = detect_hardware_profile(ollama_timeout=2.0)
     checks.append(

@@ -24,8 +24,16 @@ import sys
 import time
 import uuid
 
-from config import ATOMS_DIR, CHROMA_PATH, EMBED_MODEL, ensure_dirs, is_content_markdown
-from index_manifest import build_index_manifest, write_index_manifest
+from config import (
+    ATOMS_DIR,
+    CHROMA_PATH,
+    EMBED_MODEL,
+    _is_reparse_or_link,
+    ensure_dirs,
+    is_content_markdown,
+    safe_file_in_dir,
+)
+from index_manifest import atom_revisions, build_index_manifest, write_index_manifest
 from memory_format import is_memory_document
 from ollama_utils import embed_text, embedding_metadata
 from vector_store import close_vector_collection, reset_vector_collection
@@ -36,22 +44,31 @@ def serialized_vector_rebuild(function):
     @wraps(function)
     def wrapped(*args, **kwargs):
         if kwargs.pop("_writer_lock_held", False):
-            return function(*args, **kwargs)
+            return function(*args, _writer_lock_held=True, **kwargs)
         atoms_dir = kwargs.get("atoms_dir", ATOMS_DIR)
-        lock_path = os.path.join(os.path.dirname(os.path.abspath(atoms_dir)), ".sidecar", "writer.lock")
+        lock_path = os.path.join(
+            os.path.dirname(os.path.abspath(atoms_dir)),
+            ".sidecar",
+            "vector-rebuild.lock",
+        )
         with review_lock(lock_path):
-            return function(*args, **kwargs)
+            return function(*args, _writer_lock_held=False, **kwargs)
+
     return wrapped
 
 
 def atom_filenames(atoms_dir: str = ATOMS_DIR) -> list[str]:
-    if not os.path.isdir(atoms_dir):
+    if not os.path.isdir(atoms_dir) or _is_reparse_or_link(atoms_dir):
         return []
-    return sorted(
-        filename
-        for filename in os.listdir(atoms_dir)
-        if is_content_markdown(filename)
-    )
+    filenames: list[str] = []
+    for filename in sorted(os.listdir(atoms_dir)):
+        if not is_content_markdown(filename):
+            continue
+        path = safe_file_in_dir(atoms_dir, filename, allowed_exts={".md"})
+        if not path or _is_reparse_or_link(path) or not os.path.isfile(path):
+            continue
+        filenames.append(filename)
+    return filenames
 
 
 def rebuild_staging_path(store_path: str) -> str:
@@ -130,12 +147,16 @@ def rebuild_vectors(
     model: str = EMBED_MODEL,
     require_valid_memory: bool = True,
     prefer_json: bool = False,
+    *,
+    _writer_lock_held: bool = False,
 ) -> dict:
     ensure_dirs()
     # Do not discard a working derived index until the configured embedder is proven healthy.
     preflight_embedding = embed_text("Second Brain embedding rebuild preflight.", model=model)
     embedding_dimensions = len(preflight_embedding)
     generation_id = uuid.uuid4().hex
+    revisions_before = atom_revisions(atoms_dir)
+    revision_sha_by_file = {r["filename"]: r["content_sha256"] for r in revisions_before}
 
     stats = {
         "indexed": 0,
@@ -161,8 +182,15 @@ def rebuild_vectors(
         for filename in atom_filenames(atoms_dir):
             path = os.path.join(atoms_dir, filename)
             try:
+                if _is_reparse_or_link(path):
+                    raise PermissionError(f"Refusing to index symlink or reparse point atom: {filename}")
                 with open(path, "rb") as file:
                     content_bytes = file.read()
+                content_sha = hashlib.sha256(content_bytes).hexdigest()
+                if revision_sha_by_file.get(filename) != content_sha:
+                    raise RuntimeError(
+                        f"Canonical atom {filename} changed during vector rebuild; rerun rebuild after edits finish."
+                    )
                 content = content_bytes.decode("utf-8")
 
                 if require_valid_memory and not is_memory_document(content):
@@ -180,7 +208,7 @@ def rebuild_vectors(
                     content,
                     model,
                     embedding,
-                    content_sha256=hashlib.sha256(content_bytes).hexdigest(),
+                    content_sha256=content_sha,
                 )
                 metadata["index_generation"] = generation_id
                 collection.upsert(
@@ -198,19 +226,38 @@ def rebuild_vectors(
                     f"Vector rebuild stopped at {filename}; the active index was preserved: {exc}"
                 ) from exc
 
-        manifest = build_index_manifest(
-            atoms_dir=atoms_dir,
-            collection_name=collection_name,
-            embedding_model=model,
-            embedding_dimensions=embedding_dimensions,
-            indexed_count=stats["indexed"],
-            generation_id=generation_id,
-        )
-        write_index_manifest(staging_path, manifest)
         close_vector_collection(collection)
         collection = None
-        stats["backup_path"] = activate_staged_store(staging_path, store_path)
-        stats["committed"] = True
+
+        def _commit_staged_generation() -> None:
+            current_revisions = atom_revisions(atoms_dir)
+            if current_revisions != revisions_before:
+                raise RuntimeError(
+                    "Canonical atoms changed while vector rebuild was in progress; the active index was preserved."
+                )
+            manifest = build_index_manifest(
+                atoms_dir=atoms_dir,
+                collection_name=collection_name,
+                embedding_model=model,
+                embedding_dimensions=embedding_dimensions,
+                indexed_count=stats["indexed"],
+                generation_id=generation_id,
+                skipped_count=stats["skipped"],
+            )
+            write_index_manifest(staging_path, manifest)
+            stats["backup_path"] = activate_staged_store(staging_path, store_path)
+            stats["committed"] = True
+
+        if _writer_lock_held:
+            _commit_staged_generation()
+        else:
+            writer_lock_path = os.path.join(
+                os.path.dirname(os.path.abspath(atoms_dir)),
+                ".sidecar",
+                "writer.lock",
+            )
+            with review_lock(writer_lock_path):
+                _commit_staged_generation()
     except Exception:
         if collection is not None:
             try:

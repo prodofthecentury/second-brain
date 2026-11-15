@@ -69,11 +69,17 @@ class ImportStats:
     unchanged: int = 0
     skipped_too_large: int = 0
     skipped_unreadable: int = 0
+    conflicts_preserved: int = 0
+    dry_run: bool = False
+    notes_dir: str = ""
     elapsed_s: float = 0.0
     index: dict | None = None
 
     def as_dict(self) -> dict:
-        return dict(self.__dict__)
+        out = dict(self.__dict__)
+        out["imported"] = self.created
+        out["skipped"] = self.skipped_too_large + self.skipped_unreadable
+        return out
 
 
 def _manifest_path(paths: NotePaths) -> Path:
@@ -133,6 +139,7 @@ def import_folder(
     paths: NotePaths = DEFAULT_PATHS,
     tags: tuple[str, ...] = (),
     dry_run: bool = False,
+    overwrite_modified: bool = False,
     progress=None,
 ) -> ImportStats:
     if _is_reparse_or_link(str(Path(source_root).expanduser())) or _is_reparse_or_link(str(paths.notes_dir)):
@@ -147,7 +154,7 @@ def import_folder(
     notes_dir.mkdir(parents=True, exist_ok=True)
     if _is_reparse_or_link(str(notes_dir)):
         raise PermissionError("Refusing to import into a symlink/junction notes directory.")
-    stats = ImportStats()
+    stats = ImportStats(dry_run=bool(dry_run), notes_dir=str(notes_dir))
     started = time.perf_counter()
     root_tag = f"import:{slugify(root.name, max_len=40)}"
     all_tags = tuple(dict.fromkeys((root_tag, *tags)))
@@ -157,7 +164,9 @@ def import_folder(
         used: set[str] = set()
         for src in iter_source_files(root):
             stats.scanned += 1
-            key = str(src)
+            rel = src.relative_to(root)
+            rel_key = f"{root.name}/{rel.as_posix()}"
+            legacy_key = str(src)
             try:
                 raw = src.read_bytes()
                 text = raw.decode("utf-8-sig")
@@ -168,7 +177,7 @@ def import_folder(
                 stats.skipped_too_large += 1
                 continue
             src_sha = hashlib.sha256(raw).hexdigest()
-            entry = manifest.get(key)
+            entry = manifest.get(rel_key) or manifest.get(legacy_key)
             existing_note_path = (
                 safe_file_in_dir(str(notes_dir), str(entry.get("note", "")), allowed_exts={".md"}, must_exist=True)
                 if isinstance(entry, dict) and isinstance(entry.get("note"), str)
@@ -178,8 +187,9 @@ def import_folder(
                 note_basename = os.path.basename(existing_note_path)
                 stats.unchanged += 1
                 used.add(note_basename)
+                if rel_key not in manifest and legacy_key in manifest:
+                    manifest[rel_key] = manifest.pop(legacy_key)
                 continue
-            rel = src.relative_to(root)
             meta, body = parse_note(text, src.name)
             title = str(meta.get("title") or src.stem)
             src_tags = tuple(str(t) for t in meta.get("tags", []) or [])
@@ -193,19 +203,36 @@ def import_folder(
                 updated=mtime,
                 source_path=rel.as_posix(),
             ).encode("utf-8")
-            if dry_run:
-                stats.created += 0 if existing_note_path else 1
-                stats.updated += 1 if existing_note_path else 0
-                continue
+            rendered_sha = hashlib.sha256(rendered).hexdigest()
             if existing_note_path:
                 if _is_reparse_or_link(existing_note_path):
                     raise PermissionError(
                         f"Refusing to overwrite symlinked note file: {os.path.basename(existing_note_path)}"
                     )
+                recorded_note_sha = str((entry or {}).get("note_sha256") or "")
+                current_note_bytes = Path(existing_note_path).read_bytes()
+                current_note_sha = hashlib.sha256(current_note_bytes).hexdigest()
+                if recorded_note_sha and current_note_sha != recorded_note_sha and not overwrite_modified:
+                    stats.conflicts_preserved += 1
+                    used.add(os.path.basename(existing_note_path))
+                    continue
+                if dry_run:
+                    stats.updated += 1
+                    continue
+                if recorded_note_sha and current_note_sha != recorded_note_sha:
+                    hist_dir = notes_dir / ".history"
+                    hist_dir.mkdir(exist_ok=True)
+                    if not _is_reparse_or_link(str(hist_dir)):
+                        bak = hist_dir / f"{os.path.basename(existing_note_path)}.{current_note_sha[:16]}.bak"
+                        if not bak.exists():
+                            atomic_write_bytes(str(bak), current_note_bytes)
                 atomic_write_bytes(existing_note_path, rendered)
                 stats.updated += 1
                 note_name = os.path.basename(existing_note_path)
             else:
+                if dry_run:
+                    stats.created += 1
+                    continue
                 note_name = _note_name_for(rel, used, notes_dir)
                 fd = os.open(notes_dir / note_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
                 try:
@@ -216,7 +243,8 @@ def import_folder(
                     os.close(fd)
                 stats.created += 1
             used.add(note_name)
-            manifest[key] = {"note": note_name, "source_sha256": src_sha}
+            manifest.pop(legacy_key, None)
+            manifest[rel_key] = {"note": note_name, "source_sha256": src_sha, "note_sha256": rendered_sha}
             if progress and stats.scanned % 250 == 0:
                 progress(stats)
         if not dry_run:

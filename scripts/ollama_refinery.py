@@ -13,6 +13,8 @@ import argparse
 import sys
 import ollama
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from config import (
     RAW_DIR,
     ATOMS_DIR,
@@ -21,6 +23,8 @@ from config import (
     GEN_MODEL,
     EMBED_MODEL,
     TEXT_EXTS,
+    _WINDOWS_RESERVED_STEMS,
+    _is_reparse_or_link,
     append_archive_manifest_entry,
     archive_dir,
     build_archive_manifest_entry,
@@ -42,7 +46,7 @@ from memory_format import (
 from refinery_targets import intake_status, is_supported_refinery_target
 from vector_store import get_vector_collection
 from review_atom import review_lock
-from atom_mutator import refresh_lexical_index
+from atom_mutator import atomic_write_bytes, refresh_lexical_index
 
 def get_house_rules():
     with open(HOUSE_RULES_PATH, "r", encoding="utf-8") as f:
@@ -66,20 +70,6 @@ def embed_atom_content(collection, atom_file, content):
 def verify_embedding_available():
     """Fail before creating or archiving atoms when the configured embedder is unhealthy."""
     embed_text("Second Brain refinery preflight.", model=EMBED_MODEL)
-
-def embed_existing_atoms(collection):
-    print("[*] Syncing vector database with existing atoms...")
-    os.makedirs(ATOMS_DIR, exist_ok=True)
-    atoms = [f for f in os.listdir(ATOMS_DIR) if is_content_markdown(f)]
-    
-    # Simple sync: just re-embed everything to keep it easy (in a real prod app, check IDs)
-    for atom_file in atoms:
-        filepath = os.path.join(ATOMS_DIR, atom_file)
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-        
-        embed_atom_content(collection, atom_file, content)
-    print(f"[*] Vector sync complete. {len(atoms)} atoms embedded.")
 
 def draft_memory_atoms(raw_content, raw_filename, rules, allow_fallback=False, model=None):
     print(f"[*] Drafting memory atoms from {raw_filename}...")
@@ -184,6 +174,8 @@ OUTPUT ONLY the markdown content.
 
 def read_raw_capture(filepath):
     """Read a raw capture or a Web Scout .intake pointer."""
+    if os.path.lexists(filepath) and _is_reparse_or_link(filepath):
+        raise PermissionError(f"Refusing to read raw capture via symlink or reparse point: {filepath}")
     filename = os.path.basename(filepath)
     ext = os.path.splitext(filename)[1].lower()
     
@@ -198,12 +190,12 @@ def read_raw_capture(filepath):
     
     source_match = re.search(r"^source:\s*(.+)$", content, re.MULTILINE)
     if not source_match:
-        return content, filename
+        raise FileNotFoundError(f"Intake pointer is missing a valid 'source:' field: {filename}")
     
     source_ref = source_match.group(1).strip()
     source_path = safe_vault_reference(source_ref, allowed_exts={".md"})
-    if not source_path:
-        return content, filename
+    if not source_path or _is_reparse_or_link(source_path):
+        raise FileNotFoundError(f"Intake pointer target does not exist or is unsafe: {source_ref}")
     
     with open(source_path, "r", encoding="utf-8") as f:
         source_content = f.read()
@@ -216,19 +208,26 @@ def brain_relative_path(path: str) -> str:
     brain_root = os.path.dirname(os.path.abspath(ATOMS_DIR))
     absolute = os.path.abspath(path)
     try:
-        if os.path.commonpath([brain_root, absolute]) == brain_root:
+        if os.path.normcase(os.path.commonpath([brain_root, absolute])) == os.path.normcase(brain_root):
             return os.path.relpath(absolute, brain_root).replace("\\", "/")
     except ValueError:
         pass
     raise RuntimeError(f"Evidence source is outside the vault root: {path}")
 
 def atom_filename_for(final_atom):
-    filename = f"{datetime.datetime.now().strftime('%Y-%m%d-%H%M%S')}-atom.md"
-    id_match = re.search(r'^id:\s*(.+)$', final_atom, re.MULTILINE)
-    if id_match:
-        slug = re.sub(r'[^a-zA-Z0-9-]', '-', id_match.group(1)).strip('-')
-        filename = f"{slug}.md"
-    return filename
+    default_stem = f"{datetime.datetime.now().strftime('%Y-%m%d-%H%M%S')}-atom"
+    parsed = split_frontmatter(final_atom)
+    search_block = "\n".join(parsed[0]) if parsed is not None else final_atom
+    id_match = re.search(r"^id:\s*(.+)$", search_block, re.MULTILINE)
+    if not id_match:
+        return f"{default_stem}.md"
+    raw_id = id_match.group(1).strip().strip("\"'")
+    slug = re.sub(r"[^a-zA-Z0-9-]+", "-", raw_id).strip("-")[:96].strip("-")
+    if not slug:
+        slug = default_stem
+    elif slug.lower() in _WINDOWS_RESERVED_STEMS:
+        slug = f"atom-{slug}"
+    return f"{slug}.md"
 
 def unique_atom_path(filename):
     base, ext = os.path.splitext(filename)
@@ -311,7 +310,9 @@ def _process_single_file(
 
     lock_path = os.path.join(os.path.dirname(ATOMS_DIR), ".sidecar", "writer.lock")
     with review_lock(lock_path):
-        if not os.path.isfile(filepath) or file_sha256(filepath) != source_sha256:
+        if _is_reparse_or_link(ATOMS_DIR):
+            raise PermissionError(f"Refusing to write atoms into symlinked directory: {ATOMS_DIR}")
+        if not os.path.isfile(filepath) or _is_reparse_or_link(filepath) or file_sha256(filepath) != source_sha256:
             raise RuntimeError(f"Capture changed or was already processed while drafting: {filename}")
         os.makedirs(ATOMS_DIR, exist_ok=True)
         archived_path = archive_processed_capture(filepath) if archive else None
@@ -333,8 +334,7 @@ def _process_single_file(
             )
 
             out_path, out_filename = unique_atom_path(atom_filename_for(final_atom))
-            with open(out_path, "x", encoding="utf-8") as f:
-                f.write(final_atom)
+            atomic_write_bytes(out_path, final_atom.replace("\r\n", "\n").encode("utf-8"))
 
             saved_files.append(out_filename)
             print(f"[+] Saved new memory atom: {out_filename}")
@@ -381,22 +381,35 @@ def process_single_file(
 
 def process_raw_files():
     ensure_dirs()
+    if _is_reparse_or_link(RAW_DIR):
+        raise PermissionError(f"Refusing to scan symlinked 0-raw directory: {RAW_DIR}")
     rules = get_house_rules()
-    
-    raw_files = [
-        f for f in sorted(os.listdir(RAW_DIR))
-        if f != "reading-list.md"
-        and os.path.isfile(os.path.join(RAW_DIR, f))
-        and (os.path.splitext(f)[1].lower() in TEXT_EXTS or f.endswith(".intake"))
-    ]
-    
+
+    raw_files = []
+    for f in sorted(os.listdir(RAW_DIR)):
+        if f == "reading-list.md" or f.startswith((".", "~")):
+            continue
+        candidate_path = os.path.join(RAW_DIR, f)
+        try:
+            if (
+                not _is_reparse_or_link(candidate_path)
+                and os.path.isfile(candidate_path)
+                and is_supported_refinery_target(candidate_path)
+            ):
+                raw_files.append(f)
+        except Exception as exc:
+            print(f"[!] Deferred {f}: {exc}")
+
     if not raw_files:
         print("[*] No raw files to process.")
         return
 
     for file in raw_files:
         filepath = os.path.join(RAW_DIR, file)
-        process_single_file(filepath, rules=rules, sync_existing=False)
+        try:
+            process_single_file(filepath, rules=rules, sync_existing=False)
+        except Exception as exc:
+            print(f"[!] Deferred {file}: {exc}")
 
 
 def parse_args(argv=None):

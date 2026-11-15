@@ -47,9 +47,15 @@ JavaScript) paired with Streamlit's `SameSite=Strict` XSRF cookie
 (rejecting `0.0.0.0` or external interfaces), cross-origin HTTP/WebSocket
 rejection (`403 Forbidden`), and the session gate before vault reads. MCP
 remains disabled by default (`BRAIN_ENABLE_LOCAL_MCP=1`), fails closed without a
-configured local bearer token (`--generate-token`) supplied via MCP request
-`_meta` (`authorization: Bearer <token>`, never via tool `arguments`), enforces
-granular tool scoping (`BRAIN_MCP_ALLOWED_TOOLS`), restricts reads to
-`review_status == accepted` atoms, and isolates untrusted captures in
-`brain/0-raw/inbox/` requiring explicit owner promotion into `brain/0-raw/`
-before extraction; do not connect it to a cloud client.
+configured local bearer token (`--generate-token`, `>= 16` chars, `0600` /
+owner-only DACL) authenticated either per-request via MCP `_meta`
+(`authorization: Bearer <token>`, never via tool `arguments`) or via Phase 4's
+local stdio handshake (`BRAIN_MCP_TRUSTED_STDIO=1` paired with a constant-time
+`BRAIN_MCP_CLIENT_TOKEN` match managed by `second-brain connect`), enforces
+granular tool scoping (`BRAIN_MCP_ALLOWED_TOOLS`), restricts canonical atom
+reads (`search_memory`, `get_atom`) to `review_status == accepted`
+non-superseded atoms while tagging working-note reads (`search_notes`,
+`get_note`) as `<owner_notes untrusted="true">`, and routes untrusted or risky
+`add_to_inbox` / `remember` captures into `brain/0-raw/inbox/` requiring
+explicit owner promotion into `brain/0-raw/` before extraction; do not connect
+it to a cloud client.

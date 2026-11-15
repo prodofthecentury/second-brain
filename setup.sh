@@ -191,7 +191,6 @@ fi
 
 echo "=== Running Environment & Health Verification ==="
 "${UV_EXE}" run --frozen second-brain profile
-"${UV_EXE}" run --frozen second-brain doctor
 "${UV_EXE}" run --frozen python scripts/doctor.py
 
 if [ "${NO_LAUNCH}" -eq 0 ]; then

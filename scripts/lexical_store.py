@@ -19,8 +19,11 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import _is_reparse_or_link, safe_file_in_dir
 from index_manifest import atom_revisions, record_known_atom_hash, revisions_fingerprint
 
 
@@ -30,6 +33,16 @@ META_TABLE = "lexical_meta"
 MAX_QUERY_TERMS = 24
 MAX_QUERY_RESULTS = 500
 TOKEN_PATTERN = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
+
+
+def tokenize(text: str) -> list[str]:
+    """Extract lowercase Unicode word tokens (including hyphenated/apostrophe compounds)."""
+    return [m.group(0).casefold() for m in TOKEN_PATTERN.finditer(str(text or ""))]
+
+
+def tokenize(text: str) -> list[str]:
+    """Extract normalized lowercase lexical tokens from text."""
+    return [tok.casefold() for tok in TOKEN_PATTERN.findall(str(text or ""))]
 
 
 class LexicalIndexUnavailable(RuntimeError):
@@ -136,7 +149,9 @@ def rebuild_lexical_index(atoms_dir: str, index_path: str) -> dict[str, object]:
             )
             for revision in revisions:
                 filename = revision["filename"]
-                atom_path = os.path.join(atoms_dir, filename)
+                atom_path = safe_file_in_dir(atoms_dir, filename, allowed_exts={".md"})
+                if not atom_path or _is_reparse_or_link(atom_path):
+                    raise RuntimeError(f"Refusing to index unsafe, symlink, or reparse point atom: {filename}")
                 with open(atom_path, "rb") as file:
                     content_bytes = file.read()
                 content = content_bytes.decode("utf-8")
@@ -204,8 +219,11 @@ def upsert_lexical_atoms(
                     placeholders = ",".join("?" for _ in target_names)
                     conn.execute(f"DELETE FROM {FTS_TABLE} WHERE filename IN ({placeholders})", target_names)
                 for fname in changed_clean:
-                    atom_path = os.path.join(atoms_dir, fname)
-                    if not os.path.isfile(atom_path):
+                    candidate_path = os.path.join(atoms_dir, fname)
+                    if not os.path.lexists(candidate_path) or _is_reparse_or_link(candidate_path):
+                        continue
+                    atom_path = safe_file_in_dir(atoms_dir, fname, allowed_exts={".md"})
+                    if not atom_path or not os.path.isfile(atom_path) or _is_reparse_or_link(atom_path):
                         continue
                     with open(atom_path, "rb") as fh:
                         raw = fh.read()
@@ -286,8 +304,8 @@ def list_indexed_atoms_fast(
     """Fast paginated browse/search directly from FTS5 sidecar for thousands of notes."""
     connection = _readonly_connection(index_path)
     try:
-        safe_limit = max(1, min(int(limit), 1000))
-        safe_offset = max(0, int(offset))
+        safe_limit = max(1, min(int(limit), 100_000))
+        safe_offset = max(0, min(int(offset), 1_000_000))
         expr = _fts_query(query) if query and query.strip() else ""
         if expr:
             total_row = connection.execute(

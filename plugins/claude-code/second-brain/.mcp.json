@@ -3,14 +3,17 @@
     "second-brain": {
       "command": "uv",
       "args": [
-        "--directory",
-        "${CLAUDE_PLUGIN_ROOT}/../../..",
         "run",
-        "--frozen",
+        "--no-project",
+        "--python",
+        ">=3.11",
         "python",
-        "scripts/mcp_server.py"
+        "-c",
+        "import os, pathlib, shutil, subprocess, sys; raw = os.environ.get('SECOND_BRAIN_REPO_ROOT') or os.path.join(os.environ.get('CLAUDE_PLUGIN_ROOT', ''), '..', '..', '..'); repo = pathlib.Path(raw).resolve() if raw else None; sb = shutil.which('second-brain'); cmd = ([shutil.which('uv') or 'uv', '--directory', str(repo), 'run', '--frozen', 'python', 'scripts/mcp_server.py'] if (repo and (repo / 'pyproject.toml').is_file() and (repo / 'scripts' / 'mcp_server.py').is_file()) else ([sb, 'mcp'] if sb else None)); (sys.stderr.write('second-brain MCP: run `second-brain connect add claude-code` or install `second-brain` on PATH.\\n') or sys.exit(1)) if not cmd else sys.exit(subprocess.call(cmd))"
       ],
       "env": {
+        "CLAUDE_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "BRAIN_ENABLE_LOCAL_MCP": "1",
         "BRAIN_MCP_TRUSTED_STDIO": "1",
         "BRAIN_MCP_CLIENT_TOKEN": "${BRAIN_MCP_CLIENT_TOKEN}"

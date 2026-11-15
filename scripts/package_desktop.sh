@@ -10,8 +10,10 @@ DESKTOP_DIR="$REPO_ROOT/desktop"
 DIST_DIR="$REPO_ROOT/dist"
 
 cd "$DESKTOP_DIR"
-if [ ! -d node_modules ]; then
+if [ -f package-lock.json ]; then
   npm ci
+elif [ ! -d node_modules ]; then
+  npm install
 fi
 
 UNAME_S="$(uname -s)"

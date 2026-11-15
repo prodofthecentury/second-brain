@@ -5,15 +5,23 @@
 # ]
 # ///
 
+import argparse
 import ast
 import datetime
+import hashlib
 import json
 import os
 import re
+import sys
 
-from config import ATOMS_DIR, BRAIN_DIR, RAW_DIR, THREADS_DIR, GEN_MODEL, ensure_dirs, is_content_markdown
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from atom_mutator import atomic_write_bytes, review_lock
+from config import ATOMS_DIR, BRAIN_DIR, RAW_DIR, THREADS_DIR, GEN_MODEL, _is_reparse_or_link, ensure_dirs, is_content_markdown
 from ollama_utils import chat_with_fallback
 from review_atom import approved_revision_is_current
+
+DEFAULT_MAX_TOPICS = 12
 
 
 STOPWORDS = {
@@ -80,11 +88,15 @@ def first_meaningful_words(text: str, count: int = 2) -> str:
 
 def load_atoms() -> list[dict]:
     ensure_dirs()
+    if _is_reparse_or_link(ATOMS_DIR):
+        raise PermissionError(f"Refusing to read atoms from symlinked directory: {ATOMS_DIR}")
     atoms = []
     for filename in sorted(os.listdir(ATOMS_DIR)):
         if not is_content_markdown(filename):
             continue
         filepath = os.path.join(ATOMS_DIR, filename)
+        if _is_reparse_or_link(filepath) or not os.path.isfile(filepath):
+            continue
         decision_log = os.path.join(RAW_DIR, "archive", "decision-record.jsonl")
         if not approved_revision_is_current(
             filepath,
@@ -119,7 +131,7 @@ def fallback_topic_name(atom: dict) -> str:
     return first_meaningful_words(atom["claim"] or atom["title"] or atom["filename"])
 
 
-def compact_topic_map(topic_map: dict[str, list[str]], max_topics: int = 3) -> dict[str, list[str]]:
+def compact_topic_map(topic_map: dict[str, list[str]], max_topics: int = DEFAULT_MAX_TOPICS) -> dict[str, list[str]]:
     items = sorted(topic_map.items(), key=lambda item: (-len(item[1]), item[0].lower()))
     if len(items) <= max_topics:
         return dict(items)
@@ -179,7 +191,7 @@ def group_atoms(atoms: list[dict]) -> dict[str, list[str]]:
     ])
 
     prompt = f"""
-Group these atomic notes into 1 to 3 coherent synthesis topics.
+Group these atomic notes into 1 to {DEFAULT_MAX_TOPICS} coherent synthesis topics.
 Return only a valid JSON object mapping a short topic name to an array of exact filenames.
 Do not include prose, markdown, comments, or filenames that are not listed.
 
@@ -199,39 +211,97 @@ ATOMS:
     return fallback_group_atoms(atoms)
 
 
-def render_fallback_thread(topic_name: str, atoms_list: list[dict]) -> str:
+def compute_cluster_sha256(topic_name: str, atoms_list: list[dict]) -> str:
+    canonical_atoms = sorted(
+        (
+            str(atom.get("filename", "")),
+            hashlib.sha256(
+                str(atom.get("content", "")).replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+            ).hexdigest(),
+        )
+        for atom in atoms_list
+    )
+    payload = json.dumps(
+        {"topic_slug": slugify(topic_name), "atoms": canonical_atoms},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _attach_cluster_sha256(markdown_doc: str, cluster_sha256: str) -> str:
+    normalized = markdown_doc.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+    if lines and lines[0].strip() == "---":
+        kept: list[str] = ["---"]
+        closed = False
+        for line in lines[1:]:
+            if not closed and line.strip() == "---":
+                kept.append(f"cluster_sha256: {cluster_sha256}")
+                kept.append("---")
+                closed = True
+            elif not closed and line.strip().startswith("cluster_sha256:"):
+                continue
+            else:
+                kept.append(line)
+        if closed:
+            return "\n".join(kept).rstrip() + "\n"
+    return normalized.rstrip() + "\n"
+
+
+def existing_synthesized_cluster_hashes(threads_dir: str | None = None) -> set[str]:
+    target_dir = threads_dir or THREADS_DIR
+    if not os.path.isdir(target_dir) or _is_reparse_or_link(target_dir):
+        return set()
+    hashes: set[str] = set()
+    for entry in sorted(os.listdir(target_dir)):
+        if not is_content_markdown(entry):
+            continue
+        path = os.path.join(target_dir, entry)
+        if _is_reparse_or_link(path) or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                val = frontmatter_value(handle.read(8192), "cluster_sha256")
+            if len(val) == 64 and all(ch in "0123456789abcdef" for ch in val.lower()):
+                hashes.add(val.lower())
+        except OSError:
+            continue
+    return hashes
+
+
+def render_fallback_thread(topic_name: str, atoms_list: list[dict], *, cluster_sha256: str | None = None) -> str:
     today = datetime.datetime.now().strftime("%Y-%m-%d")
+    cluster_hash = cluster_sha256 or compute_cluster_sha256(topic_name, atoms_list)
     atom_links = "\n".join(f"- [[{atom['filename']}]]" for atom in atoms_list)
     synthesis_lines = []
     for atom in atoms_list:
         claim = atom["claim"] or atom["title"]
         synthesis_lines.append(f"- [[{atom['filename']}]]: {claim}")
 
-    return f"""---
-topic: "{topic_name.replace('"', "'")}"
-type: thread
-status: active
-last-updated: {today}
----
-
-# {topic_name}
-
-> **Thread summary**: This thread gathers {len(atoms_list)} related atom(s) for review and synthesis.
-
-## Synthesis
-{os.linesep.join(synthesis_lines)}
-
-## Atom Index
-{atom_links}
-
-## Open Questions
-- What stronger source would confirm or challenge this cluster?
-- Which atom should be linked to adjacent threads next?
-"""
+    return (
+        "---\n"
+        f'topic: "{topic_name.replace(chr(34), chr(39))}"\n'
+        "type: thread\n"
+        "status: active\n"
+        f"last-updated: {today}\n"
+        f"cluster_sha256: {cluster_hash}\n"
+        "---\n\n"
+        f"# {topic_name}\n\n"
+        f"> **Thread summary**: This thread gathers {len(atoms_list)} related atom(s) for review and synthesis.\n\n"
+        "## Synthesis\n"
+        f"{chr(10).join(synthesis_lines)}\n\n"
+        "## Atom Index\n"
+        f"{atom_links}\n\n"
+        "## Open Questions\n"
+        "- What stronger source would confirm or challenge this cluster?\n"
+        "- Which atom should be linked to adjacent threads next?\n"
+    )
 
 
-def synthesize_topic(topic_name: str, atoms_list: list[dict]) -> str:
+def synthesize_topic(topic_name: str, atoms_list: list[dict], *, cluster_sha256: str | None = None) -> str:
     print(f"[*] Synthesizing thread for: {topic_name}")
+    cluster_hash = cluster_sha256 or compute_cluster_sha256(topic_name, atoms_list)
     atoms_text = "\n\n---\n\n".join([
         f"File: {atom['filename']}\n{atom['content']}"
         for atom in atoms_list
@@ -273,27 +343,35 @@ last-updated: {today}
         response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=GEN_MODEL)
         output = extract_markdown_block(response["message"]["content"])
         if output.startswith("---") and "## Synthesis" in output:
-            return output
+            return _attach_cluster_sha256(output, cluster_hash)
         print("  [!] Model thread output did not match template; using fallback thread.")
     except Exception as exc:
         print(f"  [!] Model synthesis unavailable: {exc}")
 
-    return render_fallback_thread(topic_name, atoms_list)
+    return render_fallback_thread(topic_name, atoms_list, cluster_sha256=cluster_hash)
 
 
 def write_thread(topic_name: str, content: str) -> str:
     ensure_dirs()
+    if _is_reparse_or_link(THREADS_DIR):
+        raise PermissionError(f"Refusing to write threads into symlinked directory: {THREADS_DIR}")
+    os.makedirs(THREADS_DIR, exist_ok=True)
     slug = slugify(topic_name)
-    suffix = 1
-    while True:
-        filename = f"{slug if suffix == 1 else f'{slug}-{suffix}'}.md"
-        out_path = os.path.join(THREADS_DIR, filename)
-        try:
-            with open(out_path, "x", encoding="utf-8") as file:
-                file.write(content.rstrip() + "\n")
-            print(f"  -> Saved thread: {filename}")
-            return filename
-        except FileExistsError:
+    kept = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    normalized = "\n".join(kept).rstrip() + "\n"
+    brain_root = BRAIN_DIR or os.path.dirname(os.path.abspath(THREADS_DIR))
+    lock_path = os.path.join(brain_root, ".sidecar", "writer.lock")
+    with review_lock(lock_path):
+        if _is_reparse_or_link(THREADS_DIR):
+            raise PermissionError(f"Refusing to write threads into symlinked directory: {THREADS_DIR}")
+        suffix = 1
+        while True:
+            filename = f"{slug if suffix == 1 else f'{slug}-{suffix}'}.md"
+            out_path = os.path.join(THREADS_DIR, filename)
+            if not os.path.lexists(out_path):
+                atomic_write_bytes(out_path, normalized.encode("utf-8"))
+                print(f"  -> Saved thread: {filename}")
+                return filename
             suffix += 1
 
 
@@ -304,16 +382,29 @@ def run_editor() -> list[str]:
         return []
 
     topics = group_atoms(atoms)
+    seen_hashes = existing_synthesized_cluster_hashes(THREADS_DIR)
     saved = []
     for topic, filenames in topics.items():
         topic_atoms = [atom for atom in atoms if atom["filename"] in filenames]
         if not topic_atoms:
             continue
-        saved.append(write_thread(topic, synthesize_topic(topic, topic_atoms)))
+        cluster_hash = compute_cluster_sha256(topic, topic_atoms)
+        if cluster_hash in seen_hashes:
+            print(f"[*] Skipping already-synthesized cluster: {topic} ({cluster_hash[:12]})")
+            continue
+        saved.append(write_thread(topic, synthesize_topic(topic, topic_atoms, cluster_sha256=cluster_hash)))
+        seen_hashes.add(cluster_hash)
     return saved
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Synthesize approved Second Brain atoms into topic threads.")
+    parser.parse_args(argv)
     print("=== OLLAMA EDITOR ENGINE ===")
     run_editor()
     print("=== MORNING SHIFT COMPLETE ===")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

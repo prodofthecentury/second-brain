@@ -87,7 +87,8 @@ def _evidence_text(content: str) -> str:
         if active:
             lines.append(re.sub(r"^\s*>\s?", "", line))
     evidence = "\n".join(lines).strip()
-    if len(evidence) >= 2 and evidence[0] == evidence[-1] and evidence[0] in {'"', "'", "“", "”", "‘", "’"}:
+    _QUOTE_PAIRS = {('"', '"'), ("'", "'"), ("\u201c", "\u201d"), ("\u2018", "\u2019")}
+    if len(evidence) >= 2 and (evidence[0], evidence[-1]) in _QUOTE_PAIRS:
         evidence = evidence[1:-1].strip()
     if not evidence:
         raise EvidenceValidationError("The atom has no evidence excerpt to verify.")

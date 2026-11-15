@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -243,14 +245,80 @@ def _goal_terms(text: str) -> set[str]:
     }
 
 
+def _playbook_weighted_tf(pb: PlaybookIntegrityReport) -> tuple[Counter[str], float, set[str]]:
+    weighted: Counter[str] = Counter()
+    for tok in TOKEN_PATTERN.findall(pb.title or ""):
+        t = tok.casefold()
+        if len(t) > 1 and t not in QUERY_STOP_WORDS:
+            weighted[t] += 2.5
+    for tok in TOKEN_PATTERN.findall(pb.trigger or ""):
+        t = tok.casefold()
+        if len(t) > 1 and t not in QUERY_STOP_WORDS:
+            weighted[t] += 2.5
+    for step_txt in pb.steps:
+        for tok in TOKEN_PATTERN.findall(step_txt or ""):
+            t = tok.casefold()
+            if len(t) > 1 and t not in QUERY_STOP_WORDS:
+                weighted[t] += 1.5
+    for pre_txt in pb.preconditions:
+        for tok in TOKEN_PATTERN.findall(pre_txt or ""):
+            t = tok.casefold()
+            if len(t) > 1 and t not in QUERY_STOP_WORDS:
+                weighted[t] += 1.0
+    doc_len = float(sum(weighted.values())) or 1.0
+    return weighted, doc_len, set(weighted.keys())
+
+
 def _playbook_matches_goal(pb: PlaybookIntegrityReport, goal: str, projects: tuple[str, ...]) -> bool:
     # Every backing atom must individually be visible in the requested scope (no union laundering).
     if projects and not playbook_visible_in_scope(pb, projects):
         return False
     q_terms = _goal_terms(goal)
-    pb_corpus = f"{pb.title}\n{pb.trigger}\n" + "\n".join(pb.steps)
+    pb_corpus = f"{pb.title}\n{pb.trigger}\n" + "\n".join(pb.steps) + "\n" + "\n".join(pb.preconditions)
     pb_terms = {tok.casefold() for tok in TOKEN_PATTERN.findall(pb_corpus)}
     return len(q_terms.intersection(pb_terms)) >= 2
+
+
+def _rank_matching_playbooks(
+    candidates: list[PlaybookIntegrityReport],
+    goal: str,
+    projects: tuple[str, ...],
+    active_context_profile: tuple[str, ...] = (),
+) -> list[PlaybookIntegrityReport]:
+    """Filter and rank Playbooks by field-weighted Okapi BM25 + active context profile overlap."""
+    eligible = [pb for pb in candidates if _playbook_matches_goal(pb, goal, projects)]
+    if len(eligible) <= 1:
+        return eligible
+
+    q_terms = _goal_terms(goal)
+    profile_tags = {str(tag).strip().casefold() for tag in active_context_profile if str(tag).strip()}
+    indexed: list[tuple[PlaybookIntegrityReport, Counter[str], float, set[str]]] = []
+    df_counts: Counter[str] = Counter()
+    for pb in eligible:
+        wtf, dlen, vocab = _playbook_weighted_tf(pb)
+        for t in vocab:
+            df_counts[t] += 1
+        indexed.append((pb, wtf, dlen, vocab))
+
+    n_docs = len(indexed)
+    avgdl = sum(item[2] for item in indexed) / max(1, n_docs)
+    idf = {
+        term: math.log(1.0 + (n_docs - df_counts[term] + 0.5) / (df_counts[term] + 0.5))
+        for term in q_terms
+    }
+    k1, b = 1.5, 0.75
+    scored: list[tuple[float, str, PlaybookIntegrityReport]] = []
+    for pb, wtf, dlen, vocab in indexed:
+        bm25 = 0.0
+        norm = k1 * (1.0 - b + b * (dlen / max(1.0, avgdl)))
+        for term in q_terms & vocab:
+            tf_val = wtf[term]
+            bm25 += idf[term] * ((tf_val * (k1 + 1.0)) / (tf_val + norm))
+        pb_ctx_lower = {str(c).strip().casefold() for c in pb.contexts if str(c).strip()}
+        ctx_boost = 0.15 * len(profile_tags & pb_ctx_lower)
+        scored.append((bm25 + ctx_boost, pb.playbook_id, pb))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [item[2] for item in scored]
 
 
 def _contexts_allowed_for_host(contexts: tuple[str, ...], rule: HostSharingRule) -> bool:
@@ -444,7 +512,12 @@ def assemble_executive_plan(
         telemetry_db_path=telemetry_db_path,
         active_only=True,
     )
-    matched_pbs = [pb for pb in all_active_pbs if _playbook_matches_goal(pb, clean_goal, projects)]
+    matched_pbs = _rank_matching_playbooks(
+        all_active_pbs,
+        clean_goal,
+        projects,
+        active_context_profile=request.active_context_profile,
+    )
     if host_rule is not None:
         matched_pbs = [pb for pb in matched_pbs if _playbook_allowed_for_host(pb, host_rule, atoms_dir=atoms_dir)]
 

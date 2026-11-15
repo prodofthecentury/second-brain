@@ -5,41 +5,103 @@
 # ]
 # ///
 
-import json
 import hashlib
 import math
 import os
-import urllib.error
-import urllib.request
+import sys
 
 import ollama
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import EMBED_MODEL, GEN_MODEL
+from hardware_profile import fetch_loopback_json, loopback_ollama_base_url
+import host_adapters as _host_adapters
+from host_adapters import (
+    HostConsentError,
+    HostSharingRule,
+    OutboundSecretBlockedError,
+    _redact_outbound_with_map,
+    builtin_default_policies,
+    default_host_policy_path,
+    validate_endpoint_network_boundary,
+)
+
+_DEFAULT_OLLAMA_CHAT = ollama.chat
+_DEFAULT_OLLAMA_EMBED = ollama.embed
 
 
 class EmbeddingUnavailableError(RuntimeError):
     """Raised when Ollama cannot provide a valid embedding for a request."""
 
 
+def load_host_sharing_policy(policy_path=None) -> dict[str, HostSharingRule]:
+    """Load configured host sharing policies (delegating dynamically to host_adapters.load_host_policies)."""
+    return _host_adapters.load_host_policies(policy_path)
+
+
+def _is_monkeypatched_ollama_fn(fn, default_fn) -> bool:
+    return fn is not default_fn or not getattr(fn, "__module__", "").startswith("ollama")
+
+
+def _resolve_local_ollama_rule_and_url() -> tuple[HostSharingRule, str]:
+    policy_path = default_host_policy_path()
+    if os.path.lexists(str(policy_path)):
+        policies = load_host_sharing_policy(policy_path)
+    else:
+        policies = builtin_default_policies()
+
+    rule = policies.get("ollama_local")
+    if rule is None or not rule.enabled:
+        raise HostConsentError("Local Ollama host 'ollama_local' is disabled by host sharing policy.")
+
+    env_host = (os.environ.get("OLLAMA_HOST") or "").strip()
+    raw_endpoint = (env_host or rule.endpoint_url or "http://127.0.0.1:11434").strip().rstrip("/")
+    candidate_url = raw_endpoint if "://" in raw_endpoint else f"http://{raw_endpoint}"
+
+    effective_rule = HostSharingRule(
+        host_id=rule.host_id,
+        provider="ollama",
+        transport="local",
+        endpoint_url=candidate_url,
+        default_model=rule.default_model,
+        api_key_env=rule.api_key_env,
+        enabled=rule.enabled,
+        allowed_projects=rule.allowed_projects,
+        allow_unscoped_atoms=rule.allow_unscoped_atoms,
+        allow_preference_atoms=rule.allow_preference_atoms,
+        redact_pii=rule.redact_pii,
+        fail_on_secret_detection=rule.fail_on_secret_detection,
+    )
+    validate_endpoint_network_boundary(effective_rule)
+    canonical_loopback = loopback_ollama_base_url(candidate_url)
+    if not canonical_loopback:
+        raise HostConsentError(
+            f"OLLAMA_HOST must point strictly to a local HTTP loopback address (127.0.0.1, localhost, or [::1]); got {raw_endpoint!r}."
+        )
+    return effective_rule, canonical_loopback
+
+
 def ollama_base_url() -> str:
-    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-    if not host.startswith(("http://", "https://")):
-        host = f"http://{host}"
-    return host
+    _, validated = _resolve_local_ollama_rule_and_url()
+    return validated
 
 
 def installed_model_names() -> list[str]:
     try:
-        with urllib.request.urlopen(f"{ollama_base_url()}/api/tags", timeout=5) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        _, base = _resolve_local_ollama_rule_and_url()
+    except (HostConsentError, PermissionError, ValueError):
+        return []
+    payload = fetch_loopback_json(f"{base}/api/tags", timeout=5.0, max_bytes=65536) if base else None
+    if not isinstance(payload, dict):
         payload = {"models": []}
 
     names = []
     for model in payload.get("models", []):
+        if not isinstance(model, dict):
+            continue
         name = model.get("name") or model.get("model")
         if name:
-            names.append(name)
+            names.append(str(name))
     return names
 
 
@@ -71,13 +133,42 @@ def generation_candidates(preferred: str | None = None) -> list[str]:
     return candidates or [configured]
 
 
+def _sanitize_messages_for_rule(messages: list[dict], rule: HostSharingRule) -> list[dict]:
+    if not (rule.redact_pii or rule.fail_on_secret_detection):
+        return messages
+    sanitized: list[dict] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or not isinstance(msg.get("content"), str):
+            sanitized.append(msg)
+            continue
+        report, _ = _redact_outbound_with_map(
+            msg["content"],
+            redact_pii=rule.redact_pii,
+            fail_on_secret_detection=rule.fail_on_secret_detection,
+        )
+        sanitized.append({**msg, "content": report.sanitized_text})
+    return sanitized
+
+
 def chat_with_fallback(messages: list[dict], model: str | None = None, **kwargs):
+    rule, base_url = _resolve_local_ollama_rule_and_url()
+    outbound_messages = _sanitize_messages_for_rule(messages, rule)
     errors = []
     for candidate in generation_candidates(model):
         try:
             if candidate != (model or GEN_MODEL):
                 print(f"[*] Trying fallback generation model: {candidate}")
-            return ollama.chat(model=candidate, messages=messages, **kwargs)
+            if _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
+                return ollama.chat(model=candidate, messages=outbound_messages, **kwargs)
+            client = ollama.Client(
+                host=base_url,
+                timeout=60.0,
+                follow_redirects=False,
+                trust_env=False,
+            )
+            return client.chat(model=candidate, messages=outbound_messages, **kwargs)
+        except (HostConsentError, OutboundSecretBlockedError, PermissionError):
+            raise
         except Exception as exc:
             errors.append(f"{candidate}: {exc}")
             print(f"[!] Generation model failed: {candidate} ({exc})")
@@ -88,10 +179,31 @@ def chat_with_fallback(messages: list[dict], model: str | None = None, **kwargs)
 def embed_text(text: str, model: str | None = None) -> list[float]:
     """Return one validated embedding or fail without substituting a fake vector."""
     model_name = model or EMBED_MODEL
+    rule, base_url = _resolve_local_ollama_rule_and_url()
+    outbound_text = text
+    if rule.redact_pii or rule.fail_on_secret_detection:
+        report, _ = _redact_outbound_with_map(
+            text,
+            redact_pii=rule.redact_pii,
+            fail_on_secret_detection=rule.fail_on_secret_detection,
+        )
+        outbound_text = report.sanitized_text
+
     try:
-        response = ollama.embed(model=model_name, input=text)
+        if _is_monkeypatched_ollama_fn(ollama.embed, _DEFAULT_OLLAMA_EMBED):
+            response = ollama.embed(model=model_name, input=outbound_text)
+        else:
+            client = ollama.Client(
+                host=base_url,
+                timeout=60.0,
+                follow_redirects=False,
+                trust_env=False,
+            )
+            response = client.embed(model=model_name, input=outbound_text)
         embeddings = response["embeddings"]
         embedding = embeddings[0]
+    except (HostConsentError, OutboundSecretBlockedError, PermissionError):
+        raise
     except Exception as exc:
         raise EmbeddingUnavailableError(
             f"Embedding model {model_name!r} could not provide an embedding: {exc}"

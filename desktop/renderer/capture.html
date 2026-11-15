@@ -6,17 +6,25 @@
   <title>Quick Capture</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
-<body style="padding:14px; background:#161b22;">
-  <div style="display:flex; flex-direction:column; gap:10px; height:100%;">
+<body style="padding:14px; background:#161b22; overflow:hidden;">
+  <div style="display:flex; flex-direction:column; gap:8px; height:100%;">
     <div style="display:flex; justify-content:space-between; align-items:center;">
       <strong style="font-size:14px;">Quick Capture to Second Brain</strong>
-      <span class="kbd">Esc to close</span>
+      <span class="kbd">Ctrl+Enter save · Esc close</span>
+    </div>
+    <div id="qcStatus" class="status-banner" style="display:none; padding:6px 10px;"></div>
+    <div style="display:flex; gap:8px;">
+      <select id="qcDestination" style="width:230px;" aria-label="Destination">
+        <option value="notes">Working Note (brain/notes/)</option>
+        <option value="inbox">Quarantined Inbox (0-raw/inbox/)</option>
+      </select>
+      <input type="text" id="qcTags" placeholder="Tags (comma-separated, e.g. quick-capture)" style="flex:1;" />
     </div>
     <input type="text" id="qcTitle" placeholder="Optional title..." />
     <textarea id="qcBody" placeholder="Capture a thought, snippet, or decision... (Ctrl+Enter to save)" style="flex:1; resize:none;"></textarea>
-    <div style="display:flex; gap:8px; justify-content:flex-end;">
-      <button class="btn" id="qcCancel">Cancel</button>
-      <button class="btn primary" id="qcSave">Save Note</button>
+    <div style="display:flex; gap:8px; justify-content:flex-end; align-items:center;">
+      <button class="btn" id="qcCancel" type="button">Cancel</button>
+      <button class="btn primary" id="qcSave" type="button">Save Note</button>
     </div>
   </div>
   <script src="capture.js"></script>

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
+import inspect
 import platform
 import sys
 from pathlib import Path
@@ -94,6 +96,26 @@ def doctor() -> int:
         else []
     )
     print(f"Playbooks: {len(playbook_files)}")
+    notes_dir = Path(_config.NOTES_DIR)
+    note_files = (
+        sorted(path for path in notes_dir.glob("*.md") if path.name != "README.md")
+        if notes_dir.is_dir()
+        else []
+    )
+    print(f"Working notes: {len(note_files)}")
+    required_dirs = (
+        _config.RAW_DIR,
+        _config.INBOX_DIR,
+        _config.ATOMS_DIR,
+        _config.THREADS_DIR,
+        _config.EXPERIENCES_DIR,
+        _config.PLAYBOOKS_DIR,
+        _config.SOURCES_DIR,
+        _config.BRIEFINGS_DIR,
+    )
+    missing_dirs = [d for d in required_dirs if not os.path.isdir(d)]
+    if missing_dirs:
+        print(f"Vault directories: missing ({', '.join(missing_dirs)})")
     try:
         from scripts.review_atom import approved_revision_is_current
 
@@ -105,6 +127,19 @@ def doctor() -> int:
 
     lexical_ready = lexical_index_is_current(_config.ATOMS_DIR, _config.LEXICAL_INDEX_PATH)
     print(f"Lexical index: {'current' if lexical_ready else 'missing or stale'}")
+    ledger_ok = True
+    try:
+        from scripts.vault_ledger import verify_vault_ledger
+
+        ledger_res = verify_vault_ledger(
+            brain_dir=_config.BRAIN_DIR,
+            atoms_dir=_config.ATOMS_DIR,
+            playbooks_dir=_config.PLAYBOOKS_DIR,
+        )
+        ledger_ok = bool(ledger_res.get("chain_valid", False))
+        print(f"Vault ledger: {'valid' if ledger_ok else 'INVALID'} ({ledger_res.get('entry_count', 0)} checkpoint(s))")
+    except Exception as exc:
+        print(f"Vault ledger: could not verify ({exc})")
     try:
         tags_url = _ollama_tags_url()
         if not tags_url:
@@ -153,23 +188,61 @@ def doctor() -> int:
             print("Dense index: unavailable (no active manifest); lexical FTS5 handles recall cleanly")
     except (OSError, ValueError, TypeError) as exc:
         print(f"Dense index: unavailable or invalid ({exc}); no dense results will be served")
-    return 0
+    return 1 if (missing_dirs or not lexical_ready or not ledger_ok) else 0
 
 
-def install(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    print(f"Created/verified vault at {BRAIN_DIR}")
+def _resolve_active_vault_paths() -> tuple[str, str, str]:
+    env_vault = (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
+    vault_dir = os.path.abspath(env_vault) if env_vault else os.path.abspath(_config.BRAIN_DIR)
+    if vault_dir == os.path.abspath(_config.BRAIN_DIR):
+        ensure_dirs()
+        return vault_dir, _config.ATOMS_DIR, _config.LEXICAL_INDEX_PATH
+    for rel in (
+        "0-raw",
+        os.path.join("0-raw", "inbox"),
+        os.path.join("0-raw", "archive"),
+        os.path.join("0-raw", "note-snapshots"),
+        "1-desk",
+        "2-atoms",
+        "3-threads",
+        "4-experiences",
+        "5-playbooks",
+        "sources",
+        "briefings",
+        "notes",
+        ".chroma",
+        ".sidecar",
+    ):
+        os.makedirs(os.path.join(vault_dir, rel), exist_ok=True)
+    return (
+        vault_dir,
+        os.path.join(vault_dir, "2-atoms"),
+        os.path.join(vault_dir, ".sidecar", "lexical.sqlite3"),
+    )
+
+
+def install(args: argparse.Namespace | None = None) -> int:
+    vault_dir, atoms_dir, lexical_index_path = _resolve_active_vault_paths()
+    print(f"Created/verified vault at {vault_dir}")
+    if getattr(args, "no_index", False) and os.path.isfile(lexical_index_path):
+        return 0
     from scripts.lexical_store import rebuild_lexical_index
     from scripts.review_atom import review_lock
 
-    lock_path = _config.os.path.join(_config.os.path.dirname(_config.LEXICAL_INDEX_PATH), "writer.lock")
+    lock_path = os.path.join(os.path.dirname(lexical_index_path), "writer.lock")
     try:
         with review_lock(lock_path):
-            stats = rebuild_lexical_index(_config.ATOMS_DIR, _config.LEXICAL_INDEX_PATH)
+            stats = rebuild_lexical_index(atoms_dir, lexical_index_path)
     except Exception as exc:
         print(f"Lexical index rebuild failed: {exc}", file=sys.stderr)
         return 1
     print(f"Lexical recall initialized with {stats['indexed_count']} atom(s).")
+    try:
+        from scripts.notes_store import NotePaths, ensure_notes_index
+
+        ensure_notes_index(NotePaths.for_brain(vault_dir))
+    except Exception as exc:
+        print(f"Notes index initialization warning: {exc}", file=sys.stderr)
     print("Model-free local setup is ready. Inspect installed capabilities with `second-brain doctor`.")
     if _capability("streamlit"):
         print("Start the local dashboard with `second-brain dashboard`.")
@@ -178,6 +251,9 @@ def install(args: argparse.Namespace) -> int:
     if not _capability("ollama"):
         print("Ollama Python client is not installed. Run `uv sync --frozen`; an Ollama daemon and model are separate.")
     return 0
+
+
+cmd_install = install
 
 
 def launch_dashboard() -> int:
@@ -202,6 +278,7 @@ def launch_dashboard() -> int:
         "--server.allowedHosts=127.0.0.1",
         "--server.corsAllowedOrigins=http://127.0.0.1:8501",
         "--browser.serverAddress=127.0.0.1",
+        "--browser.gatherUsageStats=false",
     ])
 
 
@@ -211,56 +288,30 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("doctor", help="Report local runtime capabilities.")
     subparsers.add_parser("dashboard", help="Start the local password-protected dashboard.")
     install_parser = subparsers.add_parser("install", help="Initialize the vault and model-free lexical index.")
-    install_parser.add_argument("--no-index", action="store_true", help="Only create the vault folders.")
+    install_parser.add_argument("--no-index", action="store_true", help="Skip reindexing if lexical index already exists.")
 
     profile_parser = subparsers.add_parser("profile", help="Inspect host hardware tier and model recommendations.")
     profile_parser.add_argument("--json", action="store_true", help="Output structured JSON hardware profile.")
 
     serve_parser = subparsers.add_parser("serve", help="Start the loopback 127.0.0.1 HTTP JSON Memory API.")
     serve_parser.add_argument("--host", default="127.0.0.1", help="Loopback bind host (must be 127.0.0.1).")
-    serve_parser.add_argument("--port", type=int, default=8765, help="Loopback TCP port (default 8765).")
+    serve_parser.add_argument("--port", type=int, default=8765, help="Loopback TCP port (default 8765; 0 for ephemeral).")
     serve_parser.add_argument("--generate-token", action="store_true", help="Generate a 256-bit API bearer token and exit.")
+    serve_parser.add_argument("--ensure-tokens", action="store_true", help="Create agent and owner tokens if missing.")
 
     adapter_parser = subparsers.add_parser("adapter-config", help="Print IDE and custom host adapter configuration JSON.")
     adapter_parser.add_argument("--port", type=int, default=8765, help="Loopback API TCP port (default 8765).")
 
-    inbox_parser = subparsers.add_parser(
-        "inbox",
-        help="Inspect, promote, or reject quarantined 0-raw/inbox captures.",
-        add_help=False,
-    )
-    inbox_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
-
-    hosts_parser = subparsers.add_parser(
-        "hosts",
-        help="Inspect and configure per-host AI sharing consent policies.",
-        add_help=False,
-    )
-    hosts_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
-
-    cognitive_parser = subparsers.add_parser(
-        "cognitive",
-        help="Generate memory fitness reports, record feedback, and log experiences.",
-        add_help=False,
-    )
-    cognitive_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
-
-    playbooks_parser = subparsers.add_parser(
-        "playbooks",
-        help="Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks.",
-        add_help=False,
-    )
-    playbooks_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
-
-    plan_parser = subparsers.add_parser(
-        "plan",
-        help="Assemble a grounded, citation-verified Executive Plan from Playbooks and approved Atoms.",
-        add_help=False,
-    )
-    plan_parser.add_argument("sub_argv", nargs=argparse.REMAINDER)
-
     for name, help_text in (
+        ("api", "Run or configure the loopback 127.0.0.1 HTTP JSON Memory API."),
+        ("inbox", "Inspect, promote, or reject quarantined 0-raw/inbox captures."),
+        ("hosts", "Inspect and configure per-host AI sharing consent policies."),
+        ("cognitive", "Generate memory fitness reports, record feedback, and log experiences."),
+        ("playbooks", "Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks."),
+        ("playbook", "Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks."),
+        ("plan", "Assemble a grounded, citation-verified Executive Plan from Playbooks and approved Atoms."),
         ("notes", "Zero-friction notes: add, search, list, reindex, verify an excerpt."),
+        ("capture", "Quickly capture a working note or quarantined inbox item from the CLI."),
         ("import", "Bulk-import an Obsidian vault or Markdown folder into notes."),
         ("chat", "Chat with streaming answers over verified memory and notes."),
         ("connect", "One-click connect Claude Code/Desktop, Cursor, Windsurf, VS Code, or Antigravity."),
@@ -269,10 +320,23 @@ def main(argv: list[str] | None = None) -> int:
         ("ledger", "Cryptographic Vault Merkle proof and tamper-evident audit ledger."),
         ("graph", "Contradiction & Drift Radar + temporal knowledge graph."),
         ("snapshot", "Time-travel vault snapshots, semantic diff, and point-in-time recall."),
+        ("recall", "Search owner-approved memory atoms via lexical, dense, or hybrid RRF recall."),
+        ("answer", "Generate a citation-validated grounded answer from owner-approved memory."),
+        ("review", "Inspect, approve, reject, quarantine, demote, edit, or merge memory atoms."),
+        ("audit", "Audit canonical memory atoms against anchored source files."),
+        ("rebuild-lexical", "Rebuild the SQLite FTS5 lexical recall sidecar index."),
+        ("rebuild-vectors", "Rebuild the Chroma dense vector index and active generation manifest."),
+        ("refinery", "Extract candidate atomic notes from raw captures via local Ollama."),
+        ("editor", "Synthesize thematic threads and weekly briefings via local Ollama."),
+        ("scout", "Fetch allowlisted reading-list sources into 0-raw/inbox/."),
+        ("ingest", "Ingest local audio or image files into 0-raw/ Markdown captures."),
+        ("daemon", "Run the continuous local vault watchdog daemon."),
+        ("mcp", "Run or configure the loopback stdio MCP server."),
+        ("eval-retrieval", "Run retrieval quality evaluation over labeled suites."),
+        ("eval-answers", "Run grounded answer policy evaluation suites."),
     ):
         p = subparsers.add_parser(name, help=help_text, add_help=False)
         p.add_argument("sub_argv", nargs=argparse.REMAINDER)
-    serve_parser.add_argument("--ensure-tokens", action="store_true", help="Create agent and owner tokens if missing.")
 
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if raw_argv and raw_argv[0] in _PASSTHROUGH_COMMANDS:
@@ -295,10 +359,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install":
         if remainder:
             parser.error(f"unrecognized arguments: {' '.join(remainder)}")
-        if args.no_index:
-            ensure_dirs()
-            print(f"Created/verified vault at {BRAIN_DIR}")
-            return 0
         return install(args)
     if args.command == "profile":
         if remainder:
@@ -332,13 +392,169 @@ def main(argv: list[str] | None = None) -> int:
 
 
 _PASSTHROUGH_COMMANDS = frozenset({
-    "inbox", "hosts", "cognitive", "playbooks", "plan",
-    "notes", "import", "chat", "connect", "benchmark",
+    "api",
+    "inbox", "hosts", "cognitive", "playbooks", "playbook", "plan",
+    "notes", "capture", "import", "chat", "connect", "benchmark",
     "sota-benchmark", "ledger", "graph", "snapshot",
+    "recall", "answer", "review", "audit",
+    "rebuild-lexical", "rebuild-vectors",
+    "refinery", "editor", "scout", "ingest", "daemon", "mcp",
+    "eval-retrieval", "eval-answers",
 })
 
 
+def _invoke_entrypoint(fn, forwarded: list[str], *, prog: str, description: str) -> int:
+    sig = inspect.signature(fn)
+    accepts_args = any(
+        p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+        for p in sig.parameters.values()
+    )
+    if accepts_args:
+        res = fn(forwarded)
+        return int(res) if isinstance(res, int) else 0
+    sub_parser = argparse.ArgumentParser(prog=prog, description=description)
+    sub_parser.parse_args(forwarded)
+    res = fn()
+    return int(res) if isinstance(res, int) else 0
+
+
+def _run_recall_cli(forwarded: list[str]) -> int:
+    from scripts import recall as recall_mod
+
+    mod_main = getattr(recall_mod, "main", None)
+    if callable(mod_main):
+        return _invoke_entrypoint(mod_main, forwarded, prog="second-brain recall", description="Search approved vault memory.")
+
+    p = argparse.ArgumentParser(prog="second-brain recall", description="Search owner-approved memory atoms.")
+    p.add_argument("query", help="Natural-language or keyword recall query.")
+    p.add_argument("--retrieval-mode", "--mode", dest="retrieval_mode", choices=("auto", "lexical", "dense", "rrf"), default="auto")
+    p.add_argument("-n", "--limit", type=int, default=5, help="Max direct results (1..25).")
+    p.add_argument("--project", default=None, help="Optional project:<slug> scope filter.")
+    p.add_argument("--allow-cross-project", action="store_true")
+    p.add_argument("--no-follow-links", action="store_true")
+    p.add_argument("--include-duplicates", action="store_true")
+    p.add_argument("--json", action="store_true", help="Emit structured JSON output.")
+    args = p.parse_args(forwarded)
+
+    vault_dir, atoms_dir, lexical_index_path = _resolve_active_vault_paths()
+    chroma_path = os.path.join(vault_dir, ".chroma")
+    projects = (args.project.strip(),) if args.project and args.project.strip() else ()
+    opts = recall_mod.RecallOptions(
+        n_results=max(1, min(int(args.limit), 25)),
+        follow_links=not args.no_follow_links,
+        include_statuses={"accepted"},
+        projects=projects,
+        allow_cross_project=bool(args.allow_cross_project),
+        retrieval_mode=args.retrieval_mode,
+    )
+    direct, neighbors = recall_mod.search_memory(
+        args.query,
+        opts,
+        atoms_dir=atoms_dir,
+        index_path=lexical_index_path,
+        chroma_path=chroma_path,
+    )
+    duplicates = (
+        recall_mod.suggest_duplicate_atoms(
+            atoms_dir,
+            require_current_approval=True,
+            projects=projects,
+            brain_dir=vault_dir,
+        )
+        if args.include_duplicates
+        else []
+    )
+    payload = {
+        "results": [r.as_dict() for r in direct],
+        "linked_neighbors": [r.as_dict() for r in neighbors],
+        "duplicate_suggestions": duplicates,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        for item in direct:
+            print(f"[{item.score:.3f}] {item.filename} ({item.memory_type})")
+        if not direct:
+            print("No approved memories matched query.")
+    return 0
+
+
+def _run_answer_cli(forwarded: list[str]) -> int:
+    from scripts import answer_policy as ans_mod
+
+    mod_main = getattr(ans_mod, "main", None)
+    if callable(mod_main):
+        return _invoke_entrypoint(mod_main, forwarded, prog="second-brain answer", description="Generate a grounded answer.")
+
+    from scripts.host_adapters import generate_grounded_answer_via_host
+    from scripts.recall import RecallOptions, search_memory
+
+    p = argparse.ArgumentParser(prog="second-brain answer", description="Generate a citation-validated grounded answer.")
+    p.add_argument("query", help="Question to answer from approved memory.")
+    p.add_argument("--mode", choices=("standard", "preference"), default="standard")
+    p.add_argument("--retrieval-mode", choices=("auto", "lexical", "dense", "rrf"), default="auto")
+    p.add_argument("-n", "--limit", type=int, default=5)
+    p.add_argument("--project", default=None)
+    p.add_argument("--allow-cross-project", action="store_true")
+    p.add_argument("--host-id", default="ollama_local")
+    p.add_argument("--model-override", default=None)
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args(forwarded)
+
+    vault_dir, atoms_dir, lexical_index_path = _resolve_active_vault_paths()
+    chroma_path = os.path.join(vault_dir, ".chroma")
+    n_res = max(1, min(int(args.limit), 15))
+    projects = (args.project.strip(),) if args.project and args.project.strip() else ()
+    direct, neighbors = search_memory(
+        args.query,
+        RecallOptions(
+            n_results=n_res,
+            follow_links=True,
+            include_statuses={"accepted"},
+            projects=projects,
+            allow_cross_project=bool(args.allow_cross_project),
+            retrieval_mode=args.retrieval_mode,
+        ),
+        atoms_dir=atoms_dir,
+        index_path=lexical_index_path,
+        chroma_path=chroma_path,
+    )
+    ans = generate_grounded_answer_via_host(
+        ans_mod.AnswerRequest(query=args.query, mode=args.mode, project_scope=args.project, result_limit=n_res),
+        list(direct) + list(neighbors),
+        host_id=args.host_id,
+        model_override=args.model_override,
+        atoms_dir=atoms_dir,
+        brain_dir=vault_dir,
+    )
+    if args.json:
+        from dataclasses import asdict
+
+        print(
+            json.dumps(
+                {
+                    "answerable": ans.answerable,
+                    "text": ans.text,
+                    "reason": ans.reason,
+                    "claims": [
+                        {"text": c.text, "is_preference": c.is_preference, "evidence": [asdict(ev) for ev in c.evidence]}
+                        for c in ans.claims
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(ans.text)
+    return 0
+
+
 def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
+    if command == "api":
+        from scripts.memory_api import main as api_main
+
+        return api_main(forwarded)
     if command == "inbox":
         from scripts.inbox_workflow import main as inbox_main
 
@@ -351,7 +567,7 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.cognitive_core import main as cognitive_main
 
         return cognitive_main(forwarded)
-    if command == "playbooks":
+    if command in ("playbooks", "playbook"):
         from scripts.skill_playbooks import main as playbooks_main
 
         return playbooks_main(forwarded)
@@ -363,6 +579,31 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.notes_store import main as notes_main
 
         return notes_main(forwarded)
+    if command == "capture":
+        p = argparse.ArgumentParser(prog="second-brain capture", description="Quickly capture a working note.")
+        p.add_argument("text", nargs="*", help="Note body text (or pass --stdin).")
+        p.add_argument("--title", default="", help="Optional note title.")
+        p.add_argument("--tag", action="append", default=[], help="Optional tag (repeatable).")
+        p.add_argument("--stdin", action="store_true", help="Read note body from stdin.")
+        p.add_argument("--json", action="store_true", help="Emit JSON output.")
+        args = p.parse_args(forwarded)
+        body_text = sys.stdin.read() if args.stdin else " ".join(args.text)
+        if not body_text.strip():
+            p.error("Provide capture text or --stdin.")
+        vault_dir, _, _ = _resolve_active_vault_paths()
+        from scripts.notes_store import NotePaths, create_note
+
+        created = create_note(
+            args.title,
+            body_text,
+            tags=list(args.tag or []),
+            paths=NotePaths.for_brain(vault_dir),
+        )
+        if args.json:
+            print(json.dumps(created, indent=2, ensure_ascii=False))
+        else:
+            print(f"Captured note: {created.get('filename')} ({created.get('status')})")
+        return 0
     if command == "import":
         from scripts.bulk_import import main as import_main
 
@@ -395,6 +636,93 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.time_travel import main as snap_main
 
         return snap_main(forwarded)
+    if command == "recall":
+        return _run_recall_cli(forwarded)
+    if command == "answer":
+        return _run_answer_cli(forwarded)
+    if command == "review":
+        from scripts.review_atom import main as review_main
+
+        return _invoke_entrypoint(review_main, forwarded, prog="second-brain review", description="Review and mutate canonical atoms.")
+    if command == "audit":
+        from scripts.audit_sources import main as audit_main
+
+        return _invoke_entrypoint(audit_main, forwarded, prog="second-brain audit", description="Audit source anchors across atoms.")
+    if command == "rebuild-lexical":
+        from scripts.rebuild_lexical_index import main as rebuild_lex_main
+
+        return _invoke_entrypoint(rebuild_lex_main, forwarded, prog="second-brain rebuild-lexical", description="Rebuild SQLite FTS5 lexical index.")
+    if command == "rebuild-vectors":
+        from scripts.rebuild_vectors import main as rebuild_vec_main
+
+        return _invoke_entrypoint(rebuild_vec_main, forwarded, prog="second-brain rebuild-vectors", description="Rebuild Chroma dense vector index.")
+    if command == "refinery":
+        from scripts import ollama_refinery as ref_mod
+
+        fn = getattr(ref_mod, "main", None) or ref_mod.process_raw_files
+        return _invoke_entrypoint(fn, forwarded, prog="second-brain refinery", description="Extract candidate atoms from 0-raw/.")
+    if command == "editor":
+        from scripts import ollama_editor as ed_mod
+
+        fn = getattr(ed_mod, "main", None) or ed_mod.run_editor
+        return _invoke_entrypoint(fn, forwarded, prog="second-brain editor", description="Synthesize threads and weekly briefings.")
+    if command == "scout":
+        from scripts import ollama_scout as scout_mod
+
+        fn = getattr(scout_mod, "main", None) or scout_mod.run_scout
+        return _invoke_entrypoint(fn, forwarded, prog="second-brain scout", description="Fetch allowlisted reading-list sources.")
+    if command == "ingest":
+        from scripts import ingest_multimodal as ingest_mod
+
+        mod_main = getattr(ingest_mod, "main", None)
+        if callable(mod_main):
+            return _invoke_entrypoint(mod_main, forwarded, prog="second-brain ingest", description="Ingest multimodal files into 0-raw/.")
+        p = argparse.ArgumentParser(prog="second-brain ingest", description="Ingest multimodal audio/image files into 0-raw/.")
+        p.add_argument("--file", help="Path to a single audio or image file to ingest.")
+        args = p.parse_args(forwarded)
+        ensure_dirs()
+        if args.file:
+            ingest_mod.process_file(args.file)
+        else:
+            ingest_mod.scan_raw_dir()
+        return 0
+    if command == "daemon":
+        from scripts import watchdog_daemon as daemon_mod
+
+        fn = getattr(daemon_mod, "main", None) or daemon_mod.run_daemon
+        return _invoke_entrypoint(fn, forwarded, prog="second-brain daemon", description="Run continuous vault watchdog daemon.")
+    if command == "mcp":
+        from scripts import mcp_server as mcp_mod
+
+        mod_main = getattr(mcp_mod, "main", None)
+        if callable(mod_main) and not inspect.iscoroutinefunction(mod_main):
+            return _invoke_entrypoint(mod_main, forwarded, prog="second-brain mcp", description="Run loopback stdio MCP server.")
+        p = argparse.ArgumentParser(prog="second-brain mcp", description="Run or configure the Second Brain local MCP server.")
+        p.add_argument("--generate-token", action="store_true", help="Generate and store a random 256-bit MCP bearer token.")
+        p.add_argument("--print-token", action="store_true", help="Print the configured file-stored MCP bearer token.")
+        args = p.parse_args(forwarded)
+        if args.generate_token:
+            token = mcp_mod.secrets.token_urlsafe(32)
+            saved_path = mcp_mod.write_token_file(token)
+            print(f"Wrote MCP bearer token to {saved_path}")
+            return 0
+        if args.print_token:
+            token = mcp_mod.get_configured_bearer_token()
+            if not token:
+                print("No valid MCP bearer token is configured. Run with --generate-token.", file=sys.stderr)
+                return 1
+            print(token)
+            return 0
+        asyncio.run(mod_main())
+        return 0
+    if command == "eval-retrieval":
+        from scripts.evaluate_retrieval import main as eval_ret_main
+
+        return _invoke_entrypoint(eval_ret_main, forwarded, prog="second-brain eval-retrieval", description="Evaluate retrieval quality.")
+    if command == "eval-answers":
+        from scripts.evaluate_answers import main as eval_ans_main
+
+        return _invoke_entrypoint(eval_ans_main, forwarded, prog="second-brain eval-answers", description="Evaluate grounded answer policy.")
     return 2
 
 

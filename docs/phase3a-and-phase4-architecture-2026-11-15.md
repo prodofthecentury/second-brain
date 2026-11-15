@@ -111,7 +111,7 @@ Following initial Phase 4 implementation, a full security and contract audit (`P
   - `retrieve_context` enforces `project` scoping (`project:<scope>` or bare tag match) across retrieved note snippets rather than restricting only verified atoms.
   - `chat_events` filters retrieved verified atoms through `filter_atoms_for_host(..., mode="standard" if mode == "verified" else None)`, scans outbound `verified` and `stream` prompts with `inspect_and_redact_outbound` (`fail_on_secret_detection=False`) before model invocation (emitting `error` + `done` events and auditing `"blocked_secret"` if triggered), and configures `ollama.Client` (`default_stream_fn`, `default_json_fn`, `warmup`) with `timeout=45.0, follow_redirects=False, trust_env=False`.
 - **Product API Auditing & Bulk Import Symlink Hardening (`P4-HIGH-04`, `scripts/api_product.py`, `scripts/bulk_import.py`):**
-  - `api_product.dispatch` resolves `memory_api._audit_api_event` so `/v1/notes`, `/v1/atoms`, `/v1/ide/*`, `owner_only` `403` denials, and `/v1/chat/stream` completions record entries to `memory-api-audit.jsonl`, and threads `getattr(rt, "owner_token_path", None)` through `owner_authorized()` / `get_owner_token()`.
+  - `api_product.dispatch` resolves `memory_api._audit_api_event` so `/v1/notes`, `/v1/atoms`, `/v1/hosts/<id>` (host sharing policies; `ide_connector.py` is invoked via the `second-brain connect` CLI, Desktop IPC, and Dashboard rather than HTTP `/v1/ide/*`), `owner_only` `403` denials, and `/v1/chat/stream` completions record entries to `memory-api-audit.jsonl`, and threads `getattr(rt, "owner_token_path", None)` through `owner_authorized()` / `get_owner_token()`.
   - `bulk_import.py` adds `.ssh`, `.gnupg`, `.aws`, and `.kube` to `SKIP_DIRS`, checks `_is_reparse_or_link` on `source_root` before `.resolve()`, skips symlink/junction dirs/files and enforces `os.path.commonpath` realpath containment in `iter_source_files`, validates `_note_name_for` and manifest notes via `safe_file_in_dir`, blocks symlink/reparse `notes_dir` or existing destination note targets, and verifies full write lengths with `os.fsync`.
 - **IDE Connector Atomic Writes, CLI Contract & Wheel Packaging (`P4-MED-02`, `scripts/ide_connector.py`, `pyproject.toml`, `plugins/`):**
   - `_atomic_write_json` rejects symlinks/junctions, writes using OS-level binary/write/create/truncate flags with `os.fsync`, and applies `restrict_security_file_permissions` to written configs and `.bak-*` backup files; `_load_json` and `_write_antigravity_bundle` check `_is_reparse_or_link` and validate bundle templates.
@@ -136,9 +136,9 @@ Phase 5 closes the remaining product horizon items (`CODEX_CLI_GOAL.md`) across 
 
 ---
 
-## 6. Unified 11-Suite Release Verification (`scripts/test_all.py`)
+## 6. Unified 12-Suite Release Verification (`scripts/test_all.py`)
 
-The unified gate runs **11/11** suites end-to-end (`doctor`, `evaluation_dataset`, `audit_sources`, `system_safety_tests`, `phase2_safety_tests`, `phase3_cognitive_tests`, `phase4_product_tests`, `phase5_god_features_tests`, `scale_benchmark_1500`, `chroma_rebuild_canary`, `smoke_test`) against an isolated runtime and temp vaults:
+The unified gate runs **12/12** suites end-to-end (`doctor`, `evaluation_dataset`, `audit_sources`, `system_safety_tests`, `phase2_safety_tests`, `phase3_cognitive_tests`, `phase4_product_tests`, `phase5_god_features_tests`, `scale_benchmark_1500`, `chroma_rebuild_canary`, `archive_manifest_canary`, `smoke_test`) against an isolated runtime and temp vaults:
 
 - `doctor` (CLI/environment/ABI/index health)
 - `evaluation_dataset` (30-case dataset schema & SHA-256 binding)
@@ -146,8 +146,9 @@ The unified gate runs **11/11** suites end-to-end (`doctor`, `evaluation_dataset
 - `system_safety_tests` (CAS, grounding, RRF/project scoping & security penetration suite)
 - `phase2_safety_tests` (Phase 2 hardware tiers, inbox triage, consent/PII adapters, telemetry & API)
 - `phase3_cognitive_tests` (13 tests: Phase 3A fitness/ranking, Playbooks, Executive Planner & H1/H2/M1–M4/L1–L7 regressions)
-- `phase4_product_tests` (32 tests: Scale engine, notes, one-click verify, streaming chat, dual-token API, Obsidian import, IDE connectors, MCP auth & Phase 4–5 security/contract audit regressions)
-- `phase5_god_features_tests` (Desktop installers/tray, comparative SOTA benchmark, Merkle vault ledger, Contradiction Radar, Time-Travel snapshots & Phase 5 security regressions)
+- `phase4_product_tests` (33 tests: Scale engine, notes, one-click verify, streaming chat, dual-token API, Obsidian import, IDE connectors, MCP auth & Phase 4–5 security/contract/sweep regressions)
+- `phase5_god_features_tests` (11 tests: Desktop installers/tray, comparative SOTA benchmark, Merkle vault ledger, Contradiction & Drift Radar, Time-Travel BM25 snapshots & Phase 5 security/SDK regressions)
 - `scale_benchmark_1500` (1,500-note synthetic corpus correctness & latency canary)
 - `chroma_rebuild_canary` (real ChromaDB staged rebuild, cosine activation, rollback & handle cleanup canary)
+- `archive_manifest_canary` (immutable raw archive & manifest integrity canary)
 - `smoke_test` (end-to-end intake, grounding, lexical & dense recall smoke test)

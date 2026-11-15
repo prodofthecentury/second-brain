@@ -11,9 +11,12 @@ Exposes a deliberately limited MCP (Model Context Protocol) interface to a
 trusted local stdio process. It is disabled unless BRAIN_ENABLE_LOCAL_MCP=1 is set.
 
 Tools exposed:
-  search_memory(query)     — Shared recall over currently approved atoms
-  get_atom(atom_id)        — Read a specifically named, currently approved atom
-  add_to_inbox(content)    — Add a size-limited, untrusted capture to 0-raw/
+  search_memory(query, project?) — Shared recall over currently approved atoms
+  get_atom(atom_id)              — Read a specifically named, currently approved atom
+  add_to_inbox(content, source?) — Add a size-limited, untrusted capture to 0-raw/inbox/
+  search_notes(query, limit?)    — Search owner working notes in brain/notes/
+  get_note(filename)             — Read a working note from brain/notes/
+  remember(content, title?, tags?) — Save a clean working note (or quarantine risky/secret text to 0-raw/inbox/)
 
 Resources: no listable resource catalog; direct approved atom resources only.
 Tool/resource use is audited by canonical name and timestamp; input text is not logged.
@@ -41,9 +44,10 @@ from mcp import types
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
     ATOMS_DIR, THREADS_DIR, BRIEFINGS_DIR, RAW_DIR, INBOX_DIR,
-    ensure_dirs, today, now_slug,
+    _is_reparse_or_link, ensure_dirs, today, now_slug,
     is_content_markdown, normalize_markdown_filename, safe_file_in_dir
 )
+from host_adapters import read_bounded_security_file, restrict_security_file_permissions
 from recall import MemoryRecallUnavailable, RecallOptions, search_memory
 from review_atom import approved_revision_is_current
 from memory_review import parse_atom_record
@@ -61,7 +65,7 @@ UNAVAILABLE_ATOM_MESSAGE = "Atom not found or not currently owner-approved for e
 def default_mcp_token_path() -> Path:
     override = os.environ.get("BRAIN_MCP_TOKEN_FILE")
     if override:
-        return Path(override).expanduser().resolve()
+        return Path(os.path.abspath(str(Path(override).expanduser())))
     if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
         base = Path(os.environ["LOCALAPPDATA"])
     elif os.environ.get("XDG_STATE_HOME"):
@@ -79,9 +83,13 @@ def get_configured_bearer_token() -> str | None:
             raise PermissionError("Configured BRAIN_MCP_BEARER_TOKEN must contain at least 16 characters.")
         return cleaned
     token_path = default_mcp_token_path()
-    if token_path.exists():
+    if os.path.lexists(str(token_path)):
+        if _is_reparse_or_link(str(token_path)) or (
+            os.path.lexists(str(token_path.parent)) and _is_reparse_or_link(str(token_path.parent))
+        ):
+            raise PermissionError(f"Refusing to read MCP bearer token through a symlink or reparse point: {token_path}")
         try:
-            content = token_path.read_text(encoding="utf-8").strip()
+            content = read_bounded_security_file(Path(token_path), max_bytes=4096).strip()
         except OSError as exc:
             raise PermissionError(f"MCP token file could not be read safely: {exc}") from exc
         if len(content) < 16:
@@ -98,8 +106,15 @@ def save_bearer_token(token: str, token_path: Path | None = None) -> Path:
     cleaned = str(token or "").strip()
     if len(cleaned) < MIN_BEARER_TOKEN_LENGTH:
         raise ValueError(f"MCP bearer token must contain at least {MIN_BEARER_TOKEN_LENGTH} characters.")
-    path = Path(token_path or default_mcp_token_path()).expanduser().resolve()
+    raw_path = Path(token_path or default_mcp_token_path()).expanduser()
+    path = Path(os.path.abspath(str(raw_path)))
+    if (os.path.lexists(str(path)) and _is_reparse_or_link(str(path))) or (
+        os.path.lexists(str(path.parent)) and _is_reparse_or_link(str(path.parent))
+    ):
+        raise PermissionError("Refusing to write MCP bearer token through a symlink or reparse point.")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if _is_reparse_or_link(str(path.parent)) or (os.path.lexists(str(path)) and _is_reparse_or_link(str(path))):
+        raise PermissionError("Refusing to write MCP bearer token through a symlink or reparse point.")
     try:
         if os.name != "nt":
             os.chmod(path.parent, 0o700)
@@ -112,11 +127,12 @@ def save_bearer_token(token: str, token_path: Path | None = None) -> Path:
                 os.chmod(temporary, 0o600)
         except OSError:
             pass
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
             file.write(cleaned + "\n")
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary, path)
+        restrict_security_file_permissions(path)
     finally:
         if os.path.exists(temporary):
             try:
@@ -276,8 +292,16 @@ def audit_mcp_use(
         raise ValueError("MCP audit action is not allowlisted.")
     if outcome not in {"authorized", "denied"}:
         raise ValueError("MCP audit outcome is not allowlisted.")
-    target_path = audit_path or MCP_AUDIT_PATH
-    os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+    target_path = os.path.abspath(audit_path or MCP_AUDIT_PATH)
+    parent_dir = os.path.dirname(target_path)
+    if (os.path.lexists(parent_dir) and _is_reparse_or_link(parent_dir)) or (
+        os.path.lexists(target_path) and _is_reparse_or_link(target_path)
+    ):
+        raise PermissionError("Refusing to write MCP audit log through a symlink or reparse point.")
+    os.makedirs(parent_dir, exist_ok=True)
+    if _is_reparse_or_link(parent_dir) or (os.path.lexists(target_path) and _is_reparse_or_link(target_path)):
+        raise PermissionError("Refusing to write MCP audit log through a symlink or reparse point.")
+    existed_before = os.path.exists(target_path)
     record = {
         "schema_version": 1,
         "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -294,6 +318,8 @@ def audit_mcp_use(
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    if not existed_before:
+        restrict_security_file_permissions(target_path)
     return record
 
 
@@ -476,6 +502,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         source  = arguments.get("source", "MCP agent")
         source = str(source).replace("--", "—").replace("\r", " ").replace("\n", " ")[:500]
         os.makedirs(INBOX_DIR, exist_ok=True)
+        if _is_reparse_or_link(INBOX_DIR):
+            raise PermissionError("Refusing to write to a symlinked quarantined inbox directory.")
         filename = f"{now_slug()}-mcp-note.md"
         target_path = safe_file_in_dir(INBOX_DIR, filename, allowed_exts={".md"}, must_exist=False)
         if not target_path:
@@ -484,7 +512,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         suffix = 1
         while True:
             try:
-                descriptor = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                descriptor = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
                 try:
                     payload = (
                         f"<!-- second_brain_origin: mcp_local -->\n"

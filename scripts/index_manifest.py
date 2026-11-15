@@ -10,9 +10,13 @@ import datetime
 import hashlib
 import json
 import os
+import sys
 import threading
 import tempfile
 import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import _is_reparse_or_link
 
 
 INDEX_MANIFEST_FILENAME = "index-manifest.json"
@@ -43,12 +47,14 @@ def invalidate_atom_revision_cache(path: str | None = None) -> None:
 def record_known_atom_hash(path: str, content_sha256: str) -> None:
     """Update stat->sha256 cache immediately after an atomic write."""
     abs_path = os.path.abspath(path)
+    parent_dir = os.path.abspath(os.path.dirname(abs_path))
     try:
         st = os.stat(abs_path)
     except OSError:
         invalidate_atom_revision_cache(abs_path)
         return
     with _STAT_HASH_LOCK:
+        _DIR_MEMO.pop(parent_dir, None)
         if len(_STAT_HASH_CACHE) >= _MAX_STAT_CACHE_ENTRIES:
             _STAT_HASH_CACHE.clear()
         _STAT_HASH_CACHE[abs_path] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, content_sha256)
@@ -71,7 +77,13 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
         with os.scandir(abs_dir) as it:
             for entry in it:
                 name = entry.name
-                if name.endswith(".md") and name != "README.md" and entry.is_file(follow_symlinks=True):
+                if (
+                    name.endswith(".md")
+                    and name != "README.md"
+                    and entry.is_file(follow_symlinks=False)
+                    and not entry.is_symlink()
+                    and not _is_reparse_or_link(entry.path)
+                ):
                     entries.append(entry)
     except OSError as exc:
         raise RuntimeError(f"Could not scan atoms directory {atoms_dir}: {exc}") from exc
@@ -127,7 +139,7 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
 
 
 def _entry_sig(entry: os.DirEntry[str]) -> tuple[int, int, int]:
-    st = entry.stat(follow_symlinks=True)
+    st = entry.stat(follow_symlinks=False)
     return (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
 
 
@@ -154,9 +166,10 @@ def build_index_manifest(
     embedding_dimensions: int,
     indexed_count: int,
     generation_id: str | None = None,
+    skipped_count: int = 0,
 ) -> dict:
     revisions = atom_revisions(atoms_dir)
-    return {
+    manifest = {
         "schema_version": INDEX_SCHEMA_VERSION,
         "generation_id": generation_id or uuid.uuid4().hex,
         "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -168,6 +181,9 @@ def build_index_manifest(
         "atom_count": len(revisions),
         "atom_revisions_sha256": revisions_fingerprint(revisions),
     }
+    if skipped_count:
+        manifest["skipped_count"] = int(skipped_count)
+    return manifest
 
 
 def index_manifest_path(store_path: str) -> str:
@@ -205,8 +221,12 @@ def index_manifest_is_current(manifest: dict | None, atoms_dir: str) -> bool:
     if not isinstance(manifest, dict) or manifest.get("schema_version") != INDEX_SCHEMA_VERSION:
         return False
     revisions = atom_revisions(atoms_dir)
+    indexed = manifest.get("indexed_count")
+    skipped = manifest.get("skipped_count", 0)
+    if not isinstance(indexed, int) or not isinstance(skipped, int) or skipped < 0:
+        return False
     return (
         manifest.get("atom_count") == len(revisions)
-        and manifest.get("indexed_count") == len(revisions)
+        and (indexed + skipped) == len(revisions)
         and manifest.get("atom_revisions_sha256") == revisions_fingerprint(revisions)
     )

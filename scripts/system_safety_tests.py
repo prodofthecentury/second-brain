@@ -2446,6 +2446,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "phase2_safety_tests",
                 "phase3_cognitive_tests",
                 "chroma_rebuild_canary",
+                "archive_manifest_canary",
                 "smoke_test",
                 "phase4_product_tests",
                 "phase5_god_features_tests",
