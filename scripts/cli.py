@@ -28,13 +28,80 @@ if _SCRIPTS_DIR not in sys.path:
 from scripts import config as _config
 from scripts.config import _default_installed_vault
 
-if not os.environ.get("BRAIN_VAULT_DIR"):
-    installed_vault = _default_installed_vault()
+if not (os.environ.get("BRAIN_VAULT_DIR") or "").strip():
+    installed_vault = _config.read_persisted_vault_dir() or _default_installed_vault()
     if installed_vault:
         os.environ["BRAIN_VAULT_DIR"] = installed_vault
 
-BRAIN_DIR = _config.BRAIN_DIR
+BRAIN_DIR = _config.resolve_active_brain_dir()
+_INITIAL_CLI_BRAIN_DIR = BRAIN_DIR
+_INITIAL_CONFIG_BRAIN_DIR = _config.BRAIN_DIR
 ensure_dirs = _config.ensure_dirs
+
+
+def _effective_cli_brain_dir() -> str:
+    if BRAIN_DIR != _INITIAL_CLI_BRAIN_DIR:
+        return os.path.abspath(BRAIN_DIR)
+    if _config.BRAIN_DIR != _INITIAL_CONFIG_BRAIN_DIR:
+        return os.path.abspath(_config.BRAIN_DIR)
+    return _config.resolve_active_brain_dir()
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            # ERROR_ACCESS_DENIED (5) means process exists under another token
+            return int(kernel32.GetLastError()) == 5
+        try:
+            exit_code = ctypes.c_ulong(0)
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return int(exit_code.value) == 259  # STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _discover_api_port_fallback(default_port: int = 8765) -> int:
+    port_file = _config.api_port_file()
+    try:
+        if not os.path.lexists(str(port_file)) or _config._is_reparse_or_link(str(port_file)):
+            return default_port
+        if os.path.lexists(str(port_file.parent)) and _config._is_reparse_or_link(str(port_file.parent)):
+            return default_port
+        st = os.lstat(str(port_file))
+        if st.st_size <= 0 or st.st_size > 4096:
+            return default_port
+        raw = port_file.read_text(encoding="utf-8").strip()
+        if not raw:
+            return default_port
+        if raw.isdigit():
+            port_val = int(raw)
+            return port_val if 1 <= port_val <= 65535 else default_port
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return default_port
+        port_val = int(parsed.get("port", 0))
+        if not (1 <= port_val <= 65535):
+            return default_port
+        pid_val = parsed.get("pid")
+        if pid_val is not None and not _is_pid_alive(int(pid_val)):
+            return default_port
+        return port_val
+    except Exception:
+        return default_port
 
 
 def _capability(module: str) -> bool:
@@ -59,8 +126,10 @@ def doctor() -> int:
     from scripts.doctor import gpu_driver_status, native_cpp_runtime_status, system_memory_summary
     from scripts.vector_store import JsonVectorCollection, close_vector_collection, get_vector_collection, json_collection_path
 
+    vp = _config.vault_paths_for(_effective_cli_brain_dir())
+    active_brain_dir = vp["brain_dir"]
     print(f"Second Brain {platform.python_version()} on {platform.system()} {platform.release()} ({platform.machine()})")
-    print(f"Vault: {BRAIN_DIR}")
+    print(f"Vault: {active_brain_dir}")
     print(f"CPU threads: {os.cpu_count() or 'unknown'}")
     print(f"System memory: {system_memory_summary()}")
     cpp_ok, cpp_detail = native_cpp_runtime_status()
@@ -89,17 +158,17 @@ def doctor() -> int:
     }
     for name, ready in capabilities.items():
         print(f"{'ready' if ready else 'not installed':16} {name}")
-    atoms_dir = Path(_config.ATOMS_DIR)
+    atoms_dir = Path(vp["atoms_dir"])
     atom_files = sorted(path for path in atoms_dir.glob("*.md") if path.name != "README.md") if atoms_dir.is_dir() else []
     print(f"Atoms: {len(atom_files)}")
-    playbooks_dir = Path(_config.PLAYBOOKS_DIR)
+    playbooks_dir = Path(vp["playbooks_dir"])
     playbook_files = (
         sorted(path for path in playbooks_dir.glob("*.md") if path.name != "README.md")
         if playbooks_dir.is_dir()
         else []
     )
     print(f"Playbooks: {len(playbook_files)}")
-    notes_dir = Path(_config.NOTES_DIR)
+    notes_dir = Path(vp["notes_dir"])
     note_files = (
         sorted(path for path in notes_dir.glob("*.md") if path.name != "README.md")
         if notes_dir.is_dir()
@@ -107,14 +176,14 @@ def doctor() -> int:
     )
     print(f"Working notes: {len(note_files)}")
     required_dirs = (
-        _config.RAW_DIR,
-        _config.INBOX_DIR,
-        _config.ATOMS_DIR,
-        _config.THREADS_DIR,
-        _config.EXPERIENCES_DIR,
-        _config.PLAYBOOKS_DIR,
-        _config.SOURCES_DIR,
-        _config.BRIEFINGS_DIR,
+        vp["raw_dir"],
+        vp["inbox_dir"],
+        vp["atoms_dir"],
+        vp["threads_dir"],
+        vp["experiences_dir"],
+        vp["playbooks_dir"],
+        vp["sources_dir"],
+        vp["briefings_dir"],
     )
     missing_dirs = [d for d in required_dirs if not os.path.isdir(d)]
     if missing_dirs:
@@ -122,22 +191,26 @@ def doctor() -> int:
     try:
         from scripts.review_atom import approved_revision_is_current
 
-        approved = sum(1 for path in atom_files if approved_revision_is_current(str(path), brain_dir=_config.BRAIN_DIR))
+        approved = sum(
+            1
+            for path in atom_files
+            if approved_revision_is_current(str(path), brain_dir=active_brain_dir, atoms_dir=vp["atoms_dir"])
+        )
         print(f"Current owner-approved atoms: {approved}")
     except OSError:
         print("Current owner-approved atoms: could not verify")
     from scripts.lexical_store import lexical_index_is_current
 
-    lexical_ready = lexical_index_is_current(_config.ATOMS_DIR, _config.LEXICAL_INDEX_PATH)
+    lexical_ready = lexical_index_is_current(vp["atoms_dir"], vp["lexical_index_path"])
     print(f"Lexical index: {'current' if lexical_ready else 'missing or stale'}")
     ledger_ok = True
     try:
         from scripts.vault_ledger import verify_vault_ledger
 
         ledger_res = verify_vault_ledger(
-            brain_dir=_config.BRAIN_DIR,
-            atoms_dir=_config.ATOMS_DIR,
-            playbooks_dir=_config.PLAYBOOKS_DIR,
+            brain_dir=active_brain_dir,
+            atoms_dir=vp["atoms_dir"],
+            playbooks_dir=vp["playbooks_dir"],
         )
         ledger_ok = bool(ledger_res.get("chain_valid", False))
         print(f"Vault ledger: {'valid' if ledger_ok else 'INVALID'} ({ledger_res.get('entry_count', 0)} checkpoint(s))")
@@ -165,18 +238,19 @@ def doctor() -> int:
     try:
         from scripts.index_manifest import index_manifest_is_current, load_index_manifest
 
-        manifest = load_index_manifest(_config.CHROMA_PATH)
+        chroma_path = vp["chroma_path"]
+        manifest = load_index_manifest(chroma_path)
         backend_note = ""
-        json_fallback_file = json_collection_path(_config.CHROMA_PATH, "atoms")
-        if os.path.isdir(_config.CHROMA_PATH) and (manifest is not None or os.path.exists(json_fallback_file)):
-            collection = get_vector_collection(_config.CHROMA_PATH, name="atoms", create=False)
+        json_fallback_file = json_collection_path(chroma_path, "atoms")
+        if os.path.isdir(chroma_path) and (manifest is not None or os.path.exists(json_fallback_file)):
+            collection = get_vector_collection(chroma_path, name="atoms", create=False)
             try:
                 if isinstance(collection, JsonVectorCollection):
                     reason = collection.fallback_reason or "chromadb unavailable"
                     backend_note = f" [degraded JSON backend: {reason}]"
             finally:
                 close_vector_collection(collection)
-        if manifest and index_manifest_is_current(manifest, _config.ATOMS_DIR):
+        if manifest and index_manifest_is_current(manifest, vp["atoms_dir"]):
             print(
                 "Dense index: current; model={} dimensions={} generation={}{}".format(
                     manifest.get("embedding_model"),
@@ -195,33 +269,13 @@ def doctor() -> int:
 
 
 def _resolve_active_vault_paths() -> tuple[str, str, str]:
-    env_vault = (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
-    vault_dir = os.path.abspath(env_vault) if env_vault else os.path.abspath(_config.BRAIN_DIR)
+    vault_dir = _effective_cli_brain_dir()
     if vault_dir == os.path.abspath(_config.BRAIN_DIR):
         ensure_dirs()
         return vault_dir, _config.ATOMS_DIR, _config.LEXICAL_INDEX_PATH
-    for rel in (
-        "0-raw",
-        os.path.join("0-raw", "inbox"),
-        os.path.join("0-raw", "archive"),
-        os.path.join("0-raw", "note-snapshots"),
-        "1-desk",
-        "2-atoms",
-        "3-threads",
-        "4-experiences",
-        "5-playbooks",
-        "sources",
-        "briefings",
-        "notes",
-        ".chroma",
-        ".sidecar",
-    ):
-        os.makedirs(os.path.join(vault_dir, rel), exist_ok=True)
-    return (
-        vault_dir,
-        os.path.join(vault_dir, "2-atoms"),
-        os.path.join(vault_dir, ".sidecar", "lexical.sqlite3"),
-    )
+    ensure_dirs(vault_dir)
+    vp = _config.vault_paths_for(vault_dir)
+    return vp["brain_dir"], vp["atoms_dir"], vp["lexical_index_path"]
 
 
 def install(args: argparse.Namespace | None = None) -> int:
@@ -295,6 +349,10 @@ def launch_dashboard(port: int = 8501) -> int:
     dash_env = dict(os.environ)
     dash_env.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
     dash_env.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    if not (dash_env.get("BRAIN_VAULT_DIR") or "").strip():
+        persisted_or_installed = _config.read_persisted_vault_dir() or _default_installed_vault()
+        if persisted_or_installed:
+            dash_env["BRAIN_VAULT_DIR"] = persisted_or_installed
     return subprocess.call(
         [
             sys.executable, "-m", "streamlit", "run", str(app_path),
@@ -316,6 +374,21 @@ def launch_dashboard(port: int = 8501) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    had_env_vault = bool((os.environ.get("BRAIN_VAULT_DIR") or "").strip())
+    injected_vault = False
+    if not had_env_vault:
+        persisted_or_installed = _config.read_persisted_vault_dir() or _default_installed_vault()
+        if persisted_or_installed:
+            os.environ["BRAIN_VAULT_DIR"] = persisted_or_installed
+            injected_vault = True
+    try:
+        return _main_impl(argv)
+    finally:
+        if injected_vault and argv is not None:
+            os.environ.pop("BRAIN_VAULT_DIR", None)
+
+
+def _main_impl(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="second-brain", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="Report local runtime capabilities.")
@@ -335,7 +408,12 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser.add_argument("--ensure-tokens", action="store_true", help="Create agent and owner tokens if missing.")
 
     adapter_parser = subparsers.add_parser("adapter-config", help="Print IDE and custom host adapter configuration JSON.")
-    adapter_parser.add_argument("--port", type=int, default=8765, help="Loopback API TCP port (default 8765).")
+    adapter_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Loopback API TCP port (auto-discovers live port when omitted, falling back to 8765).",
+    )
 
     for name, help_text in (
         ("api", "Run or configure the loopback 127.0.0.1 HTTP JSON Memory API."),
@@ -417,9 +495,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "adapter-config":
         if remainder:
             parser.error(f"unrecognized arguments: {' '.join(remainder)}")
-        from scripts.memory_api import main as api_main
+        from scripts import memory_api as api_mod
 
-        return api_main(["--port", str(args.port), "--print-adapter-config"])
+        if args.port is not None:
+            resolved_port = int(args.port)
+        else:
+            discover_fn = getattr(api_mod, "discover_active_api_port", None)
+            if callable(discover_fn):
+                resolved_port = int(discover_fn(8765))
+            else:
+                resolved_port = _discover_api_port_fallback(8765)
+        return api_mod.main(["--port", str(resolved_port), "--print-adapter-config"])
     if args.command in _PASSTHROUGH_COMMANDS:
         forwarded = list(getattr(args, "sub_argv", []) or []) + list(remainder)
         if forwarded[:1] == ["--"]:
@@ -620,20 +706,26 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         p = argparse.ArgumentParser(prog="second-brain capture", description="Quickly capture a working note.")
         p.add_argument("text", nargs="*", help="Note body text (or pass --stdin).")
         p.add_argument("--title", default="", help="Optional note title.")
-        p.add_argument("--tag", action="append", default=[], help="Optional tag (repeatable).")
+        p.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Optional tag or comma-separated tags (repeatable).")
         p.add_argument("--stdin", action="store_true", help="Read note body from stdin.")
         p.add_argument("--json", action="store_true", help="Emit JSON output.")
         args = p.parse_args(forwarded)
         body_text = sys.stdin.read() if args.stdin else " ".join(args.text)
         if not body_text.strip():
             p.error("Provide capture text or --stdin.")
+        parsed_tags = [
+            part.strip()
+            for raw in (args.tags or [])
+            for part in str(raw).split(",")
+            if part.strip()
+        ]
         vault_dir, _, _ = _resolve_active_vault_paths()
         from scripts.notes_store import NotePaths, create_note
 
         created = create_note(
             args.title,
             body_text,
-            tags=list(args.tag or []),
+            tags=parsed_tags,
             paths=NotePaths.for_brain(vault_dir),
         )
         if args.json:
@@ -742,9 +834,15 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
             token = mcp_mod.generate_bearer_token()
             saved_path = mcp_mod.save_bearer_token(token)
             print(f"Wrote MCP bearer token to {saved_path}")
+            if args.print_token:
+                print(f"BRAIN_MCP_BEARER_TOKEN={token}")
             return 0
         if args.print_token:
-            token = mcp_mod.get_configured_bearer_token()
+            try:
+                token = mcp_mod.get_configured_bearer_token()
+            except PermissionError as exc:
+                print(f"No valid MCP bearer token is configured ({exc}). Run with --generate-token.", file=sys.stderr)
+                return 1
             if not token:
                 print("No valid MCP bearer token is configured. Run with --generate-token.", file=sys.stderr)
                 return 1

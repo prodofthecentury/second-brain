@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import datetime
 import hmac
@@ -45,6 +46,7 @@ from cognitive_core import (
     record_retrieval_telemetry,
     save_experience_record,
 )
+import config as _config
 from config import (
     ATOMS_DIR,
     BRAIN_DIR,
@@ -70,7 +72,7 @@ from host_adapters import (
     restrict_security_file_permissions,
     validate_model_identifier,
 )
-from inbox_workflow import list_inbox_items, scan_inbox_payload_risks
+from inbox_workflow import scan_inbox_payload_risks
 from index_manifest import index_manifest_is_current, load_index_manifest
 from lexical_store import LexicalIndexUnavailable, lexical_index_is_current, rebuild_lexical_index
 from memory_format import split_frontmatter
@@ -79,7 +81,6 @@ from recall import (
     MemoryRecallUnavailable,
     RecallOptions,
     consume_last_degradation_warning,
-    project_tags_match,
     search_memory,
     suggest_duplicate_atoms,
 )
@@ -95,6 +96,8 @@ def _extract_claim_text(content: str) -> str:
 
 ALLOWED_API_BIND_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8765
+DEFAULT_MAX_WORKER_THREADS = 32
+DEFAULT_MAX_SSE_STREAMS = 8
 MIN_API_TOKEN_LEN = 24
 MAX_API_BODY_BYTES = 65536
 MAX_API_LARGE_BODY_BYTES = 2_200_000
@@ -118,16 +121,19 @@ def assert_api_loopback_bind(host: str | None) -> str:
     return ALLOWED_API_BIND_HOST
 
 
-def _security_state_dir() -> Path:
-    sec_override = (
+def _fallback_security_state_dir() -> Path:
+    sec_env = (
         os.environ.get("BRAIN_SECURITY_STATE_DIR")
         or os.environ.get("SECOND_BRAIN_SECURITY_DIR")
         or ""
     ).strip()
-    if sec_override:
-        return Path(sec_override).expanduser().resolve()
-    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
-        base = Path(os.environ["LOCALAPPDATA"])
+    if sec_env:
+        return Path(sec_env).expanduser().resolve()
+    cfg_sec = getattr(_config, "security_state_dir", None)
+    if callable(cfg_sec):
+        return Path(cfg_sec()).expanduser().resolve()
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
     elif os.environ.get("XDG_STATE_HOME"):
         base = Path(os.environ["XDG_STATE_HOME"]).expanduser()
     else:
@@ -135,18 +141,31 @@ def _security_state_dir() -> Path:
     return base / "SecondBrain" / "security"
 
 
+_security_state_dir = _fallback_security_state_dir
+
+
 def default_api_token_path() -> Path:
     override = (os.environ.get("BRAIN_MEMORY_API_TOKEN_FILE") or "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    return _security_state_dir() / "memory-api-token"
+    return _fallback_security_state_dir() / "memory-api-token"
 
 
 def default_api_port_path() -> Path:
     override = (os.environ.get("BRAIN_API_PORT_FILE") or "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    return _security_state_dir() / "api-port"
+    sec_override = (
+        os.environ.get("BRAIN_SECURITY_STATE_DIR")
+        or os.environ.get("SECOND_BRAIN_SECURITY_DIR")
+        or ""
+    ).strip()
+    if sec_override:
+        return Path(sec_override).expanduser().resolve() / "api-port"
+    cfg_port_fn = getattr(_config, "api_port_file", None)
+    if callable(cfg_port_fn):
+        return Path(cfg_port_fn()).expanduser().resolve()
+    return _fallback_security_state_dir() / "api-port"
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -283,6 +302,7 @@ def discover_active_api_port(
                 return parsed_env
         except ValueError:
             pass
+
     target = (Path(port_file) if port_file is not None else default_api_port_path()).expanduser()
     if os.path.lexists(str(target)) and not _is_reparse_or_link(str(target)):
         if not (os.path.lexists(str(target.parent)) and _is_reparse_or_link(str(target.parent))):
@@ -291,20 +311,30 @@ def discover_active_api_port(
             except (OSError, UnicodeDecodeError):
                 raw = ""
             if raw:
+                candidate_port: int | None = None
+                candidate_pid: int | None = None
                 try:
                     parsed = json.loads(raw)
-                    if isinstance(parsed, int) and not isinstance(parsed, bool) and 1 <= parsed <= 65535:
-                        return parsed
-                    if isinstance(parsed, dict):
+                    if isinstance(parsed, int) and not isinstance(parsed, bool):
+                        candidate_port = parsed
+                    elif isinstance(parsed, dict):
                         p_val = parsed.get("port")
-                        cand_port = int(p_val) if isinstance(p_val, (int, str)) and not isinstance(p_val, bool) else 0
+                        if isinstance(p_val, int) and not isinstance(p_val, bool):
+                            candidate_port = p_val
+                        elif isinstance(p_val, str) and p_val.strip().isdigit():
+                            candidate_port = int(p_val.strip())
                         pid_val = parsed.get("pid")
-                        if 1 <= cand_port <= 65535:
-                            if pid_val is None or (isinstance(pid_val, int) and not isinstance(pid_val, bool) and _pid_is_alive(pid_val)):
-                                return cand_port
-                except (ValueError, json.JSONDecodeError):
-                    pass
-    return default_port
+                        if isinstance(pid_val, int) and not isinstance(pid_val, bool):
+                            candidate_pid = pid_val
+                        elif isinstance(pid_val, str) and pid_val.strip().isdigit():
+                            candidate_pid = int(pid_val.strip())
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    if raw.isdigit():
+                        candidate_port = int(raw)
+                if candidate_port is not None and 1 <= candidate_port <= 65535:
+                    if not candidate_pid or _pid_is_alive(int(candidate_pid)):
+                        return int(candidate_port)
+    return int(default_port)
 
 
 def generate_memory_api_token(token_path: Path | None = None) -> tuple[str, Path]:
@@ -529,37 +559,58 @@ class ApiExecutivePlanRequest(BaseModel):
         return validate_model_identifier(v)
 
 
+def _resolve_default_brain_dir() -> str:
+    resolver = getattr(_config, "resolve_active_brain_dir", None)
+    if callable(resolver):
+        resolved = str(resolver() or "").strip()
+        if resolved:
+            return os.path.abspath(resolved)
+    env_vault = (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
+    if env_vault:
+        return os.path.abspath(env_vault)
+    return os.path.abspath(_config.BRAIN_DIR)
+
+
 class MemoryApiRuntimeConfig:
     def __init__(
         self,
         *,
-        brain_dir: str = BRAIN_DIR,
-        atoms_dir: str = ATOMS_DIR,
-        inbox_dir: str = INBOX_DIR,
-        experiences_dir: str = EXPERIENCES_DIR,
+        brain_dir: str | None = None,
+        atoms_dir: str | None = None,
+        inbox_dir: str | None = None,
+        experiences_dir: str | None = None,
         playbooks_dir: str | None = None,
-        lexical_index_path: str = LEXICAL_INDEX_PATH,
-        chroma_path: str = CHROMA_PATH,
-        telemetry_db_path: str = TELEMETRY_DB_PATH,
+        lexical_index_path: str | None = None,
+        chroma_path: str | None = None,
+        telemetry_db_path: str | None = None,
         token_path: Path | None = None,
         owner_token_path: Path | None = None,
         policy_path: Path | None = None,
         http_transport: httpx.BaseTransport | None = None,
         skip_dns_check_for_mock_transport: bool = False,
     ) -> None:
-        self.brain_dir = os.path.abspath(brain_dir)
-        self.atoms_dir = os.path.abspath(atoms_dir)
-        self.inbox_dir = os.path.abspath(inbox_dir)
-        self.experiences_dir = os.path.abspath(experiences_dir)
-        if playbooks_dir is not None:
-            self.playbooks_dir = os.path.abspath(playbooks_dir)
-        elif self.brain_dir != os.path.abspath(BRAIN_DIR):
-            self.playbooks_dir = os.path.join(self.brain_dir, "5-playbooks")
+        module_brain = os.path.abspath(BRAIN_DIR)
+        active_brain = _resolve_default_brain_dir()
+        if brain_dir is None or (os.path.abspath(brain_dir) == module_brain and active_brain != module_brain):
+            self.brain_dir = active_brain
         else:
-            self.playbooks_dir = os.path.abspath(PLAYBOOKS_DIR)
-        self.lexical_index_path = os.path.abspath(lexical_index_path)
-        self.chroma_path = os.path.abspath(chroma_path)
-        self.telemetry_db_path = os.path.abspath(telemetry_db_path)
+            self.brain_dir = os.path.abspath(brain_dir)
+        brain_changed = self.brain_dir != module_brain
+
+        def _resolve_child(explicit: str | None, module_default: str, rel_parts: tuple[str, ...]) -> str:
+            if explicit is not None and not (brain_changed and os.path.abspath(explicit) == os.path.abspath(module_default)):
+                return os.path.abspath(explicit)
+            if not brain_changed:
+                return os.path.abspath(module_default)
+            return os.path.join(self.brain_dir, *rel_parts)
+
+        self.atoms_dir = _resolve_child(atoms_dir, ATOMS_DIR, ("2-atoms",))
+        self.inbox_dir = _resolve_child(inbox_dir, INBOX_DIR, ("0-raw", "inbox"))
+        self.experiences_dir = _resolve_child(experiences_dir, EXPERIENCES_DIR, ("4-experiences",))
+        self.playbooks_dir = _resolve_child(playbooks_dir, PLAYBOOKS_DIR, ("5-playbooks",))
+        self.lexical_index_path = _resolve_child(lexical_index_path, LEXICAL_INDEX_PATH, (".sidecar", "lexical.sqlite3"))
+        self.chroma_path = _resolve_child(chroma_path, CHROMA_PATH, (".chroma",))
+        self.telemetry_db_path = _resolve_child(telemetry_db_path, TELEMETRY_DB_PATH, (".sidecar", "telemetry.sqlite3"))
         self.token_path = token_path
         self.owner_token_path = owner_token_path
         self.policy_path = policy_path
@@ -583,10 +634,20 @@ class MemoryLoopbackHTTPServer(ThreadingHTTPServer):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
 
-    def __init__(self, host: str, port: int, runtime_config: MemoryApiRuntimeConfig | None = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        runtime_config: MemoryApiRuntimeConfig | None = None,
+        *,
+        max_workers: int = DEFAULT_MAX_WORKER_THREADS,
+        max_stream_slots: int = DEFAULT_MAX_SSE_STREAMS,
+    ) -> None:
         verified_host = assert_api_loopback_bind(host)
         if isinstance(port, bool) or not isinstance(port, int) or not (0 <= port <= 65535):
             raise ValueError(f"Invalid loopback TCP port {port!r}; expected 0..65535.")
+        worker_cap = max(1, int(max_workers))
+        stream_cap = max(1, int(max_stream_slots))
         self.runtime = runtime_config or MemoryApiRuntimeConfig()
         expected = get_configured_api_token(self.runtime.token_path)
         if not expected:
@@ -605,14 +666,74 @@ class MemoryLoopbackHTTPServer(ThreadingHTTPServer):
                 # Ignore benign errors on read-only or synthetic test harnesses.
                 pass
         super().__init__((verified_host, port), MemoryApiRequestHandler)
+        self.max_workers = worker_cap
+        self._worker_pool = ThreadPoolExecutor(max_workers=worker_cap, thread_name_prefix="sb-api")
+        self._inflight_slots = threading.BoundedSemaphore(worker_cap * 2)
+        self._stream_slots = threading.BoundedSemaphore(stream_cap)
+        self._pool_closed = False
+
+    def _reject_overloaded_socket(self, request: socket.socket) -> None:
+        body = b'{"error": "Service Unavailable: server concurrency limit reached."}\n'
+        resp = (
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: application/json; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            b"Cache-Control: no-store\r\n"
+            b"Connection: close\r\n"
+            b"Retry-After: 1\r\n\r\n" + body
+        )
+        try:
+            request.settimeout(0.05)
+            try:
+                request.recv(4096)
+            except OSError:
+                pass
+            request.sendall(resp)
+        except OSError:
+            pass
+        finally:
+            self.shutdown_request(request)
+
+    def _process_request_Pool(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            try:
+                self._inflight_slots.release()
+            except ValueError:
+                pass
+
+    _process_request_pool = _process_request_Pool
+
+    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        if self._pool_closed or not self._inflight_slots.acquire(blocking=False):
+            self._reject_overloaded_socket(request)
+            return
+        try:
+            self._worker_pool.submit(self._process_request_Pool, request, client_address)
+        except RuntimeError:
+            try:
+                self._inflight_slots.release()
+            except ValueError:
+                pass
+            self._reject_overloaded_socket(request)
+
+    def server_close(self) -> None:
+        self._pool_closed = True
+        pool = getattr(self, "_worker_pool", None)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        super().server_close()
 
 
 def create_memory_api_server(
     host: str = ALLOWED_API_BIND_HOST,
     port: int = DEFAULT_API_PORT,
     runtime_config: MemoryApiRuntimeConfig | None = None,
+    *,
+    max_workers: int = DEFAULT_MAX_WORKER_THREADS,
 ) -> MemoryLoopbackHTTPServer:
-    return MemoryLoopbackHTTPServer(host, port, runtime_config)
+    return MemoryLoopbackHTTPServer(host, port, runtime_config, max_workers=max_workers)
 
 
 def serve_memory_api(
@@ -624,18 +745,20 @@ def serve_memory_api(
     bound_host, actual_port = server.server_address[0], server.server_address[1]
     port_file_path: Path | None = None
     try:
-        port_file_path = write_active_api_port_file(actual_port, host=bound_host)
-    except OSError:
-        port_file_path = None
-    print(f"SECOND_BRAIN_API_READY http://{bound_host}:{actual_port} port={actual_port}", flush=True)
-    print(f"Second Brain Loopback Memory API listening on http://{bound_host}:{actual_port}", flush=True)
-    try:
+        try:
+            port_file_path = write_active_api_port_file(actual_port, host=bound_host)
+        except OSError:
+            port_file_path = None
+        print(f"SECOND_BRAIN_API_READY http://{bound_host}:{actual_port} port={actual_port}", flush=True)
+        print(f"Second Brain Loopback Memory API listening on http://{bound_host}:{actual_port}", flush=True)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
-        remove_active_api_port_file(expected_pid=os.getpid(), port_file=port_file_path)
+        try:
+            remove_active_api_port_file(expected_pid=os.getpid(), port_file=port_file_path)
+        finally:
+            server.server_close()
     return 0
 
 
@@ -1394,22 +1517,31 @@ class MemoryApiClient:
 
     def __init__(
         self,
-        *,
+        host: str = ALLOWED_API_BIND_HOST,
         port: int | None = None,
+        *,
         token: str | None = None,
         owner_token: str | None = None,
         timeout: float = 45.0,
     ) -> None:
+        verified_host = assert_api_loopback_bind(host)
+        if port is None:
+            actual_port = discover_active_api_port(DEFAULT_API_PORT)
+        else:
+            if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+                raise ValueError(f"Invalid loopback TCP port {port!r}; expected 1..65535.")
+            actual_port = int(port)
         resolved_token = (token or "").strip() or (get_configured_api_token() or "")
         if not resolved_token:
             raise PermissionError("MemoryApiClient requires a valid bearer token.")
-        actual_port = int(port) if port is not None else discover_active_api_port(DEFAULT_API_PORT)
-        self.base_url = f"http://{ALLOWED_API_BIND_HOST}:{actual_port}"
+        self.host = verified_host
+        self.port = actual_port
+        self.base_url = f"http://{verified_host}:{actual_port}"
         self._owner_token = owner_token.strip() if (owner_token and owner_token.strip()) else None
         self._headers = {
             "Authorization": f"Bearer {resolved_token}",
             "Content-Type": "application/json",
-            "Host": f"{ALLOWED_API_BIND_HOST}:{actual_port}",
+            "Host": f"{verified_host}:{actual_port}",
         }
         if self._owner_token:
             self._headers[api_product.OWNER_HEADER] = self._owner_token
@@ -1644,8 +1776,20 @@ class MemoryApiClient:
     def list_review_queue(self) -> dict[str, object]:
         return self._request("GET", "/v1/review/queue")
 
-    def list_atoms(self, *, limit: int = 200, offset: int = 0) -> dict[str, object]:
-        return self._request("GET", f"/v1/atoms?limit={int(limit)}&offset={int(offset)}")
+    def list_atoms(
+        self,
+        *,
+        query: str = "",
+        project_scope: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, object]:
+        params: list[str] = [f"limit={int(limit)}", f"offset={int(offset)}"]
+        if query and query.strip():
+            params.append(f"q={url_quote(query.strip(), safe='')}")
+        if project_scope and project_scope.strip():
+            params.append(f"project={url_quote(project_scope.strip(), safe=':_/-')}")
+        return self._request("GET", f"/v1/atoms?{'&'.join(params)}")
 
     def get_atom(self, filename: str) -> dict[str, object]:
         return self._request("GET", f"/v1/atoms/{url_quote(filename.strip(), safe='')}")
@@ -1731,19 +1875,30 @@ class MemoryApiClient:
         feedback: str | None = None,
         actor: str = "owner",
         note: str = "",
+        feedback_kind: str | None = None,
     ) -> dict[str, object]:
-        signal = feedback if feedback is not None else ("endorsed" if helpful else "corrected")
-        return self._request(
-            "POST",
-            "/v1/cognitive/feedback",
-            {
-                "atom_filename": atom_filename,
-                "feedback": signal,
-                "helpful": bool(helpful),
-                "actor": actor,
-                "note": note,
-            },
+        if feedback_kind is not None and feedback_kind.strip():
+            fk_norm = feedback_kind.strip().lower()
+            effective_helpful = fk_norm == "helpful"
+        elif feedback is not None and feedback.strip():
+            effective_helpful = feedback.strip().lower() in {"endorsed", "helpful", "positive"}
+        else:
+            effective_helpful = bool(helpful)
+        signal = feedback if feedback is not None else (
+            "endorsed"
+            if effective_helpful
+            else ("supersession" if (feedback_kind or "").strip().lower() == "supersession" else "corrected")
         )
+        payload: dict[str, object] = {
+            "atom_filename": atom_filename,
+            "feedback": signal,
+            "helpful": effective_helpful,
+            "actor": actor,
+            "note": note,
+        }
+        if feedback_kind is not None:
+            payload["feedback_kind"] = feedback_kind
+        return self._request("POST", "/v1/cognitive/feedback", payload)
 
     def atom_duplicates(self) -> dict[str, object]:
         return self._request("GET", "/v1/atoms/duplicates")
@@ -1933,6 +2088,16 @@ class MemoryApiClient:
     def prove_atom(self, atom_filename: str) -> dict[str, object]:
         return self._request("GET", f"/v1/ledger/prove/{url_quote(atom_filename.strip(), safe='')}")
 
+    def prove_leaf(self, target_ref: str) -> dict[str, object]:
+        cleaned = str(target_ref or "").strip().replace("\\", "/").lstrip("/")
+        segments = [
+            "%2E" * len(seg) if seg in {".", ".."} else url_quote(seg, safe="")
+            for seg in cleaned.split("/")
+            if seg
+        ]
+        encoded = "/".join(segments)
+        return self._request("GET", f"/v1/ledger/prove/{encoded}")
+
     def verify_proof(self, proof: dict[str, object]) -> dict[str, object]:
         return self._request("POST", "/v1/ledger/verify-proof", {"proof": proof})
 
@@ -2076,7 +2241,7 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "GET /v1/ledger/verify",
                 "POST /v1/ledger/commit",
                 "POST /v1/ledger/verify-proof",
-                "GET /v1/ledger/prove/<atom>",
+                "GET /v1/ledger/prove/<leaf>",
                 "GET /v1/audit/sources",
                 "POST /v1/audit/sources/demote-stale",
                 "GET /v1/graph/contradictions",
@@ -2096,7 +2261,7 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "BRAIN_ENABLE_LOCAL_MCP": "1",
                 "BRAIN_MCP_TRUSTED_STDIO": "1",
                 "BRAIN_MCP_CLIENT_TOKEN": "<contents of mcp-token>",
-                **({"BRAIN_VAULT_DIR": BRAIN_DIR} if not (repo_root_path / "pyproject.toml").exists() else {}),
+                **({"BRAIN_VAULT_DIR": _resolve_default_brain_dir()} if not (repo_root_path / "pyproject.toml").exists() else {}),
             },
             "token_path": str(_default_mcp_token_file()),
             "required_request_meta": {

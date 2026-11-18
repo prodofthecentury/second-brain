@@ -6,6 +6,7 @@
 # ///
 
 import hashlib
+import inspect
 import math
 import os
 import sys
@@ -14,7 +15,7 @@ import ollama
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import EMBED_MODEL, GEN_MODEL
-from hardware_profile import fetch_loopback_json, loopback_ollama_base_url
+from hardware_profile import detect_hardware_profile, fetch_loopback_json, loopback_ollama_base_url
 import host_adapters as _host_adapters
 from host_adapters import (
     HostConsentError,
@@ -105,19 +106,58 @@ def installed_model_names() -> list[str]:
     return names
 
 
+def _allow_heavy_qwen36_fallback(
+    preferred: str | None,
+    configured: str,
+    fallback_items: list[str],
+) -> bool:
+    pref_norm = (preferred or "").strip().lower()
+    if pref_norm == "qwen3.6:latest" or pref_norm.startswith("qwen3.6"):
+        return True
+    if "qwen3.6" in (configured or "").lower() or "qwen3.6" in (GEN_MODEL or "").lower():
+        return True
+    if any("qwen3.6" in item.lower() for item in fallback_items):
+        return True
+    try:
+        sig = inspect.signature(detect_hardware_profile)
+        if "probe_ollama" in sig.parameters:
+            hw = detect_hardware_profile(probe_ollama=False)
+        else:
+            hw = detect_hardware_profile(use_cache=True)
+    except TypeError:
+        try:
+            hw = detect_hardware_profile()
+        except Exception:
+            hw = None
+    except Exception:
+        hw = None
+    if hw is not None:
+        ram_avail = float(
+            getattr(hw, "ram_available_gb", None)
+            or getattr(hw, "available_ram_gb", None)
+            or getattr(hw, "available_ram_gib", 0.0)
+            or 0.0
+        )
+        vram = float(getattr(hw, "vram_gb", None) or getattr(hw, "vram_gib", 0.0) or 0.0)
+        if ram_avail >= 28.0 or vram >= 20.0:
+            return True
+    return False
+
+
 def generation_candidates(preferred: str | None = None) -> list[str]:
     installed = installed_model_names()
     installed_bases = {name.split(":", 1)[0]: name for name in installed}
     configured = preferred or GEN_MODEL
     fallback_env = os.environ.get("BRAIN_FALLBACK_MODELS", "")
+    fallback_items = [item.strip() for item in fallback_env.split(",") if item.strip()]
+    auto_fallbacks = ["qwen2.5-coder:7b"]
+    if _allow_heavy_qwen36_fallback(preferred, configured, fallback_items):
+        auto_fallbacks.append("qwen3.6:latest")
+    auto_fallbacks.extend(["llama3.2:3b", "mistral", "phi3"])
     requested = [
         configured,
-        *[item.strip() for item in fallback_env.split(",") if item.strip()],
-        "qwen2.5-coder:7b",
-        "qwen3.6:latest",
-        "llama3.2:3b",
-        "mistral",
-        "phi3",
+        *fallback_items,
+        *auto_fallbacks,
     ]
 
     candidates = []

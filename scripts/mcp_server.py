@@ -31,7 +31,6 @@ from __future__ import annotations
 import os
 import sys
 import json
-import glob
 import datetime
 import hmac
 import secrets
@@ -52,9 +51,10 @@ except ImportError:  # pragma: no cover - minimal core wheel without [mcp] extra
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
-    ATOMS_DIR, THREADS_DIR, BRIEFINGS_DIR, RAW_DIR, INBOX_DIR,
+    BRAIN_DIR, ATOMS_DIR, RAW_DIR, INBOX_DIR,
     _is_reparse_or_link, ensure_dirs, today, now_slug,
-    is_content_markdown, normalize_markdown_filename, safe_file_in_dir
+    normalize_markdown_filename, resolve_active_brain_dir,
+    safe_file_in_dir, security_state_dir, vault_paths_for,
 )
 from host_adapters import read_bounded_security_file, restrict_security_file_permissions
 from recall import MemoryRecallUnavailable, RecallOptions, search_memory
@@ -65,23 +65,42 @@ from memory_review import parse_atom_record
 MAX_INBOX_CHARS = 100_000
 MIN_BEARER_TOKEN_LENGTH = 16
 MCP_AUDIT_PATH = os.path.join(RAW_DIR, "archive", "mcp-audit.jsonl")
+_INITIAL_BRAIN_DIR = BRAIN_DIR
+_INITIAL_ATOMS_DIR = ATOMS_DIR
+_INITIAL_INBOX_DIR = INBOX_DIR
+_INITIAL_MCP_AUDIT_PATH = MCP_AUDIT_PATH
 TOOL_NAMES = {"search_memory", "get_atom", "add_to_inbox", "search_notes", "get_note", "remember"}
 UNAVAILABLE_ATOM_MESSAGE = "Atom not found or not currently owner-approved for external reading."
+
+
+def _effective_mcp_paths() -> tuple[str, str, str, str]:
+    """Return (brain_dir, atoms_dir, inbox_dir, audit_path), honoring monkeypatches or live vault-path.txt."""
+    dyn = vault_paths_for(resolve_active_brain_dir())
+    brain_dir = BRAIN_DIR if BRAIN_DIR != _INITIAL_BRAIN_DIR else dyn["brain_dir"]
+    if ATOMS_DIR != _INITIAL_ATOMS_DIR:
+        atoms_dir = ATOMS_DIR
+        if BRAIN_DIR == _INITIAL_BRAIN_DIR:
+            brain_dir = os.path.dirname(os.path.abspath(atoms_dir))
+    else:
+        atoms_dir = os.path.join(brain_dir, "2-atoms") if BRAIN_DIR != _INITIAL_BRAIN_DIR else dyn["atoms_dir"]
+    if INBOX_DIR != _INITIAL_INBOX_DIR:
+        inbox_dir = INBOX_DIR
+    else:
+        inbox_dir = os.path.join(brain_dir, "0-raw", "inbox") if BRAIN_DIR != _INITIAL_BRAIN_DIR else dyn["inbox_dir"]
+    if MCP_AUDIT_PATH != _INITIAL_MCP_AUDIT_PATH:
+        audit_path = MCP_AUDIT_PATH
+    else:
+        audit_path = os.path.join(brain_dir, "0-raw", "archive", "mcp-audit.jsonl")
+    return brain_dir, atoms_dir, inbox_dir, audit_path
 
 
 # ─── Security & Authorization ─────────────────────────────────────────────────
 
 def default_mcp_token_path() -> Path:
-    override = os.environ.get("BRAIN_MCP_TOKEN_FILE")
+    override = (os.environ.get("BRAIN_MCP_TOKEN_FILE") or "").strip()
     if override:
         return Path(os.path.abspath(str(Path(override).expanduser())))
-    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
-        base = Path(os.environ["LOCALAPPDATA"])
-    elif os.environ.get("XDG_STATE_HOME"):
-        base = Path(os.environ["XDG_STATE_HOME"]).expanduser()
-    else:
-        base = Path.home() / ".local" / "state"
-    return base / "SecondBrain" / "security" / "mcp-token"
+    return security_state_dir() / "mcp-token"
 
 
 def get_configured_bearer_token() -> str | None:
@@ -256,6 +275,8 @@ def semantic_search(query: str, n_results: int = 5, project: str | None = None) 
     except (TypeError, ValueError):
         n_results = 5
     projects = (str(project).strip(),) if project and str(project).strip() else ()
+    brain_dir, atoms_dir, _, _ = _effective_mcp_paths()
+    vp = vault_paths_for(brain_dir)
     direct, neighbors = search_memory(
         query,
         RecallOptions(
@@ -264,6 +285,9 @@ def semantic_search(query: str, n_results: int = 5, project: str | None = None) 
             include_statuses={"accepted"},
             projects=projects,
         ),
+        atoms_dir=atoms_dir,
+        index_path=vp["lexical_index_path"],
+        chroma_path=vp["chroma_path"],
     )
     return [item.as_dict() for item in direct + neighbors]
 
@@ -273,17 +297,6 @@ def read_file_safe(path: str | None) -> str:
         return ""
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
-
-
-def list_md_files(directory: str) -> list[str]:
-    if not os.path.exists(directory):
-        return []
-    return sorted([f for f in os.listdir(directory) if is_content_markdown(f)])
-
-
-def latest_briefing_path() -> str | None:
-    files = sorted(glob.glob(os.path.join(BRIEFINGS_DIR, "[0-9]*.md")), reverse=True)
-    return files[0] if files else None
 
 
 def audit_mcp_use(
@@ -304,7 +317,11 @@ def audit_mcp_use(
         raise ValueError("MCP audit action is not allowlisted.")
     if outcome not in {"authorized", "denied"}:
         raise ValueError("MCP audit outcome is not allowlisted.")
-    target_path = os.path.abspath(audit_path or MCP_AUDIT_PATH)
+    if audit_path is None:
+        _, _, _, default_audit = _effective_mcp_paths()
+        target_path = os.path.abspath(default_audit)
+    else:
+        target_path = os.path.abspath(audit_path)
     parent_dir = os.path.dirname(target_path)
     if (os.path.lexists(parent_dir) and _is_reparse_or_link(parent_dir)) or (
         os.path.lexists(target_path) and _is_reparse_or_link(target_path)
@@ -435,16 +452,25 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
     name = params.name
     arguments = params.arguments or {}
     event_name = f"tool:{name}" if name in TOOL_NAMES else "tool:unknown"
+    eff_brain_dir, eff_atoms_dir, eff_inbox_dir, eff_audit_path = _effective_mcp_paths()
     auth_ok = is_authorized(params, _ctx)
 
     if not auth_ok:
+        if os.path.isdir(os.path.dirname(os.path.abspath(eff_audit_path))):
+            try:
+                audit_mcp_use(event_name, outcome="denied", audit_path=eff_audit_path)
+            except (OSError, PermissionError):
+                pass
         return types.CallToolResult(
             content=[types.TextContent(type="text", text="Unauthorized: Invalid or missing MCP bearer token.")],
             isError=True,
         )
 
-    audit_mcp_use(event_name, outcome="authorized")
-    ensure_dirs()
+    audit_mcp_use(event_name, outcome="authorized", audit_path=eff_audit_path)
+    if eff_brain_dir == _INITIAL_BRAIN_DIR:
+        ensure_dirs()
+    else:
+        ensure_dirs(eff_brain_dir)
 
     if name not in get_allowed_tools():
         return types.CallToolResult(
@@ -485,11 +511,10 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         if not raw_atom_id or "../" in raw_atom_id or "..\\" in raw_atom_id or "/" in raw_atom_id or "\\" in raw_atom_id:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{raw_atom_id}' not found or invalid.")])
         atom_id = normalize_markdown_filename(raw_atom_id)
-        path    = safe_file_in_dir(ATOMS_DIR, atom_id, allowed_exts={".md"})
+        path    = safe_file_in_dir(eff_atoms_dir, atom_id, allowed_exts={".md"})
         if not path:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{atom_id}' not found or invalid.")])
-        vault_root = os.path.dirname(os.path.abspath(ATOMS_DIR))
-        if not approved_revision_is_current(path, brain_dir=vault_root, atoms_dir=ATOMS_DIR):
+        if not approved_revision_is_current(path, brain_dir=eff_brain_dir, atoms_dir=eff_atoms_dir):
             return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
         try:
             record = parse_atom_record(path)
@@ -517,11 +542,11 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
 
         source  = arguments.get("source", "MCP agent")
         source = str(source).replace("--", "—").replace("\r", " ").replace("\n", " ")[:500]
-        os.makedirs(INBOX_DIR, exist_ok=True)
-        if _is_reparse_or_link(INBOX_DIR):
+        os.makedirs(eff_inbox_dir, exist_ok=True)
+        if _is_reparse_or_link(eff_inbox_dir):
             raise PermissionError("Refusing to write to a symlinked quarantined inbox directory.")
         filename = f"{now_slug()}-mcp-note.md"
-        target_path = safe_file_in_dir(INBOX_DIR, filename, allowed_exts={".md"}, must_exist=False)
+        target_path = safe_file_in_dir(eff_inbox_dir, filename, allowed_exts={".md"}, must_exist=False)
         if not target_path:
             raise ValueError("Path traversal attempt detected: destination outside inbox.")
 
@@ -544,7 +569,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                 break
             except FileExistsError:
                 filename = f"{now_slug()}-mcp-note-{suffix}.md"
-                target_path = safe_file_in_dir(INBOX_DIR, filename, allowed_exts={".md"}, must_exist=False)
+                target_path = safe_file_in_dir(eff_inbox_dir, filename, allowed_exts={".md"}, must_exist=False)
                 if not target_path:
                     raise ValueError("Path traversal attempt detected: destination outside inbox.")
                 suffix += 1
@@ -557,7 +582,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
     elif name in {"search_notes", "get_note", "remember"}:
         from notes_store import NoteError, NotePaths, create_note, get_note, search_notes
 
-        npaths = NotePaths.for_brain(os.path.dirname(os.path.abspath(ATOMS_DIR)))
+        npaths = NotePaths.for_brain(eff_brain_dir)
         try:
             if name == "search_notes":
                 query = str(arguments.get("query") or "").strip()[:2000]
@@ -612,18 +637,21 @@ async def handle_list_resources(_ctx, _params) -> types.ListResourcesResult:
 
 async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) -> types.ReadResourceResult:
     assert_mcp_loopback_transport()
+    eff_brain_dir, eff_atoms_dir, _, eff_audit_path = _effective_mcp_paths()
     auth_ok = is_authorized(params, _ctx)
     if not auth_ok:
-        if os.path.isdir(os.path.dirname(os.path.abspath(MCP_AUDIT_PATH))):
-            audit_mcp_use("resource:read", outcome="denied")
+        if os.path.isdir(os.path.dirname(os.path.abspath(eff_audit_path))):
+            try:
+                audit_mcp_use("resource:read", outcome="denied", audit_path=eff_audit_path)
+            except (OSError, PermissionError):
+                pass
         return types.ReadResourceResult(contents=[])
-    audit_mcp_use("resource:read", outcome="authorized")
+    audit_mcp_use("resource:read", outcome="authorized", audit_path=eff_audit_path)
     uri = str(params.uri)
     if uri.startswith("brain://atoms/"):
         filename = uri.removeprefix("brain://atoms/")
-        path = safe_file_in_dir(ATOMS_DIR, filename, allowed_exts={".md"})
-        vault_root = os.path.dirname(os.path.abspath(ATOMS_DIR))
-        if not path or not approved_revision_is_current(path, brain_dir=vault_root, atoms_dir=ATOMS_DIR):
+        path = safe_file_in_dir(eff_atoms_dir, filename, allowed_exts={".md"})
+        if not path or not approved_revision_is_current(path, brain_dir=eff_brain_dir, atoms_dir=eff_atoms_dir):
             return types.ReadResourceResult(contents=[])
         try:
             record = parse_atom_record(path)

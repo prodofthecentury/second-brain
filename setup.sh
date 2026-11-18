@@ -126,31 +126,86 @@ echo "=== Synchronizing Locked Python Environment ==="
 
 echo "=== Checking Local Ollama Daemon & Models ==="
 OLLAMA_RAW_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
-case "${OLLAMA_RAW_HOST}" in
-    http://*|https://*)
-        OLLAMA_BASE_URL="${OLLAMA_RAW_HOST%/}"
-        ;;
-    *:*)
-        OLLAMA_BASE_URL="http://${OLLAMA_RAW_HOST%/}"
-        ;;
-    *)
-        OLLAMA_BASE_URL="http://${OLLAMA_RAW_HOST}:11434"
-        ;;
-esac
-OLLAMA_TAGS_URL="${OLLAMA_BASE_URL}/api/tags"
+OLLAMA_LOOPBACK_VALID=0
+OLLAMA_BASE_URL=""
+
+resolve_loopback_ollama_url() {
+    local raw="${1:-}"
+    # Strip single optional trailing slash after host/port, but reject paths, credentials, queries, fragments, or https
+    case "${raw}" in
+        ""|*"@"*|*"?"*|*"#"*|https://*|HTTPS://*)
+            return 1
+            ;;
+    esac
+    local stripped="${raw%/}"
+    if [[ "${stripped}" == *"/"* ]] && [[ ! "${stripped}" =~ ^[Hh][Tt][Tt][Pp]://[^/]+$ ]]; then
+        return 1
+    fi
+    local authority="${stripped}"
+    if [[ "${authority}" =~ ^[Hh][Tt][Tt][Pp]://(.+)$ ]]; then
+        authority="${BASH_REMATCH[1]}"
+    elif [[ "${authority}" == *"://"* ]]; then
+        return 1
+    fi
+    local host_part=""
+    local port_part="11434"
+    if [[ "${authority}" == "::1" ]] || [[ "${authority}" == "[::1]" ]]; then
+        host_part="[::1]"
+    elif [[ "${authority}" =~ ^\[::1\]:([0-9]{1,5})$ ]]; then
+        host_part="[::1]"
+        port_part="${BASH_REMATCH[1]}"
+    elif [[ "${authority}" =~ ^([A-Za-z0-9.-]+):([0-9]{1,5})$ ]]; then
+        host_part="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+        port_part="${BASH_REMATCH[2]}"
+    elif [[ "${authority}" =~ ^([A-Za-z0-9.-]+)$ ]]; then
+        host_part="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+    else
+        return 1
+    fi
+    case "${host_part}" in
+        127.0.0.1|localhost|"[::1]")
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    if [ "${port_part}" -lt 1 ] || [ "${port_part}" -gt 65535 ]; then
+        return 1
+    fi
+    printf 'http://%s:%s' "${host_part}" "${port_part}"
+}
+
+if OLLAMA_BASE_URL="$(resolve_loopback_ollama_url "${OLLAMA_RAW_HOST}")"; then
+    OLLAMA_LOOPBACK_VALID=1
+    OLLAMA_TAGS_URL="${OLLAMA_BASE_URL}/api/tags"
+else
+    OLLAMA_LOOPBACK_VALID=0
+    OLLAMA_TAGS_URL=""
+fi
 
 fetch_ollama_tags() {
+    if [ "${OLLAMA_LOOPBACK_VALID}" -ne 1 ] || [ -z "${OLLAMA_TAGS_URL}" ]; then
+        return 1
+    fi
     if command -v curl >/dev/null 2>&1; then
-        curl -fsS --max-time 3 "${OLLAMA_TAGS_URL}" 2>/dev/null
+        curl --silent --fail --noproxy '*' --max-redirs 0 --max-time 3 "${OLLAMA_TAGS_URL}" 2>/dev/null
     else
         OLLAMA_TAGS_URL="${OLLAMA_TAGS_URL}" "${UV_EXE}" run --frozen python -c \
-            "import os, sys, urllib.request; sys.stdout.write(urllib.request.urlopen(os.environ['OLLAMA_TAGS_URL'], timeout=2).read().decode('utf-8'))" 2>/dev/null
+            "import os, sys, urllib.error, urllib.request
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, 'HTTP redirects forbidden on loopback probes', headers, fp)
+op = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+with op.open(os.environ['OLLAMA_TAGS_URL'], timeout=3) as r:
+    sys.stdout.write(r.read(65536).decode('utf-8'))" 2>/dev/null
     fi
 }
 
 OLLAMA_REACHABLE=0
 TAGS_JSON=""
-if TAGS_JSON="$(fetch_ollama_tags)"; then
+if [ "${OLLAMA_LOOPBACK_VALID}" -ne 1 ]; then
+    echo "[WARN] Refusing non-loopback or malformed OLLAMA_HOST (${OLLAMA_RAW_HOST}); continuing in model-free FTS5 lexical mode." >&2
+elif TAGS_JSON="$(fetch_ollama_tags)"; then
     OLLAMA_REACHABLE=1
     echo "Ollama reachable at ${OLLAMA_BASE_URL}"
 else
@@ -158,8 +213,8 @@ else
 fi
 
 if [ "${PULL_MODELS}" -eq 1 ]; then
-    if ! command -v ollama >/dev/null 2>&1 || [ "${OLLAMA_REACHABLE}" -eq 0 ]; then
-        echo "ERROR: --pull-models requested, but ollama CLI or local daemon (${OLLAMA_BASE_URL}) is unavailable." >&2
+    if [ "${OLLAMA_LOOPBACK_VALID}" -ne 1 ] || ! command -v ollama >/dev/null 2>&1 || [ "${OLLAMA_REACHABLE}" -eq 0 ]; then
+        echo "ERROR: --pull-models requested, but ollama CLI or local loopback daemon (${OLLAMA_BASE_URL:-${OLLAMA_RAW_HOST}}) is unavailable." >&2
         exit 1
     fi
     for model in nomic-embed-text llama3.2:3b; do
@@ -175,7 +230,7 @@ echo "=== Initializing Vault & Disposable Indexes ==="
 if [ -n "${BRAIN_VAULT_DIR:-}" ]; then
     VAULT_DIR="${BRAIN_VAULT_DIR}"
 else
-    VAULT_DIR="${PROJECT_ROOT}/brain"
+    VAULT_DIR="$("${UV_EXE}" run --frozen python -c "from scripts.config import resolve_active_brain_dir; print(resolve_active_brain_dir())" 2>/dev/null || printf '%s/brain' "${PROJECT_ROOT}")"
 fi
 MANIFEST_PATH="${VAULT_DIR}/.chroma/index-manifest.json"
 

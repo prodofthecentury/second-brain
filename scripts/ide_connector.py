@@ -31,7 +31,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import _default_installed_vault, _is_reparse_or_link  # noqa: E402
+from config import _is_reparse_or_link  # noqa: E402
 from host_adapters import restrict_security_file_permissions  # noqa: E402
 
 SERVER_KEY = "second-brain"
@@ -94,7 +94,7 @@ def _venv_python_from_env(uv_proj_env: str) -> Path | None:
     return None
 
 
-def server_entry(token: str, *, extra: dict | None = None) -> dict:
+def server_entry(token: str, *, extra: dict | None = None, vault_dir: str | None = None) -> dict:
     uv_proj_env = (os.environ.get("UV_PROJECT_ENVIRONMENT") or "").strip()
     venv_python = _venv_python_from_env(uv_proj_env)
     if venv_python is not None and MCP_SCRIPT.is_file():
@@ -106,15 +106,15 @@ def server_entry(token: str, *, extra: dict | None = None) -> dict:
         command, args = sys.executable, [str(MCP_SCRIPT)]
     else:
         command, args = sys.executable, ["-m", "scripts.mcp_server"]
-    vault_env = (os.environ.get("BRAIN_VAULT_DIR") or "").strip() or (_default_installed_vault() or "")
+    explicit_vault = (vault_dir or "").strip()
     env = {
         "BRAIN_ENABLE_LOCAL_MCP": "1",
         "BRAIN_MCP_TRUSTED_STDIO": "1",
         "BRAIN_MCP_CLIENT_TOKEN": token,
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    if vault_env:
-        env["BRAIN_VAULT_DIR"] = vault_env
+    if explicit_vault:
+        env["BRAIN_VAULT_DIR"] = os.path.abspath(os.path.expanduser(explicit_vault))
     if uv_proj_env:
         env["UV_PROJECT_ENVIRONMENT"] = uv_proj_env
     entry = {
@@ -223,7 +223,13 @@ def _write_claude_code_skill(home_dir: Path) -> None:
     shutil.copy2(template, dest_file)
 
 
-def connect(host_id: str, *, dry_run: bool = False, home: Path | None = None) -> dict:
+def connect(
+    host_id: str,
+    *,
+    dry_run: bool = False,
+    home: Path | None = None,
+    vault_dir: str | None = None,
+) -> dict:
     resolved_home = home or Path.home()
     targets = host_targets(resolved_home)
     if host_id not in targets:
@@ -236,7 +242,7 @@ def connect(host_id: str, *, dry_run: bool = False, home: Path | None = None) ->
         servers = {}
     if not isinstance(servers, dict):
         raise ValueError(f"'{target.servers_key}' in {target.config_path} is not an object.")
-    servers[SERVER_KEY] = server_entry(token, extra=target.extra_entry)
+    servers[SERVER_KEY] = server_entry(token, extra=target.extra_entry, vault_dir=vault_dir)
     data[target.servers_key] = servers
     if dry_run:
         redacted = json.loads(json.dumps(servers[SERVER_KEY]))

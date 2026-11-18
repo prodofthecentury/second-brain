@@ -22,7 +22,6 @@ from config import (
     HOUSE_RULES as HOUSE_RULES_PATH,
     GEN_MODEL,
     EMBED_MODEL,
-    TEXT_EXTS,
     _WINDOWS_RESERVED_STEMS,
     _is_reparse_or_link,
     append_archive_manifest_entry,
@@ -30,7 +29,6 @@ from config import (
     build_archive_manifest_entry,
     ensure_dirs,
     file_sha256,
-    is_content_markdown,
     safe_vault_reference,
 )
 from ollama_utils import chat_with_fallback, embed_text, embedding_metadata

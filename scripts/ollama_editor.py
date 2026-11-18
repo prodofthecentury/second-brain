@@ -18,6 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import atomic_write_bytes, review_lock
 from config import ATOMS_DIR, BRAIN_DIR, RAW_DIR, THREADS_DIR, GEN_MODEL, _is_reparse_or_link, ensure_dirs, is_content_markdown
+from memory_format import split_frontmatter
+from memory_review import parse_frontmatter_values, parse_scalar_list
 from ollama_utils import chat_with_fallback
 from review_atom import approved_revision_is_current
 
@@ -43,33 +45,23 @@ def extract_markdown_block(text: str) -> str:
 
 
 def frontmatter_value(content: str, key: str) -> str:
-    match = re.search(rf"^{re.escape(key)}:\s*(.+)$", content, re.MULTILINE)
-    if not match:
+    parsed = split_frontmatter(content)
+    if parsed is None:
         return ""
-    return match.group(1).strip().strip("\"'")
+    raw = parse_frontmatter_values(parsed[0]).get(key, "")
+    if isinstance(raw, list):
+        return ", ".join(str(x) for x in raw)
+    return str(raw or "")
 
 
 def frontmatter_list(content: str, key: str) -> list[str]:
-    inline = frontmatter_value(content, key)
-    if inline.startswith("[") and inline.endswith("]"):
-        return [
-            item.strip().strip("\"'")
-            for item in inline[1:-1].split(",")
-            if item.strip().strip("\"'")
-        ]
-
-    block = re.search(
-        rf"^{re.escape(key)}:\s*\n((?:\s+-\s+.+\n?)+)",
-        content,
-        re.MULTILINE,
-    )
-    if not block:
+    parsed = split_frontmatter(content)
+    if parsed is None:
         return []
-    return [
-        line.split("-", 1)[1].strip().strip("\"'")
-        for line in block.group(1).splitlines()
-        if "-" in line
-    ]
+    raw = parse_frontmatter_values(parsed[0]).get(key, [])
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return parse_scalar_list(str(raw or ""))
 
 
 def extract_section(content: str, heading: str) -> str:

@@ -7,7 +7,8 @@
 Builds a deterministic SHA-256 binary Merkle tree over all owner-approved
 knowledge (accepted atoms under 2-atoms/ and accepted playbooks under
 5-playbooks/), chains checkpoints into an append-only hash-linked ledger
-(brain/.sidecar/vault-ledger.jsonl), and exports portable Merkle inclusion
+(brain/0-raw/archive/vault-ledger.jsonl, with automatic migration from legacy
+brain/.sidecar/vault-ledger.jsonl), and exports portable Merkle inclusion
 proofs that an external verifier can validate offline without trusting the
 running server.
 """
@@ -22,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,7 +32,6 @@ from atom_mutator import approved_revision_is_current, content_sha256, review_lo
 from config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
-    PLAYBOOKS_DIR,
     _is_reparse_or_link,
     is_content_markdown,
     safe_file_in_dir,
@@ -52,7 +53,15 @@ def _canonical_json(obj: dict[str, Any]) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def _ledger_path(brain_dir: str) -> Path:
+def ledger_path(brain_dir: str = BRAIN_DIR) -> Path:
+    return Path(brain_dir) / "0-raw" / "archive" / "vault-ledger.jsonl"
+
+
+def _ledger_path(brain_dir: str = BRAIN_DIR) -> Path:
+    return ledger_path(brain_dir)
+
+
+def _legacy_ledger_path(brain_dir: str = BRAIN_DIR) -> Path:
     return Path(brain_dir) / ".sidecar" / "vault-ledger.jsonl"
 
 
@@ -229,6 +238,33 @@ def _read_ledger_entries(ledger_file: Path) -> tuple[list[dict[str, Any]], list[
     return entries, errors
 
 
+def _write_ledger_atomic(target: Path, entries: list[dict[str, Any]]) -> None:
+    payload_bytes = "".join(_canonical_json(item) + "\n" for item in entries).encode("utf-8")
+    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), prefix=".ledger-", suffix=".tmp")
+    closed = False
+    try:
+        if os.name != "nt":
+            os.chmod(tmp_path, 0o600)
+        if os.write(fd, payload_bytes) != len(payload_bytes):
+            raise OSError("Incomplete atomic write to vault-ledger.jsonl.")
+        os.fsync(fd)
+        os.close(fd)
+        closed = True
+        os.replace(tmp_path, target)
+        restrict_security_file_permissions(target)
+    finally:
+        if not closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def commit_ledger_checkpoint(
     *,
     brain_dir: str = BRAIN_DIR,
@@ -237,24 +273,46 @@ def commit_ledger_checkpoint(
     actor: str = "owner",
     note: str = "",
 ) -> dict[str, Any]:
-    """Append a tamper-evident Merkle checkpoint to brain/.sidecar/vault-ledger.jsonl."""
+    """Append a tamper-evident Merkle checkpoint to brain/0-raw/archive/vault-ledger.jsonl."""
     clean_actor = (actor or "").strip()
     if not clean_actor:
         raise ValueError("Ledger checkpoint requires a non-empty actor.")
 
-    ledger_file = _ledger_path(brain_dir)
-    ledger_file.parent.mkdir(parents=True, exist_ok=True)
-    if _is_reparse_or_link(str(ledger_file.parent)) or (
-        os.path.lexists(str(ledger_file)) and _is_reparse_or_link(str(ledger_file))
-    ):
-        raise PermissionError("Refusing to write ledger through a symlink or junction.")
+    durable_file = ledger_path(brain_dir)
+    legacy_file = _legacy_ledger_path(brain_dir)
+    sidecar_dir = Path(brain_dir) / ".sidecar"
 
-    with review_lock(str(ledger_file.parent / "writer.lock")):
-        if os.path.lexists(str(ledger_file)) and _is_reparse_or_link(str(ledger_file)):
+    raw_root = durable_file.parent.parent
+    for check_dir in (raw_root, durable_file.parent, sidecar_dir):
+        if os.path.lexists(str(check_dir)) and _is_reparse_or_link(str(check_dir)):
             raise PermissionError("Refusing to write ledger through a symlink or junction.")
-        entries, errors = _read_ledger_entries(ledger_file)
-        if errors:
-            raise ValueError(f"Cannot append to tampered/corrupted vault ledger: {'; '.join(errors)}")
+    durable_file.parent.mkdir(parents=True, exist_ok=True)
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    for check_path in (durable_file.parent, sidecar_dir, durable_file, legacy_file):
+        if os.path.lexists(str(check_path)) and _is_reparse_or_link(str(check_path)):
+            raise PermissionError("Refusing to write ledger through a symlink or junction.")
+
+    with review_lock(str(sidecar_dir / "writer.lock")):
+        for check_path in (durable_file.parent, durable_file, legacy_file):
+            if os.path.lexists(str(check_path)) and _is_reparse_or_link(str(check_path)):
+                raise PermissionError("Refusing to write ledger through a symlink or junction.")
+
+        durable_exists = os.path.lexists(str(durable_file))
+        legacy_exists = os.path.lexists(str(legacy_file))
+
+        if durable_exists:
+            entries, errors = _read_ledger_entries(durable_file)
+            if legacy_exists:
+                _, leg_errors = _read_ledger_entries(legacy_file)
+                errors.extend(f"Legacy .sidecar ledger error: {e}" for e in leg_errors)
+            if errors:
+                raise ValueError(f"Cannot append to tampered/corrupted vault ledger: {'; '.join(errors)}")
+        elif legacy_exists:
+            entries, errors = _read_ledger_entries(legacy_file)
+            if errors:
+                raise ValueError(f"Cannot migrate tampered/corrupted legacy vault ledger: {'; '.join(errors)}")
+        else:
+            entries = []
 
         merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
         prev_hash = entries[-1]["entry_sha256"] if entries else GENESIS_HASH
@@ -272,15 +330,22 @@ def commit_ledger_checkpoint(
         }
         payload["entry_sha256"] = _sha256_text(_canonical_json(payload))
 
-        encoded_line = (_canonical_json(payload) + "\n").encode("utf-8")
-        fd = os.open(str(ledger_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o600)
-        try:
-            if os.write(fd, encoded_line) != len(encoded_line):
-                raise OSError("Incomplete write to vault-ledger.jsonl.")
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        restrict_security_file_permissions(ledger_file)
+        if not durable_exists and legacy_exists:
+            _write_ledger_atomic(durable_file, [*entries, payload])
+            try:
+                legacy_file.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            encoded_line = (_canonical_json(payload) + "\n").encode("utf-8")
+            fd = os.open(str(durable_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o600)
+            try:
+                if os.write(fd, encoded_line) != len(encoded_line):
+                    raise OSError("Incomplete write to vault-ledger.jsonl.")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            restrict_security_file_permissions(durable_file)
         return payload
 
 
@@ -291,8 +356,26 @@ def verify_vault_ledger(
     playbooks_dir: str | None = None,
 ) -> dict[str, Any]:
     """Verify hash-chain integrity of vault-ledger.jsonl and compare against live Merkle root."""
-    ledger_file = _ledger_path(brain_dir)
-    entries, errors = _read_ledger_entries(ledger_file)
+    durable_file = ledger_path(brain_dir)
+    legacy_file = _legacy_ledger_path(brain_dir)
+    raw_root = durable_file.parent.parent
+
+    if os.path.lexists(str(raw_root)) and _is_reparse_or_link(str(raw_root)):
+        entries: list[dict[str, Any]] = []
+        errors: list[str] = ["Ledger 0-raw directory is a symlink or junction (rejected fail-closed)."]
+    elif os.path.lexists(str(durable_file)):
+        entries, errors = _read_ledger_entries(durable_file)
+        if os.path.lexists(str(legacy_file)):
+            _, leg_errors = _read_ledger_entries(legacy_file)
+            if leg_errors:
+                errors.extend(f"Legacy .sidecar ledger error: {e}" for e in leg_errors)
+    elif os.path.lexists(str(legacy_file)):
+        entries, errors = _read_ledger_entries(legacy_file)
+    else:
+        _, dur_err = _read_ledger_entries(durable_file)
+        _, leg_err = _read_ledger_entries(legacy_file)
+        entries, errors = [], [*dur_err, *leg_err]
+
     merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
     latest = entries[-1] if entries else None
     chain_valid = len(errors) == 0
@@ -463,8 +546,8 @@ def main(argv: list[str] | None = None) -> int:
     p_verify = sub.add_parser("verify", help="Verify vault ledger chain and live Merkle root")
     p_verify.add_argument("--json", action="store_true")
 
-    p_prove = sub.add_parser("prove", help="Generate offline Merkle proof for an accepted atom")
-    p_prove.add_argument("atom", help="Atom filename under 2-atoms/")
+    p_prove = sub.add_parser("prove", help="Generate offline Merkle proof for an accepted atom or playbook")
+    p_prove.add_argument("atom", help="Atom or playbook reference (e.g. 2-atoms/<name>, 5-playbooks/<name>, or <name>)")
     p_prove.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
@@ -477,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2) if args.json else f"chain_valid={res['chain_valid']} synced={res['synced_with_head']} root={res['live_merkle_root'][:16]}...")
         return 0 if res["chain_valid"] else 1
     if args.cmd == "prove":
-        res = prove_atom_membership(args.atom)
+        res = prove_leaf_membership(args.atom)
         print(json.dumps(res, indent=2) if args.json else f"Proof for {res['rel_path']} root={res['merkle_root'][:16]}... valid={verify_merkle_proof(res)}")
         return 0
     return 1

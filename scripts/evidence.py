@@ -190,6 +190,72 @@ def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
     return matches[0]
 
 
+def _normalized_source_from_bytes(source_sha256: str, raw: bytes) -> tuple[str, str, list[int]] | None:
+    with _SOURCE_NORM_LOCK:
+        cached = _SOURCE_NORM_CACHE.get(source_sha256)
+    if cached is not None:
+        return cached
+    try:
+        source_text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    normalized_source, offsets = _normalize_with_offsets(source_text)
+    with _SOURCE_NORM_LOCK:
+        if len(_SOURCE_NORM_CACHE) >= _MAX_SOURCE_CACHE:
+            _SOURCE_NORM_CACHE.clear()
+        _SOURCE_NORM_CACHE[source_sha256] = (source_text, normalized_source, offsets)
+    return source_text, normalized_source, offsets
+
+
+def verify_evidence_anchor_known_source(
+    content: str,
+    anchor: dict,
+    *,
+    source_rel: str,
+    source_sha256: str,
+    source_bytes: bytes,
+) -> bool:
+    """Verify anchor fields against already-validated, hash-verified source bytes without extra disk I/O."""
+    clean_rel = source_rel.replace("\\", "/").strip()
+    if not (clean_rel.startswith("0-raw/") or clean_rel.startswith("sources/")) or not clean_rel.lower().endswith(".md"):
+        return False
+    if str(anchor.get("evidence_source") or "") != clean_rel:
+        return False
+    if str(anchor.get("evidence_sha256") or "") != source_sha256:
+        return False
+    try:
+        evidence = _evidence_text(content)
+        sources = _source_values(content)
+    except EvidenceValidationError:
+        return False
+    if len(sources) != 1:
+        return False
+    src_ref = sources[0].replace("\\", "/").strip()
+    if src_ref != clean_rel:
+        return False
+    normalized_quote, _ = _normalize_with_offsets(evidence)
+    if len(normalized_quote) < 12:
+        return False
+    quote_sha = hashlib.sha256(normalized_quote.encode("utf-8")).hexdigest()
+    if str(anchor.get("evidence_quote_sha256") or "") != quote_sha:
+        return False
+    loaded = _normalized_source_from_bytes(source_sha256, source_bytes)
+    if loaded is None:
+        return False
+    source_text, normalized_source, offsets = loaded
+    first = normalized_source.find(normalized_quote, 0)
+    if first < 0:
+        return False
+    if normalized_source.find(normalized_quote, first + 1) >= 0:
+        return False
+    end = first + len(normalized_quote)
+    source_start = offsets[first]
+    source_end = offsets[end - 1] + 1
+    byte_start = len(source_text[:source_start].encode("utf-8"))
+    byte_end = len(source_text[:source_end].encode("utf-8"))
+    return str(anchor.get("evidence_start")) == str(byte_start) and str(anchor.get("evidence_end")) == str(byte_end)
+
+
 def verify_evidence_anchor(content: str, anchor: dict, brain_dir: str) -> bool:
     try:
         current = find_evidence_anchor(content, brain_dir)

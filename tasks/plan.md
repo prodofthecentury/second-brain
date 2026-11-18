@@ -313,15 +313,26 @@ unified CI gate (`scripts/test_all.py`).
 **What was built:**
 1. Cross-platform OS-signed desktop installer pipeline (`nsis`, `msi`, `dmg`/`zip`, `AppImage`/`deb` in `desktop/package.json`), unified `.exe`/`.msi`/`.whl`/`.vsix` packaging & Authenticode signing (`scripts/package_desktop.ps1`, `scripts/package_desktop.sh`, `scripts/sign_release.ps1`), user-writable packaged runtime bootstrap (`ensureBackendBootstrapped` + bundled `setup.ps1`/`setup.sh`), 8-tab Electron UI (`Playbooks & Plan` + `Vault Proof & Radar`), and live tray lifecycle controls (`Start`/`Restart`/`Stop Memory API`, `Open Vault Folder`, `Launch at Login`) in `desktop/main.js`.
 2. Comparative SOTA benchmark harness (`scripts/sota_benchmark.py`, `second-brain sota-benchmark`) evaluating Second Brain against naive BM25 RAG, unscoped flat memory, and ungrounded LLM synthesis across positive recall, claim precision, citation grounding, pending/superseded trap leakage, cross-project isolation, and abstention accuracy with declared hardware profiles.
-3. Cryptographic Vault Merkle Proof & Audit Ledger (`scripts/vault_ledger.py`, `second-brain ledger`, `/v1/ledger/*`), Contradiction & Drift Radar + Knowledge Graph (`scripts/knowledge_graph.py`, `second-brain graph`, `/v1/graph/*`), and Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Recall (`scripts/time_travel.py`, `second-brain snapshot`, `/v1/snapshots/*`), surfaced across Electron, Streamlit (`dashboard/app.py`), and VS Code (`extensions/vscode-second-brain/extension.js`) and verified by `scripts/phase5_god_features_tests.py` (10 tests) inside the **11-suite unified release gate** (`scripts/test_all.py`, `11/11 PASS`).
+3. Cryptographic Vault Merkle Proof & Audit Ledger (`scripts/vault_ledger.py`, `second-brain ledger`, `/v1/ledger/*`), Contradiction & Drift Radar + Knowledge Graph (`scripts/knowledge_graph.py`, `second-brain graph`, `/v1/graph/*`), and Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Recall (`scripts/time_travel.py`, `second-brain snapshot`, `/v1/snapshots/*`), surfaced across Electron, Streamlit (`dashboard/app.py`), and VS Code (`extensions/vscode-second-brain/extension.js`) and verified by `scripts/phase5_god_features_tests.py` inside the **12-suite unified release gate** (`scripts/test_all.py`, `12/12 PASS`).
 
-**Verification:** `uv run --locked python scripts/test_all.py` (`11/11 PASS`, `100% PASS`).
+**Verification:** `uv run --locked python scripts/test_all.py` (`12/12 PASS`, `100% PASS`).
 
 **Files:** `desktop/package.json`, `desktop/main.js`, `desktop/renderer/index.html`, `desktop/renderer/app.js`, `desktop/renderer/styles.css`, `dashboard/app.py`, `extensions/vscode-second-brain/extension.js`, `extensions/vscode-second-brain/package.json`, `docs/sota-benchmark-results-2026-11-15.json`, `scripts/package_desktop.ps1`, `scripts/package_desktop.sh`, `scripts/sign_release.ps1`, `scripts/sota_benchmark.py`, `scripts/vault_ledger.py`, `scripts/knowledge_graph.py`, `scripts/time_travel.py`, `scripts/api_product.py`, `scripts/memory_api.py`, `scripts/cli.py`, `scripts/phase5_god_features_tests.py`.
 
-## Completed product horizon (closed in Goal 17)
+### Goal 18 — Core Runtime Parity, Three-Store Durability, Security Redaction & Sub-15ms Recall — COMPLETE
 
-Goals 0–17 complete the entire local pilot and `v0.2.0` verifiable Second Brain product: durable CAS Markdown vault, cryptographic byte-offset source anchoring, out-of-model epistemic grounding, universal loopback API + SDK, per-host online consent/redaction adapters, quarantined inbox promotion, hardware-tiered profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine, zero-friction notes with one-click excerpt verification, streaming chat, bulk Obsidian importer, IDE/Antigravity/Claude/VS Code connectors, OS-signed cross-platform desktop installers (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), comparative SOTA benchmark harness (`scripts/sota_benchmark.py`), Merkle audit ledger & proofs (`scripts/vault_ledger.py`), Contradiction & Drift Radar (`scripts/knowledge_graph.py`), Time-Travel snapshots (`scripts/time_travel.py`), and the 11-suite unified release gate (`scripts/test_all.py`, `11/11 PASS`).
+**Why:** Eliminate split-brain vault/port discovery across Desktop, CLI, Dashboard, and MCP; enforce strict Three-Store durability (`0-raw/archive/` vs disposable `.sidecar/`) with `O(changed)` content-addressed snapshots; harden non-owner snapshot/audit redaction and spec-compliant YAML frontmatter parsing; and achieve `<= 15 ms` P95 recall and paginated API reads with `0/10` trap false positives.
+
+**What was built:**
+1. Unified `vault-path.txt` & `api-port` discovery across `scripts/config.py`, `scripts/cli.py`, `scripts/memory_api.py`, `scripts/mcp_server.py`, `scripts/ide_connector.py`, `desktop/main.js`, `extensions/vscode-second-brain/extension.js`, and `dashboard/app.py`, plus full CLI/README parity (`mcp --generate-token`, `capture --tags`, `notes add/verify`, `import --overwrite-modified`) and loopback no-proxy/no-redirect setup probes (`setup.ps1`, `setup.sh`).
+2. Durable Three-Store migration of `vault-ledger.jsonl` and content-addressed `schema_version: 3` snapshot blobs into `brain/0-raw/archive/` (with transparent `.sidecar/` fallback), generalized atom+playbook Merkle proofs (`prove_leaf_membership`), Porter-stemmed BM25 recall, spec-compliant YAML/JSON frontmatter parsing, verified note `contexts:` propagation, durable `atom-corrections.jsonl` fitness merging (`ret_hits` loop removed), and strict non-owner revision/evidence/playbook redaction.
+3. Bounded `ThreadPoolExecutor` + SSE stream concurrency guards on `MemoryLoopbackHTTPServer`, FTS5-backed `GET /v1/atoms`, SHA-256-cached anchor/metadata verification, single-term (`min(2, len(query_terms))`) + calibrated dense/RRF synonym recall (`Recall@5 = 1.000`, `0/10` trap false positives, sub-15ms P95), and relocated operator runbooks (`docs/runbooks/`).
+
+**Verification:** `scripts/evaluate_retrieval.py` (`Recall@5 = 1.000`, `0/10` trap false positives), `second-brain doctor` (`exit 0`), and `scripts/test_all.py` (`12/12 PASS`, `100% PASS`).
+
+## Completed product horizon (closed in Goals 17–18)
+
+Goals 0–18 complete the local pilot and `v0.2.0` verifiable Second Brain product: durable CAS Markdown vault, cryptographic byte-offset source anchoring, out-of-model epistemic grounding, universal loopback API + SDK, per-host online consent/redaction adapters, quarantined inbox promotion, hardware-tiered profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine, zero-friction notes with one-click excerpt verification, streaming chat, bulk Obsidian importer, IDE/Antigravity/Claude/VS Code connectors, OS-signed cross-platform desktop installers (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), comparative SOTA benchmark harness (`scripts/sota_benchmark.py`), Merkle audit ledger & proofs (`scripts/vault_ledger.py`), Contradiction & Drift Radar (`scripts/knowledge_graph.py`), content-addressed Time-Travel snapshots (`scripts/time_travel.py`), and the 12-suite unified release gate (`scripts/test_all.py`, `12/12 PASS`).
 
 ## Checkpoints
 
@@ -333,9 +344,10 @@ Goals 0–17 complete the entire local pilot and `v0.2.0` verifiable Second Brai
   offline FTS5 degradation verified.
 - **Goal 8 (Passed):** Independent adversarial review reconciled and
   `scripts/test_all.py` achieves 100% pass rate.
-- **Goals 9–17 (Passed):** Phase 2–5 product ecosystem, OS-signed desktop
-  installers, SOTA benchmark, Merkle ledger, Contradiction Radar, Time-Travel
-  snapshots, and all adversarial security audits verified (`11/11` suites PASS).
+- **Goals 9–18 (Passed):** Phase 2–5 product ecosystem, OS-signed desktop
+  installers, SOTA benchmark, Three-Store Merkle ledger & content-addressed
+  Time-Travel snapshots, Contradiction Radar, sub-15ms recall, and all
+  adversarial security audits verified (`12/12` suites PASS).
 
 ## Risks
 

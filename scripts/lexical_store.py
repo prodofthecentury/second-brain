@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import datetime
+import functools
 import hashlib
 import json
 import os
@@ -34,15 +35,198 @@ MAX_QUERY_TERMS = 24
 MAX_QUERY_RESULTS = 500
 TOKEN_PATTERN = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
 
-
-def tokenize(text: str) -> list[str]:
-    """Extract lowercase Unicode word tokens (including hyphenated/apostrophe compounds)."""
-    return [m.group(0).casefold() for m in TOKEN_PATTERN.finditer(str(text or ""))]
+FTS_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by",
+        "can", "could", "did", "do", "does", "for", "from", "had", "has", "have",
+        "having", "how", "i", "in", "into", "is", "it", "its", "me", "my", "of",
+        "on", "or", "our", "owner", "owners", "owner's", "rather", "should", "so",
+        "some", "such", "than", "that", "the", "their", "them", "then", "there",
+        "these", "they", "this", "those", "through", "to", "too", "under", "very",
+        "was", "we", "were", "what", "when", "where", "which", "while", "who",
+        "why", "will", "with", "would", "you", "your", "please", "output",
+        "according", "approved", "factual", "claim", "claims", "confirms",
+        "confirm", "purely",
+    }
+)
 
 
 def tokenize(text: str) -> list[str]:
     """Extract normalized lowercase lexical tokens from text."""
     return [tok.casefold() for tok in TOKEN_PATTERN.findall(str(text or ""))]
+
+
+def _porter_is_consonant(w: str, i: int) -> bool:
+    ch = w[i]
+    if ch in "aeiou":
+        return False
+    if ch == "y":
+        k = i
+        while k > 0 and w[k - 1] == "y":
+            k -= 1
+        base_is_cons = True if k == 0 else (w[k - 1] not in "aeiou")
+        return base_is_cons if ((i - k) % 2 == 0) else (not base_is_cons)
+    return True
+
+
+def _porter_measure(w: str) -> int:
+    m = 0
+    in_vowel = False
+    for idx in range(len(w)):
+        if not _porter_is_consonant(w, idx):
+            in_vowel = True
+        elif in_vowel:
+            m += 1
+            in_vowel = False
+    return m
+
+
+def _porter_contains_vowel(w: str) -> bool:
+    return any(not _porter_is_consonant(w, i) for i in range(len(w)))
+
+
+def _porter_double_consonant(w: str) -> bool:
+    return len(w) >= 2 and w[-1] == w[-2] and _porter_is_consonant(w, len(w) - 1)
+
+
+def _porter_cvc(w: str) -> bool:
+    return (
+        len(w) >= 3
+        and _porter_is_consonant(w, len(w) - 3)
+        and not _porter_is_consonant(w, len(w) - 2)
+        and _porter_is_consonant(w, len(w) - 1)
+        and w[-1] not in "wxy"
+    )
+
+
+_PORTER_STEP2: tuple[tuple[str, str], ...] = (
+    ("ational", "ate"),
+    ("tional", "tion"),
+    ("enci", "ence"),
+    ("anci", "ance"),
+    ("izer", "ize"),
+    ("abli", "able"),
+    ("bli", "ble"),
+    ("alli", "al"),
+    ("entli", "ent"),
+    ("eli", "e"),
+    ("ousli", "ous"),
+    ("ization", "ize"),
+    ("ation", "ate"),
+    ("ator", "ate"),
+    ("alism", "al"),
+    ("iveness", "ive"),
+    ("fulness", "ful"),
+    ("ousness", "ous"),
+    ("aliti", "al"),
+    ("iviti", "ive"),
+    ("biliti", "ble"),
+    ("logi", "log"),
+)
+
+_PORTER_STEP3: tuple[tuple[str, str], ...] = (
+    ("icate", "ic"),
+    ("ative", ""),
+    ("alize", "al"),
+    ("iciti", "ic"),
+    ("ical", "ic"),
+    ("ful", ""),
+    ("ness", ""),
+)
+
+_PORTER_STEP4: tuple[str, ...] = (
+    "ement", "ance", "ence", "able", "ible", "ment",
+    "ant", "ent", "ism", "ate", "iti", "ous", "ive", "ize", "ion",
+    "al", "er", "ic", "ou",
+)
+
+
+@functools.lru_cache(maxsize=16384)
+def porter_stem(word: str) -> str:
+    """Pure-Python Martin Porter (1980) English stemmer covering Steps 1a-5b."""
+    w = str(word or "").strip().casefold()
+    if len(w) <= 2:
+        return w
+    if "-" in w:
+        parts = w.split("-")
+        if all(p for p in parts):
+            return "-".join(porter_stem(p) for p in parts)
+        return w
+    if not (w.isascii() and w.isalpha()):
+        return w
+
+    # Step 1a
+    if w.endswith("sses"):
+        w = w[:-2]
+    elif w.endswith("ies"):
+        w = w[:-2]
+    elif not w.endswith("ss") and w.endswith("s"):
+        w = w[:-1]
+
+    # Step 1b
+    if w.endswith("eed"):
+        stem = w[:-3]
+        if _porter_measure(stem) > 0:
+            w = stem + "ee"
+    else:
+        trimmed = False
+        if w.endswith("ed") and _porter_contains_vowel(w[:-2]):
+            w = w[:-2]
+            trimmed = True
+        elif w.endswith("ing") and _porter_contains_vowel(w[:-3]):
+            w = w[:-3]
+            trimmed = True
+        if trimmed:
+            if w.endswith(("at", "bl", "iz")):
+                w = w + "e"
+            elif _porter_double_consonant(w) and w[-1] not in "lsz":
+                w = w[:-1]
+            elif _porter_measure(w) == 1 and _porter_cvc(w):
+                w = w + "e"
+
+    # Step 1c
+    if w.endswith("y") and _porter_contains_vowel(w[:-1]):
+        w = w[:-1] + "i"
+
+    # Step 2 (longest matching suffix)
+    for suffix, repl in sorted(_PORTER_STEP2, key=lambda item: len(item[0]), reverse=True):
+        if w.endswith(suffix):
+            stem = w[: -len(suffix)]
+            if _porter_measure(stem) > 0:
+                w = stem + repl
+            break
+
+    # Step 3 (longest matching suffix)
+    for suffix, repl in sorted(_PORTER_STEP3, key=lambda item: len(item[0]), reverse=True):
+        if w.endswith(suffix):
+            stem = w[: -len(suffix)]
+            if _porter_measure(stem) > 0:
+                w = stem + repl
+            break
+
+    # Step 4 (longest matching suffix)
+    for suffix in _PORTER_STEP4:
+        if w.endswith(suffix):
+            stem = w[: -len(suffix)]
+            if suffix == "ion":
+                if stem.endswith(("s", "t")) and _porter_measure(stem) > 1:
+                    w = stem
+            elif _porter_measure(stem) > 1:
+                w = stem
+            break
+
+    # Step 5a
+    if w.endswith("e"):
+        stem = w[:-1]
+        m = _porter_measure(stem)
+        if m > 1 or (m == 1 and not _porter_cvc(stem)):
+            w = stem
+
+    # Step 5b
+    if _porter_measure(w) > 1 and _porter_double_consonant(w) and w.endswith("l"):
+        w = w[:-1]
+
+    return w
 
 
 class LexicalIndexUnavailable(RuntimeError):
@@ -113,17 +297,24 @@ def lexical_index_is_current(atoms_dir: str, index_path: str) -> bool:
 
 
 def _fts_query(query: str) -> str:
-    """Turn arbitrary user text into a small, literal-only FTS5 OR query."""
-    seen = set()
-    terms = []
+    """Turn arbitrary user text into a small, literal-only FTS5 OR query, stripping stopwords before slicing."""
+    seen: set[str] = set()
+    terms: list[str] = []
+    fallback_terms: list[str] = []
     for token in TOKEN_PATTERN.findall(str(query or "")):
         normalized = token.casefold()
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            terms.append(normalized)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        if normalized in FTS_STOP_WORDS:
+            if len(fallback_terms) < MAX_QUERY_TERMS:
+                fallback_terms.append(normalized)
+            continue
+        terms.append(normalized)
         if len(terms) >= MAX_QUERY_TERMS:
             break
-    return " OR ".join(f'"{term}"' for term in terms)
+    chosen = terms if terms else fallback_terms
+    return " OR ".join(f'"{term}"' for term in chosen)
 
 
 def rebuild_lexical_index(atoms_dir: str, index_path: str) -> dict[str, object]:
@@ -342,25 +533,36 @@ def list_indexed_atoms_fast(
     return items, total
 
 
-def search_lexical_index(
+def _search_lexical_index_verified(
     query: str,
     index_path: str,
     n_results: int = 5,
     atoms_dir: str | None = None,
-) -> list[LexicalCandidate]:
-    """Return FTS5 candidates only when the sidecar is current and query syntax is safe."""
-    if atoms_dir is not None and not lexical_index_is_current(atoms_dir, index_path):
-        raise LexicalIndexUnavailable("Lexical recall index is stale; rebuild it before serving memory.")
+) -> tuple[list[LexicalCandidate], dict[str, str] | None]:
+    """Return (candidates, verified_filename_sha_map) using one SQLite open and one atoms_dir scan."""
     expression = _fts_query(query)
-    if not expression:
-        return []
     try:
         limit = max(1, min(int(n_results), MAX_QUERY_RESULTS))
     except (TypeError, ValueError):
         limit = 5
 
+    verified_map: dict[str, str] | None = None
     connection = _readonly_connection(index_path)
     try:
+        if atoms_dir is not None:
+            metadata = _read_metadata(connection)
+            if not isinstance(metadata, dict) or metadata.get("schema_version") != LEXICAL_SCHEMA_VERSION:
+                raise LexicalIndexUnavailable("Lexical recall index is stale; rebuild it before serving memory.")
+            revisions = atom_revisions(atoms_dir)
+            if not (
+                metadata.get("atom_count") == len(revisions)
+                and metadata.get("indexed_count") == len(revisions)
+                and metadata.get("atom_revisions_sha256") == revisions_fingerprint(revisions)
+            ):
+                raise LexicalIndexUnavailable("Lexical recall index is stale; rebuild it before serving memory.")
+            verified_map = {item["filename"]: item["content_sha256"] for item in revisions}
+        if not expression:
+            return [], verified_map
         rows = connection.execute(
             f"SELECT filename, content, content_sha256, rank "
             f"FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ? ORDER BY rank LIMIT ?",
@@ -371,7 +573,7 @@ def search_lexical_index(
     finally:
         connection.close()
 
-    return [
+    candidates = [
         LexicalCandidate(
             filename=str(filename),
             content=str(content),
@@ -380,3 +582,17 @@ def search_lexical_index(
         )
         for filename, content, content_sha256, rank in rows
     ]
+    return candidates, verified_map
+
+
+def search_lexical_index(
+    query: str,
+    index_path: str,
+    n_results: int = 5,
+    atoms_dir: str | None = None,
+) -> list[LexicalCandidate]:
+    """Return FTS5 candidates only when the sidecar is current and query syntax is safe."""
+    candidates, _ = _search_lexical_index_verified(
+        query, index_path, n_results=n_results, atoms_dir=atoms_dir
+    )
+    return candidates

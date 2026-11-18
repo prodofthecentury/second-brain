@@ -43,6 +43,7 @@ from atom_mutator import (  # noqa: E402
     atomic_write_bytes,
     content_sha256,
 )
+import config as _config  # noqa: E402
 from config import (  # noqa: E402
     _is_reparse_or_link,
     is_content_markdown,
@@ -65,8 +66,10 @@ from memory_format import (  # noqa: E402
 )
 from memory_review import (  # noqa: E402
     list_review_queue,
+    normalize_status,
     parse_atom_record,
     parse_frontmatter_values,
+    parse_scalar_list,
     section_text,
 )
 from notes_store import (  # noqa: E402
@@ -97,6 +100,9 @@ _OWNER_RATE_LOCK = threading.Lock()
 _OWNER_AUTH_FAILURES: dict[str, list[float]] = {}
 _CAPTURE_WRITE_TIMESTAMPS: dict[str, list[float]] = {}
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
+_ATOM_SUMMARY_CACHE_MAX = 8192
+_ATOM_SUMMARY_CACHE_LOCK = threading.Lock()
+_ATOM_SUMMARY_BY_SHA: dict[str, dict[str, object]] = {}
 
 
 # ─── Owner credential & rate guards ──────────────────────────────────────────
@@ -112,8 +118,11 @@ def default_owner_token_path() -> Path:
     ).strip()
     if sec_override:
         return Path(sec_override).expanduser().resolve() / "owner-token"
-    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
-        base = Path(os.environ["LOCALAPPDATA"])
+    cfg_sec = getattr(_config, "security_state_dir", None)
+    if callable(cfg_sec):
+        return Path(cfg_sec()).expanduser().resolve() / "owner-token"
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
     elif os.environ.get("XDG_STATE_HOME"):
         base = Path(os.environ["XDG_STATE_HOME"]).expanduser()
     else:
@@ -590,51 +599,204 @@ def _parse_backing_atoms_payload(raw_val: object) -> list[tuple[str, str]]:
     return pairs
 
 
-def _verify_snapshot_fallback(snapshot_id: str, *, brain_dir: str) -> dict[str, object]:
-    from time_travel import load_snapshot
-    from vault_ledger import _build_merkle_levels, _leaf_digest
+def _atom_summary_from_indexed_row(filename: str, content: str, sha256: str) -> dict[str, object] | None:
+    """Parse static atom card metadata from FTS5 row content once per (filename, content_sha256)."""
+    cache_key = f"{filename}:{sha256}"
+    with _ATOM_SUMMARY_CACHE_LOCK:
+        cached = _ATOM_SUMMARY_BY_SHA.get(cache_key)
+    if cached is not None:
+        return {
+            **cached,
+            "contexts": list(cached["contexts"]),  # type: ignore[arg-type]
+            "sources": list(cached["sources"]),  # type: ignore[arg-type]
+        }
 
-    snap = load_snapshot(snapshot_id, brain_dir=brain_dir)
-    atoms = snap.get("atoms") if isinstance(snap.get("atoms"), dict) else {}
-    playbooks = snap.get("playbooks") if isinstance(snap.get("playbooks"), dict) else {}
-    leaves: list[tuple[str, str]] = []
-    issues: list[str] = []
+    parsed = split_frontmatter(content)
+    if parsed is None:
+        return None
+    fm_lines, body_lines = parsed
+    fm_vals = parse_frontmatter_values(fm_lines)
+    body_text = "\n".join(body_lines)
 
-    for fname, rec in atoms.items():
-        fhash = str((rec or {}).get("file_sha256") or "")
-        if len(fhash) != 64:
-            issues.append(f"Invalid atom hash in snapshot: {fname}")
-            continue
-        rel = f"2-atoms/{fname}"
-        leaves.append((rel, _leaf_digest(rel, fhash)))
+    raw_sources = fm_vals.get("sources", [])
+    sources = parse_scalar_list(raw_sources) if isinstance(raw_sources, str) else list(raw_sources)
+    raw_contexts = fm_vals.get("contexts", [])
+    contexts = parse_scalar_list(raw_contexts) if isinstance(raw_contexts, str) else list(raw_contexts)
 
-    for fname, rec in playbooks.items():
-        fhash = str((rec or {}).get("file_sha256") or "")
-        if len(fhash) != 64:
-            issues.append(f"Invalid playbook hash in snapshot: {fname}")
-            continue
-        rel = f"5-playbooks/{fname}"
-        leaves.append((rel, _leaf_digest(rel, fhash)))
-
-    leaves.sort(key=lambda item: item[0])
-    computed_root = _build_merkle_levels([h for _, h in leaves])[-1][0]
-    stored_root = str(snap.get("merkle_root") or "")
-    if computed_root != stored_root:
-        issues.append("Snapshot Merkle root mismatch.")
-    if int(snap.get("atom_count", len(atoms))) != len(atoms):
-        issues.append("Snapshot atom_count metadata mismatch.")
-    if int(snap.get("playbook_count", len(playbooks))) != len(playbooks):
-        issues.append("Snapshot playbook_count metadata mismatch.")
-
+    review_status = normalize_status(str(fm_vals.get("review_status", "pending")))
+    memory_type = str(fm_vals.get("memory_type", "semantic") or "semantic")
+    origin = str(fm_vals.get("origin", "imported_unknown") or "imported_unknown")
+    epistemic_label_raw = str(fm_vals.get("epistemic_label") or "claim").strip() or "claim"
+    epistemic_contract = str(fm_vals.get("epistemic_contract") or "").strip()
+    effective_label = (
+        "preference" if (epistemic_label_raw == "preference" or epistemic_contract) else epistemic_label_raw
+    )
+    summary: dict[str, object] = {
+        "filename": filename,
+        "claim": section_text(body_text, "Claim"),
+        "evidence": section_text(body_text, "Evidence"),
+        "review_status": review_status,
+        "status": review_status,
+        "memory_type": memory_type,
+        "epistemic_label": effective_label,
+        "epistemic_contract": epistemic_contract or None,
+        "contexts": list(contexts),
+        "origin": origin,
+        "sources": list(sources),
+        "sha256": sha256,
+    }
+    with _ATOM_SUMMARY_CACHE_LOCK:
+        if len(_ATOM_SUMMARY_BY_SHA) >= _ATOM_SUMMARY_CACHE_MAX and cache_key not in _ATOM_SUMMARY_BY_SHA:
+            _ATOM_SUMMARY_BY_SHA.pop(next(iter(_ATOM_SUMMARY_BY_SHA)), None)
+        _ATOM_SUMMARY_BY_SHA[cache_key] = summary
     return {
-        "snapshot_id": snap.get("snapshot_id", snapshot_id),
-        "valid": len(issues) == 0,
-        "stored_merkle_root": stored_root,
-        "computed_merkle_root": computed_root,
-        "merkle_root": stored_root,
-        "atom_count": len(atoms),
-        "playbook_count": len(playbooks),
-        "issues": issues,
+        **summary,
+        "contexts": list(contexts),
+        "sources": list(sources),
+    }
+
+
+def _live_approved_atom_sha(fname: object, rt) -> str | None:
+    """Return live content_sha256 of rt.atoms_dir/<fname> iff current, non-symlink, non-preference, and approved."""
+    raw_name = str(fname or "").strip()
+    if not raw_name:
+        return None
+    ap = safe_file_in_dir(rt.atoms_dir, raw_name, allowed_exts={".md"}, must_exist=True)
+    if not ap or _is_reparse_or_link(ap) or not os.path.isfile(ap):
+        return None
+    try:
+        raw_bytes = Path(ap).read_bytes()
+        raw_text = raw_bytes.decode("utf-8")
+        rec = parse_atom_record(ap)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if is_preference_atom_content(raw_text):
+        return None
+    if rec.get("review_status") != "accepted" or bool(rec.get("superseded_by")):
+        return None
+    if not approved_revision_is_current(ap, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir):
+        return None
+    return content_sha256(raw_bytes)
+
+
+def _is_live_preference_atom(fname: object, rt) -> bool:
+    raw_name = str(fname or "").strip()
+    if not raw_name:
+        return False
+    ap = safe_file_in_dir(rt.atoms_dir, raw_name, allowed_exts={".md"}, must_exist=True)
+    if not ap or _is_reparse_or_link(ap) or not os.path.isfile(ap):
+        return False
+    return _is_preference_atom_file(ap)
+
+
+def _live_active_playbook_report(fname: object, rt):
+    """Verify live Playbook integrity and return PlaybookIntegrityReport iff valid and active."""
+    from skill_playbooks import verify_playbook_integrity
+
+    raw_name = str(fname or "").strip()
+    if not raw_name:
+        return None
+    pb_path = safe_file_in_dir(rt.playbooks_dir, raw_name, allowed_exts={".md"}, must_exist=True)
+    if not pb_path or _is_reparse_or_link(pb_path) or not os.path.isfile(pb_path):
+        return None
+    try:
+        rep = verify_playbook_integrity(
+            pb_path,
+            brain_dir=rt.brain_dir,
+            atoms_dir=rt.atoms_dir,
+            playbooks_dir=rt.playbooks_dir,
+            telemetry_db_path=rt.telemetry_db_path,
+        )
+    except Exception:
+        return None
+    if not rep.valid or rep.status != "active":
+        return None
+    try:
+        disk_sha = content_sha256(Path(pb_path).read_bytes())
+    except OSError:
+        return None
+    if not rep.sha256 or disk_sha != rep.sha256:
+        return None
+    return rep
+
+
+def _prove_leaf_fallback(
+    leaf_ref: str,
+    *,
+    brain_dir: str,
+    atoms_dir: str,
+    playbooks_dir: str,
+) -> dict[str, object]:
+    import vault_ledger
+
+    parts = [p for p in leaf_ref.split("/") if p]
+    candidates: list[str] = []
+    if len(parts) == 2:
+        prefix, raw_name = parts[0].lower(), normalize_markdown_filename(parts[1])
+        if prefix in {"2-atoms", "atoms"}:
+            ap = safe_file_in_dir(atoms_dir, raw_name, allowed_exts={".md"}, must_exist=True)
+            if not ap:
+                raise FileNotFoundError(f"Atom not found: {leaf_ref}")
+            candidates.append(f"2-atoms/{os.path.basename(ap)}")
+        elif prefix in {"5-playbooks", "playbooks"}:
+            pp = safe_file_in_dir(playbooks_dir, raw_name, allowed_exts={".md"}, must_exist=True)
+            if not pp:
+                raise FileNotFoundError(f"Playbook not found: {leaf_ref}")
+            candidates.append(f"5-playbooks/{os.path.basename(pp)}")
+        else:
+            raise FileNotFoundError(f"Unknown vault leaf prefix: {leaf_ref}")
+    elif len(parts) == 1:
+        raw_name = normalize_markdown_filename(parts[0])
+        ap = safe_file_in_dir(atoms_dir, raw_name, allowed_exts={".md"}, must_exist=True)
+        pp = safe_file_in_dir(playbooks_dir, raw_name, allowed_exts={".md"}, must_exist=True)
+        if ap:
+            candidates.append(f"2-atoms/{os.path.basename(ap)}")
+        if pp:
+            candidates.append(f"5-playbooks/{os.path.basename(pp)}")
+        if not candidates:
+            raise FileNotFoundError(f"Leaf not found: {leaf_ref}")
+    else:
+        raise FileNotFoundError(f"Leaf not found: {leaf_ref}")
+
+    merkle = vault_ledger.compute_vault_merkle(
+        brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir
+    )
+    leaves = merkle["leaves"]
+    idx = None
+    target_rel = candidates[0]
+    for cand in candidates:
+        found = next((i for i, leaf in enumerate(leaves) if leaf["rel_path"] == cand), None)
+        if found is not None:
+            idx = found
+            target_rel = cand
+            break
+    if idx is None:
+        raise PermissionError(f"Target '{leaf_ref}' is not an accepted member of the verified vault Merkle tree.")
+
+    levels = vault_ledger._build_merkle_levels([leaf["leaf_sha256"] for leaf in leaves])
+    siblings: list[dict[str, str]] = []
+    cur_idx = idx
+    for level in levels[:-1]:
+        if cur_idx % 2 == 0:
+            if cur_idx + 1 < len(level):
+                siblings.append({"position": "right", "sha256": level[cur_idx + 1]})
+            else:
+                siblings.append({"position": "odd", "sha256": level[cur_idx]})
+        else:
+            siblings.append({"position": "left", "sha256": level[cur_idx - 1]})
+        cur_idx //= 2
+
+    ledger = vault_ledger.verify_vault_ledger(
+        brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir
+    )
+    return {
+        "schema_version": 1,
+        "rel_path": target_rel,
+        "file_sha256": leaves[idx]["file_sha256"],
+        "leaf_sha256": leaves[idx]["leaf_sha256"],
+        "siblings": siblings,
+        "merkle_root": merkle["merkle_root"],
+        "ledger_head_entry_sha256": ledger["head_entry_sha256"] if ledger["synced_with_head"] else None,
     }
 
 
@@ -855,34 +1017,41 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", chat_host):
                 raise ValueError("Invalid 'host_id'.")
             query_str = _str(body, "query", max_len=2000)
-            cp = ChatPaths(
-                brain_dir=rt.brain_dir,
-                atoms_dir=rt.atoms_dir,
-                lexical_index_path=rt.lexical_index_path,
-                chroma_path=rt.chroma_path,
-                policy_path=rt.policy_path,
-                telemetry_db_path=rt.telemetry_db_path,
-            )
-            scope = body.get("project_scope") if isinstance(body.get("project_scope"), str) else None
-            model_ov = _str(body, "model_override", max_len=128, required=False) or None
-            inc_prefs = bool(is_owner and body.get("include_preferences", True))
-            stream_sse(
-                handler,
-                chat_events(
-                    query_str,
-                    mode=mode,
-                    paths=cp,
-                    project_scope=scope,
-                    model_override=model_ov,
-                    include_preferences=inc_prefs,
-                    host_id=chat_host,
-                    retrieval_mode=retr_mode,
-                    answer_view=ans_view,
-                    allow_unverified_leads=bool(is_owner and ans_view == "research"),
-                ),
-                on_open=lambda: _audit_fn(rt.brain_dir, path, method, 200),
-            )
-            return True
+            stream_sem = getattr(handler.server, "_stream_slots", None)
+            if stream_sem is not None and not stream_sem.acquire(blocking=False):
+                return send(429, {"error": "Too many concurrent chat streams."})
+            try:
+                cp = ChatPaths(
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                    lexical_index_path=rt.lexical_index_path,
+                    chroma_path=rt.chroma_path,
+                    policy_path=rt.policy_path,
+                    telemetry_db_path=rt.telemetry_db_path,
+                )
+                scope = body.get("project_scope") if isinstance(body.get("project_scope"), str) else None
+                model_ov = _str(body, "model_override", max_len=128, required=False) or None
+                inc_prefs = bool(is_owner and body.get("include_preferences", True))
+                stream_sse(
+                    handler,
+                    chat_events(
+                        query_str,
+                        mode=mode,
+                        paths=cp,
+                        project_scope=scope,
+                        model_override=model_ov,
+                        include_preferences=inc_prefs,
+                        host_id=chat_host,
+                        retrieval_mode=retr_mode,
+                        answer_view=ans_view,
+                        allow_unverified_leads=bool(is_owner and ans_view == "research"),
+                    ),
+                    on_open=lambda: _audit_fn(rt.brain_dir, path, method, 200),
+                )
+                return True
+            finally:
+                if stream_sem is not None:
+                    stream_sem.release()
 
         if path == "/v1/chat/warmup" and method == "POST":
             from streaming_chat import warmup
@@ -910,6 +1079,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
             actor = _str(body, "actor", max_len=120, required=False).strip() or "owner"
             note = _str(body, "note", max_len=1000, required=False).strip()
+            raw_kind = body.get("feedback_kind")
+            if raw_kind is not None:
+                kind_norm = _str(body, "feedback_kind", max_len=32, required=False).strip().lower()
+                if kind_norm and kind_norm not in {"helpful", "correction", "supersession"}:
+                    raise ValueError("Invalid 'feedback_kind'; expected 'helpful', 'correction', or 'supersession'.")
+            else:
+                kind_norm = ""
+
             allowed_fb = {
                 "endorsed",
                 "helpful",
@@ -922,7 +1099,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 "supersession",
             }
             raw_fb = body.get("feedback") if "feedback" in body else body.get("signal")
-            if isinstance(raw_fb, str) and raw_fb.strip():
+            if kind_norm:
+                if isinstance(raw_fb, str) and raw_fb.strip() and raw_fb.strip().lower() not in allowed_fb:
+                    raise ValueError("Invalid 'feedback'; expected 'endorsed', 'corrected', or 'superseded'.")
+                helpful = kind_norm == "helpful"
+                resolved_kind = kind_norm
+            elif isinstance(raw_fb, str) and raw_fb.strip():
                 fb_norm = raw_fb.strip().lower()
                 if fb_norm not in allowed_fb:
                     raise ValueError("Invalid 'feedback'; expected 'endorsed', 'corrected', or 'superseded'.")
@@ -936,28 +1118,33 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 helpful = bool(body.get("helpful"))
                 resolved_kind = "helpful" if helpful else "correction"
             else:
-                raise ValueError("Provide 'feedback' ('endorsed' | 'corrected' | 'superseded') or boolean 'helpful'.")
-            fb_res = record_atom_feedback(
-                atom_fn,
-                helpful=helpful,
-                feedback_kind=resolved_kind,
-                actor=actor,
-                note=note,
-                db_path=rt.telemetry_db_path,
-                brain_dir=rt.brain_dir,
-            )
-            return send(
-                200,
-                {
-                    "status": "recorded",
-                    "atom_filename": atom_fn,
-                    "helpful": helpful,
-                    "feedback_kind": resolved_kind,
-                    "actor": actor,
-                    "note": note,
-                    **(fb_res if isinstance(fb_res, dict) else {}),
-                },
-            )
+                raise ValueError("Provide 'feedback' ('endorsed' | 'corrected' | 'superseded'), 'feedback_kind', or boolean 'helpful'.")
+
+            fb_params = inspect.signature(record_atom_feedback).parameters
+            fb_kwargs: dict[str, object] = {
+                "helpful": helpful,
+                "db_path": rt.telemetry_db_path,
+                "brain_dir": rt.brain_dir,
+            }
+            if "actor" in fb_params:
+                fb_kwargs["actor"] = actor
+            if "note" in fb_params:
+                fb_kwargs["note"] = note
+            if "feedback_kind" in fb_params:
+                fb_kwargs["feedback_kind"] = resolved_kind
+            fb_res = record_atom_feedback(atom_fn, **fb_kwargs)
+            resp_payload: dict[str, object] = {
+                "status": "recorded",
+                "atom_filename": atom_fn,
+                "helpful": helpful,
+                "feedback_kind": resolved_kind,
+                "actor": actor,
+                "note": note,
+            }
+            if isinstance(fb_res, dict):
+                for k, v in fb_res.items():
+                    resp_payload.setdefault(k, v)
+            return send(200, resp_payload)
 
         # ── One-click review & Atom Governance ──
         if path == "/v1/review/queue" and method == "GET":
@@ -986,33 +1173,135 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/atoms" and method == "GET":
+            from atom_mutator import review_lock
+            from lexical_store import (
+                lexical_index_is_current,
+                list_indexed_atoms_fast,
+                sync_lexical_index,
+                tokenize,
+            )
+            from recall import project_tags_match
+
             limit = _parse_bounded_int(q, "limit", default=200, min_val=1, max_val=500)
             offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
-            cards = []
-            for name in sorted(os.listdir(rt.atoms_dir)) if (os.path.isdir(rt.atoms_dir) and not _is_reparse_or_link(rt.atoms_dir)) else []:
-                if not is_content_markdown(name):
-                    continue
-                p = safe_file_in_dir(rt.atoms_dir, name, allowed_exts={".md"}, must_exist=True)
-                if p and not _is_reparse_or_link(p):
+            q_search = (q.get("q") or q.get("query") or [""])[0].strip()[:500]
+            proj_filter = (q.get("project") or [""])[0].strip()
+            if len(proj_filter) > 120:
+                raise ValueError("Invalid project query filter.")
+
+            if (os.path.lexists(rt.brain_dir) and _is_reparse_or_link(rt.brain_dir)) or (
+                os.path.lexists(rt.atoms_dir) and _is_reparse_or_link(rt.atoms_dir)
+            ):
+                raise PermissionError("Refusing to list atoms through a symlink or reparse point.")
+            if not os.path.isdir(rt.atoms_dir):
+                return send(
+                    200,
+                    {"atoms": [], "items": [], "count": 0, "total": 0, "offset": offset, "limit": limit},
+                )
+
+            use_fast_index = False
+            if rt.lexical_index_path:
+                if lexical_index_is_current(rt.atoms_dir, rt.lexical_index_path):
+                    use_fast_index = True
+                else:
+                    try:
+                        lock_path = os.path.join(os.path.dirname(os.path.abspath(rt.lexical_index_path)), "writer.lock")
+                        with review_lock(lock_path):
+                            sync_lexical_index(rt.atoms_dir, rt.lexical_index_path)
+                        use_fast_index = True
+                    except (OSError, UnicodeDecodeError, RuntimeError, ValueError, LexicalIndexUnavailable):
+                        use_fast_index = False
+
+            matching: list[dict[str, object]] = []
+            if use_fast_index:
+                from atom_mutator import decision_log_path, latest_decisions_by_atom
+
+                canon_atoms_dir = os.path.realpath(rt.atoms_dir)
+                try:
+                    batch_decision_map: dict[str, dict] | None = latest_decisions_by_atom(
+                        decision_log_path(rt.brain_dir)
+                    )
+                except Exception:
+                    batch_decision_map = None
+                batch_source_memo: dict[str, str | None] = {}
+                rows, _ = list_indexed_atoms_fast(rt.lexical_index_path, query=q_search, limit=100_000, offset=0)
+                for row in rows:
+                    fname = row.filename
+                    if (
+                        not is_content_markdown(fname)
+                        or "/" in fname
+                        or "\\" in fname
+                        or fname in {".", ".."}
+                    ):
+                        continue
+                    atom_path = os.path.join(canon_atoms_dir, fname)
+                    if not os.path.lexists(atom_path) or _is_reparse_or_link(atom_path):
+                        continue
+                    base = _atom_summary_from_indexed_row(fname, row.content, row.content_sha256)
+                    if base is None:
+                        continue
+                    if proj_filter and not project_tags_match(tuple(base["contexts"]), (proj_filter,)):  # type: ignore[arg-type]
+                        continue
+                    if not is_owner and (
+                        base.get("epistemic_label") == "preference" or bool(base.get("epistemic_contract"))
+                    ):
+                        continue
+                    if not is_owner and base.get("review_status") != "accepted":
+                        continue
+                    verified = (
+                        base.get("review_status") == "accepted"
+                        and approved_revision_is_current(
+                            atom_path,
+                            brain_dir=rt.brain_dir,
+                            atoms_dir=rt.atoms_dir,
+                            known_atom_bytes=row.content.encode("utf-8"),
+                            known_atom_sha256=row.content_sha256,
+                            known_decision_map=batch_decision_map,
+                            source_sha_memo=batch_source_memo,
+                            canonical_atoms_root=canon_atoms_dir,
+                        )
+                    )
+                    if not is_owner and not verified:
+                        continue
+                    matching.append({**base, "verified": verified})
+            else:
+                q_terms = set(tokenize(q_search)) if q_search else set()
+                for name in sorted(os.listdir(rt.atoms_dir)):
+                    if not is_content_markdown(name):
+                        continue
+                    p = safe_file_in_dir(rt.atoms_dir, name, allowed_exts={".md"}, must_exist=True)
+                    if not p or _is_reparse_or_link(p):
+                        continue
                     card = _safe_atom_card(p, rt)
                     if card is None:
+                        continue
+                    if q_terms:
+                        haystack = set(
+                            tokenize(
+                                f"{card.get('filename', '')} {card.get('claim', '')} {card.get('evidence', '')} {' '.join(card.get('contexts') or [])}"  # type: ignore[arg-type]
+                            )
+                        )
+                        if not (q_terms & haystack):
+                            continue
+                    if proj_filter and not project_tags_match(tuple(card.get("contexts") or ()), (proj_filter,)):  # type: ignore[arg-type]
                         continue
                     if not is_owner:
                         if not card["verified"]:
                             continue
                         if card.get("epistemic_label") == "preference" or bool(card.get("epistemic_contract")):
                             continue
-                    cards.append(card)
-            page = cards[offset : offset + limit]
+                    matching.append(card)
+
+            page = matching[offset : offset + limit]
             return send(
                 200,
                 {
-                    "total": len(cards),
+                    "atoms": page,
+                    "items": page,
                     "count": len(page),
+                    "total": len(matching),
                     "offset": offset,
                     "limit": limit,
-                    "items": page,
-                    "atoms": page,
                 },
             )
 
@@ -1565,17 +1854,48 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, {"valid": bool(verify_merkle_proof(proof_obj))})
 
         if path.startswith("/v1/ledger/prove/") and method == "GET":
-            from vault_ledger import prove_atom_membership
+            import vault_ledger
 
-            atom_name = unquote(path[len("/v1/ledger/prove/"):])
+            raw_leaf = unquote(path[len("/v1/ledger/prove/"):]).strip().replace("\\", "/").lstrip("/")
+            parts = [p for p in raw_leaf.split("/") if p]
+            if not parts or len(parts) > 2 or any(p in {".", ".."} or ":" in p or "\x00" in p for p in parts):
+                if not is_owner:
+                    return send(404, {"error": "Verified atom proof not found."})
+                return send(404, {"error": f"Leaf not found: {raw_leaf}"})
+
+            prove_leaf_fn = getattr(vault_ledger, "prove_leaf_membership", None)
             try:
-                proof = prove_atom_membership(
-                    atom_name, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir, playbooks_dir=rt.playbooks_dir
-                )
-            except (FileNotFoundError, PermissionError):
+                if callable(prove_leaf_fn):
+                    proof = prove_leaf_fn(
+                        raw_leaf,
+                        brain_dir=rt.brain_dir,
+                        atoms_dir=rt.atoms_dir,
+                        playbooks_dir=rt.playbooks_dir,
+                    )
+                else:
+                    proof = _prove_leaf_fallback(
+                        raw_leaf,
+                        brain_dir=rt.brain_dir,
+                        atoms_dir=rt.atoms_dir,
+                        playbooks_dir=rt.playbooks_dir,
+                    )
+            except (FileNotFoundError, PermissionError, ValueError):
                 if not is_owner:
                     return send(404, {"error": "Verified atom proof not found."})
                 raise
+
+            if not is_owner:
+                rel_p = str(proof.get("rel_path") or "")
+                if rel_p.startswith("2-atoms/"):
+                    atom_fname = os.path.basename(rel_p)
+                    live_sha = _live_approved_atom_sha(atom_fname, rt)
+                    if live_sha is None or live_sha != proof.get("file_sha256"):
+                        return send(404, {"error": "Verified atom proof not found."})
+                elif rel_p.startswith("5-playbooks/"):
+                    pb_fname = os.path.basename(rel_p)
+                    pb_rep = _live_active_playbook_report(pb_fname, rt)
+                    if pb_rep is None or pb_rep.sha256 != proof.get("file_sha256"):
+                        return send(404, {"error": "Verified atom proof not found."})
             return send(200, proof)
 
         # ── Contradiction & Drift Radar + Knowledge Graph ──
@@ -1744,7 +2064,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             stale = [
                 r
                 for r in reports
-                if r.get("stale_approval") or r.get("action") in {"review_required", "would_demote", "demoted"}
+                if r.get("stale_approval")
+                or r.get("action") in {"review_required", "would_demote", "demoted", "conflict_or_failure"}
             ]
             return send(
                 200,
@@ -1770,6 +2091,11 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 actor=actor,
             )
             demoted = [r for r in reports if r.get("demoted") or r.get("action") == "demoted"]
+            if demoted:
+                _sync_lexical_after_atom_mutation(
+                    rt,
+                    [str(r.get("atom_id")) for r in demoted if r.get("atom_id")],
+                )
             return send(
                 200,
                 {
@@ -1812,43 +2138,95 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 playbooks_dir=rt.playbooks_dir,
             )
             if not is_owner:
-                def _live_atom_approved(fname: object) -> bool:
-                    p = safe_file_in_dir(rt.atoms_dir, str(fname or ""), allowed_exts={".md"}, must_exist=True)
-                    return bool(p and approved_revision_is_current(p, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir))
+                def _diff_entry_is_pref(entry: dict) -> bool:
+                    return (
+                        entry.get("epistemic_label") == "preference"
+                        or bool(entry.get("epistemic_contract"))
+                        or _is_live_preference_atom(entry.get("filename"), rt)
+                    )
+
+                def _redact_atom_diff_entry(entry: dict) -> dict:
+                    live_sha = _live_approved_atom_sha(entry.get("filename"), rt)
+                    if live_sha is not None and live_sha == entry.get("file_sha256"):
+                        return entry
+                    return {**entry, "claim": "", "evidence": "", "redacted_revoked": True}
 
                 added = [
-                    a
+                    _redact_atom_diff_entry(a)
                     for a in (res.get("added_atoms") or [])
-                    if a.get("epistemic_label") != "preference" and _live_atom_approved(a.get("filename"))
+                    if not _diff_entry_is_pref(a)
                 ]
                 removed = [
-                    (
-                        a
-                        if _live_atom_approved(a.get("filename"))
-                        else {**a, "claim": "", "redacted_revoked": True}
-                    )
+                    _redact_atom_diff_entry(a)
                     for a in (res.get("removed_atoms") or [])
-                    if a.get("epistemic_label") != "preference"
+                    if not _diff_entry_is_pref(a)
                 ]
-                modified = [
-                    {
+                modified = []
+                for m in res.get("modified_atoms") or []:
+                    if (
+                        m.get("before_epistemic_label") == "preference"
+                        or m.get("after_epistemic_label") == "preference"
+                        or bool(m.get("before_epistemic_contract"))
+                        or bool(m.get("after_epistemic_contract"))
+                        or _is_live_preference_atom(m.get("filename"), rt)
+                    ):
+                        continue
+                    live_sha = _live_approved_atom_sha(m.get("filename"), rt)
+                    new_is_live = live_sha is not None and live_sha == m.get("new_sha256")
+                    redacted_m = {
                         **m,
-                        "before_claim": "",
                         "old_claim": "",
-                        "after_claim": m.get("after_claim", "") if _live_atom_approved(m.get("filename")) else "",
-                        "new_claim": m.get("new_claim", "") if _live_atom_approved(m.get("filename")) else "",
+                        "before_claim": "",
+                        "old_evidence": "",
+                        "before_evidence": "",
                         "redacted_revoked": True,
                     }
-                    for m in (res.get("modified_atoms") or [])
-                    if m.get("before_epistemic_label") != "preference"
-                    and m.get("after_epistemic_label") != "preference"
-                ]
+                    if not new_is_live:
+                        redacted_m["new_claim"] = ""
+                        redacted_m["after_claim"] = ""
+                        redacted_m["new_evidence"] = ""
+                        redacted_m["after_evidence"] = ""
+                    modified.append(redacted_m)
+
+                raw_pb_changes = dict(res.get("playbook_changes") or {})
+                pb_added = []
+                for item in raw_pb_changes.get("added") or []:
+                    pb_rep = _live_active_playbook_report(item.get("filename"), rt)
+                    expected_sha = item.get("new_sha256") or item.get("old_sha256")
+                    if not pb_rep or pb_rep.sha256 != expected_sha:
+                        pb_added.append({**item, "steps": [], "title": "", "redacted_revoked": True})
+                    else:
+                        pb_added.append(item)
+
+                pb_removed = []
+                for item in raw_pb_changes.get("removed") or []:
+                    pb_rep = _live_active_playbook_report(item.get("filename"), rt)
+                    expected_sha = item.get("new_sha256") or item.get("old_sha256")
+                    if not pb_rep or pb_rep.sha256 != expected_sha:
+                        pb_removed.append({**item, "steps": [], "title": "", "redacted_revoked": True})
+                    else:
+                        pb_removed.append(item)
+
+                pb_modified = []
+                for item in raw_pb_changes.get("modified") or []:
+                    pb_rep = _live_active_playbook_report(item.get("filename"), rt)
+                    redacted_pb = {**item, "old_steps": [], "redacted_revoked": True}
+                    if not pb_rep or pb_rep.sha256 != item.get("new_sha256"):
+                        redacted_pb["new_steps"] = []
+                        redacted_pb["title"] = ""
+                    pb_modified.append(redacted_pb)
+
                 prev_summary = dict(res.get("summary") or {})
                 res = {
                     **res,
                     "added_atoms": added,
                     "removed_atoms": removed,
                     "modified_atoms": modified,
+                    "playbook_changes": {
+                        "added": pb_added,
+                        "removed": pb_removed,
+                        "modified": pb_modified,
+                    },
                     "summary": {
                         **prev_summary,
                         "added": len(added),
@@ -1859,22 +2237,24 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, res)
 
         if path == "/v1/snapshots/recall" and method == "POST":
+            from skill_playbooks import playbook_visible_in_scope
             from time_travel import recall_at_snapshot
 
             raw_limit = body.get("top_k") if "top_k" in body else body.get("limit", 5)
             if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, str)):
                 raise ValueError("'limit' must be an integer between 1 and 25.")
             top_k = max(1, min(int(str(raw_limit).strip()[:9]), 25))
+            proj_scope = _str(body, "project_scope", max_len=120, required=False).strip() or None
             inc_prefs = bool(is_owner and body.get("include_preferences", True))
             ras_params = inspect.signature(recall_at_snapshot).parameters
             ras_kwargs: dict[str, object] = {
-                "project_scope": _str(body, "project_scope", max_len=120, required=False) or None,
+                "project_scope": proj_scope,
                 "brain_dir": rt.brain_dir,
             }
             if "include_preferences" in ras_params:
                 ras_kwargs["include_preferences"] = inc_prefs
             if "top_k" in ras_params:
-                ras_kwargs["top_k"] = top_k
+                ras_kwargs["top_k"] = top_k if is_owner else min(25, max(top_k * 3, 15))
             res = recall_at_snapshot(
                 _str(body, "query", max_len=1000),
                 _str(body, "snapshot_id", max_len=120),
@@ -1884,24 +2264,24 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 filtered_results = []
                 for hit in res.get("results") or []:
                     if hit.get("kind", "atom") == "playbook":
+                        pb_rep = _live_active_playbook_report(hit.get("filename"), rt)
+                        if pb_rep is None or pb_rep.sha256 != hit.get("file_sha256"):
+                            continue
+                        if proj_scope and not playbook_visible_in_scope(pb_rep, (proj_scope,)):
+                            continue
                         filtered_results.append(hit)
                         continue
-                    ap = safe_file_in_dir(rt.atoms_dir, str(hit.get("filename") or ""), allowed_exts={".md"}, must_exist=True)
-                    if ap and approved_revision_is_current(ap, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir) and not _is_preference_atom_file(ap):
+                    live_sha = _live_approved_atom_sha(hit.get("filename"), rt)
+                    if live_sha is not None and live_sha == hit.get("file_sha256"):
                         filtered_results.append(hit)
-                res = {**res, "results": filtered_results}
+                res = {**res, "results": filtered_results[:top_k]}
             return send(200, res)
 
         if path == "/v1/snapshots/verify" and method == "POST":
-            import time_travel
+            from time_travel import verify_snapshot
 
             sid = _str(body, "snapshot_id", max_len=120)
-            verify_fn = getattr(time_travel, "verify_snapshot", None)
-            if callable(verify_fn):
-                res = verify_fn(sid, brain_dir=rt.brain_dir)
-            else:
-                res = _verify_snapshot_fallback(sid, brain_dir=rt.brain_dir)
-            return send(200, res)
+            return send(200, verify_snapshot(sid, brain_dir=rt.brain_dir))
 
         # ── Vault Section Browsers (threads, experiences, briefings — owner) ──
         if path.startswith("/v1/vault/") and method == "GET":

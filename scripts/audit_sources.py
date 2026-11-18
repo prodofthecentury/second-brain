@@ -27,7 +27,6 @@ from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdow
 from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values
-from atom_mutator import DECISION_LOG
 
 
 def _source_snapshot(brain_root: Path, anchor: dict[str, Any]) -> tuple[str, str | None, str | None]:
@@ -172,9 +171,13 @@ def audit_sources(
                 entry["action"] = "conflict_or_failure"
                 entry["mutation_error"] = str(exc)
         entry["stale_approval"] = bool(
-            should_demote or entry["action"] in {"review_required", "would_demote", "demoted"}
+            should_demote or entry["action"] in {"review_required", "demoted", "would_demote"}
         )
-        entry["demoted"] = entry["action"] == "demoted"
+        entry["demoted"] = bool(entry["action"] == "demoted")
+        entry["ok"] = bool(
+            entry["action"] not in {"review_required", "would_demote", "conflict_or_failure"}
+            and entry["anchor_status"] != "unreadable"
+        )
         reports.append(entry)
     return reports
 

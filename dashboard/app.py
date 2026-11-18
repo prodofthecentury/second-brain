@@ -60,6 +60,7 @@ from scripts.config import (
     now_slug,
     is_content_markdown,
     normalize_markdown_filename,
+    resolve_active_brain_dir,
     safe_file_in_dir,
 )
 from scripts.recall import (
@@ -152,9 +153,10 @@ from scripts.time_travel import (
     verify_snapshot,
 )
 
-# Resolve active vault directories dynamically so env overrides (BRAIN_VAULT_DIR) stay isolated per run.
+# Resolve active vault directories dynamically so env overrides (BRAIN_VAULT_DIR) or persisted vault paths stay isolated per run.
 _env_vault_override = (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
-BRAIN_DIR = os.path.abspath(_env_vault_override) if _env_vault_override else _DEFAULT_BRAIN_DIR
+BRAIN_DIR = os.path.abspath(_env_vault_override) if _env_vault_override else resolve_active_brain_dir()
+_vault_overridden = bool(_env_vault_override) or (os.path.abspath(BRAIN_DIR) != os.path.abspath(_DEFAULT_BRAIN_DIR))
 RAW_DIR = os.path.join(BRAIN_DIR, "0-raw")
 INBOX_DIR = os.path.join(RAW_DIR, "inbox")
 DESK_DIR = os.path.join(BRAIN_DIR, "1-desk")
@@ -169,9 +171,9 @@ NOTE_SNAPSHOTS_DIR = os.path.join(RAW_DIR, "note-snapshots")
 READING_LIST = os.path.join(RAW_DIR, "reading-list.md")
 HOUSE_RULES = os.path.join(BRAIN_DIR, "house-rules.md")
 SIDECAR_DIR = os.path.join(BRAIN_DIR, ".sidecar")
-CHROMA_PATH = os.path.join(BRAIN_DIR, ".chroma") if _env_vault_override else _DEFAULT_CHROMA_PATH
-LEXICAL_INDEX_PATH = os.path.join(SIDECAR_DIR, "lexical.sqlite3") if _env_vault_override else _DEFAULT_LEXICAL_INDEX_PATH
-TELEMETRY_DB_PATH = os.path.join(SIDECAR_DIR, "telemetry.sqlite3") if _env_vault_override else _DEFAULT_TELEMETRY_DB_PATH
+CHROMA_PATH = os.path.join(BRAIN_DIR, ".chroma") if _vault_overridden else _DEFAULT_CHROMA_PATH
+LEXICAL_INDEX_PATH = os.path.join(SIDECAR_DIR, "lexical.sqlite3") if _vault_overridden else _DEFAULT_LEXICAL_INDEX_PATH
+TELEMETRY_DB_PATH = os.path.join(SIDECAR_DIR, "telemetry.sqlite3") if _vault_overridden else _DEFAULT_TELEMETRY_DB_PATH
 SUPPORTED_IMPORT_FORMATS = (".md", ".markdown", ".txt", ".pdf", ".docx", ".epub", ".html", ".htm", ".csv", ".tsv")
 _API_KEY_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 _UNSET = object()
@@ -356,6 +358,7 @@ def run_script_process(script_rel_path: str, extra_args: Sequence[str] = ()):
         if script_abs.parent != SCRIPTS_DIR.resolve() or not script_abs.is_file():
             raise FileNotFoundError(f"Script not found in {SCRIPTS_DIR}: {script_name}")
         cmd = [sys.executable, str(script_abs), *(str(arg) for arg in extra_args)]
+        child_env = {**os.environ, "BRAIN_VAULT_DIR": BRAIN_DIR}
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -363,6 +366,7 @@ def run_script_process(script_rel_path: str, extra_args: Sequence[str] = ()):
             text=True,
             bufsize=1,
             cwd=_writable_process_cwd(),
+            env=child_env,
         )
         return process
     except Exception as e:

@@ -303,8 +303,8 @@ def _matches_scope(contexts: list[str], project_scope: str | None) -> bool:
     target = normalize_project_tag(project_scope)
     if not target:
         return True
-    proj_tags = [str(c).strip() for c in contexts if str(c).strip().lower().startswith("project:")]
-    return bool(proj_tags) and all(bool(project_tags_match((c,), (target,))) for c in proj_tags)
+    clean_ctx = tuple(str(c).strip() for c in (contexts or ()) if str(c).strip())
+    return bool(project_tags_match(clean_ctx, (target,)))
 
 
 def _parse_ref_list(raw_val: Any) -> list[str]:

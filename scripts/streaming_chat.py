@@ -422,8 +422,8 @@ def retrieve_context(
     try:
         for rec in search_notes(query, limit=MAX_NOTES * 3 if scope_raw else MAX_NOTES, paths=paths.notes):
             if scope_tag:
-                proj_tags = [str(t).strip() for t in rec.tags if str(t).strip().lower().startswith("project:")]
-                if not proj_tags or not all(bool(project_tags_match((t,), (scope_tag,))) for t in proj_tags):
+                clean_tags = tuple(str(t).strip() for t in rec.tags if str(t).strip())
+                if not project_tags_match(clean_tags, (scope_tag,)):
                     continue
             from notes_store import get_note
 

@@ -508,7 +508,13 @@ class DashboardGovernancePlaybooksFeedbackAndAuditTests(IsolatedDashboardAppTest
         at.button(key="btn_record_fb").click()
         at.run()
         self.assertEqual(len(at.exception), 0)
-        self.assertFalse(corr_log.exists(), "Endorsed feedback must not create atom-corrections.jsonl")
+        from scripts.cognitive_core import count_canonical_corrections
+
+        self.assertEqual(
+            count_canonical_corrections(str(self.vault_dir), "feedback-atom.md"),
+            0,
+            "Endorsed feedback must not record any atom_correction",
+        )
 
         # 2. Superseded feedback MUST NOT write a false negative correction to atom-corrections.jsonl
         at.selectbox(key="fb_atom_sel").set_value("feedback-atom.md")
@@ -518,9 +524,10 @@ class DashboardGovernancePlaybooksFeedbackAndAuditTests(IsolatedDashboardAppTest
         at.button(key="btn_record_fb").click()
         at.run()
         self.assertEqual(len(at.exception), 0)
-        self.assertFalse(
-            corr_log.exists(),
-            "Submitting 'superseded' feedback must NEVER append a false atom_correction to atom-corrections.jsonl!",
+        self.assertEqual(
+            count_canonical_corrections(str(self.vault_dir), "feedback-atom.md"),
+            0,
+            "Submitting 'superseded' feedback must NEVER append a false atom_correction!",
         )
 
         # 3. Corrected feedback persists actor & note in both feedback log and canonical corrections log
@@ -543,10 +550,11 @@ class DashboardGovernancePlaybooksFeedbackAndAuditTests(IsolatedDashboardAppTest
 
         self.assertTrue(corr_log.is_file())
         corr_entries = [json.loads(line) for line in corr_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-        self.assertEqual(len(corr_entries), 1)
-        self.assertEqual(corr_entries[0]["action"], "atom_correction")
-        self.assertEqual(corr_entries[0]["actor"], "cameron_owner")
-        self.assertEqual(corr_entries[0]["note"], "Needs updated schema_version detail")
+        correction_only = [e for e in corr_entries if e.get("action") == "atom_correction"]
+        self.assertEqual(len(correction_only), 1)
+        self.assertEqual(correction_only[0]["action"], "atom_correction")
+        self.assertEqual(correction_only[0]["actor"], "cameron_owner")
+        self.assertEqual(correction_only[0]["note"], "Needs updated schema_version detail")
 
         # 4. Experience Logger parity fields (plan, reasoning_summary, reflection, confidence_before/after)
         at.text_input(key="exp_goal").set_value("Validate Goal 3 dashboard parity")
