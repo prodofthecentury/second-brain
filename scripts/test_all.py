@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Unified CI-style end-to-end test orchestrator for Second Brain.
@@ -67,6 +67,31 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "phase5_god_features_tests",
         "Desktop installers/tray, comparative SOTA benchmark, Merkle vault ledger, contradiction radar & time-travel snapshots (scripts/phase5_god_features_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "phase5_god_features_tests.py")),
+    ),
+    (
+        "goal3_backend_contract_tests",
+        "Goal 3 backend API parity, document extractors, port discovery, research view & Merkle leaf contracts (scripts/goal3_backend_contract_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "goal3_backend_contract_tests.py")),
+    ),
+    (
+        "desktop_ui_tests",
+        "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
+        (str(SCRIPTS_DIR / "run_desktop_tests.py"),),
+    ),
+    (
+        "vscode_extension_tests",
+        "VS Code extension SSE cancellation, singleton chat, CAS notes & governance suite (scripts/run_vscode_tests.py)",
+        (str(SCRIPTS_DIR / "run_vscode_tests.py"),),
+    ),
+    (
+        "dashboard_apptest_tests",
+        "Streamlit AppTest dashboard auth, chat modes, governance, snapshots & import suite (scripts/dashboard_apptest_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "dashboard_apptest_tests.py")),
+    ),
+    (
+        "wheel_packaging_tests",
+        "Clean wheel namespace, isolated temp-venv CLI/API/dashboard, VSIX, icons & offline wheelhouse suite (scripts/wheel_packaging_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "wheel_packaging_tests.py")),
     ),
     (
         "scale_benchmark_1500",

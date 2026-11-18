@@ -1,3 +1,24 @@
+"use strict";
+
+const MdHelper =
+  (typeof window !== "undefined" && window.SecondBrainMarkdown) ||
+  (typeof require === "function" ? require("./markdown") : null);
+const PbHelper =
+  (typeof window !== "undefined" && window.SecondBrainPlaybookUnits) ||
+  (typeof require === "function" ? require("./playbook_units") : null);
+const PageHelper =
+  (typeof window !== "undefined" && window.SecondBrainPagination) ||
+  (typeof require === "function" ? require("./pagination") : null);
+const ChatHelper =
+  (typeof window !== "undefined" && window.SecondBrainChatState) ||
+  (typeof require === "function" ? require("./chat_state") : null);
+const GraphHelper =
+  (typeof window !== "undefined" && window.SecondBrainGraph) ||
+  (typeof require === "function" ? require("./graph") : null);
+const ModalHelper =
+  (typeof window !== "undefined" && window.SecondBrainModal) ||
+  (typeof require === "function" ? require("./modal_helpers") : null);
+
 let activeView = "notes";
 let activeNote = null;
 let notesCache = [];
@@ -5,8 +26,58 @@ let noteBaseline = { title: "", tags: "", body: "" };
 let splitPreviewOpen = false;
 let isChatStreaming = false;
 let candidatesCache = [];
+let playbooksCache = [];
+let allLoadedAtoms = [];
 let approvedAtomsCache = [];
 let snapshotsCache = [];
+let hostsCache = {};
+
+let graphRawData = { nodes: [], edges: [] };
+let graphViewer = null;
+
+let activeVaultCategory = "threads";
+let activeVaultDoc = null;
+let vaultRawMode = false;
+
+const activeJobsMap = new Map();
+let jobPollTimer = null;
+
+const notesPaginator = PageHelper.createPaginator({
+  pageSize: 100,
+  keyField: "filename",
+});
+const reviewQueuePaginator = PageHelper.createPaginator({
+  pageSize: 50,
+  keyField: "filename",
+});
+const atomsPaginator = PageHelper.createPaginator({
+  pageSize: 100,
+  keyField: "filename",
+});
+const ledgerLeavesPaginator = PageHelper.createPaginator({
+  pageSize: 100,
+  getKey: (item) => String(item?.rel_path || item?.filename || item || ""),
+});
+const ledgerHistoryPaginator = PageHelper.createPaginator({
+  pageSize: 25,
+  getKey: (item) => String(item?.seq ?? item?.entry_sha256 ?? ""),
+});
+const vaultPaginator = PageHelper.createPaginator({
+  pageSize: 50,
+  keyField: "filename",
+});
+
+const chatSession = ChatHelper.createChatSession();
+let activeStreamingTurnId = null;
+const chatAbortManager = ChatHelper.createStreamAbortManager({
+  onAbortIpc: () => {
+    if (window.secondBrain && typeof window.secondBrain.abortChat === "function") {
+      return window.secondBrain.abortChat();
+    }
+    return Promise.resolve();
+  },
+  defaultTimeoutMs: 90000,
+});
 
 const DEFAULT_PRIVACY_NOTICE =
   "When this host's AI uses Second Brain tools, recalled verified memories and notes are sent to " +
@@ -71,8 +142,8 @@ function apiErrorMessage(res, fallback = "Request failed") {
   }
   if (status === 409) {
     return rawMsg
-      ? `409 Conflict — ${rawMsg} (refresh and retry)`
-      : "409 Conflict — item changed on disk; refresh and retry.";
+      ? `409 CAS Conflict — ${rawMsg} (refresh and retry)`
+      : "409 CAS Conflict — item changed on disk; refresh and retry.";
   }
   if (status === 422) {
     return rawMsg
@@ -110,30 +181,55 @@ function shortSha(sha) {
   return sha ? String(sha).slice(0, 12) : "—";
 }
 
-// ─── Modal Helper (Atom Editor & Atom Inspector) ─────────────────────────────
+function openExternalSafe(url) {
+  const clean = MdHelper.sanitizeExternalUrl(url);
+  if (!clean) {
+    showToast("Blocked unsafe external URL.", "warn");
+    return;
+  }
+  if (window.secondBrain && typeof window.secondBrain.openExternal === "function") {
+    window.secondBrain.openExternal(clean).catch((err) => {
+      showToast(`Could not open link: ${err?.message || String(err)}`, "danger");
+    });
+  }
+}
+
+function renderRichMarkdown(container, markdown, extraOpts = {}) {
+  return MdHelper.renderMarkdownSafe(container, markdown, {
+    onOpenExternal: openExternalSafe,
+    onWikiLinkClick: resolveAndOpenWikiLink,
+    ...extraOpts,
+  });
+}
+
+// ─── Modal Controller (Atom Editor, Atom Inspector & Confirmations) ──────────
 
 const modalBackdrop = document.getElementById("atomModalBackdrop");
 const modalTitleEl = document.getElementById("atomModalTitle");
 const modalBodyEl = document.getElementById("atomModalBody");
 const modalFooterEl = document.getElementById("atomModalFooter");
+const modalCloseBtnEl = document.getElementById("atomModalCloseBtn");
+
+const modalCtrl = ModalHelper.createModalController({
+  backdropEl: modalBackdrop,
+  titleEl: modalTitleEl,
+  bodyEl: modalBodyEl,
+  footerEl: modalFooterEl,
+  closeBtnEl: modalCloseBtnEl,
+});
 
 function closeModal() {
-  modalBackdrop.classList.remove("open");
-  modalBodyEl.replaceChildren();
-  modalFooterEl.replaceChildren();
+  modalCtrl.close();
 }
-
-document.getElementById("atomModalCloseBtn").addEventListener("click", closeModal);
-modalBackdrop.addEventListener("click", (e) => {
-  if (e.target === modalBackdrop) closeModal();
-});
 
 async function openAtomInspectorModal(filename, fallbackData = null) {
   if (!filename) return;
-  modalTitleEl.textContent = `Atom: ${filename}`;
-  modalBodyEl.replaceChildren(el("div", "status-banner", "Loading atom details..."));
-  modalFooterEl.replaceChildren();
-  modalBackdrop.classList.add("open");
+  modalCtrl.open({
+    title: `Atom: ${filename}`,
+    renderBody(body) {
+      body.appendChild(el("div", "status-banner", "Loading atom details..."));
+    },
+  });
 
   let atom = fallbackData || {};
   try {
@@ -144,8 +240,7 @@ async function openAtomInspectorModal(filename, fallbackData = null) {
     if (res.ok && res.data) {
       atom = res.data.atom || res.data;
     } else {
-      const listRes = await window.secondBrain.api("GET", "/v1/atoms?limit=300");
-      const found = (listRes.data?.items || []).find((a) => a.filename === filename);
+      const found = allLoadedAtoms.find((a) => a.filename === filename);
       if (found) atom = { ...atom, ...found };
     }
   } catch {}
@@ -200,14 +295,19 @@ async function openAtomInspectorModal(filename, fallbackData = null) {
   modalBodyEl.appendChild(badges);
 
   if (evSrc || meta.evidence_sha256) {
-    const provBar = el(
-      "div",
-      "note-item-meta",
-      `Provenance Source: ${evSrc || "—"}${
-        offsetText ? ` · Byte Offsets:${offsetText}` : ""
-      }${meta.evidence_sha256 ? ` · Evidence SHA-256: ${shortSha(meta.evidence_sha256)}` : ""}`
+    modalBodyEl.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        `Provenance Source: ${evSrc || "—"}${
+          offsetText ? ` · Byte Offsets:${offsetText}` : ""
+        }${
+          meta.evidence_sha256
+            ? ` · Evidence SHA-256: ${shortSha(meta.evidence_sha256)}`
+            : ""
+        }`
+      )
     );
-    modalBodyEl.appendChild(provBar);
   }
 
   const claimCol = el("div", "field-col");
@@ -249,10 +349,12 @@ async function openAtomInspectorModal(filename, fallbackData = null) {
 async function openAtomEditorModal(atomSummary) {
   const filename = atomSummary?.filename;
   if (!filename) return;
-  modalTitleEl.textContent = `Edit Atom: ${filename}`;
-  modalBodyEl.replaceChildren(el("div", "status-banner", "Loading atom markdown..."));
-  modalFooterEl.replaceChildren();
-  modalBackdrop.classList.add("open");
+  modalCtrl.open({
+    title: `Edit Atom: ${filename}`,
+    renderBody(body) {
+      body.appendChild(el("div", "status-banner", "Loading atom markdown..."));
+    },
+  });
 
   let fullAtom = { ...atomSummary };
   try {
@@ -289,10 +391,18 @@ async function openAtomEditorModal(atomSummary) {
   const info = el(
     "div",
     "status-banner",
-    `Editing ${filename} (CAS sha256: ${shortSha(fullAtom.sha256)}). Saving transitions atom through owner CAS validation.`
+    `Editing ${filename} (CAS sha256: ${shortSha(
+      fullAtom.sha256
+    )}). Saving transitions atom through owner CAS validation.`
   );
   const claimWrap = el("div", "field-col");
-  claimWrap.appendChild(el("span", "field-label", "Claim Text (Quick Edit — syncs into ## Claim section)"));
+  claimWrap.appendChild(
+    el(
+      "span",
+      "field-label",
+      "Claim Text (Quick Edit — syncs into ## Claim section)"
+    )
+  );
   const claimInput = el("input");
   claimInput.type = "text";
   claimInput.value = fullAtom.claim || "";
@@ -340,6 +450,7 @@ async function openAtomEditorModal(atomSummary) {
         closeModal();
         if (activeView === "review") loadReviewQueue();
         if (activeView === "proof") loadProofView();
+        if (activeView === "graph") loadGraphView();
         refreshHealth();
       } else {
         showToast(apiErrorMessage(res, "Atom edit failed"), "danger");
@@ -364,19 +475,41 @@ function switchView(name) {
   document.querySelectorAll(".view").forEach((v) => {
     v.classList.toggle("active", v.id === `view-${name}`);
   });
+  if (name === "chat") loadChatHosts();
   if (name === "review") loadReviewQueue();
+  if (name === "import") loadScoutQueue();
   if (name === "ide") loadIdeStatus();
   if (name === "system") loadSystemView();
   if (name === "planner") loadPlannerView();
   if (name === "proof") loadProofView();
+  if (name === "graph") loadGraphView();
+  if (name === "vault") loadVaultBrowser({ append: false });
 }
 
 document.querySelectorAll(".nav-btn").forEach((btn) => {
   btn.addEventListener("click", () => switchView(btn.dataset.view));
 });
 
+function applyShortcutStatus(st) {
+  if (!st) return;
+  if (st.platform) {
+    ModalHelper.applyPlatformShortcutsToDom(document, st.platform);
+  }
+  const warnEl = document.getElementById("shortcutWarningText");
+  if (warnEl) {
+    if (st.shortcutWarning) {
+      warnEl.style.display = "block";
+      warnEl.textContent = `⚠ ${st.shortcutWarning}`;
+    } else {
+      warnEl.style.display = "none";
+      warnEl.textContent = "";
+    }
+  }
+}
+
 function handleBackendStatus(st) {
   if (!st) return;
+  applyShortcutStatus(st);
   const dot = document.getElementById("apiDot");
   const text = document.getElementById("apiStatusText");
   const startupBanner = document.getElementById("backendStartupBanner");
@@ -388,16 +521,21 @@ function handleBackendStatus(st) {
     text.textContent = `Loopback :${st.apiPort} ready`;
     startupBanner.className = "startup-banner";
     refreshHealth();
-    loadNotes(document.getElementById("noteSearchInput").value);
+    loadNotes({ append: false });
+    loadChatHosts();
     if (activeView === "review") loadReviewQueue();
+    if (activeView === "import") loadScoutQueue();
     if (activeView === "ide") loadIdeStatus();
     if (activeView === "system") loadSystemView();
     if (activeView === "planner") loadPlannerView();
     if (activeView === "proof") loadProofView();
+    if (activeView === "graph") loadGraphView();
+    if (activeView === "vault") loadVaultBrowser({ append: false });
   } else if (st.state === "bootstrapping" || st.state === "starting") {
     dot.style.background = "#d29922";
     dot.style.boxShadow = "0 0 10px rgba(210, 153, 34, 0.55)";
-    text.textContent = st.state === "bootstrapping" ? "Bootstrapping..." : "Starting API...";
+    text.textContent =
+      st.state === "bootstrapping" ? "Bootstrapping..." : "Starting API...";
     startupText.textContent = st.message || "Starting loopback Memory API...";
     startupBanner.className = "startup-banner warn visible";
   } else if (st.state === "error") {
@@ -405,18 +543,23 @@ function handleBackendStatus(st) {
     dot.style.boxShadow = "0 0 10px rgba(248, 81, 73, 0.55)";
     text.textContent = "API stopped / error";
     startupText.textContent =
-      st.message || "Memory API sidecar is stopped. Use Tray -> Restart Memory API.";
+      st.message ||
+      "Memory API sidecar is stopped. Use Tray -> Restart Memory API.";
     startupBanner.className = "startup-banner danger visible";
   }
 }
 
-if (typeof window.secondBrain.onBackendStatus === "function") {
+if (
+  window.secondBrain &&
+  typeof window.secondBrain.onBackendStatus === "function"
+) {
   window.secondBrain.onBackendStatus((st) => handleBackendStatus(st));
 }
 
 async function refreshHealth() {
   try {
     const status = await window.secondBrain.getStatus();
+    applyShortcutStatus(status);
     if (!status.ready) {
       if (status.backendStatus) handleBackendStatus(status.backendStatus);
       return;
@@ -448,13 +591,15 @@ async function refreshHealth() {
       atomsRes.data?.total ??
       atomsRes.data?.items?.length ??
       0;
-    document.getElementById("vaultMetrics").textContent = `Notes: ${nCount} · Verified Atoms: ${aCount}`;
+    document.getElementById(
+      "vaultMetrics"
+    ).textContent = `Notes: ${nCount} · Verified Atoms: ${aCount}`;
   } catch {
     document.getElementById("apiStatusText").textContent = "Disconnected";
   }
 }
 
-// ─── TAB 1: Notes, Dirty Tracking, Safe Markdown Preview & Verify Excerpt ────
+// ─── TAB 1: Notes, Pagination, Safe Markdown Preview & Verify Excerpt ────────
 
 function setNoteBaseline(title = "", tags = "", body = "") {
   noteBaseline = {
@@ -483,11 +628,16 @@ function updateDirtyIndicator() {
   }
 }
 
-function confirmDiscardIfDirty() {
+async function confirmDiscardIfDirty() {
   if (!isNoteDirty()) return true;
-  return window.confirm(
-    "You have unsaved changes in the current note. Discard unsaved edits?"
-  );
+  const res = await modalCtrl.confirm({
+    title: "Unsaved Note Edits",
+    message:
+      "You have unsaved changes in the current note. Discard unsaved edits?",
+    confirmLabel: "Discard Edits",
+    confirmClass: "danger",
+  });
+  return res.confirmed;
 }
 
 async function resolveAndOpenWikiLink(rawTarget) {
@@ -520,12 +670,13 @@ async function resolveAndOpenWikiLink(rawTarget) {
     await openNote(exact.filename);
     return;
   }
-  if (
-    window.confirm(
-      `No note titled "${clean}" exists yet. Create a new note for [[${clean}]]?`
-    )
-  ) {
-    if (!confirmDiscardIfDirty()) return;
+  const createRes = await modalCtrl.confirm({
+    title: "Create Linked Note",
+    message: `No note titled "${clean}" exists yet. Create a new note for [[${clean}]]?`,
+    confirmLabel: "Create Note",
+  });
+  if (createRes.confirmed) {
+    if (!(await confirmDiscardIfDirty())) return;
     activeNote = null;
     document.getElementById("noteTitleInput").value = clean;
     document.getElementById("noteTagsInput").value = "";
@@ -536,168 +687,51 @@ async function resolveAndOpenWikiLink(rawTarget) {
   }
 }
 
-function appendInlineMarkdown(parent, text) {
-  const tokenRe = /(\[\[[^\]]+\]\]|`[^`]+`|\*\*[^*]+\*\*)/g;
-  let lastIdx = 0;
-  let match;
-  while ((match = tokenRe.exec(text)) !== null) {
-    if (match.index > lastIdx) {
-      parent.appendChild(document.createTextNode(text.slice(lastIdx, match.index)));
-    }
-    const tok = match[0];
-    if (tok.startsWith("[[") && tok.endsWith("]]")) {
-      const inner = tok.slice(2, -2);
-      const parts = inner.split("|");
-      const target = parts[0].trim();
-      const label = (parts[1] || parts[0]).trim();
-      const linkPill = el("span", "wikilink-pill", `[[${label}]]`);
-      linkPill.title = `Open note: ${target}`;
-      linkPill.onclick = () => resolveAndOpenWikiLink(target);
-      parent.appendChild(linkPill);
-    } else if (tok.startsWith("`") && tok.endsWith("`")) {
-      parent.appendChild(el("code", "md-inline-code", tok.slice(1, -1)));
-    } else if (tok.startsWith("**") && tok.endsWith("**")) {
-      parent.appendChild(el("strong", "", tok.slice(2, -2)));
-    }
-    lastIdx = match.index + tok.length;
-  }
-  if (lastIdx < text.length) {
-    parent.appendChild(document.createTextNode(text.slice(lastIdx)));
-  }
-}
-
-function renderMarkdownSafe(container, markdown) {
-  container.replaceChildren();
-  const lines = String(markdown || "").split(/\r?\n/);
-  let inCode = false;
-  let codeLines = [];
-  let listNode = null;
-  let listType = "";
-
-  const flushList = () => {
-    if (listNode) {
-      container.appendChild(listNode);
-      listNode = null;
-      listType = "";
-    }
-  };
-
-  for (const rawLine of lines) {
-    if (rawLine.trim().startsWith("```")) {
-      flushList();
-      if (!inCode) {
-        inCode = true;
-        codeLines = [];
-      } else {
-        const pre = el("pre", "md-code");
-        pre.appendChild(el("code", "", codeLines.join("\n")));
-        container.appendChild(pre);
-        inCode = false;
-        codeLines = [];
-      }
-      continue;
-    }
-    if (inCode) {
-      codeLines.push(rawLine);
-      continue;
-    }
-
-    const trimmed = rawLine.trim();
-    if (!trimmed) {
-      flushList();
-      continue;
-    }
-
-    if (/^---+$/.test(trimmed)) {
-      flushList();
-      container.appendChild(el("hr"));
-      continue;
-    }
-
-    const headingMatch = /^(#{1,4})\s+(.*)$/.exec(trimmed);
-    if (headingMatch) {
-      flushList();
-      const level = headingMatch[1].length;
-      const h = el(`h${level}`);
-      appendInlineMarkdown(h, headingMatch[2]);
-      container.appendChild(h);
-      continue;
-    }
-
-    if (trimmed.startsWith(">")) {
-      flushList();
-      const bq = el("blockquote");
-      appendInlineMarkdown(bq, trimmed.replace(/^>\s?/, ""));
-      container.appendChild(bq);
-      continue;
-    }
-
-    const ulMatch = /^[-*]\s+(.*)$/.exec(trimmed);
-    if (ulMatch) {
-      if (listType !== "ul") {
-        flushList();
-        listNode = el("ul");
-        listType = "ul";
-      }
-      const li = el("li");
-      appendInlineMarkdown(li, ulMatch[1]);
-      listNode.appendChild(li);
-      continue;
-    }
-
-    const olMatch = /^\d+\.\s+(.*)$/.exec(trimmed);
-    if (olMatch) {
-      if (listType !== "ol") {
-        flushList();
-        listNode = el("ol");
-        listType = "ol";
-      }
-      const li = el("li");
-      appendInlineMarkdown(li, olMatch[1]);
-      listNode.appendChild(li);
-      continue;
-    }
-
-    flushList();
-    const p = el("p");
-    appendInlineMarkdown(p, rawLine);
-    container.appendChild(p);
-  }
-
-  flushList();
-  if (inCode && codeLines.length) {
-    const pre = el("pre", "md-code");
-    pre.appendChild(el("code", "", codeLines.join("\n")));
-    container.appendChild(pre);
-  }
-  if (!container.children.length) {
-    container.appendChild(
-      el("div", "note-item-meta", "Preview will appear as you type Markdown or [[WikiLinks]]...")
-    );
-  }
-}
-
 function renderNotePreview() {
   if (!splitPreviewOpen) return;
-  renderMarkdownSafe(
+  renderRichMarkdown(
     document.getElementById("notePreviewPane"),
-    document.getElementById("noteBodyInput").value
+    document.getElementById("noteBodyInput").value,
+    {
+      emptyPlaceholder:
+        "Preview will appear as you type Markdown or [[WikiLinks]]...",
+    }
   );
 }
 
-async function loadNotes(query = "") {
-  const q = query
-    ? `?q=${encodeURIComponent(query)}&limit=200`
-    : "?limit=200";
-  const res = await window.secondBrain.request("GET", `/v1/notes${q}`);
+async function loadNotes({ append = false } = {}) {
+  const query = document.getElementById("noteSearchInput").value.trim();
+  const tag = document.getElementById("noteTagFilterInput").value.trim();
+  if (!append) {
+    notesPaginator.reset();
+  }
+  const pathUrl = PageHelper.buildPaginatedPath("/v1/notes", {
+    limit: notesPaginator.getPageSize(),
+    offset: notesPaginator.nextOffset(),
+    params: { q: query, tag },
+  });
+  const res = await window.secondBrain.request("GET", pathUrl);
   if (!res.ok) return;
-  notesCache = res.data?.items || res.data?.notes || [];
+
+  notesPaginator.applyPage(res.data || {}, {
+    append,
+    preferredKey: "items",
+  });
+  notesCache = notesPaginator.getItems();
+
   const listEl = document.getElementById("notesList");
   listEl.replaceChildren();
   if (!notesCache.length) {
     listEl.appendChild(el("div", "status-banner", "No notes found."));
+    PageHelper.renderPaginationBar(
+      document.getElementById("notesPaginationBar"),
+      notesPaginator,
+      () => loadNotes({ append: true }),
+      { noun: "notes" }
+    );
     return;
   }
+
   for (const note of notesCache) {
     const item = el(
       "div",
@@ -706,11 +740,20 @@ async function loadNotes(query = "") {
     );
     item.dataset.filename = note.filename;
     item.appendChild(el("div", "note-item-title", note.title || note.filename));
-    const tagText = (note.tags || []).length ? ` · ${(note.tags || []).join(", ")}` : "";
+    const tagText = (note.tags || []).length
+      ? ` · ${(note.tags || []).join(", ")}`
+      : "";
     item.appendChild(el("div", "note-item-meta", `${note.filename}${tagText}`));
     item.addEventListener("click", () => openNote(note.filename));
     listEl.appendChild(item);
   }
+
+  PageHelper.renderPaginationBar(
+    document.getElementById("notesPaginationBar"),
+    notesPaginator,
+    () => loadNotes({ append: true }),
+    { noun: "notes" }
+  );
 }
 
 function renderBacklinksBar(backlinks) {
@@ -731,7 +774,11 @@ function renderBacklinksBar(backlinks) {
 }
 
 async function openNote(filename, { skipDirtyPrompt = false } = {}) {
-  if (!skipDirtyPrompt && activeNote?.filename !== filename && !confirmDiscardIfDirty()) {
+  if (
+    !skipDirtyPrompt &&
+    activeNote?.filename !== filename &&
+    !(await confirmDiscardIfDirty())
+  ) {
     return;
   }
   const res = await window.secondBrain.request(
@@ -792,11 +839,13 @@ async function saveActiveNote({ silentSuccessToast = false } = {}) {
           ...(res.data.note || res.data),
         };
         setNoteBaseline(titleInput.value, tagsInput.value, bodyInput.value);
-        banner.textContent = `Saved ${activeNote.filename} (${shortSha(activeNote.sha256)})`;
+        banner.textContent = `Saved ${activeNote.filename} (${shortSha(
+          activeNote.sha256
+        )})`;
         if (!silentSuccessToast) {
           showToast(`Saved ${activeNote.filename}`, "ok", 2500);
         }
-        await loadNotes(document.getElementById("noteSearchInput").value);
+        await loadNotes({ append: false });
         refreshHealth();
         return true;
       }
@@ -820,11 +869,13 @@ async function saveActiveNote({ silentSuccessToast = false } = {}) {
         ...(res.data.note || res.data),
       };
       setNoteBaseline(titleInput.value, tagsInput.value, bodyInput.value);
-      banner.textContent = `Created ${activeNote.filename} (${shortSha(activeNote.sha256)})`;
+      banner.textContent = `Created ${activeNote.filename} (${shortSha(
+        activeNote.sha256
+      )})`;
       if (!silentSuccessToast) {
         showToast(`Created ${activeNote.filename}`, "ok", 2500);
       }
-      await loadNotes(document.getElementById("noteSearchInput").value);
+      await loadNotes({ append: false });
       refreshHealth();
       return true;
     }
@@ -857,14 +908,16 @@ async function verifySelectionAsAtom() {
 
   const excerpt = textarea.value.slice(start, end).trim();
   if (excerpt.length < 12) {
-    const msg = "Highlighted excerpt must be at least 12 characters to anchor as an Atom.";
+    const msg =
+      "Highlighted excerpt must be at least 12 characters to anchor as an Atom.";
     banner.textContent = msg;
     showToast(msg, "warn");
     return;
   }
 
   if (!activeNote || !activeNote.filename || isNoteDirty()) {
-    banner.textContent = "Auto-saving unsaved note edits before anchoring excerpt...";
+    banner.textContent =
+      "Auto-saving unsaved note edits before anchoring excerpt...";
     const saved = await saveActiveNote({ silentSuccessToast: true });
     if (!saved || !activeNote?.filename) {
       return;
@@ -881,6 +934,7 @@ async function verifySelectionAsAtom() {
     excerpt,
     actor,
     expected_sha256: activeNote.sha256,
+    expected_note_sha256: activeNote.sha256,
     memory_type,
     tags,
   };
@@ -897,7 +951,9 @@ async function verifySelectionAsAtom() {
     if (res.ok) {
       const atomFn = res.data?.atom_filename || res.data?.filename || "atom";
       document.getElementById("verifyClaimInput").value = "";
-      banner.textContent = `Verified Atom anchored: ${atomFn} (${res.data?.memory_type || memory_type})`;
+      banner.textContent = `Verified Atom anchored: ${atomFn} (${
+        res.data?.memory_type || memory_type
+      })`;
       showToast(`Promoted excerpt to Verified Atom: ${atomFn}`, "ok");
       refreshHealth();
     } else {
@@ -918,9 +974,14 @@ async function deleteActiveNote() {
     return;
   }
   const label = activeNote.title || activeNote.filename;
-  if (!window.confirm(`Move note "${label}" (${activeNote.filename}) to trash?`)) {
-    return;
-  }
+  const confirmDel = await modalCtrl.confirm({
+    title: "Move Note to Trash",
+    message: `Move note "${label}" (${activeNote.filename}) to trash?`,
+    confirmLabel: "Move to Trash",
+    confirmClass: "danger",
+  });
+  if (!confirmDel.confirmed) return;
+
   try {
     const res = await window.secondBrain.request(
       "DELETE",
@@ -936,9 +997,11 @@ async function deleteActiveNote() {
       setNoteBaseline("", "", "");
       renderBacklinksBar([]);
       renderNotePreview();
-      document.getElementById("notesBanner").textContent = `Moved ${deletedName} to trash.`;
+      document.getElementById(
+        "notesBanner"
+      ).textContent = `Moved ${deletedName} to trash.`;
       showToast(`Moved ${deletedName} to trash`, "ok");
-      await loadNotes(document.getElementById("noteSearchInput").value);
+      await loadNotes({ append: false });
       refreshHealth();
     } else {
       showToast(apiErrorMessage(res, "Delete failed"), "danger");
@@ -948,8 +1011,8 @@ async function deleteActiveNote() {
   }
 }
 
-document.getElementById("newNoteBtn").addEventListener("click", () => {
-  if (!confirmDiscardIfDirty()) return;
+document.getElementById("newNoteBtn").addEventListener("click", async () => {
+  if (!(await confirmDiscardIfDirty())) return;
   activeNote = null;
   document.getElementById("noteTitleInput").value = "";
   document.getElementById("noteTagsInput").value = "";
@@ -957,7 +1020,9 @@ document.getElementById("newNoteBtn").addEventListener("click", () => {
   setNoteBaseline("", "", "");
   renderBacklinksBar([]);
   renderNotePreview();
-  document.querySelectorAll(".note-item").forEach((n) => n.classList.remove("active"));
+  document
+    .querySelectorAll(".note-item")
+    .forEach((n) => n.classList.remove("active"));
   document.getElementById("noteTitleInput").focus();
 });
 
@@ -977,28 +1042,86 @@ for (const inputId of ["noteTitleInput", "noteTagsInput", "noteBodyInput"]) {
   });
 }
 
-document.getElementById("saveNoteBtn").addEventListener("click", () => saveActiveNote());
-document.getElementById("verifyExcerptBtn").addEventListener("click", verifySelectionAsAtom);
-document.getElementById("deleteNoteBtn").addEventListener("click", deleteActiveNote);
+document
+  .getElementById("saveNoteBtn")
+  .addEventListener("click", () => saveActiveNote());
+document
+  .getElementById("verifyExcerptBtn")
+  .addEventListener("click", verifySelectionAsAtom);
+document
+  .getElementById("deleteNoteBtn")
+  .addEventListener("click", deleteActiveNote);
 document
   .getElementById("noteSearchInput")
-  .addEventListener("input", (e) => loadNotes(e.target.value));
+  .addEventListener("input", () => loadNotes({ append: false }));
+document
+  .getElementById("noteTagFilterInput")
+  .addEventListener("input", () => loadNotes({ append: false }));
 
-// ─── TAB 2: Streaming Chat ───────────────────────────────────────────────────
+// ─── TAB 2: Upgraded Multi-Turn Streaming Chat ───────────────────────────────
 
 const chatOutputEl = document.getElementById("chatOutput");
 const chatSourcesEl = document.getElementById("chatSources");
+const chatSourcesHeaderEl = document.getElementById("chatSourcesHeader");
 const chatBannerEl = document.getElementById("chatBanner");
 const chatWarningEl = document.getElementById("chatWarningBar");
-const chatVerifiedClaimsEl = document.getElementById("chatVerifiedClaims");
-const chatGroundingEl = document.getElementById("chatGroundingBar");
 const chatSendBtn = document.getElementById("chatSendBtn");
 const chatStopBtn = document.getElementById("chatStopBtn");
 
 function setChatStreamingState(streaming) {
   isChatStreaming = streaming;
-  chatSendBtn.disabled = streaming;
   if (chatStopBtn) chatStopBtn.disabled = !streaming;
+}
+
+function populateHostSelectElement(selectEl, hostsObj) {
+  if (!selectEl || !hostsObj || typeof hostsObj !== "object") return;
+  const entries = Object.entries(hostsObj);
+  if (!entries.length) return;
+  const prev = selectEl.value || "ollama_local";
+  selectEl.replaceChildren();
+  for (const [hid, rule] of entries) {
+    const opt = el(
+      "option",
+      "",
+      `${hid}${rule && rule.enabled === false ? " (disabled)" : ""}`
+    );
+    opt.value = hid;
+    selectEl.appendChild(opt);
+  }
+  if ([...selectEl.options].some((o) => o.value === prev)) {
+    selectEl.value = prev;
+  }
+}
+
+async function loadChatHosts() {
+  try {
+    const hostsRes = await window.secondBrain.request("GET", "/v1/hosts");
+    let resolved = null;
+    if (
+      hostsRes.ok &&
+      hostsRes.data &&
+      typeof hostsRes.data === "object" &&
+      !hostsRes.data.error
+    ) {
+      resolved = hostsRes.data.hosts || hostsRes.data;
+    } else {
+      const profRes = await window.secondBrain.request("GET", "/v1/profile");
+      if (profRes.ok && profRes.data?.hosts) {
+        resolved = profRes.data.hosts;
+      }
+    }
+    if (resolved && Object.keys(resolved).length) {
+      hostsCache = resolved;
+      populateHostSelectElement(
+        document.getElementById("chatHostSelect"),
+        resolved
+      );
+      populateHostSelectElement(
+        document.getElementById("planHostSelect"),
+        resolved
+      );
+    }
+  } catch {}
 }
 
 function tierBadgeInfo(src) {
@@ -1010,19 +1133,42 @@ function tierBadgeInfo(src) {
   if (tier === "preference" || cid.startsWith("P")) {
     return { cls: "tier-p", label: `[${cid || "P"}] Preference` };
   }
+  if (tier === "unverified_lead" || cid.startsWith("L")) {
+    return { cls: "tier-l", label: `[${cid || "L"}] Unverified Lead` };
+  }
   return { cls: "tier-n", label: `[${cid || "N"}] Working Note` };
 }
 
-function renderChatSourceCards(sources) {
+function renderChatSourceCards(turn, highlightCitationId = null) {
   chatSourcesEl.replaceChildren();
+  const sources = turn ? turn.sources || [] : [];
+  if (chatSourcesHeaderEl) {
+    chatSourcesHeaderEl.textContent = turn
+      ? `Retrieved Sources (${sources.length}) — ${turn.query.slice(0, 36)}${
+          turn.query.length > 36 ? "…" : ""
+        }`
+      : "Retrieved Sources (Click to Inspect)";
+  }
   if (!sources.length) {
     chatSourcesEl.appendChild(
-      el("div", "status-banner", "No matching sources retrieved for this query.")
+      el("div", "status-banner", "No matching sources retrieved for this turn.")
     );
     return;
   }
+
+  let highlightedEl = null;
+  const targetCid = highlightCitationId
+    ? String(highlightCitationId).replace(/^\[|\]$/g, "").toUpperCase()
+    : "";
+
   for (const src of sources) {
-    const card = el("div", "source-card");
+    const cid = String(src.citation_id || "").toUpperCase();
+    const isMatch = Boolean(targetCid && cid === targetCid);
+    const card = el(
+      "div",
+      `source-card${isMatch ? " highlighted" : ""}`
+    );
+    if (cid) card.dataset.citationId = cid;
     const badgeSpec = tierBadgeInfo(src);
     card.appendChild(el("span", `badge ${badgeSpec.cls}`, badgeSpec.label));
     card.appendChild(
@@ -1036,20 +1182,32 @@ function renderChatSourceCards(sources) {
     );
     card.onclick = () => {
       const tier = String(src.tier || "").toLowerCase();
-      if (tier === "note" || String(src.citation_id || "").startsWith("N")) {
+      if (tier === "note" || cid.startsWith("N")) {
         switchView("notes");
         openNote(src.filename);
+      } else if (tier === "unverified_lead" || cid.startsWith("L")) {
+        if (src.url) openExternalSafe(src.url);
       } else if (src.filename) {
         openAtomInspectorModal(src.filename, src);
       }
     };
     chatSourcesEl.appendChild(card);
+    if (isMatch) highlightedEl = card;
+  }
+
+  if (highlightedEl && typeof highlightedEl.scrollIntoView === "function") {
+    highlightedEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 }
 
-function renderGroundingBar(g) {
-  chatGroundingEl.replaceChildren();
-  chatGroundingEl.style.display = "block";
+function handleCitationBadgeClick(turnId, citationId) {
+  const turn = chatSession.selectTurn(turnId);
+  if (!turn) return;
+  renderAllChatTurns();
+  renderChatSourceCards(turn, citationId);
+}
+
+function buildTurnGroundingElement(g) {
   const fullyCited = Boolean(g.fully_cited);
   const box = el("div", `grounding-bar ${fullyCited ? "ok" : "warn"}`);
 
@@ -1084,7 +1242,7 @@ function renderGroundingBar(g) {
     el(
       "span",
       `badge ${withheldCount > 0 ? "warn" : "ok"}`,
-      `Withheld / Unsupported Claims: ${withheldCount}`
+      `Withheld / Unsupported: ${withheldCount}`
     )
   );
   box.appendChild(headerRow);
@@ -1115,24 +1273,58 @@ function renderGroundingBar(g) {
     }
     box.appendChild(ul);
   }
-  chatGroundingEl.appendChild(box);
+  return box;
 }
 
-function renderVerifiedClaims(data) {
-  chatVerifiedClaimsEl.replaceChildren();
-  const claims = data.claims || [];
-  if (!data.answerable || !claims.length) {
-    chatVerifiedClaimsEl.style.display = "none";
-    chatOutputEl.textContent =
-      data.reason ||
-      data.text ||
-      "Abstained: no owner-verified claims directly answer this question.";
-    return;
+function buildTurnResearchLeadsWarningCard(turn) {
+  const rl = turn.researchLeads;
+  if (!rl) return null;
+  const box = el("div", "chat-leads-warning");
+  box.appendChild(
+    el(
+      "div",
+      "chat-leads-warning-title",
+      ChatHelper.RESEARCH_LEADS_WARNING_TITLE
+    )
+  );
+  if (rl.text) {
+    const body = el("div", "md-rendered");
+    renderRichMarkdown(body, rl.text, {
+      onCitationClick: (cid) => handleCitationBadgeClick(turn.id, cid),
+    });
+    box.appendChild(body);
   }
-  chatOutputEl.textContent =
-    data.text || `Grounded in ${claims.length} owner-verified claim(s):`;
-  chatVerifiedClaimsEl.style.display = "flex";
-  for (const cl of claims) {
+  const leads = Array.isArray(rl.leads) ? rl.leads : [];
+  for (const ld of leads) {
+    const item = el("div", "sub-panel");
+    const top = el("div", "toolbar");
+    if (ld.citation_id) {
+      const cBtn = el("button", "citation-badge tier-l", `[${ld.citation_id}]`);
+      cBtn.type = "button";
+      cBtn.onclick = () => handleCitationBadgeClick(turn.id, ld.citation_id);
+      top.appendChild(cBtn);
+    } else {
+      top.appendChild(el("span", "badge tier-l", "Unverified Lead"));
+    }
+    top.appendChild(
+      el("strong", "", ld.title || ld.filename || ld.source || "Untrusted Lead")
+    );
+    item.appendChild(top);
+    const snip = ld.snippet || ld.excerpt || ld.text || "";
+    if (snip) item.appendChild(el("div", "note-item-meta", snip));
+    box.appendChild(item);
+  }
+  return box;
+}
+
+function buildTurnVerifiedClaimsCards(turn) {
+  const data = turn.verifiedClaims;
+  if (!data || !data.answerable || !Array.isArray(data.claims) || !data.claims.length) {
+    return null;
+  }
+  const wrap = el("div", "field-col");
+  wrap.style.gap = "8px";
+  for (const cl of data.claims) {
     const card = el("div", "claim-card");
     const top = el("div", "toolbar");
     top.appendChild(
@@ -1158,101 +1350,227 @@ function renderVerifiedClaims(data) {
         card.appendChild(el("div", "claim-quote", `"${quote}"`));
       }
     }
-    chatVerifiedClaimsEl.appendChild(card);
+    wrap.appendChild(card);
+  }
+  return wrap;
+}
+
+function buildChatTurnCard(turn, isSelected) {
+  const card = el("div", `chat-turn-card${isSelected ? " selected" : ""}`);
+  card.dataset.turnId = turn.id;
+  card.addEventListener("click", () => {
+    chatSession.selectTurn(turn.id);
+    renderAllChatTurns();
+    renderChatSourceCards(chatSession.getSelectedTurn());
+  });
+
+  const header = el("div", "chat-user-header");
+  header.appendChild(el("div", "chat-user-query", turn.query));
+
+  const metaBadges = el("div", "toolbar");
+  metaBadges.appendChild(el("span", "badge mono", turn.mode));
+  metaBadges.appendChild(el("span", "badge mono", turn.retrieval_mode));
+  if (turn.answer_view && turn.answer_view !== "standard") {
+    metaBadges.appendChild(el("span", "badge warn", `view:${turn.answer_view}`));
+  }
+  metaBadges.appendChild(el("span", "badge", turn.host_id));
+  if (turn.retrieval_ms !== null) {
+    metaBadges.appendChild(
+      el("span", "badge mono", `ret:${turn.retrieval_ms}ms`)
+    );
+  }
+  if (turn.total_ms !== null) {
+    metaBadges.appendChild(el("span", "badge mono", `tot:${turn.total_ms}ms`));
+  }
+  if (turn.status === "cancelled") {
+    metaBadges.appendChild(el("span", "badge warn", "Cancelled"));
+  } else if (turn.status === "error") {
+    metaBadges.appendChild(el("span", "badge danger", "Error"));
+  }
+  header.appendChild(metaBadges);
+  card.appendChild(header);
+
+  if (turn.warning) {
+    card.appendChild(el("div", "status-banner banner-warn", turn.warning));
+  }
+
+  const body = el("div", "chat-assistant-body md-rendered");
+  if (turn.assistantText) {
+    renderRichMarkdown(body, turn.assistantText, {
+      onCitationClick: (cid) => handleCitationBadgeClick(turn.id, cid),
+    });
+  } else if (turn.status === "error") {
+    body.appendChild(
+      el("div", "status-banner banner-danger", turn.error || "Stream failed")
+    );
+  } else if (turn.status === "cancelled") {
+    body.appendChild(
+      el("div", "note-item-meta", "Stream cancelled before completion.")
+    );
+  } else {
+    body.appendChild(el("div", "note-item-meta", "Streaming response..."));
+  }
+  card.appendChild(body);
+
+  const verifiedWrap = buildTurnVerifiedClaimsCards(turn);
+  if (verifiedWrap) card.appendChild(verifiedWrap);
+
+  const leadsCard = buildTurnResearchLeadsWarningCard(turn);
+  if (leadsCard) card.appendChild(leadsCard);
+
+  if (turn.grounding) {
+    card.appendChild(buildTurnGroundingElement(turn.grounding));
+  }
+
+  return card;
+}
+
+function renderAllChatTurns() {
+  const turns = chatSession.getTurns();
+  const selected = chatSession.getSelectedTurn();
+  chatOutputEl.replaceChildren();
+  if (!turns.length) {
+    chatOutputEl.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        "Ask a question above to search working notes, verified atoms, and owner preferences across a multi-turn session."
+      )
+    );
+    return;
+  }
+  for (const t of turns) {
+    chatOutputEl.appendChild(
+      buildChatTurnCard(t, Boolean(selected && selected.id === t.id))
+    );
   }
 }
 
-window.secondBrain.onChatEvent(({ event, data }) => {
-  if (!data) return;
-  if (event === "context") {
-    const ms =
-      data.retrieval_ms !== undefined ? `${data.retrieval_ms} ms` : "instant";
-    const sources = data.sources || [];
-    chatBannerEl.textContent = `Retrieved ${sources.length} source(s) in ${ms}`;
-    if (data.warning) {
-      chatWarningEl.style.display = "block";
-      chatWarningEl.textContent = data.warning;
-    } else {
-      chatWarningEl.style.display = "none";
+if (window.secondBrain && typeof window.secondBrain.onChatEvent === "function") {
+  window.secondBrain.onChatEvent(({ event, data }) => {
+    if (!data || !activeStreamingTurnId) return;
+    const turn = chatSession.applyEvent(activeStreamingTurnId, event, data);
+    if (!turn) return;
+
+    const resolvedEvent =
+      event && event !== "message" ? event : data.type || "message";
+
+    if (resolvedEvent === "context") {
+      const ms =
+        turn.retrieval_ms !== null ? `${turn.retrieval_ms} ms` : "instant";
+      chatBannerEl.textContent = `Retrieved ${turn.sources.length} source(s) in ${ms}`;
+      if (turn.warning) {
+        chatWarningEl.style.display = "block";
+        chatWarningEl.textContent = turn.warning;
+      } else {
+        chatWarningEl.style.display = "none";
+      }
+      renderChatSourceCards(turn);
+    } else if (resolvedEvent === "cancelled") {
+      chatBannerEl.textContent = "Chat stream cancelled.";
+      setChatStreamingState(false);
+    } else if (resolvedEvent === "error") {
+      const errMsg = turn.error || "Stream failed";
+      chatBannerEl.textContent = `Error: ${errMsg}`;
+      showToast(errMsg, "danger");
+      setChatStreamingState(false);
+    } else if (resolvedEvent === "done") {
+      if (turn.total_ms !== null) {
+        chatBannerEl.textContent += ` · Completed in ${turn.total_ms} ms`;
+      }
+      setChatStreamingState(false);
     }
-    renderChatSourceCards(sources);
-    if (document.getElementById("chatModeSelect").value === "instant") {
-      chatOutputEl.textContent = sources.length
-        ? `Instant retrieval complete (${sources.length} source cards on the right — no LLM invoked).\n\n` +
-          sources
-            .map(
-              (s) =>
-                `[${s.citation_id || s.tier}] ${s.title || s.filename}: ${
-                  s.claim || s.excerpt || ""
-                }`
-            )
-            .join("\n\n")
-        : "No matching verified atoms or working notes found.";
+
+    renderAllChatTurns();
+    const scrollBox = document.getElementById("chatMainScroll");
+    if (scrollBox && resolvedEvent === "token") {
+      scrollBox.scrollTop = scrollBox.scrollHeight;
     }
-  } else if (event === "token") {
-    chatOutputEl.textContent += data.text ?? data.token ?? "";
-  } else if (event === "verified_answer") {
-    renderVerifiedClaims(data);
-  } else if (event === "grounding") {
-    renderGroundingBar(data);
-  } else if (event === "abstain") {
-    chatOutputEl.textContent = `Abstained: ${
-      data.reason || data.text || "Insufficient verified context."
-    }`;
-  } else if (event === "cancelled") {
-    chatBannerEl.textContent = "Chat stream cancelled by owner.";
-    setChatStreamingState(false);
-  } else if (event === "error") {
-    const errMsg = data.error || "Stream failed";
-    chatBannerEl.textContent = `Error: ${errMsg}`;
-    showToast(errMsg, "danger");
-    setChatStreamingState(false);
-  } else if (event === "done") {
-    const ms = data.elapsed_ms ?? data.total_ms;
-    if (ms !== undefined) {
-      chatBannerEl.textContent += ` · Completed in ${ms} ms`;
+  });
+}
+
+document
+  .getElementById("chatAnswerViewSelect")
+  .addEventListener("change", (e) => {
+    if (e.target.value === "preference") {
+      document.getElementById("chatIncludePrefsCheck").checked = true;
     }
-    setChatStreamingState(false);
-  }
-});
+  });
 
 async function sendChat() {
-  const query = document.getElementById("chatQueryInput").value.trim();
+  const queryInput = document.getElementById("chatQueryInput");
+  const query = queryInput.value.trim();
   if (!query) {
     showToast("Enter a question to query your vault.", "warn");
     return;
   }
-  const mode = document.getElementById("chatModeSelect").value;
-  const project_scope =
-    document.getElementById("chatScopeInput").value.trim() || undefined;
 
-  chatOutputEl.textContent = "";
-  chatSourcesEl.replaceChildren();
+  if (activeStreamingTurnId && chatAbortManager.isActive()) {
+    chatSession.markCancelled(activeStreamingTurnId);
+  }
+
+  const streamHandle = chatAbortManager.beginStream({
+    timeoutMs: 90000,
+    onTimeout: () => {
+      if (activeStreamingTurnId) {
+        chatSession.applyEvent(activeStreamingTurnId, "error", {
+          error: "Chat stream timed out after 90 seconds.",
+        });
+        renderAllChatTurns();
+      }
+      setChatStreamingState(false);
+    },
+  });
+
+  const reqPayload = ChatHelper.buildChatStreamRequest({
+    query,
+    mode: document.getElementById("chatModeSelect").value,
+    host_id: document.getElementById("chatHostSelect").value || "ollama_local",
+    model_override: document.getElementById("chatModelInput").value,
+    retrieval_mode: document.getElementById("chatRetrievalModeSelect").value,
+    answer_view: document.getElementById("chatAnswerViewSelect").value,
+    project_scope: document.getElementById("chatScopeInput").value,
+    include_preferences: document.getElementById("chatIncludePrefsCheck")
+      .checked,
+  });
+
+  const turn = chatSession.startTurn(reqPayload);
+  activeStreamingTurnId = turn.id;
+  queryInput.value = "";
   chatWarningEl.style.display = "none";
-  chatVerifiedClaimsEl.style.display = "none";
-  chatVerifiedClaimsEl.replaceChildren();
-  chatGroundingEl.style.display = "none";
-  chatGroundingEl.replaceChildren();
   chatBannerEl.textContent = "Retrieving context...";
   setChatStreamingState(true);
+  renderAllChatTurns();
+  renderChatSourceCards(turn);
 
   try {
-    const res = await window.secondBrain.streamChat({
-      query,
-      mode,
-      project_scope,
-    });
-    if (res && !res.ok && !res.cancelled && chatBannerEl.textContent === "Retrieving context...") {
+    const res = await window.secondBrain.streamChat(reqPayload);
+    if (
+      res &&
+      !res.ok &&
+      !res.cancelled &&
+      !streamHandle.signal.aborted &&
+      turn.status === "streaming"
+    ) {
       const errMsg = res.error || `HTTP ${res.status}`;
+      chatSession.applyEvent(turn.id, "error", { error: errMsg });
       chatBannerEl.textContent = `Error: ${errMsg}`;
+      renderAllChatTurns();
       showToast(errMsg, "danger");
     }
   } catch (err) {
-    const errMsg = err?.message || String(err);
-    chatBannerEl.textContent = `Error: ${errMsg}`;
-    showToast(errMsg, "danger");
+    if (!streamHandle.signal.aborted) {
+      const errMsg = err?.message || String(err);
+      chatSession.applyEvent(turn.id, "error", { error: errMsg });
+      chatBannerEl.textContent = `Error: ${errMsg}`;
+      renderAllChatTurns();
+      showToast(errMsg, "danger");
+    }
   } finally {
-    setChatStreamingState(false);
+    streamHandle.finish();
+    if (activeStreamingTurnId === turn.id) {
+      setChatStreamingState(false);
+    }
   }
 }
 
@@ -1260,17 +1578,64 @@ document.getElementById("chatSendBtn").addEventListener("click", sendChat);
 document.getElementById("chatQueryInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendChat();
 });
-document.getElementById("chatStopBtn").addEventListener("click", async () => {
-  await window.secondBrain.abortChat();
+document.getElementById("chatStopBtn").addEventListener("click", () => {
+  if (activeStreamingTurnId) {
+    chatSession.markCancelled(activeStreamingTurnId);
+  }
+  chatAbortManager.abort("stop");
   setChatStreamingState(false);
+  chatBannerEl.textContent = "Chat stream stopped by owner.";
+  renderAllChatTurns();
 });
+document
+  .getElementById("chatClearHistoryBtn")
+  .addEventListener("click", () => {
+    chatAbortManager.abort("clear");
+    activeStreamingTurnId = null;
+    setChatStreamingState(false);
+    chatSession.clearHistory();
+    chatWarningEl.style.display = "none";
+    chatSourcesEl.replaceChildren();
+    if (chatSourcesHeaderEl) {
+      chatSourcesHeaderEl.textContent = "Retrieved Sources (Click to Inspect)";
+    }
+    chatBannerEl.textContent = "Cleared multi-turn chat session history.";
+    renderAllChatTurns();
+  });
+document
+  .getElementById("chatExportMdBtn")
+  .addEventListener("click", async () => {
+    const md = chatSession.exportMarkdown();
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(md);
+      }
+    } catch {}
+    try {
+      const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = el("a");
+      a.href = url;
+      a.download = `second-brain-chat-${new Date()
+        .toISOString()
+        .slice(0, 19)
+        .replace(/[:T]/g, "-")}.md`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch {}
+    showToast("Exported multi-turn chat session Markdown", "ok");
+  });
+
 document.getElementById("chatWarmupBtn").addEventListener("click", async () => {
   chatBannerEl.textContent = "Warming up local Ollama model...";
   try {
     const res = await window.secondBrain.request("POST", "/v1/chat/warmup", {});
     if (res.ok) {
       const modelName = res.data?.model || "local model";
-      const ms = res.data?.warmup_ms !== undefined ? ` in ${res.data.warmup_ms} ms` : "";
+      const ms =
+        res.data?.warmup_ms !== undefined ? ` in ${res.data.warmup_ms} ms` : "";
       const msg = `Model warmed: ${modelName}${ms}`;
       chatBannerEl.textContent = msg;
       showToast(msg, "ok");
@@ -1286,7 +1651,7 @@ document.getElementById("chatWarmupBtn").addEventListener("click", async () => {
   }
 });
 
-// ─── TAB 3: Quarantined Inbox, Atom Review & CAS Merge ───────────────────────
+// ─── TAB 3: Quarantined Inbox, Atom Review, Pagination & CAS Merge ───────────
 
 function buildInboxCard(item) {
   const card = el("div", "card");
@@ -1373,7 +1738,8 @@ function buildInboxCard(item) {
         "mono-box",
         res.ok && res.data
           ? res.data.content || res.data.preview || "(empty payload)"
-          : item.preview || apiErrorMessage(res, "Preview only (full inspect unavailable)")
+          : item.preview ||
+              apiErrorMessage(res, "Preview only (full inspect unavailable)")
       );
       rawPre.style.marginTop = "6px";
       inspectDrawer.appendChild(rawPre);
@@ -1479,7 +1845,9 @@ function buildAtomReviewCard(atom) {
     el(
       "div",
       "note-item-meta",
-      `Origin: ${atom.origin || "unknown"}${srcList ? " · Sources: " + srcList : ""}`
+      `Origin: ${atom.origin || "unknown"}${
+        srcList ? " · Sources: " + srcList : ""
+      }`
     )
   );
 
@@ -1582,22 +1950,27 @@ function buildApprovedAtomCard(atom) {
   noteInput.type = "text";
   noteInput.placeholder = "Feedback note (optional)...";
   noteInput.style.flex = "1";
-  noteInput.style.minWidth = "130px";
+  noteInput.style.minWidth = "120px";
   fbRow.appendChild(noteInput);
 
   for (const [fb, cls, label] of [
     ["endorsed", "good", "Endorse"],
     ["corrected", "warn", "Corrected"],
+    ["superseded", "", "Superseded"],
   ]) {
-    const btn = el("button", `btn sm ${cls}`, label);
+    const btn = el("button", `btn sm ${cls}`.trim(), label);
     btn.type = "button";
     btn.onclick = async () => {
-      const res = await window.secondBrain.api("POST", "/v1/cognitive/feedback", {
-        atom_filename: atom.filename,
-        feedback: fb,
-        actor: "desktop_owner",
-        note: noteInput.value.trim(),
-      });
+      const res = await window.secondBrain.api(
+        "POST",
+        "/v1/cognitive/feedback",
+        {
+          atom_filename: atom.filename,
+          feedback: fb,
+          actor: "desktop_owner",
+          note: noteInput.value.trim(),
+        }
+      );
       if (res.ok) {
         noteInput.value = "";
         showToast(`Recorded '${fb}' feedback on ${atom.filename}`, "ok");
@@ -1613,30 +1986,27 @@ function buildApprovedAtomCard(atom) {
 }
 
 function applyReviewSectionFilter(filterMode) {
-  const view = document.getElementById("view-review");
-  if (!view) return;
   document.querySelectorAll("[data-review-filter]").forEach((btn) => {
     btn.classList.toggle("primary", btn.dataset.reviewFilter === filterMode);
   });
-  const inboxGrid = document.getElementById("inboxQueueGrid");
-  const reviewGrid = document.getElementById("reviewGrid");
-  const approvedGrid = document.getElementById("approvedAtomsGrid");
-  const headers = view.querySelectorAll(".section-header");
-  const mergeCard = approvedGrid?.previousElementSibling;
-
   const showInbox = filterMode === "all" || filterMode === "inbox";
   const showPending = filterMode === "all" || filterMode === "pending";
   const showApproved = filterMode === "all" || filterMode === "approved";
 
-  if (headers[0]) headers[0].style.display = showInbox ? "" : "none";
-  if (inboxGrid) inboxGrid.style.display = showInbox ? "" : "none";
-  if (headers[1]) headers[1].style.display = showPending ? "" : "none";
-  if (reviewGrid) reviewGrid.style.display = showPending ? "" : "none";
-  if (headers[2]) headers[2].style.display = showApproved ? "" : "none";
-  if (mergeCard && mergeCard.classList.contains("card")) {
-    mergeCard.style.display = showApproved ? "" : "none";
-  }
-  if (approvedGrid) approvedGrid.style.display = showApproved ? "" : "none";
+  const setDisp = (id, show) => {
+    const node = document.getElementById(id);
+    if (node) node.style.display = show ? "" : "none";
+  };
+
+  setDisp("reviewHeaderInbox", showInbox);
+  setDisp("inboxQueueGrid", showInbox);
+  setDisp("reviewHeaderPending", showPending);
+  setDisp("reviewGrid", showPending);
+  if (!showPending) setDisp("reviewPaginationBar", false);
+  setDisp("reviewHeaderApproved", showApproved);
+  setDisp("reviewMergeCard", showApproved);
+  setDisp("approvedAtomsGrid", showApproved);
+  if (!showApproved) setDisp("atomsPaginationBar", false);
 }
 
 document.querySelectorAll("[data-review-filter]").forEach((btn) => {
@@ -1645,52 +2015,56 @@ document.querySelectorAll("[data-review-filter]").forEach((btn) => {
   });
 });
 
-async function loadReviewQueue() {
-  const inboxGrid = document.getElementById("inboxQueueGrid");
+async function loadReviewPendingPage({ append = false } = {}) {
   const reviewGrid = document.getElementById("reviewGrid");
-  const approvedGrid = document.getElementById("approvedAtomsGrid");
-  const dupListEl = document.getElementById("duplicatesList");
-
-  inboxGrid.replaceChildren(el("div", "status-banner", "Loading inbox..."));
-  reviewGrid.replaceChildren(el("div", "status-banner", "Loading review queue..."));
-
-  const [inboxRes, reviewRes, atomsRes, dupRes] = await Promise.all([
-    window.secondBrain.request("GET", "/v1/inbox/queue"),
-    window.secondBrain.request("GET", "/v1/review/queue"),
-    window.secondBrain.request("GET", "/v1/atoms?limit=100"),
-    window.secondBrain.request("GET", "/v1/atoms/duplicates"),
-  ]);
-
-  inboxGrid.replaceChildren();
-  const inboxItems = inboxRes.data?.items || [];
-  if (!inboxItems.length) {
-    inboxGrid.appendChild(el("div", "status-banner", "Quarantined inbox is empty."));
-  } else {
-    for (const item of inboxItems) {
-      inboxGrid.appendChild(buildInboxCard(item));
-    }
+  if (!append) {
+    reviewQueuePaginator.reset();
+    reviewGrid.replaceChildren(
+      el("div", "status-banner", "Loading review queue...")
+    );
   }
+  const url = PageHelper.buildPaginatedPath("/v1/review/queue", {
+    limit: reviewQueuePaginator.getPageSize(),
+    offset: reviewQueuePaginator.nextOffset(),
+  });
+  const reviewRes = await window.secondBrain.request("GET", url);
+  reviewQueuePaginator.applyPage(reviewRes.data || {}, {
+    append,
+    preferredKey: "items",
+  });
 
   reviewGrid.replaceChildren();
-  const reviewItems = reviewRes.data?.items || [];
+  const reviewItems = reviewQueuePaginator.getItems();
   if (!reviewItems.length) {
     reviewGrid.appendChild(
-      el("div", "status-banner", "Pending & quarantined atom review queue is clear.")
+      el(
+        "div",
+        "status-banner",
+        "Pending & quarantined atom review queue is clear."
+      )
     );
   } else {
     for (const atom of reviewItems) {
       reviewGrid.appendChild(buildAtomReviewCard(atom));
     }
   }
+  PageHelper.renderPaginationBar(
+    document.getElementById("reviewPaginationBar"),
+    reviewQueuePaginator,
+    () => loadReviewPendingPage({ append: true }),
+    { noun: "pending atoms" }
+  );
+}
 
-  const allAtoms = atomsRes.data?.items || atomsRes.data?.atoms || [];
-  approvedAtomsCache = allAtoms.filter((a) => a.verified || a.review_status === "accepted");
-
+function syncMergeSelectorsFromAtoms() {
   const survSel = document.getElementById("mergeSurvivorSelect");
   const supSel = document.getElementById("mergeSupersededSelect");
+  const prevSurv = survSel.value;
+  const prevSup = supSel.value;
   survSel.replaceChildren();
   supSel.replaceChildren();
-  for (const a of allAtoms) {
+
+  for (const a of allLoadedAtoms) {
     for (const sel of [survSel, supSel]) {
       const opt = el("option", "", `${a.filename} (${shortSha(a.sha256)})`);
       opt.value = a.filename;
@@ -1698,12 +2072,94 @@ async function loadReviewQueue() {
       sel.appendChild(opt);
     }
   }
-  if (supSel.options.length > 1) supSel.selectedIndex = 1;
+  if (prevSurv && [...survSel.options].some((o) => o.value === prevSurv)) {
+    survSel.value = prevSurv;
+  }
+  if (prevSup && [...supSel.options].some((o) => o.value === prevSup)) {
+    supSel.value = prevSup;
+  } else if (supSel.options.length > 1) {
+    supSel.selectedIndex = 1;
+  }
 
+  const moreBtn = document.getElementById("loadMoreMergeAtomsBtn");
+  if (moreBtn) {
+    moreBtn.style.display = atomsPaginator.canLoadMore()
+      ? "inline-block"
+      : "none";
+  }
+}
+
+async function loadAtomsPage({ append = false } = {}) {
+  const approvedGrid = document.getElementById("approvedAtomsGrid");
+  if (!append) {
+    atomsPaginator.reset();
+  }
+  const url = PageHelper.buildPaginatedPath("/v1/atoms", {
+    limit: atomsPaginator.getPageSize(),
+    offset: atomsPaginator.nextOffset(),
+  });
+  const atomsRes = await window.secondBrain.request("GET", url);
+  atomsPaginator.applyPage(atomsRes.data || {}, {
+    append,
+    preferredKey: "items",
+  });
+
+  allLoadedAtoms = atomsPaginator.getItems();
+  approvedAtomsCache = allLoadedAtoms.filter(
+    (a) => a.verified || a.review_status === "accepted"
+  );
+
+  syncMergeSelectorsFromAtoms();
+
+  approvedGrid.replaceChildren();
+  if (!approvedAtomsCache.length) {
+    approvedGrid.appendChild(
+      el("div", "status-banner", "No approved atoms yet.")
+    );
+  } else {
+    for (const atom of approvedAtomsCache) {
+      approvedGrid.appendChild(buildApprovedAtomCard(atom));
+    }
+  }
+  PageHelper.renderPaginationBar(
+    document.getElementById("atomsPaginationBar"),
+    atomsPaginator,
+    () => loadAtomsPage({ append: true }),
+    { noun: "atoms" }
+  );
+}
+
+async function loadReviewQueue() {
+  const inboxGrid = document.getElementById("inboxQueueGrid");
+  const dupListEl = document.getElementById("duplicatesList");
+  inboxGrid.replaceChildren(el("div", "status-banner", "Loading inbox..."));
+
+  const [inboxRes, dupRes] = await Promise.all([
+    window.secondBrain.request("GET", "/v1/inbox/queue"),
+    window.secondBrain.request("GET", "/v1/atoms/duplicates"),
+    loadReviewPendingPage({ append: false }),
+    loadAtomsPage({ append: false }),
+  ]);
+
+  inboxGrid.replaceChildren();
+  const inboxItems = inboxRes.data?.items || [];
+  if (!inboxItems.length) {
+    inboxGrid.appendChild(
+      el("div", "status-banner", "Quarantined inbox is empty.")
+    );
+  } else {
+    for (const item of inboxItems) {
+      inboxGrid.appendChild(buildInboxCard(item));
+    }
+  }
+
+  const survSel = document.getElementById("mergeSurvivorSelect");
+  const supSel = document.getElementById("mergeSupersededSelect");
   dupListEl.replaceChildren();
   const duplicates = dupRes.ok ? dupRes.data?.duplicates || [] : [];
   if (!duplicates.length) {
-    dupListEl.textContent = "No duplicate atom pairs detected across approved memory.";
+    dupListEl.textContent =
+      "No duplicate atom pairs detected across approved memory.";
   } else {
     for (const dup of duplicates) {
       const aFn = dup.atom_a || dup.filename_a || dup[0] || "";
@@ -1715,7 +2171,9 @@ async function loadReviewQueue() {
           "span",
           "",
           `${aFn}  <->  ${bFn}${
-            dup.similarity !== undefined ? ` (similarity: ${dup.similarity})` : ""
+            dup.similarity !== undefined
+              ? ` (similarity: ${dup.similarity})`
+              : ""
           }`
         )
       );
@@ -1730,18 +2188,14 @@ async function loadReviewQueue() {
       dupListEl.appendChild(row);
     }
   }
-
-  approvedGrid.replaceChildren();
-  if (!approvedAtomsCache.length) {
-    approvedGrid.appendChild(el("div", "status-banner", "No approved atoms yet."));
-  } else {
-    for (const atom of approvedAtomsCache.slice(0, 100)) {
-      approvedGrid.appendChild(buildApprovedAtomCard(atom));
-    }
-  }
 }
 
-document.getElementById("refreshReviewBtn").addEventListener("click", loadReviewQueue);
+document
+  .getElementById("refreshReviewBtn")
+  .addEventListener("click", loadReviewQueue);
+document
+  .getElementById("loadMoreMergeAtomsBtn")
+  .addEventListener("click", () => loadAtomsPage({ append: true }));
 document.getElementById("runMergeBtn").addEventListener("click", async () => {
   const survSel = document.getElementById("mergeSurvivorSelect");
   const supSel = document.getElementById("mergeSupersededSelect");
@@ -1784,7 +2238,7 @@ document.getElementById("runMergeBtn").addEventListener("click", async () => {
   }
 });
 
-// ─── TAB 4: Bulk Import ──────────────────────────────────────────────────────
+// ─── TAB 4: Bulk Import, Single Document Import, Web Scout & Operator Jobs ───
 
 const importDryRunCheck = document.getElementById("importDryRunCheck");
 const runImportBtn = document.getElementById("runImportBtn");
@@ -1795,15 +2249,17 @@ importDryRunCheck.addEventListener("change", () => {
     : "Import Notes";
 });
 
-document.getElementById("pickImportDirBtn").addEventListener("click", async () => {
-  const dir = await window.secondBrain.pickFolder();
-  if (dir) document.getElementById("importDirInput").value = dir;
-});
+document
+  .getElementById("pickImportDirBtn")
+  .addEventListener("click", async () => {
+    const dir = await window.secondBrain.pickFolder();
+    if (dir) document.getElementById("importDirInput").value = dir;
+  });
 
 runImportBtn.addEventListener("click", async () => {
   const source_dir = document.getElementById("importDirInput").value.trim();
   if (!source_dir) {
-    showToast("Choose a source folder containing Markdown or text files.", "warn");
+    showToast("Choose a source folder containing documents or notes.", "warn");
     return;
   }
   const tags = parseTags(document.getElementById("importTagsInput").value);
@@ -1847,7 +2303,8 @@ runImportBtn.addEventListener("click", async () => {
 
       const errorList = Array.isArray(d.errors) ? d.errors : [];
       const errorCount =
-        d.error_count ?? (errorList.length || Number(d.skipped_unreadable || 0));
+        d.error_count ??
+        (errorList.length || Number(d.skipped_unreadable || 0));
 
       kpiGrid.appendChild(makeKpiCard("Scanned", d.scanned ?? 0));
       kpiGrid.appendChild(
@@ -1872,7 +2329,9 @@ runImportBtn.addEventListener("click", async () => {
       if (errorList.length) {
         const errBox = el("div", "sub-panel");
         errBox.style.gridColumn = "1 / -1";
-        errBox.appendChild(el("strong", "", `Import Errors (${errorList.length}):`));
+        errBox.appendChild(
+          el("strong", "", `Import Errors (${errorList.length}):`)
+        );
         for (const itemErr of errorList.slice(0, 12)) {
           errBox.appendChild(
             el(
@@ -1880,7 +2339,9 @@ runImportBtn.addEventListener("click", async () => {
               "note-item-meta",
               typeof itemErr === "string"
                 ? itemErr
-                : `${itemErr.file || itemErr.path || "file"}: ${itemErr.error || ""}`
+                : `${itemErr.file || itemErr.path || "file"}: ${
+                    itemErr.error || ""
+                  }`
             )
           );
         }
@@ -1894,7 +2355,7 @@ runImportBtn.addEventListener("click", async () => {
         "ok"
       );
       if (!isDry) {
-        loadNotes();
+        loadNotes({ append: false });
         refreshHealth();
       }
     } else {
@@ -1912,6 +2373,255 @@ runImportBtn.addEventListener("click", async () => {
     runImportBtn.disabled = false;
   }
 });
+
+// Single Document Picker & Import
+document
+  .getElementById("pickImportFileBtn")
+  .addEventListener("click", async () => {
+    if (
+      window.secondBrain &&
+      typeof window.secondBrain.pickFile === "function"
+    ) {
+      const filePath = await window.secondBrain.pickFile();
+      if (filePath) document.getElementById("importFileInput").value = filePath;
+    }
+  });
+
+document
+  .getElementById("runImportFileBtn")
+  .addEventListener("click", async () => {
+    const filePath = document.getElementById("importFileInput").value.trim();
+    const resEl = document.getElementById("importFileResult");
+    const btn = document.getElementById("runImportFileBtn");
+    if (!filePath) {
+      showToast("Choose a document file to import.", "warn");
+      return;
+    }
+    const tags = parseTags(document.getElementById("importFileTagsInput").value);
+    btn.disabled = true;
+    resEl.className = "status-banner";
+    resEl.textContent = `Importing ${filePath}...`;
+
+    try {
+      const res = await window.secondBrain.request("POST", "/v1/import/file", {
+        path: filePath,
+        tags,
+      });
+      if (res.ok && res.data) {
+        const fn =
+          res.data.filename ||
+          res.data.note_filename ||
+          res.data.note?.filename ||
+          filePath;
+        resEl.className = "status-banner banner-ok";
+        resEl.textContent = `Imported document -> ${fn}`;
+        showToast(`Imported document: ${fn}`, "ok");
+        loadNotes({ append: false });
+        refreshHealth();
+      } else {
+        const errMsg = apiErrorMessage(res, "Document import failed");
+        resEl.className = "status-banner banner-danger";
+        resEl.textContent = errMsg;
+        showToast(errMsg, "danger");
+      }
+    } catch (err) {
+      const errMsg = `Document import error: ${err?.message || String(err)}`;
+      resEl.className = "status-banner banner-danger";
+      resEl.textContent = errMsg;
+      showToast(errMsg, "danger");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+// Web Scout Queue & Operator Jobs
+async function loadScoutQueue() {
+  const listEl = document.getElementById("scoutQueueList");
+  if (!listEl) return;
+  const res = await window.secondBrain.request("GET", "/v1/scout/queue");
+  listEl.replaceChildren();
+  if (!res.ok) {
+    listEl.textContent = apiErrorMessage(res, "Web Scout queue unavailable");
+    return;
+  }
+  const items = res.data?.items || [];
+  if (!items.length) {
+    listEl.textContent =
+      "Reading queue is empty (0-raw/reading-list.md). Add an http/https URL above.";
+    return;
+  }
+  for (const item of items) {
+    const row = el("div", "toolbar");
+    row.style.marginBottom = "4px";
+    const statusStr = String(item.status || "queued").toLowerCase();
+    row.appendChild(
+      el(
+        "span",
+        `badge ${statusStr === "done" || statusStr === "completed" ? "ok" : "warn"}`,
+        statusStr
+      )
+    );
+    const linkBtn = el("button", "pill clickable", item.url || "");
+    linkBtn.type = "button";
+    linkBtn.onclick = () => openExternalSafe(item.url);
+    row.appendChild(linkBtn);
+    listEl.appendChild(row);
+  }
+}
+
+document
+  .getElementById("refreshScoutBtn")
+  .addEventListener("click", loadScoutQueue);
+
+document
+  .getElementById("addScoutUrlBtn")
+  .addEventListener("click", async () => {
+    const input = document.getElementById("scoutUrlInput");
+    const rawUrl = input.value.trim();
+    const safeUrl = MdHelper.sanitizeExternalUrl(rawUrl);
+    if (!safeUrl || (!safeUrl.startsWith("http://") && !safeUrl.startsWith("https://"))) {
+      showToast("Enter a valid http:// or https:// URL for Web Scout.", "warn");
+      return;
+    }
+    const res = await window.secondBrain.request("POST", "/v1/scout/queue", {
+      url: safeUrl,
+    });
+    if (res.ok) {
+      input.value = "";
+      showToast("Added URL to Web Scout reading queue", "ok");
+      loadScoutQueue();
+    } else {
+      showToast(apiErrorMessage(res, "Failed to queue URL"), "danger");
+    }
+  });
+
+function renderActiveJobs() {
+  const wrap = document.getElementById("activeJobsList");
+  if (!wrap) return;
+  wrap.replaceChildren();
+  if (!activeJobsMap.size) {
+    wrap.textContent = "No operator jobs triggered in this session yet.";
+    return;
+  }
+  for (const job of [...activeJobsMap.values()].reverse()) {
+    const card = el("div", "step-card");
+    card.style.marginBottom = "8px";
+    const top = el("div", "toolbar");
+    top.appendChild(el("strong", "", `${job.kind || "job"} (${job.job_id})`));
+    const st = String(job.status || "running").toLowerCase();
+    const cls =
+      st === "completed"
+        ? "ok"
+        : st === "failed"
+        ? "danger"
+        : "warn";
+    top.appendChild(el("span", `badge ${cls}`, st.toUpperCase()));
+    if (job.returncode !== undefined && job.returncode !== null) {
+      top.appendChild(el("span", "badge mono", `exit:${job.returncode}`));
+    }
+    card.appendChild(top);
+    if (job.output_tail) {
+      card.appendChild(el("pre", "mono-box", job.output_tail));
+    }
+    wrap.appendChild(card);
+  }
+}
+
+function scheduleJobPoll() {
+  if (jobPollTimer) return;
+  jobPollTimer = setInterval(async () => {
+    const runningIds = [...activeJobsMap.values()]
+      .filter((j) => j.status === "running" || j.status === "started")
+      .map((j) => j.job_id);
+    if (!runningIds.length) {
+      clearInterval(jobPollTimer);
+      jobPollTimer = null;
+      return;
+    }
+    for (const jid of runningIds) {
+      try {
+        const res = await window.secondBrain.request(
+          "GET",
+          `/v1/jobs/${encodeURIComponent(jid)}`
+        );
+        if (res.ok && res.data) {
+          const prev = activeJobsMap.get(jid) || {};
+          const updated = { ...prev, ...res.data, job_id: jid };
+          activeJobsMap.set(jid, updated);
+          if (updated.status === "completed") {
+            showToast(`Job ${updated.kind || jid} completed`, "ok");
+            refreshHealth();
+            if (activeView === "import") loadScoutQueue();
+          } else if (updated.status === "failed") {
+            showToast(`Job ${updated.kind || jid} failed`, "danger");
+          }
+        }
+      } catch {}
+    }
+    renderActiveJobs();
+  }, 1500);
+}
+
+function registerTriggeredJob(data, fallbackKind) {
+  const jid = data?.job_id || `${fallbackKind}-${Date.now()}`;
+  activeJobsMap.set(jid, {
+    job_id: jid,
+    kind: data?.kind || fallbackKind,
+    status: data?.status || "started",
+    returncode: data?.returncode,
+    output_tail: data?.output_tail || data?.output || "",
+  });
+  renderActiveJobs();
+  if (
+    data?.job_id &&
+    (data.status === "started" || data.status === "running")
+  ) {
+    scheduleJobPoll();
+  }
+}
+
+document.getElementById("runScoutBtn").addEventListener("click", async () => {
+  const rawMax = Number(document.getElementById("scoutMaxItemsInput").value || 5);
+  const max_items = Math.max(1, Math.min(20, Number.isFinite(rawMax) ? rawMax : 5));
+  const btn = document.getElementById("runScoutBtn");
+  btn.disabled = true;
+  try {
+    const res = await window.secondBrain.request("POST", "/v1/scout/run", {
+      max_items,
+    });
+    if (res.ok && res.data) {
+      registerTriggeredJob(res.data, "scout");
+      showToast("Triggered Web Scout crawl job", "ok");
+      loadScoutQueue();
+    } else {
+      showToast(apiErrorMessage(res, "Web Scout trigger failed"), "danger");
+    }
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+for (const [btnId, jobEndpoint, jobKind] of [
+  ["runRefineryJobBtn", "/v1/jobs/refinery", "refinery"],
+  ["runEditorJobBtn", "/v1/jobs/editor", "editor"],
+  ["runDoctorJobBtn", "/v1/jobs/doctor", "doctor"],
+]) {
+  document.getElementById(btnId).addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const res = await window.secondBrain.request("POST", jobEndpoint, {});
+      if (res.ok && res.data) {
+        registerTriggeredJob(res.data, jobKind);
+        showToast(`Started ${jobKind} job`, "ok");
+      } else {
+        showToast(apiErrorMessage(res, `Failed to start ${jobKind}`), "danger");
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
 
 // ─── TAB 5: IDE Hub ──────────────────────────────────────────────────────────
 
@@ -1953,14 +2663,21 @@ async function loadIdeStatus() {
       btn.type = "button";
       btn.onclick = async () => {
         if (!connected) {
-          const ok = window.confirm(
-            `Cloud Provider Privacy Notice (${label}):\n\n${privacyNotice}\n\nConnect ${label} to your local Second Brain MCP server now?`
-          );
-          if (!ok) return;
+          const conf = await modalCtrl.confirm({
+            title: `Cloud Provider Privacy Notice (${label})`,
+            message: privacyNotice,
+            detail: `Connect ${label} to your local Second Brain MCP server now?`,
+            confirmLabel: `Connect ${label}`,
+          });
+          if (!conf.confirmed) return;
         } else {
-          if (!window.confirm(`Disconnect ${label} from Second Brain MCP?`)) {
-            return;
-          }
+          const conf = await modalCtrl.confirm({
+            title: `Disconnect ${label}`,
+            message: `Disconnect ${label} from Second Brain MCP?`,
+            confirmLabel: "Disconnect",
+            confirmClass: "danger",
+          });
+          if (!conf.confirmed) return;
         }
         btn.disabled = true;
         try {
@@ -2008,23 +2725,8 @@ function renderSystemHostsTable(hostsObj) {
     return;
   }
 
-  const plannerHostSel = document.getElementById("planHostSelect");
-  if (plannerHostSel) {
-    const prev = plannerHostSel.value || "ollama_local";
-    plannerHostSel.replaceChildren();
-    for (const [hid, rule] of entries) {
-      const opt = el(
-        "option",
-        "",
-        `${hid} (${rule.provider || ""}${rule.enabled ? "" : " · disabled"})`
-      );
-      opt.value = hid;
-      plannerHostSel.appendChild(opt);
-    }
-    if ([...plannerHostSel.options].some((o) => o.value === prev)) {
-      plannerHostSel.value = prev;
-    }
-  }
+  populateHostSelectElement(document.getElementById("planHostSelect"), hostsObj);
+  populateHostSelectElement(document.getElementById("chatHostSelect"), hostsObj);
 
   const table = el("table", "data-table");
   const thead = el("thead");
@@ -2118,7 +2820,8 @@ function renderSystemHostsTable(hostsObj) {
     const keyInput = el("input");
     keyInput.type = "text";
     keyInput.value = rule.api_key_env || "";
-    keyInput.placeholder = rule.transport === "local" ? "(local)" : "OPENAI_API_KEY";
+    keyInput.placeholder =
+      rule.transport === "local" ? "(local)" : "OPENAI_API_KEY";
     keyInput.style.width = "125px";
     keyTd.appendChild(keyInput);
     tr.appendChild(keyTd);
@@ -2173,13 +2876,15 @@ async function loadSystemView() {
 
   healthKpis.replaceChildren(el("div", "status-banner", "Loading health..."));
 
-  const [appSt, healthRes, profileRes, hostsRes, fitnessRes] = await Promise.all([
-    window.secondBrain.getStatus(),
-    window.secondBrain.request("GET", "/v1/health"),
-    window.secondBrain.request("GET", "/v1/profile"),
-    window.secondBrain.request("GET", "/v1/hosts"),
-    window.secondBrain.request("GET", "/v1/cognitive/fitness"),
-  ]);
+  const [appSt, healthRes, profileRes, hostsRes, fitnessRes] = await Promise.all(
+    [
+      window.secondBrain.getStatus(),
+      window.secondBrain.request("GET", "/v1/health"),
+      window.secondBrain.request("GET", "/v1/profile"),
+      window.secondBrain.request("GET", "/v1/hosts"),
+      window.secondBrain.request("GET", "/v1/cognitive/fitness"),
+    ]
+  );
 
   document.getElementById("systemVaultPathText").textContent = `Vault folder: ${
     appSt.vaultDir || "(default)"
@@ -2262,9 +2967,13 @@ async function loadSystemView() {
   hwCard.appendChild(modelsRow);
 
   const resolvedHosts =
-    hostsRes.ok && hostsRes.data && typeof hostsRes.data === "object" && !hostsRes.data.error
+    hostsRes.ok &&
+    hostsRes.data &&
+    typeof hostsRes.data === "object" &&
+    !hostsRes.data.error
       ? hostsRes.data.hosts || hostsRes.data
       : profileRes.data?.hosts || {};
+  hostsCache = resolvedHosts;
   renderSystemHostsTable(resolvedHosts);
 
   fitWrap.replaceChildren();
@@ -2278,21 +2987,28 @@ async function loadSystemView() {
     )
   );
   fitKpis.appendChild(
-    makeKpiCard(
-      "Tracked Procedures",
-      (fit.procedure_maturity || []).length
-    )
+    makeKpiCard("Tracked Procedures", (fit.procedure_maturity || []).length)
   );
   fitKpis.appendChild(
     makeKpiCard(
       "Stale / Dormant",
-      (fit.stale_or_dormant_atoms || fit.dormant_atoms || fit.cold_verified_atoms || []).length
+      (
+        fit.stale_or_dormant_atoms ||
+        fit.dormant_atoms ||
+        fit.cold_verified_atoms ||
+        []
+      ).length
     )
   );
   fitKpis.appendChild(
     makeKpiCard(
       "High-Utility Atoms",
-      (fit.top_performing_atoms || fit.high_fitness_atoms || fit.high_utility_verified_atoms || []).length
+      (
+        fit.top_performing_atoms ||
+        fit.high_fitness_atoms ||
+        fit.high_utility_verified_atoms ||
+        []
+      ).length
     )
   );
   fitWrap.appendChild(fitKpis);
@@ -2307,7 +3023,9 @@ async function loadSystemView() {
         el(
           "span",
           "badge",
-          `${p.atom_id || "pending-atom"} · ${p.maturity_stage || p.stage || "candidate"}`
+          `${p.atom_id || "pending-atom"} · ${
+            p.maturity_stage || p.stage || "candidate"
+          }`
         )
       );
     }
@@ -2315,57 +3033,115 @@ async function loadSystemView() {
   }
 }
 
-document.getElementById("refreshSystemBtn").addEventListener("click", loadSystemView);
-document.getElementById("switchVaultBtn").addEventListener("click", async () => {
-  try {
-    const res = await window.secondBrain.switchVault();
-    if (res && res.canceled) return;
-    if (res && res.ok) {
-      showToast(`Switched active vault to ${res.vaultDir}`, "ok");
-      activeNote = null;
-      setNoteBaseline("", "", "");
-      loadNotes();
-      loadSystemView();
-      refreshHealth();
-    } else if (res && res.error) {
-      showToast(res.error, "danger");
+document
+  .getElementById("refreshSystemBtn")
+  .addEventListener("click", loadSystemView);
+document
+  .getElementById("switchVaultBtn")
+  .addEventListener("click", async () => {
+    try {
+      const res = await window.secondBrain.switchVault();
+      if (res && res.canceled) return;
+      if (res && res.ok) {
+        showToast(`Switched active vault to ${res.vaultDir}`, "ok");
+        activeNote = null;
+        setNoteBaseline("", "", "");
+        loadNotes({ append: false });
+        loadSystemView();
+        refreshHealth();
+      } else if (res && res.error) {
+        showToast(res.error, "danger");
+      }
+    } catch (err) {
+      showToast(`Switch vault failed: ${err?.message || String(err)}`, "danger");
     }
-  } catch (err) {
-    showToast(`Switch vault failed: ${err?.message || String(err)}`, "danger");
+  });
+
+function parseOptionalConfidence(rawVal) {
+  const s = String(rawVal || "").trim();
+  if (!s) return undefined;
+  const num = Number(s);
+  if (!Number.isFinite(num) || num < 0 || num > 1) {
+    return NaN;
   }
-});
+  return num;
+}
 
 document.getElementById("recordExpBtn").addEventListener("click", async () => {
   const goal = document.getElementById("expGoalInput").value.trim();
   const result_summary = document.getElementById("expSummaryInput").value.trim();
   if (!goal || !result_summary) {
-    showToast("Goal and Result Summary are required to log an experience.", "warn");
+    showToast(
+      "Goal and Result Summary are required to log an experience.",
+      "warn"
+    );
     return;
   }
+
+  const confBefore = parseOptionalConfidence(
+    document.getElementById("expConfBeforeInput").value
+  );
+  const confAfter = parseOptionalConfidence(
+    document.getElementById("expConfAfterInput").value
+  );
+  if (Number.isNaN(confBefore) || Number.isNaN(confAfter)) {
+    showToast(
+      "Confidence Before / After must be numbers between 0.0 and 1.0.",
+      "warn"
+    );
+    return;
+  }
+
   const payload = {
     goal,
     result_summary,
     success: Boolean(document.getElementById("expSuccessCheck").checked),
     context: parseTags(document.getElementById("expContextInput").value),
+    tools_used: parseTags(document.getElementById("expToolsInput").value),
+    referenced_atoms: parseTags(document.getElementById("expAtomsInput").value),
+    plan: parseLines(document.getElementById("expPlanInput").value),
     actions: parseLines(document.getElementById("expActionsInput").value),
     lessons: parseLines(document.getElementById("expLessonsInput").value),
     candidate_procedure_title:
       document.getElementById("expCandTitleInput").value.trim() || null,
     propose_to_inbox: Boolean(document.getElementById("expProposeCheck").checked),
   };
+
+  const reasoning = document.getElementById("expReasoningInput").value.trim();
+  if (reasoning) payload.reasoning_summary = reasoning;
+  if (confBefore !== undefined) payload.confidence_before = confBefore;
+  if (confAfter !== undefined) payload.confidence_after = confAfter;
+  const reflection = document.getElementById("expReflectionInput").value.trim();
+  if (reflection) payload.reflection = reflection;
+
   const res = await window.secondBrain.api(
     "POST",
     "/v1/cognitive/experiences",
     payload
   );
   if (res.ok) {
-    document.getElementById("expGoalInput").value = "";
-    document.getElementById("expSummaryInput").value = "";
-    document.getElementById("expActionsInput").value = "";
-    document.getElementById("expLessonsInput").value = "";
-    document.getElementById("expCandTitleInput").value = "";
+    for (const id of [
+      "expGoalInput",
+      "expContextInput",
+      "expToolsInput",
+      "expAtomsInput",
+      "expSummaryInput",
+      "expReasoningInput",
+      "expPlanInput",
+      "expActionsInput",
+      "expLessonsInput",
+      "expConfBeforeInput",
+      "expConfAfterInput",
+      "expReflectionInput",
+      "expCandTitleInput",
+    ]) {
+      const node = document.getElementById(id);
+      if (node) node.value = "";
+    }
     showToast(
-      `Recorded experience ${res.data?.filename || res.data?.experience_id || ""}`,
+      `Recorded experience ${
+        res.data?.filename || res.data?.experience_id || ""
+      }`,
       "ok"
     );
   } else {
@@ -2374,6 +3150,116 @@ document.getElementById("recordExpBtn").addEventListener("click", async () => {
 });
 
 // ─── TAB 7: Playbooks & Grounded Executive Planner ───────────────────────────
+
+function syncPlaybookUpdateModeUi() {
+  const expectedSha = document
+    .getElementById("pbExpectedShaInput")
+    .value.trim();
+  const banner = document.getElementById("pbUpdateModeBanner");
+  const resetBtn = document.getElementById("pbResetUpdateBtn");
+  const promoteBtn = document.getElementById("promotePlaybookBtn");
+  const heading = document.getElementById("pbFormHeading");
+
+  if (expectedSha) {
+    const idVal = document.getElementById("pbIdInput").value.trim() || "playbook";
+    banner.style.display = "block";
+    banner.textContent = `CAS Update Mode: updating '${idVal}' anchored to expected_playbook_sha256=${shortSha(
+      expectedSha
+    )} (409 Conflict if modified concurrently).`;
+    resetBtn.style.display = "inline-block";
+    promoteBtn.textContent = "Update Playbook (CAS)";
+    heading.textContent = `Update / Re-Promote Existing Skill Playbook (${idVal})`;
+  } else {
+    banner.style.display = "none";
+    banner.textContent = "";
+    resetBtn.style.display = "none";
+    promoteBtn.textContent = "Promote Playbook";
+    heading.textContent =
+      "Promote Verified Procedural Atom(s) to Skill Playbook";
+  }
+}
+
+document
+  .getElementById("pbExpectedShaInput")
+  .addEventListener("input", syncPlaybookUpdateModeUi);
+
+document.getElementById("pbResetUpdateBtn").addEventListener("click", () => {
+  document.getElementById("pbExpectedShaInput").value = "";
+  syncPlaybookUpdateModeUi();
+});
+
+async function ensureBackingAtomCheckbox(atomId) {
+  const wrap = document.getElementById("pbBackingSelectWrap");
+  const cleanFn = atomId.endsWith(".md") ? atomId : `${atomId}.md`;
+  const existing = [
+    ...wrap.querySelectorAll("input[type='checkbox']"),
+  ].find(
+    (c) => c.dataset.atomId === atomId || c.dataset.atomId === cleanFn
+  );
+  if (existing) {
+    existing.checked = true;
+    return;
+  }
+  try {
+    const res = await window.secondBrain.api(
+      "GET",
+      `/v1/atoms/${encodeURIComponent(cleanFn)}`
+    );
+    const atom = res.ok && res.data ? res.data.atom || res.data : null;
+    if (atom && atom.sha256) {
+      const chkLbl = el("label", "inline-check");
+      chkLbl.style.marginRight = "14px";
+      const chk = document.createElement("input");
+      chk.type = "checkbox";
+      chk.checked = true;
+      chk.dataset.atomId = cleanFn;
+      chk.dataset.sha = atom.sha256;
+      chkLbl.appendChild(chk);
+      chkLbl.appendChild(
+        el("span", "", `${cleanFn} (${shortSha(atom.sha256)})`)
+      );
+      wrap.appendChild(chkLbl);
+    }
+  } catch {}
+}
+
+async function prefillPlaybookForUpdate(pb) {
+  const prefill = PbHelper.buildPlaybookUpdatePrefill(pb);
+  if (!prefill) return;
+
+  document.getElementById("pbIdInput").value = prefill.playbookId;
+  document.getElementById("pbTitleInput").value = prefill.title;
+  document.getElementById("pbTriggerInput").value = prefill.trigger;
+  document.getElementById("pbPreconditionsInput").value =
+    prefill.preconditionsText;
+  document.getElementById("pbStepsInput").value = prefill.stepsText;
+  document.getElementById("pbExpectedOutputsInput").value =
+    prefill.expectedOutputsText;
+  document.getElementById("pbRollbackInput").value =
+    prefill.failureRecoveryText;
+  document.getElementById("pbExpectedShaInput").value =
+    prefill.expectedPlaybookSha256;
+
+  document
+    .querySelectorAll("#pbBackingSelectWrap input[type='checkbox']")
+    .forEach((chk) => {
+      chk.checked = false;
+    });
+  for (const aid of prefill.backingAtoms) {
+    await ensureBackingAtomCheckbox(aid);
+  }
+
+  syncPlaybookUpdateModeUi();
+  const promoteCard = document.getElementById("playbookPromoteCard");
+  if (promoteCard && typeof promoteCard.scrollIntoView === "function") {
+    promoteCard.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+  showToast(
+    `Loaded playbook '${prefill.playbookId}' into CAS Update form`,
+    "info",
+    3000
+  );
+}
 
 function buildPlaybookCard(pb) {
   const card = el("div", "card");
@@ -2393,6 +3279,9 @@ function buildPlaybookCard(pb) {
         : `INACTIVE (${pb.reason || pb.status || "deprecated"})`
     )
   );
+  if (pb.sha256) {
+    head.appendChild(el("span", "badge mono", `sha:${shortSha(pb.sha256)}`));
+  }
   card.appendChild(head);
 
   card.appendChild(
@@ -2447,8 +3336,13 @@ function buildPlaybookCard(pb) {
   }
   card.appendChild(atomsRow);
 
+  const actRow = el("div", "toolbar");
+  const editUpdateBtn = el("button", "btn sm primary", "Edit / Update");
+  editUpdateBtn.type = "button";
+  editUpdateBtn.onclick = () => prefillPlaybookForUpdate(pb);
+  actRow.appendChild(editUpdateBtn);
+
   if (isActive && pb.filename) {
-    const depRow = el("div", "toolbar");
     const reasonInput = el("input");
     reasonInput.type = "text";
     reasonInput.placeholder = "Deprecation rationale...";
@@ -2458,9 +3352,15 @@ function buildPlaybookCard(pb) {
     depBtn.onclick = async () => {
       const rationale =
         reasonInput.value.trim() || "Deprecated via Desktop Playbook Manager";
-      if (!window.confirm(`Deprecate playbook "${pb.title || pb.filename}"?`)) {
-        return;
-      }
+      const conf = await modalCtrl.confirm({
+        title: "Deprecate Playbook",
+        message: `Deprecate playbook "${pb.title || pb.filename}"?`,
+        detail: `Rationale: ${rationale}`,
+        confirmLabel: "Deprecate Playbook",
+        confirmClass: "danger",
+      });
+      if (!conf.confirmed) return;
+
       const res = await window.secondBrain.api(
         "POST",
         `/v1/playbooks/${encodeURIComponent(pb.filename)}/deprecate`,
@@ -2477,38 +3377,39 @@ function buildPlaybookCard(pb) {
         showToast(apiErrorMessage(res, "Deprecate playbook failed"), "danger");
       }
     };
-    depRow.appendChild(reasonInput);
-    depRow.appendChild(depBtn);
-    card.appendChild(depRow);
+    actRow.appendChild(reasonInput);
+    actRow.appendChild(depBtn);
   }
+  card.appendChild(actRow);
 
   return card;
 }
 
 function prefillFromCandidate(cand) {
   if (!cand) return;
-  const stem = String(cand.atom_id || "")
-    .replace(/\.md$/i, "")
-    .replace(/[^a-z0-9-]+/gi, "-")
-    .toLowerCase();
   const idInput = document.getElementById("pbIdInput");
   const titleInput = document.getElementById("pbTitleInput");
   const stepsInput = document.getElementById("pbStepsInput");
-  if (!idInput.value.trim() && stem) idInput.value = `pb-${stem}`.slice(0, 48);
-  if (!titleInput.value.trim() && stem) {
-    titleInput.value = stem.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-  }
-  const lines = String(cand.claim || "")
-    .split(/\r?\n|(?:;\s+)/)
-    .map((l) => l.replace(/^(?:\d+[.)]\s*|[-*]\s*)/, "").trim())
-    .filter(Boolean);
-  stepsInput.value = lines.join("\n");
+
+  const result = PbHelper.buildPlaybookPrefillFromCandidate(cand, {
+    playbookId: idInput.value,
+    title: titleInput.value,
+  });
+
+  idInput.value = result.playbookId;
+  titleInput.value = result.title;
+  stepsInput.value = result.stepsText;
+
   document
     .querySelectorAll("#pbBackingSelectWrap input[type='checkbox']")
     .forEach((chk) => {
       if (chk.dataset.atomId === cand.atom_id) chk.checked = true;
     });
-  showToast(`Pre-filled steps from ${cand.atom_id}`, "ok", 2600);
+  showToast(
+    `Pre-filled ${result.steps.length} grounding-valid step(s) from ${cand.atom_id}`,
+    "ok",
+    2800
+  );
 }
 
 async function loadPlannerView() {
@@ -2524,29 +3425,23 @@ async function loadPlannerView() {
   ]);
 
   if (profRes.ok && profRes.data?.hosts) {
-    const plannerHostSel = document.getElementById("planHostSelect");
-    const prev = plannerHostSel.value || "ollama_local";
-    plannerHostSel.replaceChildren();
-    for (const [hid, rule] of Object.entries(profRes.data.hosts)) {
-      const opt = el(
-        "option",
-        "",
-        `${hid}${rule.enabled ? "" : " (disabled)"}`
-      );
-      opt.value = hid;
-      plannerHostSel.appendChild(opt);
-    }
-    if ([...plannerHostSel.options].some((o) => o.value === prev)) {
-      plannerHostSel.value = prev;
-    }
+    populateHostSelectElement(
+      document.getElementById("planHostSelect"),
+      profRes.data.hosts
+    );
   }
 
   const grid = document.getElementById("playbooksGrid");
   grid.replaceChildren();
   const items = pbRes.data?.playbooks || pbRes.data?.items || [];
+  playbooksCache = items;
   if (!items.length) {
     grid.appendChild(
-      el("div", "status-banner", "No skill playbooks registered for this scope yet.")
+      el(
+        "div",
+        "status-banner",
+        "No skill playbooks registered for this scope yet."
+      )
     );
   } else {
     for (const pb of items) {
@@ -2559,7 +3454,9 @@ async function loadPlannerView() {
   candGrid.replaceChildren();
   backingWrap.replaceChildren();
 
-  let candidates = candRes.ok ? candRes.data?.candidates || [] : [];
+  let candidates = candRes.ok
+    ? candRes.data?.candidates || candRes.data?.items || []
+    : [];
   if (!candidates.length) {
     const atomsRes = await window.secondBrain.api("GET", "/v1/atoms?limit=200");
     const procAtoms = (atomsRes.data?.items || []).filter(
@@ -2628,7 +3525,9 @@ async function loadPlannerView() {
     chk.dataset.atomId = cand.atom_id;
     chk.dataset.sha = cand.sha256 || "";
     chkLbl.appendChild(chk);
-    chkLbl.appendChild(el("span", "", `${cand.atom_id} (${shortSha(cand.sha256)})`));
+    chkLbl.appendChild(
+      el("span", "", `${cand.atom_id} (${shortSha(cand.sha256)})`)
+    );
     backingWrap.appendChild(chkLbl);
   }
 }
@@ -2761,7 +3660,9 @@ function renderExecutivePlanOutput(outEl, plan) {
         card.appendChild(el("div", "", ea.claim));
       }
       if (ea.evidence || ea.quote) {
-        card.appendChild(el("div", "claim-quote", `"${ea.evidence || ea.quote}"`));
+        card.appendChild(
+          el("div", "claim-quote", `"${ea.evidence || ea.quote}"`)
+        );
       }
       evWrap.appendChild(card);
     }
@@ -2810,7 +3711,9 @@ async function runExecutivePlan() {
     });
     if (res.ok && res.data) {
       banner.textContent = res.data.plan_ready
-        ? `Plan assembled (${res.data.mode_used || mode}) — ${(res.data.steps || []).length} grounded step(s).`
+        ? `Plan assembled (${res.data.mode_used || mode}) — ${
+            (res.data.steps || []).length
+          } grounded step(s).`
         : "Abstained: insufficient verified playbooks/atoms for this goal.";
       renderExecutivePlanOutput(out, res.data);
     } else {
@@ -2857,8 +3760,17 @@ document
     const title = document.getElementById("pbTitleInput").value.trim();
     const trigger = document.getElementById("pbTriggerInput").value.trim();
     const steps = parseLines(document.getElementById("pbStepsInput").value);
+    const expected_playbook_sha256 = document
+      .getElementById("pbExpectedShaInput")
+      .value.trim();
 
-    if (!backing_atoms.length || !playbook_id || !title || !trigger || !steps.length) {
+    if (
+      !backing_atoms.length ||
+      !playbook_id ||
+      !title ||
+      !trigger ||
+      !steps.length
+    ) {
       showToast(
         "Select at least one backing atom and fill Playbook ID, Title, Trigger, and Steps.",
         "warn"
@@ -2866,7 +3778,7 @@ document
       return;
     }
 
-    const res = await window.secondBrain.api("POST", "/v1/playbooks/promote", {
+    const payload = PbHelper.buildPlaybookPromotePayload({
       playbook_id,
       title,
       backing_atoms,
@@ -2884,7 +3796,9 @@ document
       actor: "desktop_owner",
       rationale:
         document.getElementById("pbRationaleInput").value.trim() ||
-        "Owner promoted via Desktop App",
+        (expected_playbook_sha256
+          ? "Owner updated playbook via Desktop App"
+          : "Owner promoted via Desktop App"),
       allow_early_owner_override: Boolean(
         document.getElementById("pbAllowEarlyCheck").checked
       ),
@@ -2894,50 +3808,224 @@ document
       allow_multi_project: Boolean(
         document.getElementById("pbAllowMultiProjCheck").checked
       ),
+      expected_playbook_sha256,
     });
 
+    const res = await window.secondBrain.api(
+      "POST",
+      "/v1/playbooks/promote",
+      payload
+    );
+
     if (res.ok) {
-      showToast(`Promoted Skill Playbook: ${title}`, "ok");
+      const wasUpdate = Boolean(expected_playbook_sha256);
+      document.getElementById("pbExpectedShaInput").value = "";
+      syncPlaybookUpdateModeUi();
+      showToast(
+        wasUpdate
+          ? `Updated Skill Playbook: ${title} (sha:${shortSha(res.data?.sha256)})`
+          : `Promoted Skill Playbook: ${title}`,
+        "ok"
+      );
       loadPlannerView();
     } else {
-      showToast(apiErrorMessage(res, "Playbook promotion failed"), "danger");
+      const errMsg = apiErrorMessage(res, "Playbook promotion failed");
+      if (res.status === 409) {
+        const banner = document.getElementById("pbUpdateModeBanner");
+        banner.style.display = "block";
+        banner.className = "status-banner banner-danger";
+        banner.textContent = `${errMsg} — Click 'Refresh Playbooks' and 'Edit / Update' to load the latest SHA-256.`;
+      }
+      showToast(errMsg, "danger");
     }
   });
 
-document.getElementById("runPlanBtn").addEventListener("click", runExecutivePlan);
+document
+  .getElementById("runPlanBtn")
+  .addEventListener("click", runExecutivePlan);
 document
   .getElementById("refreshPlaybooksBtn")
   .addEventListener("click", loadPlannerView);
 
-// ─── TAB 8: Merkle Ledger, Contradiction Radar & Time-Travel Snapshots ───────
+// ─── TAB 8: Merkle Ledger, History, Leaves, Source Audit, Radar & Snapshots ──
+
+function renderLedgerCheckpointHistoryTable(entries) {
+  const wrap = document.getElementById("ledgerHistoryWrap");
+  if (!wrap) return;
+  wrap.replaceChildren();
+  if (!Array.isArray(entries) || !entries.length) {
+    wrap.appendChild(
+      el("div", "note-item-meta", "No signed Merkle checkpoints committed yet.")
+    );
+    return;
+  }
+
+  const title = el(
+    "div",
+    "field-label",
+    `Signed Checkpoint History (${entries.length}):`
+  );
+  title.style.marginBottom = "4px";
+  wrap.appendChild(title);
+
+  const tbl = el("table", "data-table");
+  const thead = el("thead");
+  const htr = el("tr");
+  for (const col of [
+    "Seq",
+    "Timestamp",
+    "Actor",
+    "Note",
+    "Leaves (Atoms / Playbooks)",
+    "Merkle Root",
+    "Entry SHA-256",
+  ]) {
+    htr.appendChild(el("th", "", col));
+  }
+  thead.appendChild(htr);
+  tbl.appendChild(thead);
+
+  const tbody = el("tbody");
+  for (const entry of entries) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "kpi-sub", `#${entry.seq ?? "?"}`));
+    tr.appendChild(el("td", "note-item-meta", entry.timestamp || entry.created_at || ""));
+    tr.appendChild(el("td", "", entry.actor || "owner"));
+    tr.appendChild(el("td", "", entry.note || "—"));
+    tr.appendChild(
+      el(
+        "td",
+        "",
+        `${entry.leaf_count ?? 0} (${entry.approved_atoms ?? 0} / ${
+          entry.accepted_playbooks ?? 0
+        })`
+      )
+    );
+    tr.appendChild(el("td", "kpi-sub", shortSha(entry.merkle_root)));
+    tr.appendChild(el("td", "kpi-sub", shortSha(entry.entry_sha256)));
+    tbody.appendChild(tr);
+  }
+  tbl.appendChild(tbody);
+  wrap.appendChild(tbl);
+}
+
+async function loadLedgerHistoryPage({ append = false, fallbackEntries = [] } = {}) {
+  if (!append) {
+    ledgerHistoryPaginator.reset();
+  }
+  const histUrl = PageHelper.buildPaginatedPath("/v1/ledger/history", {
+    limit: ledgerHistoryPaginator.getPageSize(),
+    offset: ledgerHistoryPaginator.nextOffset(),
+  });
+  const histRes = await window.secondBrain.request("GET", histUrl);
+  if (histRes.ok && histRes.data) {
+    ledgerHistoryPaginator.applyPage(histRes.data, {
+      append,
+      preferredKey: "entries",
+    });
+  } else if (!append && Array.isArray(fallbackEntries) && fallbackEntries.length) {
+    ledgerHistoryPaginator.applyPage(
+      {
+        items: fallbackEntries,
+        total: fallbackEntries.length,
+        offset: 0,
+      },
+      { append: false }
+    );
+  }
+
+  renderLedgerCheckpointHistoryTable(ledgerHistoryPaginator.getItems());
+  PageHelper.renderPaginationBar(
+    document.getElementById("ledgerHistoryPaginationBar"),
+    ledgerHistoryPaginator,
+    () => loadLedgerHistoryPage({ append: true }),
+    { noun: "checkpoints" }
+  );
+}
+
+async function loadLedgerLeavesPage({ append = false } = {}) {
+  const atomSel = document.getElementById("proveAtomSelect");
+  const prevVal = atomSel.value;
+  if (!append) {
+    ledgerLeavesPaginator.reset();
+  }
+
+  const leavesUrl = PageHelper.buildPaginatedPath("/v1/ledger/leaves", {
+    limit: ledgerLeavesPaginator.getPageSize(),
+    offset: ledgerLeavesPaginator.nextOffset(),
+  });
+  const leavesRes = await window.secondBrain.request("GET", leavesUrl);
+
+  if (leavesRes.ok && leavesRes.data) {
+    ledgerLeavesPaginator.applyPage(leavesRes.data, {
+      append,
+      preferredKey: "items",
+    });
+  } else if (!append) {
+    const [atomsRes, pbRes] = await Promise.all([
+      window.secondBrain.request("GET", "/v1/atoms?limit=200"),
+      window.secondBrain.request("GET", "/v1/playbooks"),
+    ]);
+    const atomLeaves = (atomsRes.data?.items || [])
+      .filter((a) => a.verified || a.review_status === "accepted")
+      .map((a) => ({ rel_path: `2-atoms/${a.filename}`, kind: "atom" }));
+    const pbLeaves = (pbRes.data?.playbooks || pbRes.data?.items || [])
+      .filter((p) => p.valid !== false)
+      .map((p) => ({
+        rel_path: `5-playbooks/${p.filename || `${p.playbook_id}.md`}`,
+        kind: "playbook",
+      }));
+    const combined = [...atomLeaves, ...pbLeaves];
+    ledgerLeavesPaginator.applyPage(
+      { items: combined, total: combined.length, offset: 0 },
+      { append: false }
+    );
+  }
+
+  atomSel.replaceChildren();
+  const placeholderOpt = el(
+    "option",
+    "",
+    "-- Select approved atom or playbook leaf --"
+  );
+  placeholderOpt.value = "";
+  atomSel.appendChild(placeholderOpt);
+
+  for (const rawLeaf of ledgerLeavesPaginator.getItems()) {
+    const norm = PageHelper.normalizeLedgerLeafOption(rawLeaf);
+    if (!norm) continue;
+    const opt = el("option", "", norm.label);
+    opt.value = norm.value;
+    atomSel.appendChild(opt);
+  }
+  if (prevVal && [...atomSel.options].some((o) => o.value === prevVal)) {
+    atomSel.value = prevVal;
+  }
+
+  const moreBtn = document.getElementById("loadMoreLeavesBtn");
+  if (moreBtn) {
+    moreBtn.style.display = ledgerLeavesPaginator.canLoadMore()
+      ? "inline-block"
+      : "none";
+  }
+}
 
 async function loadLedgerStatus() {
   const kpiGrid = document.getElementById("ledgerKpiGrid");
   const rootsBar = document.getElementById("ledgerRootsBar");
-  const atomSel = document.getElementById("proveAtomSelect");
 
-  const [res, atomsRes] = await Promise.all([
+  const [res] = await Promise.all([
     window.secondBrain.request("GET", "/v1/ledger/verify"),
-    window.secondBrain.request("GET", "/v1/atoms?limit=200"),
+    loadLedgerLeavesPage({ append: false }),
   ]);
-
-  const verifiedAtoms = (atomsRes.data?.items || []).filter(
-    (a) => a.verified || a.review_status === "accepted"
-  );
-  atomSel.replaceChildren();
-  const placeholderOpt = el("option", "", "-- Select verified atom --");
-  placeholderOpt.value = "";
-  atomSel.appendChild(placeholderOpt);
-  for (const a of verifiedAtoms) {
-    const opt = el("option", "", a.filename);
-    opt.value = a.filename;
-    atomSel.appendChild(opt);
-  }
 
   kpiGrid.replaceChildren();
   rootsBar.replaceChildren();
   if (!res.ok || !res.data) {
-    rootsBar.textContent = apiErrorMessage(res, "Failed to verify Merkle ledger");
+    rootsBar.textContent = apiErrorMessage(
+      res,
+      "Failed to verify Merkle ledger"
+    );
     return;
   }
   const d = res.data;
@@ -2955,12 +4043,8 @@ async function loadLedgerStatus() {
   kpiGrid.appendChild(
     makeKpiCard("Live Leaves", d.live_leaf_count ?? d.leaf_count ?? 0)
   );
-  kpiGrid.appendChild(
-    makeKpiCard("Approved Atoms", d.approved_atoms ?? verifiedAtoms.length)
-  );
-  kpiGrid.appendChild(
-    makeKpiCard("Playbooks", d.accepted_playbooks ?? 0)
-  );
+  kpiGrid.appendChild(makeKpiCard("Approved Atoms", d.approved_atoms ?? 0));
+  kpiGrid.appendChild(makeKpiCard("Playbooks", d.accepted_playbooks ?? 0));
   kpiGrid.appendChild(
     makeKpiCard(
       "Synced w/ Head",
@@ -2984,13 +4068,145 @@ async function loadLedgerStatus() {
       rootsBar.appendChild(el("div", "status-banner banner-danger", err));
     }
   }
+
+  await loadLedgerHistoryPage({
+    append: false,
+    fallbackEntries: Array.isArray(d.entries) ? d.entries : [],
+  });
 }
+
+document
+  .getElementById("loadMoreLeavesBtn")
+  .addEventListener("click", () => loadLedgerLeavesPage({ append: true }));
 
 document.getElementById("proveAtomSelect").addEventListener("change", (e) => {
   if (e.target.value) {
     document.getElementById("proveAtomInput").value = e.target.value;
   }
 });
+
+// Source Audit & 1-Click Demote Stale Approvals
+async function loadSourceAudit() {
+  const sumEl = document.getElementById("sourceAuditSummary");
+  const tableWrap = document.getElementById("sourceAuditTableWrap");
+  const demoteBtn = document.getElementById("demoteStaleSourcesBtn");
+  if (!sumEl || !tableWrap) return;
+
+  const res = await window.secondBrain.request("GET", "/v1/audit/sources");
+  tableWrap.replaceChildren();
+  if (!res.ok || !res.data) {
+    sumEl.className = "status-banner banner-danger";
+    sumEl.textContent = apiErrorMessage(res, "Source anchor audit failed");
+    if (demoteBtn) demoteBtn.disabled = true;
+    return;
+  }
+
+  const reports = res.data.reports || res.data.items || [];
+  const staleCount = Number(
+    res.data.stale_count ?? reports.filter((r) => r.stale_approval).length
+  );
+
+  if (demoteBtn) {
+    demoteBtn.disabled = staleCount === 0;
+    demoteBtn.textContent =
+      staleCount > 0
+        ? `Demote Stale Approvals (${staleCount})`
+        : "Demote Stale Approvals (0 stale)";
+  }
+
+  sumEl.className = `status-banner ${
+    staleCount > 0 ? "banner-warn" : "banner-ok"
+  }`;
+  sumEl.textContent =
+    staleCount > 0
+      ? `Detected ${staleCount} stale source-anchored approval(s) across ${reports.length} audited atom(s). Review and click 'Demote Stale Approvals' to re-gate.`
+      : `All ${reports.length} audited atom source anchors are current (0 stale approvals).`;
+
+  const staleOrInteresting = reports.filter(
+    (r) => r.stale_approval || (r.action && r.action !== "ok" && r.action !== "none")
+  );
+  const displayRows = staleOrInteresting.length
+    ? staleOrInteresting
+    : reports.slice(0, 15);
+  if (!displayRows.length) return;
+
+  const tbl = el("table", "data-table");
+  const thead = el("thead");
+  const htr = el("tr");
+  for (const col of ["Atom", "Stale Approval", "Status / Action", "Inspect"]) {
+    htr.appendChild(el("th", "", col));
+  }
+  thead.appendChild(htr);
+  tbl.appendChild(thead);
+
+  const tbody = el("tbody");
+  for (const rep of displayRows) {
+    const fn = rep.filename || rep.atom_id || "";
+    const tr = el("tr");
+    tr.appendChild(el("td", "kpi-sub", fn));
+    tr.appendChild(
+      el(
+        "td",
+        "",
+        rep.stale_approval ? "STALE (Drift Detected)" : "Valid"
+      )
+    );
+    tr.appendChild(
+      el(
+        "td",
+        "note-item-meta",
+        rep.action || rep.reason || rep.status || "verified"
+      )
+    );
+    const actTd = el("td");
+    if (fn) {
+      const btn = el("button", "btn sm", "Inspect");
+      btn.type = "button";
+      btn.onclick = () => openAtomInspectorModal(fn);
+      actTd.appendChild(btn);
+    }
+    tr.appendChild(actTd);
+    tbody.appendChild(tr);
+  }
+  tbl.appendChild(tbody);
+  tableWrap.appendChild(tbl);
+}
+
+document
+  .getElementById("refreshSourceAuditBtn")
+  .addEventListener("click", loadSourceAudit);
+
+document
+  .getElementById("demoteStaleSourcesBtn")
+  .addEventListener("click", async () => {
+    const defaultActor =
+      document.getElementById("auditActorInput").value.trim() || "desktop_owner";
+    const conf = await modalCtrl.confirm({
+      title: "Demote Stale Source Approvals",
+      message:
+        "Demote all approved atoms whose source evidence byte-offsets or SHA-256 anchors have drifted? Demoted atoms return to the owner review queue.",
+      confirmLabel: "Demote Stale Approvals",
+      confirmClass: "warn",
+      actorDefault: defaultActor,
+      actorLabel: "Owner Actor (recorded in immutable audit log)",
+    });
+    if (!conf.confirmed) return;
+
+    const actor = conf.actor || defaultActor;
+    document.getElementById("auditActorInput").value = actor;
+    const res = await window.secondBrain.api(
+      "POST",
+      "/v1/audit/sources/demote-stale",
+      { actor }
+    );
+    if (res.ok && res.data) {
+      const count = res.data.demoted_count ?? (res.data.demoted || []).length;
+      showToast(`Demoted ${count} stale approval(s)`, "ok");
+      await Promise.all([loadSourceAudit(), loadLedgerStatus(), refreshHealth()]);
+    } else {
+      showToast(apiErrorMessage(res, "Demote stale approvals failed"), "danger");
+    }
+  });
 
 const HEX64_RE = /^[0-9a-f]{64}$/;
 
@@ -3014,7 +4230,10 @@ async function verifyMerkleProofWebCrypto(proof) {
   const fileSha = String(proof.file_sha256 || "").toLowerCase();
   const leafSha = String(proof.leaf_sha256 || "").toLowerCase();
   const expectedRoot = String(proof.merkle_root || "").toLowerCase();
-  const siblings = proof.siblings === undefined || proof.siblings === null ? [] : proof.siblings;
+  const siblings =
+    proof.siblings === undefined || proof.siblings === null
+      ? []
+      : proof.siblings;
 
   if (
     !relPath ||
@@ -3046,7 +4265,9 @@ async function verifyMerkleProofWebCrypto(proof) {
   let chosenScheme = null;
   let computedLeaf = "";
   for (const sc of schemes) {
-    const cand = await sha256HexWebCrypto(`${sc.leafPrefix}${relPath}:${fileSha}`);
+    const cand = await sha256HexWebCrypto(
+      `${sc.leafPrefix}${relPath}:${fileSha}`
+    );
     if (cand === leafSha) {
       chosenScheme = sc;
       computedLeaf = cand;
@@ -3056,9 +4277,9 @@ async function verifyMerkleProofWebCrypto(proof) {
   if (!chosenScheme) {
     computedLeaf = await sha256HexWebCrypto(`leaf:${relPath}:${fileSha}`);
     trace.push(
-      `Leaf MISMATCH: SHA256("leaf:${relPath}:${shortSha(fileSha)}…") = ${shortSha(
-        computedLeaf
-      )} != ${shortSha(leafSha)}`
+      `Leaf MISMATCH: SHA256("leaf:${relPath}:${shortSha(
+        fileSha
+      )}…") = ${shortSha(computedLeaf)} != ${shortSha(leafSha)}`
     );
     return { valid: false, reason: "Leaf preimage digest mismatch.", trace };
   }
@@ -3078,10 +4299,16 @@ async function verifyMerkleProofWebCrypto(proof) {
     const pos = String(step.position || "");
     const sib = String(step.sha256 || "").toLowerCase();
     if (!HEX64_RE.test(sib)) {
-      return { valid: false, reason: `Invalid sibling hash at level ${i}.`, trace };
+      return {
+        valid: false,
+        reason: `Invalid sibling hash at level ${i}.`,
+        trace,
+      };
     }
     if (pos === "right") {
-      const next = await sha256HexWebCrypto(`${chosenScheme.nodePrefix}${cur}:${sib}`);
+      const next = await sha256HexWebCrypto(
+        `${chosenScheme.nodePrefix}${cur}:${sib}`
+      );
       trace.push(
         `Level ${i} (pair w/ right ${shortSha(sib)}): SHA256("${
           chosenScheme.nodePrefix
@@ -3089,7 +4316,9 @@ async function verifyMerkleProofWebCrypto(proof) {
       );
       cur = next;
     } else if (pos === "left") {
-      const next = await sha256HexWebCrypto(`${chosenScheme.nodePrefix}${sib}:${cur}`);
+      const next = await sha256HexWebCrypto(
+        `${chosenScheme.nodePrefix}${sib}:${cur}`
+      );
       trace.push(
         `Level ${i} (pair w/ left ${shortSha(sib)}): SHA256("${
           chosenScheme.nodePrefix
@@ -3099,9 +4328,15 @@ async function verifyMerkleProofWebCrypto(proof) {
     } else if (pos === "odd") {
       if (sib !== cur) {
         trace.push(
-          `Level ${i} (odd duplicate MISMATCH): sibling ${shortSha(sib)} != current ${shortSha(cur)}`
+          `Level ${i} (odd duplicate MISMATCH): sibling ${shortSha(
+            sib
+          )} != current ${shortSha(cur)}`
         );
-        return { valid: false, reason: `Odd node mismatch at level ${i}.`, trace };
+        return {
+          valid: false,
+          reason: `Odd node mismatch at level ${i}.`,
+          trace,
+        };
       }
       const next = await sha256HexWebCrypto(`${chosenScheme.oddPrefix}${cur}`);
       trace.push(
@@ -3204,10 +4439,8 @@ async function quickRadarAtomTransition(filename, action) {
   );
   let sha = getRes.data?.sha256 || getRes.data?.atom?.sha256 || "";
   if (!sha) {
-    const listRes = await window.secondBrain.api("GET", "/v1/atoms?limit=300");
     sha =
-      (listRes.data?.items || []).find((a) => a.filename === filename)?.sha256 ||
-      "";
+      allLoadedAtoms.find((a) => a.filename === filename)?.sha256 || "";
   }
   if (!sha) {
     showToast(`Could not resolve CAS sha256 for ${filename}`, "danger");
@@ -3224,19 +4457,24 @@ async function quickRadarAtomTransition(filename, action) {
     loadLedgerStatus();
     refreshHealth();
   } else {
-    showToast(apiErrorMessage(res, `Failed to ${action} ${filename}`), "danger");
+    showToast(
+      apiErrorMessage(res, `Failed to ${action} ${filename}`),
+      "danger"
+    );
   }
 }
 
 async function openGraphNeighborsModal(filenameA, filenameB = null) {
   const targets = [filenameA, filenameB].filter(Boolean);
   if (!targets.length) return;
-  modalTitleEl.textContent = `Graph Neighbors: ${targets.join(" & ")}`;
-  modalBodyEl.replaceChildren(
-    el("div", "status-banner", "Loading knowledge graph neighborhood...")
-  );
-  modalFooterEl.replaceChildren();
-  modalBackdrop.classList.add("open");
+  modalCtrl.open({
+    title: `Graph Neighbors: ${targets.join(" & ")}`,
+    renderBody(body) {
+      body.appendChild(
+        el("div", "status-banner", "Loading knowledge graph neighborhood...")
+      );
+    },
+  });
 
   const responses = await Promise.all(
     targets.map((fn) =>
@@ -3254,7 +4492,11 @@ async function openGraphNeighborsModal(filenameA, filenameB = null) {
     sec.appendChild(el("strong", "", `Neighborhood for ${fn}`));
     if (!res.ok || !res.data) {
       sec.appendChild(
-        el("div", "note-item-meta", apiErrorMessage(res, "Could not load neighbors"))
+        el(
+          "div",
+          "note-item-meta",
+          apiErrorMessage(res, "Could not load neighbors")
+        )
       );
       modalBodyEl.appendChild(sec);
       return;
@@ -3269,14 +4511,16 @@ async function openGraphNeighborsModal(filenameA, filenameB = null) {
       )
     );
     if (!edges.length && !neighbors.length) {
-      sec.appendChild(el("div", "note-item-meta", "No graph edges connected to this atom."));
+      sec.appendChild(
+        el("div", "note-item-meta", "No graph edges connected to this atom.")
+      );
     } else {
       const bar = el("div", "backlinks-bar");
       bar.style.marginTop = "6px";
       for (const e of edges.slice(0, 20)) {
-        const desc = `${e.from || ""} --[${e.kind || e.relation || "edge"}]--> ${
-          e.to || ""
-        }`;
+        const desc = `${e.from || ""} --[${
+          e.kind || e.relation || "edge"
+        }]--> ${e.to || ""}`;
         bar.appendChild(el("span", "badge mono", desc));
       }
       for (const nb of neighbors.slice(0, 20)) {
@@ -3395,7 +4639,11 @@ async function scanContradictions() {
 
       if ((al.shared_terms || []).length) {
         card.appendChild(
-          el("div", "note-item-meta", `Shared terms: ${al.shared_terms.join(", ")}`)
+          el(
+            "div",
+            "note-item-meta",
+            `Shared terms: ${al.shared_terms.join(", ")}`
+          )
         );
       }
 
@@ -3417,7 +4665,8 @@ async function scanContradictions() {
         btnRow.style.marginTop = "6px";
         const qBtn = el("button", "btn sm warn", `Quarantine ${label}`);
         qBtn.type = "button";
-        qBtn.onclick = () => quickRadarAtomTransition(side.filename, "quarantine");
+        qBtn.onclick = () =>
+          quickRadarAtomTransition(side.filename, "quarantine");
         const dBtn = el("button", "btn sm", `Demote ${label}`);
         dBtn.type = "button";
         dBtn.onclick = () => quickRadarAtomTransition(side.filename, "demote");
@@ -3455,7 +4704,9 @@ async function scanContradictions() {
     }
   }
 
-  orphansBar.appendChild(el("span", "field-label", `Orphan Approved Atoms (${orphans.length}):`));
+  orphansBar.appendChild(
+    el("span", "field-label", `Orphan Approved Atoms (${orphans.length}):`)
+  );
   if (!orphans.length) {
     orphansBar.appendChild(el("span", "note-item-meta", "none"));
   } else {
@@ -3482,7 +4733,7 @@ async function loadSnapshotsList() {
   liveOpt.value = "live";
   toSel.appendChild(liveOpt);
 
-  snapshotsCache = res.data?.snapshots || [];
+  snapshotsCache = res.data?.snapshots || res.data?.items || [];
   if (!snapshotsCache.length) {
     tableWrap.appendChild(
       el("div", "status-banner", "No vault snapshots recorded yet.")
@@ -3548,7 +4799,9 @@ function renderSnapshotDiff(outEl, d) {
     el(
       "span",
       `badge ${d.unchanged ? "ok" : "warn"}`,
-      d.unchanged ? "UNCHANGED (Identical Merkle Root)" : "SEMANTIC CHANGES DETECTED"
+      d.unchanged
+        ? "UNCHANGED (Identical Merkle Root)"
+        : "SEMANTIC CHANGES DETECTED"
     )
   );
   top.appendChild(
@@ -3573,14 +4826,18 @@ function renderSnapshotDiff(outEl, d) {
   for (const a of added) {
     const c = el("div", "diff-card added");
     c.style.marginTop = "6px";
-    c.appendChild(el("strong", "", `+ Added Atom: ${a.filename || a.atom_id || ""}`));
+    c.appendChild(
+      el("strong", "", `+ Added Atom: ${a.filename || a.atom_id || ""}`)
+    );
     c.appendChild(el("div", "", a.claim || ""));
     outEl.appendChild(c);
   }
   for (const a of removed) {
     const c = el("div", "diff-card removed");
     c.style.marginTop = "6px";
-    c.appendChild(el("strong", "", `- Removed Atom: ${a.filename || a.atom_id || ""}`));
+    c.appendChild(
+      el("strong", "", `- Removed Atom: ${a.filename || a.atom_id || ""}`)
+    );
     c.appendChild(el("div", "", a.claim || ""));
     outEl.appendChild(c);
   }
@@ -3591,9 +4848,9 @@ function renderSnapshotDiff(outEl, d) {
       el(
         "strong",
         "",
-        `~ Modified Atom: ${m.filename} (${shortSha(m.old_sha256)} -> ${shortSha(
-          m.new_sha256
-        )})`
+        `~ Modified Atom: ${m.filename} (${shortSha(
+          m.old_sha256
+        )} -> ${shortSha(m.new_sha256)})`
       )
     );
     c.appendChild(el("div", "note-item-meta", `Before: ${m.old_claim || ""}`));
@@ -3619,7 +4876,9 @@ function renderSnapshotDiff(outEl, d) {
 function renderSnapshotRecall(outEl, d, query) {
   outEl.replaceChildren();
   const top = el("div", "toolbar");
-  top.appendChild(el("span", "badge ok", `Point-in-Time Recall @ ${d.snapshot_id}`));
+  top.appendChild(
+    el("span", "badge ok", `Point-in-Time Recall @ ${d.snapshot_id}`)
+  );
   top.appendChild(el("span", "badge mono", `Merkle: ${shortSha(d.merkle_root)}`));
   outEl.appendChild(top);
 
@@ -3646,7 +4905,9 @@ function renderSnapshotRecall(outEl, d, query) {
     const row = el("div", "toolbar");
     row.appendChild(el("strong", "", `#${idx + 1} ${r.filename}`));
     row.appendChild(el("span", "badge tier-v", `score: ${r.score}`));
-    row.appendChild(el("span", "badge mono", `sha:${shortSha(r.file_sha256)}`));
+    row.appendChild(
+      el("span", "badge mono", `sha:${shortSha(r.file_sha256)}`)
+    );
     for (const ctx of r.contexts || []) {
       row.appendChild(el("span", "pill", ctx));
     }
@@ -3677,7 +4938,10 @@ function renderSnapshotRecall(outEl, d, query) {
 function renderSnapshotVerification(outEl, d, snapshotId) {
   outEl.replaceChildren();
   const valid = Boolean(
-    d.valid ?? d.verified ?? d.merkle_valid ?? (d.status === "valid" || !d.errors?.length)
+    d.valid ??
+      d.verified ??
+      d.merkle_valid ??
+      (d.status === "valid" || !d.errors?.length)
   );
   const top = el("div", "toolbar");
   top.appendChild(
@@ -3723,193 +4987,572 @@ function renderSnapshotVerification(outEl, d, snapshotId) {
 }
 
 async function loadProofView() {
-  await Promise.all([loadLedgerStatus(), scanContradictions(), loadSnapshotsList()]);
+  await Promise.all([
+    loadLedgerStatus(),
+    loadSourceAudit(),
+    scanContradictions(),
+    loadSnapshotsList(),
+  ]);
 }
 
-document.getElementById("refreshProofBtn").addEventListener("click", loadProofView);
-document.getElementById("commitLedgerBtn").addEventListener("click", async () => {
-  const note = document.getElementById("ledgerNoteInput").value.trim();
-  const res = await window.secondBrain.request("POST", "/v1/ledger/commit", {
-    actor: "desktop_owner",
-    note,
+document
+  .getElementById("refreshProofBtn")
+  .addEventListener("click", loadProofView);
+document
+  .getElementById("commitLedgerBtn")
+  .addEventListener("click", async () => {
+    const note = document.getElementById("ledgerNoteInput").value.trim();
+    const res = await window.secondBrain.request("POST", "/v1/ledger/commit", {
+      actor: "desktop_owner",
+      note,
+    });
+    if (res.ok) {
+      document.getElementById("ledgerNoteInput").value = "";
+      showToast(
+        `Committed signed Merkle checkpoint #${res.data?.seq ?? ""}`,
+        "ok"
+      );
+      loadLedgerStatus();
+    } else {
+      showToast(apiErrorMessage(res, "Ledger commit failed"), "danger");
+    }
   });
-  if (res.ok) {
-    document.getElementById("ledgerNoteInput").value = "";
-    showToast(
-      `Committed signed Merkle checkpoint #${res.data?.seq ?? ""}`,
-      "ok"
-    );
-    loadLedgerStatus();
-  } else {
-    showToast(apiErrorMessage(res, "Ledger commit failed"), "danger");
-  }
-});
 
 document.getElementById("proveAtomBtn").addEventListener("click", async () => {
-  const atom =
+  const targetRef =
     document.getElementById("proveAtomInput").value.trim() ||
     document.getElementById("proveAtomSelect").value;
-  if (!atom) {
-    showToast("Select or enter an approved atom filename to prove.", "warn");
+  if (!targetRef) {
+    showToast(
+      "Select or enter an approved atom or playbook leaf (e.g. 5-playbooks/pb.md) to prove.",
+      "warn"
+    );
     return;
   }
   const res = await window.secondBrain.request(
     "GET",
-    `/v1/ledger/prove/${encodeURIComponent(atom)}`
+    `/v1/ledger/prove/${encodeURIComponent(targetRef)}`
   );
   if (res.ok && res.data) {
     await renderAtomProofCard(res.data);
-    showToast(`Generated Merkle inclusion proof for ${atom}`, "ok");
+    showToast(`Generated Merkle inclusion proof for ${targetRef}`, "ok");
   } else {
-    showToast(apiErrorMessage(res, "Atom proof failed"), "danger");
+    showToast(apiErrorMessage(res, "Leaf proof failed"), "danger");
   }
 });
 
-document.getElementById("verifyProofBtn").addEventListener("click", async () => {
-  const raw = document.getElementById("verifyProofTextarea").value.trim();
-  const out = document.getElementById("verifyProofResult");
-  out.replaceChildren();
-  if (!raw) {
-    showToast("Paste a Merkle proof JSON bundle to verify.", "warn");
-    return;
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    showToast("Proof input is not valid JSON.", "danger");
-    out.appendChild(el("span", "badge danger", "Invalid JSON"));
-    return;
-  }
-  const webCheck = await verifyMerkleProofWebCrypto(parsed);
-  let serverValid = webCheck.valid;
-  try {
-    const res = await window.secondBrain.api("POST", "/v1/ledger/verify-proof", {
-      proof: parsed,
-    });
-    if (res.ok && res.data && typeof res.data.valid === "boolean") {
-      serverValid = Boolean(res.data.valid);
+document
+  .getElementById("verifyProofBtn")
+  .addEventListener("click", async () => {
+    const raw = document.getElementById("verifyProofTextarea").value.trim();
+    const out = document.getElementById("verifyProofResult");
+    out.replaceChildren();
+    if (!raw) {
+      showToast("Paste a Merkle proof JSON bundle to verify.", "warn");
+      return;
     }
-  } catch {}
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      showToast("Proof input is not valid JSON.", "danger");
+      out.appendChild(el("span", "badge danger", "Invalid JSON"));
+      return;
+    }
+    const webCheck = await verifyMerkleProofWebCrypto(parsed);
+    let serverValid = webCheck.valid;
+    try {
+      const res = await window.secondBrain.api(
+        "POST",
+        "/v1/ledger/verify-proof",
+        {
+          proof: parsed,
+        }
+      );
+      if (res.ok && res.data && typeof res.data.valid === "boolean") {
+        serverValid = Boolean(res.data.valid);
+      }
+    } catch {}
 
-  const valid = Boolean(webCheck.valid && serverValid);
-  const wrap = el("div", "field-col");
-  wrap.style.marginTop = "6px";
-  const badgeRow = el("div", "toolbar");
-  badgeRow.appendChild(
+    const valid = Boolean(webCheck.valid && serverValid);
+    const wrap = el("div", "field-col");
+    wrap.style.marginTop = "6px";
+    const badgeRow = el("div", "toolbar");
+    badgeRow.appendChild(
+      el(
+        "span",
+        `badge ${valid ? "ok" : "danger"}`,
+        valid
+          ? "Offline WebCrypto Proof Verified ✓"
+          : `PROOF INVALID / TAMPERED (${webCheck.reason || "failed"})`
+      )
+    );
+    wrap.appendChild(badgeRow);
+    if (webCheck.trace && webCheck.trace.length) {
+      wrap.appendChild(buildAuditTraceList(webCheck.trace));
+    }
+    out.appendChild(wrap);
+    showToast(
+      valid
+        ? "Merkle proof verified valid via WebCrypto"
+        : "Merkle proof failed verification",
+      valid ? "ok" : "danger"
+    );
+  });
+
+document
+  .getElementById("scanRadarBtn")
+  .addEventListener("click", scanContradictions);
+document
+  .getElementById("createSnapshotBtn")
+  .addEventListener("click", async () => {
+    const label = document.getElementById("snapshotLabelInput").value.trim();
+    const res = await window.secondBrain.request("POST", "/v1/snapshots", {
+      actor: "desktop_owner",
+      label,
+    });
+    if (res.ok && res.data) {
+      document.getElementById("snapshotLabelInput").value = "";
+      showToast(`Created snapshot ${res.data.snapshot_id}`, "ok");
+      await loadSnapshotsList();
+    } else {
+      showToast(apiErrorMessage(res, "Create snapshot failed"), "danger");
+    }
+  });
+
+document
+  .getElementById("diffSnapshotBtn")
+  .addEventListener("click", async () => {
+    const from_snapshot = document.getElementById("snapshotSelect").value;
+    const to_snapshot =
+      document.getElementById("snapshotToSelect").value || "live";
+    if (!from_snapshot) {
+      showToast("Create or select a From Snapshot first.", "warn");
+      return;
+    }
+    const res = await window.secondBrain.request("POST", "/v1/snapshots/diff", {
+      from_snapshot,
+      to_snapshot,
+    });
+    if (res.ok && res.data) {
+      renderSnapshotDiff(document.getElementById("snapshotOutput"), res.data);
+    } else {
+      showToast(apiErrorMessage(res, "Snapshot diff failed"), "danger");
+    }
+  });
+
+document
+  .getElementById("verifySnapshotBtn")
+  .addEventListener("click", async () => {
+    const snapshot_id = document.getElementById("snapshotSelect").value;
+    if (!snapshot_id) {
+      showToast("Create or select a Snapshot first to verify.", "warn");
+      return;
+    }
+    const res = await window.secondBrain.request(
+      "POST",
+      "/v1/snapshots/verify",
+      {
+        snapshot_id,
+      }
+    );
+    if (res.ok && res.data) {
+      renderSnapshotVerification(
+        document.getElementById("snapshotOutput"),
+        res.data,
+        snapshot_id
+      );
+      const ok = Boolean(
+        res.data.valid ?? res.data.verified ?? res.data.merkle_valid ?? true
+      );
+      showToast(
+        ok
+          ? `Snapshot ${snapshot_id} integrity verified`
+          : `Snapshot ${snapshot_id} failed integrity check`,
+        ok ? "ok" : "danger"
+      );
+    } else {
+      showToast(apiErrorMessage(res, "Snapshot verify failed"), "danger");
+    }
+  });
+
+document
+  .getElementById("recallSnapshotBtn")
+  .addEventListener("click", async () => {
+    const snapshot_id = document.getElementById("snapshotSelect").value;
+    const query = document.getElementById("snapshotQueryInput").value.trim();
+    const project_scope =
+      document.getElementById("snapshotRecallScopeInput").value.trim() ||
+      undefined;
+    if (!snapshot_id || !query) {
+      showToast("Select a snapshot and enter a recall query.", "warn");
+      return;
+    }
+    const res = await window.secondBrain.request(
+      "POST",
+      "/v1/snapshots/recall",
+      {
+        snapshot_id,
+        query,
+        project_scope,
+        limit: 10,
+      }
+    );
+    if (res.ok && res.data) {
+      renderSnapshotRecall(
+        document.getElementById("snapshotOutput"),
+        res.data,
+        query
+      );
+    } else {
+      showToast(apiErrorMessage(res, "Snapshot recall failed"), "danger");
+    }
+  });
+
+// ─── TAB 9: Interactive 2D Knowledge Graph ───────────────────────────────────
+
+function ensureGraphViewerInitialized() {
+  if (graphViewer) return graphViewer;
+  const container = document.getElementById("graphCanvasContainer");
+  graphViewer = GraphHelper.createGraphViewer(container, {
+    width: 880,
+    height: 540,
+    onSelectNode: (node, incidentEdges) =>
+      inspectSelectedGraphNode(node, incidentEdges),
+  });
+  return graphViewer;
+}
+
+function currentGraphFilters() {
+  return {
+    search: document.getElementById("graphSearchInput").value,
+    project: document.getElementById("graphProjectInput").value,
+    status: document.getElementById("graphStatusSelect").value,
+    memoryType: document.getElementById("graphTypeSelect").value,
+    includePending: document.getElementById("graphIncludePendingCheck").checked,
+  };
+}
+
+function rerenderGraphFromState() {
+  const viewer = ensureGraphViewerInitialized();
+  const filtered = viewer.render(graphRawData, currentGraphFilters());
+  const banner = document.getElementById("graphBanner");
+  if (banner) {
+    banner.textContent = `Showing ${filtered.nodes.length} node(s) and ${
+      filtered.edges.length
+    } edge(s)${graphRawData.fallback ? " (synthesized fallback view)" : ""}. Drag to pan, scroll to zoom, click a node to inspect.`;
+  }
+}
+
+async function inspectSelectedGraphNode(node, localEdges = []) {
+  const pane = document.getElementById("graphInspectorBody");
+  if (!pane || !node) return;
+  pane.replaceChildren(
+    el("div", "status-banner", `Loading neighborhood for ${node.id}...`)
+  );
+
+  const [nbRes, atomRes] = await Promise.all([
+    window.secondBrain.request(
+      "GET",
+      `/v1/graph/neighbors/${encodeURIComponent(node.id)}?include_pending=1`
+    ),
+    window.secondBrain.request(
+      "GET",
+      `/v1/atoms/${encodeURIComponent(node.id)}`
+    ),
+  ]);
+
+  pane.replaceChildren();
+  const card = el("div", "card");
+  const badges = el("div", "toolbar");
+  badges.appendChild(el("strong", "", node.id));
+  badges.appendChild(
     el(
       "span",
-      `badge ${valid ? "ok" : "danger"}`,
-      valid
-        ? "Offline WebCrypto Proof Verified ✓"
-        : `PROOF INVALID / TAMPERED (${webCheck.reason || "failed"})`
+      `badge ${node.verified ? "ok" : "warn"}`,
+      node.review_status || "atom"
     )
   );
-  wrap.appendChild(badgeRow);
-  if (webCheck.trace && webCheck.trace.length) {
-    wrap.appendChild(buildAuditTraceList(webCheck.trace));
+  badges.appendChild(el("span", "badge", node.memory_type || "semantic"));
+  card.appendChild(badges);
+
+  if (node.contexts && node.contexts.length) {
+    card.appendChild(
+      el("div", "note-item-meta", `Contexts: ${node.contexts.join(", ")}`)
+    );
   }
-  out.appendChild(wrap);
-  showToast(
-    valid ? "Merkle proof verified valid via WebCrypto" : "Merkle proof failed verification",
-    valid ? "ok" : "danger"
+
+  const fullAtom =
+    atomRes.ok && atomRes.data ? atomRes.data.atom || atomRes.data : null;
+  card.appendChild(
+    el("div", "sub-panel", fullAtom?.claim || node.label || "(no claim)")
   );
-});
-
-document.getElementById("scanRadarBtn").addEventListener("click", scanContradictions);
-document.getElementById("createSnapshotBtn").addEventListener("click", async () => {
-  const label = document.getElementById("snapshotLabelInput").value.trim();
-  const res = await window.secondBrain.request("POST", "/v1/snapshots", {
-    actor: "desktop_owner",
-    label,
-  });
-  if (res.ok && res.data) {
-    document.getElementById("snapshotLabelInput").value = "";
-    showToast(`Created snapshot ${res.data.snapshot_id}`, "ok");
-    await loadSnapshotsList();
-  } else {
-    showToast(apiErrorMessage(res, "Create snapshot failed"), "danger");
+  if (fullAtom?.evidence) {
+    card.appendChild(el("div", "mono-box", fullAtom.evidence));
   }
-});
 
-document.getElementById("diffSnapshotBtn").addEventListener("click", async () => {
-  const from_snapshot = document.getElementById("snapshotSelect").value;
-  const to_snapshot =
-    document.getElementById("snapshotToSelect").value || "live";
-  if (!from_snapshot) {
-    showToast("Create or select a From Snapshot first.", "warn");
+  const actRow = el("div", "toolbar");
+  const openBtn = el("button", "btn sm primary", "Open Atom Inspector");
+  openBtn.type = "button";
+  openBtn.onclick = () => openAtomInspectorModal(node.id, fullAtom || node.raw);
+  const editBtn = el("button", "btn sm", "Edit Atom");
+  editBtn.type = "button";
+  editBtn.onclick = () =>
+    openAtomEditorModal(fullAtom || { filename: node.id, claim: node.label });
+  actRow.appendChild(openBtn);
+  actRow.appendChild(editBtn);
+  card.appendChild(actRow);
+  pane.appendChild(card);
+
+  const nbCard = el("div", "card");
+  nbCard.style.marginTop = "10px";
+  const apiEdges =
+    nbRes.ok && Array.isArray(nbRes.data?.edges)
+      ? nbRes.data.edges
+      : localEdges;
+  const apiNeighbors =
+    nbRes.ok && Array.isArray(nbRes.data?.neighbors) ? nbRes.data.neighbors : [];
+  nbCard.appendChild(
+    el("strong", "", `Connected Edges (${apiEdges.length})`)
+  );
+
+  if (!apiEdges.length && !apiNeighbors.length) {
+    nbCard.appendChild(
+      el("div", "note-item-meta", "No connected graph neighbors.")
+    );
+  } else {
+    for (const edge of apiEdges.slice(0, 30)) {
+      const otherId = edge.from === node.id ? edge.to : edge.from;
+      const row = el("div", "toolbar");
+      row.appendChild(
+        el("span", "badge mono", edge.kind || edge.relation || "related")
+      );
+      if (otherId) {
+        const jumpBtn = el("button", "pill clickable", otherId);
+        jumpBtn.type = "button";
+        jumpBtn.onclick = () => {
+          if (!graphViewer?.selectNodeById(otherId)) {
+            openAtomInspectorModal(otherId);
+          }
+        };
+        row.appendChild(jumpBtn);
+      }
+      nbCard.appendChild(row);
+    }
+  }
+  pane.appendChild(nbCard);
+}
+
+async function loadGraphView() {
+  ensureGraphViewerInitialized();
+  const proj = document.getElementById("graphProjectInput").value.trim();
+  const incPending = document.getElementById("graphIncludePendingCheck").checked
+    ? "1"
+    : "0";
+  const params = [`include_pending=${incPending}`, "limit=300"];
+  if (proj) params.push(`project=${encodeURIComponent(proj)}`);
+
+  const fullRes = await window.secondBrain.request(
+    "GET",
+    `/v1/graph/full?${params.join("&")}`
+  );
+  if (fullRes.ok && fullRes.data && Array.isArray(fullRes.data.nodes)) {
+    graphRawData = {
+      nodes: fullRes.data.nodes,
+      edges: Array.isArray(fullRes.data.edges) ? fullRes.data.edges : [],
+      fallback: false,
+    };
+  } else {
+    const [atomsRes, radarRes] = await Promise.all([
+      window.secondBrain.request("GET", "/v1/atoms?limit=300"),
+      window.secondBrain.request(
+        "GET",
+        `/v1/graph/contradictions?include_pending=${incPending}`
+      ),
+    ]);
+    graphRawData = GraphHelper.synthesizeFallbackGraph(
+      atomsRes.data?.items || [],
+      radarRes.data || {}
+    );
+  }
+  rerenderGraphFromState();
+}
+
+for (const id of [
+  "graphSearchInput",
+  "graphStatusSelect",
+  "graphTypeSelect",
+  "graphIncludePendingCheck",
+]) {
+  document.getElementById(id).addEventListener("input", rerenderGraphFromState);
+  document.getElementById(id).addEventListener("change", rerenderGraphFromState);
+}
+document
+  .getElementById("graphProjectInput")
+  .addEventListener("change", loadGraphView);
+document
+  .getElementById("graphProjectInput")
+  .addEventListener("input", rerenderGraphFromState);
+document.getElementById("graphZoomInBtn").addEventListener("click", () => {
+  ensureGraphViewerInitialized().zoomBy(1.22);
+});
+document.getElementById("graphZoomOutBtn").addEventListener("click", () => {
+  ensureGraphViewerInitialized().zoomBy(0.82);
+});
+document.getElementById("graphResetViewBtn").addEventListener("click", () => {
+  ensureGraphViewerInitialized().resetView();
+});
+document
+  .getElementById("refreshGraphBtn")
+  .addEventListener("click", loadGraphView);
+
+// ─── TAB 10: Vault Explorer (3-threads/, 4-experiences/, briefings/) ─────────
+
+function renderActiveVaultDocument() {
+  const viewer = document.getElementById("vaultDocViewer");
+  const metaBar = document.getElementById("vaultDocMetaBar");
+  const modeBtn = document.getElementById("vaultRenderModeBtn");
+  if (!viewer || !metaBar) return;
+
+  modeBtn.textContent = vaultRawMode
+    ? "View Rendered Markdown"
+    : "View Raw Source";
+
+  viewer.replaceChildren();
+  if (!activeVaultDoc) {
+    metaBar.textContent = "Select a vault document on the left to view";
+    viewer.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        `Browse ${activeVaultCategory} files on the left.`
+      )
+    );
     return;
   }
-  const res = await window.secondBrain.request("POST", "/v1/snapshots/diff", {
-    from_snapshot,
-    to_snapshot,
-  });
-  if (res.ok && res.data) {
-    renderSnapshotDiff(document.getElementById("snapshotOutput"), res.data);
-  } else {
-    showToast(apiErrorMessage(res, "Snapshot diff failed"), "danger");
-  }
-});
 
-document.getElementById("verifySnapshotBtn").addEventListener("click", async () => {
-  const snapshot_id = document.getElementById("snapshotSelect").value;
-  if (!snapshot_id) {
-    showToast("Create or select a Snapshot first to verify.", "warn");
-    return;
+  metaBar.textContent = `${activeVaultCategory}/${activeVaultDoc.filename} (Untrusted Vault Document)`;
+  if (vaultRawMode) {
+    viewer.appendChild(el("pre", "mono-box", activeVaultDoc.content || ""));
+  } else {
+    renderRichMarkdown(viewer, activeVaultDoc.content || "", {
+      emptyPlaceholder: "(Empty vault document)",
+    });
   }
-  const res = await window.secondBrain.request("POST", "/v1/snapshots/verify", {
-    snapshot_id,
-  });
-  if (res.ok && res.data) {
-    renderSnapshotVerification(
-      document.getElementById("snapshotOutput"),
-      res.data,
-      snapshot_id
-    );
-    const ok = Boolean(
-      res.data.valid ?? res.data.verified ?? res.data.merkle_valid ?? true
-    );
+}
+
+async function openVaultDocument(category, filename) {
+  const res = await window.secondBrain.request(
+    "GET",
+    `/v1/vault/${encodeURIComponent(category)}/${encodeURIComponent(filename)}`
+  );
+  if (!res.ok || !res.data) {
     showToast(
-      ok
-        ? `Snapshot ${snapshot_id} integrity verified`
-        : `Snapshot ${snapshot_id} failed integrity check`,
-      ok ? "ok" : "danger"
+      apiErrorMessage(res, `Failed to open ${category}/${filename}`),
+      "danger"
     );
-  } else {
-    showToast(apiErrorMessage(res, "Snapshot verify failed"), "danger");
-  }
-});
-
-document.getElementById("recallSnapshotBtn").addEventListener("click", async () => {
-  const snapshot_id = document.getElementById("snapshotSelect").value;
-  const query = document.getElementById("snapshotQueryInput").value.trim();
-  const project_scope =
-    document.getElementById("snapshotRecallScopeInput").value.trim() || undefined;
-  if (!snapshot_id || !query) {
-    showToast("Select a snapshot and enter a recall query.", "warn");
     return;
   }
-  const res = await window.secondBrain.request("POST", "/v1/snapshots/recall", {
-    snapshot_id,
-    query,
-    project_scope,
-    limit: 10,
+  activeVaultDoc = {
+    category,
+    filename: res.data.filename || filename,
+    content: res.data.content || "",
+  };
+  document.querySelectorAll("#vaultFilesList .note-item").forEach((n) => {
+    n.classList.toggle("active", n.dataset.filename === filename);
   });
-  if (res.ok && res.data) {
-    renderSnapshotRecall(
-      document.getElementById("snapshotOutput"),
-      res.data,
-      query
+  renderActiveVaultDocument();
+}
+
+async function loadVaultBrowser({ append = false } = {}) {
+  const listEl = document.getElementById("vaultFilesList");
+  if (!append) {
+    vaultPaginator.reset();
+    activeVaultDoc = null;
+    renderActiveVaultDocument();
+  }
+  const url = PageHelper.buildPaginatedPath(
+    `/v1/vault/${encodeURIComponent(activeVaultCategory)}`,
+    {
+      limit: vaultPaginator.getPageSize(),
+      offset: vaultPaginator.nextOffset(),
+    }
+  );
+  const res = await window.secondBrain.request("GET", url);
+  listEl.replaceChildren();
+  if (!res.ok) {
+    listEl.appendChild(
+      el(
+        "div",
+        "status-banner",
+        apiErrorMessage(res, `No ${activeVaultCategory} endpoint or directory.`)
+      )
+    );
+    document.getElementById("vaultPaginationBar").style.display = "none";
+    return;
+  }
+
+  vaultPaginator.applyPage(res.data || {}, {
+    append,
+    preferredKey: "items",
+  });
+  const items = vaultPaginator.getItems();
+  if (!items.length) {
+    listEl.appendChild(
+      el("div", "status-banner", `No files in ${activeVaultCategory} yet.`)
     );
   } else {
-    showToast(apiErrorMessage(res, "Snapshot recall failed"), "danger");
+    for (const item of items) {
+      const row = el(
+        "div",
+        "note-item" +
+          (activeVaultDoc?.filename === item.filename ? " active" : "")
+      );
+      row.dataset.filename = item.filename;
+      row.appendChild(el("div", "note-item-title", item.title || item.filename));
+      const meta = [
+        item.filename,
+        item.modified_at ? String(item.modified_at).slice(0, 19) : "",
+        item.size_bytes !== undefined ? `${item.size_bytes} B` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      row.appendChild(el("div", "note-item-meta", meta));
+      row.onclick = () => openVaultDocument(activeVaultCategory, item.filename);
+      listEl.appendChild(row);
+    }
   }
+
+  PageHelper.renderPaginationBar(
+    document.getElementById("vaultPaginationBar"),
+    vaultPaginator,
+    () => loadVaultBrowser({ append: true }),
+    { noun: activeVaultCategory }
+  );
+}
+
+document.querySelectorAll("[data-vault-cat]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    activeVaultCategory = btn.dataset.vaultCat || "threads";
+    document.querySelectorAll("[data-vault-cat]").forEach((b) => {
+      b.classList.toggle("primary", b.dataset.vaultCat === activeVaultCategory);
+    });
+    loadVaultBrowser({ append: false });
+  });
 });
+
+document.getElementById("vaultRenderModeBtn").addEventListener("click", () => {
+  vaultRawMode = !vaultRawMode;
+  renderActiveVaultDocument();
+});
+document
+  .getElementById("refreshVaultBtn")
+  .addEventListener("click", () => loadVaultBrowser({ append: false }));
 
 // ─── Global Shortcuts & Init ─────────────────────────────────────────────────
 
 window.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && modalBackdrop.classList.contains("open")) {
+  if (e.key === "Escape" && modalCtrl.isOpen()) {
     closeModal();
     return;
   }
@@ -3917,26 +5560,37 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     if (activeView === "notes") saveActiveNote();
   }
-  const tabs = [
-    "notes",
-    "chat",
-    "review",
-    "import",
-    "ide",
-    "system",
-    "planner",
-    "proof",
-  ];
-  if ((e.ctrlKey || e.metaKey) && e.key >= "1" && e.key <= "8") {
+  const keyMap = {
+    1: "notes",
+    2: "chat",
+    3: "review",
+    4: "import",
+    5: "ide",
+    6: "system",
+    7: "planner",
+    8: "proof",
+    9: "graph",
+    0: "vault",
+  };
+  if ((e.ctrlKey || e.metaKey) && Object.prototype.hasOwnProperty.call(keyMap, e.key)) {
     e.preventDefault();
-    switchView(tabs[Number(e.key) - 1]);
+    switchView(keyMap[e.key]);
   }
 });
 
-window.secondBrain.onRefresh(() => {
-  loadNotes(document.getElementById("noteSearchInput").value);
+if (window.secondBrain) {
+  if (window.secondBrain.platform) {
+    ModalHelper.applyPlatformShortcutsToDom(
+      document,
+      window.secondBrain.platform
+    );
+  }
+  if (typeof window.secondBrain.onRefresh === "function") {
+    window.secondBrain.onRefresh(() => {
+      loadNotes({ append: false });
+      refreshHealth();
+    });
+  }
   refreshHealth();
-});
-
-refreshHealth();
-loadNotes();
+  loadNotes({ append: false });
+}

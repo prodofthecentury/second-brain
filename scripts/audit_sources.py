@@ -171,6 +171,10 @@ def audit_sources(
             except (ReviewConflictError, ReviewTransitionError, OSError, ValueError) as exc:
                 entry["action"] = "conflict_or_failure"
                 entry["mutation_error"] = str(exc)
+        entry["stale_approval"] = bool(
+            should_demote or entry["action"] in {"review_required", "would_demote", "demoted"}
+        )
+        entry["demoted"] = entry["action"] == "demoted"
         reports.append(entry)
     return reports
 

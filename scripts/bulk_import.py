@@ -57,7 +57,14 @@ SKIP_DIRS = {
     ".aws",
     ".kube",
 }
-IMPORT_EXTS = {".md", ".markdown", ".txt"}
+from doc_extractors import (
+    DOC_EXTRACTOR_EXTS,
+    DocumentExtractionError,
+    MAX_DOC_BINARY_BYTES,
+    extract_document,
+)
+
+IMPORT_EXTS = {".md", ".markdown", ".txt", *DOC_EXTRACTOR_EXTS}
 MANIFEST_NAME = "notes-import-manifest.json"
 
 
@@ -167,13 +174,14 @@ def import_folder(
             rel = src.relative_to(root)
             rel_key = f"{root.name}/{rel.as_posix()}"
             legacy_key = str(src)
+            ext = src.suffix.lower()
             try:
                 raw = src.read_bytes()
-                text = raw.decode("utf-8-sig")
-            except (OSError, UnicodeDecodeError):
+            except OSError:
                 stats.skipped_unreadable += 1
                 continue
-            if len(raw) > MAX_NOTE_BYTES:
+            max_raw = MAX_DOC_BINARY_BYTES if ext in DOC_EXTRACTOR_EXTS else MAX_NOTE_BYTES
+            if len(raw) > max_raw:
                 stats.skipped_too_large += 1
                 continue
             src_sha = hashlib.sha256(raw).hexdigest()
@@ -190,7 +198,27 @@ def import_folder(
                 if rel_key not in manifest and legacy_key in manifest:
                     manifest[rel_key] = manifest.pop(legacy_key)
                 continue
-            meta, body = parse_note(text, src.name)
+            if ext in DOC_EXTRACTOR_EXTS:
+                try:
+                    extracted = extract_document(src, max_bytes=MAX_DOC_BINARY_BYTES)
+                except (DocumentExtractionError, ValueError, OSError):
+                    stats.skipped_unreadable += 1
+                    continue
+                doc_body = extracted.markdown.strip()
+                if not doc_body:
+                    stats.skipped_unreadable += 1
+                    continue
+                if len(doc_body.encode("utf-8")) > MAX_NOTE_BYTES:
+                    doc_body = doc_body.encode("utf-8")[: MAX_NOTE_BYTES - 512].decode("utf-8", errors="ignore").rstrip()
+                meta = {"title": extracted.title or src.stem, "tags": [f"format:{ext.lstrip('.')}"], "created": ""}
+                body = doc_body
+            else:
+                try:
+                    text = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    stats.skipped_unreadable += 1
+                    continue
+                meta, body = parse_note(text, src.name)
             title = str(meta.get("title") or src.stem)
             src_tags = tuple(str(t) for t in meta.get("tags", []) or [])
             mtime = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(src.stat().st_mtime))
@@ -256,16 +284,65 @@ def import_folder(
     return stats
 
 
+def import_file(
+    source_file: str | Path,
+    *,
+    paths: NotePaths = DEFAULT_PATHS,
+    tags: tuple[str, ...] = (),
+) -> dict:
+    """Import a single local Markdown/text/PDF/DOCX/EPUB/HTML/CSV document into working notes."""
+    from notes_store import create_note
+
+    if _is_reparse_or_link(str(Path(source_file).expanduser())) or _is_reparse_or_link(str(paths.notes_dir)):
+        raise PermissionError("Refusing to import from or into a symlink/junction path.")
+    src = Path(source_file).expanduser().resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"Document not found: {src}")
+    ext = src.suffix.lower()
+    if ext not in IMPORT_EXTS:
+        raise ValueError(f"Unsupported import extension '{ext}'; expected one of {sorted(IMPORT_EXTS)}.")
+    if ext in DOC_EXTRACTOR_EXTS:
+        extracted = extract_document(src, max_bytes=MAX_DOC_BINARY_BYTES)
+        body = extracted.markdown.strip()
+        if not body:
+            raise ValueError(f"Document contained no extractable text: {src.name}")
+        if len(body.encode("utf-8")) > MAX_NOTE_BYTES:
+            body = body.encode("utf-8")[: MAX_NOTE_BYTES - 512].decode("utf-8", errors="ignore").rstrip()
+        title = extracted.title or src.stem
+        merged_tags = (*tags, f"format:{ext.lstrip('.')}")
+    else:
+        raw = src.read_bytes()
+        if len(raw) > MAX_NOTE_BYTES:
+            raise ValueError(f"Document exceeds maximum note size ({MAX_NOTE_BYTES} bytes).")
+        meta, body = parse_note(raw.decode("utf-8-sig"), src.name)
+        title = str(meta.get("title") or src.stem)
+        merged_tags = (*tags, *(str(t) for t in (meta.get("tags") or [])))
+    created = create_note(
+        title=title,
+        body=body,
+        tags=list(dict.fromkeys(t for t in merged_tags if t)),
+        origin="owner_import",
+        paths=paths,
+    )
+    return {**created, "source_file": src.name, "format": ext.lstrip(".")}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", help="Folder to import (Obsidian vault, Markdown docs, notes).")
+    parser.add_argument("source", help="Folder to import (Obsidian vault, Markdown/PDF/DOCX/HTML docs, notes).")
     parser.add_argument("--tag", action="append", default=[])
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--overwrite-modified",
+        action="store_true",
+        help="Overwrite locally edited imported notes after saving a .history/ backup.",
+    )
     args = parser.parse_args(argv)
     stats = import_folder(
         args.source,
         tags=tuple(args.tag),
         dry_run=args.dry_run,
+        overwrite_modified=args.overwrite_modified,
         progress=lambda s: print(f"  … {s.scanned} scanned", file=sys.stderr),
     )
     print(json.dumps(stats.as_dict(), indent=2))

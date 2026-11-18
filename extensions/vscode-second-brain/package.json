@@ -5,6 +5,12 @@
   "version": "0.2.0",
   "publisher": "second-brain",
   "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/second-brain/second-brain.git",
+    "directory": "extensions/vscode-second-brain"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -13,9 +19,13 @@
     "AI"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onFileSystem:secondbrain-note"
   ],
   "main": "./extension.js",
+  "scripts": {
+    "test": "node --test test/"
+  },
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
@@ -58,6 +68,71 @@
         "icon": "$(comment-discussion)"
       },
       {
+        "command": "secondBrain.createNote",
+        "title": "Second Brain: Create Working Note",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "secondBrain.editNote",
+        "title": "Second Brain: Edit Working Note",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "secondBrain.deleteNote",
+        "title": "Second Brain: Delete Working Note",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "secondBrain.verifyNoteExcerpt",
+        "title": "Second Brain: Verify Note Excerpt as Atom",
+        "icon": "$(verified)"
+      },
+      {
+        "command": "secondBrain.promoteInboxItem",
+        "title": "Second Brain: Promote Quarantined Inbox Item",
+        "icon": "$(check)"
+      },
+      {
+        "command": "secondBrain.rejectInboxItem",
+        "title": "Second Brain: Reject Quarantined Inbox Item",
+        "icon": "$(close)"
+      },
+      {
+        "command": "secondBrain.approveAtom",
+        "title": "Second Brain: Approve Pending Atom",
+        "icon": "$(pass)"
+      },
+      {
+        "command": "secondBrain.rejectAtom",
+        "title": "Second Brain: Reject Atom",
+        "icon": "$(error)"
+      },
+      {
+        "command": "secondBrain.demoteAtom",
+        "title": "Second Brain: Demote Verified Atom",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "secondBrain.quarantineAtom",
+        "title": "Second Brain: Quarantine Atom",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "secondBrain.mergeAtoms",
+        "title": "Second Brain: Merge Duplicate Atoms",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "secondBrain.promotePlaybook",
+        "title": "Second Brain: Promote Skill Playbook",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "secondBrain.deprecatePlaybook",
+        "title": "Second Brain: Deprecate Skill Playbook",
+        "icon": "$(archive)"
+      },
+      {
         "command": "secondBrain.assemblePlan",
         "title": "Second Brain: Assemble Executive Plan"
       },
@@ -66,8 +141,12 @@
         "title": "Second Brain: Verify Vault Merkle Ledger"
       },
       {
+        "command": "secondBrain.commitLedger",
+        "title": "Second Brain: Commit Vault Merkle Ledger Checkpoint"
+      },
+      {
         "command": "secondBrain.proveAtom",
-        "title": "Second Brain: Prove Verified Atom Membership"
+        "title": "Second Brain: Prove Verified Atom or Playbook Membership"
       },
       {
         "command": "secondBrain.scanContradictions",
@@ -82,6 +161,14 @@
         "title": "Second Brain: Diff Snapshot vs Live Vault"
       },
       {
+        "command": "secondBrain.recallSnapshot",
+        "title": "Second Brain: Recall at Historical Snapshot"
+      },
+      {
+        "command": "secondBrain.verifySnapshot",
+        "title": "Second Brain: Verify Snapshot Integrity"
+      },
+      {
         "command": "secondBrain.recordExperience",
         "title": "Second Brain: Record Episodic Experience"
       },
@@ -93,6 +180,10 @@
       {
         "command": "secondBrain.openTreeItem",
         "title": "Second Brain: Open Vault Item"
+      },
+      {
+        "command": "secondBrain.loadMoreSection",
+        "title": "Second Brain: Load More Vault Items"
       }
     ],
     "menus": {
@@ -101,23 +192,129 @@
           "command": "secondBrain.rememberSelection",
           "when": "editorHasSelection",
           "group": "navigation@1"
+        },
+        {
+          "command": "secondBrain.verifyNoteExcerpt",
+          "when": "editorHasSelection",
+          "group": "navigation@2"
         }
       ],
       "view/title": [
         {
-          "command": "secondBrain.openChat",
+          "command": "secondBrain.createNote",
           "when": "view == secondBrain.vaultView",
           "group": "navigation@1"
         },
         {
-          "command": "secondBrain.refreshVault",
+          "command": "secondBrain.openChat",
           "when": "view == secondBrain.vaultView",
           "group": "navigation@2"
+        },
+        {
+          "command": "secondBrain.refreshVault",
+          "when": "view == secondBrain.vaultView",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "secondBrain.editNote",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.note",
+          "group": "inline@1"
+        },
+        {
+          "command": "secondBrain.deleteNote",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.note",
+          "group": "inline@2"
+        },
+        {
+          "command": "secondBrain.verifyNoteExcerpt",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.note",
+          "group": "1_governance@1"
+        },
+        {
+          "command": "secondBrain.promoteInboxItem",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.inboxItem",
+          "group": "inline@1"
+        },
+        {
+          "command": "secondBrain.rejectInboxItem",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.inboxItem",
+          "group": "inline@2"
+        },
+        {
+          "command": "secondBrain.approveAtom",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.pendingAtom",
+          "group": "inline@1"
+        },
+        {
+          "command": "secondBrain.rejectAtom",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.pendingAtom",
+          "group": "inline@2"
+        },
+        {
+          "command": "secondBrain.quarantineAtom",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.pendingAtom",
+          "group": "1_governance@1"
+        },
+        {
+          "command": "secondBrain.mergeAtoms",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.pendingAtom",
+          "group": "1_governance@2"
+        },
+        {
+          "command": "secondBrain.proveAtom",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.verifiedAtom",
+          "group": "1_governance@1"
+        },
+        {
+          "command": "secondBrain.demoteAtom",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.verifiedAtom",
+          "group": "1_governance@2"
+        },
+        {
+          "command": "secondBrain.quarantineAtom",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.verifiedAtom",
+          "group": "1_governance@3"
+        },
+        {
+          "command": "secondBrain.mergeAtoms",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.verifiedAtom",
+          "group": "1_governance@4"
+        },
+        {
+          "command": "secondBrain.proveAtom",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.playbook",
+          "group": "1_governance@1"
+        },
+        {
+          "command": "secondBrain.deprecatePlaybook",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.playbook",
+          "group": "1_governance@2"
+        },
+        {
+          "command": "secondBrain.diffSnapshot",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.snapshot",
+          "group": "1_governance@1"
+        },
+        {
+          "command": "secondBrain.recallSnapshot",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.snapshot",
+          "group": "1_governance@2"
+        },
+        {
+          "command": "secondBrain.verifySnapshot",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.snapshot",
+          "group": "1_governance@3"
         }
       ],
       "commandPalette": [
         {
           "command": "secondBrain.openTreeItem",
+          "when": "false"
+        },
+        {
+          "command": "secondBrain.loadMoreSection",
           "when": "false"
         }
       ]
@@ -142,7 +339,7 @@
           "type": "number",
           "default": 8765,
           "scope": "application",
-          "description": "Loopback port of the local Second Brain HTTP API (user/application scope only; ignored in workspace settings)."
+          "description": "Explicit loopback port override for the local Second Brain HTTP API (user/application scope only; ignored in workspace settings). When unset, auto-discovers live port from SecondBrain/security/api-port and falls back to 8765."
         },
         "secondBrain.ownerTokenPath": {
           "type": "string",

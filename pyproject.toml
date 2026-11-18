@@ -7,28 +7,22 @@ name = "second-brain"
 version = "0.2.0"
 description = "A local-first, evidence-grounded memory core for AI hosts"
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "chromadb>=1.0,<2",
-    "streamlit>=1.66,<2",
     "httpx>=0.28,<1",
     "httpcore>=1,<2",
-    "trafilatura>=2,<3",
-    "ollama>=0.6,<1",
-    "mcp>=2.3,<3",
-    "plotly>=6,<7",
-    "networkx>=3.4,<4",
-    "pandas>=2.2,<3",
-    "beautifulsoup4>=4.13,<5",
-    "watchdog>=6,<7",
     "filelock>=3.12,<4",
     "pydantic>=2.7,<3",
     "rich>=13,<15",
+    "beautifulsoup4>=4.13,<5",
+    "pypdf>=5,<7",
+    "PyYAML>=6.0,<7",
 ]
 
 [project.optional-dependencies]
-dashboard = ["streamlit>=1.66,<2", "plotly>=6,<7", "networkx>=3.4,<4", "pandas>=2.2,<3"]
+dashboard = ["streamlit>=1.66,<2", "plotly>=6,<7", "networkx>=3.4,<4", "pandas>=2.2,<3", "ollama>=0.6,<1"]
 online = ["ollama>=0.6,<1", "chromadb>=1.0,<2", "rich>=13,<15"]
+dense = ["chromadb>=1.0,<2", "ollama>=0.6,<1"]
 mcp = ["mcp>=2.3,<3", "ollama>=0.6,<1"]
 scout = ["httpx>=0.28,<1", "httpcore>=1,<2", "trafilatura>=2,<3", "beautifulsoup4>=4.13,<5"]
 watchdog = ["watchdog>=6,<7"]
@@ -36,16 +30,50 @@ evaluation = ["ollama>=0.6,<1", "chromadb>=1.0,<2"]
 multimodal = ["faster-whisper>=1.1,<2", "Pillow>=11,<13"]
 dev = []
 all = [
+    "chromadb>=1.0,<2",
+    "streamlit>=1.66,<2",
+    "plotly>=6,<7",
+    "networkx>=3.4,<4",
+    "pandas>=2.2,<3",
+    "ollama>=0.6,<1",
+    "mcp>=2.3,<3",
+    "trafilatura>=2,<3",
+    "watchdog>=6,<7",
+    "faster-whisper>=1.1,<2",
+    "Pillow>=11,<13",
+]
+
+[dependency-groups]
+dev = [
+    "chromadb>=1.0,<2",
+    "streamlit>=1.66,<2",
+    "plotly>=6,<7",
+    "networkx>=3.4,<4",
+    "pandas>=2.2,<3",
+    "ollama>=0.6,<1",
+    "mcp>=2.3,<3",
+    "trafilatura>=2,<3",
+    "watchdog>=6,<7",
     "faster-whisper>=1.1,<2",
     "Pillow>=11,<13",
 ]
 
 [project.scripts]
-second-brain = "scripts.cli:main"
+second-brain = "second_brain.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["scripts", "dashboard", "plugins"]
-only-include = ["scripts", "dashboard", "plugins"]
+packages = ["second_brain"]
+exclude = [
+    "**/__pycache__",
+    "**/*.pyc",
+    "**/*.pyo",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"scripts" = "second_brain/scripts"
+"dashboard" = "second_brain/dashboard"
+"plugins" = "second_brain/plugins"
+".streamlit/config.toml" = "second_brain/_streamlit/config.toml"
 
 [tool.uv]
-default-groups = []
+default-groups = ["dev"]

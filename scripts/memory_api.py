@@ -118,17 +118,193 @@ def assert_api_loopback_bind(host: str | None) -> str:
     return ALLOWED_API_BIND_HOST
 
 
-def default_api_token_path() -> Path:
-    override = (os.environ.get("BRAIN_MEMORY_API_TOKEN_FILE") or "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
+def _security_state_dir() -> Path:
+    sec_override = (
+        os.environ.get("BRAIN_SECURITY_STATE_DIR")
+        or os.environ.get("SECOND_BRAIN_SECURITY_DIR")
+        or ""
+    ).strip()
+    if sec_override:
+        return Path(sec_override).expanduser().resolve()
     if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
         base = Path(os.environ["LOCALAPPDATA"])
     elif os.environ.get("XDG_STATE_HOME"):
         base = Path(os.environ["XDG_STATE_HOME"]).expanduser()
     else:
         base = Path.home() / ".local" / "state"
-    return base / "SecondBrain" / "security" / "memory-api-token"
+    return base / "SecondBrain" / "security"
+
+
+def default_api_token_path() -> Path:
+    override = (os.environ.get("BRAIN_MEMORY_API_TOKEN_FILE") or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return _security_state_dir() / "memory-api-token"
+
+
+def default_api_port_path() -> Path:
+    override = (os.environ.get("BRAIN_API_PORT_FILE") or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return _security_state_dir() / "api-port"
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_proc = kernel32.OpenProcess
+            open_proc.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            open_proc.restype = wintypes.HANDLE
+            get_exit = kernel32.GetExitCodeProcess
+            get_exit.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            get_exit.restype = wintypes.BOOL
+            close_h = kernel32.CloseHandle
+            close_h.argtypes = [wintypes.HANDLE]
+            close_h.restype = wintypes.BOOL
+
+            handle = open_proc(0x1000, False, pid)
+            if not handle:
+                return ctypes.get_last_error() == 5
+            try:
+                exit_code = wintypes.DWORD(0)
+                if not get_exit(handle, ctypes.byref(exit_code)):
+                    return False
+                return int(exit_code.value) == 259
+            finally:
+                close_h(handle)
+        except Exception:
+            pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError, SystemError, ValueError):
+        return False
+
+
+def write_active_api_port_file(
+    port: int,
+    *,
+    host: str = ALLOWED_API_BIND_HOST,
+    port_file: Path | None = None,
+) -> Path:
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        raise ValueError(f"Invalid active API port {port!r}; expected 1..65535.")
+    target = (Path(port_file) if port_file is not None else default_api_port_path()).expanduser().resolve()
+    if os.path.lexists(str(target)) and _is_reparse_or_link(str(target)):
+        raise PermissionError(f"Refusing to overwrite symlinked API port file: {target}")
+    if os.path.lexists(str(target.parent)) and _is_reparse_or_link(str(target.parent)):
+        raise PermissionError(f"Refusing to write API port file under symlinked directory: {target.parent}")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if _is_reparse_or_link(str(target.parent)) or (os.path.lexists(str(target)) and _is_reparse_or_link(str(target))):
+        raise PermissionError(f"Refusing to write API port file through a symlink or reparse point: {target}")
+
+    payload = {
+        "port": int(port),
+        "host": str(host),
+        "pid": os.getpid(),
+        "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    }
+    encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".api-port-", suffix=".tmp")
+    fd_closed = False
+    try:
+        if os.name != "nt":
+            os.chmod(tmp_name, 0o600)
+        if os.write(fd, encoded) != len(encoded):
+            raise OSError("Incomplete API port file write.")
+        os.fsync(fd)
+        os.close(fd)
+        fd_closed = True
+        os.replace(tmp_name, target)
+        restrict_security_file_permissions(target)
+    finally:
+        if not fd_closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if os.path.exists(tmp_name):
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+    return target
+
+
+def remove_active_api_port_file(
+    *,
+    expected_pid: int | None = None,
+    port_file: Path | None = None,
+) -> None:
+    target = (Path(port_file) if port_file is not None else default_api_port_path()).expanduser()
+    if not os.path.lexists(str(target)):
+        return
+    if _is_reparse_or_link(str(target)) or (
+        os.path.lexists(str(target.parent)) and _is_reparse_or_link(str(target.parent))
+    ):
+        return
+    if expected_pid is not None:
+        try:
+            raw = read_bounded_security_file(Path(target), max_bytes=4096).strip()
+            parsed = json.loads(raw) if raw else None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(parsed, dict):
+            return
+        rec_pid = parsed.get("pid")
+        if isinstance(rec_pid, bool) or not isinstance(rec_pid, int) or rec_pid != int(expected_pid):
+            return
+    try:
+        os.remove(str(target))
+    except OSError:
+        pass
+
+
+def discover_active_api_port(
+    default_port: int = DEFAULT_API_PORT,
+    *,
+    port_file: Path | None = None,
+) -> int:
+    env_port = (os.environ.get("SECOND_BRAIN_PORT") or os.environ.get("BRAIN_MEMORY_API_PORT") or "").strip()
+    if env_port:
+        try:
+            parsed_env = int(env_port)
+            if 1 <= parsed_env <= 65535:
+                return parsed_env
+        except ValueError:
+            pass
+    target = (Path(port_file) if port_file is not None else default_api_port_path()).expanduser()
+    if os.path.lexists(str(target)) and not _is_reparse_or_link(str(target)):
+        if not (os.path.lexists(str(target.parent)) and _is_reparse_or_link(str(target.parent))):
+            try:
+                raw = read_bounded_security_file(Path(target), max_bytes=4096).strip()
+            except (OSError, UnicodeDecodeError):
+                raw = ""
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, int) and not isinstance(parsed, bool) and 1 <= parsed <= 65535:
+                        return parsed
+                    if isinstance(parsed, dict):
+                        p_val = parsed.get("port")
+                        cand_port = int(p_val) if isinstance(p_val, (int, str)) and not isinstance(p_val, bool) else 0
+                        pid_val = parsed.get("pid")
+                        if 1 <= cand_port <= 65535:
+                            if pid_val is None or (isinstance(pid_val, int) and not isinstance(pid_val, bool) and _pid_is_alive(pid_val)):
+                                return cand_port
+                except (ValueError, json.JSONDecodeError):
+                    pass
+    return default_port
 
 
 def generate_memory_api_token(token_path: Path | None = None) -> tuple[str, Path]:
@@ -268,7 +444,7 @@ class ApiRecallRequest(BaseModel):
 class ApiAnswerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     query: str = Field(..., min_length=1, max_length=2000)
-    mode: str = Field(default="standard", pattern=r"^(standard|preference)$")
+    mode: str = Field(default="standard", pattern=r"^(standard|preference|research)$")
     retrieval_mode: str = Field(default="auto", pattern=r"^(auto|lexical|dense|rrf)$")
     n_results: int = Field(default=5, ge=1, le=15)
     project_scope: str | None = Field(default=None, max_length=120)
@@ -311,6 +487,11 @@ class ApiExperienceCreateRequest(BaseModel):
     tools_used: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
     referenced_atoms: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
     lessons: list[BoundedExperienceItem] = Field(default_factory=list, max_length=20)
+    plan: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
+    reasoning_summary: str | None = Field(default=None, max_length=2000)
+    confidence_before: float | None = Field(default=None, ge=0.0, le=1.0)
+    confidence_after: float | None = Field(default=None, ge=0.0, le=1.0)
+    reflection: str | None = Field(default=None, max_length=2000)
     candidate_procedure_title: str | None = Field(default=None, max_length=200)
     propose_to_inbox: bool = False
 
@@ -441,6 +622,11 @@ def serve_memory_api(
 ) -> int:
     server = create_memory_api_server(host, port, runtime_config)
     bound_host, actual_port = server.server_address[0], server.server_address[1]
+    port_file_path: Path | None = None
+    try:
+        port_file_path = write_active_api_port_file(actual_port, host=bound_host)
+    except OSError:
+        port_file_path = None
     print(f"SECOND_BRAIN_API_READY http://{bound_host}:{actual_port} port={actual_port}", flush=True)
     print(f"Second Brain Loopback Memory API listening on http://{bound_host}:{actual_port}", flush=True)
     try:
@@ -449,6 +635,7 @@ def serve_memory_api(
         pass
     finally:
         server.server_close()
+        remove_active_api_port_file(expected_pid=os.getpid(), port_file=port_file_path)
     return 0
 
 
@@ -1146,6 +1333,11 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     tools_used=req.tools_used,
                     referenced_atoms=req.referenced_atoms,
                     lessons=req.lessons,
+                    plan=req.plan,
+                    reasoning_summary=req.reasoning_summary,
+                    confidence_before=req.confidence_before,
+                    confidence_after=req.confidence_after,
+                    reflection=req.reflection,
                     candidate_procedure_title=req.candidate_procedure_title,
                     propose_to_inbox=req.propose_to_inbox,
                     experiences_dir=rt.experiences_dir,
@@ -1203,7 +1395,7 @@ class MemoryApiClient:
     def __init__(
         self,
         *,
-        port: int = DEFAULT_API_PORT,
+        port: int | None = None,
         token: str | None = None,
         owner_token: str | None = None,
         timeout: float = 45.0,
@@ -1211,12 +1403,13 @@ class MemoryApiClient:
         resolved_token = (token or "").strip() or (get_configured_api_token() or "")
         if not resolved_token:
             raise PermissionError("MemoryApiClient requires a valid bearer token.")
-        self.base_url = f"http://{ALLOWED_API_BIND_HOST}:{port}"
+        actual_port = int(port) if port is not None else discover_active_api_port(DEFAULT_API_PORT)
+        self.base_url = f"http://{ALLOWED_API_BIND_HOST}:{actual_port}"
         self._owner_token = owner_token.strip() if (owner_token and owner_token.strip()) else None
         self._headers = {
             "Authorization": f"Bearer {resolved_token}",
             "Content-Type": "application/json",
-            "Host": f"{ALLOWED_API_BIND_HOST}:{port}",
+            "Host": f"{ALLOWED_API_BIND_HOST}:{actual_port}",
         }
         if self._owner_token:
             self._headers[api_product.OWNER_HEADER] = self._owner_token
@@ -1536,12 +1729,20 @@ class MemoryApiClient:
         *,
         helpful: bool = True,
         feedback: str | None = None,
+        actor: str = "owner",
+        note: str = "",
     ) -> dict[str, object]:
         signal = feedback if feedback is not None else ("endorsed" if helpful else "corrected")
         return self._request(
             "POST",
             "/v1/cognitive/feedback",
-            {"atom_filename": atom_filename, "feedback": signal, "helpful": bool(helpful)},
+            {
+                "atom_filename": atom_filename,
+                "feedback": signal,
+                "helpful": bool(helpful),
+                "actor": actor,
+                "note": note,
+            },
         )
 
     def atom_duplicates(self) -> dict[str, object]:

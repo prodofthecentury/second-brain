@@ -1,29 +1,44 @@
+"use strict";
+
 const destEl = document.getElementById("qcDestination");
 const tagsEl = document.getElementById("qcTags");
 const titleEl = document.getElementById("qcTitle");
 const bodyEl = document.getElementById("qcBody");
 const saveBtn = document.getElementById("qcSave");
 const cancelBtn = document.getElementById("qcCancel");
+const closeTopBtn = document.getElementById("qcCloseTop");
 const statusEl = document.getElementById("qcStatus");
+const shortcutHintEl = document.getElementById("qcShortcutHint");
 
 let isSaving = false;
+
+function applyPlatformLabels(platform) {
+  if (platform !== "darwin") return;
+  if (shortcutHintEl) {
+    shortcutHintEl.textContent = "⌘+Enter save · Esc close";
+  }
+  if (bodyEl) {
+    bodyEl.placeholder =
+      "Capture a thought, snippet, or decision... (⌘+Enter to save)";
+  }
+}
 
 function showStatus(msg, kind = "info") {
   if (!statusEl) return;
   if (!msg) {
     statusEl.style.display = "none";
     statusEl.textContent = "";
-    statusEl.className = "status-banner";
+    statusEl.className = "status-banner no-drag";
     return;
   }
   statusEl.style.display = "block";
   statusEl.textContent = msg;
   statusEl.className =
     kind === "error"
-      ? "status-banner banner-danger"
+      ? "status-banner banner-danger no-drag"
       : kind === "warn"
-      ? "status-banner banner-warn"
-      : "status-banner banner-ok";
+      ? "status-banner banner-warn no-drag"
+      : "status-banner banner-ok no-drag";
 }
 
 function parseTagsInput(raw) {
@@ -50,6 +65,9 @@ if (destEl) {
 
 function applyBackendStatus(st) {
   if (!st) return;
+  if (st.platform) {
+    applyPlatformLabels(st.platform);
+  }
   if (st.state === "bootstrapping" || st.state === "starting") {
     showStatus(st.message || "Memory API is starting up...", "warn");
   } else if (st.state === "error") {
@@ -60,20 +78,26 @@ function applyBackendStatus(st) {
 }
 
 async function initCapture() {
+  if (window.secondBrain && window.secondBrain.platform) {
+    applyPlatformLabels(window.secondBrain.platform);
+  }
   if (bodyEl) bodyEl.focus();
   try {
     const appSt = await window.secondBrain.getStatus();
+    if (appSt && appSt.platform) {
+      applyPlatformLabels(appSt.platform);
+    }
     if (appSt && !appSt.ready && appSt.backendStatus) {
       applyBackendStatus(appSt.backendStatus);
     }
   } catch {}
 }
 
-if (typeof window.secondBrain.onBackendStatus === "function") {
+if (window.secondBrain && typeof window.secondBrain.onBackendStatus === "function") {
   window.secondBrain.onBackendStatus((st) => applyBackendStatus(st));
 }
 
-if (typeof window.secondBrain.onCaptureFocus === "function") {
+if (window.secondBrain && typeof window.secondBrain.onCaptureFocus === "function") {
   window.secondBrain.onCaptureFocus(() => {
     showStatus("");
     if (bodyEl) bodyEl.focus();
@@ -147,20 +171,26 @@ async function save() {
   }
 }
 
-if (saveBtn) saveBtn.addEventListener("click", save);
-if (cancelBtn) {
-  cancelBtn.addEventListener("click", () => {
-    if (!isSaving) window.secondBrain.closeCapture();
-  });
+function requestClose() {
+  if (!isSaving && window.secondBrain) {
+    window.secondBrain.closeCapture();
+  }
 }
+
+if (saveBtn) saveBtn.addEventListener("click", save);
+if (cancelBtn) cancelBtn.addEventListener("click", requestClose);
+if (closeTopBtn) closeTopBtn.addEventListener("click", requestClose);
+
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !isSaving) {
     e.preventDefault();
-    window.secondBrain.closeCapture();
+    requestClose();
   } else if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
     e.preventDefault();
     save();
   }
 });
 
-initCapture();
+if (typeof window !== "undefined" && window.secondBrain) {
+  initCapture();
+}

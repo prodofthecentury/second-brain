@@ -614,7 +614,7 @@ def filter_atoms_for_host(
             continue
         if mode == "preference" and not is_pref:
             continue
-        if mode == "standard" and is_pref:
+        if mode in {"standard", "research"} and is_pref:
             continue
 
         contexts_raw = fm.get("contexts") or []

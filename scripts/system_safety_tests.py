@@ -378,11 +378,20 @@ Structured logs should use JSON and request IDs.
             )
         self.assertFalse(result.answerable)
 
-    def test_standard_prompt_rejects_unimplemented_research_mode(self):
-        from answer_policy import AnswerRequest, build_grounding_prompt
+    def test_standard_prompt_rejects_unknown_mode_and_enforces_research_envelope(self):
+        from answer_policy import AnswerRequest, build_grounding_prompt, format_research_leads
 
         with self.assertRaises(ValueError):
-            build_grounding_prompt(AnswerRequest(query="question", mode="research"), [])
+            build_grounding_prompt(AnswerRequest(query="question", mode="unverified_freeform"), [])
+
+        research_prompt = build_grounding_prompt(AnswerRequest(query="question", mode="research"), [])
+        self.assertIn("Do not use general knowledge.", research_prompt)
+        self.assertIn("These are the only allowed claim strings", research_prompt)
+
+        leads_block = format_research_leads(
+            [{"filename": "note.md", "kind": "working_note", "title": "Draft", "excerpt": "Unverified lead"}]
+        )
+        self.assertIn("UNVERIFIED LEADS — NOT OWNER-APPROVED", leads_block)
 
     def test_grounding_prompt_lists_only_exact_claim_sections_as_allowed_output(self):
         from answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, build_grounding_prompt
@@ -2450,6 +2459,11 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "smoke_test",
                 "phase4_product_tests",
                 "phase5_god_features_tests",
+                "goal3_backend_contract_tests",
+                "desktop_ui_tests",
+                "vscode_extension_tests",
+                "dashboard_apptest_tests",
+                "wheel_packaging_tests",
                 "scale_benchmark_1500",
             },
         )
@@ -2459,6 +2473,9 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
             "run_dashboard.ps1",
             "run_daemon.ps1",
             "run_night_shift.ps1",
+            "run_dashboard.sh",
+            "run_daemon.sh",
+            "run_night_shift.sh",
             "setup.ps1",
             "setup.sh",
         )
@@ -2481,8 +2498,9 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                     f"{launcher_name} references missing script: scripts/{script_basename}",
                 )
 
-        setup_sh_bytes = (ROOT / "setup.sh").read_bytes()
-        self.assertEqual(setup_sh_bytes.count(b"\r"), 0, "setup.sh must use LF line endings (zero \\r bytes)")
+        for sh_name in ("setup.sh", "run_dashboard.sh", "run_daemon.sh", "run_night_shift.sh", "scripts/package_desktop.sh"):
+            sh_bytes = (ROOT / sh_name).read_bytes()
+            self.assertEqual(sh_bytes.count(b"\r"), 0, f"{sh_name} must use LF line endings (zero \\r bytes)")
 
 
 class IndependentAuditReconciliationTests(unittest.TestCase):

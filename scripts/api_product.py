@@ -40,6 +40,7 @@ from atom_mutator import (  # noqa: E402
     apply_atom_merge,
     apply_review_transition,
     approved_revision_is_current,
+    atomic_write_bytes,
     content_sha256,
 )
 from config import (  # noqa: E402
@@ -104,6 +105,13 @@ def default_owner_token_path() -> Path:
     override = (os.environ.get("BRAIN_OWNER_TOKEN_FILE") or "").strip()
     if override:
         return Path(override).expanduser().resolve()
+    sec_override = (
+        os.environ.get("BRAIN_SECURITY_STATE_DIR")
+        or os.environ.get("SECOND_BRAIN_SECURITY_DIR")
+        or ""
+    ).strip()
+    if sec_override:
+        return Path(sec_override).expanduser().resolve() / "owner-token"
     if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
         base = Path(os.environ["LOCALAPPDATA"])
     elif os.environ.get("XDG_STATE_HOME"):
@@ -111,6 +119,73 @@ def default_owner_token_path() -> Path:
     else:
         base = Path.home() / ".local" / "state"
     return base / "SecondBrain" / "security" / "owner-token"
+
+
+_JOBS_LOCK = threading.Lock()
+_JOBS: dict[str, dict[str, object]] = {}
+
+
+def _start_operator_job(kind: str, script_name: str, extra_args: list[str], *, brain_dir: str) -> dict[str, object]:
+    import subprocess
+    import tempfile
+
+    scripts_dir = Path(__file__).resolve().parent
+    script_path = scripts_dir / script_name
+    if not script_path.is_file():
+        raise FileNotFoundError(f"Operator script not found: {script_name}")
+    job_id = f"job-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+    rec: dict[str, object] = {
+        "job_id": job_id,
+        "kind": kind,
+        "status": "running",
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "returncode": None,
+        "output_tail": "",
+    }
+    with _JOBS_LOCK:
+        if len(_JOBS) > 64:
+            oldest = next(iter(_JOBS))
+            _JOBS.pop(oldest, None)
+        _JOBS[job_id] = rec
+
+    writable_cwd = str(Path(brain_dir).resolve().parent) if os.access(str(Path(brain_dir).resolve().parent), os.W_OK) else tempfile.gettempdir()
+    env = dict(os.environ)
+    env["BRAIN_VAULT_DIR"] = str(brain_dir)
+
+    def _runner() -> None:
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script_path), *extra_args],
+                cwd=writable_cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=900,
+                check=False,
+            )
+            combined = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")).strip()
+            with _JOBS_LOCK:
+                rec["returncode"] = int(proc.returncode)
+                rec["status"] = "completed" if proc.returncode == 0 else "failed"
+                rec["output_tail"] = combined[-8000:]
+        except subprocess.TimeoutExpired:
+            with _JOBS_LOCK:
+                rec["returncode"] = -1
+                rec["status"] = "failed"
+                rec["output_tail"] = "Job timed out after 900 seconds."
+        except Exception as exc:
+            with _JOBS_LOCK:
+                rec["returncode"] = -1
+                rec["status"] = "failed"
+                rec["output_tail"] = f"Job error: {exc}"
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join(timeout=1.5)
+    with _JOBS_LOCK:
+        return dict(rec)
 
 
 def ensure_owner_token(path: Path | None = None) -> str:
@@ -731,11 +806,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if method == "DELETE" and action is None:
                 return send(200, delete_note(filename, expected_sha256=_str(body, "expected_sha256", max_len=64), paths=paths))
             if method == "POST" and action == "verify":
+                exp_note_sha = (
+                    _str(body, "expected_sha256", max_len=64, required=False)
+                    or _str(body, "expected_note_sha256", max_len=64)
+                )
                 res = verify_note_excerpt(
                     filename,
                     _str(body, "excerpt", max_len=4000),
                     actor=_str(body, "actor", max_len=120),
-                    expected_note_sha256=_str(body, "expected_sha256", max_len=64),
+                    expected_note_sha256=exp_note_sha,
                     claim=body.get("claim") if isinstance(body.get("claim"), str) else None,
                     memory_type=body.get("memory_type") if isinstance(body.get("memory_type"), str) else "semantic",
                     tags=_tags(body) if "tags" in body else None,
@@ -761,11 +840,20 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Streaming chat ──
         if path == "/v1/chat/stream" and method == "POST":
-            from streaming_chat import CHAT_MODES, ChatPaths, chat_events
+            from streaming_chat import ANSWER_VIEWS, CHAT_MODES, RETRIEVAL_MODES, ChatPaths, chat_events
 
             mode = _str(body, "mode", max_len=16, required=False, default="stream")
             if mode not in CHAT_MODES:
                 raise ValueError(f"mode must be one of {CHAT_MODES}")
+            retr_mode = _str(body, "retrieval_mode", max_len=16, required=False, default="lexical") or "lexical"
+            if retr_mode not in RETRIEVAL_MODES:
+                raise ValueError(f"retrieval_mode must be one of {RETRIEVAL_MODES}")
+            ans_view = _str(body, "answer_view", max_len=16, required=False, default="standard") or "standard"
+            if ans_view not in ANSWER_VIEWS:
+                raise ValueError(f"answer_view must be one of {ANSWER_VIEWS}")
+            chat_host = _str(body, "host_id", max_len=64, required=False, default="ollama_local") or "ollama_local"
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", chat_host):
+                raise ValueError("Invalid 'host_id'.")
             query_str = _str(body, "query", max_len=2000)
             cp = ChatPaths(
                 brain_dir=rt.brain_dir,
@@ -787,6 +875,10 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     project_scope=scope,
                     model_override=model_ov,
                     include_preferences=inc_prefs,
+                    host_id=chat_host,
+                    retrieval_mode=retr_mode,
+                    answer_view=ans_view,
+                    allow_unverified_leads=bool(is_owner and ans_view == "research"),
                 ),
                 on_open=lambda: _audit_fn(rt.brain_dir, path, method, 200),
             )
@@ -816,31 +908,82 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if not atom_path or _is_reparse_or_link(atom_path):
                 return send(404, {"error": "Atom not found."})
 
+            actor = _str(body, "actor", max_len=120, required=False).strip() or "owner"
+            note = _str(body, "note", max_len=1000, required=False).strip()
+            allowed_fb = {
+                "endorsed",
+                "helpful",
+                "positive",
+                "corrected",
+                "correction",
+                "unhelpful",
+                "negative",
+                "superseded",
+                "supersession",
+            }
             raw_fb = body.get("feedback") if "feedback" in body else body.get("signal")
             if isinstance(raw_fb, str) and raw_fb.strip():
                 fb_norm = raw_fb.strip().lower()
-                if fb_norm not in {"endorsed", "helpful", "positive", "corrected", "unhelpful", "negative"}:
-                    raise ValueError("Invalid 'feedback'; expected 'endorsed' or 'corrected'.")
+                if fb_norm not in allowed_fb:
+                    raise ValueError("Invalid 'feedback'; expected 'endorsed', 'corrected', or 'superseded'.")
                 helpful = fb_norm in {"endorsed", "helpful", "positive"}
+                resolved_kind = (
+                    "helpful"
+                    if helpful
+                    else ("supersession" if fb_norm in {"superseded", "supersession"} else "correction")
+                )
             elif isinstance(body.get("helpful"), bool):
                 helpful = bool(body.get("helpful"))
+                resolved_kind = "helpful" if helpful else "correction"
             else:
-                raise ValueError("Provide 'feedback' ('endorsed' | 'corrected') or boolean 'helpful'.")
-            record_atom_feedback(atom_fn, helpful=helpful, db_path=rt.telemetry_db_path, brain_dir=rt.brain_dir)
-            return send(200, {"status": "recorded", "atom_filename": atom_fn, "helpful": helpful})
+                raise ValueError("Provide 'feedback' ('endorsed' | 'corrected' | 'superseded') or boolean 'helpful'.")
+            fb_res = record_atom_feedback(
+                atom_fn,
+                helpful=helpful,
+                feedback_kind=resolved_kind,
+                actor=actor,
+                note=note,
+                db_path=rt.telemetry_db_path,
+                brain_dir=rt.brain_dir,
+            )
+            return send(
+                200,
+                {
+                    "status": "recorded",
+                    "atom_filename": atom_fn,
+                    "helpful": helpful,
+                    "feedback_kind": resolved_kind,
+                    "actor": actor,
+                    "note": note,
+                    **(fb_res if isinstance(fb_res, dict) else {}),
+                },
+            )
 
         # ── One-click review & Atom Governance ──
         if path == "/v1/review/queue" and method == "GET":
             if not owner_only():
                 return True
-            items = []
+            limit = _parse_bounded_int(q, "limit", default=200, min_val=1, max_val=500)
+            offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
+            all_items = []
             for rec in list_review_queue(rt.atoms_dir, {"pending", "needs_edit"}):
                 p = safe_file_in_dir(rt.atoms_dir, rec["filename"], allowed_exts={".md"}, must_exist=True)
                 if p and not _is_reparse_or_link(p):
                     card = _safe_atom_card(p, rt, fallback=rec)
                     if card is not None:
-                        items.append(card)
-            return send(200, {"items": items, "count": len(items), "total": len(items)})
+                        all_items.append(card)
+            page = all_items[offset : offset + limit]
+            return send(
+                200,
+                {
+                    "items": page,
+                    "count": len(page),
+                    "total": len(all_items),
+                    "offset": offset,
+                    "limit": limit,
+                    "has_more": offset + len(page) < len(all_items),
+                },
+            )
 
         if path == "/v1/atoms" and method == "GET":
             limit = _parse_bounded_int(q, "limit", default=200, min_val=1, max_val=500)
@@ -1131,7 +1274,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/playbooks/candidates" and method == "GET":
             if not owner_only():
                 return True
-            from skill_playbooks import inspect_skill_candidates
+            from skill_playbooks import _claim_grounding_units, inspect_skill_candidates
 
             raw_cands = inspect_skill_candidates(
                 brain_dir=rt.brain_dir,
@@ -1150,7 +1293,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                             claim_txt = str(parse_atom_record(ap).get("claim") or "")
                         except Exception:
                             claim_txt = ""
-                cands.append({**cand, "claim": claim_txt})
+                units = list(_claim_grounding_units(claim_txt)) if claim_txt else []
+                cands.append({**cand, "claim": claim_txt, "grounding_units": units})
             return send(200, {"candidates": cands, "items": cands, "count": len(cands)})
 
         if path == "/v1/playbooks/promote" and method == "POST":
@@ -1330,11 +1474,73 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(200, stats.as_dict())
 
+        if path == "/v1/import/file" and method == "POST":
+            if not owner_only():
+                return True
+            from bulk_import import import_file
+
+            file_path = _str(body, "path", max_len=1000)
+            res = import_file(file_path, tags=tuple(_tags(body)), paths=paths)
+            return send(201, res)
+
         # ── Cryptographic Vault Merkle Ledger ──
         if path == "/v1/ledger/verify" and method == "GET":
             from vault_ledger import verify_vault_ledger
 
             return send(200, verify_vault_ledger(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir, playbooks_dir=rt.playbooks_dir))
+
+        if path == "/v1/ledger/history" and method == "GET":
+            from vault_ledger import verify_vault_ledger
+
+            limit = _parse_bounded_int(q, "limit", default=100, min_val=1, max_val=500)
+            offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
+            led = verify_vault_ledger(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir, playbooks_dir=rt.playbooks_dir)
+            entries = list(reversed(list(led.get("entries") or [])))
+            page = entries[offset : offset + limit]
+            return send(
+                200,
+                {
+                    "total": len(entries),
+                    "count": len(page),
+                    "offset": offset,
+                    "limit": limit,
+                    "has_more": offset + len(page) < len(entries),
+                    "entries": page,
+                    "items": page,
+                },
+            )
+
+        if path == "/v1/ledger/leaves" and method == "GET":
+            from vault_ledger import compute_vault_merkle
+
+            limit = _parse_bounded_int(q, "limit", default=200, min_val=1, max_val=500)
+            offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
+            merkle = compute_vault_merkle(
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                playbooks_dir=rt.playbooks_dir,
+            )
+            leaves = list(merkle.get("leaves") or [])
+            if not is_owner:
+                pref_rels = {
+                    f"2-atoms/{name}"
+                    for name in (os.listdir(rt.atoms_dir) if os.path.isdir(rt.atoms_dir) else [])
+                    if is_content_markdown(name) and _is_preference_atom_file(os.path.join(rt.atoms_dir, name))
+                }
+                leaves = [lf for lf in leaves if lf.get("rel_path") not in pref_rels]
+            page = leaves[offset : offset + limit]
+            return send(
+                200,
+                {
+                    "total": len(leaves),
+                    "count": len(page),
+                    "offset": offset,
+                    "limit": limit,
+                    "has_more": offset + len(page) < len(leaves),
+                    "items": page,
+                    "leaves": page,
+                },
+            )
 
         if path == "/v1/ledger/commit" and method == "POST":
             if not owner_only():
@@ -1430,6 +1636,59 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             res = build_knowledge_graph(**bg_kwargs)
             return send(200, {k: v for k, v in res.items() if k not in {"nodes", "edges"}})
 
+        if path in {"/v1/graph/full", "/v1/graph"} and method == "GET":
+            from knowledge_graph import build_knowledge_graph
+
+            proj = ((q.get("project") or [None])[0] or None)
+            if proj and len(proj) > 120:
+                raise ValueError("Invalid project query filter.")
+            limit = _parse_bounded_int(q, "limit", default=300, min_val=1, max_val=1000)
+            q_inc_pending = (q.get("include_pending") or ["0"])[0] in {"1", "true", "yes"}
+            bg_kwargs_full: dict[str, object] = {
+                "brain_dir": rt.brain_dir,
+                "atoms_dir": rt.atoms_dir,
+                "project_scope": proj,
+                "include_pending": bool(is_owner and q_inc_pending),
+            }
+            if "include_preferences" in inspect.signature(build_knowledge_graph).parameters:
+                bg_kwargs_full["include_preferences"] = bool(is_owner)
+            res = build_knowledge_graph(**bg_kwargs_full)
+            nodes_raw = list(res.get("nodes") or [])[:limit]
+            kept_ids = {str(n.get("id") or n.get("filename") or "") for n in nodes_raw}
+            nodes_norm = [
+                {
+                    "id": str(n.get("id") or n.get("filename") or ""),
+                    "filename": str(n.get("filename") or n.get("id") or ""),
+                    "label": str(n.get("claim") or n.get("label") or n.get("filename") or "")[:140],
+                    "claim": str(n.get("claim") or ""),
+                    "review_status": str(n.get("review_status") or "pending"),
+                    "memory_type": str(n.get("memory_type") or "semantic"),
+                    "contexts": list(n.get("contexts") or []),
+                    "verified": bool(n.get("approved_current", n.get("verified", False))),
+                }
+                for n in nodes_raw
+            ]
+            edges_norm = [
+                {
+                    "from": str(e.get("from") or e.get("source") or ""),
+                    "to": str(e.get("to") or e.get("target") or ""),
+                    "kind": str(e.get("kind") or e.get("relation") or "link"),
+                }
+                for e in (res.get("edges") or [])
+                if str(e.get("from") or e.get("source") or "") in kept_ids
+                and str(e.get("to") or e.get("target") or "") in kept_ids
+            ]
+            return send(
+                200,
+                {
+                    **res,
+                    "nodes": nodes_norm,
+                    "edges": edges_norm,
+                    "node_count": len(nodes_norm),
+                    "edge_count": len(edges_norm),
+                },
+            )
+
         if path.startswith("/v1/graph/neighbors/") and method == "GET":
             from knowledge_graph import graph_neighbors
 
@@ -1482,12 +1741,17 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             from audit_sources import audit_sources
 
             reports = audit_sources(atoms_dir=rt.atoms_dir, brain_dir=rt.brain_dir, demote_stale=False)
-            stale = [r for r in reports if r.get("stale_approval")]
+            stale = [
+                r
+                for r in reports
+                if r.get("stale_approval") or r.get("action") in {"review_required", "would_demote", "demoted"}
+            ]
             return send(
                 200,
                 {
                     "count": len(reports),
                     "stale_count": len(stale),
+                    "stale": stale,
                     "reports": reports,
                     "items": reports,
                 },
@@ -1505,7 +1769,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 demote_stale=True,
                 actor=actor,
             )
-            demoted = [r for r in reports if r.get("demoted")]
+            demoted = [r for r in reports if r.get("demoted") or r.get("action") == "demoted"]
             return send(
                 200,
                 {
@@ -1638,6 +1902,140 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             else:
                 res = _verify_snapshot_fallback(sid, brain_dir=rt.brain_dir)
             return send(200, res)
+
+        # ── Vault Section Browsers (threads, experiences, briefings — owner) ──
+        if path.startswith("/v1/vault/") and method == "GET":
+            if not owner_only():
+                return True
+            section_map = {
+                "threads": os.path.join(rt.brain_dir, "3-threads"),
+                "experiences": rt.experiences_dir,
+                "briefings": os.path.join(rt.brain_dir, "briefings"),
+            }
+            sub = path[len("/v1/vault/") :].strip("/")
+            parts = [unquote(p) for p in sub.split("/") if p]
+            if not parts or parts[0] not in section_map:
+                return send(404, {"error": "Unknown vault section."})
+            sec_dir = section_map[parts[0]]
+            if len(parts) == 1:
+                limit = _parse_bounded_int(q, "limit", default=100, min_val=1, max_val=500)
+                offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
+                rows: list[dict[str, object]] = []
+                if os.path.isdir(sec_dir) and not _is_reparse_or_link(sec_dir):
+                    for name in sorted(os.listdir(sec_dir), reverse=True):
+                        if not is_content_markdown(name):
+                            continue
+                        fp = safe_file_in_dir(sec_dir, name, allowed_exts={".md"}, must_exist=True)
+                        if not fp or _is_reparse_or_link(fp):
+                            continue
+                        try:
+                            st = os.stat(fp)
+                            head = Path(fp).read_text(encoding="utf-8", errors="replace")[:600]
+                        except OSError:
+                            continue
+                        title_m = re.search(r"(?m)^#\s+(.+)$", head)
+                        title = title_m.group(1).strip() if title_m else os.path.splitext(name)[0]
+                        rows.append(
+                            {
+                                "filename": name,
+                                "title": title[:160],
+                                "size_bytes": int(st.st_size),
+                                "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime)),
+                            }
+                        )
+                page = rows[offset : offset + limit]
+                return send(
+                    200,
+                    {
+                        "section": parts[0],
+                        "total": len(rows),
+                        "count": len(page),
+                        "offset": offset,
+                        "limit": limit,
+                        "has_more": offset + len(page) < len(rows),
+                        "items": page,
+                    },
+                )
+            if len(parts) == 2:
+                norm_name = normalize_markdown_filename(parts[1])
+                fp = safe_file_in_dir(sec_dir, norm_name, allowed_exts={".md"}, must_exist=True)
+                if not fp or _is_reparse_or_link(fp):
+                    return send(404, {"error": "Vault item not found."})
+                raw_txt = Path(fp).read_text(encoding="utf-8", errors="replace")
+                return send(
+                    200,
+                    {
+                        "section": parts[0],
+                        "filename": norm_name,
+                        "content": raw_txt,
+                        "sha256": content_sha256(raw_txt.encode("utf-8")),
+                    },
+                )
+            return send(404, {"error": "Vault item not found."})
+
+        # ── Web Scout Reading Queue & Operator Jobs (owner) ──
+        if path == "/v1/scout/queue" and method == "GET":
+            if not owner_only():
+                return True
+            rlist = Path(rt.brain_dir) / "0-raw" / "reading-list.md"
+            items: list[dict[str, str]] = []
+            if rlist.is_file() and not _is_reparse_or_link(str(rlist)):
+                for raw_line in rlist.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = raw_line.strip()
+                    m = re.match(r"^-\s*\[( |x|X|feed|failed|blocked)\]\s+(https?://\S+)", line)
+                    if m:
+                        mark, u = m.group(1).lower(), m.group(2)
+                        status_lbl = "queued" if mark == " " else ("completed" if mark == "x" else mark)
+                        items.append({"url": u, "status": status_lbl, "kind": "feed" if mark == "feed" else "url"})
+            return send(200, {"total": len(items), "count": len(items), "items": items})
+
+        if path == "/v1/scout/queue" and method == "POST":
+            if not owner_only():
+                return True
+            raw_url = _str(body, "url", max_len=1000).strip()
+            is_feed = bool(body.get("is_feed"))
+            if not re.match(r"^https?://[^\s<>\"']+$", raw_url):
+                raise ValueError("Scout URL must start with http:// or https:// and contain no whitespace.")
+            raw_dir = Path(rt.brain_dir) / "0-raw"
+            if _is_reparse_or_link(str(raw_dir)):
+                raise PermissionError("Refusing to write reading-list.md under symlinked 0-raw directory.")
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            rlist = raw_dir / "reading-list.md"
+            if rlist.exists() and _is_reparse_or_link(str(rlist)):
+                raise PermissionError("Refusing to write symlinked reading-list.md.")
+            existing_txt = rlist.read_text(encoding="utf-8", errors="replace") if rlist.is_file() else "# Reading List\n\n"
+            marker = "[feed]" if is_feed else "[ ]"
+            new_line = f"- {marker} {raw_url}\n"
+            if not existing_txt.endswith("\n"):
+                existing_txt += "\n"
+            atomic_write_bytes(str(rlist), (existing_txt + new_line).encode("utf-8"))
+            return send(201, {"status": "queued", "url": raw_url, "kind": "feed" if is_feed else "url"})
+
+        if path == "/v1/scout/run" and method == "POST":
+            if not owner_only():
+                return True
+            return send(202, _start_operator_job("scout", "ollama_scout.py", [], brain_dir=rt.brain_dir))
+
+        if path in {"/v1/jobs/refinery", "/v1/jobs/editor", "/v1/jobs/doctor"} and method == "POST":
+            if not owner_only():
+                return True
+            kind = path.rsplit("/", 1)[-1]
+            script_map = {
+                "refinery": "ollama_refinery.py",
+                "editor": "ollama_editor.py",
+                "doctor": "doctor.py",
+            }
+            return send(202, _start_operator_job(kind, script_map[kind], [], brain_dir=rt.brain_dir))
+
+        if path.startswith("/v1/jobs/") and method == "GET":
+            if not owner_only():
+                return True
+            jid = unquote(path[len("/v1/jobs/") :]).strip()
+            with _JOBS_LOCK:
+                rec = dict(_JOBS[jid]) if jid in _JOBS else None
+            if rec is None:
+                return send(404, {"error": "Job not found."})
+            return send(200, rec)
 
     except (MemoryRecallUnavailable, LexicalIndexUnavailable) as exc:
         return send(

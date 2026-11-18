@@ -16,8 +16,11 @@ import urllib.error
 import urllib.request
 
 # Existing internal modules use direct imports when executed from the scripts
-# directory. Preserve that import contract inside the installed wheel.
+# directory. Preserve that import contract inside both repo checkouts and wheels.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+_RUNTIME_ROOT = str(Path(__file__).resolve().parent.parent)
+if _RUNTIME_ROOT not in sys.path:
+    sys.path.insert(0, _RUNTIME_ROOT)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
@@ -256,9 +259,28 @@ def install(args: argparse.Namespace | None = None) -> int:
 cmd_install = install
 
 
-def launch_dashboard() -> int:
+def _resolve_writable_dashboard_cwd(app_path: Path) -> str:
+    root_dir = app_path.parent.parent
+    if (root_dir / "pyproject.toml").is_file() and os.access(str(root_dir), os.W_OK):
+        return str(root_dir)
+    vault_dir = (os.environ.get("BRAIN_VAULT_DIR") or "").strip() or _config.BRAIN_DIR
+    try:
+        os.makedirs(vault_dir, exist_ok=True)
+        if os.access(vault_dir, os.W_OK):
+            return vault_dir
+    except OSError:
+        pass
+    import tempfile
+
+    return tempfile.gettempdir()
+
+
+def launch_dashboard(port: int = 8501) -> int:
+    if not (1 <= int(port) <= 65535):
+        print("--port must be between 1 and 65535.", file=sys.stderr)
+        return 2
     if not _capability("streamlit"):
-        print("Dashboard dependencies are not installed. Run `uv sync --frozen` first.", file=sys.stderr)
+        print("Dashboard dependencies are not installed. Run `uv sync --frozen` or install `second-brain[dashboard]`.", file=sys.stderr)
         return 2
     from scripts.dashboard_auth import configure_password_interactively, load_password_record
 
@@ -268,25 +290,38 @@ def launch_dashboard() -> int:
     if not app_path.is_file():
         print("Dashboard files are missing from this installation.", file=sys.stderr)
         return 2
-    return subprocess.call([
-        sys.executable, "-m", "streamlit", "run", str(app_path),
-        "--server.address=127.0.0.1",
-        "--server.port=8501",
-        "--server.enableCORS=true",
-        "--server.enableXsrfProtection=true",
-        "--server.xsrfCookieSameSite=strict",
-        "--server.allowedHosts=127.0.0.1",
-        "--server.corsAllowedOrigins=http://127.0.0.1:8501",
-        "--browser.serverAddress=127.0.0.1",
-        "--browser.gatherUsageStats=false",
-    ])
+    bound_port = int(port)
+    run_cwd = _resolve_writable_dashboard_cwd(app_path)
+    dash_env = dict(os.environ)
+    dash_env.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    dash_env.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    return subprocess.call(
+        [
+            sys.executable, "-m", "streamlit", "run", str(app_path),
+            "--server.headless=true",
+            "--server.address=127.0.0.1",
+            f"--server.port={bound_port}",
+            "--server.enableCORS=true",
+            "--server.enableXsrfProtection=true",
+            "--server.xsrfCookieSameSite=strict",
+            "--server.allowedHosts=127.0.0.1",
+            f"--server.corsAllowedOrigins=http://127.0.0.1:{bound_port}",
+            "--client.toolbarMode=minimal",
+            "--browser.serverAddress=127.0.0.1",
+            "--browser.gatherUsageStats=false",
+        ],
+        cwd=run_cwd,
+        env=dash_env,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="second-brain", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="Report local runtime capabilities.")
-    subparsers.add_parser("dashboard", help="Start the local password-protected dashboard.")
+    dashboard_parser = subparsers.add_parser("dashboard", help="Start the local password-protected dashboard.")
+    dashboard_parser.add_argument("--port", type=int, default=8501, help="Loopback TCP port (default 8501).")
+    dashboard_parser.add_argument("--headless", action="store_true", default=True, help="Run headless without opening a browser.")
     install_parser = subparsers.add_parser("install", help="Initialize the vault and model-free lexical index.")
     install_parser.add_argument("--no-index", action="store_true", help="Skip reindexing if lexical index already exists.")
 
@@ -355,7 +390,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "dashboard":
         if remainder:
             parser.error(f"unrecognized arguments: {' '.join(remainder)}")
-        return launch_dashboard()
+        if not (1 <= args.port <= 65535):
+            parser.error("--port must be between 1 and 65535.")
+        return launch_dashboard(port=args.port)
     if args.command == "install":
         if remainder:
             parser.error(f"unrecognized arguments: {' '.join(remainder)}")
@@ -702,8 +739,8 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         p.add_argument("--print-token", action="store_true", help="Print the configured file-stored MCP bearer token.")
         args = p.parse_args(forwarded)
         if args.generate_token:
-            token = mcp_mod.secrets.token_urlsafe(32)
-            saved_path = mcp_mod.write_token_file(token)
+            token = mcp_mod.generate_bearer_token()
+            saved_path = mcp_mod.save_bearer_token(token)
             print(f"Wrote MCP bearer token to {saved_path}")
             return 0
         if args.print_token:

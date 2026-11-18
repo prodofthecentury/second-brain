@@ -1,6 +1,9 @@
+"use strict";
+
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("secondBrain", {
+  platform: process.platform,
   getStatus: () => ipcRenderer.invoke("app:status"),
   request: (method, path, body = null) =>
     ipcRenderer.invoke("api:request", { method, path, body }),
@@ -10,6 +13,8 @@ contextBridge.exposeInMainWorld("secondBrain", {
   abortChat: () => ipcRenderer.invoke("chat:abort"),
   cancelChat: () => ipcRenderer.invoke("chat:abort"),
   pickFolder: () => ipcRenderer.invoke("dialog:pick-folder"),
+  pickFile: () => ipcRenderer.invoke("dialog:pick-file"),
+  openExternal: (url) => ipcRenderer.invoke("shell:open-external", { url }),
   switchVault: () => ipcRenderer.invoke("vault:switch"),
   chooseVault: () => ipcRenderer.invoke("vault:switch"),
   ideAction: (action, target = null, options = {}) =>

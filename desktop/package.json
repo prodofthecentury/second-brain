@@ -5,6 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test tests/",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --win nsis",
     "dist:win": "electron-builder --win nsis msi",
@@ -22,16 +23,28 @@
   "build": {
     "appId": "com.secondbrain.desktop",
     "productName": "Second Brain",
+    "afterPack": "./build/afterPack.js",
+    "toolsets": {
+      "winCodeSign": "1.1.0"
+    },
     "directories": {
       "output": "../dist"
     },
     "files": [
       "main.js",
       "preload.js",
+      "lib/**/*",
       "renderer/**/*",
       "assets/**/*"
     ],
     "extraResources": [
+      {
+        "from": "../second_brain",
+        "to": "backend/second_brain",
+        "filter": [
+          "**/*.py"
+        ]
+      },
       {
         "from": "../scripts",
         "to": "backend/scripts",
@@ -90,9 +103,14 @@
           ]
         }
       ],
-      "icon": "assets/icon.png",
+      "icon": "assets/icon.ico",
       "artifactName": "Second-Brain-Setup-${version}-${arch}.${ext}",
-      "signAndEditExecutable": false
+      "signtoolOptions": {
+        "sign": "./build/sign.js",
+        "signingHashAlgorithms": [
+          "sha256"
+        ]
+      }
     },
     "nsis": {
       "oneClick": true,
@@ -116,7 +134,7 @@
     },
     "mac": {
       "category": "public.app-category.productivity",
-      "icon": "assets/icon.png",
+      "icon": "assets/icon.icns",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "entitlements.mac.plist",

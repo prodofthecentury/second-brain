@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build and sign Second Brain desktop installers on macOS (DMG/zip) or Linux (AppImage/deb).
+# Build and sign Second Brain desktop installers on macOS (DMG/zip) or Linux (AppImage/deb),
+# plus Python wheel, offline wheelhouse, VSIX extension, and SHA256SUMS.txt.
 # Optional env vars for macOS notarization/signing:
 #   CSC_LINK / CSC_KEY_PASSWORD / APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DESKTOP_DIR="$REPO_ROOT/desktop"
 DIST_DIR="$REPO_ROOT/dist"
+
+mkdir -p "$DIST_DIR"
+
+if command -v uv >/dev/null 2>&1; then
+  cd "$REPO_ROOT"
+  uv run --frozen python scripts/make_icons.py
+  uv build --wheel --out-dir "$DIST_DIR"
+  uv run --frozen python scripts/build_wheelhouse.py --out-dir "$DIST_DIR/wheelhouse"
+  uv run --frozen python scripts/build_vsix.py --out-dir "$DIST_DIR"
+fi
 
 cd "$DESKTOP_DIR"
 if [ -f package-lock.json ]; then
@@ -29,47 +40,6 @@ case "$UNAME_S" in
     exit 1
     ;;
 esac
-
-if command -v uv >/dev/null 2>&1; then
-  cd "$REPO_ROOT"
-  mkdir -p "$DIST_DIR"
-  uv build --wheel --out-dir "$DIST_DIR"
-  uv run --frozen python - <<'PY'
-import json, pathlib, zipfile
-from xml.sax.saxutils import escape
-root = pathlib.Path("extensions/vscode-second-brain")
-pkg = json.loads((root / "package.json").read_text(encoding="utf-8"))
-esc = lambda v: escape(str(v), {'"': "&quot;", "'": "&apos;"})
-ver = pkg["version"]
-out = pathlib.Path("dist") / f"second-brain-vscode-{ver}.vsix"
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-    z.writestr(
-        "[Content_Types].xml",
-        '<?xml version="1.0" encoding="utf-8"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="json" ContentType="application/json"/>'
-        '<Default Extension="js" ContentType="application/javascript"/>'
-        '<Default Extension="md" ContentType="text/markdown"/>'
-        '<Default Extension="vsixmanifest" ContentType="text/xml"/>'
-        "</Types>",
-    )
-    z.writestr(
-        "extension.vsixmanifest",
-        '<?xml version="1.0" encoding="utf-8"?>'
-        '<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">'
-        f'<Metadata><Identity Language="en-US" Id="{esc(pkg["name"])}" Version="{esc(ver)}" Publisher="{esc(pkg["publisher"])}"/>'
-        f'<DisplayName>{esc(pkg["displayName"])}</DisplayName>'
-        f'<Description>{esc(pkg["description"])}</Description></Metadata>'
-        '<Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation>'
-        '<Assets><Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json"/></Assets>'
-        "</PackageManifest>",
-    )
-    for p in sorted(root.rglob("*")):
-        rel = p.relative_to(root).as_posix()
-        if p.is_file() and not rel.startswith("node_modules/") and p.suffix.lower() != ".vsix":
-            z.write(p, f"extension/{rel}")
-PY
-fi
 
 if [ -d "$DIST_DIR" ]; then
   cd "$DIST_DIR"

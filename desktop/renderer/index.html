@@ -20,14 +20,17 @@
       <button class="nav-btn active" data-view="notes" type="button">Notes <span class="kbd">Ctrl+1</span></button>
       <button class="nav-btn" data-view="chat" type="button">Streaming Chat <span class="kbd">Ctrl+2</span></button>
       <button class="nav-btn" data-view="review" type="button">Inbox &amp; Review <span class="kbd">Ctrl+3</span></button>
-      <button class="nav-btn" data-view="import" type="button">Bulk Import <span class="kbd">Ctrl+4</span></button>
+      <button class="nav-btn" data-view="import" type="button">Import, Scout &amp; Jobs <span class="kbd">Ctrl+4</span></button>
       <button class="nav-btn" data-view="ide" type="button">IDE Hub <span class="kbd">Ctrl+5</span></button>
       <button class="nav-btn" data-view="system" type="button">System <span class="kbd">Ctrl+6</span></button>
       <button class="nav-btn" data-view="planner" type="button">Playbooks &amp; Plan <span class="kbd">Ctrl+7</span></button>
-      <button class="nav-btn" data-view="proof" type="button">Vault Proof &amp; Radar <span class="kbd">Ctrl+8</span></button>
+      <button class="nav-btn" data-view="proof" type="button">Vault Proof &amp; Audit <span class="kbd">Ctrl+8</span></button>
+      <button class="nav-btn" data-view="graph" type="button">Knowledge Graph <span class="kbd">Ctrl+9</span></button>
+      <button class="nav-btn" data-view="vault" type="button">Vault Explorer <span class="kbd">Ctrl+0</span></button>
 
       <div class="sidebar-footer">
-        <div>Quick Capture: <span class="kbd">Ctrl+Shift+Space</span></div>
+        <div>Quick Capture: <span class="kbd" id="captureShortcutBadge">Ctrl+Shift+Space</span></div>
+        <div id="shortcutWarningText" style="display:none; margin-top:4px; color:#f2cc60;"></div>
         <div id="vaultMetrics" style="margin-top:4px;">Loading vault...</div>
       </div>
     </aside>
@@ -40,16 +43,18 @@
       <!-- TAB 1: NOTES VIEW -->
       <section class="view active" id="view-notes">
         <div class="toolbar">
-          <input type="search" id="noteSearchInput" placeholder="Search notes &amp; tags..." style="flex:1; min-width:200px;" />
+          <input type="search" id="noteSearchInput" placeholder="Search notes..." style="flex:1; min-width:180px;" />
+          <input type="text" id="noteTagFilterInput" placeholder="Filter tag (optional)" style="width:165px;" />
           <button class="btn primary" id="newNoteBtn" type="button">+ New Note</button>
           <button class="btn" id="saveNoteBtn" type="button">Save <span class="kbd">Ctrl+S</span></button>
           <button class="btn" id="togglePreviewBtn" type="button">Split Preview</button>
           <button class="btn danger" id="deleteNoteBtn" type="button">Trash</button>
         </div>
-        <div class="status-banner" id="notesBanner">Zero-friction owner notes index immediately. Highlight an excerpt (>= 12 chars) below to promote it into a SHA-256 anchored Verified Atom.</div>
+        <div class="status-banner" id="notesBanner">Zero-friction owner notes index immediately. Highlight an excerpt (&gt;= 12 chars) below to promote it into a SHA-256 anchored Verified Atom.</div>
         <div class="notes-grid">
           <div class="pane">
             <div class="scroll-list" id="notesList"></div>
+            <div class="pagination-bar" id="notesPaginationBar" style="display:none;"></div>
           </div>
           <div class="pane">
             <div class="editor-wrap">
@@ -84,28 +89,56 @@
       <section class="view" id="view-chat">
         <div class="toolbar">
           <input type="text" id="chatQueryInput" placeholder="Ask your Second Brain..." style="flex:1; min-width:220px;" />
-          <select id="chatModeSelect">
+          <select id="chatModeSelect" aria-label="Chat Mode">
             <option value="stream">Stream (Instant cards + SSE)</option>
             <option value="verified">Verified (Claim-ID grounded)</option>
             <option value="instant">Instant (&lt;20ms retrieval only)</option>
           </select>
-          <input type="text" id="chatScopeInput" placeholder="project_scope (optional)" style="width:165px;" />
           <button class="btn primary" id="chatSendBtn" type="button">Ask</button>
           <button class="btn danger" id="chatStopBtn" type="button" disabled>Stop</button>
-          <button class="btn" id="chatWarmupBtn" type="button">Warmup Model</button>
+          <button class="btn" id="chatWarmupBtn" type="button">Warmup</button>
+          <button class="btn" id="chatExportMdBtn" type="button">Export Markdown</button>
+          <button class="btn" id="chatClearHistoryBtn" type="button">Clear History</button>
         </div>
-        <div class="status-banner" id="chatBanner">Sub-20ms retrieval cards appear immediately before local LLM tokens stream.</div>
+        <div class="toolbar">
+          <span class="field-label">Host:</span>
+          <select id="chatHostSelect" aria-label="Chat Host" style="min-width:140px;">
+            <option value="ollama_local">ollama_local</option>
+          </select>
+          <input type="text" id="chatModelInput" placeholder="Model override (optional)" style="width:170px;" />
+          <span class="field-label">Retrieval:</span>
+          <select id="chatRetrievalModeSelect" aria-label="Retrieval Mode">
+            <option value="auto">auto</option>
+            <option value="lexical">lexical (BM25)</option>
+            <option value="dense">dense (vector)</option>
+            <option value="rrf">rrf (hybrid)</option>
+          </select>
+          <span class="field-label">Answer View:</span>
+          <select id="chatAnswerViewSelect" aria-label="Answer View">
+            <option value="standard">standard</option>
+            <option value="preference">preference</option>
+            <option value="research">research (includes leads)</option>
+          </select>
+          <input type="text" id="chatScopeInput" placeholder="project_scope (optional)" style="width:155px;" />
+          <label class="inline-check">
+            <input type="checkbox" id="chatIncludePrefsCheck" checked />
+            Prefs
+          </label>
+        </div>
+        <div class="status-banner" id="chatBanner">Multi-turn grounded chat: sub-20ms retrieval cards appear immediately before LLM tokens stream. Click any [V#]/[N#]/[P#]/[L#] badge to jump to its source card.</div>
         <div class="chat-layout">
           <div class="pane">
-            <div class="chat-main-scroll">
+            <div class="chat-main-scroll" id="chatMainScroll">
               <div class="status-banner banner-warn" id="chatWarningBar" style="display:none;"></div>
-              <div class="chat-output" id="chatOutput">Ask a question to search working notes, verified atoms, and owner preferences.</div>
+              <div class="chat-turns-list" id="chatOutput">
+                <div class="note-item-meta">Ask a question above to search working notes, verified atoms, and owner preferences across a multi-turn session.</div>
+              </div>
               <div id="chatVerifiedClaims" style="display:none; flex-direction:column; gap:8px;"></div>
               <div id="chatGroundingBar" style="display:none;"></div>
             </div>
           </div>
           <div class="pane">
-            <div style="padding:10px 12px; border-bottom:1px solid var(--border); font-weight:600; font-size:12px;">Retrieved Sources (Click to Inspect)</div>
+            <div id="chatSourcesHeader" style="padding:10px 12px; border-bottom:1px solid var(--border); font-weight:600; font-size:12px;">Retrieved Sources (Click to Inspect)</div>
             <div class="scroll-list" id="chatSources"></div>
           </div>
         </div>
@@ -124,20 +157,21 @@
           </div>
         </div>
 
-        <div class="section-header">
+        <div class="section-header" id="reviewHeaderInbox">
           <h4 class="section-title">1. Quarantined Agent &amp; External Inbox (0-raw/inbox/)</h4>
         </div>
         <div class="cards-grid" id="inboxQueueGrid"></div>
 
-        <div class="section-header">
+        <div class="section-header" id="reviewHeaderPending">
           <h4 class="section-title">2. Pending &amp; Quarantined Atom Review Queue</h4>
         </div>
         <div class="cards-grid" id="reviewGrid"></div>
+        <div class="pagination-bar" id="reviewPaginationBar" style="display:none;"></div>
 
-        <div class="section-header">
+        <div class="section-header" id="reviewHeaderApproved">
           <h4 class="section-title">3. Approved Atoms, Duplicate Suggestions &amp; Two-Atom CAS Merge</h4>
         </div>
-        <div class="card">
+        <div class="card" id="reviewMergeCard">
           <strong>Duplicate Suggestions</strong>
           <div id="duplicatesList" class="sub-panel">Scanning for duplicate approved atoms...</div>
           <div class="toolbar" style="margin-top:6px;">
@@ -153,20 +187,25 @@
               <span class="field-label">Merge Rationale</span>
               <input type="text" id="mergeRationaleInput" placeholder="Why survivor supersedes duplicate..." />
             </div>
+            <button class="btn sm" id="loadMoreMergeAtomsBtn" type="button" style="align-self:flex-end; display:none;">Load More Selectors</button>
             <button class="btn primary" id="runMergeBtn" type="button" style="align-self:flex-end;">Merge Atoms (CAS)</button>
           </div>
         </div>
         <div class="cards-grid" id="approvedAtomsGrid"></div>
+        <div class="pagination-bar" id="atomsPaginationBar" style="display:none;"></div>
       </section>
 
-      <!-- TAB 4: BULK IMPORT VIEW -->
+      <!-- TAB 4: IMPORT, WEB SCOUT & OPERATOR JOBS VIEW -->
       <section class="view" id="view-import">
         <div class="toolbar">
-          <h3 style="margin:0;">Obsidian / Markdown Bulk Importer</h3>
+          <h3 style="margin:0;">Document &amp; Vault Importers, Web Scout &amp; Operator Jobs</h3>
         </div>
+
+        <!-- BULK FOLDER IMPORT -->
         <div class="card">
+          <strong>1. Bulk Folder Importer (Obsidian / Markdown / PDF / DOCX / EPUB / HTML / CSV)</strong>
           <div class="toolbar">
-            <input type="text" id="importDirInput" placeholder="Select folder containing .md or .txt notes..." style="flex:1;" />
+            <input type="text" id="importDirInput" placeholder="Select folder containing .md, .txt, .pdf, .docx, .epub, .html, .csv..." style="flex:1;" />
             <button class="btn" id="pickImportDirBtn" type="button">Browse Folder...</button>
           </div>
           <div class="toolbar">
@@ -183,6 +222,48 @@
           </div>
           <div class="status-banner" id="importResult">Idempotent SHA-256 content-hashed import. Run a Dry Run preview first, then uncheck Dry Run to commit.</div>
           <div class="kpi-grid" id="importKpiGrid"></div>
+        </div>
+
+        <!-- SINGLE DOCUMENT IMPORT -->
+        <div class="card">
+          <strong>2. Single-File Document Importer (PDF / DOCX / EPUB / HTML / CSV / Markdown)</strong>
+          <div class="toolbar">
+            <input type="text" id="importFileInput" placeholder="Choose a single document (.pdf, .docx, .epub, .html, .csv, .tsv, .md, .txt)..." style="flex:1;" />
+            <button class="btn" id="pickImportFileBtn" type="button">Choose File...</button>
+            <input type="text" id="importFileTagsInput" placeholder="Tags (comma-separated)" style="width:210px;" />
+            <button class="btn primary" id="runImportFileBtn" type="button">Import Document</button>
+          </div>
+          <div class="status-banner" id="importFileResult">Select a local document to extract and import into your notes vault.</div>
+        </div>
+
+        <!-- WEB SCOUT QUEUE & TRIGGER -->
+        <div class="card">
+          <div class="toolbar">
+            <strong>3. Web Scout Reading Queue &amp; Crawl Trigger (0-raw/reading-list.md)</strong>
+            <button class="btn sm" id="refreshScoutBtn" type="button" style="margin-left:auto;">Refresh Queue</button>
+          </div>
+          <div class="toolbar">
+            <input type="text" id="scoutUrlInput" placeholder="https://example.com/article (http/https only)..." style="flex:1; min-width:240px;" />
+            <button class="btn primary" id="addScoutUrlBtn" type="button">Queue URL</button>
+            <span class="field-label" style="margin-left:8px;">Max Items (1-20):</span>
+            <input type="text" id="scoutMaxItemsInput" value="5" style="width:65px;" />
+            <button class="btn good" id="runScoutBtn" type="button">Run Web Scout</button>
+          </div>
+          <div id="scoutQueueList" class="sub-panel">Loading reading queue...</div>
+        </div>
+
+        <!-- OPERATOR PIPELINE JOBS -->
+        <div class="card">
+          <div class="toolbar">
+            <strong>4. Operator Pipeline Jobs (Bounded Background Subprocesses)</strong>
+            <div class="toolbar" style="margin-left:auto;">
+              <button class="btn primary" id="runRefineryJobBtn" type="button">Run Refinery</button>
+              <button class="btn" id="runEditorJobBtn" type="button">Run Editor</button>
+              <button class="btn good" id="runDoctorJobBtn" type="button">Run Vault Doctor</button>
+            </div>
+          </div>
+          <div class="note-item-meta">Trigger Refinery (distill raw captures into candidate atoms), Editor (synthesize threads &amp; briefings), or Vault Doctor diagnostics with live job status polling.</div>
+          <div id="activeJobsList" class="sub-panel">No operator jobs triggered in this session yet.</div>
         </div>
       </section>
 
@@ -241,12 +322,30 @@
               <span class="field-label">Context Scopes (comma-separated)</span>
               <input type="text" id="expContextInput" placeholder="e.g. project:alpha, ops" />
             </div>
-          </div>
-          <div class="field-col">
-            <span class="field-label">Result Summary *</span>
-            <textarea id="expSummaryInput" rows="2" placeholder="What happened and how was the outcome verified?"></textarea>
+            <div class="field-col">
+              <span class="field-label">Tools Used (comma-separated)</span>
+              <input type="text" id="expToolsInput" placeholder="e.g. pg_dump, psql, pytest" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Referenced Atoms (comma-separated)</span>
+              <input type="text" id="expAtomsInput" placeholder="e.g. pg-migration-rule.md" />
+            </div>
           </div>
           <div class="form-grid">
+            <div class="field-col">
+              <span class="field-label">Result Summary *</span>
+              <textarea id="expSummaryInput" rows="2" placeholder="What happened and how was the outcome verified?"></textarea>
+            </div>
+            <div class="field-col">
+              <span class="field-label">Reasoning Summary</span>
+              <textarea id="expReasoningInput" rows="2" placeholder="Key trade-offs or hypothesis tested..."></textarea>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="field-col">
+              <span class="field-label">Initial Plan (one step per line)</span>
+              <textarea id="expPlanInput" rows="2" placeholder="1. Snapshot schema..."></textarea>
+            </div>
             <div class="field-col">
               <span class="field-label">Actions Taken (one per line)</span>
               <textarea id="expActionsInput" rows="2" placeholder="1. Ran pre-flight backup..."></textarea>
@@ -254,6 +353,20 @@
             <div class="field-col">
               <span class="field-label">Lessons Learned (one per line)</span>
               <textarea id="expLessonsInput" rows="2" placeholder="Always lock schema migrations..."></textarea>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="field-col">
+              <span class="field-label">Confidence Before (0.0 - 1.0)</span>
+              <input type="text" id="expConfBeforeInput" placeholder="e.g. 0.65" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Confidence After (0.0 - 1.0)</span>
+              <input type="text" id="expConfAfterInput" placeholder="e.g. 0.95" />
+            </div>
+            <div class="field-col" style="grid-column: span 2;">
+              <span class="field-label">Reflection</span>
+              <input type="text" id="expReflectionInput" placeholder="What should change next time?" />
             </div>
           </div>
           <div class="toolbar">
@@ -308,11 +421,15 @@
         </div>
         <div class="cards-grid" id="candidatesGrid"></div>
 
-        <div class="card">
+        <div class="card" id="playbookPromoteCard">
           <div class="toolbar" style="justify-content:space-between;">
-            <strong>Promote Verified Procedural Atom(s) to Skill Playbook</strong>
-            <button class="btn sm" id="prefillStepsFromCandidateBtn" type="button">Pre-fill Steps from Selected Candidate</button>
+            <strong id="pbFormHeading">Promote Verified Procedural Atom(s) to Skill Playbook</strong>
+            <div class="toolbar">
+              <button class="btn sm" id="prefillStepsFromCandidateBtn" type="button">Pre-fill Steps from Selected Candidate</button>
+              <button class="btn sm" id="pbResetUpdateBtn" type="button" style="display:none;">Cancel Update (New Playbook)</button>
+            </div>
           </div>
+          <div class="status-banner banner-warn" id="pbUpdateModeBanner" style="display:none;"></div>
           <div class="field-col">
             <span class="field-label">Select Backing Procedural Atom(s) *</span>
             <div id="pbBackingSelectWrap" class="sub-panel">No procedural candidates loaded yet.</div>
@@ -330,6 +447,10 @@
               <span class="field-label">Trigger Condition *</span>
               <input type="text" id="pbTriggerInput" placeholder="e.g. Before cutting a release tag" />
             </div>
+            <div class="field-col">
+              <span class="field-label">Expected Playbook SHA-256 (CAS Update Only)</span>
+              <input type="text" id="pbExpectedShaInput" placeholder="(blank for initial promotion)" />
+            </div>
           </div>
           <div class="form-grid">
             <div class="field-col">
@@ -337,7 +458,7 @@
               <textarea id="pbPreconditionsInput" rows="2" placeholder="Clean working tree"></textarea>
             </div>
             <div class="field-col">
-              <span class="field-label">Execution Steps * (one per line)</span>
+              <span class="field-label">Execution Steps * (one grounding-valid step per line)</span>
               <textarea id="pbStepsInput" rows="3" placeholder="Run smoke test suite"></textarea>
             </div>
           </div>
@@ -352,7 +473,7 @@
             </div>
           </div>
           <div class="toolbar">
-            <input type="text" id="pbRationaleInput" placeholder="Promotion rationale..." style="flex:1; min-width:200px;" />
+            <input type="text" id="pbRationaleInput" placeholder="Promotion / update rationale..." style="flex:1; min-width:200px;" />
             <label class="inline-check"><input type="checkbox" id="pbAllowEarlyCheck" /> Early Override</label>
             <label class="inline-check"><input type="checkbox" id="pbAckCorrectionsCheck" /> Ack Corrections</label>
             <label class="inline-check"><input type="checkbox" id="pbAllowMultiProjCheck" /> Multi-Project</label>
@@ -361,10 +482,10 @@
         </div>
       </section>
 
-      <!-- TAB 8: VAULT PROOF, RADAR & SNAPSHOTS VIEW -->
+      <!-- TAB 8: VAULT PROOF, SOURCE AUDIT, RADAR & SNAPSHOTS VIEW -->
       <section class="view" id="view-proof">
         <div class="toolbar">
-          <h3 style="margin:0;">Cryptographic Ledger, Contradiction Radar &amp; Time-Travel</h3>
+          <h3 style="margin:0;">Cryptographic Ledger, Source Audit, Contradiction Radar &amp; Time-Travel</h3>
           <button class="btn" id="refreshProofBtn" type="button" style="margin-left:auto;">Refresh All</button>
         </div>
 
@@ -378,12 +499,15 @@
           <div id="ledgerOutput" style="display:flex; flex-direction:column; gap:8px;">
             <div class="kpi-grid" id="ledgerKpiGrid"></div>
             <div id="ledgerRootsBar" class="sub-panel">Loading Merkle ledger state...</div>
+            <div id="ledgerHistoryWrap"></div>
+            <div class="pagination-bar" id="ledgerHistoryPaginationBar" style="display:none;"></div>
           </div>
 
           <div class="toolbar" style="margin-top:4px;">
-            <span class="field-label">Approved Atom Proof Generator:</span>
-            <select id="proveAtomSelect" style="min-width:220px;"></select>
-            <input type="text" id="proveAtomInput" placeholder="Or type atom filename..." style="width:200px;" />
+            <span class="field-label">Approved Leaf Proof Generator (Atoms &amp; Playbooks):</span>
+            <select id="proveAtomSelect" style="min-width:250px;"></select>
+            <button class="btn sm" id="loadMoreLeavesBtn" type="button" style="display:none;">Load More Leaves</button>
+            <input type="text" id="proveAtomInput" placeholder="e.g. atom.md or 5-playbooks/pb.md" style="width:230px;" />
             <button class="btn primary" id="proveAtomBtn" type="button">Prove Membership</button>
           </div>
           <div id="proofResultArea"></div>
@@ -396,6 +520,18 @@
               <span id="verifyProofResult"></span>
             </div>
           </div>
+        </div>
+
+        <!-- SOURCE ANCHOR AUDIT & DEMOTE STALE -->
+        <div class="card">
+          <div class="toolbar">
+            <strong>Source Anchor Audit &amp; Stale Approval Governance</strong>
+            <input type="text" id="auditActorInput" value="desktop_owner" placeholder="Owner actor" style="width:150px; margin-left:auto;" />
+            <button class="btn" id="refreshSourceAuditBtn" type="button">Audit Sources</button>
+            <button class="btn warn" id="demoteStaleSourcesBtn" type="button" disabled>Demote Stale Approvals</button>
+          </div>
+          <div id="sourceAuditSummary" class="status-banner">Checking byte-offset &amp; SHA-256 source anchors across approved atoms...</div>
+          <div id="sourceAuditTableWrap"></div>
         </div>
 
         <!-- CONTRADICTION & DRIFT RADAR -->
@@ -442,14 +578,88 @@
           <div id="snapshotOutput" class="sub-panel">Select or create a snapshot above to inspect semantic diffs or run point-in-time recall.</div>
         </div>
       </section>
+
+      <!-- TAB 9: INTERACTIVE 2D KNOWLEDGE GRAPH VIEW -->
+      <section class="view" id="view-graph">
+        <div class="toolbar">
+          <input type="search" id="graphSearchInput" placeholder="Search graph nodes / claims..." style="flex:1; min-width:180px;" />
+          <input type="text" id="graphProjectInput" placeholder="Project scope filter" style="width:160px;" />
+          <select id="graphStatusSelect" aria-label="Status Filter">
+            <option value="all">All Statuses</option>
+            <option value="accepted">Accepted / Verified</option>
+            <option value="pending">Pending</option>
+            <option value="needs_edit">Quarantined / Needs Edit</option>
+          </select>
+          <select id="graphTypeSelect" aria-label="Memory Type Filter">
+            <option value="all">All Types</option>
+            <option value="semantic">Semantic</option>
+            <option value="procedural">Procedural</option>
+            <option value="episodic">Episodic</option>
+            <option value="self">Preference / Self</option>
+          </select>
+          <label class="inline-check">
+            <input type="checkbox" id="graphIncludePendingCheck" checked />
+            Pending
+          </label>
+          <button class="btn sm" id="graphZoomInBtn" type="button" title="Zoom In">+</button>
+          <button class="btn sm" id="graphZoomOutBtn" type="button" title="Zoom Out">−</button>
+          <button class="btn sm" id="graphResetViewBtn" type="button">Reset View</button>
+          <button class="btn primary" id="refreshGraphBtn" type="button">Reload Graph</button>
+        </div>
+        <div class="status-banner" id="graphBanner">Interactive 2D Knowledge Graph — drag to pan, scroll to zoom, and click any node to inspect its neighborhood and provenance.</div>
+        <div class="graph-layout">
+          <div class="pane">
+            <div class="graph-canvas-wrap" id="graphCanvasContainer"></div>
+            <div class="graph-legend">
+              <span class="legend-item"><span class="legend-dot" style="background:#58a6ff;"></span>Semantic</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#2ea043;"></span>Procedural</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#7c5cff;"></span>Preference/Self</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#38bdf8;"></span>Episodic</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#d29922;"></span>Pending</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#f85149;"></span>Conflict / Needs Edit</span>
+            </div>
+          </div>
+          <div class="pane">
+            <div style="padding:10px 12px; border-bottom:1px solid var(--border); font-weight:600; font-size:12px;">Node &amp; Neighborhood Inspector</div>
+            <div class="scroll-list" id="graphInspectorBody">
+              <div class="note-item-meta">Click a node in the 2D Knowledge Graph to inspect its claim, status, and connected neighbors.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 10: VAULT EXPLORER (3-threads/, 4-experiences/, briefings/) -->
+      <section class="view" id="view-vault">
+        <div class="toolbar">
+          <h3 style="margin:0;">Vault Explorer</h3>
+          <button class="btn sm primary" data-vault-cat="threads" type="button">Threads (3-threads/)</button>
+          <button class="btn sm" data-vault-cat="experiences" type="button">Experiences (4-experiences/)</button>
+          <button class="btn sm" data-vault-cat="briefings" type="button">Briefings (briefings/)</button>
+          <div class="toolbar" style="margin-left:auto;">
+            <button class="btn sm" id="vaultRenderModeBtn" type="button">View Raw Source</button>
+            <button class="btn" id="refreshVaultBtn" type="button">Refresh</button>
+          </div>
+        </div>
+        <div class="status-banner banner-warn">Vault synthesis documents (threads, episodic logs, briefings) are rendered safely as untrusted data — only Approved Atoms carry owner verification.</div>
+        <div class="vault-grid">
+          <div class="pane">
+            <div class="scroll-list" id="vaultFilesList"></div>
+            <div class="pagination-bar" id="vaultPaginationBar" style="display:none;"></div>
+          </div>
+          <div class="pane">
+            <div id="vaultDocMetaBar" style="padding:10px 12px; border-bottom:1px solid var(--border); font-weight:600; font-size:12px;">Select a vault document on the left to view</div>
+            <div class="scroll-list md-rendered" id="vaultDocViewer"></div>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 
-  <!-- MODAL FOR ATOM MARKDOWN EDITOR & ATOM INSPECTOR -->
+  <!-- MODAL FOR ATOM MARKDOWN EDITOR, INSPECTOR & CONFIRMATION DIALOGS -->
   <div class="modal-backdrop" id="atomModalBackdrop">
     <div class="modal-panel">
       <div class="modal-header">
-        <span id="atomModalTitle">Atom</span>
+        <span id="atomModalTitle">Dialog</span>
         <button class="btn sm" id="atomModalCloseBtn" type="button">Close</button>
       </div>
       <div class="modal-body" id="atomModalBody"></div>
@@ -460,6 +670,12 @@
   <!-- NON-INTRUSIVE GLOBAL TOAST STACK -->
   <div class="toast-container" id="toastContainer"></div>
 
+  <script src="markdown.js"></script>
+  <script src="playbook_units.js"></script>
+  <script src="pagination.js"></script>
+  <script src="chat_state.js"></script>
+  <script src="graph.js"></script>
+  <script src="modal_helpers.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

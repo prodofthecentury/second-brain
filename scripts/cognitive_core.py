@@ -204,20 +204,68 @@ def atom_correction_log_path(brain_dir: str) -> str:
     return os.path.join(brain_dir, "0-raw", "archive", "atom-corrections.jsonl")
 
 
-def _append_canonical_correction(brain_dir: str, atom_id: str) -> None:
+def atom_feedback_log_path(brain_dir: str) -> str:
+    return os.path.join(brain_dir, "0-raw", "archive", "atom-feedback.jsonl")
+
+
+def _append_canonical_feedback(
+    brain_dir: str,
+    atom_id: str,
+    *,
+    feedback_kind: str,
+    helpful: bool,
+    actor: str = "owner",
+    note: str = "",
+) -> None:
+    log_path = atom_feedback_log_path(brain_dir)
+    archive_dir = os.path.dirname(log_path)
+    os.makedirs(archive_dir, exist_ok=True)
+    if _is_reparse_or_link(archive_dir) or (os.path.lexists(log_path) and _is_reparse_or_link(log_path)):
+        raise PermissionError("Refusing to write atom feedback log through a symlink or reparse point.")
+    record = {
+        "schema_version": 1,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "action": f"atom_{feedback_kind}",
+        "feedback_kind": feedback_kind,
+        "helpful": bool(helpful),
+        "atom_id": atom_id,
+        "actor": _sanitize_single_line(actor or "owner", max_len=120) or "owner",
+        "note": _sanitize_single_line(note or "", max_len=500),
+    }
+    encoded = (json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        if os.write(fd, encoded) != len(encoded):
+            raise OSError("Incomplete write to atom-feedback.jsonl.")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _append_canonical_correction(
+    brain_dir: str,
+    atom_id: str,
+    *,
+    actor: str = "owner",
+    note: str = "",
+) -> None:
     """Durable append-only correction record so Playbook staleness never depends on a disposable sidecar."""
     log_path = atom_correction_log_path(brain_dir)
     archive_dir = os.path.dirname(log_path)
     os.makedirs(archive_dir, exist_ok=True)
     if _is_reparse_or_link(archive_dir) or (os.path.lexists(log_path) and _is_reparse_or_link(log_path)):
         raise PermissionError("Refusing to write atom correction log through a symlink or reparse point.")
-    record = {
+    record: dict[str, object] = {
         "schema_version": 1,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "action": "atom_correction",
         "atom_id": atom_id,
+        "actor": _sanitize_single_line(actor or "owner", max_len=120) or "owner",
     }
-    encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    clean_note = _sanitize_single_line(note or "", max_len=500)
+    if clean_note:
+        record["note"] = clean_note
+    encoded = (json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         if os.write(fd, encoded) != len(encoded):
@@ -255,29 +303,52 @@ def count_canonical_corrections(brain_dir: str, atom_id: str) -> int | None:
 def record_atom_feedback(
     atom_id: str,
     *,
-    helpful: bool,
+    helpful: bool = True,
+    feedback_kind: str | None = None,
+    actor: str = "owner",
+    note: str = "",
     db_path: str = TELEMETRY_DB_PATH,
     brain_dir: str | None = None,
-) -> None:
+) -> dict[str, object]:
     if not _valid_atom_id(atom_id):
         raise ValueError(f"Invalid atom_id for telemetry feedback: {atom_id!r}")
-    if not helpful:
-        owning_brain = brain_dir or _brain_dir_for_telemetry_db(db_path)
-        if owning_brain:
-            _append_canonical_correction(owning_brain, atom_id)
-    init_telemetry_db(db_path)
-    col = "positive_feedback" if helpful else "corrections"
-    with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
-        conn.execute(
-            f"""
-            INSERT INTO atom_telemetry (atom_id, {col})
-            VALUES (?, 1)
-            ON CONFLICT(atom_id) DO UPDATE SET
-                {col} = {col} + 1
-            """,
-            (atom_id,),
+    resolved_kind = (feedback_kind or ("helpful" if helpful else "correction")).strip().lower()
+    if resolved_kind not in {"helpful", "correction", "supersession"}:
+        raise ValueError("feedback_kind must be 'helpful', 'correction', or 'supersession'.")
+    is_helpful = resolved_kind == "helpful"
+    owning_brain = brain_dir or _brain_dir_for_telemetry_db(db_path)
+    if owning_brain:
+        _append_canonical_feedback(
+            owning_brain,
+            atom_id,
+            feedback_kind=resolved_kind,
+            helpful=is_helpful,
+            actor=actor,
+            note=note,
         )
-        conn.commit()
+        if resolved_kind == "correction":
+            _append_canonical_correction(owning_brain, atom_id, actor=actor, note=note)
+    if resolved_kind in {"helpful", "correction"}:
+        init_telemetry_db(db_path)
+        col = "positive_feedback" if is_helpful else "corrections"
+        with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+            conn.execute(
+                f"""
+                INSERT INTO atom_telemetry (atom_id, {col})
+                VALUES (?, 1)
+                ON CONFLICT(atom_id) DO UPDATE SET
+                    {col} = {col} + 1
+                """,
+                (atom_id,),
+            )
+            conn.commit()
+    return {
+        "atom_id": atom_id,
+        "feedback_kind": resolved_kind,
+        "helpful": is_helpful,
+        "actor": _sanitize_single_line(actor or "owner", max_len=120) or "owner",
+        "note": _sanitize_single_line(note or "", max_len=500),
+    }
 
 
 def _load_telemetry_map(db_path: str) -> dict[str, dict[str, object]]:
@@ -325,8 +396,10 @@ def compute_memory_fitness_report(
             cand_hits = int(stats.get("candidate_hits", 0) or 0)
             citations = int(stats.get("grounded_citations", 0) or 0)
             pos_fb = int(stats.get("positive_feedback", 0) or 0)
-            corrections = int(stats.get("corrections", 0) or 0)
-            utility_score = round((citations * 2.0) + (ret_hits * 0.5) + (pos_fb * 1.5) - (corrections * 3.0), 2)
+            db_corrections = int(stats.get("corrections", 0) or 0)
+            durable_corrections = count_canonical_corrections(brain_dir, fname)
+            corrections = max(db_corrections, durable_corrections if durable_corrections is not None else 1)
+            utility_score = round((citations * 2.0) + (pos_fb * 1.5) - (corrections * 3.0), 2)
 
             entry = {
                 "atom_id": fname,
@@ -416,6 +489,11 @@ def save_experience_record(
     tools_used: list[str] | None = None,
     referenced_atoms: list[str] | None = None,
     lessons: list[str] | None = None,
+    plan: list[str] | None = None,
+    reasoning_summary: str | None = None,
+    confidence_before: float | None = None,
+    confidence_after: float | None = None,
+    reflection: str | None = None,
     candidate_procedure_title: str | None = None,
     propose_to_inbox: bool = False,
     experiences_dir: str = EXPERIENCES_DIR,
@@ -434,9 +512,14 @@ def save_experience_record(
 
     ctx_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (context or [])) if s)
     act_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (actions or [])) if s)
+    plan_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (plan or [])) if s)
     tools_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (tools_used or [])) if s)
     atoms_tuple = tuple(str(x).strip() for x in (referenced_atoms or []) if _valid_atom_id(str(x).strip()))
     lessons_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (lessons or [])) if s)
+    reasoning_clean = _sanitize_multiline_body(reasoning_summary or "", max_len=2000)
+    reflection_clean = _sanitize_multiline_body(reflection or "", max_len=2000)
+    conf_before_val = round(min(max(float(confidence_before), 0.0), 1.0), 2) if confidence_before is not None else None
+    conf_after_val = round(min(max(float(confidence_after), 0.0), 1.0), 2) if confidence_after is not None else None
     cand_title = _sanitize_single_line(candidate_procedure_title, max_len=200) if candidate_procedure_title else None
     if cand_title == "":
         cand_title = None
@@ -460,7 +543,10 @@ def save_experience_record(
                 f"created_at: {_yaml_quote(ts_iso)}",
                 f"goal: {_yaml_quote(goal_clean)}",
                 f"success: {'true' if success else 'false'}",
+                f"confidence_before: {conf_before_val if conf_before_val is not None else 'null'}",
+                f"confidence_after: {conf_after_val if conf_after_val is not None else 'null'}",
                 f"context: {json.dumps(list(ctx_tuple), ensure_ascii=False)}",
+                f"plan: {json.dumps(list(plan_tuple), ensure_ascii=False)}",
                 f"tools_used: {json.dumps(list(tools_tuple), ensure_ascii=False)}",
                 f"referenced_atoms: {json.dumps(list(atoms_tuple), ensure_ascii=False)}",
                 f"candidate_procedure: {_yaml_quote(cand_title) if cand_title else 'null'}",
@@ -474,11 +560,17 @@ def save_experience_record(
                 "",
                 "## Result",
                 summary_clean,
+            ]
+            if reasoning_clean:
+                md_lines.extend(["", "## Reasoning Summary", reasoning_clean])
+            if reflection_clean:
+                md_lines.extend(["", "## Reflection", reflection_clean])
+            md_lines.extend([
                 "",
                 "## Lessons & Reflection",
                 *(f"- {item}" for item in (lessons_tuple or ("No explicit lessons recorded.",))),
                 "",
-            ]
+            ])
             payload = "\n".join(md_lines).encode("utf-8")
             try:
                 fd = os.open(exp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

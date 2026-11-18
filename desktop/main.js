@@ -1,3 +1,5 @@
+"use strict";
+
 const {
   app,
   BrowserWindow,
@@ -17,10 +19,28 @@ const http = require("http");
 const { fileURLToPath } = require("url");
 const { spawn } = require("child_process");
 
+const {
+  resolveSecurityDir,
+  resolvePortFilePath,
+  readSafeSecurityFile,
+  readPortDiscoveryFile,
+  ensurePortDiscoveryFile,
+  removePortDiscoveryFileIfOwned,
+  formatShortcut,
+  buildPackagedRuntimeConfig,
+  buildUvBootstrapArgs,
+} = require("./lib/port_discovery");
+
 const IS_SMOKE_TEST = process.argv.includes("--smoke-test");
 const isSmokeTest = IS_SMOKE_TEST;
 const RENDERER_DIR = path.resolve(__dirname, "renderer");
 const EXPLICIT_ENV_VAULT_DIR = (process.env.BRAIN_VAULT_DIR || "").trim();
+const BOOTSTRAP_TIMEOUT_MS = Math.max(
+  5000,
+  Number(process.env.SECOND_BRAIN_BOOTSTRAP_TIMEOUT_MS || 180000)
+);
+const CAPTURE_ACCELERATOR = "CommandOrControl+Shift+Space";
+const ALLOWED_EXTERNAL_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
 const IDE_PRIVACY_NOTICE =
   "When this host's AI uses Second Brain tools, the recalled verified memories and notes are sent to " +
@@ -31,49 +51,88 @@ let mainWindow = null;
 let captureWindow = null;
 let tray = null;
 let apiProcess = null;
+let spawnedApiPid = null;
 let apiPort = Number(process.env.SECOND_BRAIN_PORT || 0);
 let apiReady = false;
 let isQuitting = false;
 let activeChatReq = null;
 let activeVaultOverride = "";
+
+let shortcutState = {
+  accelerator: CAPTURE_ACCELERATOR,
+  displayLabel: formatShortcut(CAPTURE_ACCELERATOR, process.platform),
+  registered: false,
+  warning: "",
+};
+
+let startupState = {
+  phase: "starting",
+  message: "Initializing Second Brain...",
+  progressLines: [],
+  startedAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+};
+
 let backendStatus = {
   state: "starting",
   message: "Initializing Second Brain...",
   apiPort: 0,
+  startupState,
+  shortcutRegistered: false,
+  shortcutWarning: "",
 };
 
-function getBackendRoot() {
-  if (app.isPackaged) {
-    return path.join(process.resourcesPath, "backend");
+function getSafeUserDataDir() {
+  try {
+    const p = app.getPath("userData");
+    if (p) return path.resolve(p);
+  } catch {}
+  if (process.platform === "win32") {
+    const base =
+      process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+    return path.join(base, "second-brain-desktop");
   }
-  return path.resolve(__dirname, "..");
+  if (process.platform === "darwin") {
+    return path.join(
+      os.homedir(),
+      "Library",
+      "Application Support",
+      "second-brain-desktop"
+    );
+  }
+  const cfgHome =
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(cfgHome, "second-brain-desktop");
+}
+
+function getRuntimeConfig() {
+  return buildPackagedRuntimeConfig({
+    isPackaged: Boolean(app.isPackaged),
+    resourcesPath: process.resourcesPath || "",
+    userDataPath: getSafeUserDataDir(),
+    devRepoRoot: path.resolve(__dirname, ".."),
+    platform: process.platform,
+  });
+}
+
+function getBackendRoot() {
+  return getRuntimeConfig().backendRoot;
 }
 
 function getSecurityDir() {
-  if (process.platform === "win32") {
-    const localAppData =
-      process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
-    return path.join(localAppData, "SecondBrain", "security");
-  }
-  const stateHome =
-    process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
-  return path.join(stateHome, "SecondBrain", "security");
+  return resolveSecurityDir({
+    env: process.env,
+    platform: process.platform,
+    homedir: os.homedir(),
+  });
 }
 
-function readSafeSecurityFile(filePath, maxBytes = 4096) {
-  try {
-    const parentStat = fs.lstatSync(path.dirname(filePath));
-    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
-      return "";
-    }
-    const st = fs.lstatSync(filePath);
-    if (!st.isFile() || st.isSymbolicLink() || st.size > maxBytes) {
-      return "";
-    }
-    return fs.readFileSync(filePath, "utf8").trim();
-  } catch {
-    return "";
-  }
+function getPortFilePath() {
+  return resolvePortFilePath({
+    env: process.env,
+    platform: process.platform,
+    homedir: os.homedir(),
+  });
 }
 
 function readTokens() {
@@ -81,13 +140,15 @@ function readTokens() {
   const apiTokenPath =
     (process.env.BRAIN_MEMORY_API_TOKEN_FILE || "").trim() ||
     path.join(secDir, "memory-api-token");
+  const apiAltTokenPath = path.join(secDir, "api-token");
   const ownerTokenPath =
     (process.env.BRAIN_OWNER_TOKEN_FILE || "").trim() ||
     path.join(secDir, "owner-token");
   const ownerAltTokenPath = path.join(secDir, "owner-api-token");
   const apiToken =
     (process.env.BRAIN_MEMORY_API_TOKEN || "").trim() ||
-    readSafeSecurityFile(apiTokenPath);
+    readSafeSecurityFile(apiTokenPath) ||
+    readSafeSecurityFile(apiAltTokenPath);
   const ownerToken =
     (process.env.BRAIN_OWNER_TOKEN || "").trim() ||
     (process.env.BRAIN_OWNER_API_TOKEN || "").trim() ||
@@ -136,10 +197,6 @@ function getDefaultPackagedVaultDir() {
   return path.join(dataHome, "second-brain", "brain");
 }
 
-function getPackagedVenvDir() {
-  return path.join(path.dirname(getDefaultPackagedVaultDir()), "venv");
-}
-
 function getVaultPointerPath() {
   return path.join(getSecurityDir(), "vault-path.txt");
 }
@@ -182,13 +239,34 @@ function getVaultDir() {
   return path.join(getBackendRoot(), "brain");
 }
 
+function appendStartupProgressLine(line) {
+  const cleaned = String(line || "").trim();
+  if (!cleaned) return;
+  startupState.progressLines = [
+    ...startupState.progressLines.slice(-29),
+    cleaned.slice(0, 240),
+  ];
+  startupState.updatedAt = new Date().toISOString();
+}
+
 function emitBackendStatus(state, message = "") {
+  startupState = {
+    ...startupState,
+    phase: state,
+    message: message || startupState.message,
+    updatedAt: new Date().toISOString(),
+  };
   backendStatus = {
     state,
     message,
     apiPort,
     ready: state === "ready",
     vaultDir: getVaultDir(),
+    startupState,
+    shortcutRegistered: shortcutState.registered,
+    shortcutWarning: shortcutState.warning,
+    shortcutLabel: shortcutState.displayLabel,
+    platform: process.platform,
   };
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("sb:backend-status", backendStatus);
@@ -243,31 +321,42 @@ function resolveUvBinary() {
 }
 
 function getVenvPythonPath() {
-  const venvRoot = app.isPackaged
-    ? getPackagedVenvDir()
-    : path.join(getBackendRoot(), ".venv");
-  return process.platform === "win32"
-    ? path.join(venvRoot, "Scripts", "python.exe")
-    : path.join(venvRoot, "bin", "python");
+  return getRuntimeConfig().venvPython;
 }
 
 function buildBackendEnv() {
+  const cfg = getRuntimeConfig();
   const activeVaultDir = getVaultDir();
   try {
     if (!fs.existsSync(activeVaultDir)) {
       fs.mkdirSync(activeVaultDir, { recursive: true });
     }
+    if (!fs.existsSync(cfg.runtimeCwd)) {
+      fs.mkdirSync(cfg.runtimeCwd, { recursive: true });
+    }
   } catch {}
+  const scriptsDir = path.join(cfg.backendRoot, "scripts");
+  const existingPyPath = String(process.env.PYTHONPATH || "").trim();
   const env = {
     ...process.env,
     PYTHONUTF8: "1",
     PYTHONDONTWRITEBYTECODE: "1",
     BRAIN_VAULT_DIR: activeVaultDir,
+    PYTHONPATH: existingPyPath
+      ? `${scriptsDir}${path.delimiter}${existingPyPath}`
+      : scriptsDir,
   };
   if (app.isPackaged) {
-    env.UV_PROJECT_ENVIRONMENT = getPackagedVenvDir();
+    env.UV_PROJECT_ENVIRONMENT = cfg.venvDir;
   }
   return env;
+}
+
+function cleanupOwnedPortFile(pid) {
+  if (!pid) return;
+  try {
+    removePortDiscoveryFileIfOwned(getPortFilePath(), pid);
+  } catch {}
 }
 
 function killProcessTree(proc) {
@@ -333,12 +422,12 @@ function killProcessTree(proc) {
 }
 
 function spawnBackendCli(args) {
-  const root = getBackendRoot();
+  const cfg = getRuntimeConfig();
   const env = buildBackendEnv();
-  const venvPy = getVenvPythonPath();
-  if (fs.existsSync(venvPy)) {
-    return spawn(venvPy, args, {
-      cwd: root,
+  const resolvedArgs = cfg.resolveCliArgs(args);
+  if (fs.existsSync(cfg.venvPython)) {
+    return spawn(cfg.venvPython, resolvedArgs, {
+      cwd: cfg.runtimeCwd,
       env,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
@@ -346,9 +435,9 @@ function spawnBackendCli(args) {
   }
   return spawn(
     resolveUvBinary(),
-    ["--directory", root, "run", "--frozen", "python", ...args],
+    ["--directory", cfg.backendRoot, "run", "--frozen", "python", ...resolvedArgs],
     {
-      cwd: root,
+      cwd: cfg.runtimeCwd,
       env,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
@@ -356,15 +445,27 @@ function spawnBackendCli(args) {
   );
 }
 
-function runBackendCli(args) {
+function runBackendCli(args, { timeoutMs = 60000 } = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawnBackendCli(args);
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(proc).finally(() => {
+        reject(new Error(`Backend CLI timed out after ${timeoutMs}ms.`));
+      });
+    }, timeoutMs);
     proc.stdout.on("data", (d) => (stdout += d.toString("utf8")));
     proc.stderr.on("data", (d) => (stderr += d.toString("utf8")));
-    proc.on("error", reject);
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
     proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) return;
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
@@ -376,7 +477,7 @@ function runBackendCli(args) {
   });
 }
 
-function runSpawnPromise(cmd, args, cwd, env) {
+function runBootstrapStep(cmd, args, cwd, env, { timeoutMs = BOOTSTRAP_TIMEOUT_MS, label = "Bootstrapping" } = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, {
       cwd,
@@ -385,44 +486,114 @@ function runSpawnPromise(cmd, args, cwd, env) {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stderr = "";
-    proc.stderr.on("data", (d) => (stderr += d.toString("utf8")));
-    proc.on("error", reject);
+    let lineBuf = "";
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      const msg = `${label} timed out after ${Math.round(timeoutMs / 1000)}s.`;
+      appendStartupProgressLine(msg);
+      emitBackendStatus("error", msg);
+      killProcessTree(proc).finally(() => reject(new Error(msg)));
+    }, timeoutMs);
+
+    const handleStreamChunk = (chunk, isErr = false) => {
+      const text = chunk.toString("utf8");
+      if (isErr) {
+        stderr = (stderr + text).slice(-2000);
+      }
+      lineBuf += text;
+      const lines = lineBuf.split(/\r?\n/);
+      lineBuf = lines.pop() || "";
+      for (const ln of lines) {
+        const clean = ln.trim();
+        if (clean) {
+          appendStartupProgressLine(clean);
+          emitBackendStatus("bootstrapping", `${label}: ${clean.slice(0, 140)}`);
+        }
+      }
+    };
+
+    proc.stdout.on("data", (d) => handleStreamChunk(d, false));
+    proc.stderr.on("data", (d) => handleStreamChunk(d, true));
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
     proc.on("close", (code) => {
-      if (code === 0) resolve();
-      else
+      clearTimeout(timer);
+      if (timedOut) return;
+      if (lineBuf.trim()) {
+        appendStartupProgressLine(lineBuf.trim());
+      }
+      if (code === 0) {
+        resolve();
+      } else {
         reject(new Error((stderr || `${cmd} exited with code ${code}`).trim()));
+      }
     });
   });
 }
 
+function directoryExistsSafe(dirPath) {
+  try {
+    const st = fs.lstatSync(dirPath);
+    return st.isDirectory() && !st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 async function ensureBackendBootstrapped() {
-  const root = getBackendRoot();
+  const cfg = getRuntimeConfig();
   const venvPy = getVenvPythonPath();
   let freshlySynced = false;
 
   if (!fs.existsSync(venvPy)) {
+    startupState.progressLines = [];
     emitBackendStatus(
       "bootstrapping",
       "Preparing isolated Python environment..."
     );
     const env = buildBackendEnv();
+    fs.mkdirSync(cfg.runtimeCwd, { recursive: true });
     if (app.isPackaged) {
-      fs.mkdirSync(path.dirname(getPackagedVenvDir()), { recursive: true });
+      fs.mkdirSync(path.dirname(cfg.venvDir), { recursive: true });
     }
+    const hasWheelhouse = directoryExistsSafe(cfg.wheelhouseDir);
+    const uvBin = resolveUvBinary();
+    const uvArgs = buildUvBootstrapArgs({
+      backendRoot: cfg.backendRoot,
+      wheelhouseDir: cfg.wheelhouseDir,
+      hasWheelhouse,
+    });
+
     try {
-      await runSpawnPromise(
-        resolveUvBinary(),
-        ["--directory", root, "sync", "--frozen"],
-        root,
-        env
-      );
+      await runBootstrapStep(uvBin, uvArgs, cfg.runtimeCwd, env, {
+        timeoutMs: BOOTSTRAP_TIMEOUT_MS,
+        label: hasWheelhouse ? "Offline wheelhouse sync" : "Python env sync",
+      });
       freshlySynced = true;
     } catch (err) {
-      if (err && err.code === "ENOENT") {
+      if (
+        hasWheelhouse &&
+        err?.code !== "ENOENT" &&
+        process.env.SECOND_BRAIN_STRICT_OFFLINE !== "1"
+      ) {
+        const onlineArgs = buildUvBootstrapArgs({
+          backendRoot: cfg.backendRoot,
+          hasWheelhouse: false,
+        });
+        await runBootstrapStep(uvBin, onlineArgs, cfg.runtimeCwd, env, {
+          timeoutMs: BOOTSTRAP_TIMEOUT_MS,
+          label: "Python env sync (online fallback)",
+        });
+        freshlySynced = true;
+      } else if (err && err.code === "ENOENT") {
         if (process.platform === "win32") {
-          const ps1 = path.join(root, "setup.ps1");
+          const ps1 = path.join(cfg.backendRoot, "setup.ps1");
           if (fs.existsSync(ps1)) {
-            await runSpawnPromise(
+            await runBootstrapStep(
               "powershell.exe",
               [
                 "-NoProfile",
@@ -432,16 +603,24 @@ async function ensureBackendBootstrapped() {
                 ps1,
                 "-NoLaunch",
               ],
-              root,
-              env
+              cfg.runtimeCwd,
+              env,
+              { timeoutMs: BOOTSTRAP_TIMEOUT_MS, label: "Setup bootstrap" }
             );
             freshlySynced = true;
+          } else {
+            throw err;
           }
         } else {
-          const sh = path.join(root, "setup.sh");
+          const sh = path.join(cfg.backendRoot, "setup.sh");
           if (fs.existsSync(sh)) {
-            await runSpawnPromise("bash", [sh, "--no-launch"], root, env);
+            await runBootstrapStep("bash", [sh, "--no-launch"], cfg.runtimeCwd, env, {
+              timeoutMs: BOOTSTRAP_TIMEOUT_MS,
+              label: "Setup bootstrap",
+            });
             freshlySynced = true;
+          } else {
+            throw err;
           }
         }
       } else {
@@ -453,7 +632,10 @@ async function ensureBackendBootstrapped() {
   const lexicalDb = path.join(getVaultDir(), ".sidecar", "lexical.sqlite3");
   if (freshlySynced || !fs.existsSync(lexicalDb)) {
     try {
-      await runBackendCli(["scripts/cli.py", "install"]);
+      emitBackendStatus("bootstrapping", "Initializing vault sidecar index...");
+      await runBackendCli(["scripts/cli.py", "install"], {
+        timeoutMs: Math.min(60000, BOOTSTRAP_TIMEOUT_MS),
+      });
     } catch {
       // Non-fatal fallback: memory_api.py ensure_dirs() will still initialize core folders.
     }
@@ -471,6 +653,7 @@ function spawnMemoryApiOnce(requestedPort) {
       "--ensure-tokens",
     ]);
     apiProcess = proc;
+    const thisPid = proc.pid || null;
 
     let settled = false;
     let stdoutBuf = "";
@@ -498,7 +681,17 @@ function spawnMemoryApiOnce(requestedPort) {
         return;
       }
       apiPort = boundPort;
+      spawnedApiPid = thisPid;
       apiReady = true;
+      if (thisPid && thisPid > 0) {
+        try {
+          ensurePortDiscoveryFile(getPortFilePath(), {
+            port: boundPort,
+            pid: thisPid,
+            host: "127.0.0.1",
+          });
+        } catch {}
+      }
       refreshTrayMenu();
       emitBackendStatus(
         "ready",
@@ -545,6 +738,10 @@ function spawnMemoryApiOnce(requestedPort) {
         apiReady = false;
         apiProcess = null;
       }
+      if (thisPid && spawnedApiPid === thisPid) {
+        cleanupOwnedPortFile(thisPid);
+        spawnedApiPid = null;
+      }
       refreshTrayMenu();
       const detail = stderrTail.trim()
         ? ` (${stderrTail.trim().split(/\r?\n/).pop()})`
@@ -568,8 +765,11 @@ function spawnMemoryApiOnce(requestedPort) {
 async function startApiSidecar() {
   if (apiProcess) {
     const prev = apiProcess;
+    const prevPid = spawnedApiPid || prev.pid;
     apiProcess = null;
+    spawnedApiPid = null;
     await killProcessTree(prev);
+    cleanupOwnedPortFile(prevPid);
   }
   apiReady = false;
   refreshTrayMenu();
@@ -597,10 +797,12 @@ async function startApiSidecar() {
     return firstAttempt.boundPort;
   }
 
-  // Fallback if an older memory_api.py printed port=0 without reporting its ephemeral socket port
   if (firstAttempt.proc) {
+    const prevPid = firstAttempt.proc.pid;
     apiProcess = null;
+    spawnedApiPid = null;
     await killProcessTree(firstAttempt.proc);
+    cleanupOwnedPortFile(prevPid);
   }
   const fallbackPort = await findFreePort(0);
   const secondAttempt = await spawnMemoryApiOnce(fallbackPort);
@@ -609,11 +811,14 @@ async function startApiSidecar() {
 
 async function stopApiSidecar() {
   apiReady = false;
+  const pidToClean = spawnedApiPid || (apiProcess && apiProcess.pid) || null;
+  spawnedApiPid = null;
   if (apiProcess) {
     const proc = apiProcess;
     apiProcess = null;
     await killProcessTree(proc);
   }
+  cleanupOwnedPortFile(pidToClean);
   apiPort = Number(process.env.SECOND_BRAIN_PORT || 0);
   refreshTrayMenu();
   if (!isQuitting) {
@@ -743,8 +948,8 @@ function apiRequest(method, apiPath, body = null) {
         });
       }
     );
-    req.setTimeout(45000, () => {
-      req.destroy(new Error("API request timed out after 45s."));
+    req.setTimeout(60000, () => {
+      req.destroy(new Error("API request timed out after 60s."));
     });
     req.on("error", (err) => {
       if (isQuitting || !apiReady || !apiProcess || apiProcess.exitCode !== null) {
@@ -866,9 +1071,17 @@ function streamChat(sender, payload) {
               try {
                 parsed = JSON.parse(rawData);
               } catch {}
+              const resolvedEvent =
+                currentEvent && currentEvent !== "message"
+                  ? currentEvent
+                  : parsed &&
+                    typeof parsed === "object" &&
+                    typeof parsed.type === "string"
+                  ? parsed.type
+                  : currentEvent;
               if (!sender.isDestroyed()) {
                 sender.send("chat:event", {
-                  event: currentEvent,
+                  event: resolvedEvent,
                   data: parsed,
                 });
               }
@@ -962,10 +1175,21 @@ function hardenWindowNavigation(win) {
   });
 }
 
+function showAndFocusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow();
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+}
+
 function createMainWindow() {
   mainWindow = new BrowserWindow({
-    width: 1320,
-    height: 860,
+    width: 1360,
+    height: 880,
     minWidth: 980,
     minHeight: 660,
     title: "Second Brain",
@@ -997,10 +1221,10 @@ function createMainWindow() {
 }
 
 function toggleCaptureWindow() {
-  if (!captureWindow) {
+  if (!captureWindow || captureWindow.isDestroyed()) {
     captureWindow = new BrowserWindow({
       width: 580,
-      height: 380,
+      height: 390,
       frame: false,
       resizable: false,
       alwaysOnTop: true,
@@ -1054,20 +1278,24 @@ function refreshTrayMenu() {
     openAtLogin = Boolean(app.getLoginItemSettings().openAtLogin);
   } catch {}
 
-  const contextMenu = Menu.buildFromTemplate([
-    { label: statusLabel, enabled: false },
+  const shortcutDisplay = formatShortcut(CAPTURE_ACCELERATOR, process.platform);
+  const template = [{ label: statusLabel, enabled: false }];
+  if (shortcutState.warning) {
+    template.push({
+      label: `⚠ ${shortcutState.warning}`,
+      enabled: false,
+    });
+  }
+  template.push(
     { type: "separator" },
     {
       label: "Open Second Brain",
-      click: () => {
-        if (mainWindow) {
-          mainWindow.show();
-          mainWindow.focus();
-        }
-      },
+      click: () => showAndFocusMainWindow(),
     },
     {
-      label: "Quick Capture (Ctrl+Shift+Space)",
+      label: shortcutState.registered
+        ? `Quick Capture (${shortcutDisplay})`
+        : "Quick Capture (Shortcut unavailable)",
       click: () => toggleCaptureWindow(),
     },
     {
@@ -1130,9 +1358,12 @@ function refreshTrayMenu() {
         isQuitting = true;
         app.quit();
       },
-    },
-  ]);
-  tray.setToolTip(`Second Brain — ${statusLabel}`);
+    }
+  );
+
+  const contextMenu = Menu.buildFromTemplate(template);
+  const tipSuffix = shortcutState.warning ? ` (${shortcutState.warning})` : "";
+  tray.setToolTip(`Second Brain — ${statusLabel}${tipSuffix}`);
   tray.setContextMenu(contextMenu);
 }
 
@@ -1140,18 +1371,48 @@ function createTray() {
   const icon = nativeImage.createFromPath(
     path.join(__dirname, "assets", "icon.png")
   );
-  tray = new Tray(icon.resize({ width: 16, height: 16 }));
+  const resized = icon.resize({ width: 16, height: 16 });
+  if (process.platform === "darwin") {
+    resized.setTemplateImage(false);
+  }
+  tray = new Tray(resized);
   refreshTrayMenu();
-  tray.on("double-click", () => {
-    if (mainWindow) {
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
+  if (process.platform === "win32") {
+    tray.on("click", () => showAndFocusMainWindow());
+    tray.on("double-click", () => showAndFocusMainWindow());
+  } else if (process.platform !== "darwin") {
+    // Linux StatusNotifier / AppIndicator single-click opens/focuses main window
+    tray.on("click", () => showAndFocusMainWindow());
+  }
+}
+
+function registerCaptureShortcut() {
+  const displayLabel = formatShortcut(CAPTURE_ACCELERATOR, process.platform);
+  let ok = false;
+  try {
+    ok = Boolean(
+      globalShortcut.register(CAPTURE_ACCELERATOR, toggleCaptureWindow) &&
+        globalShortcut.isRegistered(CAPTURE_ACCELERATOR)
+    );
+  } catch {
+    ok = false;
+  }
+  shortcutState = {
+    accelerator: CAPTURE_ACCELERATOR,
+    displayLabel,
+    registered: ok,
+    warning: ok
+      ? ""
+      : `Quick Capture shortcut (${displayLabel}) is already in use by another app. Use Tray -> Quick Capture instead.`,
+  };
+  refreshTrayMenu();
+  emitBackendStatus(backendStatus.state, backendStatus.message);
+  return shortcutState;
 }
 
 ipcMain.handle("app:status", (event) => {
   assertTrustedRenderer(event, { allowCapture: true });
+  const portFile = readPortDiscoveryFile(getPortFilePath());
   return {
     port: apiPort,
     ready: Boolean(
@@ -1159,7 +1420,20 @@ ipcMain.handle("app:status", (event) => {
     ),
     apiUrl: apiPort ? `http://127.0.0.1:${apiPort}` : "",
     backendRoot: getBackendRoot(),
+    runtimeCwd: getRuntimeConfig().runtimeCwd,
     vaultDir: getVaultDir(),
+    platform: process.platform,
+    shortcutRegistered: shortcutState.registered,
+    shortcutWarning: shortcutState.warning,
+    shortcutLabel: shortcutState.displayLabel,
+    startupState,
+    portFile: {
+      path: portFile.path,
+      exists: portFile.exists,
+      valid: portFile.valid,
+      alive: portFile.alive,
+      record: portFile.record,
+    },
     backendStatus,
   };
 });
@@ -1212,6 +1486,61 @@ const handlePickFolderIpc = async (event) => {
 };
 ipcMain.handle("dialog:pick-folder", handlePickFolderIpc);
 ipcMain.handle("dialog:pickFolder", handlePickFolderIpc);
+
+ipcMain.handle("dialog:pick-file", async (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  const res = await dialog.showOpenDialog(mainWindow || undefined, {
+    title: "Select Document to Import into Second Brain",
+    properties: ["openFile"],
+    filters: [
+      {
+        name: "Supported Documents",
+        extensions: [
+          "md",
+          "markdown",
+          "txt",
+          "pdf",
+          "docx",
+          "epub",
+          "html",
+          "htm",
+          "csv",
+          "tsv",
+        ],
+      },
+    ],
+  });
+  return res.canceled || !res.filePaths || !res.filePaths[0]
+    ? null
+    : res.filePaths[0];
+});
+
+ipcMain.handle("shell:open-external", async (event, payload = {}) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  const rawUrl =
+    typeof payload === "string"
+      ? payload
+      : payload && typeof payload === "object"
+      ? String(payload.url || "")
+      : "";
+  const trimmed = rawUrl.trim();
+  if (!trimmed || trimmed.length > 2048 || /[\u0000-\u001f\u007f]/.test(trimmed)) {
+    throw new Error("Blocked invalid external URL.");
+  }
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error("Blocked malformed external URL.");
+  }
+  if (!ALLOWED_EXTERNAL_PROTOCOLS.has(parsed.protocol)) {
+    throw new Error(
+      `Blocked disallowed external URL protocol: ${parsed.protocol}`
+    );
+  }
+  await shell.openExternal(parsed.toString());
+  return { ok: true };
+});
 
 const ALLOWED_IDE_ACTIONS = new Set(["status", "add", "remove"]);
 const IDE_TARGET_RE = /^[a-z0-9-]+$/;
@@ -1277,6 +1606,12 @@ ipcMain.handle("capture:saved", (event) => {
   notifyMainWindowRefresh();
 });
 
+app.on("activate", () => {
+  if (!IS_SMOKE_TEST) {
+    showAndFocusMainWindow();
+  }
+});
+
 app.whenReady().then(async () => {
   if (IS_SMOKE_TEST) {
     try {
@@ -1296,25 +1631,42 @@ app.whenReady().then(async () => {
       ok: false,
       error: String(e),
     }));
+    const apiReadyBeforeCleanup = apiReady;
+    const portInfo = readPortDiscoveryFile(getPortFilePath());
     console.log(
       "ELECTRON_SMOKE_RESULT",
-      JSON.stringify({ apiPort, apiReady, health })
+      JSON.stringify({
+        apiPort,
+        apiReady: apiReadyBeforeCleanup,
+        health,
+        portFile: {
+          path: portInfo.path,
+          exists: portInfo.exists,
+          valid: portInfo.valid,
+          alive: portInfo.alive,
+          record: portInfo.record,
+        },
+      })
     );
     isQuitting = true;
     apiReady = false;
     abortActiveChatStream();
+    const pidToClean = spawnedApiPid || (apiProcess && apiProcess.pid) || null;
+    spawnedApiPid = null;
     if (apiProcess) {
       const proc = apiProcess;
       apiProcess = null;
       await killProcessTree(proc);
     }
-    app.exit(0);
+    cleanupOwnedPortFile(pidToClean);
+    const smokeOk = Boolean(apiReadyBeforeCleanup && health && health.ok);
+    app.exit(smokeOk ? 0 : 1);
     return;
   }
 
   createMainWindow();
   createTray();
-  globalShortcut.register("CommandOrControl+Shift+Space", toggleCaptureWindow);
+  registerCaptureShortcut();
 
   startApiSidecar()
     .then(() => {
@@ -1331,9 +1683,13 @@ app.on("before-quit", () => {
   apiReady = false;
   abortActiveChatStream();
   globalShortcut.unregisterAll();
+  const pidToClean = spawnedApiPid || (apiProcess && apiProcess.pid) || null;
+  spawnedApiPid = null;
   if (apiProcess) {
     const proc = apiProcess;
     apiProcess = null;
-    killProcessTree(proc).catch(() => {});
+    killProcessTree(proc).finally(() => cleanupOwnedPortFile(pidToClean));
+  } else {
+    cleanupOwnedPortFile(pidToClean);
   }
 });

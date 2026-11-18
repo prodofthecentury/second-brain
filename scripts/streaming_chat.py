@@ -35,12 +35,14 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from answer_policy import validate_standard_answer  # noqa: E402
-from cognitive_core import record_grounded_answer_telemetry, record_retrieval_telemetry  # noqa: E402
-from config import ATOMS_DIR, BRAIN_DIR, CHROMA_PATH, LEXICAL_INDEX_PATH  # noqa: E402
+from answer_policy import format_research_leads, validate_standard_answer  # noqa: E402
+from cognitive_core import peek_lexical_candidate_atom_ids, record_grounded_answer_telemetry, record_retrieval_telemetry  # noqa: E402
+from config import ATOMS_DIR, BRAIN_DIR, CHROMA_PATH, LEXICAL_INDEX_PATH, _is_reparse_or_link  # noqa: E402
 from host_adapters import (  # noqa: E402
     HostConsentError,
+    PinnedHTTPTransport,
     _audit_outbound_call,
+    _invoke_provider_draft,
     builtin_default_policies,
     filter_atoms_for_host,
     inspect_and_redact_outbound,
@@ -48,14 +50,18 @@ from host_adapters import (  # noqa: E402
     validate_endpoint_network_boundary,
     validate_model_identifier,
 )
+from inbox_workflow import list_inbox_items  # noqa: E402
 from memory_format import split_frontmatter  # noqa: E402
-from memory_review import parse_frontmatter_values, section_text  # noqa: E402
+from memory_review import list_review_queue, parse_frontmatter_values, section_text  # noqa: E402
 from notes_store import NotePaths, search_notes  # noqa: E402
 from recall import MemoryRecallUnavailable, RecallOptions, normalize_project_tag, project_tags_match, search_memory  # noqa: E402
 
 CHAT_MODES = ("instant", "verified", "stream")
+RETRIEVAL_MODES = ("auto", "lexical", "dense", "rrf")
+ANSWER_VIEWS = ("standard", "preference", "research")
 MAX_VERIFIED = 6
 MAX_NOTES = 4
+MAX_LEADS = 4
 NOTE_EXCERPT_CHARS = 700
 KEEP_ALIVE = "30m"
 CITATION_RE = re.compile(r"\[([VNP])(\d+)\]")
@@ -87,15 +93,22 @@ class ChatPaths:
         return NotePaths.for_brain(self.brain_dir)
 
 
-def _ollama_rule(policy_path: Path | None):
+def _resolve_chat_host_rule(policy_path: Path | None, host_id: str = "ollama_local"):
     policies = load_host_policies(policy_path)
-    rule = policies.get("ollama_local")
-    if rule is None or not rule.enabled:
-        raise HostConsentError("Local model host 'ollama_local' is disabled; enable it to use model-assisted chat.")
-    if rule.transport != "local" or rule.provider != "ollama":
-        raise HostConsentError("Streaming chat is restricted to the loopback Ollama host.")
+    clean_host = (host_id or "ollama_local").strip() or "ollama_local"
+    rule = policies.get(clean_host)
+    if rule is None:
+        raise HostConsentError(f"Unknown AI host '{clean_host}'. Configure it in host-sharing-policy.json first.")
+    if not rule.enabled:
+        raise HostConsentError(
+            f"Host '{clean_host}' ({rule.transport}) is disabled; enable it in host sharing policy to use chat."
+        )
     validate_endpoint_network_boundary(rule)
     return rule
+
+
+def _ollama_rule(policy_path: Path | None):
+    return _resolve_chat_host_rule(policy_path, "ollama_local")
 
 
 def default_stream_fn(endpoint: str) -> StreamFn:
@@ -117,6 +130,84 @@ def default_stream_fn(endpoint: str) -> StreamFn:
     return _stream
 
 
+def default_host_stream_fn(rule) -> StreamFn:
+    if rule.provider == "ollama":
+        return default_stream_fn(rule.endpoint_url)
+
+    def _stream_remote(prompt: str, model: str) -> Iterator[str]:
+        import httpx
+        from urllib.parse import quote as url_quote
+
+        safe_model = validate_model_identifier(model, provider=rule.provider)
+        api_key = (os.environ.get(rule.api_key_env) or "").strip() if rule.api_key_env else ""
+        if rule.transport == "online" and not api_key:
+            raise HostConsentError(
+                f"Missing API credential in environment variable '{rule.api_key_env}' for online host '{rule.host_id}'."
+            )
+        owned_transport = None
+        client_kwargs: dict[str, object] = {"timeout": 45.0, "follow_redirects": False, "trust_env": False}
+        if rule.transport == "online":
+            resolved = validate_endpoint_network_boundary(rule)
+            if resolved is not None:
+                owned_transport = PinnedHTTPTransport(resolved)
+                client_kwargs["transport"] = owned_transport
+        entered = False
+        try:
+            with httpx.Client(**client_kwargs) as client:
+                entered = True
+                if rule.provider == "openai_compatible":
+                    headers = {"Content-Type": "application/json"}
+                    if api_key:
+                        headers["Authorization"] = f"Bearer {api_key}"
+                    resp = client.post(
+                        f"{rule.endpoint_url}/chat/completions",
+                        headers=headers,
+                        json={"model": safe_model, "temperature": 0.2, "messages": [{"role": "user", "content": prompt}]},
+                    )
+                    resp.raise_for_status()
+                    text = str(resp.json()["choices"][0]["message"]["content"] or "")
+                elif rule.provider == "anthropic":
+                    resp = client.post(
+                        f"{rule.endpoint_url}/messages",
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-api-key": api_key,
+                            "anthropic-version": "2023-06-01",
+                        },
+                        json={
+                            "model": safe_model,
+                            "max_tokens": 768,
+                            "temperature": 0.2,
+                            "messages": [{"role": "user", "content": prompt}],
+                        },
+                    )
+                    resp.raise_for_status()
+                    blocks = resp.json().get("content") or []
+                    text = "".join(str(b.get("text") or "") for b in blocks if b.get("type") == "text")
+                elif rule.provider == "gemini":
+                    enc_m = url_quote(safe_model, safe="._-")
+                    resp = client.post(
+                        f"{rule.endpoint_url}/models/{enc_m}:generateContent",
+                        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                        json={
+                            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                            "generationConfig": {"temperature": 0.2},
+                        },
+                    )
+                    resp.raise_for_status()
+                    parts = resp.json()["candidates"][0]["content"]["parts"]
+                    text = "".join(str(p.get("text") or "") for p in parts)
+                else:
+                    raise ValueError(f"Unsupported provider: {rule.provider}")
+                if text:
+                    yield text
+        finally:
+            if owned_transport is not None and not entered:
+                owned_transport.close()
+
+    return _stream_remote
+
+
 def default_json_fn(endpoint: str) -> JsonFn:
     def _json(prompt: str, model: str, schema: dict) -> str:
         import ollama
@@ -132,6 +223,28 @@ def default_json_fn(endpoint: str) -> JsonFn:
         return str(resp["message"]["content"])
 
     return _json
+
+
+def default_host_json_fn(rule) -> JsonFn:
+    if rule.provider == "ollama":
+        return default_json_fn(rule.endpoint_url)
+
+    def _json_remote(prompt: str, model: str, schema: dict) -> str:
+        gem_schema = {
+            "type": "OBJECT",
+            "properties": {"claim_ids": {"type": "ARRAY", "items": {"type": "INTEGER"}}},
+            "required": ["claim_ids"],
+        }
+        return _invoke_provider_draft(
+            rule,
+            model=model,
+            prompt=prompt,
+            json_schema=schema,
+            schema_name="claim_selection",
+            gemini_response_schema=gem_schema,
+        )
+
+    return _json_remote
 
 
 def warmup(policy_path: Path | None = None) -> dict[str, object]:
@@ -166,19 +279,96 @@ def _note_excerpt(body: str, query: str) -> str:
     return flat[best : best + NOTE_EXCERPT_CHARS]
 
 
-def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None = None) -> dict[str, object]:
+def _collect_unverified_leads(
+    query: str,
+    paths: ChatPaths,
+    *,
+    project_scope: str | None = None,
+) -> list[dict[str, object]]:
+    """Collect non-promoted pending atoms & quarantined inbox leads strictly for owner Research view."""
+    q_terms = {t for t in re.findall(r"[a-z0-9]{3,}", (query or "").casefold())}
+    if not q_terms:
+        return []
+    scope_raw = (project_scope or "").strip()
+    scope_tag = normalize_project_tag(scope_raw) if scope_raw else ""
+    need = min(2, len(q_terms))
+    leads: list[dict[str, object]] = []
+    try:
+        for rec in list_review_queue(paths.atoms_dir, {"pending", "needs_edit"}):
+            fname = str(rec.get("filename") or "")
+            p = os.path.join(paths.atoms_dir, fname)
+            if not fname or not os.path.isfile(p) or _is_reparse_or_link(p):
+                continue
+            try:
+                raw_txt = Path(p).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            parsed = split_frontmatter(raw_txt)
+            fm = parse_frontmatter_values(parsed[0]) if parsed else {}
+            if scope_tag:
+                ctxs = fm.get("contexts") or []
+                if isinstance(ctxs, str):
+                    ctxs = [ctxs]
+                proj_tags = [str(c).strip() for c in ctxs if str(c).strip().lower().startswith("project:")]
+                if not proj_tags or not bool(project_tags_match(tuple(proj_tags), (scope_tag,))):
+                    continue
+            claim_txt, ev_txt = _claim_and_evidence(raw_txt)
+            overlap = len(q_terms & set(re.findall(r"[a-z0-9]{3,}", f"{claim_txt} {ev_txt}".casefold())))
+            if overlap >= need:
+                leads.append({
+                    "filename": fname,
+                    "status": str(rec.get("review_status") or "pending"),
+                    "claim": claim_txt,
+                    "excerpt": ev_txt[:260],
+                    "_score": overlap,
+                })
+    except Exception:
+        pass
+    if not scope_tag:
+        try:
+            raw_dir = os.path.join(paths.brain_dir, "0-raw")
+            for item in list_inbox_items(os.path.join(raw_dir, "inbox"), raw_dir=raw_dir, brain_dir=paths.brain_dir):
+                preview_txt = str(getattr(item, "preview", "") or "")
+                fname = str(getattr(item, "filename", "") or "")
+                overlap = len(q_terms & set(re.findall(r"[a-z0-9]{3,}", f"{fname} {preview_txt}".casefold())))
+                if overlap >= need:
+                    leads.append({
+                        "filename": f"0-raw/inbox/{fname}",
+                        "status": "quarantined_inbox",
+                        "claim": preview_txt[:220],
+                        "excerpt": preview_txt[:260],
+                        "_score": overlap,
+                    })
+        except Exception:
+            pass
+    leads.sort(key=lambda d: (-int(d.get("_score", 0)), str(d.get("filename", ""))))
+    return [
+        {"id": f"L{i}", **{k: v for k, v in item.items() if not k.startswith("_")}}
+        for i, item in enumerate(leads[:MAX_LEADS], start=1)
+    ]
+
+
+def retrieve_context(
+    query: str,
+    paths: ChatPaths,
+    *,
+    project_scope: str | None = None,
+    retrieval_mode: str = "lexical",
+    include_leads: bool = False,
+) -> dict[str, object]:
     t0 = time.perf_counter()
     verified: list[dict[str, object]] = []
     preferences: list[dict[str, object]] = []
     records: list[dict[str, str]] = []
     warning = None
+    eff_mode = retrieval_mode if retrieval_mode in RETRIEVAL_MODES else "lexical"
     telemetry_db = paths.telemetry_db_path or os.path.join(paths.brain_dir, ".sidecar", "telemetry.sqlite3")
     try:
         opts = RecallOptions(
             n_results=MAX_VERIFIED,
             follow_links=True,
             include_statuses={"accepted"},
-            retrieval_mode="lexical",
+            retrieval_mode=eff_mode,
             enable_fitness_boost=True,
             telemetry_db_path=telemetry_db,
             projects=(project_scope,) if project_scope else (),
@@ -207,9 +397,16 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
                 verified.append({"id": f"V{len(verified) + 1}", "atom_id": result.filename, "claim": claim, "evidence": evidence})
             records.append({"filename": result.filename, "content": result.content})
         try:
+            try:
+                cand_ids = peek_lexical_candidate_atom_ids(
+                    query, index_path=paths.lexical_index_path, atoms_dir=paths.atoms_dir
+                )
+            except Exception:
+                cand_ids = None
             record_retrieval_telemetry(
                 [r["filename"] for r in records],
-                mode="chat_lexical",
+                candidate_atom_ids=cand_ids,
+                mode=f"chat_{eff_mode}",
                 latency_ms=(time.perf_counter() - t0) * 1000.0,
                 db_path=telemetry_db,
             )
@@ -240,6 +437,7 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
                 break
     except Exception as exc:  # notes are optional context; never block verified recall
         warning = (warning + "; " if warning else "") + f"Notes unavailable: {exc}"
+    leads = _collect_unverified_leads(query, paths, project_scope=project_scope) if include_leads else []
     sources = [
         {
             "tier": "verified",
@@ -269,13 +467,25 @@ def retrieve_context(query: str, paths: ChatPaths, *, project_scope: str | None 
             "excerpt": n["excerpt"],
         }
         for n in notes
+    ] + [
+        {
+            "tier": "unverified_lead",
+            "citation_id": ld["id"],
+            "filename": ld["filename"],
+            "title": f"{ld['filename']} ({ld['status']})",
+            "claim": ld["claim"],
+            "excerpt": ld["excerpt"],
+        }
+        for ld in leads
     ]
     return {
         "type": "context",
         "verified": verified,
         "preferences": preferences,
         "notes": notes,
+        "leads": leads,
         "sources": sources,
+        "retrieval_mode": eff_mode,
         "retrieval_ms": round((time.perf_counter() - t0) * 1000, 1),
         "warning": warning,
         "_records": records,
@@ -591,15 +801,26 @@ def chat_events(
     json_fn: JsonFn | None = None,
     model_override: str | None = None,
     include_preferences: bool = True,
+    host_id: str = "ollama_local",
+    retrieval_mode: str = "lexical",
+    answer_view: str = "standard",
+    allow_unverified_leads: bool = False,
 ) -> Iterator[dict[str, object]]:
     """Yield chat events: context → (tokens|verified_answer) → grounding → done."""
     if mode not in CHAT_MODES:
         raise ValueError(f"mode must be one of {CHAT_MODES}")
+    if retrieval_mode not in RETRIEVAL_MODES:
+        raise ValueError(f"retrieval_mode must be one of {RETRIEVAL_MODES}")
+    if answer_view not in ANSWER_VIEWS:
+        raise ValueError(f"answer_view must be one of {ANSWER_VIEWS}")
     paths = paths or ChatPaths()
     started = time.perf_counter()
+    clean_host = (host_id or "ollama_local").strip() or "ollama_local"
     try:
         policies = load_host_policies(paths.policy_path)
-        context_rule = policies.get("ollama_local") or builtin_default_policies()["ollama_local"]
+        context_rule = policies.get(clean_host) or (
+            policies.get("ollama_local") or builtin_default_policies()["ollama_local"]
+        )
     except (ValueError, OSError) as exc:
         if isinstance(exc, PermissionError) and mode == "instant":
             raise
@@ -608,15 +829,58 @@ def chat_events(
         yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
         return
 
-    raw_ctx = retrieve_context(query, paths, project_scope=project_scope)
+    want_leads = answer_view == "research" and bool(allow_unverified_leads)
+    raw_ctx = retrieve_context(
+        query,
+        paths,
+        project_scope=project_scope,
+        retrieval_mode=retrieval_mode,
+        include_leads=want_leads,
+    )
     ctx = _filter_and_redact_context(raw_ctx, context_rule)
-    if not include_preferences:
+    raw_leads = list(raw_ctx.get("leads") or []) if want_leads else []
+    if raw_leads and context_rule.transport == "online":
+        raw_leads = []
+    if not include_preferences or answer_view == "research":
         ctx = {
             **ctx,
             "preferences": [],
             "sources": [s for s in ctx["sources"] if s.get("tier") != "preference"],
         }
+    if answer_view == "preference":
+        ctx = {
+            **ctx,
+            "verified": [],
+            "notes": [],
+            "sources": [s for s in ctx["sources"] if s.get("tier") == "preference"],
+        }
+    ctx = {
+        **ctx,
+        "leads": raw_leads,
+        "answer_view": answer_view,
+        "host_id": clean_host,
+        "retrieval_mode": raw_ctx.get("retrieval_mode", retrieval_mode),
+        "sources": list(ctx["sources"])
+        + [
+            {
+                "tier": "unverified_lead",
+                "citation_id": ld["id"],
+                "filename": ld["filename"],
+                "title": f"{ld['filename']} ({ld['status']})",
+                "claim": ld.get("claim", ""),
+                "excerpt": ld.get("excerpt", ""),
+            }
+            for ld in raw_leads
+        ],
+    }
     yield _public(ctx)
+    if raw_leads:
+        yield {
+            "type": "research_leads",
+            "label": "UNVERIFIED LEADS — NOT OWNER-APPROVED",
+            "text": format_research_leads(raw_leads),
+            "leads": raw_leads,
+        }
     verified = ctx["verified"]
     preferences = ctx["preferences"]
     notes = ctx["notes"]
@@ -630,7 +894,7 @@ def chat_events(
         return
 
     try:
-        rule = _ollama_rule(paths.policy_path)
+        rule = _resolve_chat_host_rule(paths.policy_path, clean_host)
         model = validate_model_identifier((model_override or "").strip() or rule.default_model, provider=rule.provider)
     except (HostConsentError, ValueError, OSError) as exc:
         yield {"type": "error", "error": str(exc)}
@@ -644,6 +908,27 @@ def chat_events(
     pre_secret_hits = tuple(ctx.get("_pre_secret_hits") or ())
     model_verified = list(verified)
     verified_atom_ids = [str(v["atom_id"]) for v in model_verified]
+
+    if mode == "verified" and answer_view == "preference":
+        if not preferences:
+            msg = "No owner preference memory matches this question."
+            yield {"type": "verified_answer", "answerable": False, "text": msg, "answer": msg, "claims": []}
+        else:
+            pref_text = "\n".join(f"- [Preference] {p['claim']} [{p['id']}]" for p in preferences)
+            yield {
+                "type": "verified_answer",
+                "answerable": True,
+                "text": pref_text,
+                "answer": pref_text,
+                "model_ms": 0.0,
+                "claims": [
+                    {"text": str(p["claim"]), "is_preference": True, "evidence": [{"atom_id": p["atom_id"]}]}
+                    for p in preferences
+                ],
+            }
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield {"type": "done", "total_ms": elapsed, "elapsed_ms": elapsed}
+        return
 
     if mode == "verified":
         if not model_verified:
@@ -664,7 +949,7 @@ def chat_events(
             if blocked_events:
                 yield from blocked_events
                 return
-            fn = json_fn or default_json_fn(rule.endpoint_url)
+            fn = json_fn or default_host_json_fn(rule)
             t0 = time.perf_counter()
             outcome = "abstained"
             try:
@@ -777,7 +1062,7 @@ def chat_events(
     if blocked_events:
         yield from blocked_events
         return
-    fn = stream_fn or default_stream_fn(rule.endpoint_url)
+    fn = stream_fn or default_host_stream_fn(rule)
     pieces: list[str] = []
     first_token_ms = None
     outcome = "streamed_synthesis"
@@ -818,7 +1103,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("query")
     parser.add_argument("--mode", choices=CHAT_MODES, default="stream")
     parser.add_argument("--project", default=None, help="Optional project:<id> scope filter.")
-    parser.add_argument("--model", default=None, help="Optional local Ollama model override.")
+    parser.add_argument("--model", default=None, help="Optional model override for the selected host.")
+    parser.add_argument("--host", default="ollama_local", help="Host sharing policy id (default ollama_local).")
+    parser.add_argument("--retrieval", choices=RETRIEVAL_MODES, default="lexical", help="Retrieval mode.")
+    parser.add_argument("--view", choices=ANSWER_VIEWS, default="standard", help="Answer view.")
     parser.add_argument("--no-preferences", action="store_true", help="Exclude subjective preference atoms.")
     parser.add_argument("--json", action="store_true", help="Emit raw JSON events (one per line).")
     args = parser.parse_args(argv)
@@ -828,6 +1116,10 @@ def main(argv: list[str] | None = None) -> int:
         project_scope=args.project,
         model_override=args.model,
         include_preferences=not args.no_preferences,
+        host_id=args.host,
+        retrieval_mode=args.retrieval,
+        answer_view=args.view,
+        allow_unverified_leads=args.view == "research",
     ):
         if args.json:
             print(json.dumps(event, ensure_ascii=False), flush=True)
@@ -843,6 +1135,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  ✎ [{n['id']}] {n['title']}  ({n['filename']})")
             if event.get("warning"):
                 print(f"  ! {event['warning']}")
+            print()
+        elif kind == "research_leads":
+            print(event.get("text", ""))
             print()
         elif kind == "token":
             print(event["text"], end="", flush=True)

@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        python-version: ["3.11"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+            skip_gui_pack: true
+          - os: ubuntu-latest
+            python-version: "3.13"
+            skip_gui_pack: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux headless GUI & Electron dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb \
+            libnss3 \
+            libatk1.0-0 \
+            libatk-bridge2.0-0 \
+            libcups2 \
+            libdrm2 \
+            libxkbcommon0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            libgbm1 \
+            libpango-1.0-0 \
+            libcairo2
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python ${{ matrix.python-version }} & sync environment
+        run: |
+          uv python install ${{ matrix.python-version }}
+          uv sync --locked --python ${{ matrix.python-version }}
+
+      - name: Set up Node.js
+        if: ${{ !matrix.skip_gui_pack }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Generate multi-platform icons
+        run: uv run --frozen python scripts/make_icons.py
+
+      - name: Run Python unit, contract & dashboard AppTest suites
+        run: >
+          uv run --frozen python scripts/test_all.py --fail-fast
+          --only evaluation_dataset audit_sources system_safety_tests
+          phase2_safety_tests phase3_cognitive_tests phase4_product_tests
+          phase5_god_features_tests goal3_backend_contract_tests
+          dashboard_apptest_tests chroma_rebuild_canary
+          archive_manifest_canary smoke_test
+
+      - name: Build wheel & run isolated clean-wheel venv tests
+        run: |
+          uv build --wheel --out-dir dist
+          uv run --frozen python -m unittest scripts.wheel_packaging_tests -v
+
+      - name: Build VS Code VSIX package
+        run: uv run --frozen python scripts/build_vsix.py --out-dir dist
+
+      - name: Run VS Code extension tests
+        if: ${{ !matrix.skip_gui_pack }}
+        working-directory: extensions/vscode-second-brain
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-package-lock
+          fi
+          if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.test ? 0 : 1)'; then
+            if [ "${RUNNER_OS}" = "Linux" ]; then
+              xvfb-run -a npm test
+            else
+              npm test
+            fi
+          fi
+
+      - name: Run Electron desktop tests & unpacked directory build
+        if: ${{ !matrix.skip_gui_pack }}
+        working-directory: desktop
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          npm ci
+          if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.test ? 0 : 1)'; then
+            if [ "${RUNNER_OS}" = "Linux" ]; then
+              xvfb-run -a npm test
+            else
+              npm test
+            fi
+          fi
+          npx electron-builder --dir --publish never

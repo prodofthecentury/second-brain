@@ -133,8 +133,8 @@ def _render_claims(claims: list[GroundedClaim]) -> str:
 def build_grounding_prompt(query: str | AnswerRequest, retrieved_atoms) -> str:
     """Build a strict JSON-only draft prompt with program-computed revisions."""
     if isinstance(query, AnswerRequest):
-        if query.mode not in {"standard", "preference"}:
-            raise ValueError("Only standard and preference answer modes are currently supported.")
+        if query.mode not in {"standard", "preference", "research"}:
+            raise ValueError("Only standard, preference, and research answer modes are currently supported.")
         question = query.query
         mode = query.mode
     else:
@@ -155,7 +155,7 @@ def build_grounding_prompt(query: str | AnswerRequest, retrieved_atoms) -> str:
             is_pref_atom = atom_label == "preference" or bool(fm_values.get("epistemic_contract"))
             if mode == "preference" and not is_pref_atom:
                 continue
-            if mode == "standard" and is_pref_atom:
+            if mode in {"standard", "research"} and is_pref_atom:
                 continue
             claim = section_text("\n".join(parsed[1]), "Claim")
             if claim:
@@ -201,7 +201,7 @@ draft identifies a retrieved atom and reproduces its Claim exactly. Program-
 verified source provenance and the full anchored evidence excerpt are rendered
 from current source bytes, never selected by the model.
     """
-    if mode not in {"standard", "preference", "auto"}:
+    if mode not in {"standard", "preference", "research", "auto"}:
         raise ValueError("Unsupported answer validation mode.")
     atoms_root = Path(atoms_dir).resolve()
     brain_root = atoms_root.parent
@@ -295,7 +295,7 @@ from current source bytes, never selected by the model.
                     atom_epistemic_label = str(values.get("epistemic_label", "claim"))
                     atom_contract = values.get("epistemic_contract")
                     is_pref = atom_epistemic_label == "preference" or bool(atom_contract)
-                    if mode == "standard" and is_pref:
+                    if mode in {"standard", "research"} and is_pref:
                         return _abstain("Subjective owner preferences are excluded from standard factual answers.")
                     if mode == "preference" and not is_pref:
                         return _abstain("Empirical factual claims are excluded from subjective preference mode.")
@@ -322,3 +322,17 @@ from current source bytes, never selected by the model.
         verified_claims.append(supported)
 
     return AnswerResult(True, _render_claims(verified_claims), tuple(verified_claims))
+
+
+def format_research_leads(leads: list[dict[str, object]]) -> str:
+    """Render candidate/quarantined leads inside a non-model structural envelope without promoting them."""
+    if not leads:
+        return ""
+    lines = ["[UNVERIFIED LEADS — NOT OWNER-APPROVED]"]
+    for idx, lead in enumerate(leads, start=1):
+        lid = str(lead.get("id") or f"L{idx}")
+        fname = str(lead.get("filename") or "unknown.md")
+        status = str(lead.get("status") or "pending")
+        summary = str(lead.get("claim") or lead.get("excerpt") or "").replace("\r", " ").replace("\n", " ").strip()[:240]
+        lines.append(f"- [{lid}] `{fname}` ({status}): {summary}")
+    return "\n".join(lines)

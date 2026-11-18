@@ -145,6 +145,9 @@ def _collect_verified_leaves(
     return leaves
 
 
+collect_canonical_vault_leaves = _collect_verified_leaves
+
+
 def _build_merkle_levels(leaf_hashes: list[str]) -> list[list[str]]:
     if not leaf_hashes:
         return [[_sha256_text("empty-vault-merkle-root")]]
@@ -297,6 +300,7 @@ def verify_vault_ledger(
     return {
         "chain_valid": chain_valid,
         "entry_count": len(entries),
+        "entries": entries,
         "errors": errors,
         "head_seq": latest["seq"] if latest else 0,
         "head_entry_sha256": latest["entry_sha256"] if latest else None,
@@ -311,26 +315,55 @@ def verify_vault_ledger(
     }
 
 
-def prove_atom_membership(
-    atom_filename: str,
+def prove_leaf_membership(
+    target_ref: str,
     *,
     brain_dir: str = BRAIN_DIR,
     atoms_dir: str = ATOMS_DIR,
     playbooks_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Generate a portable Merkle inclusion proof for an accepted atom."""
-    raw_name = str(atom_filename or "").strip()
-    norm_name = raw_name if raw_name.lower().endswith(".md") else f"{raw_name}.md"
-    safe_path = safe_file_in_dir(atoms_dir, norm_name, allowed_exts={".md"}, must_exist=True)
-    if not safe_path:
-        raise FileNotFoundError(f"Atom not found: {atom_filename}")
-    target_rel = f"2-atoms/{os.path.basename(safe_path)}"
+    """Generate a portable Merkle inclusion proof for an accepted atom or playbook leaf."""
+    raw_name = str(target_ref or "").strip().replace("\\", "/")
+    if not raw_name:
+        raise FileNotFoundError(f"Leaf not found: {target_ref}")
+    pb_dir = playbooks_dir if playbooks_dir is not None else os.path.join(brain_dir, "5-playbooks")
+
+    if raw_name.startswith("2-atoms/"):
+        sub = raw_name[len("2-atoms/") :]
+        norm_name = sub if sub.lower().endswith(".md") else f"{sub}.md"
+        safe_path = safe_file_in_dir(atoms_dir, norm_name, allowed_exts={".md"}, must_exist=True)
+        if not safe_path:
+            raise FileNotFoundError(f"Atom not found: {target_ref}")
+        target_rel = f"2-atoms/{os.path.basename(safe_path)}"
+    elif raw_name.startswith(("5-playbooks/", "playbooks/", "playbook:")):
+        if raw_name.startswith("5-playbooks/"):
+            sub = raw_name[len("5-playbooks/") :]
+        elif raw_name.startswith("playbooks/"):
+            sub = raw_name[len("playbooks/") :]
+        else:
+            sub = raw_name[len("playbook:") :]
+        norm_name = sub if sub.lower().endswith(".md") else f"{sub}.md"
+        safe_path = safe_file_in_dir(pb_dir, norm_name, allowed_exts={".md"}, must_exist=True)
+        if not safe_path:
+            raise FileNotFoundError(f"Playbook not found: {target_ref}")
+        target_rel = f"5-playbooks/{os.path.basename(safe_path)}"
+    else:
+        norm_name = raw_name if raw_name.lower().endswith(".md") else f"{raw_name}.md"
+        safe_atom = safe_file_in_dir(atoms_dir, norm_name, allowed_exts={".md"}, must_exist=True)
+        if safe_atom:
+            target_rel = f"2-atoms/{os.path.basename(safe_atom)}"
+        else:
+            safe_pb = safe_file_in_dir(pb_dir, norm_name, allowed_exts={".md"}, must_exist=True)
+            if safe_pb:
+                target_rel = f"5-playbooks/{os.path.basename(safe_pb)}"
+            else:
+                raise FileNotFoundError(f"Leaf not found: {target_ref}")
 
     merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
     leaves = merkle["leaves"]
     idx = next((i for i, leaf in enumerate(leaves) if leaf["rel_path"] == target_rel), None)
     if idx is None:
-        raise PermissionError(f"Atom '{atom_filename}' is not an accepted member of the verified vault Merkle tree.")
+        raise PermissionError(f"Leaf '{target_ref}' is not an accepted member of the verified vault Merkle tree.")
 
     levels = _build_merkle_levels([leaf["leaf_sha256"] for leaf in leaves])
     siblings: list[dict[str, str]] = []
@@ -348,6 +381,7 @@ def prove_atom_membership(
     ledger = verify_vault_ledger(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
     return {
         "schema_version": 1,
+        "kind": leaves[idx]["kind"],
         "rel_path": target_rel,
         "file_sha256": leaves[idx]["file_sha256"],
         "leaf_sha256": leaves[idx]["leaf_sha256"],
@@ -355,6 +389,22 @@ def prove_atom_membership(
         "merkle_root": merkle["merkle_root"],
         "ledger_head_entry_sha256": ledger["head_entry_sha256"] if ledger["synced_with_head"] else None,
     }
+
+
+def prove_atom_membership(
+    atom_filename: str,
+    *,
+    brain_dir: str = BRAIN_DIR,
+    atoms_dir: str = ATOMS_DIR,
+    playbooks_dir: str | None = None,
+) -> dict[str, Any]:
+    """Generate a portable Merkle inclusion proof for an accepted atom or playbook leaf."""
+    return prove_leaf_membership(
+        atom_filename,
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        playbooks_dir=playbooks_dir,
+    )
 
 
 def verify_merkle_proof(proof: dict[str, Any]) -> bool:
