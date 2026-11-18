@@ -142,7 +142,7 @@
           "type": "number",
           "default": 8765,
           "scope": "application",
-          "description": "Loopback port of the local Second Brain HTTP API (user/application scope only; ignored in workspace settings)."
+          "description": "Loopback TCP port for the Second Brain Memory API (0 or default auto-discovers live Desktop/CLI port from SecondBrain/security/api-port, falling back to 8765; user/application scope only)."
         },
         "secondBrain.ownerTokenPath": {
           "type": "string",

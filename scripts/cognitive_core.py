@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import datetime
 import json
 import os
@@ -200,31 +200,144 @@ def _brain_dir_for_telemetry_db(db_path: str) -> str | None:
     return None
 
 
+from pathlib import Path
+import threading
+
+
+_DURABLE_FB_LOCK = threading.Lock()
+# Maps abs_log_path -> (mtime_ns, size_bytes, per_atom_counts)
+_DURABLE_FB_CACHE: dict[str, tuple[int, int, dict[str, dict[str, object]]]] = {}
+
+
 def atom_correction_log_path(brain_dir: str) -> str:
     return os.path.join(brain_dir, "0-raw", "archive", "atom-corrections.jsonl")
 
 
-def _append_canonical_correction(brain_dir: str, atom_id: str) -> None:
-    """Durable append-only correction record so Playbook staleness never depends on a disposable sidecar."""
+def _restrict_durable_log_permissions(log_path: str) -> None:
+    try:
+        from host_adapters import restrict_security_file_permissions
+
+        restrict_security_file_permissions(Path(log_path))
+    except Exception:
+        if os.name != "nt":
+            try:
+                os.chmod(log_path, 0o600)
+            except OSError:
+                pass
+
+
+def _append_durable_feedback(
+    brain_dir: str,
+    atom_id: str,
+    *,
+    action: str,
+    actor: str = "owner",
+    note: str = "",
+) -> None:
+    """Persist durable feedback/correction/supersession records in 0-raw/archive/atom-corrections.jsonl."""
     log_path = atom_correction_log_path(brain_dir)
     archive_dir = os.path.dirname(log_path)
     os.makedirs(archive_dir, exist_ok=True)
     if _is_reparse_or_link(archive_dir) or (os.path.lexists(log_path) and _is_reparse_or_link(log_path)):
         raise PermissionError("Refusing to write atom correction log through a symlink or reparse point.")
-    record = {
+    clean_actor = _sanitize_single_line(actor or "owner", max_len=120) or "owner"
+    clean_note = _sanitize_single_line(note or "", max_len=500)
+    record: dict[str, object] = {
         "schema_version": 1,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-        "action": "atom_correction",
+        "action": action,
         "atom_id": atom_id,
+        "actor": clean_actor,
+        "note": clean_note,
     }
-    encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    encoded = (json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o600)
     try:
         if os.write(fd, encoded) != len(encoded):
             raise OSError("Incomplete write to atom-corrections.jsonl.")
         os.fsync(fd)
     finally:
         os.close(fd)
+    _restrict_durable_log_permissions(log_path)
+    with _DURABLE_FB_LOCK:
+        _DURABLE_FB_CACHE.pop(os.path.abspath(log_path), None)
+
+
+def _append_canonical_correction(
+    brain_dir: str,
+    atom_id: str,
+    *,
+    actor: str = "owner",
+    note: str = "",
+) -> None:
+    """Durable append-only correction record so Playbook staleness never depends on a disposable sidecar."""
+    _append_durable_feedback(brain_dir, atom_id, action="atom_correction", actor=actor, note=note)
+
+
+def load_durable_feedback_counts(brain_dir: str) -> dict[str, dict[str, object]]:
+    """Load per-atom positive_feedback, corrections, supersessions, last_actor, and last_note from atom-corrections.jsonl."""
+    if not brain_dir:
+        return {}
+    log_path = atom_correction_log_path(brain_dir)
+    abs_log = os.path.abspath(log_path)
+    if not os.path.lexists(abs_log):
+        return {}
+    if _is_reparse_or_link(abs_log) or _is_reparse_or_link(os.path.dirname(abs_log)):
+        return {}
+    try:
+        st = os.stat(abs_log)
+    except OSError:
+        return {}
+    with _DURABLE_FB_LOCK:
+        cached = _DURABLE_FB_CACHE.get(abs_log)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return {k: dict(v) for k, v in cached[2].items()}
+
+    counts: dict[str, dict[str, object]] = {}
+    try:
+        with open(abs_log, "r", encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                aid = rec.get("atom_id")
+                if not isinstance(aid, str) or not aid:
+                    continue
+                act = str(rec.get("action") or "")
+                if act not in {"atom_helpful", "atom_endorsed", "atom_correction", "atom_supersession"}:
+                    continue
+                bucket = counts.setdefault(
+                    aid,
+                    {
+                        "positive_feedback": 0,
+                        "corrections": 0,
+                        "supersessions": 0,
+                        "last_actor": "",
+                        "last_note": "",
+                    },
+                )
+                if act in {"atom_helpful", "atom_endorsed"}:
+                    bucket["positive_feedback"] = int(bucket["positive_feedback"]) + 1
+                elif act == "atom_correction":
+                    bucket["corrections"] = int(bucket["corrections"]) + 1
+                elif act == "atom_supersession":
+                    bucket["supersessions"] = int(bucket["supersessions"]) + 1
+                bucket["last_actor"] = str(rec.get("actor") or "")
+                bucket["last_note"] = str(rec.get("note") or "")
+    except OSError:
+        return {}
+
+    with _DURABLE_FB_LOCK:
+        if len(_DURABLE_FB_CACHE) > 256:
+            _DURABLE_FB_CACHE.clear()
+        _DURABLE_FB_CACHE[abs_log] = (st.st_mtime_ns, st.st_size, counts)
+    return {k: dict(v) for k, v in counts.items()}
 
 
 def count_canonical_corrections(brain_dir: str, atom_id: str) -> int | None:
@@ -255,29 +368,68 @@ def count_canonical_corrections(brain_dir: str, atom_id: str) -> int | None:
 def record_atom_feedback(
     atom_id: str,
     *,
-    helpful: bool,
+    helpful: bool = True,
+    actor: str = "owner",
+    note: str = "",
+    feedback_kind: str | None = None,
     db_path: str = TELEMETRY_DB_PATH,
     brain_dir: str | None = None,
-) -> None:
+) -> dict[str, object]:
     if not _valid_atom_id(atom_id):
         raise ValueError(f"Invalid atom_id for telemetry feedback: {atom_id!r}")
-    if not helpful:
-        owning_brain = brain_dir or _brain_dir_for_telemetry_db(db_path)
-        if owning_brain:
-            _append_canonical_correction(owning_brain, atom_id)
-    init_telemetry_db(db_path)
-    col = "positive_feedback" if helpful else "corrections"
-    with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
-        conn.execute(
-            f"""
-            INSERT INTO atom_telemetry (atom_id, {col})
-            VALUES (?, 1)
-            ON CONFLICT(atom_id) DO UPDATE SET
-                {col} = {col} + 1
-            """,
-            (atom_id,),
+
+    if feedback_kind is not None:
+        fk = str(feedback_kind).strip().lower()
+        if fk not in {"helpful", "correction", "supersession"}:
+            raise ValueError(
+                f"Invalid feedback_kind {feedback_kind!r}; expected one of 'helpful', 'correction', 'supersession'."
+            )
+        resolved_kind = fk
+    else:
+        resolved_kind = "helpful" if helpful else "correction"
+
+    clean_actor = _sanitize_single_line(actor or "owner", max_len=120) or "owner"
+    clean_note = _sanitize_single_line(note or "", max_len=500)
+    action_map = {
+        "helpful": "atom_helpful",
+        "correction": "atom_correction",
+        "supersession": "atom_supersession",
+    }
+    action = action_map[resolved_kind]
+
+    owning_brain = brain_dir or _brain_dir_for_telemetry_db(db_path)
+    if owning_brain:
+        _append_durable_feedback(
+            owning_brain,
+            atom_id,
+            action=action,
+            actor=clean_actor,
+            note=clean_note,
         )
-        conn.commit()
+
+    init_telemetry_db(db_path)
+    if resolved_kind in {"helpful", "correction"}:
+        col = "positive_feedback" if resolved_kind == "helpful" else "corrections"
+        with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+            conn.execute(
+                f"""
+                INSERT INTO atom_telemetry (atom_id, {col})
+                VALUES (?, 1)
+                ON CONFLICT(atom_id) DO UPDATE SET
+                    {col} = {col} + 1
+                """,
+                (atom_id,),
+            )
+            conn.commit()
+
+    return {
+        "atom_id": atom_id,
+        "feedback_kind": resolved_kind,
+        "action": action,
+        "helpful": resolved_kind == "helpful",
+        "actor": clean_actor,
+        "note": clean_note,
+    }
 
 
 def _load_telemetry_map(db_path: str) -> dict[str, dict[str, object]]:
@@ -298,6 +450,13 @@ def compute_memory_fitness_report(
 ) -> dict[str, object]:
     """Compute read-only memory utility, review bottlenecks, and procedural skill maturity."""
     telemetry = _load_telemetry_map(db_path)
+    durable_feedback = load_durable_feedback_counts(brain_dir)
+    corr_log_path = atom_correction_log_path(brain_dir) if brain_dir else ""
+    corr_log_unsafe = bool(
+        corr_log_path
+        and os.path.lexists(corr_log_path)
+        and (_is_reparse_or_link(corr_log_path) or _is_reparse_or_link(os.path.dirname(corr_log_path)))
+    )
     high_utility: list[dict[str, object]] = []
     cold_verified: list[dict[str, object]] = []
     pending_bottlenecks: list[dict[str, object]] = []
@@ -321,12 +480,19 @@ def compute_memory_fitness_report(
             is_approved = approved_revision_is_current(fpath, brain_dir=brain_dir, atoms_dir=atoms_dir)
 
             stats = telemetry.get(fname, {})
+            d_stats = durable_feedback.get(fname, {})
             ret_hits = int(stats.get("retrieval_hits", 0) or 0)
             cand_hits = int(stats.get("candidate_hits", 0) or 0)
             citations = int(stats.get("grounded_citations", 0) or 0)
-            pos_fb = int(stats.get("positive_feedback", 0) or 0)
-            corrections = int(stats.get("corrections", 0) or 0)
-            utility_score = round((citations * 2.0) + (ret_hits * 0.5) + (pos_fb * 1.5) - (corrections * 3.0), 2)
+            pos_fb = max(
+                int(stats.get("positive_feedback", 0) or 0),
+                int(d_stats.get("positive_feedback", 0) or 0),
+            )
+            db_corrections = int(stats.get("corrections", 0) or 0)
+            durable_corrections = 1 if corr_log_unsafe else int(d_stats.get("corrections", 0) or 0)
+            corrections = max(db_corrections, durable_corrections)
+            supersessions = int(d_stats.get("supersessions", 0) or 0)
+            utility_score = round((citations * 2.0) + (pos_fb * 1.5) - (corrections * 3.0), 2)
 
             entry = {
                 "atom_id": fname,
@@ -338,11 +504,12 @@ def compute_memory_fitness_report(
                 "grounded_citations": citations,
                 "positive_feedback": pos_fb,
                 "corrections": corrections,
+                "supersessions": supersessions,
                 "utility_score": utility_score,
             }
 
             if is_approved:
-                if citations > 0 or ret_hits > 0:
+                if citations > 0 or pos_fb > 0:
                     high_utility.append(entry)
                 else:
                     cold_verified.append(entry)
@@ -416,6 +583,11 @@ def save_experience_record(
     tools_used: list[str] | None = None,
     referenced_atoms: list[str] | None = None,
     lessons: list[str] | None = None,
+    plan: list[str] | None = None,
+    reasoning_summary: str | None = None,
+    confidence_before: float | None = None,
+    confidence_after: float | None = None,
+    reflection: str | None = None,
     candidate_procedure_title: str | None = None,
     propose_to_inbox: bool = False,
     experiences_dir: str = EXPERIENCES_DIR,
@@ -434,9 +606,14 @@ def save_experience_record(
 
     ctx_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (context or [])) if s)
     act_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (actions or [])) if s)
+    plan_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (plan or [])) if s)
     tools_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (tools_used or [])) if s)
     atoms_tuple = tuple(str(x).strip() for x in (referenced_atoms or []) if _valid_atom_id(str(x).strip()))
     lessons_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (lessons or [])) if s)
+    reasoning_clean = _sanitize_multiline_body(reasoning_summary or "", max_len=2000)
+    reflection_clean = _sanitize_multiline_body(reflection or "", max_len=2000)
+    conf_before_val = round(min(max(float(confidence_before), 0.0), 1.0), 2) if confidence_before is not None else None
+    conf_after_val = round(min(max(float(confidence_after), 0.0), 1.0), 2) if confidence_after is not None else None
     cand_title = _sanitize_single_line(candidate_procedure_title, max_len=200) if candidate_procedure_title else None
     if cand_title == "":
         cand_title = None
@@ -460,7 +637,10 @@ def save_experience_record(
                 f"created_at: {_yaml_quote(ts_iso)}",
                 f"goal: {_yaml_quote(goal_clean)}",
                 f"success: {'true' if success else 'false'}",
+                f"confidence_before: {conf_before_val if conf_before_val is not None else 'null'}",
+                f"confidence_after: {conf_after_val if conf_after_val is not None else 'null'}",
                 f"context: {json.dumps(list(ctx_tuple), ensure_ascii=False)}",
+                f"plan: {json.dumps(list(plan_tuple), ensure_ascii=False)}",
                 f"tools_used: {json.dumps(list(tools_tuple), ensure_ascii=False)}",
                 f"referenced_atoms: {json.dumps(list(atoms_tuple), ensure_ascii=False)}",
                 f"candidate_procedure: {_yaml_quote(cand_title) if cand_title else 'null'}",
@@ -474,11 +654,17 @@ def save_experience_record(
                 "",
                 "## Result",
                 summary_clean,
+            ]
+            if reasoning_clean:
+                md_lines.extend(["", "## Reasoning Summary", reasoning_clean])
+            if reflection_clean:
+                md_lines.extend(["", "## Reflection", reflection_clean])
+            md_lines.extend([
                 "",
                 "## Lessons & Reflection",
                 *(f"- {item}" for item in (lessons_tuple or ("No explicit lessons recorded.",))),
                 "",
-            ]
+            ])
             payload = "\n".join(md_lines).encode("utf-8")
             try:
                 fd = os.open(exp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

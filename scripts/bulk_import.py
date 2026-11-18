@@ -29,7 +29,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
-from config import _is_reparse_or_link, safe_file_in_dir  # noqa: E402
+from config import _is_reparse_or_link, resolve_active_brain_dir, safe_file_in_dir  # noqa: E402
 from lexical_store import sync_lexical_index  # noqa: E402
 from notes_store import (  # noqa: E402
     DEFAULT_PATHS,
@@ -41,6 +41,8 @@ from notes_store import (  # noqa: E402
     render_note,
     slugify,
 )
+
+_INITIAL_DEFAULT_PATHS = DEFAULT_PATHS
 
 SKIP_DIRS = {
     ".obsidian",
@@ -259,13 +261,31 @@ def import_folder(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", help="Folder to import (Obsidian vault, Markdown docs, notes).")
-    parser.add_argument("--tag", action="append", default=[])
+    parser.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Optional tag or comma-separated tags (repeatable).")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--overwrite-modified",
+        action="store_true",
+        help="Overwrite previously imported notes even if edited locally (saves .history backup first).",
+    )
     args = parser.parse_args(argv)
+    parsed_tags = tuple(
+        part.strip()
+        for raw in (args.tags or [])
+        for part in str(raw).split(",")
+        if part.strip()
+    )
+    cli_paths = (
+        DEFAULT_PATHS
+        if DEFAULT_PATHS != _INITIAL_DEFAULT_PATHS
+        else NotePaths.for_brain(resolve_active_brain_dir())
+    )
     stats = import_folder(
         args.source,
-        tags=tuple(args.tag),
+        paths=cli_paths,
+        tags=parsed_tags,
         dry_run=args.dry_run,
+        overwrite_modified=args.overwrite_modified,
         progress=lambda s: print(f"  … {s.scanned} scanned", file=sys.stderr),
     )
     print(json.dumps(stats.as_dict(), indent=2))

@@ -30,7 +30,6 @@ import os
 from pathlib import Path
 import re
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,6 +50,7 @@ from config import (  # noqa: E402
     NOTE_SNAPSHOTS_DIR,
     _WINDOWS_RESERVED_STEMS,
     _is_reparse_or_link,
+    resolve_active_brain_dir,
     safe_file_in_dir,
 )
 from evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
@@ -108,6 +108,33 @@ class NotePaths:
 
 
 DEFAULT_PATHS = NotePaths()
+_INITIAL_DEFAULT_PATHS = DEFAULT_PATHS
+
+
+def _extract_derived_contexts(tags: tuple[str, ...]) -> list[str]:
+    """Derive canonical project/context scope tags from merged note + verification tags."""
+    contexts: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in tags:
+        tag = str(raw_tag or "").strip()
+        if ":" not in tag:
+            continue
+        prefix, rest = tag.split(":", 1)
+        p_low = prefix.strip().lower()
+        val = rest.strip()
+        if not val:
+            continue
+        if p_low == "ctx":
+            canonical = f"context:{val}"
+        elif p_low in {"project", "context", "domain", "topic"}:
+            canonical = f"{p_low}:{val}"
+        else:
+            continue
+        dedup_key = canonical.casefold()
+        if dedup_key not in seen:
+            seen.add(dedup_key)
+            contexts.append(canonical)
+    return contexts
 
 
 @dataclass(frozen=True)
@@ -558,7 +585,9 @@ def verify_note_excerpt(
                 os.close(fd)
         rel_source = Path(os.path.relpath(snap_path, paths.brain_dir)).as_posix()
         today = datetime.date.today().isoformat()
-        clean_tags = _clean_tags(tags)
+        parent_rec = _record_from_text(filename, note_bytes.decode("utf-8"), note_sha)
+        all_note_tags = _clean_tags((*parent_rec.tags, *(tags or ())))
+        derived_contexts = _extract_derived_contexts(all_note_tags)
 
         def _build_note_atom_text(excerpt_val: str) -> str:
             return (
@@ -574,8 +603,8 @@ def verify_note_excerpt(
                 "sources:\n"
                 f"  - {rel_source}\n"
                 f"links: [{json.dumps(stem)}]\n"
-                f"tags: {json.dumps(list(clean_tags))}\n"
-                "contexts: []\n"
+                f"tags: {json.dumps(list(all_note_tags))}\n"
+                f"contexts: {json.dumps(derived_contexts)}\n"
                 "supersedes: []\n"
                 "superseded_by: []\n"
                 "contested_by: []\n"
@@ -643,53 +672,109 @@ def rebuild_notes_index(paths: NotePaths = DEFAULT_PATHS) -> dict[str, object]:
         return rebuild_lexical_index(paths.notes_dir, paths.index_path)
 
 
+def _split_cli_tags(raw_tags: list[str] | None) -> list[str]:
+    return [
+        part.strip()
+        for raw in (raw_tags or [])
+        for part in str(raw).split(",")
+        if part.strip()
+    ]
+
+
+def _active_cli_note_paths() -> NotePaths:
+    if DEFAULT_PATHS != _INITIAL_DEFAULT_PATHS:
+        return DEFAULT_PATHS
+    return NotePaths.for_brain(resolve_active_brain_dir())
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="Second Brain owner notes (zero-friction capture).")
     sub = parser.add_subparsers(dest="cmd", required=True)
     add = sub.add_parser("add", help="Create a note (searchable immediately).")
-    add.add_argument("title")
-    add.add_argument("body", nargs="?", default=None, help="Body text; reads stdin if omitted.")
-    add.add_argument("--tag", action="append", default=[])
+    add.add_argument("pos_title", nargs="?", default=None, metavar="title", help="Note title (or pass --title).")
+    add.add_argument("pos_body", nargs="?", default=None, metavar="body", help="Body text (or pass --body / --stdin).")
+    add.add_argument("--title", dest="opt_title", default=None, help="Note title.")
+    add.add_argument("--body", dest="opt_body", default=None, help="Markdown note body.")
+    add.add_argument("--stdin", action="store_true", help="Read note body from stdin.")
+    add.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Tag or comma-separated tags (repeatable).")
+    add.add_argument("--json", action="store_true", help="Emit JSON output.")
     s = sub.add_parser("search", help="Search notes.")
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=8)
+    s.add_argument("--json", action="store_true", help="Emit JSON output.")
     ls = sub.add_parser("list", help="List notes.")
     ls.add_argument("--limit", type=int, default=50)
-    sub.add_parser("reindex", help="Reconcile the notes index with disk.")
+    ls.add_argument("--json", action="store_true", help="Emit JSON output.")
+    reidx = sub.add_parser("reindex", help="Reconcile the notes index with disk.")
+    reidx.add_argument("--json", action="store_true", help="Emit JSON output.")
     v = sub.add_parser("verify", help="Promote a note excerpt to a verified atom (owner action).")
-    v.add_argument("filename")
-    v.add_argument("excerpt")
-    v.add_argument("--actor", required=True)
-    v.add_argument("--claim")
-    v.add_argument("--memory-type", default="semantic", choices=["semantic", "episodic", "procedural", "self"])
-    v.add_argument("--tag", action="append", default=[])
+    v.add_argument("filename", help="Working note filename in notes/ (e.g. my-note.md).")
+    v.add_argument("pos_excerpt", nargs="?", default=None, metavar="excerpt", help="Exact excerpt to verify (or pass --excerpt).")
+    v.add_argument("--excerpt", dest="opt_excerpt", default=None, help="Exact excerpt to verify.")
+    v.add_argument("--actor", required=True, help="Human owner actor identity.")
+    v.add_argument("--expected-sha256", dest="expected_sha256", default=None, help="Optional CAS SHA-256 of the note.")
+    v.add_argument("--claim", default=None)
+    v.add_argument("--memory-type", "--type", dest="memory_type", default="semantic", choices=["semantic", "episodic", "procedural", "self"])
+    v.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Tag or comma-separated tags (repeatable).")
+    v.add_argument("--json", action="store_true", help="Emit JSON output.")
     args = parser.parse_args(argv)
+    cli_paths = _active_cli_note_paths()
 
     if args.cmd == "add":
-        body = args.body if args.body is not None else sys.stdin.read()
-        print(json.dumps(create_note(args.title, body, tags=args.tag), indent=2))
+        if args.opt_title is not None:
+            title = args.opt_title
+            if args.opt_body is not None:
+                if args.pos_title is not None or args.pos_body is not None:
+                    add.error("Do not combine positional arguments with both --title and --body.")
+                body = args.opt_body
+            elif args.pos_title is not None and args.pos_body is None:
+                body = args.pos_title
+            elif args.stdin or not sys.stdin.isatty():
+                body = sys.stdin.read()
+            else:
+                add.error("Provide --body, positional body text, or --stdin.")
+        else:
+            if args.pos_title is None:
+                add.error("Provide a note title (positional or --title).")
+            title = args.pos_title
+            if args.opt_body is not None:
+                if args.pos_body is not None:
+                    add.error("Provide body either positionally or via --body, not both.")
+                body = args.opt_body
+            elif args.pos_body is not None:
+                body = args.pos_body
+            else:
+                body = sys.stdin.read()
+        print(json.dumps(create_note(title, body, tags=_split_cli_tags(args.tags), paths=cli_paths), indent=2, ensure_ascii=False))
     elif args.cmd == "search":
-        print(json.dumps([r.as_dict() for r in search_notes(args.query, limit=args.limit)], indent=2, ensure_ascii=False))
+        print(json.dumps([r.as_dict() for r in search_notes(args.query, limit=args.limit, paths=cli_paths)], indent=2, ensure_ascii=False))
     elif args.cmd == "list":
-        items, total = list_notes(limit=args.limit)
+        items, total = list_notes(limit=args.limit, paths=cli_paths)
         print(json.dumps({"total": total, "items": [r.as_dict() for r in items]}, indent=2, ensure_ascii=False))
     elif args.cmd == "reindex":
-        print(json.dumps(ensure_notes_index(), indent=2))
+        print(json.dumps(ensure_notes_index(paths=cli_paths), indent=2))
     elif args.cmd == "verify":
-        note = get_note(args.filename)
+        if args.opt_excerpt is not None and args.pos_excerpt is not None:
+            v.error("Provide excerpt either positionally or via --excerpt, not both.")
+        excerpt = args.opt_excerpt if args.opt_excerpt is not None else args.pos_excerpt
+        if not excerpt:
+            v.error("Provide an excerpt to verify (positional or --excerpt).")
+        expected_sha = args.expected_sha256 if args.expected_sha256 else get_note(args.filename, paths=cli_paths).sha256
         print(json.dumps(
             verify_note_excerpt(
                 args.filename,
-                args.excerpt,
+                excerpt,
                 actor=args.actor,
                 claim=args.claim,
                 memory_type=args.memory_type,
-                tags=args.tag,
-                expected_note_sha256=note.sha256,
+                tags=_split_cli_tags(args.tags),
+                expected_note_sha256=expected_sha,
+                paths=cli_paths,
             ),
             indent=2,
+            ensure_ascii=False,
         ))
     return 0
 

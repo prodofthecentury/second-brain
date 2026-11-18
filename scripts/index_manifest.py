@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import json
 import os
+import stat
 import sys
 import threading
 import tempfile
@@ -41,13 +42,14 @@ def invalidate_atom_revision_cache(path: str | None = None) -> None:
             _STAT_HASH_CACHE.clear()
             _FP_MEMO.clear()
         else:
-            _STAT_HASH_CACHE.pop(os.path.abspath(path), None)
+            _STAT_HASH_CACHE.pop(os.path.normcase(os.path.abspath(path)), None)
 
 
 def record_known_atom_hash(path: str, content_sha256: str) -> None:
     """Update stat->sha256 cache immediately after an atomic write."""
     abs_path = os.path.abspath(path)
-    parent_dir = os.path.abspath(os.path.dirname(abs_path))
+    cache_key = os.path.normcase(abs_path)
+    parent_dir = os.path.normcase(os.path.abspath(os.path.dirname(abs_path)))
     try:
         st = os.stat(abs_path)
     except OSError:
@@ -57,7 +59,26 @@ def record_known_atom_hash(path: str, content_sha256: str) -> None:
         _DIR_MEMO.pop(parent_dir, None)
         if len(_STAT_HASH_CACHE) >= _MAX_STAT_CACHE_ENTRIES:
             _STAT_HASH_CACHE.clear()
-        _STAT_HASH_CACHE[abs_path] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, content_sha256)
+        _STAT_HASH_CACHE[cache_key] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, content_sha256)
+
+
+def cached_atom_hash_for_stat(path: str, st: os.stat_result) -> str | None:
+    """Return cached SHA-256 only when (mtime_ns, ctime_ns, size) matches a large-vault cache entry."""
+    cache_key = os.path.normcase(os.path.abspath(path))
+    with _STAT_HASH_LOCK:
+        cached = _STAT_HASH_CACHE.get(cache_key)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_ctime_ns and cached[2] == st.st_size:
+        return cached[3]
+    return None
+
+
+def _entry_is_reparse_or_link(entry: os.DirEntry[str], st: os.stat_result) -> bool:
+    if entry.is_symlink():
+        return True
+    if os.name == "nt":
+        return bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(callable(isjunction) and isjunction(entry.path))
 
 
 def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
@@ -65,50 +86,51 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
 
     Uses os.scandir() (zero extra per-file Win32 stat syscalls) and stat-backed
     SHA-256 caching on vaults above LARGE_VAULT_STAT_CACHE_THRESHOLD so 5,000+
-    note checks complete in a few milliseconds while tiny test vaults hash raw
+    note checks complete in sub-millisecond time while tiny test vaults hash raw
     bytes unconditionally on every call.
     """
     if not os.path.isdir(atoms_dir):
         return []
 
     abs_dir = os.path.abspath(atoms_dir)
-    entries: list[os.DirEntry[str]] = []
+    if _is_reparse_or_link(abs_dir):
+        return []
+    try:
+        dir_st = os.stat(abs_dir)
+    except OSError as exc:
+        raise RuntimeError(f"Could not stat atoms directory {atoms_dir}: {exc}") from exc
+
+    entry_rows: list[tuple[str, str, tuple[int, int, int]]] = []
     try:
         with os.scandir(abs_dir) as it:
             for entry in it:
                 name = entry.name
-                if (
-                    name.endswith(".md")
-                    and name != "README.md"
-                    and entry.is_file(follow_symlinks=False)
-                    and not entry.is_symlink()
-                    and not _is_reparse_or_link(entry.path)
-                ):
-                    entries.append(entry)
+                if not name.endswith(".md") or name == "README.md":
+                    continue
+                st = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(st.st_mode) or _entry_is_reparse_or_link(entry, st):
+                    continue
+                entry_rows.append((name, entry.path, (st.st_mtime_ns, st.st_ctime_ns, st.st_size)))
     except OSError as exc:
         raise RuntimeError(f"Could not scan atoms directory {atoms_dir}: {exc}") from exc
 
-    entries.sort(key=lambda e: e.name)
-    use_stat_cache = len(entries) > LARGE_VAULT_STAT_CACHE_THRESHOLD
+    entry_rows.sort(key=lambda item: item[0])
+    use_stat_cache = len(entry_rows) > LARGE_VAULT_STAT_CACHE_THRESHOLD
     revisions: list[dict[str, str]] = []
 
     if use_stat_cache:
-        try:
-            sigs = tuple((e.name, *_entry_sig(e)) for e in entries)
-        except OSError as exc:
-            raise RuntimeError(f"Could not stat atoms in {atoms_dir}: {exc}") from exc
+        dir_key = os.path.normcase(abs_dir)
+        sigs = (dir_st.st_mtime_ns, *((name, *esig) for name, _path, esig in entry_rows))
         with _STAT_HASH_LOCK:
-            memo = _DIR_MEMO.get(abs_dir)
+            memo = _DIR_MEMO.get(dir_key)
         if memo is not None and memo[0] == sigs:
             return memo[1]
 
-    for index, entry in enumerate(entries):
-        filename = entry.name
-        abs_path = entry.path
+    for filename, abs_path, sig in entry_rows:
         if use_stat_cache:
-            sig = sigs[index][1:]
+            path_key = os.path.normcase(abs_path)
             with _STAT_HASH_LOCK:
-                cached = _STAT_HASH_CACHE.get(abs_path)
+                cached = _STAT_HASH_CACHE.get(path_key)
             if cached is not None and cached[:3] == sig:
                 revisions.append({"filename": filename, "content_sha256": cached[3]})
                 continue
@@ -120,7 +142,7 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
             with _STAT_HASH_LOCK:
                 if len(_STAT_HASH_CACHE) >= _MAX_STAT_CACHE_ENTRIES:
                     _STAT_HASH_CACHE.clear()
-                _STAT_HASH_CACHE[abs_path] = (*sig, digest)
+                _STAT_HASH_CACHE[path_key] = (*sig, digest)
             revisions.append({"filename": filename, "content_sha256": digest})
         else:
             try:
@@ -134,13 +156,8 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
         with _STAT_HASH_LOCK:
             if len(_DIR_MEMO) > 64:
                 _DIR_MEMO.clear()
-            _DIR_MEMO[abs_dir] = (sigs, revisions)
+            _DIR_MEMO[dir_key] = (sigs, revisions)
     return revisions
-
-
-def _entry_sig(entry: os.DirEntry[str]) -> tuple[int, int, int]:
-    st = entry.stat(follow_symlinks=False)
-    return (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
 
 
 def revisions_fingerprint(revisions: list[dict[str, str]]) -> str:

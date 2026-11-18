@@ -4,14 +4,16 @@
 # ///
 """Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Okapi BM25 Recall.
 
-Creates immutable, content-addressed checkpoints under brain/.sidecar/snapshots/
-recording the exact SHA-256 hashes, claims, evidence, and contexts of all
-owner-approved atoms and playbooks at timestamp T. Supports:
+Creates immutable, content-addressed checkpoints under brain/0-raw/archive/snapshots/
+(with transparent read fallback to legacy brain/.sidecar/snapshots/) recording the
+exact SHA-256 hashes, claims, evidence, and contexts of all owner-approved atoms
+and playbooks at timestamp T using content-addressed SHA-256 blob deduplication
+(schema_version 3). Supports:
   * Semantic diff between any two snapshots (or snapshot vs live vault), including
     atom claim/evidence diffs and playbook step/backing-atom diffs
-  * Point-in-time field-weighted Okapi BM25 + corpus IDF recall ("what did my
-    verified brain know at snapshot T?") with zero leakage from later edits or
-    unapproved drafts.
+  * Point-in-time field-weighted Okapi BM25 + corpus IDF + Porter-stem recall
+    ("what did my verified brain know at snapshot T?") with zero leakage from
+    later edits or unapproved drafts.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import re
 import secrets
 import sys
 import tempfile
+import threading
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from atom_mutator import approved_revision_is_current, content_sha256, review_lock  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown, safe_file_in_dir  # noqa: E402
 from host_adapters import restrict_security_file_permissions  # noqa: E402
-from lexical_store import tokenize  # noqa: E402
+from lexical_store import porter_stem, tokenize  # noqa: E402
 from memory_review import parse_atom_record  # noqa: E402
 from recall import QUERY_STOP_WORDS, normalize_project_tag, project_tags_match  # noqa: E402
 from skill_playbooks import verify_playbook_integrity  # noqa: E402
@@ -46,28 +49,134 @@ _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _BM25_K1 = 1.5
 _BM25_B = 0.75
 
+_BLOB_CACHE_LOCK = threading.Lock()
+_BLOB_MEM_CACHE: dict[str, dict[str, Any]] = {}
+_MAX_BLOB_CACHE = 16_384
+
+# Backward-compatible alias for any callers importing _light_stem
+_light_stem = porter_stem
+
+
+def snapshots_dir(brain_dir: str = BRAIN_DIR) -> Path:
+    return Path(brain_dir) / "0-raw" / "archive" / "snapshots"
+
 
 def _snapshots_dir(brain_dir: str) -> Path:
+    return snapshots_dir(brain_dir)
+
+
+def _legacy_snapshots_dir(brain_dir: str) -> Path:
     return Path(brain_dir) / ".sidecar" / "snapshots"
 
 
-def _light_stem(token: str) -> str:
-    t = token.casefold()
-    if len(t) <= 3:
-        return t
-    if t.endswith("tion") and len(t) >= 6:
-        t = t[:-3]
-    elif t.endswith("ing") and len(t) >= 6:
-        t = t[:-3]
-    elif t.endswith("ed") and len(t) >= 5:
-        t = t[:-2]
-    elif t.endswith("es") and len(t) >= 5:
-        t = t[:-2]
-    elif t.endswith("s") and not t.endswith("ss") and len(t) >= 4:
-        t = t[:-1]
-    if t.endswith("e") and len(t) >= 5:
-        t = t[:-1]
-    return t
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _blob_digest_and_bytes(record_payload: dict[str, Any]) -> tuple[str, bytes]:
+    raw_bytes = _canonical_json(record_payload).encode("utf-8")
+    return hashlib.sha256(raw_bytes).hexdigest(), raw_bytes
+
+
+def _write_blob_if_missing(blobs_root: Path, bhash: str, raw_bytes: bytes, record_payload: dict[str, Any]) -> None:
+    if os.path.lexists(str(blobs_root)) and _is_reparse_or_link(str(blobs_root)):
+        raise PermissionError("Refusing to write snapshot blob through symlinked blobs directory.")
+    shard_dir = blobs_root / bhash[:2]
+    if os.path.lexists(str(shard_dir)) and _is_reparse_or_link(str(shard_dir)):
+        raise PermissionError("Refusing to write snapshot blob through symlinked shard directory.")
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    blob_file = shard_dir / f"{bhash}.json"
+    if os.path.lexists(str(blob_file)):
+        if _is_reparse_or_link(str(blob_file)) or not blob_file.is_file():
+            raise PermissionError(f"Refusing to use symlinked or non-regular snapshot blob: {blob_file}")
+    else:
+        fd, tmp_path = tempfile.mkstemp(dir=str(shard_dir), prefix=".blob-", suffix=".tmp")
+        closed = False
+        try:
+            if os.name != "nt":
+                os.chmod(tmp_path, 0o600)
+            if os.write(fd, raw_bytes) != len(raw_bytes):
+                raise OSError(f"Incomplete snapshot blob write: {blob_file}")
+            os.fsync(fd)
+            os.close(fd)
+            closed = True
+            os.replace(tmp_path, blob_file)
+            restrict_security_file_permissions(blob_file)
+        finally:
+            if not closed:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    with _BLOB_CACHE_LOCK:
+        if len(_BLOB_MEM_CACHE) >= _MAX_BLOB_CACHE:
+            _BLOB_MEM_CACHE.clear()
+        _BLOB_MEM_CACHE[bhash] = json.loads(raw_bytes.decode("utf-8"))
+
+
+def _read_and_verify_blob(
+    bhash: str,
+    *,
+    blobs_roots: tuple[Path, ...],
+    verify_hash: bool = True,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not _HEX64_RE.fullmatch(bhash):
+        return None, f"Invalid blob_sha256 {bhash!r}."
+    blob_file: Path | None = None
+    for root in blobs_roots:
+        if os.path.lexists(str(root)) and _is_reparse_or_link(str(root)):
+            return None, f"Snapshot blobs directory is a symlink or junction: {root}"
+        shard = root / bhash[:2]
+        if os.path.lexists(str(shard)) and _is_reparse_or_link(str(shard)):
+            return None, f"Snapshot blob shard directory is a symlink or junction: {shard}"
+        cand = shard / f"{bhash}.json"
+        if os.path.lexists(str(cand)):
+            if _is_reparse_or_link(str(cand)) or not cand.is_file():
+                return None, f"Snapshot blob {bhash[:12]} is a symlink or non-regular file."
+            blob_file = cand
+            break
+    if blob_file is None:
+        return None, f"Missing snapshot blob {bhash[:12]}."
+
+    if not verify_hash:
+        with _BLOB_CACHE_LOCK:
+            cached = _BLOB_MEM_CACHE.get(bhash)
+        if cached is not None:
+            return json.loads(_canonical_json(cached)), None
+
+    try:
+        raw_bytes = blob_file.read_bytes()
+    except OSError as exc:
+        return None, f"Unreadable snapshot blob {bhash[:12]}: {exc}"
+
+    actual_hash = hashlib.sha256(raw_bytes).hexdigest()
+    if actual_hash != bhash:
+        with _BLOB_CACHE_LOCK:
+            _BLOB_MEM_CACHE.pop(bhash, None)
+        return None, f"Tampered snapshot blob (expected={bhash[:12]}, actual={actual_hash[:12]})."
+
+    with _BLOB_CACHE_LOCK:
+        cached = _BLOB_MEM_CACHE.get(bhash)
+    if cached is not None:
+        return dict(cached), None
+
+    try:
+        parsed = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"Corrupted JSON in snapshot blob {bhash[:12]}: {exc}"
+    if not isinstance(parsed, dict):
+        return None, f"Snapshot blob {bhash[:12]} is not a JSON object."
+
+    with _BLOB_CACHE_LOCK:
+        if len(_BLOB_MEM_CACHE) >= _MAX_BLOB_CACHE:
+            _BLOB_MEM_CACHE.clear()
+        _BLOB_MEM_CACHE[bhash] = parsed
+    return dict(parsed), None
 
 
 def _meaningful_tokens(text: str) -> list[str]:
@@ -193,83 +302,136 @@ def create_snapshot(
     atoms_dir: str = ATOMS_DIR,
     playbooks_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Create an immutable point-in-time snapshot under brain/.sidecar/snapshots/."""
+    """Create an immutable, content-addressed point-in-time snapshot under brain/0-raw/archive/snapshots/."""
     clean_actor = (actor or "").strip()
     if not clean_actor:
         raise ValueError("Snapshot requires a non-empty actor.")
 
     snap_dir = _snapshots_dir(brain_dir)
     snap_dir.mkdir(parents=True, exist_ok=True)
-    if _is_reparse_or_link(str(snap_dir.parent)) or _is_reparse_or_link(str(snap_dir)):
+    if (
+        _is_reparse_or_link(str(Path(brain_dir)))
+        or _is_reparse_or_link(str(snap_dir.parent.parent))
+        or _is_reparse_or_link(str(snap_dir.parent))
+        or _is_reparse_or_link(str(snap_dir))
+    ):
         raise PermissionError("Refusing to write snapshot through a symlink or junction.")
 
-    with review_lock(str(snap_dir.parent / "writer.lock")):
+    lock_file = Path(brain_dir) / ".sidecar" / "writer.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with review_lock(str(lock_file)):
         if _is_reparse_or_link(str(snap_dir.parent)) or _is_reparse_or_link(str(snap_dir)):
             raise PermissionError("Refusing to write snapshot through a symlink or junction.")
         state = _capture_live_state(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
         now = datetime.now(timezone.utc)
         stamp = now.strftime("%Y%m%dT%H%M%SZ")
+        legacy_dir = _legacy_snapshots_dir(brain_dir)
         while True:
             entropy = secrets.token_hex(8)
             nonce = hashlib.sha256(f"{stamp}:{state['merkle_root']}:{label}:{entropy}".encode("utf-8")).hexdigest()[:8]
             snapshot_id = f"snap-{stamp}-{nonce}"
             target = snap_dir / f"{snapshot_id}.json"
-            if not target.exists():
+            if not target.exists() and not (legacy_dir / f"{snapshot_id}.json").exists():
                 break
 
-        doc: dict[str, Any] = {
-            "schema_version": 2,
+        blobs_root = snap_dir / "blobs"
+        atom_refs: dict[str, dict[str, str]] = {}
+        for fname, atom_payload in sorted(state["atoms"].items()):
+            bhash, raw_bytes = _blob_digest_and_bytes(atom_payload)
+            _write_blob_if_missing(blobs_root, bhash, raw_bytes, atom_payload)
+            atom_refs[fname] = {"file_sha256": str(atom_payload["file_sha256"]), "blob_sha256": bhash}
+
+        playbook_refs: dict[str, dict[str, str]] = {}
+        for pb_fname, pb_payload in sorted(state["playbooks"].items()):
+            bhash, raw_bytes = _blob_digest_and_bytes(pb_payload)
+            _write_blob_if_missing(blobs_root, bhash, raw_bytes, pb_payload)
+            playbook_refs[pb_fname] = {"file_sha256": str(pb_payload["file_sha256"]), "blob_sha256": bhash}
+
+        manifest_doc: dict[str, Any] = {
+            "schema_version": 3,
             "snapshot_id": snapshot_id,
             "created_at": now.isoformat(timespec="seconds"),
             "actor": clean_actor,
             "label": (label or "").strip()[:160],
             "merkle_root": state["merkle_root"],
-            "atom_count": len(state["atoms"]),
-            "playbook_count": len(state["playbooks"]),
-            "atoms": state["atoms"],
-            "playbooks": state["playbooks"],
+            "atom_count": len(atom_refs),
+            "playbook_count": len(playbook_refs),
+            "atom_refs": atom_refs,
+            "playbook_refs": playbook_refs,
         }
         fd, tmp_path = tempfile.mkstemp(dir=str(snap_dir), prefix=".snap-", suffix=".tmp")
         try:
-            os.write(fd, json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8"))
+            os.write(fd, json.dumps(manifest_doc, indent=2, ensure_ascii=False).encode("utf-8"))
             os.fsync(fd)
         finally:
             os.close(fd)
         os.replace(tmp_path, target)
         restrict_security_file_permissions(target)
-        return doc
+        return {
+            **manifest_doc,
+            "atoms": state["atoms"],
+            "playbooks": state["playbooks"],
+        }
+
+
+def _candidate_snapshot_dirs(brain_dir: str) -> list[Path]:
+    primary = _snapshots_dir(brain_dir)
+    legacy = _legacy_snapshots_dir(brain_dir)
+    dirs = [primary]
+    if os.path.normcase(os.path.abspath(str(legacy))) != os.path.normcase(os.path.abspath(str(primary))):
+        dirs.append(legacy)
+    return dirs
+
+
+def _blobs_roots_for_brain(brain_dir: str) -> tuple[Path, ...]:
+    return tuple(d / "blobs" for d in _candidate_snapshot_dirs(brain_dir))
 
 
 def list_snapshots(*, brain_dir: str = BRAIN_DIR) -> list[dict[str, Any]]:
-    snap_dir = _snapshots_dir(brain_dir)
-    if not snap_dir.is_dir() or _is_reparse_or_link(str(snap_dir.parent)) or _is_reparse_or_link(str(snap_dir)):
-        return []
+    seen_ids: set[str] = set()
     out: list[dict[str, Any]] = []
-    for entry in sorted(os.scandir(snap_dir), key=lambda e: e.name, reverse=True):
-        if not entry.name.endswith(".json") or _is_reparse_or_link(entry.path):
+    for snap_dir in _candidate_snapshot_dirs(brain_dir):
+        if not snap_dir.is_dir():
             continue
-        try:
-            data = json.loads(Path(entry.path).read_text(encoding="utf-8"))
-            out.append(
-                {
-                    "snapshot_id": data["snapshot_id"],
-                    "created_at": data["created_at"],
-                    "label": data.get("label", ""),
-                    "actor": data.get("actor", ""),
-                    "merkle_root": data.get("merkle_root", ""),
-                    "atom_count": data.get("atom_count", 0),
-                    "playbook_count": data.get("playbook_count", 0),
-                }
-            )
-        except (OSError, json.JSONDecodeError, KeyError):
+        if _is_reparse_or_link(str(snap_dir.parent)) or _is_reparse_or_link(str(snap_dir)):
             continue
+        for entry in sorted(os.scandir(snap_dir), key=lambda e: e.name, reverse=True):
+            if not entry.name.endswith(".json") or _is_reparse_or_link(entry.path) or not entry.is_file(follow_symlinks=False):
+                continue
+            try:
+                data = json.loads(Path(entry.path).read_text(encoding="utf-8"))
+                sid = str(data["snapshot_id"])
+                if sid in seen_ids:
+                    continue
+                seen_ids.add(sid)
+                out.append(
+                    {
+                        "snapshot_id": sid,
+                        "created_at": data["created_at"],
+                        "label": data.get("label", ""),
+                        "actor": data.get("actor", ""),
+                        "merkle_root": data.get("merkle_root", ""),
+                        "atom_count": data.get("atom_count", 0),
+                        "playbook_count": data.get("playbook_count", 0),
+                        "schema_version": data.get("schema_version", 1),
+                    }
+                )
+            except (OSError, json.JSONDecodeError, KeyError):
+                continue
+    out.sort(key=lambda item: (item["created_at"], item["snapshot_id"]), reverse=True)
     return out
 
 
-def _verify_snapshot_doc(data: Any, fallback_id: str = "") -> dict[str, Any]:
+def _hydrate_and_verify_snapshot_doc(
+    data: Any,
+    fallback_id: str = "",
+    *,
+    brain_dir: str = BRAIN_DIR,
+    verify_blobs: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     errors: list[str] = []
     if not isinstance(data, dict):
-        return {
+        rep = {
             "valid": False,
             "snapshot_id": fallback_id,
             "recorded_merkle_root": "",
@@ -278,27 +440,83 @@ def _verify_snapshot_doc(data: Any, fallback_id: str = "") -> dict[str, Any]:
             "playbook_count": 0,
             "errors": ["Snapshot document is not a JSON object."],
         }
+        return {}, rep
+
     snap_id = str(data.get("snapshot_id") or fallback_id)
     recorded_root = str(data.get("merkle_root") or "")
-    atoms = data.get("atoms")
-    playbooks = data.get("playbooks")
-    if not isinstance(atoms, dict):
-        errors.append("Snapshot 'atoms' map is missing or invalid.")
-        atoms = {}
-    if not isinstance(playbooks, dict):
-        errors.append("Snapshot 'playbooks' map is missing or invalid.")
-        playbooks = {}
+    schema_ver = data.get("schema_version", 1)
+    blobs_roots = _blobs_roots_for_brain(brain_dir)
+
+    hydrated_atoms: dict[str, dict[str, Any]] = {}
+    hydrated_playbooks: dict[str, dict[str, Any]] = {}
+
+    if schema_ver == 3 or ("atom_refs" in data or "playbook_refs" in data):
+        atom_refs = data.get("atom_refs")
+        pb_refs = data.get("playbook_refs")
+        if not isinstance(atom_refs, dict):
+            errors.append("Snapshot 'atom_refs' map is missing or invalid.")
+            atom_refs = {}
+        if not isinstance(pb_refs, dict):
+            errors.append("Snapshot 'playbook_refs' map is missing or invalid.")
+            pb_refs = {}
+        for k, ref in sorted(atom_refs.items()):
+            if not isinstance(ref, dict):
+                errors.append(f"Invalid atom_ref entry for 2-atoms/{k}.")
+                continue
+            fhash = str(ref.get("file_sha256") or "")
+            bhash = str(ref.get("blob_sha256") or "")
+            if not _HEX64_RE.fullmatch(fhash):
+                errors.append(f"Invalid atom file_sha256 for 2-atoms/{k}.")
+            blob_obj, blob_err = _read_and_verify_blob(bhash, blobs_roots=blobs_roots, verify_hash=verify_blobs)
+            if blob_err or blob_obj is None:
+                errors.append(f"2-atoms/{k}: {blob_err or 'unreadable blob'}")
+                hydrated_atoms[k] = {"filename": k, "file_sha256": fhash}
+            else:
+                if str(blob_obj.get("file_sha256") or "") != fhash:
+                    errors.append(f"Atom blob file_sha256 mismatch for 2-atoms/{k}.")
+                hydrated_atoms[k] = blob_obj
+        for k, ref in sorted(pb_refs.items()):
+            if not isinstance(ref, dict):
+                errors.append(f"Invalid playbook_ref entry for 5-playbooks/{k}.")
+                continue
+            fhash = str(ref.get("file_sha256") or "")
+            bhash = str(ref.get("blob_sha256") or "")
+            if not _HEX64_RE.fullmatch(fhash):
+                errors.append(f"Invalid playbook file_sha256 for 5-playbooks/{k}.")
+            blob_obj, blob_err = _read_and_verify_blob(bhash, blobs_roots=blobs_roots, verify_hash=verify_blobs)
+            if blob_err or blob_obj is None:
+                errors.append(f"5-playbooks/{k}: {blob_err or 'unreadable blob'}")
+                hydrated_playbooks[k] = {"filename": k, "file_sha256": fhash}
+            else:
+                if str(blob_obj.get("file_sha256") or "") != fhash:
+                    errors.append(f"Playbook blob file_sha256 mismatch for 5-playbooks/{k}.")
+                hydrated_playbooks[k] = blob_obj
+        atom_source_map = atom_refs
+        pb_source_map = pb_refs
+    else:
+        atoms = data.get("atoms")
+        playbooks = data.get("playbooks")
+        if not isinstance(atoms, dict):
+            errors.append("Snapshot 'atoms' map is missing or invalid.")
+            atoms = {}
+        if not isinstance(playbooks, dict):
+            errors.append("Snapshot 'playbooks' map is missing or invalid.")
+            playbooks = {}
+        hydrated_atoms = {k: (dict(v) if isinstance(v, dict) else {}) for k, v in atoms.items()}
+        hydrated_playbooks = {k: (dict(v) if isinstance(v, dict) else {}) for k, v in playbooks.items()}
+        atom_source_map = atoms
+        pb_source_map = playbooks
 
     leaves: list[tuple[str, str]] = []
-    for k, v in atoms.items():
+    for k, v in atom_source_map.items():
         fhash = str(v.get("file_sha256") or "") if isinstance(v, dict) else ""
-        if not _HEX64_RE.fullmatch(fhash):
+        if not _HEX64_RE.fullmatch(fhash) and schema_ver != 3:
             errors.append(f"Invalid atom file_sha256 for 2-atoms/{k}.")
         rel_path = f"2-atoms/{k}"
         leaves.append((rel_path, _leaf_digest(rel_path, fhash)))
-    for k, v in playbooks.items():
+    for k, v in pb_source_map.items():
         fhash = str(v.get("file_sha256") or "") if isinstance(v, dict) else ""
-        if not _HEX64_RE.fullmatch(fhash):
+        if not _HEX64_RE.fullmatch(fhash) and schema_ver != 3:
             errors.append(f"Invalid playbook file_sha256 for 5-playbooks/{k}.")
         rel_path = f"5-playbooks/{k}"
         leaves.append((rel_path, _leaf_digest(rel_path, fhash)))
@@ -311,21 +529,32 @@ def _verify_snapshot_doc(data: Any, fallback_id: str = "") -> dict[str, Any]:
         )
 
     rec_atom_count = data.get("atom_count")
-    if isinstance(rec_atom_count, bool) or not isinstance(rec_atom_count, int) or rec_atom_count != len(atoms):
-        errors.append(f"atom_count mismatch (recorded={rec_atom_count!r}, actual={len(atoms)}).")
+    if isinstance(rec_atom_count, bool) or not isinstance(rec_atom_count, int) or rec_atom_count != len(atom_source_map):
+        errors.append(f"atom_count mismatch (recorded={rec_atom_count!r}, actual={len(atom_source_map)}).")
     rec_pb_count = data.get("playbook_count")
-    if isinstance(rec_pb_count, bool) or not isinstance(rec_pb_count, int) or rec_pb_count != len(playbooks):
-        errors.append(f"playbook_count mismatch (recorded={rec_pb_count!r}, actual={len(playbooks)}).")
+    if isinstance(rec_pb_count, bool) or not isinstance(rec_pb_count, int) or rec_pb_count != len(pb_source_map):
+        errors.append(f"playbook_count mismatch (recorded={rec_pb_count!r}, actual={len(pb_source_map)}).")
 
-    return {
+    hydrated_doc = {
+        **data,
+        "atoms": hydrated_atoms,
+        "playbooks": hydrated_playbooks,
+    }
+    report = {
         "valid": len(errors) == 0,
         "snapshot_id": snap_id,
         "recorded_merkle_root": recorded_root,
         "computed_merkle_root": computed_root,
-        "atom_count": len(atoms),
-        "playbook_count": len(playbooks),
+        "atom_count": len(atom_source_map),
+        "playbook_count": len(pb_source_map),
         "errors": errors,
     }
+    return hydrated_doc, report
+
+
+def _verify_snapshot_doc(data: Any, fallback_id: str = "", *, brain_dir: str = BRAIN_DIR) -> dict[str, Any]:
+    _, rep = _hydrate_and_verify_snapshot_doc(data, fallback_id=fallback_id, brain_dir=brain_dir, verify_blobs=True)
+    return rep
 
 
 def _resolve_snapshot_file(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> tuple[str, str]:
@@ -334,19 +563,23 @@ def _resolve_snapshot_file(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> t
         clean = clean[:-5]
     if not clean or not _SNAP_ID_RE.match(clean):
         raise ValueError(f"Invalid snapshot_id: {snapshot_id!r}")
-    snap_dir = _snapshots_dir(brain_dir)
-    if _is_reparse_or_link(str(snap_dir.parent)) or _is_reparse_or_link(str(snap_dir)):
-        raise PermissionError("Refusing to load snapshot through a symlink or junction.")
-    safe = safe_file_in_dir(str(snap_dir), f"{clean}.json", allowed_exts={".json"}, must_exist=True)
-    if not safe:
-        raise FileNotFoundError(f"Snapshot not found: {clean}")
-    if _is_reparse_or_link(safe):
-        raise PermissionError("Refusing to load snapshot through a symlink or junction.")
-    return clean, safe
+    for snap_dir in _candidate_snapshot_dirs(brain_dir):
+        if os.path.lexists(str(snap_dir.parent)) and _is_reparse_or_link(str(snap_dir.parent)):
+            raise PermissionError("Refusing to load snapshot through a symlink or junction.")
+        if os.path.lexists(str(snap_dir)) and _is_reparse_or_link(str(snap_dir)):
+            raise PermissionError("Refusing to load snapshot through a symlink or junction.")
+        if not snap_dir.is_dir():
+            continue
+        safe = safe_file_in_dir(str(snap_dir), f"{clean}.json", allowed_exts={".json"}, must_exist=True)
+        if safe:
+            if _is_reparse_or_link(safe):
+                raise PermissionError("Refusing to load snapshot through a symlink or junction.")
+            return clean, safe
+    raise FileNotFoundError(f"Snapshot not found: {clean}")
 
 
 def verify_snapshot(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> dict[str, Any]:
-    """Recompute and verify cryptographic Merkle integrity of a saved snapshot."""
+    """Recompute and verify cryptographic Merkle + content-addressed blob integrity of a saved snapshot."""
     clean, safe = _resolve_snapshot_file(snapshot_id, brain_dir=brain_dir)
     try:
         data = json.loads(Path(safe).read_text(encoding="utf-8"))
@@ -360,7 +593,7 @@ def verify_snapshot(snapshot_id: str, *, brain_dir: str = BRAIN_DIR) -> dict[str
             "playbook_count": 0,
             "errors": [f"Unreadable or malformed snapshot JSON: {exc}"],
         }
-    return _verify_snapshot_doc(data, fallback_id=clean)
+    return _verify_snapshot_doc(data, fallback_id=clean, brain_dir=brain_dir)
 
 
 def load_snapshot(
@@ -371,13 +604,17 @@ def load_snapshot(
 ) -> dict[str, Any]:
     clean, safe = _resolve_snapshot_file(snapshot_id, brain_dir=brain_dir)
     data = json.loads(Path(safe).read_text(encoding="utf-8"))
-    if verify_integrity:
-        rep = _verify_snapshot_doc(data, fallback_id=clean)
-        if not rep["valid"]:
-            raise ValueError(
-                f"Snapshot Merkle integrity check failed for {clean}: {'; '.join(rep['errors'])}"
-            )
-    return data
+    hydrated, rep = _hydrate_and_verify_snapshot_doc(
+        data,
+        fallback_id=clean,
+        brain_dir=brain_dir,
+        verify_blobs=verify_integrity,
+    )
+    if verify_integrity and not rep["valid"]:
+        raise ValueError(
+            f"Snapshot Merkle integrity check failed for {clean}: {'; '.join(rep['errors'])}"
+        )
+    return hydrated
 
 
 def _write_export_file_atomic(target: Path, text: str) -> None:
@@ -457,6 +694,8 @@ def export_snapshot(
         safe_card = safe_file_in_dir(str(atoms_out), fname, allowed_exts={".md"}, must_exist=False)
         if not safe_card:
             raise ValueError(f"Unsafe atom filename in snapshot during export: {fname!r}")
+        ep_contract = str(atom.get("epistemic_contract") or "").strip()
+        ctx_list = [str(c) for c in (atom.get("contexts") or []) if str(c).strip()]
         card_lines = [
             "---",
             f"id: {atom.get('atom_id', Path(fname).stem)}",
@@ -464,6 +703,8 @@ def export_snapshot(
             f"file_sha256: {atom.get('file_sha256', '')}",
             f"memory_type: {atom.get('memory_type', '')}",
             f"epistemic_label: {atom.get('epistemic_label', 'claim')}",
+            *([f"epistemic_contract: {ep_contract}"] if ep_contract else []),
+            f"contexts: {json.dumps(ctx_list, ensure_ascii=False)}",
             "---",
             "",
             "## Claim",
@@ -660,8 +901,8 @@ def recall_at_snapshot(
     def _matches_proj(contexts: list[Any]) -> bool:
         if not target:
             return True
-        proj_tags = [str(c).strip() for c in contexts if str(c).strip().lower().startswith("project:")]
-        return bool(proj_tags) and all(bool(project_tags_match((c,), (target,))) for c in proj_tags)
+        clean_ctx = tuple(str(c).strip() for c in contexts if str(c).strip())
+        return bool(project_tags_match(clean_ctx, (target,)))
 
     for fname, atom in sorted(snap.get("atoms", {}).items()):
         if not include_preferences and (

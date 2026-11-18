@@ -205,7 +205,9 @@ class VaultMerkleLedgerTests(Phase5IsolatedTestCase):
             with self.assertRaises(PermissionError):
                 prove_atom_membership("draft.md", brain_dir=str(brain), atoms_dir=str(atoms_dir))
 
-            ledger_file = brain / ".sidecar" / "vault-ledger.jsonl"
+            ledger_file = brain / "0-raw" / "archive" / "vault-ledger.jsonl"
+            self.assertTrue(ledger_file.is_file())
+            self.assertFalse((brain / ".sidecar" / "vault-ledger.jsonl").exists())
             ledger_file.write_text(ledger_file.read_text(encoding="utf-8").replace('"owner"', '"mallory"'), encoding="utf-8")
             bad_ver = verify_vault_ledger(brain_dir=str(brain), atoms_dir=str(atoms_dir))
             self.assertFalse(bad_ver["chain_valid"])
@@ -960,7 +962,7 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
             )
 
             snap_before_pb = create_snapshot(label="before-pb", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
-            self.assertEqual(snap_before_pb["schema_version"], 2)
+            self.assertEqual(snap_before_pb["schema_version"], 3)
 
             proc_atom = _seed_atom(
                 brain,
@@ -1234,6 +1236,518 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
                         headers={"Authorization": f"Bearer {agent_tok}", "Host": f"127.0.0.1:{port}"},
                     )
                     self.assertIn(r_huge_offset.status_code, (200, 422))
+            finally:
+                server.shutdown()
+                server.server_close()
+
+
+class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
+    def test_cli_mcp_token_vault_path_port_discovery_and_readme_argparse_parity(self) -> None:
+        import io
+        import re
+        import shlex
+        from contextlib import redirect_stdout
+        from scripts import cli, config, ide_connector, mcp_server
+        from memory_api import (
+            MemoryApiClient,
+            discover_active_api_port,
+            remove_active_api_port_file,
+            write_active_api_port_file,
+        )
+
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sec_dir = tmp_path / "sec"
+            sec_dir.mkdir(parents=True, exist_ok=True)
+            switched_vault = tmp_path / "custom-vault"
+            switched_vault.mkdir(parents=True, exist_ok=True)
+            (sec_dir / "vault-path.txt").write_text(str(switched_vault) + "\n", encoding="utf-8")
+            mcp_tok_file = sec_dir / "mcp-token"
+            api_port_path = sec_dir / "api-port"
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BRAIN_SECURITY_STATE_DIR": str(sec_dir),
+                    "BRAIN_MCP_TOKEN_FILE": str(mcp_tok_file),
+                    "BRAIN_API_PORT_FILE": str(api_port_path),
+                },
+                clear=False,
+            ):
+                os.environ.pop("BRAIN_VAULT_DIR", None)
+                os.environ.pop("SECOND_BRAIN_PORT", None)
+
+                # 1. Unified vault-path.txt resolution across config, cli, mcp_server, ide_connector
+                self.assertEqual(Path(config.resolve_active_brain_dir()), switched_vault.resolve())
+                vdir, _, _ = cli._resolve_active_vault_paths()
+                self.assertEqual(Path(vdir), switched_vault.resolve())
+                mcp_brain, _, _, _ = mcp_server._effective_mcp_paths()
+                self.assertEqual(Path(mcp_brain), switched_vault.resolve())
+                entry = ide_connector.server_entry("test-token-1234567890")
+                self.assertNotIn("BRAIN_VAULT_DIR", entry["env"])
+
+                # 2. Fix mcp --generate-token & --print-token (no AttributeError on write_token_file)
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc_gen = cli.main(["mcp", "--generate-token"])
+                self.assertEqual(rc_gen, 0)
+                self.assertTrue(mcp_tok_file.is_file())
+                saved_tok = mcp_tok_file.read_text(encoding="utf-8").strip()
+                self.assertGreaterEqual(len(saved_tok), 32)
+                buf2 = io.StringIO()
+                with redirect_stdout(buf2):
+                    rc_print = cli.main(["mcp", "--print-token"])
+                self.assertEqual(rc_print, 0)
+                self.assertEqual(buf2.getvalue().strip(), saved_tok)
+
+                # 3. Port file persistence, PID check, and SDK / CLI adapter-config discovery
+                self.assertEqual(discover_active_api_port(8765), 8765)
+                write_active_api_port_file(51923, port_file=api_port_path)
+                self.assertEqual(discover_active_api_port(8765, port_file=api_port_path), 51923)
+                auto_client = MemoryApiClient(token="x" * 32)
+                self.assertIn(":51923", auto_client.base_url)
+                buf_cfg = io.StringIO()
+                with redirect_stdout(buf_cfg):
+                    self.assertEqual(cli.main(["adapter-config"]), 0)
+                self.assertIn("51923", buf_cfg.getvalue())
+                remove_active_api_port_file(expected_pid=os.getpid(), port_file=api_port_path)
+                self.assertEqual(discover_active_api_port(8765, port_file=api_port_path), 8765)
+
+                # Dead PID in api-port falls back cleanly to 8765
+                api_port_path.write_text(json.dumps({"port": 59999, "pid": 999_999_991}), encoding="utf-8")
+                self.assertEqual(discover_active_api_port(8765, port_file=api_port_path), 8765)
+
+                # 4. Behavioral CLI parity: capture --tags, notes add --title/--body, notes verify --excerpt, import --overwrite-modified
+                with patch.dict(os.environ, {"BRAIN_VAULT_DIR": str(switched_vault)}, clear=False):
+                    self.assertEqual(cli.main(["install"]), 0)
+                    cap_buf = io.StringIO()
+                    with redirect_stdout(cap_buf):
+                        self.assertEqual(
+                            cli.main(
+                                [
+                                    "capture",
+                                    "Idempotent PostgreSQL migration procedures require transactional DDL locks.",
+                                    "--title",
+                                    "PG Migrations",
+                                    "--tags",
+                                    "project:alpha,project:shared,db",
+                                    "--json",
+                                ]
+                            ),
+                            0,
+                        )
+                    cap_doc = json.loads(cap_buf.getvalue())
+                    note_fname = cap_doc["filename"]
+
+                    ver_buf = io.StringIO()
+                    with redirect_stdout(ver_buf):
+                        self.assertEqual(
+                            cli.main(
+                                [
+                                    "notes",
+                                    "verify",
+                                    note_fname,
+                                    "--excerpt",
+                                    "Idempotent PostgreSQL migration procedures require transactional DDL locks.",
+                                    "--actor",
+                                    "cli-owner",
+                                    "--json",
+                                ]
+                            ),
+                            0,
+                        )
+                    ver_doc = json.loads(ver_buf.getvalue())
+                    atom_fname = ver_doc.get("atom_filename") or ver_doc.get("filename")
+                    from memory_review import parse_atom_record
+
+                    atom_rec = parse_atom_record(switched_vault / "2-atoms" / str(atom_fname))
+                    self.assertIn("project:alpha", atom_rec["contexts"])
+                    self.assertIn("project:shared", atom_rec["contexts"])
+
+                    # Add note via --title / --body flags (README syntax)
+                    add_buf = io.StringIO()
+                    with redirect_stdout(add_buf):
+                        self.assertEqual(
+                            cli.main(["notes", "add", "--title", "Flag Note", "--body", "Body via flags.", "--json"]),
+                            0,
+                        )
+                    self.assertEqual(json.loads(add_buf.getvalue())["status"], "saved")
+
+                    # Bulk import --overwrite-modified flag
+                    ext_dir = tmp_path / "obsidian-src"
+                    ext_dir.mkdir()
+                    (ext_dir / "ext.md").write_text("# Ext\n\nVersion one.\n", encoding="utf-8")
+                    self.assertEqual(cli.main(["import", str(ext_dir), "--tags", "project:alpha,imported"]), 0)
+                    imported_note = next((switched_vault / "notes").glob("*ext*.md"))
+                    imported_note.write_text(imported_note.read_text(encoding="utf-8") + "\nLocal edit.\n", encoding="utf-8")
+                    (ext_dir / "ext.md").write_text("# Ext\n\nVersion two.\n", encoding="utf-8")
+                    self.assertEqual(cli.main(["import", str(ext_dir), "--overwrite-modified"]), 0)
+                    self.assertIn("Version two.", imported_note.read_text(encoding="utf-8"))
+
+                # 5. CLI argparse --help smoke check across every `second-brain <subcmd>` documented in README.md
+                readme_text = (root / "README.md").read_text(encoding="utf-8")
+                subcmds_in_readme: set[str] = set()
+                for line in readme_text.splitlines():
+                    m = re.search(r"\bsecond-brain\s+([a-z0-9-]+)", line)
+                    if m:
+                        subcmds_in_readme.add(m.group(1))
+                self.assertGreaterEqual(len(subcmds_in_readme), 15)
+                for subcmd in sorted(subcmds_in_readme):
+                    out_h = io.StringIO()
+                    with self.assertRaises(SystemExit) as cm, redirect_stdout(out_h):
+                        cli.main([subcmd, "--help"])
+                    self.assertEqual(cm.exception.code, 0, f"second-brain {subcmd} --help exited {cm.exception.code}")
+                    _ = shlex
+
+        # Static checks on setup.ps1 / setup.sh / runbooks relocation
+        setup_ps1 = (root / "setup.ps1").read_text(encoding="utf-8")
+        self.assertIn("UseProxy", setup_ps1)
+        self.assertIn("AllowAutoRedirect", setup_ps1)
+        setup_sh = (root / "setup.sh").read_text(encoding="utf-8")
+        self.assertIn("--noproxy", setup_sh)
+        self.assertIn("--max-redirs 0", setup_sh)
+        for rb in ("audit-run.md", "editor-run.md", "refinery-run.md", "scout-run.md", "templates/atom.md", "templates/briefing.md", "templates/thread.md"):
+            self.assertTrue((root / "docs" / "runbooks" / rb).is_file(), f"Missing relocated runbook: {rb}")
+
+    def test_three_store_durability_yaml_frontmatter_feedback_redaction_and_sub15ms_scale(self) -> None:
+        import time
+        import httpx
+        from api_product import ensure_owner_token
+        from atom_mutator import apply_atom_edit, apply_review_transition, content_sha256
+        from cognitive_core import compute_memory_fitness_report, record_atom_feedback, record_retrieval_telemetry
+        from knowledge_graph import build_knowledge_graph
+        from lexical_store import _fts_query, porter_stem, rebuild_lexical_index
+        from memory_api import (
+            MemoryApiClient,
+            MemoryApiRuntimeConfig,
+            MemoryLoopbackHTTPServer,
+            generate_memory_api_token,
+            reset_api_rate_limiter,
+        )
+        from memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list
+        from ollama_utils import generation_candidates
+        from recall import RecallOptions, _load_fitness_signals, search_lexical_memory
+        from skill_playbooks import deprecate_skill_playbook, promote_skill_playbook
+        from time_travel import create_snapshot, export_snapshot, recall_at_snapshot, verify_snapshot
+        from vault_ledger import (
+            GENESIS_HASH,
+            _canonical_json,
+            _sha256_text,
+            commit_ledger_checkpoint,
+            prove_leaf_membership,
+            verify_merkle_proof,
+            verify_vault_ledger,
+        )
+
+        # 1. Spec-compliant YAML/JSON frontmatter & Porter stemmer + FTS stopword slicing
+        self.assertEqual(
+            parse_scalar_list('["alpha, beta", \'it\'\'s: ok\', bare_tag]'),
+            ["alpha, beta", "it's: ok", "bare_tag"],
+        )
+        fm_parsed = parse_frontmatter_values(
+            [
+                'confidence: 0.90 # keep exact trailing zero',
+                'created: 2026-11-16',
+                'tags: ["one, two", "three: four"]',
+                'contexts:',
+                '  - "project:alpha"',
+                "  - 'project:beta'",
+            ]
+        )
+        self.assertEqual(fm_parsed["confidence"], "0.90")
+        self.assertEqual(fm_parsed["created"], "2026-11-16")
+        self.assertEqual(fm_parsed["tags"], ["one, two", "three: four"])
+        self.assertEqual(fm_parsed["contexts"], ["project:alpha", "project:beta"])
+
+        self.assertEqual(porter_stem("nodes"), "node")
+        self.assertEqual(porter_stem("node"), "node")
+        self.assertEqual(porter_stem("idempotency"), porter_stem("idempotent"))
+        long_stop_q = " ".join(["what", "is", "the", "for", "with", "that", "from", "should"] * 5 + ["postgresql"])
+        self.assertEqual(_fts_query(long_stop_q), '"postgresql"')
+
+        # 2. qwen3.6:latest excluded on constrained RAM unless explicitly requested
+        with patch("ollama_utils.installed_model_names", return_value=["qwen2.5-coder:7b", "qwen3.6:latest", "llama3.2:3b"]):
+            with patch("hardware_profile.detect_hardware_profile") as mock_hw:
+                mock_hw.return_value.ram_available_gb = 10.0
+                mock_hw.return_value.vram_gb = 0.0
+                cands_default = generation_candidates("llama3.2:3b")
+                self.assertNotIn("qwen3.6:latest", cands_default)
+                cands_explicit = generation_candidates("qwen3.6:latest")
+                self.assertEqual(cands_explicit[0], "qwen3.6:latest")
+
+        reset_api_rate_limiter()
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms_dir = brain / "2-atoms"
+            pb_dir = brain / "5-playbooks"
+            pb_dir.mkdir(parents=True, exist_ok=True)
+
+            # Seed multi-project procedural atom + preference atom
+            proc_atom = _seed_atom(
+                brain,
+                filename="pg-idempotent.md",
+                claim="PostgreSQL schema migrations must be idempotent across multi-region nodes.",
+                evidence="PostgreSQL schema migrations must be idempotent across multi-region nodes.",
+                project="project:alpha",
+                memory_type="procedural",
+                approve=True,
+            )
+            # Add second project tag ("project:shared") and re-approve
+            edited_txt = proc_atom.read_text(encoding="utf-8").replace(
+                "  - project:alpha\n", "  - project:alpha\n  - project:shared\n"
+            )
+            apply_atom_edit(
+                atom_path=str(proc_atom),
+                expected_sha256=content_sha256(proc_atom.read_bytes()),
+                edited_content=edited_txt,
+                actor="owner",
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+            )
+            apply_review_transition(
+                action="approve",
+                atom_path=str(proc_atom),
+                expected_sha256=content_sha256(proc_atom.read_bytes()),
+                actor="owner",
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+            )
+
+            rec_parsed = parse_atom_record(proc_atom)
+            self.assertIn("PostgreSQL", rec_parsed["evidence"])
+
+            # Multi-project scope works across recall, knowledge_graph, and time_travel
+            lex_db = str(brain / ".sidecar" / "lexical.sqlite3")
+            rebuild_lexical_index(str(atoms_dir), lex_db)
+            # Single-term & stem recall ("PostgreSQL", "idempotency")
+            one_term_hits, _ = search_lexical_memory(
+                "PostgreSQL",
+                RecallOptions(n_results=5, projects=("project:alpha",)),
+                atoms_dir=str(atoms_dir),
+                index_path=lex_db,
+            )
+            self.assertEqual([h.filename for h in one_term_hits], ["pg-idempotent.md"])
+            kg_alpha = build_knowledge_graph(brain_dir=str(brain), atoms_dir=str(atoms_dir), project_scope="project:alpha")
+            self.assertEqual([n["filename"] for n in kg_alpha["nodes"]], ["pg-idempotent.md"])
+
+            # Promote playbook & prove BOTH atom and playbook leaves; migrate legacy .sidecar ledger
+            promote_skill_playbook(
+                playbook_id="pg-migration-pb",
+                title="PG Migration Playbook",
+                backing_atoms=[("pg-idempotent.md", content_sha256(proc_atom.read_bytes()))],
+                trigger="Running PostgreSQL DDL",
+                preconditions=["Backup verified"],
+                steps=["PostgreSQL schema migrations must be idempotent across multi-region nodes."],
+                expected_outputs=["Zero lock timeouts"],
+                failure_recovery=["Rollback tx"],
+                actor="owner",
+                rationale="goal1 test",
+                allow_early_owner_override=True,
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                playbooks_dir=str(pb_dir),
+                telemetry_db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
+            )
+            pb_proof = prove_leaf_membership("5-playbooks/pg-migration-pb.md", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+            self.assertTrue(verify_merkle_proof(pb_proof))
+
+            legacy_ledger = brain / ".sidecar" / "vault-ledger.jsonl"
+            legacy_entry = {
+                "schema_version": 1,
+                "seq": 1,
+                "timestamp": "2026-11-16T00:00:00+00:00",
+                "actor": "owner",
+                "note": "legacy",
+                "prev_entry_sha256": GENESIS_HASH,
+                "merkle_root": pb_proof["merkle_root"],
+                "leaf_count": 2,
+                "approved_atoms": 1,
+                "accepted_playbooks": 1,
+            }
+            legacy_entry["entry_sha256"] = _sha256_text(_canonical_json(legacy_entry))
+            legacy_ledger.write_text(_canonical_json(legacy_entry) + "\n", encoding="utf-8")
+            self.assertTrue(verify_vault_ledger(brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))["chain_valid"])
+            cp2 = commit_ledger_checkpoint(brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir), actor="owner", note="migrated")
+            self.assertEqual(cp2["seq"], 2)
+            self.assertTrue((brain / "0-raw" / "archive" / "vault-ledger.jsonl").is_file())
+            self.assertFalse(legacy_ledger.exists())
+
+            # Content-addressed O(changed) snapshots + blob tamper check + Porter BM25 ("node" matches "nodes")
+            s1 = create_snapshot(label="s1", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+            s2 = create_snapshot(label="s2", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+            blobs_dir = brain / "0-raw" / "archive" / "snapshots" / "blobs"
+            blob_files = list(blobs_dir.rglob("*.json"))
+            self.assertEqual(len(blob_files), 2)  # 1 atom + 1 playbook deduplicated across 2 snapshots!
+            on_disk_s1 = json.loads((brain / "0-raw" / "archive" / "snapshots" / f"{s1['snapshot_id']}.json").read_text(encoding="utf-8"))
+            self.assertNotIn("atoms", on_disk_s1)
+            self.assertIn("atom_refs", on_disk_s1)
+            porter_hit = recall_at_snapshot("node", s1["snapshot_id"], project_scope="project:alpha", brain_dir=str(brain))
+            self.assertEqual(porter_hit["results"][0]["filename"], "pg-idempotent.md")
+            exp_dir = Path(tmp) / "exported-snap"
+            exp_res = export_snapshot(s1["snapshot_id"], str(exp_dir), brain_dir=str(brain))
+            self.assertEqual(exp_res["atom_count"], 1)
+
+            # Feedback durability (actor, note, supersession vs correction, no ret_hits*0.5, survives telemetry DB deletion)
+            tel_db = str(brain / ".sidecar" / "telemetry.sqlite3")
+            record_retrieval_telemetry(["pg-idempotent.md"] * 10, db_path=tel_db)
+            record_atom_feedback("pg-idempotent.md", helpful=True, actor="alice", note="solid rule", db_path=tel_db, brain_dir=str(brain))
+            record_atom_feedback("pg-idempotent.md", helpful=False, actor="alice", note="replaced", feedback_kind="supersession", db_path=tel_db, brain_dir=str(brain))
+            fit1 = compute_memory_fitness_report(atoms_dir=str(atoms_dir), brain_dir=str(brain), db_path=tel_db)
+            row1 = next(x for x in fit1["high_utility_verified_atoms"] if x["atom_id"] == "pg-idempotent.md")
+            self.assertEqual(row1["corrections"], 0)
+            self.assertEqual(row1["utility_score"], 1.5)  # pos_fb * 1.5 only (zero ret_hits inflation!)
+            os.remove(tel_db)
+            fit2 = compute_memory_fitness_report(atoms_dir=str(atoms_dir), brain_dir=str(brain), db_path=tel_db)
+            row2 = next(x for x in fit2["high_utility_verified_atoms"] if x["atom_id"] == "pg-idempotent.md")
+            self.assertEqual(row2["positive_feedback"], 1)
+            sig = _load_fitness_signals("pg-idempotent.md", tel_db, brain_dir=str(brain))
+            self.assertEqual(sig["positive_feedback"], 1)
+
+            # Edit v1 -> v2 (new SHA-256) & deprecate playbook, then test non-owner v1 redaction + audit_sources API + 250-atom <15ms SLO
+            v1_atom = _seed_atom(
+                brain,
+                filename="rotating-secret.md",
+                claim="Legacy v1 token lifetime is 99 hours.",
+                evidence="Legacy v1 token lifetime is 99 hours.",
+                project="project:alpha",
+                approve=True,
+            )
+            snap_v1 = create_snapshot(label="v1", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+            # Update source + atom to v2 and re-approve
+            (brain / "0-raw" / "src-rotating-secret.md").write_text("Primary record: Updated v2 token lifetime is 12 hours.\n", encoding="utf-8")
+            v2_doc = v1_atom.read_text(encoding="utf-8").replace("Legacy v1 token lifetime is 99 hours.", "Updated v2 token lifetime is 12 hours.")
+            apply_atom_edit(atom_path=str(v1_atom), expected_sha256=content_sha256(v1_atom.read_bytes()), edited_content=v2_doc, actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            apply_review_transition(action="approve", atom_path=str(v1_atom), expected_sha256=content_sha256(v1_atom.read_bytes()), actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            deprecate_skill_playbook(
+                "pg-migration-pb.md",
+                expected_sha256=content_sha256((pb_dir / "pg-migration-pb.md").read_bytes()),
+                actor="owner",
+                rationale="deprecated for v2",
+                brain_dir=str(brain),
+                playbooks_dir=str(pb_dir),
+            )
+            snap_v2 = create_snapshot(label="v2", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
+
+            # Seed 220 synthetic approved atoms for sub-15ms recall & fast paginated GET /v1/atoms check
+            bulk_src = brain / "0-raw" / "bulk-src.md"
+            bulk_lines = [f"Synthetic rule {i:03d}: partition shard_{i:03d} uses deterministic quorum writes." for i in range(220)]
+            bulk_src.write_text("\n".join(bulk_lines) + "\n", encoding="utf-8")
+            from evidence import find_evidence_anchor
+
+            dlog_path = brain / "0-raw" / "archive" / "decision-record.jsonl"
+            dlog_records = []
+            for i, claim_line in enumerate(bulk_lines):
+                fn = f"synth-{i:03d}.md"
+                draft = (
+                    f"---\nid: synth-{i:03d}\ntype: atom\nmemory_type: semantic\nepistemic_label: claim\n"
+                    f"sources:\n  - 0-raw/bulk-src.md\ncontexts:\n  - project:alpha\n"
+                    f"claim_state: human_reviewed\nreview_status: accepted\ncitation_integrity: anchored\n---\n\n"
+                    f"## Claim\n{claim_line}\n\n## Evidence\n{claim_line}\n"
+                )
+                anc = find_evidence_anchor(draft, str(brain))
+                parts = draft.split("---", 2)
+                fm_full = parts[1] + "".join(f"{k}: {v}\n" for k, v in anc.items())
+                full_bytes = f"---{fm_full}---{parts[2]}".encode("utf-8")
+                (atoms_dir / fn).write_bytes(full_bytes)
+                dlog_records.append(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "action": "approve",
+                            "actor": "owner",
+                            "atom_filename": fn,
+                            "content_sha256_after": content_sha256(full_bytes),
+                        }
+                    )
+                )
+            with open(dlog_path, "a", encoding="utf-8") as fh:
+                fh.write("\n".join(dlog_records) + "\n")
+            from atom_mutator import invalidate_decision_log_cache
+
+            invalidate_decision_log_cache()
+            rebuild_lexical_index(str(atoms_dir), lex_db)
+
+            # Warm once, then measure 20 lexical recall queries over 220+ approved atoms (P95 <= 15 ms)
+            search_lexical_memory("shard_010 quorum writes", RecallOptions(n_results=5), atoms_dir=str(atoms_dir), index_path=lex_db)
+            latencies_ms = []
+            for i in range(20):
+                t0 = time.perf_counter()
+                hits, _ = search_lexical_memory(
+                    f"shard_{i * 10:03d} quorum writes",
+                    RecallOptions(n_results=5),
+                    atoms_dir=str(atoms_dir),
+                    index_path=lex_db,
+                )
+                latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+                self.assertTrue(any(h.filename == f"synth-{i * 10:03d}.md" for h in hits))
+            p95_ms = sorted(latencies_ms)[int(0.95 * (len(latencies_ms) - 1))]
+            self.assertLessEqual(p95_ms, 15.0, f"220-atom lexical P95 {p95_ms:.2f}ms exceeded 15ms SLO")
+
+            tok_path = Path(tmp) / "api-token"
+            own_path = Path(tmp) / "owner-token"
+            agent_tok, _ = generate_memory_api_token(tok_path)
+            owner_tok = ensure_owner_token(own_path)
+            rt = MemoryApiRuntimeConfig(
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+                inbox_dir=str(brain / "0-raw" / "inbox"),
+                experiences_dir=str(brain / "4-experiences"),
+                playbooks_dir=str(pb_dir),
+                lexical_index_path=lex_db,
+                chroma_path=str(brain / ".chroma"),
+                telemetry_db_path=tel_db,
+                token_path=tok_path,
+                owner_token_path=own_path,
+                policy_path=Path(tmp) / "policy.json",
+            )
+            server = MemoryLoopbackHTTPServer("127.0.0.1", 0, rt)
+            self.assertTrue(hasattr(server, "_worker_pool"))
+            self.assertTrue(hasattr(server, "_stream_slots"))
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            try:
+                sdk_agent = MemoryApiClient(port=port, token=agent_tok)
+                sdk_owner = MemoryApiClient(port=port, token=agent_tok, owner_token=owner_tok)
+
+                # Non-owner snapshot recall & diff MUST NOT leak historical v1 claim/evidence or deprecated playbook steps!
+                self.assertEqual(sdk_agent.recall_snapshot("Legacy v1 token lifetime", snap_v1["snapshot_id"])["results"], [])
+                self.assertEqual(sdk_agent.recall_snapshot("PG Migration Playbook", snap_v1["snapshot_id"])["results"], [])
+                ag_diff = sdk_agent.diff_snapshots(snap_v1["snapshot_id"], snap_v2["snapshot_id"])
+                mod_entry = next(m for m in ag_diff["modified_atoms"] if m["filename"] == "rotating-secret.md")
+                self.assertEqual(mod_entry["old_claim"], "")
+                self.assertEqual(mod_entry.get("old_evidence", ""), "")
+                pb_rem = ag_diff["playbook_changes"]["removed"][0]
+                self.assertEqual(pb_rem["steps"], [])
+                self.assertTrue(pb_rem.get("redacted_revoked"))
+
+                # Owner sees full historical v1 -> v2 diff
+                own_diff = sdk_owner.diff_snapshots(snap_v1["snapshot_id"], snap_v2["snapshot_id"])
+                own_mod = next(m for m in own_diff["modified_atoms"] if m["filename"] == "rotating-secret.md")
+                self.assertIn("99 hours", own_mod["old_claim"])
+
+                # Fast paginated GET /v1/atoms
+                page = sdk_agent.list_atoms(limit=20, offset=10)
+                self.assertEqual(len(page["items"]), 20)
+                self.assertGreaterEqual(page["total"], 220)
+
+                # Corrupt source file -> /v1/audit/sources stale_count == 1 -> demote-stale demoted_count == 1
+                (brain / "0-raw" / "src-rotating-secret.md").write_text("CORRUPTED ON DISK\n", encoding="utf-8")
+                audit_before = sdk_owner.audit_sources()
+                self.assertEqual(audit_before["stale_count"], 1)
+                with httpx.Client(trust_env=False, timeout=10) as raw_c:
+                    r_demote = raw_c.post(
+                        f"http://127.0.0.1:{port}/v1/audit/sources/demote-stale",
+                        headers={"Authorization": f"Bearer {agent_tok}", "X-Owner-Token": owner_tok, "Host": f"127.0.0.1:{port}"},
+                        json={"actor": "owner"},
+                    )
+                    self.assertEqual(r_demote.status_code, 200)
+                    self.assertEqual(r_demote.json()["demoted_count"], 1)
+
+                # Blob tamper fails verify_snapshot cleanly
+                blob_files[0].write_text('{"tampered": true}', encoding="utf-8")
+                self.assertFalse(verify_snapshot(s1["snapshot_id"], brain_dir=str(brain))["valid"])
             finally:
                 server.shutdown()
                 server.server_close()

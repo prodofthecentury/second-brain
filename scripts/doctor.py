@@ -361,7 +361,7 @@ def run_checks() -> list[tuple[str, str, str]]:
                 )
             )
         else:
-            checks.append(fail("vault ledger", f"Tamper or hash-chain error: {ledger_status.get('issues')}"))
+            checks.append(fail("vault ledger", f"Tamper or hash-chain error: {ledger_status.get('errors')}"))
     except Exception as exc:
         checks.append(warn("vault ledger", f"Could not verify vault ledger: {exc}"))
 

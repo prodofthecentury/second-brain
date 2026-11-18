@@ -15,7 +15,7 @@ const os = require("os");
 const net = require("net");
 const http = require("http");
 const { fileURLToPath } = require("url");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 const IS_SMOKE_TEST = process.argv.includes("--smoke-test");
 const isSmokeTest = IS_SMOKE_TEST;
@@ -50,6 +50,10 @@ function getBackendRoot() {
 }
 
 function getSecurityDir() {
+  const explicit = (process.env.BRAIN_SECURITY_STATE_DIR || "").trim();
+  if (explicit) {
+    return path.resolve(explicit);
+  }
   if (process.platform === "win32") {
     const localAppData =
       process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
@@ -58,6 +62,137 @@ function getSecurityDir() {
   const stateHome =
     process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
   return path.join(stateHome, "SecondBrain", "security");
+}
+
+function getApiPortFilePath() {
+  const explicit = (process.env.BRAIN_API_PORT_FILE || "").trim();
+  if (explicit) {
+    return path.resolve(explicit);
+  }
+  return path.join(getSecurityDir(), "api-port");
+}
+
+function restrictWindowsSecurityAcl(targetPath, isDir = false) {
+  if (process.platform !== "win32") return;
+  try {
+    const sysRoot = process.env.SystemRoot || "C:\\Windows";
+    const icaclsExe = path.join(sysRoot, "System32", "icacls.exe");
+    if (!fs.existsSync(icaclsExe)) return;
+    const principal =
+      process.env.USERDOMAIN && process.env.USERNAME
+        ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`
+        : (process.env.USERNAME || "").trim();
+    if (!principal) return;
+    const grants = isDir
+      ? [
+          "*S-1-5-18:(OI)(CI)(F)",
+          "*S-1-5-32-544:(OI)(CI)(F)",
+          `${principal}:(OI)(CI)(F)`,
+        ]
+      : ["*S-1-5-18:(F)", "*S-1-5-32-544:(F)", `${principal}:(F)`];
+    spawnSync(icaclsExe, [targetPath, "/inheritance:r", "/grant:r", ...grants], {
+      windowsHide: true,
+      stdio: "ignore",
+      timeout: 4000,
+    });
+  } catch {}
+}
+
+function writeSecurityFileAtomic(filePath, content) {
+  const secDir = path.dirname(filePath);
+  fs.mkdirSync(secDir, { recursive: true, mode: 0o700 });
+  if (fs.lstatSync(secDir).isSymbolicLink()) {
+    throw new Error(
+      `Refusing to write ${path.basename(filePath)} under a symlinked security directory.`
+    );
+  }
+  if (fs.existsSync(filePath) && fs.lstatSync(filePath).isSymbolicLink()) {
+    throw new Error(
+      `Refusing to write ${path.basename(filePath)} through a symlink.`
+    );
+  }
+  if (process.platform !== "win32") {
+    try {
+      fs.chmodSync(secDir, 0o700);
+    } catch {}
+  } else if (path.basename(secDir).toLowerCase() === "security") {
+    restrictWindowsSecurityAcl(secDir, true);
+  }
+  const tmpPath = path.join(
+    secDir,
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`
+  );
+  if (fs.existsSync(tmpPath) && fs.lstatSync(tmpPath).isSymbolicLink()) {
+    throw new Error("Refusing to write temporary security file through a symlink.");
+  }
+  const fd = fs.openSync(
+    tmpPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+    0o600
+  );
+  let closed = false;
+  try {
+    fs.writeFileSync(fd, content, "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    closed = true;
+    fs.renameSync(tmpPath, filePath);
+    if (process.platform !== "win32") {
+      try {
+        fs.chmodSync(filePath, 0o600);
+      } catch {}
+    } else {
+      restrictWindowsSecurityAcl(filePath, false);
+    }
+  } finally {
+    if (!closed) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+    if (fs.existsSync(tmpPath)) {
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {}
+    }
+  }
+}
+
+function writeApiPortFile(port, pid) {
+  if (!port || port <= 0) return;
+  try {
+    const payload =
+      JSON.stringify({
+        port: Number(port),
+        host: "127.0.0.1",
+        pid: pid || null,
+        started_at: new Date().toISOString(),
+      }) + "\n";
+    writeSecurityFileAtomic(getApiPortFilePath(), payload);
+  } catch {}
+}
+
+function removeApiPortFile(expectedPid = null) {
+  const portFile = getApiPortFilePath();
+  try {
+    const parentStat = fs.lstatSync(path.dirname(portFile));
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) return;
+    if (!fs.existsSync(portFile)) return;
+    const st = fs.lstatSync(portFile);
+    if (!st.isFile() || st.isSymbolicLink()) return;
+    if (expectedPid !== null && expectedPid !== undefined) {
+      try {
+        const raw = fs.readFileSync(portFile, "utf8").trim();
+        if (raw.startsWith("{")) {
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.pid && Number(parsed.pid) !== Number(expectedPid)) {
+            return;
+          }
+        }
+      } catch {}
+    }
+    fs.unlinkSync(portFile);
+  } catch {}
 }
 
 function readSafeSecurityFile(filePath, maxBytes = 4096) {
@@ -147,7 +282,7 @@ function getVaultPointerPath() {
 function resolveConfiguredVaultPointer() {
   const pointerFile = getVaultPointerPath();
   const raw = readSafeSecurityFile(pointerFile, 4096);
-  if (!raw) return "";
+  if (!raw || /[\0\r\n]/.test(raw)) return "";
   try {
     const resolved = path.resolve(raw);
     if (fs.existsSync(resolved)) {
@@ -166,15 +301,12 @@ function getVaultDir() {
   if (activeVaultOverride) {
     return activeVaultOverride;
   }
-  if (IS_SMOKE_TEST && EXPLICIT_ENV_VAULT_DIR) {
+  if (EXPLICIT_ENV_VAULT_DIR) {
     return path.resolve(EXPLICIT_ENV_VAULT_DIR);
   }
   if (!IS_SMOKE_TEST) {
     const configured = resolveConfiguredVaultPointer();
     if (configured) return configured;
-  }
-  if (EXPLICIT_ENV_VAULT_DIR) {
-    return path.resolve(EXPLICIT_ENV_VAULT_DIR);
   }
   if (app.isPackaged) {
     return getDefaultPackagedVaultDir();
@@ -272,6 +404,7 @@ function buildBackendEnv() {
 
 function killProcessTree(proc) {
   apiReady = false;
+  removeApiPortFile(proc && proc.pid ? proc.pid : null);
   if (!proc) return Promise.resolve();
 
   return new Promise((resolve) => {
@@ -499,6 +632,7 @@ function spawnMemoryApiOnce(requestedPort) {
       }
       apiPort = boundPort;
       apiReady = true;
+      writeApiPortFile(apiPort, proc.pid);
       refreshTrayMenu();
       emitBackendStatus(
         "ready",
@@ -544,6 +678,7 @@ function spawnMemoryApiOnce(requestedPort) {
       if (apiProcess === proc) {
         apiReady = false;
         apiProcess = null;
+        removeApiPortFile(proc.pid);
       }
       refreshTrayMenu();
       const detail = stderrTail.trim()
@@ -614,6 +749,7 @@ async function stopApiSidecar() {
     apiProcess = null;
     await killProcessTree(proc);
   }
+  removeApiPortFile(null);
   apiPort = Number(process.env.SECOND_BRAIN_PORT || 0);
   refreshTrayMenu();
   if (!isQuitting) {
@@ -641,18 +777,7 @@ async function chooseVaultDirectory() {
     );
   }
   const pointerFile = getVaultPointerPath();
-  const secDir = path.dirname(pointerFile);
-  fs.mkdirSync(secDir, { recursive: true, mode: 0o700 });
-  if (fs.lstatSync(secDir).isSymbolicLink()) {
-    throw new Error("Refusing to write vault-path.txt under a symlinked security directory.");
-  }
-  if (fs.existsSync(pointerFile) && fs.lstatSync(pointerFile).isSymbolicLink()) {
-    throw new Error("Refusing to write vault-path.txt through a symlink.");
-  }
-  fs.writeFileSync(pointerFile, `${vaultDir}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
+  writeSecurityFileAtomic(pointerFile, `${vaultDir}\n`);
   activeVaultOverride = vaultDir;
 
   await stopApiServer();

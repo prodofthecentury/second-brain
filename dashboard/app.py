@@ -27,7 +27,6 @@ import re
 import html
 import json
 import inspect
-import datetime
 import subprocess
 import glob
 import hashlib
@@ -47,11 +46,13 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts"))
 from scripts.config import (
     BRAIN_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, PLAYBOOKS_DIR, NOTES_DIR,
     RAW_DIR, INBOX_DIR, SOURCES_DIR, BRIEFINGS_DIR, SIDECAR_DIR,
+    CHROMA_PATH, LEXICAL_INDEX_PATH, TELEMETRY_DB_PATH,
     GEN_MODEL, READING_LIST,
     _WINDOWS_RESERVED_STEMS, _is_reparse_or_link,
-    ensure_dirs, read_house_rules, today, now_slug,
+    ensure_dirs, today, now_slug,
     is_content_markdown,
-    normalize_markdown_filename, safe_file_in_dir
+    normalize_markdown_filename, resolve_active_brain_dir,
+    safe_file_in_dir, vault_paths_for,
 )
 from scripts.recall import (
     RecallOptions,
@@ -61,11 +62,8 @@ from scripts.recall import (
     suggest_duplicate_atoms,
 )
 from scripts.answer_policy import (
-    ANSWER_DRAFT_SCHEMA,
     AnswerRequest,
-    NO_APPROVED_MEMORY_RESPONSE,
     answer_from_memory,
-    build_grounding_prompt,
     validate_standard_answer,
 )
 from scripts.atom_mutator import apply_atom_edit, apply_atom_merge
@@ -81,9 +79,6 @@ import scripts.host_adapters as _host_adapters_mod
 from scripts.host_adapters import (
     HostConsentError,
     HostSharingRule,
-    _audit_outbound_call,
-    _redact_outbound_with_map,
-    _rehydrate_draft_claims,
     filter_atoms_for_host,
     generate_grounded_answer_via_host,
     load_host_policies,
@@ -100,7 +95,6 @@ from scripts.cognitive_core import (
     save_experience_record,
 )
 from scripts.skill_playbooks import (
-    PlaybookValidationError,
     deprecate_skill_playbook,
     inspect_skill_candidates,
     list_playbooks,
@@ -112,6 +106,7 @@ from scripts.executive_planner import (
 )
 from scripts.notes_store import (
     NoteError,
+    NotePaths,
     backlinks,
     create_note,
     delete_note,
@@ -143,8 +138,6 @@ from scripts.time_travel import (
     list_snapshots,
     recall_at_snapshot,
 )
-
-ensure_dirs()
 
 # ─── Page Settings & Styling ──────────────────────────────────────────────────
 st.set_page_config(
@@ -245,6 +238,33 @@ st.markdown("""
 
 # ─── Data & Helpers ───────────────────────────────────────────────────────────
 
+_ACTIVE_VAULT_PATHS = vault_paths_for(resolve_active_brain_dir())
+BRAIN_DIR = _ACTIVE_VAULT_PATHS["brain_dir"]
+RAW_DIR = _ACTIVE_VAULT_PATHS["raw_dir"]
+INBOX_DIR = _ACTIVE_VAULT_PATHS["inbox_dir"]
+ATOMS_DIR = _ACTIVE_VAULT_PATHS["atoms_dir"]
+THREADS_DIR = _ACTIVE_VAULT_PATHS["threads_dir"]
+EXPERIENCES_DIR = _ACTIVE_VAULT_PATHS["experiences_dir"]
+PLAYBOOKS_DIR = _ACTIVE_VAULT_PATHS["playbooks_dir"]
+SOURCES_DIR = _ACTIVE_VAULT_PATHS["sources_dir"]
+BRIEFINGS_DIR = _ACTIVE_VAULT_PATHS["briefings_dir"]
+NOTES_DIR = _ACTIVE_VAULT_PATHS["notes_dir"]
+SIDECAR_DIR = _ACTIVE_VAULT_PATHS["sidecar_dir"]
+CHROMA_PATH = _ACTIVE_VAULT_PATHS["chroma_path"]
+LEXICAL_INDEX_PATH = _ACTIVE_VAULT_PATHS["lexical_index_path"]
+TELEMETRY_DB_PATH = _ACTIVE_VAULT_PATHS["telemetry_db_path"]
+READING_LIST = os.path.join(RAW_DIR, "reading-list.md")
+HOUSE_RULES = os.path.join(BRAIN_DIR, "house-rules.md")
+ACTIVE_NOTE_PATHS = NotePaths.for_brain(BRAIN_DIR)
+ensure_dirs(BRAIN_DIR)
+
+
+def read_house_rules() -> str:
+    if not os.path.isfile(HOUSE_RULES) or _is_reparse_or_link(HOUSE_RULES):
+        return ""
+    with open(HOUSE_RULES, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
 def get_counts():
     """Counts files in each vault directory."""
     counts = {
@@ -286,13 +306,15 @@ def run_script_process(script_rel_path, extra_args=[]):
     try:
         script_abs = os.path.join(PROJECT_ROOT, script_rel_path)
         cmd = [sys.executable, script_abs] + list(extra_args)
+        child_env = {**os.environ, "BRAIN_VAULT_DIR": BRAIN_DIR}
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            cwd=PROJECT_ROOT
+            cwd=PROJECT_ROOT,
+            env=child_env,
         )
         return process
     except Exception as e:
@@ -332,28 +354,6 @@ def make_slug(text: str, max_len: int = 60) -> str:
     if slug.split(".", 1)[0].lower() in _WINDOWS_RESERVED_STEMS:
         slug = f"capture-{slug}"
     return slug
-
-def _stream_local_ollama_chat(*, endpoint_url: str, model: str, messages: list[dict], schema: dict):
-    chat_attr = getattr(ollama, "chat", None)
-    client_attr = getattr(ollama, "Client", None)
-    if (
-        chat_attr is not None
-        and not getattr(chat_attr, "__module__", "ollama").startswith("ollama")
-        and getattr(client_attr, "__module__", "ollama").startswith("ollama")
-    ):
-        return chat_attr(
-            model=model,
-            messages=messages,
-            format=schema,
-            stream=True,
-        )
-    client = ollama.Client(host=endpoint_url, follow_redirects=False, trust_env=False)
-    return client.chat(
-        model=model,
-        messages=messages,
-        format=schema,
-        stream=True,
-    )
 
 def get_ollama_model_names() -> list[str]:
     try:
@@ -470,10 +470,10 @@ def _list_notes_filtered(*, query: str = "", tag: str = "", limit: int = 25, off
     clean_tag = tag.strip()
     sig = inspect.signature(list_notes)
     if "tag" in sig.parameters:
-        return list_notes(query=query, tag=clean_tag or None, limit=limit, offset=offset)
+        return list_notes(query=query, tag=clean_tag or None, limit=limit, offset=offset, paths=ACTIVE_NOTE_PATHS)
     if not clean_tag:
-        return list_notes(query=query, limit=limit, offset=offset)
-    all_items, _ = list_notes(query=query, limit=2000, offset=0)
+        return list_notes(query=query, limit=limit, offset=offset, paths=ACTIVE_NOTE_PATHS)
+    all_items, _ = list_notes(query=query, limit=2000, offset=0, paths=ACTIVE_NOTE_PATHS)
     want = clean_tag.casefold()
     filtered = [rec for rec in all_items if any(t.casefold() == want for t in rec.tags)]
     return filtered[offset : offset + limit], len(filtered)
@@ -595,7 +595,11 @@ def search_memory(
                 retrieval_mode=retrieval_mode,
                 enable_fitness_boost=enable_fitness_boost,
                 active_context_profile=tuple(active_context_profile),
+                telemetry_db_path=TELEMETRY_DB_PATH,
             ),
+            atoms_dir=ATOMS_DIR,
+            index_path=LEXICAL_INDEX_PATH,
+            chroma_path=CHROMA_PATH,
         )
     except Exception as e:
         st.error(f"Recall Error: {e}")
@@ -620,6 +624,8 @@ def build_network_graph(
 ):
     G = nx.Graph()
     kg = build_knowledge_graph(
+        brain_dir=BRAIN_DIR,
+        atoms_dir=ATOMS_DIR,
         project_scope=(project_scope or "").strip() or None,
         include_pending=include_pending,
     )
@@ -663,6 +669,8 @@ def build_network_graph(
 
     # OverlayContradiction / contested edges if detected among visible nodes
     radar = detect_contradictions(
+        brain_dir=BRAIN_DIR,
+        atoms_dir=ATOMS_DIR,
         project_scope=(project_scope or "").strip() or None,
         include_pending=include_pending,
     )
@@ -1157,7 +1165,12 @@ if nav_selection == "💬 Chat with Memory":
                 for ev in chat_events(
                     user_prompt,
                     mode=selected_chat_mode,
-                    paths=ChatPaths(),
+                    paths=ChatPaths(
+                        brain_dir=BRAIN_DIR,
+                        atoms_dir=ATOMS_DIR,
+                        lexical_index_path=LEXICAL_INDEX_PATH,
+                        chroma_path=CHROMA_PATH,
+                    ),
                     project_scope=primary_scope,
                     model_override=st_model if selected_chat_mode != "instant" else None,
                 ):
@@ -1498,6 +1511,8 @@ elif nav_selection == "🗄️ Vault Explorer":
                                     edited_content=edited_content,
                                     expected_sha256=hashlib.sha256(file_content.encode("utf-8")).hexdigest(),
                                     actor="local_dashboard_owner",
+                                    brain_dir=BRAIN_DIR,
+                                    atoms_dir=ATOMS_DIR,
                                 )
                                 st.success("Atom saved as a new pending revision; recall index refreshed.")
                             except Exception as exc:
@@ -1510,7 +1525,7 @@ elif nav_selection == "🗄️ Vault Explorer":
                         current_approval = False
                         try:
                             record = parse_atom_record(file_path)
-                            current_approval = approved_revision_is_current(file_path)
+                            current_approval = approved_revision_is_current(file_path, brain_dir=BRAIN_DIR, atoms_dir=ATOMS_DIR)
                             approval_text = "verified current owner approval" if current_approval else f"{record['review_status']} (not eligible for recall)"
                             review_details = atom_review_details(
                                 file_content,
@@ -1559,6 +1574,8 @@ elif nav_selection == "🗄️ Vault Explorer":
                                     action="approve",
                                     expected_sha256=expected_hash,
                                     actor="local_dashboard_owner",
+                                    brain_dir=BRAIN_DIR,
+                                    atoms_dir=ATOMS_DIR,
                                 )
                                 st.success("Atom approved; source evidence verified and recall index refreshed.")
                                 st.rerun()
@@ -1571,6 +1588,8 @@ elif nav_selection == "🗄️ Vault Explorer":
                                     action="quarantine",
                                     expected_sha256=expected_hash,
                                     actor="local_dashboard_owner",
+                                    brain_dir=BRAIN_DIR,
+                                    atoms_dir=ATOMS_DIR,
                                 )
                                 st.success("Atom quarantined as needs_edit and excluded from recall.")
                                 st.rerun()
@@ -1583,6 +1602,8 @@ elif nav_selection == "🗄️ Vault Explorer":
                                     action="demote",
                                     expected_sha256=expected_hash,
                                     actor="local_dashboard_owner",
+                                    brain_dir=BRAIN_DIR,
+                                    atoms_dir=ATOMS_DIR,
                                 )
                                 st.success("Atom demoted to pending; inspect current source evidence before re-approval.")
                                 st.rerun()
@@ -1595,6 +1616,8 @@ elif nav_selection == "🗄️ Vault Explorer":
                                     action="reject",
                                     expected_sha256=expected_hash,
                                     actor="local_dashboard_owner",
+                                    brain_dir=BRAIN_DIR,
+                                    atoms_dir=ATOMS_DIR,
                                 )
                                 st.success("Atom rejected and recall index refreshed.")
                                 st.rerun()
@@ -1629,6 +1652,8 @@ elif nav_selection == "🗄️ Vault Explorer":
                                                 superseded_expected_sha256=target_hash,
                                                 actor="local_dashboard_owner",
                                                 rationale=merge_rationale.strip(),
+                                                brain_dir=BRAIN_DIR,
+                                                atoms_dir=ATOMS_DIR,
                                             )
                                             st.success(f"Merged `{merge_target}` into survivor `{selected_file}`; survivor queued as pending.")
                                             st.rerun()
@@ -1884,6 +1909,9 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                                 expected_sha256=str(q_detail["sha256"]),
                                 actor=actor_name,
                                 acknowledge_risks=ack_risks,
+                                inbox_dir=INBOX_DIR,
+                                raw_dir=RAW_DIR,
+                                brain_dir=BRAIN_DIR,
                             )
                             st.success(f"Promoted to `0-raw/{dec['promoted_filename']}` (SHA-256 `{dec['promoted_sha256']}`).")
                             st.rerun()
@@ -1896,6 +1924,8 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                                 selected_q,
                                 expected_sha256=str(q_detail["sha256"]),
                                 actor=actor_name,
+                                inbox_dir=INBOX_DIR,
+                                brain_dir=BRAIN_DIR,
                             )
                             st.info(f"Rejected and archived `{selected_q}`.")
                             st.rerun()
@@ -1948,7 +1978,7 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
 
     with tab_fitness:
         st.subheader("Memory Fitness & Procedural Skill Maturity")
-        report = compute_memory_fitness_report()
+        report = compute_memory_fitness_report(atoms_dir=ATOMS_DIR, brain_dir=BRAIN_DIR, db_path=TELEMETRY_DB_PATH)
         qs = report["query_summary"]
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Recall Queries", qs["total_recall_events"])
@@ -1977,7 +2007,7 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
             for fname in sorted(os.listdir(ATOMS_DIR)):
                 if is_content_markdown(fname):
                     ap = safe_file_in_dir(ATOMS_DIR, fname, allowed_exts={".md"})
-                    if ap and not _is_reparse_or_link(ap) and approved_revision_is_current(ap):
+                    if ap and not _is_reparse_or_link(ap) and approved_revision_is_current(ap, brain_dir=BRAIN_DIR, atoms_dir=ATOMS_DIR):
                         approved_atom_files.append(fname)
 
         fb_c1, fb_c2, fb_c3 = st.columns([2, 1.2, 1.2])
@@ -2042,6 +2072,9 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                     lessons=[ln.strip() for ln in exp_lessons.splitlines() if ln.strip()],
                     candidate_procedure_title=exp_proc or None,
                     propose_to_inbox=exp_prop,
+                    experiences_dir=EXPERIENCES_DIR,
+                    inbox_dir=INBOX_DIR,
+                    brain_dir=BRAIN_DIR,
                 )
                 st.success(f"Saved `4-experiences/{saved_exp['filename']}` (SHA-256 `{saved_exp['sha256']}`).")
             except Exception as exc:
@@ -2054,7 +2087,12 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
             "They are never executed as code and automatically become inactive if any backing atom is edited, demoted, or receives unacknowledged corrections."
         )
 
-        candidates = inspect_skill_candidates()
+        candidates = inspect_skill_candidates(
+            atoms_dir=ATOMS_DIR,
+            brain_dir=BRAIN_DIR,
+            playbooks_dir=PLAYBOOKS_DIR,
+            telemetry_db_path=TELEMETRY_DB_PATH,
+        )
         if candidates:
             st.markdown("#### Approved Procedural Atoms & Promotion Readiness")
             st.dataframe(pd.DataFrame(candidates), width="stretch")
@@ -2125,6 +2163,10 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                         acknowledge_corrections=pb_ack_corr,
                         expected_playbook_sha256=pb_prev_sha.strip() or None,
                         allow_multi_project=pb_multi_proj,
+                        brain_dir=BRAIN_DIR,
+                        atoms_dir=ATOMS_DIR,
+                        playbooks_dir=PLAYBOOKS_DIR,
+                        telemetry_db_path=TELEMETRY_DB_PATH,
                     )
                     st.success(f"Promoted `5-playbooks/{promoted_res['filename']}` (SHA-256 `{promoted_res['sha256']}`).")
                     st.rerun()
@@ -2133,7 +2175,13 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
 
         st.divider()
         st.markdown("#### Registered Skill Playbooks & Cryptographic Integrity")
-        all_playbooks = list_playbooks(active_only=False)
+        all_playbooks = list_playbooks(
+            playbooks_dir=PLAYBOOKS_DIR,
+            brain_dir=BRAIN_DIR,
+            atoms_dir=ATOMS_DIR,
+            telemetry_db_path=TELEMETRY_DB_PATH,
+            active_only=False,
+        )
         if not all_playbooks:
             st.caption("No Playbooks present in `brain/5-playbooks/` yet.")
         else:
@@ -2166,6 +2214,8 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                                 expected_sha256=active_choices[dep_target],
                                 actor=dep_actor,
                                 rationale=dep_reason,
+                                brain_dir=BRAIN_DIR,
+                                playbooks_dir=PLAYBOOKS_DIR,
                             )
                             st.info(f"Deprecated `5-playbooks/{dep_res['filename']}` (new SHA-256 `{dep_res['sha256']}`).")
                             st.rerun()
@@ -2205,7 +2255,17 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                         mode=plan_mode,
                         host_id=plan_host,
                     )
-                    plan_result = assemble_executive_plan(req, save_briefing=plan_save)
+                    plan_result = assemble_executive_plan(
+                        req,
+                        brain_dir=BRAIN_DIR,
+                        atoms_dir=ATOMS_DIR,
+                        playbooks_dir=PLAYBOOKS_DIR,
+                        briefings_dir=BRIEFINGS_DIR,
+                        lexical_index_path=LEXICAL_INDEX_PATH,
+                        chroma_path=CHROMA_PATH,
+                        telemetry_db_path=TELEMETRY_DB_PATH,
+                        save_briefing=plan_save,
+                    )
                     if plan_result.plan_ready:
                         st.success(f"Plan assembled ({plan_result.mode_used}): {plan_result.summary}")
                     else:
@@ -2259,8 +2319,8 @@ elif nav_selection == "📝 Working Notes & Import":
             note_choices = {f"{n.title} ({n.filename})": n.filename for n in note_items}
             chosen_label = st.selectbox("Select Working Note", list(note_choices.keys()), key="sel_working_note")
             chosen_fn = note_choices[chosen_label]
-            full_note = get_note(chosen_fn)
-            note_backlinks = backlinks(chosen_fn)
+            full_note = get_note(chosen_fn, paths=ACTIVE_NOTE_PATHS)
+            note_backlinks = backlinks(chosen_fn, paths=ACTIVE_NOTE_PATHS)
 
             st.caption(
                 f"SHA-256: `{full_note.sha256}` | Origin: `{full_note.origin}` | "
@@ -2287,6 +2347,7 @@ elif nav_selection == "📝 Working Notes & Import":
                                 expected_sha256=full_note.sha256,
                                 title=edited_title,
                                 tags=[t.strip() for t in edited_tags.split(",") if t.strip()],
+                                paths=ACTIVE_NOTE_PATHS,
                             )
                             st.success(f"Saved `{res['filename']}` (SHA-256 `{res['sha256'][:16]}…`).")
                             st.rerun()
@@ -2300,7 +2361,7 @@ elif nav_selection == "📝 Working Notes & Import":
                     )
                     if st.button("🗑️ Delete Note (CAS)", disabled=not del_confirm, key=f"btn_del_nt_{chosen_fn}"):
                         try:
-                            delete_note(chosen_fn, expected_sha256=full_note.sha256)
+                            delete_note(chosen_fn, expected_sha256=full_note.sha256, paths=ACTIVE_NOTE_PATHS)
                             st.info(f"Deleted `{chosen_fn}`.")
                             st.rerun()
                         except Exception as exc:
@@ -2320,7 +2381,7 @@ elif nav_selection == "📝 Working Notes & Import":
                             "filename": b.filename,
                             "title": b.title,
                             "tags": ", ".join(b.tags),
-                            "updated_at": b.updated_at,
+                            "updated_at": getattr(b, "updated_at", b.updated),
                             "origin": b.origin,
                         }
                         for b in note_backlinks
@@ -2379,6 +2440,7 @@ elif nav_selection == "📝 Working Notes & Import":
                             claim=ver_claim.strip() or None,
                             memory_type=ver_mtype,
                             tags=tuple(t.strip() for t in ver_tags.split(",") if t.strip()),
+                            paths=ACTIVE_NOTE_PATHS,
                         )
                         ev_src = vres.get("evidence_source") or vres.get("snapshot_rel_path", "")
                         st.success(
@@ -2398,6 +2460,7 @@ elif nav_selection == "📝 Working Notes & Import":
                     new_nt_title,
                     new_nt_body,
                     tags=[t.strip() for t in new_nt_tags.split(",") if t.strip()],
+                    paths=ACTIVE_NOTE_PATHS,
                 )
                 st.success(f"Created `brain/notes/{created['filename']}` (SHA-256 `{created['sha256'][:16]}…`).")
             except NoteError as exc:
@@ -2415,6 +2478,7 @@ elif nav_selection == "📝 Working Notes & Import":
                 try:
                     stats = import_folder(
                         imp_folder.strip(),
+                        paths=ACTIVE_NOTE_PATHS,
                         tags=tuple(t.strip() for t in imp_tags.split(",") if t.strip()),
                         dry_run=imp_dry,
                     )
@@ -2456,8 +2520,8 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
     ])
 
     with tab_merkle:
-        ledger_state = verify_vault_ledger()
-        merkle_live = compute_vault_merkle()
+        ledger_state = verify_vault_ledger(brain_dir=BRAIN_DIR, atoms_dir=ATOMS_DIR, playbooks_dir=PLAYBOOKS_DIR)
+        merkle_live = compute_vault_merkle(brain_dir=BRAIN_DIR, atoms_dir=ATOMS_DIR, playbooks_dir=PLAYBOOKS_DIR)
         live_leaf_cnt = ledger_state.get("leaf_count", ledger_state.get("live_leaf_count", merkle_live.get("leaf_count", 0)))
         synced_head = ledger_state.get("matches_latest_checkpoint", ledger_state.get("synced_with_head", False))
         approved_cnt = ledger_state.get("approved_atoms", merkle_live.get("approved_atoms", 0))
@@ -2491,7 +2555,13 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                 ckpt_note = st.text_input("Checkpoint Note", placeholder="e.g. Post-review release checkpoint", key="ldg_note")
                 if st.button("🔏 Commit Signed Merkle Checkpoint", key="btn_commit_ledger"):
                     try:
-                        entry = commit_ledger_checkpoint(actor=ckpt_actor, note=ckpt_note)
+                        entry = commit_ledger_checkpoint(
+                            brain_dir=BRAIN_DIR,
+                            atoms_dir=ATOMS_DIR,
+                            playbooks_dir=PLAYBOOKS_DIR,
+                            actor=ckpt_actor,
+                            note=ckpt_note,
+                        )
                         st.success(f"Committed checkpoint #{entry['seq']} (`{entry['entry_sha256'][:16]}…`).")
                         st.rerun()
                     except Exception as exc:
@@ -2518,7 +2588,12 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                         st.warning("Select or enter an approved atom filename.")
                     else:
                         try:
-                            proof = prove_atom_membership(str(prove_target).strip())
+                            proof = prove_atom_membership(
+                                str(prove_target).strip(),
+                                brain_dir=BRAIN_DIR,
+                                atoms_dir=ATOMS_DIR,
+                                playbooks_dir=PLAYBOOKS_DIR,
+                            )
                             verified_ok = verify_merkle_proof(proof)
                             proof["verified_offline"] = verified_ok
                             pm1, pm2, pm3 = st.columns(3)
@@ -2584,8 +2659,18 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
             radar_inc_pending = st.checkbox("Include Pending Drafts in Graph & Contradiction Scan", value=True, key="radar_pending")
         if st.button("📡 Scan Vault for Contradictions, Source Drift & Orphans", key="btn_scan_radar"):
             scope_arg = radar_proj.strip() or None
-            graph_info = build_knowledge_graph(project_scope=scope_arg, include_pending=radar_inc_pending)
-            radar_info = detect_contradictions(project_scope=scope_arg, include_pending=radar_inc_pending)
+            graph_info = build_knowledge_graph(
+                brain_dir=BRAIN_DIR,
+                atoms_dir=ATOMS_DIR,
+                project_scope=scope_arg,
+                include_pending=radar_inc_pending,
+            )
+            radar_info = detect_contradictions(
+                brain_dir=BRAIN_DIR,
+                atoms_dir=ATOMS_DIR,
+                project_scope=scope_arg,
+                include_pending=radar_inc_pending,
+            )
             drift_alerts = radar_info.get("drift_alerts", [])
             drift_cnt = radar_info.get("drift_count", len(drift_alerts))
             orphans = radar_info.get("orphan_approved_atoms", graph_info.get("orphan_approved_atoms", []))
@@ -2640,13 +2725,19 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                 snap_actor = st.text_input("Owner Actor", value="local_dashboard_owner", key="tt_actor")
                 if st.button("📸 Capture Vault Snapshot", key="btn_take_snap"):
                     try:
-                        snap_doc = create_snapshot(label=snap_label, actor=snap_actor)
+                        snap_doc = create_snapshot(
+                            label=snap_label,
+                            actor=snap_actor,
+                            brain_dir=BRAIN_DIR,
+                            atoms_dir=ATOMS_DIR,
+                            playbooks_dir=PLAYBOOKS_DIR,
+                        )
                         st.success(f"Created snapshot `{snap_doc['snapshot_id']}` ({snap_doc['atom_count']} approved atoms, Merkle `{snap_doc['merkle_root'][:16]}…`).")
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Snapshot failed: {exc}")
 
-        snaps = list_snapshots()
+        snaps = list_snapshots(brain_dir=BRAIN_DIR)
         with sc2:
             st.markdown(f"#### 🗂️ Recorded Snapshots ({len(snaps)})")
             if snaps:
@@ -2665,7 +2756,13 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                     to_snap = st.selectbox("To Snapshot (or `live`)", ["live", *snap_ids], key="tt_to")
                     if st.button("🔍 Compute Semantic Diff", key="btn_diff_snap"):
                         try:
-                            diff_doc = diff_snapshots(from_snap, to_snap)
+                            diff_doc = diff_snapshots(
+                                from_snap,
+                                to_snap,
+                                brain_dir=BRAIN_DIR,
+                                atoms_dir=ATOMS_DIR,
+                                playbooks_dir=PLAYBOOKS_DIR,
+                            )
                             dm1, dm2, dm3, dm4 = st.columns(4)
                             dm1.metric("State", "UNCHANGED" if diff_doc.get("unchanged") else "CHANGED")
                             dm2.metric("Added Atoms", len(diff_doc.get("added_atoms", [])))
@@ -2716,6 +2813,7 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                                 project_scope=pit_proj.strip() or None,
                                 include_preferences=pit_prefs,
                                 top_k=pit_topk,
+                                brain_dir=BRAIN_DIR,
                             )
                             hits = pit_res.get("results", [])
                             st.caption(

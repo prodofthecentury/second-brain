@@ -12,13 +12,20 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import threading
 import time
 
 from config import ATOMS_DIR, RAW_DIR
-from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor, verify_evidence_anchor
-from index_manifest import record_known_atom_hash
+from evidence import (
+    ANCHOR_FIELDS,
+    EvidenceValidationError,
+    find_evidence_anchor,
+    verify_evidence_anchor,
+    verify_evidence_anchor_known_source,
+)
+from index_manifest import LARGE_VAULT_STAT_CACHE_THRESHOLD, record_known_atom_hash
 from memory_format import (
     frontmatter_value,
     is_memory_document,
@@ -97,14 +104,23 @@ def decision_log_path(brain_dir: str) -> str:
 
 
 _DECISION_CACHE_LOCK = threading.Lock()
-# Maps abs_log_path -> (mtime_ns, size_bytes, prefix_sha256, latest_by_atom_filename_dict)
-_DECISION_LOG_CACHE: dict[str, tuple[int, int, str, dict[str, dict]]] = {}
+# Maps abs_log_path -> (mtime_ns, ctime_ns, size_bytes, prefix_sha256, latest_by_atom_filename_dict)
+_DECISION_LOG_CACHE: dict[str, tuple[int, int, int, str, dict[str, dict]]] = {}
+# Maps atom_sha256 -> (valid_approved_frontmatter_bool, anchors_dict)
+_ATOM_ANCHOR_PARSE_CACHE: dict[str, tuple[bool, dict[str, object]]] = {}
+# Maps (atom_sha256, src_sha256) -> anchor_verified_bool
+_ANCHOR_VERIFY_BY_HASH_CACHE: dict[tuple[str, str], bool] = {}
+# Maps normcase(abs_src_path) -> (mtime_ns, ctime_ns, size, src_sha256) for large (>64) vaults
+_SOURCE_STAT_SHA_CACHE: dict[str, tuple[int, int, int, str]] = {}
 
 
 def invalidate_decision_log_cache(decision_log_path: str | None = None) -> None:
     with _DECISION_CACHE_LOCK:
         if decision_log_path is None:
             _DECISION_LOG_CACHE.clear()
+            _ATOM_ANCHOR_PARSE_CACHE.clear()
+            _ANCHOR_VERIFY_BY_HASH_CACHE.clear()
+            _SOURCE_STAT_SHA_CACHE.clear()
         else:
             _DECISION_LOG_CACHE.pop(os.path.abspath(decision_log_path), None)
 
@@ -112,27 +128,36 @@ def invalidate_decision_log_cache(decision_log_path: str | None = None) -> None:
 def latest_decisions_by_atom(decision_log_path: str) -> dict[str, dict]:
     """Return latest decision record per atom_filename in O(1) cached time when log is unchanged."""
     abs_log = os.path.abspath(decision_log_path)
+    st = os.stat(abs_log)
+    with _DECISION_CACHE_LOCK:
+        cached = _DECISION_LOG_CACHE.get(abs_log)
+    if (
+        cached is not None
+        and len(cached[4]) > LARGE_VAULT_STAT_CACHE_THRESHOLD
+        and cached[0] == st.st_mtime_ns
+        and cached[1] == st.st_ctime_ns
+        and cached[2] == st.st_size
+    ):
+        return cached[4]
     with open(abs_log, "rb") as raw_fh:
         raw = raw_fh.read()
     # Hashing raw bytes is cheap (GB/s); JSON parsing is the expensive part we avoid.
     full_sha = hashlib.sha256(raw).hexdigest()
     size = len(raw)
-    with _DECISION_CACHE_LOCK:
-        cached = _DECISION_LOG_CACHE.get(abs_log)
-    if cached is not None and cached[1] == size and cached[2] == full_sha:
-        return cached[3]
+    if cached is not None and cached[2] == size and cached[3] == full_sha:
+        return cached[4]
 
     # Parse only the appended tail when the cached prefix is byte-identical; else full scan.
     latest_map: dict[str, dict] = {}
     start_offset = 0
     if (
         cached is not None
-        and size > cached[1]
-        and raw[cached[1] - 1 : cached[1]] == b"\n"
-        and hashlib.sha256(raw[: cached[1]]).hexdigest() == cached[2]
+        and size > cached[2]
+        and raw[cached[2] - 1 : cached[2]] == b"\n"
+        and hashlib.sha256(raw[: cached[2]]).hexdigest() == cached[3]
     ):
-        start_offset = cached[1]
-        latest_map = dict(cached[3])
+        start_offset = cached[2]
+        latest_map = dict(cached[4])
     tail_text = raw[start_offset:].decode("utf-8")
 
     for line in tail_text.splitlines():
@@ -149,7 +174,7 @@ def latest_decisions_by_atom(decision_log_path: str) -> dict[str, dict]:
     with _DECISION_CACHE_LOCK:
         if len(_DECISION_LOG_CACHE) > 256:
             _DECISION_LOG_CACHE.clear()
-        _DECISION_LOG_CACHE[abs_log] = (0, size, full_sha, latest_map)
+        _DECISION_LOG_CACHE[abs_log] = (st.st_mtime_ns, st.st_ctime_ns, size, full_sha, latest_map)
     return latest_map
 
 
@@ -641,13 +666,37 @@ def apply_atom_merge(
         return records
 
 
+def _lstat_regular_non_reparse(path: str) -> os.stat_result | None:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        return None
+    if os.name == "nt" and (getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        return None
+    isjunction = getattr(os.path, "isjunction", None)
+    if callable(isjunction) and isjunction(path):
+        return None
+    return st
+
+
 def approved_revision_is_current(
     atom_path: str,
     decision_log_path: str | None = None,
     brain_dir: str | None = None,
     atoms_dir: str = ATOMS_DIR,
+    *,
+    known_atom_bytes: bytes | None = None,
+    known_atom_sha256: str | None = None,
+    known_decision_map: dict[str, dict] | None = None,
+    source_sha_memo: dict[str, str | None] | None = None,
+    canonical_atoms_root: str | None = None,
 ) -> bool:
     """Accept only the latest owner approval for the exact atom and evidence revisions."""
+    content = ""
+    anchors: dict[str, object] = {}
+    current_hash = ""
     try:
         brain_dir = os.path.abspath(brain_dir or os.path.dirname(os.path.abspath(atoms_dir)))
         resolved_decision_log = (
@@ -655,30 +704,156 @@ def approved_revision_is_current(
             if decision_log_path is not None
             else os.path.join(brain_dir, "0-raw", "archive", "decision-record.jsonl")
         )
-        path = _canonical_atom_path(atom_path, atoms_dir)
-        content_bytes = Path(path).read_bytes()
-        content = content_bytes.decode("utf-8")
-        current_hash = content_sha256(content_bytes)
-        parsed = split_frontmatter(content)
-        if parsed is None or not is_memory_document(content):
-            return False
-        frontmatter, _ = parsed
-        values = parse_frontmatter_values(frontmatter)
-        sup_by = values.get("superseded_by", [])
-        if isinstance(sup_by, str):
-            sup_by = [sup_by] if sup_by.strip() else []
-        if sup_by:
-            return False
-        if values.get("review_status") != "accepted" or values.get("claim_state") != "human_reviewed":
-            return False
-        anchors = {key: values.get(key) for key in ANCHOR_FIELDS}
-        if not all(anchors.values()) or frontmatter_value(frontmatter, "citation_integrity") != "anchored":
-            return False
-        latest_map = latest_decisions_by_atom(resolved_decision_log)
+        if canonical_atoms_root is not None and known_atom_bytes is not None:
+            path = atom_path
+            content_bytes = known_atom_bytes
+            current_hash = known_atom_sha256 or content_sha256(content_bytes)
+        else:
+            path = _canonical_atom_path(atom_path, atoms_dir)
+            content_bytes = Path(path).read_bytes()
+            current_hash = content_sha256(content_bytes)
+        with _DECISION_CACHE_LOCK:
+            cached_parse = _ATOM_ANCHOR_PARSE_CACHE.get(current_hash)
+        if cached_parse is not None:
+            ok_fm, anchors = cached_parse
+            if not ok_fm:
+                return False
+        else:
+            content = content_bytes.decode("utf-8")
+            parsed = split_frontmatter(content)
+            if parsed is None or not is_memory_document(content):
+                with _DECISION_CACHE_LOCK:
+                    if len(_ATOM_ANCHOR_PARSE_CACHE) > 8192:
+                        _ATOM_ANCHOR_PARSE_CACHE.clear()
+                    _ATOM_ANCHOR_PARSE_CACHE[current_hash] = (False, {})
+                return False
+            frontmatter, _ = parsed
+            values = parse_frontmatter_values(frontmatter)
+            sup_by = values.get("superseded_by", [])
+            if isinstance(sup_by, str):
+                sup_by = [sup_by] if sup_by.strip() else []
+            anchors = {key: values.get(key) for key in ANCHOR_FIELDS}
+            ok_fm = (
+                not sup_by
+                and values.get("review_status") == "accepted"
+                and values.get("claim_state") == "human_reviewed"
+                and all(anchors.values())
+                and frontmatter_value(frontmatter, "citation_integrity") == "anchored"
+            )
+            with _DECISION_CACHE_LOCK:
+                if len(_ATOM_ANCHOR_PARSE_CACHE) > 8192:
+                    _ATOM_ANCHOR_PARSE_CACHE.clear()
+                _ATOM_ANCHOR_PARSE_CACHE[current_hash] = (ok_fm, anchors)
+            if not ok_fm:
+                return False
+        latest_map = known_decision_map if known_decision_map is not None else latest_decisions_by_atom(resolved_decision_log)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ReviewTransitionError):
         return False
 
-    latest = latest_map.get(Path(path).name)
+    latest = latest_map.get(os.path.basename(path))
     if not latest or latest.get("action") != "approve" or latest.get("content_sha256_after") != current_hash:
         return False
+
+    # Fast hash-verified source check: avoids re-running quote regexes when source file SHA-256 is unchanged.
+    src_rel = str(anchors.get("evidence_source") or "").replace("\\", "/").strip()
+    recorded_src_sha = str(anchors.get("evidence_sha256") or "").strip().lower()
+    if src_rel and len(recorded_src_sha) == 64 and not src_rel.startswith("/") and ".." not in src_rel.split("/"):
+        src_candidate = os.path.join(brain_dir, *src_rel.split("/"))
+        live_src_sha: str | None = None
+        src_bytes: bytes | None = None
+        if source_sha_memo is not None and src_candidate in source_sha_memo:
+            memo_val = source_sha_memo[src_candidate]
+            if memo_val is None:
+                return False
+            if isinstance(memo_val, tuple):
+                live_src_sha, src_bytes = memo_val
+            else:
+                live_src_sha = str(memo_val)
+            if live_src_sha != recorded_src_sha:
+                return False
+        else:
+            src_st = _lstat_regular_non_reparse(src_candidate)
+            if src_st is not None:
+                src_key = os.path.normcase(os.path.abspath(src_candidate))
+                use_src_stat_cache = len(latest_map) > LARGE_VAULT_STAT_CACHE_THRESHOLD
+                if use_src_stat_cache:
+                    with _DECISION_CACHE_LOCK:
+                        cached_src = _SOURCE_STAT_SHA_CACHE.get(src_key)
+                    if (
+                        cached_src is not None
+                        and cached_src[0] == src_st.st_mtime_ns
+                        and cached_src[1] == src_st.st_ctime_ns
+                        and cached_src[2] == src_st.st_size
+                    ):
+                        live_src_sha = cached_src[3]
+                        if source_sha_memo is not None:
+                            source_sha_memo[src_candidate] = live_src_sha
+                        if live_src_sha != recorded_src_sha:
+                            return False
+                if live_src_sha is None:
+                    try:
+                        with open(src_candidate, "rb") as src_fh:
+                            src_bytes = src_fh.read()
+                        live_src_sha = content_sha256(src_bytes)
+                        if use_src_stat_cache:
+                            with _DECISION_CACHE_LOCK:
+                                if len(_SOURCE_STAT_SHA_CACHE) > 4096:
+                                    _SOURCE_STAT_SHA_CACHE.clear()
+                                _SOURCE_STAT_SHA_CACHE[src_key] = (
+                                    src_st.st_mtime_ns,
+                                    src_st.st_ctime_ns,
+                                    src_st.st_size,
+                                    live_src_sha,
+                                )
+                        if source_sha_memo is not None:
+                            source_sha_memo[src_candidate] = (live_src_sha, src_bytes)  # type: ignore[assignment]
+                    except OSError:
+                        if source_sha_memo is not None:
+                            source_sha_memo[src_candidate] = None
+                        return False
+                    if live_src_sha != recorded_src_sha:
+                        return False
+            elif source_sha_memo is not None:
+                source_sha_memo[src_candidate] = None
+
+        if live_src_sha == recorded_src_sha:
+            pair_key = (current_hash, live_src_sha)
+            with _DECISION_CACHE_LOCK:
+                cached_verify = _ANCHOR_VERIFY_BY_HASH_CACHE.get(pair_key)
+            if cached_verify is not None:
+                return cached_verify
+            if not content:
+                try:
+                    content = content_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    return False
+            if src_bytes is None:
+                try:
+                    with open(src_candidate, "rb") as src_fh:
+                        src_bytes = src_fh.read()
+                    if content_sha256(src_bytes) != live_src_sha:
+                        return False
+                except OSError:
+                    return False
+            if verify_evidence_anchor_known_source(
+                content,
+                anchors,
+                source_rel=src_rel,
+                source_sha256=live_src_sha,
+                source_bytes=src_bytes,
+            ):
+                verified = True
+            else:
+                verified = verify_evidence_anchor(content, anchors, brain_dir)
+            with _DECISION_CACHE_LOCK:
+                if len(_ANCHOR_VERIFY_BY_HASH_CACHE) > 8192:
+                    _ANCHOR_VERIFY_BY_HASH_CACHE.clear()
+                _ANCHOR_VERIFY_BY_HASH_CACHE[pair_key] = verified
+            return verified
+
+    if not content:
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
     return verify_evidence_anchor(content, anchors, brain_dir)

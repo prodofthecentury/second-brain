@@ -275,7 +275,6 @@ from current source bytes, never selected by the model.
                     values = parse_frontmatter_values(frontmatter)
                     body = "\n".join(body_lines)
                     atom_claim = section_text(body, "Claim")
-                    evidence_text = section_text(body, "Evidence")
                     if not atom_claim or claim_text != atom_claim:
                         continue
                     anchors = {key: values.get(key) for key in ANCHOR_FIELDS}

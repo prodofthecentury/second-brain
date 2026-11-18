@@ -1101,7 +1101,7 @@ class MCPBoundaryTests(unittest.TestCase):
         self.assertIn("MAX_INBOX_CHARS = 100_000", implementation)
         self.assertNotIn('name="list_atoms"', implementation)
         self.assertNotIn('name="list_threads"', implementation)
-        self.assertIn("return []", implementation)
+        self.assertIn("ListResourcesResult(resources=[])", implementation)
         self.assertIn("do not register it with cloud-connected clients", readme_policy)
 
         vault_policy_path = ROOT / "brain" / "mcp-config.md"
@@ -1175,6 +1175,7 @@ class MCPBoundaryTests(unittest.TestCase):
 
     def test_mcp_bearer_token_authorization(self):
         import asyncio
+        import json
         import mcp_server
         from mcp import types
 
@@ -1189,27 +1190,29 @@ class MCPBoundaryTests(unittest.TestCase):
                 )
                 self.assertTrue(unconf_call.is_error)
                 self.assertIn("Unauthorized", unconf_call.content[0].text)
-                self.assertFalse(unconf_env["audit_path"].exists())
+                if unconf_env["audit_path"].exists():
+                    denied_rows = [json.loads(ln) for ln in unconf_env["audit_path"].read_text(encoding="utf-8").splitlines() if ln.strip()]
+                    self.assertTrue(all(r.get("outcome") == "denied" for r in denied_rows))
 
                 # Truncated token file must also fail closed
                 unconf_env["token_file"].parent.mkdir(parents=True, exist_ok=True)
                 unconf_env["token_file"].write_text("short\n", encoding="utf-8")
                 self.assertFalse(mcp_server.is_authorized())
 
-            # 2. Configured token enforcement + pre-auth audit protection + _meta bearer header
+            # 2. Configured token enforcement + denied/authorized audit logging + _meta bearer header
             with self._isolated_mcp_env(configure_token=test_token) as auth_env:
                 audit_path = auth_env["audit_path"]
 
-                # Request without token fails BEFORE writing audit log
+                # Request without token fails closed and records outcome="denied"
                 no_auth_call = await mcp_server.handle_call_tool(
                     None,
                     types.CallToolRequestParams(name="search_memory", arguments={"query": "structured JSON"}),
                 )
                 self.assertTrue(no_auth_call.is_error)
                 self.assertIn("Unauthorized", no_auth_call.content[0].text)
-                self.assertFalse(audit_path.exists())
+                self.assertTrue(audit_path.exists())
 
-                # Request with wrong token fails BEFORE writing audit log
+                # Request with wrong token fails closed and records outcome="denied"
                 wrong_auth_call = await mcp_server.handle_call_tool(
                     None,
                     types.CallToolRequestParams(
@@ -1220,7 +1223,6 @@ class MCPBoundaryTests(unittest.TestCase):
                 )
                 self.assertTrue(wrong_auth_call.is_error)
                 self.assertIn("Unauthorized", wrong_auth_call.content[0].text)
-                self.assertFalse(audit_path.exists())
 
                 # Request passing token in tool arguments without _meta MUST be rejected
                 args_only_call = await mcp_server.handle_call_tool(
@@ -1232,7 +1234,9 @@ class MCPBoundaryTests(unittest.TestCase):
                 )
                 self.assertTrue(args_only_call.is_error)
                 self.assertIn("Unauthorized", args_only_call.content[0].text)
-                self.assertFalse(audit_path.exists())
+                pre_valid_rows = [json.loads(ln) for ln in audit_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                self.assertEqual(len(pre_valid_rows), 3)
+                self.assertTrue(all(r.get("outcome") == "denied" and r.get("event") == "tool:search_memory" for r in pre_valid_rows))
 
                 # Request with valid token in _meta succeeds against isolated lexical index and records audit
                 valid_auth_call = await mcp_server.handle_call_tool(

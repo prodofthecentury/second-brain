@@ -23,12 +23,15 @@ import math
 import os
 import re
 import sqlite3
+import stat
 import sys
+import threading
 
 if __name__ in ("recall", "scripts.recall"):
     sys.modules.setdefault("recall", sys.modules[__name__])
     sys.modules.setdefault("scripts.recall", sys.modules[__name__])
 
+from atom_mutator import latest_decisions_by_atom
 from config import (
     ATOMS_DIR,
     BRAIN_DIR,
@@ -37,16 +40,27 @@ from config import (
     LEXICAL_INDEX_PATH,
     RAW_DIR,
     TELEMETRY_DB_PATH,
+    _WINDOWS_RESERVED_STEMS,
+    _is_reparse_or_link,
     is_content_markdown,
     normalize_markdown_filename,
     safe_file_in_dir,
 )
-from index_manifest import index_manifest_is_current, load_index_manifest
-from lexical_store import LexicalIndexUnavailable, TOKEN_PATTERN, search_lexical_index
+from index_manifest import cached_atom_hash_for_stat, index_manifest_is_current, load_index_manifest
+from lexical_store import (
+    FTS_STOP_WORDS,
+    TOKEN_PATTERN,
+    _search_lexical_index_verified,
+    porter_stem,
+    search_lexical_index,
+)
 from memory_format import split_frontmatter
-from memory_review import REVIEW_STATUSES, parse_atom_record, parse_scalar_list, section_text
+from memory_review import REVIEW_STATUSES, parse_atom_record, parse_atom_record_text, parse_scalar_list, section_text
 from review_atom import approved_revision_is_current
 from vector_store import close_vector_collection, get_vector_collection
+
+_ORIG_APPROVED_REVISION_IS_CURRENT = approved_revision_is_current
+_ORIG_SEARCH_LEXICAL_INDEX = search_lexical_index
 
 
 class MemoryRecallUnavailable(RuntimeError):
@@ -89,13 +103,24 @@ REVIEW_STATUS_WEIGHTS = {
     "rejected": -1.00,
     "merged": -1.00,
 }
-QUERY_STOP_WORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could",
-    "did", "do", "does", "for", "from", "how", "i", "in", "into", "is", "it",
-    "me", "my", "of", "on", "or", "our", "owner", "owners", "owner's", "should",
-    "that", "the", "their", "these", "this", "those", "to", "we", "what", "when",
-    "where", "which", "who", "why", "will", "with", "would", "you", "your",
+QUERY_STOP_WORDS = set(FTS_STOP_WORDS) | {
+    "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can", "could",
+    "did", "do", "does", "for", "from", "had", "has", "have", "having", "how", "i", "in", "into",
+    "is", "it", "its", "me", "my", "of", "on", "or", "our", "owner", "owners", "owner's",
+    "rather", "should", "so", "some", "such", "than", "that", "the", "their", "them", "then",
+    "there", "these", "they", "this", "those", "through", "to", "too", "under", "very", "was",
+    "we", "were", "what", "when", "where", "which", "while", "who", "why", "will", "with", "would",
+    "you", "your", "please", "output", "according", "approved", "factual", "claim", "claims",
+    "confirms", "confirm", "purely",
 }
+
+_RECALL_PARSE_CACHE_LOCK = threading.Lock()
+# Maps (filename, content_sha256) -> dict of immutable parsed atom metadata
+_ATOM_RECORD_BY_SHA: dict[tuple[str, str], dict] = {}
+# Maps content_sha256 -> (corroborating_terms_set, corroborating_stems_set)
+_CORROBORATING_TERMS_BY_SHA: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+# Maps abs_telemetry_db -> ((db_mtime_ns, db_size, wal_mtime_ns, wal_size), {atom_id: stats_dict})
+_TELEMETRY_MAP_CACHE: dict[str, tuple[tuple[int, int, int, int], dict[str, dict[str, int]]]] = {}
 
 
 @dataclass(frozen=True)
@@ -241,21 +266,129 @@ def metadata_contexts(record: dict) -> tuple[str, ...]:
     return tuple(str(item).strip() for item in contexts if str(item).strip())
 
 
-def load_memory_metadata(filename: str, atoms_dir: str = ATOMS_DIR) -> dict:
-    path = safe_file_in_dir(atoms_dir, filename, allowed_exts={".md"})
-    if not path:
-        return {
-            "filename": filename,
-            "memory_type": "semantic",
-            "review_status": "pending",
-            "claim_state": "candidate",
-            "confidence": "0.50",
-            "importance": "0.50",
-            "contexts": [],
-        }
+def _resolve_canonical_atoms_root(atoms_dir: str) -> str | None:
+    if not atoms_dir or not os.path.isdir(atoms_dir) or _is_reparse_or_link(atoms_dir):
+        return None
     try:
-        record = parse_atom_record(path)
+        real_root = os.path.realpath(atoms_dir)
+    except OSError:
+        return None
+    if not os.path.isdir(real_root) or _is_reparse_or_link(real_root):
+        return None
+    return real_root
+
+
+def _read_verified_atom_bytes_fast(
+    filename: str,
+    expected_sha256: str,
+    *,
+    canonical_atoms_root: str | None,
+    atoms_dir: str,
+    candidate_content: str | None = None,
+) -> tuple[str, bytes, str] | None:
+    """Verify atom filename, symlink safety, and exact SHA-256 without redundant disk opens."""
+    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+        return None
+    st: os.stat_result | None = None
+    if canonical_atoms_root is not None:
+        name = str(filename or "").strip().replace("\\", "/")
+        if (
+            not name
+            or name in {".", ".."}
+            or "/" in name
+            or ":" in name
+            or "\x00" in name
+            or os.path.isabs(name)
+            or not name.lower().endswith(".md")
+        ):
+            return None
+        stem = os.path.splitext(name)[0].rstrip(" .").lower()
+        first_stem = name.split(".", 1)[0].rstrip(" .").lower()
+        if stem in _WINDOWS_RESERVED_STEMS or first_stem in _WINDOWS_RESERVED_STEMS:
+            return None
+        path = os.path.join(canonical_atoms_root, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            return None
+        if os.name == "nt" and (getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            return None
+    else:
+        resolved = safe_file_in_dir(atoms_dir, filename, allowed_exts={".md"})
+        if not resolved:
+            return None
+        path = resolved
+
+    if st is not None and candidate_content is not None:
+        cached_sha = cached_atom_hash_for_stat(path, st)
+        if cached_sha == expected_sha256:
+            try:
+                cand_bytes = candidate_content.encode("utf-8")
+            except UnicodeEncodeError:
+                cand_bytes = b""
+            if cand_bytes and hashlib.sha256(cand_bytes).hexdigest() == expected_sha256:
+                return path, cand_bytes, candidate_content
+
+    try:
+        with open(path, "rb") as fh:
+            raw_bytes = fh.read()
+        content = raw_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if hashlib.sha256(raw_bytes).hexdigest() != expected_sha256:
+        return None
+    return path, raw_bytes, content
+
+
+def load_memory_metadata(
+    filename: str,
+    atoms_dir: str = ATOMS_DIR,
+    *,
+    _preverified: tuple[str, bytes, str] | None = None,
+    _known_sha256: str | None = None,
+    _canonical_atoms_root: str | None = None,
+    _decision_map: dict[str, dict] | None = None,
+    _source_sha_memo: dict[str, str | None] | None = None,
+) -> dict:
+    pre_content: str | None = None
+    if _preverified is not None:
+        path, raw_bytes, pre_content = _preverified
+    else:
+        path = safe_file_in_dir(atoms_dir, filename, allowed_exts={".md"})
+        if not path:
+            return {
+                "filename": filename,
+                "memory_type": "semantic",
+                "review_status": "pending",
+                "claim_state": "candidate",
+                "confidence": "0.50",
+                "importance": "0.50",
+                "contexts": [],
+            }
+        raw_bytes = b""
+    try:
+        if not raw_bytes:
+            with open(path, "rb") as fh:
+                raw_bytes = fh.read()
+        sha = _known_sha256 or hashlib.sha256(raw_bytes).hexdigest()
+        cache_key = (filename, sha)
+        with _RECALL_PARSE_CACHE_LOCK:
+            cached_rec = _ATOM_RECORD_BY_SHA.get(cache_key)
+        if cached_rec is not None:
+            record = dict(cached_rec)
+        else:
+            if pre_content is not None:
+                record = parse_atom_record_text(filename, pre_content)
+            else:
+                record = parse_atom_record(path)
+            with _RECALL_PARSE_CACHE_LOCK:
+                if len(_ATOM_RECORD_BY_SHA) > 8192:
+                    _ATOM_RECORD_BY_SHA.clear()
+                _ATOM_RECORD_BY_SHA[cache_key] = dict(record)
     except Exception:
+        sha = ""
         record = {
             "filename": filename,
             "memory_type": "semantic",
@@ -270,12 +403,30 @@ def load_memory_metadata(filename: str, atoms_dir: str = ATOMS_DIR) -> dict:
     if os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR):
         effective_brain_dir = BRAIN_DIR
         decision_log = os.path.join(RAW_DIR, "archive", "decision-record.jsonl")
-    record["approved_revision_current"] = approved_revision_is_current(
-        path,
-        decision_log_path=decision_log,
-        brain_dir=effective_brain_dir,
-        atoms_dir=atoms_dir,
-    )
+    if (
+        approved_revision_is_current is _ORIG_APPROVED_REVISION_IS_CURRENT
+        and raw_bytes
+        and sha
+        and _canonical_atoms_root is not None
+    ):
+        record["approved_revision_current"] = approved_revision_is_current(
+            path,
+            decision_log_path=decision_log,
+            brain_dir=effective_brain_dir,
+            atoms_dir=atoms_dir,
+            known_atom_bytes=raw_bytes,
+            known_atom_sha256=sha,
+            known_decision_map=_decision_map,
+            source_sha_memo=_source_sha_memo,
+            canonical_atoms_root=_canonical_atoms_root,
+        )
+    else:
+        record["approved_revision_current"] = approved_revision_is_current(
+            path,
+            decision_log_path=decision_log,
+            brain_dir=effective_brain_dir,
+            atoms_dir=atoms_dir,
+        )
     return record
 
 
@@ -335,31 +486,92 @@ def context_match_score(record_contexts: tuple[str, ...], requested_contexts: tu
 
 
 def _load_single_atom_telemetry(filename: str, telemetry_db_path: str | None = None) -> dict[str, int]:
-    """Read-only lookup of disposable sidecar telemetry; returns zeros if DB is absent or locked."""
+    """Read-only lookup of disposable sidecar telemetry; stat-cached in memory so recall avoids N SQLite connects."""
     db_path = telemetry_db_path or TELEMETRY_DB_PATH
-    if not db_path or not os.path.isfile(db_path):
+    if not db_path:
         return {}
+    abs_db = os.path.abspath(db_path)
     try:
-        with closing(sqlite3.connect(db_path, timeout=2.0)) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
+        st_db = os.stat(abs_db)
+    except OSError:
+        return {}
+    wal_mtime = 0
+    wal_size = 0
+    try:
+        st_wal = os.stat(abs_db + "-wal")
+        wal_mtime = st_wal.st_mtime_ns
+        wal_size = st_wal.st_size
+    except OSError:
+        pass
+    sig = (st_db.st_mtime_ns, st_db.st_size, wal_mtime, wal_size)
+    with _RECALL_PARSE_CACHE_LOCK:
+        cached = _TELEMETRY_MAP_CACHE.get(abs_db)
+    if cached is not None and cached[0] == sig:
+        hit = cached[1].get(filename)
+        return dict(hit) if hit else {}
+
+    try:
+        table_map: dict[str, dict[str, int]] = {}
+        with closing(sqlite3.connect(abs_db, timeout=2.0)) as conn:
+            rows = conn.execute(
                 """
-                SELECT retrieval_hits, grounded_citations, positive_feedback, corrections
+                SELECT atom_id, retrieval_hits, grounded_citations, positive_feedback, corrections
                 FROM atom_telemetry
-                WHERE atom_id = ?
-                """,
-                (filename,),
-            ).fetchone()
-            if not row:
-                return {}
-            return {
-                "retrieval_hits": int(row["retrieval_hits"] or 0),
-                "grounded_citations": int(row["grounded_citations"] or 0),
-                "positive_feedback": int(row["positive_feedback"] or 0),
-                "corrections": int(row["corrections"] or 0),
-            }
+                """
+            ).fetchall()
+            for atom_id, ret_h, cit_h, pos_h, corr_h in rows:
+                if atom_id:
+                    table_map[str(atom_id)] = {
+                        "retrieval_hits": int(ret_h or 0),
+                        "grounded_citations": int(cit_h or 0),
+                        "positive_feedback": int(pos_h or 0),
+                        "corrections": int(corr_h or 0),
+                    }
+        with _RECALL_PARSE_CACHE_LOCK:
+            if len(_TELEMETRY_MAP_CACHE) > 64:
+                _TELEMETRY_MAP_CACHE.clear()
+            _TELEMETRY_MAP_CACHE[abs_db] = (sig, table_map)
+        hit = table_map.get(filename)
+        return dict(hit) if hit else {}
     except sqlite3.Error:
         return {}
+
+
+def _load_fitness_signals(
+    filename: str,
+    telemetry_db_path: str | None = None,
+    brain_dir: str | None = None,
+) -> dict[str, int]:
+    """Merge disposable SQLite telemetry with durable 0-raw/archive/atom-corrections.jsonl."""
+    sidecar = _load_single_atom_telemetry(filename, telemetry_db_path)
+    resolved_brain = brain_dir
+    if resolved_brain is None:
+        db_candidate = telemetry_db_path or TELEMETRY_DB_PATH
+        if db_candidate:
+            abs_db = os.path.abspath(db_candidate)
+            parent = os.path.dirname(abs_db)
+            if os.path.basename(parent) == ".sidecar":
+                resolved_brain = os.path.dirname(parent)
+    durable_pos = 0
+    durable_corr = 0
+    if resolved_brain:
+        try:
+            from cognitive_core import load_durable_feedback_counts
+
+            dmap = load_durable_feedback_counts(resolved_brain)
+            dentry = dmap.get(filename) or {}
+            durable_pos = int(dentry.get("positive_feedback", 0) or 0)
+            durable_corr = int(dentry.get("corrections", 0) or 0)
+        except Exception:
+            pass
+    if not sidecar and durable_pos == 0 and durable_corr == 0:
+        return {}
+    return {
+        "retrieval_hits": int(sidecar.get("retrieval_hits", 0) or 0),
+        "grounded_citations": int(sidecar.get("grounded_citations", 0) or 0),
+        "positive_feedback": max(int(sidecar.get("positive_feedback", 0) or 0), durable_pos),
+        "corrections": max(int(sidecar.get("corrections", 0) or 0), durable_corr),
+    }
 
 
 def _compute_freshness_bonus(record: dict) -> float:
@@ -384,8 +596,10 @@ def result_from_candidate(
     source: str,
     atoms_dir: str = ATOMS_DIR,
     similarity_override: float | None = None,
+    *,
+    _preloaded_record: dict | None = None,
 ) -> RecallResult | None:
-    record = load_memory_metadata(filename, atoms_dir=atoms_dir)
+    record = _preloaded_record if _preloaded_record is not None else load_memory_metadata(filename, atoms_dir=atoms_dir)
     if not should_include_record(record, options):
         return None
 
@@ -423,10 +637,15 @@ def result_from_candidate(
         reasons.append("project:" + ",".join(matched_projects))
 
     if options.enable_fitness_boost:
+        effective_brain = (
+            BRAIN_DIR
+            if os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR)
+            else os.path.abspath(os.path.join(atoms_dir, os.pardir))
+        )
         effective_db = options.telemetry_db_path
         if effective_db is None and os.path.abspath(atoms_dir) != os.path.abspath(ATOMS_DIR):
-            effective_db = os.path.join(os.path.abspath(os.path.join(atoms_dir, os.pardir)), ".sidecar", "telemetry.sqlite3")
-        t_stats = _load_single_atom_telemetry(filename, effective_db)
+            effective_db = os.path.join(effective_brain, ".sidecar", "telemetry.sqlite3")
+        t_stats = _load_fitness_signals(filename, effective_db, brain_dir=effective_brain)
         if t_stats:
             # Retrieval hits are intentionally excluded: boosted results would otherwise accrue
             # hits and self-reinforce their own rank (feedback loop). Only grounded citations,
@@ -462,30 +681,91 @@ def result_from_candidate(
     )
 
 
-def candidate_has_query_overlap(query: str, content: str) -> bool:
-    """Require literal claim/evidence corroboration before trusted recall injects a result.
-
-    This is a conservative relevance precondition, not a relevance score or proof of
-    entailment. Supporting evidence can be more specific than a concise claim, so both
-    sections count. Synonym-only matches remain excluded until evaluation justifies a
-    stronger answerability method.
-    """
+def _corroborating_vocab(
+    content: str,
+    content_sha256: str | None = None,
+) -> tuple[frozenset[str], frozenset[str]] | None:
+    content_hash = (
+        content_sha256
+        if (isinstance(content_sha256, str) and len(content_sha256) == 64)
+        else hashlib.sha256(content.encode("utf-8")).hexdigest()
+    )
+    with _RECALL_PARSE_CACHE_LOCK:
+        cached = _CORROBORATING_TERMS_BY_SHA.get(content_hash)
+    if cached is not None:
+        return cached
     parsed = split_frontmatter(content)
     if parsed is None:
-        return False
+        return None
     body = "\n".join(parsed[1])
     claim = section_text(body, "Claim")
     evidence = section_text(body, "Evidence")
-    query_terms = {
+    terms = frozenset(term.casefold() for term in TOKEN_PATTERN.findall(f"{claim}\n{evidence}"))
+    stems = frozenset(porter_stem(t) for t in terms if len(t) >= 4)
+    with _RECALL_PARSE_CACHE_LOCK:
+        if len(_CORROBORATING_TERMS_BY_SHA) > 8192:
+            _CORROBORATING_TERMS_BY_SHA.clear()
+        _CORROBORATING_TERMS_BY_SHA[content_hash] = (terms, stems)
+    return terms, stems
+
+
+def _extract_query_terms(query: str) -> set[str]:
+    return {
         term.casefold()
         for term in TOKEN_PATTERN.findall(str(query or ""))
         if term.casefold() not in QUERY_STOP_WORDS and len(term) > 1
     }
-    corroborating_terms = {
-        term.casefold()
-        for term in TOKEN_PATTERN.findall(f"{claim}\n{evidence}")
-    }
-    return len(query_terms.intersection(corroborating_terms)) >= 2
+
+
+def candidate_has_query_overlap(
+    query: str,
+    content: str,
+    *,
+    content_sha256: str | None = None,
+) -> bool:
+    """Require literal or single-term stem claim/evidence corroboration before trusted recall injects a result."""
+    vocab = _corroborating_vocab(content, content_sha256=content_sha256)
+    if vocab is None:
+        return False
+    corroborating_terms, corroborating_stems = vocab
+    query_terms = _extract_query_terms(query)
+    if not query_terms:
+        return False
+    required = min(2, len(query_terms))
+    literal_overlap = len(query_terms.intersection(corroborating_terms))
+    if literal_overlap >= required:
+        return True
+    if required == 1:
+        only_term = next(iter(query_terms))
+        stem = porter_stem(only_term)
+        if len(stem) >= 4 and stem in corroborating_stems:
+            return True
+    return False
+
+
+def candidate_has_semantic_corroboration(
+    query: str,
+    content: str,
+    *,
+    distance: float | int | str | None = None,
+    content_sha256: str | None = None,
+) -> bool:
+    """Allow calibrated high-confidence dense/RRF synonym matches while blocking adversarial traps."""
+    if candidate_has_query_overlap(query, content, content_sha256=content_sha256):
+        return True
+    vocab = _corroborating_vocab(content, content_sha256=content_sha256)
+    if vocab is None:
+        return False
+    corroborating_terms, corroborating_stems = vocab
+    query_terms = _extract_query_terms(query)
+    if not query_terms or distance is None:
+        return False
+    sim = cosine_distance_to_similarity(distance)
+    literal_hits = len(query_terms.intersection(corroborating_terms))
+    stem_hits = sum(1 for qt in query_terms if len(porter_stem(qt)) >= 4 and porter_stem(qt) in corroborating_stems)
+    if (literal_hits >= 1 or stem_hits >= 1) and sim >= 0.86:
+        return True
+    return sim >= 0.90
 
 
 def wikilinks(content: str) -> list[str]:
@@ -548,6 +828,27 @@ def verified_atom_content(filename: str, expected_sha256: str, atoms_dir: str = 
     return content if actual_sha256 == expected_sha256 else None
 
 
+_ORIG_LOAD_MEMORY_METADATA = load_memory_metadata
+_ORIG_VERIFIED_ATOM_CONTENT = verified_atom_content
+
+
+def _preload_batch_decision_map(atoms_dir: str) -> dict[str, dict] | None:
+    effective_brain_dir = (
+        BRAIN_DIR
+        if os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR)
+        else os.path.abspath(os.path.join(atoms_dir, os.pardir))
+    )
+    decision_log = (
+        os.path.join(RAW_DIR, "archive", "decision-record.jsonl")
+        if os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR)
+        else os.path.join(effective_brain_dir, "0-raw", "archive", "decision-record.jsonl")
+    )
+    try:
+        return latest_decisions_by_atom(decision_log)
+    except Exception:
+        return None
+
+
 def rerank_candidates(
     results: dict,
     options: RecallOptions,
@@ -559,14 +860,64 @@ def rerank_candidates(
     metadatas = (results.get("metadatas") or [[]])[0]
     distances = (results.get("distances") or [[]])[0]
 
+    use_fast_verify = (
+        verified_atom_content is _ORIG_VERIFIED_ATOM_CONTENT
+        and load_memory_metadata is _ORIG_LOAD_MEMORY_METADATA
+    )
+    canon_root = _resolve_canonical_atoms_root(atoms_dir) if use_fast_verify else None
+    decision_map = _preload_batch_decision_map(atoms_dir) if use_fast_verify else None
+    source_sha_memo: dict[str, str | None] = {}
+
     ranked = []
     for index, content in enumerate(documents):
         metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
         distance = distances[index] if index < len(distances) else None
         filename = metadata.get("filename", "unknown.md")
+        expected_sha = metadata.get("content_sha256", "")
+        if use_fast_verify and canon_root is not None:
+            if isinstance(content, str) and not candidate_has_semantic_corroboration(
+                query, content, distance=distance, content_sha256=expected_sha
+            ):
+                continue
+            verified_bundle = _read_verified_atom_bytes_fast(
+                filename,
+                expected_sha,
+                canonical_atoms_root=canon_root,
+                atoms_dir=atoms_dir,
+                candidate_content=content if isinstance(content, str) else None,
+            )
+            if verified_bundle is None:
+                continue
+            current_content = verified_bundle[2]
+            if not candidate_has_semantic_corroboration(
+                query, current_content, distance=distance, content_sha256=expected_sha
+            ):
+                continue
+            rec = load_memory_metadata(
+                filename,
+                atoms_dir=atoms_dir,
+                _preverified=verified_bundle,
+                _known_sha256=expected_sha,
+                _canonical_atoms_root=canon_root,
+                _decision_map=decision_map,
+                _source_sha_memo=source_sha_memo,
+            )
+            result = result_from_candidate(
+                content=current_content,
+                filename=filename,
+                distance=distance,
+                options=options,
+                source="vector",
+                atoms_dir=atoms_dir,
+                _preloaded_record=rec,
+            )
+            if result:
+                ranked.append(result)
+            continue
+
         current_content = verified_atom_content(
             filename,
-            metadata.get("content_sha256", ""),
+            expected_sha,
             atoms_dir=atoms_dir,
         )
         if current_content is None:
@@ -580,7 +931,7 @@ def rerank_candidates(
             atoms_dir=atoms_dir,
         )
         if result:
-            if candidate_has_query_overlap(query, current_content):
+            if candidate_has_semantic_corroboration(query, current_content, distance=distance):
                 ranked.append(result)
 
     return sorted(ranked, key=lambda item: item.score, reverse=True)[: options.n_results]
@@ -659,44 +1010,96 @@ def search_lexical_memory(
     """Retrieve through the model-free sidecar, then apply the canonical trust filter."""
     options = options or RecallOptions()
     candidate_count = max(options.n_results, options.n_results * max(1, options.candidate_multiplier))
-    candidates = search_lexical_index(query, index_path, n_results=candidate_count, atoms_dir=atoms_dir)
+    use_fast_verify = (
+        verified_atom_content is _ORIG_VERIFIED_ATOM_CONTENT
+        and load_memory_metadata is _ORIG_LOAD_MEMORY_METADATA
+    )
+    verified_rev_map: dict[str, str] | None = None
+    if use_fast_verify and search_lexical_index is _ORIG_SEARCH_LEXICAL_INDEX:
+        candidates, verified_rev_map = _search_lexical_index_verified(
+            query, index_path, n_results=candidate_count, atoms_dir=atoms_dir
+        )
+    else:
+        candidates = search_lexical_index(query, index_path, n_results=candidate_count, atoms_dir=atoms_dir)
+    if not candidates:
+        return [], []
 
     fitness_or_profile = bool(options.enable_fitness_boost or options.active_context_profile)
+    if verified_rev_map is not None:
+        canon_root: str | None = os.path.abspath(atoms_dir)
+    else:
+        canon_root = _resolve_canonical_atoms_root(atoms_dir) if use_fast_verify else None
+    decision_map = _preload_batch_decision_map(atoms_dir) if use_fast_verify else None
+    source_sha_memo: dict[str, str | None] = {}
 
-    # Apply the canonical content/overlap gates first so untrusted (pending, out-of-scope,
-    # tampered) candidates never participate in BM25 normalization.
-    gated: list[tuple[int, object, str]] = []
-    for position, candidate in enumerate(candidates):
-        current_content = verified_atom_content(candidate.filename, candidate.content_sha256, atoms_dir=atoms_dir)
-        if current_content is None or not candidate_has_query_overlap(query, current_content):
-            continue
-        gated.append((position, candidate, current_content))
-
-    best_bm25 = 0.0
-    if fitness_or_profile:
-        trusted_ranks = [
-            abs(float(candidate.rank))
-            for _, candidate, current_content in gated
-            if result_from_candidate(
-                content=current_content,
-                filename=candidate.filename,
-                distance=None,
-                options=options,
-                source="lexical",
+    # Apply the canonical content/overlap/trust gates once per candidate so untrusted
+    # (pending, out-of-scope, tampered) candidates never participate in BM25 normalization.
+    trusted_gated: list[tuple[object, str, dict]] = []
+    for candidate in candidates:
+        if use_fast_verify and canon_root is not None:
+            if not candidate_has_query_overlap(
+                query, candidate.content, content_sha256=candidate.content_sha256
+            ):
+                continue
+            verified_bundle: tuple[str, bytes, str] | None = None
+            if (
+                verified_rev_map is not None
+                and verified_rev_map.get(candidate.filename) == candidate.content_sha256
+            ):
+                try:
+                    cand_bytes = candidate.content.encode("utf-8")
+                except UnicodeEncodeError:
+                    cand_bytes = b""
+                if cand_bytes and hashlib.sha256(cand_bytes).hexdigest() == candidate.content_sha256:
+                    verified_bundle = (
+                        os.path.join(canon_root, candidate.filename),
+                        cand_bytes,
+                        candidate.content,
+                    )
+            if verified_bundle is None:
+                verified_bundle = _read_verified_atom_bytes_fast(
+                    candidate.filename,
+                    candidate.content_sha256,
+                    canonical_atoms_root=canon_root,
+                    atoms_dir=atoms_dir,
+                    candidate_content=candidate.content,
+                )
+            if verified_bundle is None:
+                continue
+            current_content = verified_bundle[2]
+            if current_content is not candidate.content and not candidate_has_query_overlap(
+                query, current_content, content_sha256=candidate.content_sha256
+            ):
+                continue
+            rec = load_memory_metadata(
+                candidate.filename,
                 atoms_dir=atoms_dir,
-                similarity_override=1.0,
+                _preverified=verified_bundle,
+                _known_sha256=candidate.content_sha256,
+                _canonical_atoms_root=canon_root,
+                _decision_map=decision_map,
+                _source_sha_memo=source_sha_memo,
             )
-        ]
-        best_bm25 = max(trusted_ranks, default=0.0)
+        else:
+            current_content = verified_atom_content(
+                candidate.filename, candidate.content_sha256, atoms_dir=atoms_dir
+            )
+            if current_content is None or not candidate_has_query_overlap(query, current_content):
+                continue
+            rec = load_memory_metadata(candidate.filename, atoms_dir=atoms_dir)
+        if not should_include_record(rec, options):
+            continue
+        trusted_gated.append((candidate, current_content, rec))
+
+    best_bm25 = (
+        max((abs(float(cand.rank)) for cand, _, _ in trusted_gated), default=0.0)
+        if fitness_or_profile
+        else 0.0
+    )
     use_bm25_ratio = fitness_or_profile and best_bm25 > 0.0
 
     direct = []
-    trusted_position = 0
-    for _position, candidate, current_content in gated:
-        # Preserve legacy 1/(trusted_pos+1) when fitness/profile ranking is off; use proportional BM25
-        # relevance (normalized over trusted candidates only) when fitness/profile ranking is active
-        # so near-equal BM25 hits can be differentiated by context profile, fitness utility/corrections,
-        # and freshness without overriding strong topical matches.
+    for trusted_position, (candidate, current_content, rec) in enumerate(trusted_gated):
         if use_bm25_ratio:
             lexical_similarity = clamp_number(abs(float(candidate.rank)) / best_bm25)
         else:
@@ -709,10 +1112,10 @@ def search_lexical_memory(
             source="lexical",
             atoms_dir=atoms_dir,
             similarity_override=lexical_similarity,
+            _preloaded_record=rec,
         )
         if result:
             direct.append(result)
-            trusted_position += 1
 
     direct = sorted(direct, key=lambda item: item.score, reverse=True)[: options.n_results]
     neighbors = []

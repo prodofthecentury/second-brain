@@ -37,7 +37,13 @@ from config import (
     is_content_markdown,
     safe_file_in_dir,
 )
-from memory_format import split_frontmatter
+from memory_format import (
+    frontmatter_has_key,
+    remove_frontmatter_fields,
+    render_memory_document,
+    set_scalar_field,
+    split_frontmatter,
+)
 from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 from recall import normalize_project_tag, project_tags_match
 from review_atom import approved_revision_is_current
@@ -634,26 +640,26 @@ def verify_playbook_integrity(
     if parsed is None:
         return PlaybookIntegrityReport(pb_id_fallback, fname, False, "invalid", "missing_frontmatter", sha256=sha)
 
-    fm_map: dict[str, object] = {}
-    for raw_line in parsed[0]:
-        if ":" not in raw_line:
-            continue
-        k, v = raw_line.split(":", 1)
-        key = k.strip()
-        val = v.strip()
-        if not key:
-            continue
-        try:
-            fm_map[key] = json.loads(val)
-        except json.JSONDecodeError:
-            fm_map[key] = val.strip("\"'")
+    raw_fm = parse_frontmatter_values(parsed[0])
+    fm_map: dict[str, object] = dict(raw_fm)
+    for json_dict_key in ("backing_atom_sha256s", "acknowledged_corrections"):
+        raw_mapping = fm_map.get(json_dict_key)
+        if isinstance(raw_mapping, str) and raw_mapping.strip().startswith("{"):
+            try:
+                fm_map[json_dict_key] = json.loads(raw_mapping)
+            except json.JSONDecodeError:
+                pass
 
     pb_id = str(fm_map.get("playbook_id") or pb_id_fallback)
     status = str(fm_map.get("playbook_status") or "invalid")
     title = str(fm_map.get("title") or pb_id)
     contexts_raw = fm_map.get("contexts")
+    if isinstance(contexts_raw, str):
+        contexts_raw = parse_scalar_list(contexts_raw)
     contexts = tuple(str(x).strip() for x in contexts_raw if str(x).strip()) if isinstance(contexts_raw, list) else ()
     backing_list = fm_map.get("backing_atoms")
+    if isinstance(backing_list, str):
+        backing_list = parse_scalar_list(backing_list)
     backing_hashes = fm_map.get("backing_atom_sha256s")
     ack_corr = fm_map.get("acknowledged_corrections")
     if not isinstance(ack_corr, dict):
@@ -871,37 +877,26 @@ def deprecate_skill_playbook(
         if parsed_pb is None:
             raise PlaybookValidationError(f"Playbook '{fname}' is missing a valid frontmatter block.")
         existing_fm = parse_frontmatter_values(parsed_pb[0])
-        if str(existing_fm.get("type", "")).strip().strip("\"'") != "playbook":
+        if str(existing_fm.get("type", "")).strip() != "playbook":
             raise PlaybookValidationError(f"File '{fname}' is not a Skill Playbook (missing type: playbook).")
-        cur_status = str(existing_fm.get("playbook_status", "")).strip().strip("\"'")
+        if not frontmatter_has_key(parsed_pb[0], "playbook_status"):
+            raise PlaybookValidationError(f"Playbook '{fname}' is missing playbook_status field.")
+        cur_status = str(existing_fm.get("playbook_status", "")).strip()
         if cur_status != "active":
             raise PlaybookValidationError(f"Playbook '{fname}' is not active (status={cur_status!r}).")
-        fm_match = re.match(r"\A(---\r?\n)(.*?)(\r?\n---\r?\n)", raw_text, re.S)
-        if not fm_match:
-            raise PlaybookValidationError(f"Playbook '{fname}' is missing a valid frontmatter block.")
-        fm_block = fm_match.group(2)
+
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-        # Edit ONLY inside the parsed frontmatter block (never the body), then append status provenance.
-        new_fm_block, n_subs = re.subn(
-            r"(?m)^playbook_status:[^\r\n]*$", "playbook_status: deprecated", fm_block, count=1
+        updated_fm = remove_frontmatter_fields(parsed_pb[0], {"deprecated_at", "deprecated_by"})
+        updated_fm = set_scalar_field(updated_fm, "playbook_status", "deprecated", "type")
+        updated_fm = set_scalar_field(updated_fm, "deprecated_at", json.dumps(now_iso), "acknowledged_corrections")
+        updated_fm = set_scalar_field(
+            updated_fm, "deprecated_by", json.dumps(clean_actor, ensure_ascii=False), "deprecated_at"
         )
-        if n_subs != 1:
-            raise PlaybookValidationError(f"Playbook '{fname}' is missing playbook_status field.")
-        new_fm_block = re.sub(r"(?m)^(deprecated_at|deprecated_by):[^\r\n]*(\r?\n)?", "", new_fm_block).rstrip("\r\n")
-        new_fm_block += (
-            f"\ndeprecated_at: {json.dumps(now_iso)}"
-            f"\ndeprecated_by: {json.dumps(clean_actor, ensure_ascii=False)}"
-        )
-        updated_text = fm_match.group(1) + new_fm_block + fm_match.group(3) + raw_text[fm_match.end():]
+        updated_text = render_memory_document(updated_fm, parsed_pb[1])
 
         reparsed = split_frontmatter(updated_text)
-        reparsed_status = ""
-        if reparsed is not None:
-            for raw_line in reparsed[0]:
-                if raw_line.strip().startswith("playbook_status:"):
-                    reparsed_status = raw_line.split(":", 1)[1].strip().strip("\"'")
-                    break
-        if reparsed_status != "deprecated":
+        reparsed_fm = parse_frontmatter_values(reparsed[0]) if reparsed is not None else {}
+        if str(reparsed_fm.get("playbook_status", "")) != "deprecated":
             raise PlaybookValidationError(f"Playbook '{fname}' deprecation could not be verified after edit.")
 
         _backup_playbook_revision(playbooks_dir, target, f"{os.path.splitext(fname)[0]}.{current_sha[:12]}.md")

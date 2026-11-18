@@ -58,7 +58,8 @@ researching, deciding, and creating.
 - `brain/1-desk/`: scratch workspace for intermediate processing.
 - `brain/2-atoms/`: typed atomic memories, one claim/event/procedure/system fact per file.
 - `brain/3-threads/`: synthesis documents linking related atoms.
-- `brain/playbooks/`: human-readable workflows and templates.
+- `brain/5-playbooks/`: owner-gated CAS Skill Playbooks and `.history/` revisions.
+- `docs/runbooks/`: human-readable operator workflows and Markdown templates (`docs/runbooks/templates/`).
 - `brain/.chroma/`: rebuildable vector recall layer.
 - `scripts/`: local engine core.
 - `dashboard/`: local operator interface.

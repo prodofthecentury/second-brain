@@ -276,7 +276,7 @@ def _playbook_matches_goal(pb: PlaybookIntegrityReport, goal: str, projects: tup
     q_terms = _goal_terms(goal)
     pb_corpus = f"{pb.title}\n{pb.trigger}\n" + "\n".join(pb.steps) + "\n" + "\n".join(pb.preconditions)
     pb_terms = {tok.casefold() for tok in TOKEN_PATTERN.findall(pb_corpus)}
-    return len(q_terms.intersection(pb_terms)) >= 2
+    return bool(q_terms) and len(q_terms.intersection(pb_terms)) >= min(2, len(q_terms))
 
 
 def _rank_matching_playbooks(

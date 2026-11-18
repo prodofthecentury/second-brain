@@ -103,40 +103,110 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
 
     Write-Host '=== Checking Local Ollama Daemon & Models ===' -ForegroundColor Cyan
-    $OllamaRawHost = if ($env:OLLAMA_HOST -and $env:OLLAMA_HOST.Trim()) { $env:OLLAMA_HOST.Trim() } else { 'http://127.0.0.1:11434' }
-    if ($OllamaRawHost -match '^https?://') {
-        $OllamaBaseUrl = $OllamaRawHost.TrimEnd('/')
-    } elseif ($OllamaRawHost -match ':') {
-        $OllamaBaseUrl = "http://$($OllamaRawHost.TrimEnd('/'))"
-    } else {
-        $OllamaBaseUrl = "http://${OllamaRawHost}:11434"
+    function Resolve-LoopbackOllamaBaseUrl {
+        param([string]$RawHost)
+        $Candidate = if ($RawHost -and $RawHost.Trim()) { $RawHost.Trim() } else { 'http://127.0.0.1:11434' }
+        if ($Candidate -match '://') {
+            if ($Candidate -notmatch '(?i)^http://') { return $null }
+            $Normalized = $Candidate
+        } elseif ($Candidate -eq '::1' -or $Candidate -eq '[::1]') {
+            $Normalized = 'http://[::1]:11434'
+        } elseif ($Candidate -match '^\[::1\]:\d+/?$' -or ($Candidate -notmatch '^\[' -and $Candidate -match '^[^/:]+:\d+/?$')) {
+            $Normalized = "http://$Candidate"
+        } else {
+            $Normalized = "http://$($Candidate.TrimEnd('/')):11434"
+        }
+        $ParsedUri = $null
+        if (-not [System.Uri]::TryCreate($Normalized, [System.UriKind]::Absolute, [ref]$ParsedUri)) {
+            return $null
+        }
+        if (
+            $ParsedUri.Scheme -ne 'http' -or
+            -not [string]::IsNullOrEmpty($ParsedUri.UserInfo) -or
+            $ParsedUri.AbsolutePath -notin @('', '/') -or
+            -not [string]::IsNullOrEmpty($ParsedUri.Query) -or
+            -not [string]::IsNullOrEmpty($ParsedUri.Fragment) -or
+            $ParsedUri.Port -lt 1 -or
+            $ParsedUri.Port -gt 65535
+        ) {
+            return $null
+        }
+        $HostLower = $ParsedUri.DnsSafeHost.ToLowerInvariant()
+        $ParsedIp = $null
+        $IsIpv6Loopback = (
+            [System.Net.IPAddress]::TryParse($HostLower, [ref]$ParsedIp) -and
+            $ParsedIp.Equals([System.Net.IPAddress]::IPv6Loopback)
+        )
+        if ($HostLower -notin @('127.0.0.1', 'localhost') -and -not $IsIpv6Loopback) {
+            return $null
+        }
+        $HasExplicitPort = ($Normalized.TrimEnd('/') -match ':\d+$')
+        $FinalPort = if ($HasExplicitPort) { $ParsedUri.Port } else { 11434 }
+        $OutHost = if ($IsIpv6Loopback) { '[::1]' } else { $HostLower }
+        return ("http://{0}:{1}" -f $OutHost, $FinalPort)
     }
-    $OllamaTagsUrl = "$OllamaBaseUrl/api/tags"
+
+    function Invoke-LoopbackOllamaTags {
+        param([string]$TagsUrl)
+        Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+        $SocketsHandlerType = 'System.Net.Http.SocketsHttpHandler' -as [type]
+        if ($SocketsHandlerType) {
+            $Handler = [System.Net.Http.SocketsHttpHandler]@{
+                UseProxy = $false
+                AllowAutoRedirect = $false
+            }
+        } else {
+            $Handler = New-Object System.Net.Http.HttpClientHandler
+            $Handler.UseProxy = $false
+            $Handler.AllowAutoRedirect = $false
+        }
+        $Client = New-Object System.Net.Http.HttpClient($Handler, $true)
+        try {
+            $Client.Timeout = [TimeSpan]::FromSeconds(3)
+            $Response = $Client.GetAsync($TagsUrl).GetAwaiter().GetResult()
+            if (-not $Response.IsSuccessStatusCode) {
+                throw ("HTTP {0}" -f [int]$Response.StatusCode)
+            }
+            $RawJson = $Response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            return ($RawJson | ConvertFrom-Json)
+        } finally {
+            $Client.Dispose()
+        }
+    }
+
+    $OllamaRawHost = if ($env:OLLAMA_HOST -and $env:OLLAMA_HOST.Trim()) { $env:OLLAMA_HOST.Trim() } else { 'http://127.0.0.1:11434' }
+    $OllamaBaseUrl = Resolve-LoopbackOllamaBaseUrl -RawHost $OllamaRawHost
+    $OllamaTagsUrl = if ($OllamaBaseUrl) { "$OllamaBaseUrl/api/tags" } else { $null }
 
     $OllamaReachable = $false
     $InstalledModels = @()
-    try {
-        $TagsResponse = Invoke-RestMethod -Uri $OllamaTagsUrl -Method Get -TimeoutSec 3
-        $OllamaReachable = $true
-        if ($TagsResponse.models) {
-            $InstalledModels = @($TagsResponse.models | ForEach-Object { $_.name })
+    if (-not $OllamaBaseUrl) {
+        Write-Host ("[WARN] Refusing non-loopback or malformed OLLAMA_HOST ({0}); continuing in model-free FTS5 lexical mode." -f $OllamaRawHost) -ForegroundColor Yellow
+    } else {
+        try {
+            $TagsResponse = Invoke-LoopbackOllamaTags -TagsUrl $OllamaTagsUrl
+            $OllamaReachable = $true
+            if ($TagsResponse.models) {
+                $InstalledModels = @($TagsResponse.models | ForEach-Object { $_.name })
+            }
+            Write-Host ("Ollama reachable at {0} ({1} model(s) present)" -f $OllamaBaseUrl, $InstalledModels.Count) -ForegroundColor Green
+        } catch {
+            Write-Host ("Ollama daemon not reachable at {0}; continuing in model-free FTS5 lexical mode." -f $OllamaBaseUrl) -ForegroundColor Yellow
         }
-        Write-Host ("Ollama reachable at {0} ({1} model(s) present)" -f $OllamaBaseUrl, $InstalledModels.Count) -ForegroundColor Green
-    } catch {
-        Write-Host ("Ollama daemon not reachable at {0}; continuing in model-free FTS5 lexical mode." -f $OllamaBaseUrl) -ForegroundColor Yellow
     }
 
     if ($PullModels) {
         $OllamaCmd = Get-Command ollama -ErrorAction SilentlyContinue
-        if (-not $OllamaCmd -or -not $OllamaReachable) {
-            throw ('PullModels requested, but Ollama CLI or local daemon ({0}) is unavailable. Start `ollama serve` first.' -f $OllamaBaseUrl)
+        if (-not $OllamaBaseUrl -or -not $OllamaCmd -or -not $OllamaReachable) {
+            $DisplayTarget = if ($OllamaBaseUrl) { $OllamaBaseUrl } else { $OllamaRawHost }
+            throw ('PullModels requested, but Ollama CLI or local loopback daemon ({0}) is unavailable. Start `ollama serve` on loopback first.' -f $DisplayTarget)
         }
         foreach ($ReqModel in @('nomic-embed-text', 'llama3.2:3b')) {
             Write-Host "Pulling required local model: $ReqModel ..."
             & $OllamaCmd.Source pull $ReqModel
             if ($LASTEXITCODE -ne 0) { throw "Failed to pull model $ReqModel." }
         }
-        $TagsResponse = Invoke-RestMethod -Uri $OllamaTagsUrl -Method Get -TimeoutSec 3
+        $TagsResponse = Invoke-LoopbackOllamaTags -TagsUrl $OllamaTagsUrl
         if ($TagsResponse.models) {
             $InstalledModels = @($TagsResponse.models | ForEach-Object { $_.name })
         }
@@ -149,7 +219,8 @@ try {
     if ($env:BRAIN_VAULT_DIR -and $env:BRAIN_VAULT_DIR.Trim()) {
         $VaultDir = $env:BRAIN_VAULT_DIR.Trim()
     } else {
-        $VaultDir = Join-Path $ProjectRoot 'brain'
+        $ResolvedVault = (& $UvExe run --frozen python -c "from scripts.config import resolve_active_brain_dir; print(resolve_active_brain_dir())" 2>$null | Select-Object -First 1)
+        $VaultDir = if ($ResolvedVault -and $ResolvedVault.Trim()) { $ResolvedVault.Trim() } else { Join-Path $ProjectRoot 'brain' }
     }
     $ManifestPath = Join-Path $VaultDir '.chroma\index-manifest.json'
     $HasEmbedder = ($InstalledModels | Where-Object { $_ -eq 'nomic-embed-text' -or $_ -like 'nomic-embed-text:*' }).Count -gt 0

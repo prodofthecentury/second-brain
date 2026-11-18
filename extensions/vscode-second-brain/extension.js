@@ -6,6 +6,10 @@ const os = require("os");
 const crypto = require("crypto");
 
 function getSecurityDir() {
+  const explicit = (process.env.BRAIN_SECURITY_STATE_DIR || "").trim();
+  if (explicit) {
+    return path.resolve(explicit);
+  }
   if (process.platform === "win32") {
     const localAppData =
       process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
@@ -67,14 +71,60 @@ function readOwnerToken() {
   return candidate && candidate.length >= 24 ? candidate : "";
 }
 
+function isPidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && err.code === "EPERM");
+  }
+}
+
+function discoverLiveApiPort() {
+  const explicitPortFile = (process.env.BRAIN_API_PORT_FILE || "").trim();
+  const portFile = explicitPortFile
+    ? path.resolve(explicitPortFile)
+    : path.join(getSecurityDir(), "api-port");
+  const raw = readSafeTokenFile(portFile);
+  if (!raw) return 0;
+  if (/^\d+$/.test(raw)) {
+    const p = Number(raw);
+    return p >= 1 && p <= 65535 ? p : 0;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return 0;
+    const port = Math.trunc(Number(parsed.port));
+    if (!Number.isFinite(port) || port < 1 || port > 65535) return 0;
+    if (parsed.pid !== undefined && parsed.pid !== null) {
+      if (!isPidAlive(parsed.pid)) return 0;
+    }
+    return port;
+  } catch {
+    return 0;
+  }
+}
+
 function getPort() {
   const inspected = vscode.workspace
     .getConfiguration("secondBrain")
     .inspect("apiPort");
-  const raw = inspected?.globalValue ?? inspected?.defaultValue ?? 43124;
-  const parsed = Math.trunc(Number(raw));
-  if (!Number.isFinite(parsed)) return 43124;
-  return Math.max(1, Math.min(65535, parsed));
+  const defaultPort =
+    Math.trunc(Number(inspected?.defaultValue ?? 8765)) || 8765;
+  const userGlobal = inspected?.globalValue;
+  if (typeof userGlobal === "number" && Number.isFinite(userGlobal)) {
+    const customPort = Math.trunc(userGlobal);
+    if (customPort >= 1 && customPort <= 65535 && customPort !== defaultPort) {
+      return customPort;
+    }
+  }
+  const discovered = discoverLiveApiPort();
+  if (discovered >= 1 && discovered <= 65535) {
+    return discovered;
+  }
+  return 8765;
 }
 
 function apiRequest(method, apiPath, body = null, { useOwnerToken = true } = {}) {
