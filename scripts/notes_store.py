@@ -66,6 +66,7 @@ from lexical_store import (  # noqa: E402
 )
 from memory_format import split_frontmatter  # noqa: E402
 from memory_review import parse_frontmatter_values, parse_scalar_list  # noqa: E402
+from recall import normalize_project_tag, project_tags_match  # noqa: E402
 
 NOTE_ORIGINS = frozenset({"owner_note", "owner_import", "agent_capture"})
 AGENT_ORIGINS = frozenset({"agent_capture"})
@@ -75,6 +76,14 @@ DISALLOWED_ACTORS = frozenset({"auto", "system", "llm", "model", "ollama", "assi
 _O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: prevent CRLF translation that breaks hashes
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]")
+_CHECKBOX_TASK_RE = re.compile(r"^\s*[-*+]\s*\[([ xX])\]\s+(.+)$")
+_KEYWORD_TASK_RE = re.compile(r"^\s*(?:[-*+]\s+)?(TODO|ACTION|FIXME)\s*:\s*(.+)$")
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+_DUE_DATE_RE = re.compile(r"(?:@due\((\d{4}-\d{2}-\d{2})\)|\bdue:(\d{4}-\d{2}-\d{2})\b)", re.IGNORECASE)
+_PRIORITY_RE = re.compile(r"(?:(?<!\S)!(high|medium|low)\b|\[(P1|P2|P3)\])", re.IGNORECASE)
+_INLINE_TAG_RE = re.compile(r"(?<!\S)(?:#([A-Za-z0-9_:/.-]+)|(project:[A-Za-z0-9_:/.-]+))")
+_SKIP_RAW_FILENAMES = frozenset({"reading-list.md", "readme.md"})
+_SKIP_RAW_DIRS = frozenset({".history", ".trash", "inbox", "archive", "note-snapshots"})
 
 
 class NoteError(ValueError):
@@ -466,12 +475,38 @@ def _search_with_heal(fn, paths: NotePaths):
         return fn()
 
 
-def search_notes(query: str, *, limit: int = 8, paths: NotePaths = DEFAULT_PATHS) -> list[NoteRecord]:
+def _matches_project_scope(tags: tuple[str, ...] | list[str], scope_tag: str) -> bool:
+    """Strict multi-project containment: require >=1 project:* tag and every project:* tag within scope_tag."""
+    if not scope_tag:
+        return True
+    proj_tags = [str(t).strip() for t in tags if str(t).strip().lower().startswith("project:")]
+    return bool(proj_tags) and all(bool(project_tags_match((t,), (scope_tag,))) for t in proj_tags)
+
+
+def search_notes(
+    query: str,
+    *,
+    limit: int = 8,
+    project: str | None = None,
+    paths: NotePaths = DEFAULT_PATHS,
+) -> list[NoteRecord]:
+    eff_limit = max(1, int(limit))
+    scope_raw = (project or "").strip()
+    scope_tag = normalize_project_tag(scope_raw) if scope_raw else ""
+    fetch_limit = max(eff_limit * 5, 40) if scope_tag else eff_limit
     hits = _search_with_heal(
-        lambda: search_lexical_index(query, paths.index_path, n_results=limit, atoms_dir=paths.notes_dir),
+        lambda: search_lexical_index(query, paths.index_path, n_results=fetch_limit, atoms_dir=paths.notes_dir),
         paths,
     )
-    return [_record_from_text(h.filename, h.content, h.content_sha256, query=query) for h in hits]
+    records: list[NoteRecord] = []
+    for h in hits:
+        rec = _record_from_text(h.filename, h.content, h.content_sha256, query=query)
+        if scope_tag and not _matches_project_scope(rec.tags, scope_tag):
+            continue
+        records.append(rec)
+        if len(records) >= eff_limit:
+            break
+    return records
 
 
 def list_notes(
@@ -687,6 +722,259 @@ def _active_cli_note_paths() -> NotePaths:
     return NotePaths.for_brain(resolve_active_brain_dir())
 
 
+def _parse_due_date(line_text: str) -> str | None:
+    match = _DUE_DATE_RE.search(line_text)
+    if not match:
+        return None
+    candidate = match.group(1) or match.group(2)
+    try:
+        datetime.date.fromisoformat(candidate)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _parse_priority(line_text: str) -> str | None:
+    match = _PRIORITY_RE.search(line_text)
+    if not match:
+        return None
+    if match.group(1):
+        return match.group(1).lower()
+    p_code = (match.group(2) or "").upper()
+    return {"P1": "high", "P2": "medium", "P3": "low"}.get(p_code)
+
+
+def _extract_inline_tags(line_text: str) -> list[str]:
+    found: list[str] = []
+    for match in _INLINE_TAG_RE.finditer(line_text):
+        raw_tok = (match.group(1) or match.group(2) or "").rstrip(".,;:!?)")
+        cleaned = re.sub(r"[^A-Za-z0-9_:/.-]", "", raw_tok)[:64]
+        if cleaned and cleaned not in found:
+            found.append(cleaned)
+    return found
+
+
+def _frontmatter_body_start_index(lines: list[str]) -> int:
+    if not lines or lines[0].strip() != "---":
+        return 0
+    end_idx: int | None = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            end_idx = idx
+            break
+    if end_idx is None:
+        return 0
+    if any(re.match(r"^[A-Za-z0-9_-]+\s*:", ln) for ln in lines[1:end_idx]):
+        return end_idx + 1
+    return 0
+
+
+def _scan_file_action_items(
+    *,
+    filepath: Path,
+    filename: str,
+    source_kind: str,
+    max_bytes: int,
+) -> list[dict[str, object]]:
+    try:
+        st = filepath.stat()
+    except OSError:
+        return []
+    if st.st_size <= 0 or st.st_size > max_bytes:
+        return []
+    try:
+        raw_bytes = filepath.read_bytes()
+    except OSError:
+        return []
+    digest = content_sha256(raw_bytes)
+    full_text = raw_bytes.decode("utf-8", errors="replace")
+
+    if filename.lower().endswith(".md"):
+        meta, body_for_title = parse_note(full_text, filename)
+        raw_title = str(meta.get("title") or meta.get("document_title") or "").strip()
+        if not raw_title or raw_title == Path(filename).stem:
+            first_h = re.search(r"^#\s+(.+)$", body_for_title or "", re.MULTILINE)
+            if first_h:
+                raw_title = first_h.group(1).strip()
+        title = _clean_line(raw_title or Path(filename).stem)
+        base_tags: list[str] = []
+        for field_key in ("tags", "contexts"):
+            vals = meta.get(field_key, [])
+            if isinstance(vals, str):
+                vals = parse_scalar_list(vals)
+            if isinstance(vals, (list, tuple)):
+                for v in vals:
+                    sv = str(v).strip()
+                    if sv and sv not in base_tags:
+                        base_tags.append(sv)
+    else:
+        first_nonempty = next((ln.strip() for ln in full_text.splitlines() if ln.strip()), "")
+        heading = re.match(r"^#\s+(.+)$", first_nonempty)
+        title = _clean_line(heading.group(1) if heading else Path(filename).stem)
+        base_tags = []
+
+    lines = full_text.splitlines()
+    start_idx = _frontmatter_body_start_index(lines) if filename.lower().endswith(".md") else 0
+
+    in_fence_char: str | None = None
+    in_fence_len: int = 0
+    extracted: list[dict[str, object]] = []
+
+    for idx in range(start_idx, len(lines)):
+        line = lines[idx]
+        line_number = idx + 1
+
+        if in_fence_char is not None:
+            if re.match(rf"^\s*{re.escape(in_fence_char)}{{{in_fence_len},}}\s*$", line):
+                in_fence_char = None
+                in_fence_len = 0
+            continue
+
+        fence_match = _FENCE_OPEN_RE.match(line)
+        if fence_match:
+            token = fence_match.group(1)
+            rest = line[fence_match.end() :]
+            # Single-line inline fence (e.g. ```foo```) does not open a multi-line block
+            if token[0] == "`" and token in rest:
+                continue
+            in_fence_char = token[0]
+            in_fence_len = len(token)
+            continue
+
+        cb_match = _CHECKBOX_TASK_RE.match(line)
+        if cb_match:
+            completed = cb_match.group(1) in ("x", "X")
+            marker = "checkbox"
+            raw_item_text = cb_match.group(2)
+        else:
+            kw_match = _KEYWORD_TASK_RE.match(line)
+            if not kw_match:
+                continue
+            completed = False
+            marker = kw_match.group(1).lower()
+            raw_item_text = kw_match.group(2)
+
+        item_text = _clean_line(raw_item_text, max_len=500)
+        if not item_text:
+            continue
+
+        inline_tags = _extract_inline_tags(raw_item_text)
+        merged_tags = list(dict.fromkeys([*base_tags, *inline_tags]))
+        item_projects = list(
+            dict.fromkeys(
+                normalize_project_tag(t)
+                for t in merged_tags
+                if t.lower().startswith("project:") and normalize_project_tag(t)
+            )
+        )
+
+        extracted.append(
+            {
+                "text": item_text,
+                "completed": completed,
+                "marker": marker,
+                "source_kind": source_kind,
+                "filename": filename,
+                "title": title,
+                "line_number": line_number,
+                "sha256": digest,
+                "tags": merged_tags,
+                "projects": item_projects,
+                "due_date": _parse_due_date(raw_item_text),
+                "priority": _parse_priority(raw_item_text),
+            }
+        )
+    return extracted
+
+
+def extract_action_items(
+    *,
+    paths: NotePaths = DEFAULT_PATHS,
+    raw_dir: str | Path | None = None,
+    include_completed: bool = False,
+    include_raw: bool = True,
+    project: str | None = None,
+    tag: str | None = None,
+) -> list[dict[str, object]]:
+    """Model-free deterministic scanner for tasks and action items across working notes and local raw captures."""
+    scope_raw = (project or "").strip()
+    scope_tag = normalize_project_tag(scope_raw) if scope_raw else ""
+    wanted_tag = (tag or "").strip().lstrip("#").casefold()
+    wanted_proj_tag = normalize_project_tag(wanted_tag) if wanted_tag.startswith("project:") else ""
+
+    all_items: list[dict[str, object]] = []
+
+    notes_root = Path(paths.notes_dir)
+    if os.path.lexists(str(notes_root)) and _is_reparse_or_link(str(notes_root)):
+        raise PermissionError(f"Refusing to scan symlinked notes directory: {notes_root}")
+    if notes_root.is_dir():
+        for entry in sorted(os.listdir(notes_root)):
+            if entry.startswith((".", "~")) or entry == "README.md" or not entry.lower().endswith(".md"):
+                continue
+            safe_path = safe_file_in_dir(str(notes_root), entry, allowed_exts={".md"}, must_exist=True)
+            if not safe_path or _is_reparse_or_link(safe_path) or not os.path.isfile(safe_path):
+                continue
+            all_items.extend(
+                _scan_file_action_items(
+                    filepath=Path(safe_path),
+                    filename=entry,
+                    source_kind="note",
+                    max_bytes=MAX_NOTE_BYTES,
+                )
+            )
+
+    if include_raw:
+        resolved_raw = Path(raw_dir) if raw_dir is not None else (Path(paths.brain_dir) / "0-raw")
+        if os.path.lexists(str(resolved_raw)) and _is_reparse_or_link(str(resolved_raw)):
+            raise PermissionError(f"Refusing to scan symlinked raw directory: {resolved_raw}")
+        if resolved_raw.is_dir():
+            for entry in sorted(os.listdir(resolved_raw)):
+                if (
+                    entry.startswith((".", "~"))
+                    or entry.lower() in _SKIP_RAW_FILENAMES
+                    or entry.lower() in _SKIP_RAW_DIRS
+                ):
+                    continue
+                ext = os.path.splitext(entry)[1].lower()
+                if ext not in {".md", ".txt"}:
+                    continue
+                safe_raw = safe_file_in_dir(str(resolved_raw), entry, allowed_exts={".md", ".txt"}, must_exist=True)
+                if not safe_raw or _is_reparse_or_link(safe_raw) or not os.path.isfile(safe_raw):
+                    continue
+                all_items.extend(
+                    _scan_file_action_items(
+                        filepath=Path(safe_raw),
+                        filename=entry,
+                        source_kind="raw_capture",
+                        max_bytes=MAX_NOTE_BYTES * 4,
+                    )
+                )
+
+    filtered: list[dict[str, object]] = []
+    for item in all_items:
+        if not include_completed and bool(item["completed"]):
+            continue
+        if scope_tag:
+            projs = list(item.get("projects") or [])
+            if not projs or not all(bool(project_tags_match((str(p),), (scope_tag,))) for p in projs):
+                continue
+        if wanted_tag:
+            tags_list = [str(t) for t in (item.get("tags") or [])]
+            direct_hit = any(t.lstrip("#").casefold() == wanted_tag for t in tags_list)
+            proj_hit = bool(
+                wanted_proj_tag
+                and any(
+                    bool(project_tags_match((str(t),), (wanted_proj_tag,)))
+                    for t in tags_list
+                    if str(t).lower().startswith("project:")
+                )
+            )
+            if not (direct_hit or proj_hit):
+                continue
+        filtered.append(item)
+    return filtered
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -703,6 +991,7 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("search", help="Search notes.")
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=8)
+    s.add_argument("--project", default=None, help="Filter notes strictly to project:<slug>.")
     s.add_argument("--json", action="store_true", help="Emit JSON output.")
     ls = sub.add_parser("list", help="List notes.")
     ls.add_argument("--limit", type=int, default=50)
@@ -719,6 +1008,12 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--memory-type", "--type", dest="memory_type", default="semantic", choices=["semantic", "episodic", "procedural", "self"])
     v.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Tag or comma-separated tags (repeatable).")
     v.add_argument("--json", action="store_true", help="Emit JSON output.")
+    t = sub.add_parser("tasks", help="Extract structured action items from working notes and raw captures.")
+    t.add_argument("--include-completed", action="store_true", help="Include completed [x] tasks.")
+    t.add_argument("--no-raw", action="store_true", help="Scan working notes only, skipping 0-raw/.")
+    t.add_argument("--project", default=None, help="Filter action items strictly to project:<slug>.")
+    t.add_argument("--tag", default=None, help="Filter action items by tag.")
+    t.add_argument("--json", action="store_true", help="Emit JSON array of extracted action items.")
     args = parser.parse_args(argv)
     cli_paths = _active_cli_note_paths()
 
@@ -749,7 +1044,13 @@ def main(argv: list[str] | None = None) -> int:
                 body = sys.stdin.read()
         print(json.dumps(create_note(title, body, tags=_split_cli_tags(args.tags), paths=cli_paths), indent=2, ensure_ascii=False))
     elif args.cmd == "search":
-        print(json.dumps([r.as_dict() for r in search_notes(args.query, limit=args.limit, paths=cli_paths)], indent=2, ensure_ascii=False))
+        print(
+            json.dumps(
+                [r.as_dict() for r in search_notes(args.query, limit=args.limit, project=args.project, paths=cli_paths)],
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
     elif args.cmd == "list":
         items, total = list_notes(limit=args.limit, paths=cli_paths)
         print(json.dumps({"total": total, "items": [r.as_dict() for r in items]}, indent=2, ensure_ascii=False))
@@ -776,6 +1077,33 @@ def main(argv: list[str] | None = None) -> int:
             indent=2,
             ensure_ascii=False,
         ))
+    elif args.cmd == "tasks":
+        items = extract_action_items(
+            paths=cli_paths,
+            include_completed=args.include_completed,
+            include_raw=not args.no_raw,
+            project=args.project,
+            tag=args.tag,
+        )
+        if args.json:
+            print(json.dumps(items, indent=2, ensure_ascii=False))
+        elif not items:
+            print("No matching action items.")
+        else:
+            for item in items:
+                box = "[x]" if item["completed"] else "[ ]"
+                meta_bits = []
+                if item.get("priority"):
+                    meta_bits.append(f"priority={item['priority']}")
+                if item.get("due_date"):
+                    meta_bits.append(f"due={item['due_date']}")
+                if item.get("projects"):
+                    meta_bits.append("projects=" + ",".join(str(p) for p in item["projects"]))
+                suffix = f" ({'; '.join(meta_bits)})" if meta_bits else ""
+                print(
+                    f"{box} [{item['source_kind']}:{item['filename']}:{item['line_number']}] "
+                    f"({item['marker']}) {item['text']}{suffix}"
+                )
     return 0
 
 

@@ -395,55 +395,21 @@ def verify_vault_ledger(
     }
 
 
-def prove_leaf_membership(
-    target_ref: str,
+def _build_proof_from_merkle(
+    target_rel: str,
     *,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
-    playbooks_dir: str | None = None,
+    merkle: dict[str, Any],
+    brain_dir: str,
+    atoms_dir: str,
+    playbooks_dir: str | None,
+    include_kind: bool = True,
+    not_member_label: str = "",
 ) -> dict[str, Any]:
-    """Generate a portable Merkle inclusion proof for an accepted atom or playbook leaf."""
-    raw_name = str(target_ref or "").strip().replace("\\", "/")
-    if not raw_name:
-        raise FileNotFoundError(f"Leaf not found: {target_ref}")
-    pb_dir = playbooks_dir if playbooks_dir is not None else os.path.join(brain_dir, "5-playbooks")
-
-    if raw_name.startswith("2-atoms/"):
-        sub = raw_name[len("2-atoms/") :]
-        norm_name = sub if sub.lower().endswith(".md") else f"{sub}.md"
-        safe_path = safe_file_in_dir(atoms_dir, norm_name, allowed_exts={".md"}, must_exist=True)
-        if not safe_path:
-            raise FileNotFoundError(f"Atom not found: {target_ref}")
-        target_rel = f"2-atoms/{os.path.basename(safe_path)}"
-    elif raw_name.startswith(("5-playbooks/", "playbooks/", "playbook:")):
-        if raw_name.startswith("5-playbooks/"):
-            sub = raw_name[len("5-playbooks/") :]
-        elif raw_name.startswith("playbooks/"):
-            sub = raw_name[len("playbooks/") :]
-        else:
-            sub = raw_name[len("playbook:") :]
-        norm_name = sub if sub.lower().endswith(".md") else f"{sub}.md"
-        safe_path = safe_file_in_dir(pb_dir, norm_name, allowed_exts={".md"}, must_exist=True)
-        if not safe_path:
-            raise FileNotFoundError(f"Playbook not found: {target_ref}")
-        target_rel = f"5-playbooks/{os.path.basename(safe_path)}"
-    else:
-        norm_name = raw_name if raw_name.lower().endswith(".md") else f"{raw_name}.md"
-        safe_atom = safe_file_in_dir(atoms_dir, norm_name, allowed_exts={".md"}, must_exist=True)
-        if safe_atom:
-            target_rel = f"2-atoms/{os.path.basename(safe_atom)}"
-        else:
-            safe_pb = safe_file_in_dir(pb_dir, norm_name, allowed_exts={".md"}, must_exist=True)
-            if safe_pb:
-                target_rel = f"5-playbooks/{os.path.basename(safe_pb)}"
-            else:
-                raise FileNotFoundError(f"Leaf not found: {target_ref}")
-
-    merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
     leaves = merkle["leaves"]
     idx = next((i for i, leaf in enumerate(leaves) if leaf["rel_path"] == target_rel), None)
     if idx is None:
-        raise PermissionError(f"Leaf '{target_ref}' is not an accepted member of the verified vault Merkle tree.")
+        label = not_member_label or target_rel
+        raise PermissionError(f"Leaf '{label}' is not an accepted member of the verified vault Merkle tree.")
 
     levels = _build_merkle_levels([leaf["leaf_sha256"] for leaf in leaves])
     siblings: list[dict[str, str]] = []
@@ -459,9 +425,8 @@ def prove_leaf_membership(
         cur_idx //= 2
 
     ledger = verify_vault_ledger(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
-    return {
+    proof: dict[str, Any] = {
         "schema_version": 1,
-        "kind": leaves[idx]["kind"],
         "rel_path": target_rel,
         "file_sha256": leaves[idx]["file_sha256"],
         "leaf_sha256": leaves[idx]["leaf_sha256"],
@@ -469,6 +434,149 @@ def prove_leaf_membership(
         "merkle_root": merkle["merkle_root"],
         "ledger_head_entry_sha256": ledger["head_entry_sha256"] if ledger["synced_with_head"] else None,
     }
+    if include_kind:
+        proof["kind"] = leaves[idx]["kind"]
+    return proof
+
+
+def prove_leaf_membership(
+    target: str,
+    *,
+    kind: str = "auto",
+    brain_dir: str = BRAIN_DIR,
+    atoms_dir: str = ATOMS_DIR,
+    playbooks_dir: str | None = None,
+) -> dict[str, Any]:
+    """Generate a portable Merkle inclusion proof for a verified atom or active playbook leaf."""
+    clean_kind = str(kind or "auto").strip().lower()
+    if clean_kind not in {"auto", "atom", "playbook"}:
+        raise ValueError(f"Unsupported leaf kind: {kind!r}. Expected 'auto', 'atom', or 'playbook'.")
+
+    eff_atoms_dir = (
+        os.path.join(brain_dir, "2-atoms")
+        if atoms_dir == ATOMS_DIR and os.path.abspath(brain_dir) != os.path.abspath(BRAIN_DIR)
+        else atoms_dir
+    )
+    if playbooks_dir is not None:
+        eff_pb_dir = playbooks_dir
+    elif os.path.abspath(brain_dir) != os.path.abspath(BRAIN_DIR):
+        eff_pb_dir = os.path.join(brain_dir, "5-playbooks")
+    else:
+        eff_pb_dir = PLAYBOOKS_DIR
+
+    raw_target = str(target or "").strip()
+    if not raw_target:
+        raise FileNotFoundError("Leaf target must be non-empty.")
+
+    # Normalize explicit 'playbook:<name>' prefix while rejecting any other colon/drive/path tricks.
+    if raw_target.startswith("playbook:"):
+        raw_target = f"5-playbooks/{raw_target[len('playbook:'):]}"
+    if (
+        "\x00" in raw_target
+        or ":" in raw_target
+        or raw_target.startswith(("/", "\\"))
+        or os.path.isabs(raw_target)
+    ):
+        raise PermissionError(f"Unsafe or absolute leaf target rejected: {target!r}")
+
+    norm_rel = raw_target.replace("\\", "/")
+    parts = norm_rel.split("/")
+    if any(seg in {"", ".", ".."} for seg in parts):
+        raise PermissionError(f"Path traversal or malformed leaf target rejected: {target!r}")
+
+    def _resolve_leaf_file(base_dir: str, basename: str, prefix: str) -> str:
+        if os.path.lexists(base_dir) and _is_reparse_or_link(base_dir):
+            raise PermissionError(f"Refusing to resolve leaf under symlinked directory: {base_dir}")
+        md_name = basename if basename.lower().endswith(".md") else f"{basename}.md"
+        candidate_raw = os.path.join(base_dir, md_name)
+        if os.path.lexists(candidate_raw) and _is_reparse_or_link(candidate_raw):
+            raise PermissionError(f"Refusing to prove symlinked or reparse-point leaf: {target!r}")
+        safe_path = safe_file_in_dir(base_dir, md_name, allowed_exts={".md"}, must_exist=True)
+        if not safe_path or not os.path.isfile(safe_path) or _is_reparse_or_link(safe_path):
+            raise FileNotFoundError(f"Leaf target not found: {target}")
+        return f"{prefix}/{os.path.basename(safe_path)}"
+
+    if len(parts) == 2 and parts[0] == "2-atoms":
+        if clean_kind == "playbook":
+            raise PermissionError(f"Leaf prefix '2-atoms/' conflicts with kind='playbook': {target!r}")
+        target_rel = _resolve_leaf_file(eff_atoms_dir, parts[1], "2-atoms")
+    elif len(parts) == 2 and parts[0] in {"5-playbooks", "playbooks"}:
+        if clean_kind == "atom":
+            raise PermissionError(f"Leaf prefix '{parts[0]}/' conflicts with kind='atom': {target!r}")
+        target_rel = _resolve_leaf_file(eff_pb_dir, parts[1], "5-playbooks")
+    elif len(parts) > 1:
+        raise PermissionError(f"Unsupported leaf directory prefix in {target!r}")
+    else:
+        basename = parts[0]
+        if clean_kind == "atom":
+            target_rel = _resolve_leaf_file(eff_atoms_dir, basename, "2-atoms")
+        elif clean_kind == "playbook":
+            target_rel = _resolve_leaf_file(eff_pb_dir, basename, "5-playbooks")
+        else:
+            # Auto-detect across 2-atoms/ and 5-playbooks/, rejecting symlinks fail-closed first.
+            md_name = basename if basename.lower().endswith(".md") else f"{basename}.md"
+            for check_dir in (eff_atoms_dir, eff_pb_dir):
+                if os.path.lexists(check_dir) and _is_reparse_or_link(check_dir):
+                    raise PermissionError(f"Refusing to resolve leaf under symlinked directory: {check_dir}")
+                cand = os.path.join(check_dir, md_name)
+                if os.path.lexists(cand) and _is_reparse_or_link(cand):
+                    raise PermissionError(f"Refusing to prove symlinked or reparse-point leaf: {target!r}")
+            atom_safe = (
+                safe_file_in_dir(eff_atoms_dir, md_name, allowed_exts={".md"}, must_exist=True)
+                if os.path.isdir(eff_atoms_dir)
+                else None
+            )
+            pb_safe = (
+                safe_file_in_dir(eff_pb_dir, md_name, allowed_exts={".md"}, must_exist=True)
+                if os.path.isdir(eff_pb_dir)
+                else None
+            )
+            merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=eff_atoms_dir, playbooks_dir=eff_pb_dir)
+            leaf_paths = {leaf["rel_path"] for leaf in merkle["leaves"]}
+            atom_rel = f"2-atoms/{os.path.basename(atom_safe)}" if atom_safe else None
+            pb_rel = f"5-playbooks/{os.path.basename(pb_safe)}" if pb_safe else None
+            in_atom = bool(atom_rel and atom_rel in leaf_paths)
+            in_pb = bool(pb_rel and pb_rel in leaf_paths)
+            if in_atom and in_pb:
+                raise PermissionError(
+                    f"Ambiguous leaf target '{target}': present in both 2-atoms/ and 5-playbooks/; specify kind."
+                )
+            if in_atom and atom_rel is not None:
+                return _build_proof_from_merkle(
+                    atom_rel,
+                    merkle=merkle,
+                    brain_dir=brain_dir,
+                    atoms_dir=eff_atoms_dir,
+                    playbooks_dir=eff_pb_dir,
+                    include_kind=True,
+                    not_member_label=target,
+                )
+            if in_pb and pb_rel is not None:
+                return _build_proof_from_merkle(
+                    pb_rel,
+                    merkle=merkle,
+                    brain_dir=brain_dir,
+                    atoms_dir=eff_atoms_dir,
+                    playbooks_dir=eff_pb_dir,
+                    include_kind=True,
+                    not_member_label=target,
+                )
+            if atom_safe or pb_safe:
+                raise PermissionError(
+                    f"Target '{target}' is not an accepted member of the verified vault Merkle tree."
+                )
+            raise FileNotFoundError(f"Leaf target not found: {target}")
+
+    merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=eff_atoms_dir, playbooks_dir=eff_pb_dir)
+    return _build_proof_from_merkle(
+        target_rel,
+        merkle=merkle,
+        brain_dir=brain_dir,
+        atoms_dir=eff_atoms_dir,
+        playbooks_dir=eff_pb_dir,
+        include_kind=True,
+        not_member_label=target,
+    )
 
 
 def prove_atom_membership(
@@ -543,8 +651,9 @@ def main(argv: list[str] | None = None) -> int:
     p_verify = sub.add_parser("verify", help="Verify vault ledger chain and live Merkle root")
     p_verify.add_argument("--json", action="store_true")
 
-    p_prove = sub.add_parser("prove", help="Generate offline Merkle proof for an accepted atom or playbook")
+    p_prove = sub.add_parser("prove", help="Generate offline Merkle proof for a verified atom or playbook leaf")
     p_prove.add_argument("atom", help="Atom or playbook reference (e.g. 2-atoms/<name>, 5-playbooks/<name>, or <name>)")
+    p_prove.add_argument("--kind", choices=["auto", "atom", "playbook"], default="auto")
     p_prove.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
@@ -557,7 +666,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2) if args.json else f"chain_valid={res['chain_valid']} synced={res['synced_with_head']} root={res['live_merkle_root'][:16]}...")
         return 0 if res["chain_valid"] else 1
     if args.cmd == "prove":
-        res = prove_leaf_membership(args.atom)
+        res = prove_leaf_membership(args.atom, kind=args.kind)
         print(json.dumps(res, indent=2) if args.json else f"Proof for {res['rel_path']} root={res['merkle_root'][:16]}... valid={verify_merkle_proof(res)}")
         return 0
     return 1

@@ -7,16 +7,27 @@
 # ///
 """
 Feature 4 — Native MCP Server
-Exposes a deliberately limited MCP (Model Context Protocol) interface to a
-trusted local stdio process. It is disabled unless BRAIN_ENABLE_LOCAL_MCP=1 is set.
+Exposes a bounded, scope-enforced, audited MCP (Model Context Protocol) interface
+to a trusted local stdio process. It is disabled unless BRAIN_ENABLE_LOCAL_MCP=1 is set.
 
-Tools exposed:
-  search_memory(query, project?) — Shared recall over currently approved atoms
-  get_atom(atom_id)              — Read a specifically named, currently approved atom
-  add_to_inbox(content, source?) — Add a size-limited, untrusted capture to 0-raw/inbox/
-  search_notes(query, limit?)    — Search owner working notes in brain/notes/
-  get_note(filename)             — Read a working note from brain/notes/
-  remember(content, title?, tags?) — Save a clean working note (or quarantine risky/secret text to 0-raw/inbox/)
+Tools exposed (17 total):
+  search_memory(query, n_results?, project?)       — Shared recall over currently approved atoms
+  get_atom(atom_id)                                — Read a specifically named, currently approved atom
+  add_to_inbox(content, source?)                   — Add a size-limited, untrusted capture to 0-raw/inbox/
+  search_notes(query, limit?, project?)            — Search owner working notes in brain/notes/
+  get_note(filename)                               — Read a working note from brain/notes/
+  remember(content, title?, tags?)                 — Save a clean working note (or quarantine risky text)
+  list_playbooks(project?)                         — List active verified Skill Playbooks
+  get_playbook(playbook_id, project?)              — Read an active verified Skill Playbook
+  assemble_plan(goal, project?, mode?, max_steps?) — Assemble a grounded Executive Plan
+  list_contradictions(project?)                    — Detect contradictions & drift across approved atoms
+  graph_neighbors(atom_id, project?)               — Inspect 1-hop verified knowledge graph neighbors
+  list_snapshots()                                 — List content-free Time-Travel snapshot headers
+  recall_at_snapshot(query, snapshot_id, ...)      — Point-in-time recall with live revocation guard
+  verify_ledger()                                  — Verify vault Merkle ledger hash chain & live root
+  prove_leaf(leaf_id, kind?, project?)             — Generate portable Merkle inclusion proof for atom/playbook
+  record_experience(goal, result_summary, ...)     — Record risk-scanned episodic experience in 4-experiences/
+  record_feedback(atom_id, helpful, project?)      — Record disposable sidecar telemetry feedback
 
 Resources: no listable resource catalog; direct approved atom resources only.
 Tool/resource use is audited by canonical name and timestamp; input text is not logged.
@@ -26,66 +37,208 @@ Run only from an explicitly trusted local process:
     uv run scripts/mcp_server.py
 """
 
-import os
-import sys
-import json
-import datetime
-import hmac
-import secrets
-import tempfile
 from collections.abc import Mapping
+from contextlib import closing
+import datetime
+import glob
+import hmac
+import inspect
+import json
+import os
 from pathlib import Path
+import secrets
+import sqlite3
+import sys
+import tempfile
+from typing import Any
 
+from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config as _cfg
 from config import (
-    BRAIN_DIR, ATOMS_DIR, RAW_DIR, INBOX_DIR,
-    _is_reparse_or_link, ensure_dirs, today, now_slug,
-    normalize_markdown_filename, resolve_active_brain_dir,
-    safe_file_in_dir, security_state_dir, vault_paths_for,
+    ATOMS_DIR,
+    BRAIN_DIR,
+    BRIEFINGS_DIR,
+    INBOX_DIR,
+    RAW_DIR,
+    THREADS_DIR,
+    _is_reparse_or_link,
+    is_content_markdown,
+    normalize_markdown_filename,
+    now_slug,
+    resolve_active_brain_dir,
+    safe_file_in_dir,
+    security_state_dir,
+    today,
+    vault_paths_for,
 )
 from host_adapters import read_bounded_security_file, restrict_security_file_permissions
-from recall import MemoryRecallUnavailable, RecallOptions, search_memory
+from memory_format import split_frontmatter
+from memory_review import parse_atom_record, parse_frontmatter_values
+from recall import (
+    MemoryRecallUnavailable,
+    RecallOptions,
+    normalize_project_tag,
+    project_tags_match,
+    search_memory,
+)
 from review_atom import approved_revision_is_current
-from memory_review import parse_atom_record
 
 
 MAX_INBOX_CHARS = 100_000
 MIN_BEARER_TOKEN_LENGTH = 16
 MCP_AUDIT_PATH = os.path.join(RAW_DIR, "archive", "mcp-audit.jsonl")
+
 _INITIAL_BRAIN_DIR = BRAIN_DIR
 _INITIAL_ATOMS_DIR = ATOMS_DIR
 _INITIAL_INBOX_DIR = INBOX_DIR
 _INITIAL_MCP_AUDIT_PATH = MCP_AUDIT_PATH
-TOOL_NAMES = {"search_memory", "get_atom", "add_to_inbox", "search_notes", "get_note", "remember"}
+
+_IMPORT_BRAIN_DIR = os.path.abspath(BRAIN_DIR)
+_IMPORT_ATOMS_DIR = os.path.abspath(ATOMS_DIR)
+_IMPORT_RAW_DIR = os.path.abspath(RAW_DIR)
+_IMPORT_INBOX_DIR = os.path.abspath(INBOX_DIR)
+_IMPORT_BRIEFINGS_DIR = os.path.abspath(BRIEFINGS_DIR)
+_IMPORT_AUDIT_PATH = os.path.abspath(MCP_AUDIT_PATH)
+
+TOOL_NAMES = {
+    "search_memory",
+    "get_atom",
+    "add_to_inbox",
+    "search_notes",
+    "get_note",
+    "remember",
+    "list_playbooks",
+    "get_playbook",
+    "assemble_plan",
+    "list_contradictions",
+    "graph_neighbors",
+    "list_snapshots",
+    "recall_at_snapshot",
+    "verify_ledger",
+    "prove_leaf",
+    "record_experience",
+    "record_feedback",
+}
 UNAVAILABLE_ATOM_MESSAGE = "Atom not found or not currently owner-approved for external reading."
+UNAVAILABLE_PLAYBOOK_MESSAGE = "Playbook not found or not currently active in scope."
+UNAVAILABLE_GRAPH_ATOM_MESSAGE = "Atom not found or not currently available in graph scope."
+UNAVAILABLE_LEAF_PROOF_MESSAGE = "Verified leaf proof not found in scope."
+UNAVAILABLE_FEEDBACK_ATOM_MESSAGE = "Atom not found or not currently available for feedback in scope."
+
+
+# ─── Dynamic Vault Path Resolution ────────────────────────────────────────────
+
+def _resolve_vault_dirs() -> dict[str, str]:
+    """Resolve isolated or live vault subdirectories dynamically at request time."""
+    cur_brain = os.path.abspath(BRAIN_DIR)
+    cur_atoms = os.path.abspath(ATOMS_DIR)
+    cfg_brain = os.path.abspath(_cfg.BRAIN_DIR)
+    cfg_atoms = os.path.abspath(_cfg.ATOMS_DIR)
+
+    if cur_brain != _IMPORT_BRAIN_DIR:
+        brain_dir = cur_brain
+        atoms_dir = cur_atoms if cur_atoms != _IMPORT_ATOMS_DIR else os.path.join(brain_dir, "2-atoms")
+    elif cur_atoms != _IMPORT_ATOMS_DIR:
+        atoms_dir = cur_atoms
+        brain_dir = os.path.dirname(atoms_dir)
+    elif cfg_brain != _IMPORT_BRAIN_DIR:
+        brain_dir = cfg_brain
+        atoms_dir = cfg_atoms if cfg_atoms != _IMPORT_ATOMS_DIR else os.path.join(brain_dir, "2-atoms")
+    else:
+        brain_dir = os.path.abspath(resolve_active_brain_dir())
+        atoms_dir = os.path.join(brain_dir, "2-atoms")
+
+    cfg_matches = os.path.normcase(brain_dir) == os.path.normcase(cfg_brain)
+    cur_raw = os.path.abspath(RAW_DIR)
+    cur_inbox = os.path.abspath(INBOX_DIR)
+    cur_briefings = os.path.abspath(BRIEFINGS_DIR)
+
+    raw_dir = (
+        cur_raw
+        if cur_raw != _IMPORT_RAW_DIR
+        else (_cfg.RAW_DIR if cfg_matches else os.path.join(brain_dir, "0-raw"))
+    )
+    inbox_dir = (
+        cur_inbox
+        if cur_inbox != _IMPORT_INBOX_DIR
+        else (_cfg.INBOX_DIR if cfg_matches else os.path.join(raw_dir, "inbox"))
+    )
+    briefings_dir = (
+        cur_briefings
+        if cur_briefings != _IMPORT_BRIEFINGS_DIR
+        else (_cfg.BRIEFINGS_DIR if cfg_matches else os.path.join(brain_dir, "briefings"))
+    )
+    playbooks_dir = _cfg.PLAYBOOKS_DIR if cfg_matches else os.path.join(brain_dir, "5-playbooks")
+    experiences_dir = _cfg.EXPERIENCES_DIR if cfg_matches else os.path.join(brain_dir, "4-experiences")
+    sidecar_dir = _cfg.SIDECAR_DIR if cfg_matches else os.path.join(brain_dir, ".sidecar")
+    lexical_index_path = _cfg.LEXICAL_INDEX_PATH if cfg_matches else os.path.join(sidecar_dir, "lexical.sqlite3")
+    chroma_path = _cfg.CHROMA_PATH if cfg_matches else os.path.join(brain_dir, ".chroma")
+    telemetry_db_path = _cfg.TELEMETRY_DB_PATH if cfg_matches else os.path.join(sidecar_dir, "telemetry.sqlite3")
+    return {
+        "brain_dir": brain_dir,
+        "atoms_dir": atoms_dir,
+        "raw_dir": raw_dir,
+        "inbox_dir": inbox_dir,
+        "briefings_dir": briefings_dir,
+        "playbooks_dir": playbooks_dir,
+        "experiences_dir": experiences_dir,
+        "sidecar_dir": sidecar_dir,
+        "lexical_index_path": lexical_index_path,
+        "chroma_path": chroma_path,
+        "telemetry_db_path": telemetry_db_path,
+    }
+
+
+def ensure_dirs(brain_dir: str | None = None) -> None:
+    """Create vault directories for the active vault without touching live brain/ during isolated tests."""
+    if brain_dir is not None:
+        _cfg.ensure_dirs(brain_dir)
+        return
+    vdirs = _resolve_vault_dirs()
+    if os.path.normcase(vdirs["brain_dir"]) == os.path.normcase(os.path.abspath(_cfg.BRAIN_DIR)):
+        _cfg.ensure_dirs()
+        return
+    for key in (
+        "raw_dir",
+        "inbox_dir",
+        "atoms_dir",
+        "briefings_dir",
+        "playbooks_dir",
+        "experiences_dir",
+        "sidecar_dir",
+        "chroma_path",
+    ):
+        os.makedirs(vdirs[key], exist_ok=True)
+    for extra in ("1-desk", "3-threads", "sources", "notes"):
+        os.makedirs(os.path.join(vdirs["brain_dir"], extra), exist_ok=True)
+    os.makedirs(os.path.join(vdirs["raw_dir"], "note-snapshots"), exist_ok=True)
+    os.makedirs(os.path.join(vdirs["raw_dir"], "archive"), exist_ok=True)
 
 
 def _effective_mcp_paths() -> tuple[str, str, str, str]:
     """Return (brain_dir, atoms_dir, inbox_dir, audit_path), honoring monkeypatches or live vault-path.txt."""
-    dyn = vault_paths_for(resolve_active_brain_dir())
-    brain_dir = BRAIN_DIR if BRAIN_DIR != _INITIAL_BRAIN_DIR else dyn["brain_dir"]
-    if ATOMS_DIR != _INITIAL_ATOMS_DIR:
-        atoms_dir = ATOMS_DIR
-        if BRAIN_DIR == _INITIAL_BRAIN_DIR:
-            brain_dir = os.path.dirname(os.path.abspath(atoms_dir))
-    else:
-        atoms_dir = os.path.join(brain_dir, "2-atoms") if BRAIN_DIR != _INITIAL_BRAIN_DIR else dyn["atoms_dir"]
-    if INBOX_DIR != _INITIAL_INBOX_DIR:
-        inbox_dir = INBOX_DIR
-    else:
-        inbox_dir = os.path.join(brain_dir, "0-raw", "inbox") if BRAIN_DIR != _INITIAL_BRAIN_DIR else dyn["inbox_dir"]
-    if MCP_AUDIT_PATH != _INITIAL_MCP_AUDIT_PATH:
-        audit_path = MCP_AUDIT_PATH
-    else:
-        audit_path = os.path.join(brain_dir, "0-raw", "archive", "mcp-audit.jsonl")
-    return brain_dir, atoms_dir, inbox_dir, audit_path
+    vdirs = _resolve_vault_dirs()
+    cur_audit = os.path.abspath(MCP_AUDIT_PATH)
+    audit_path = cur_audit if cur_audit != _IMPORT_AUDIT_PATH else os.path.join(vdirs["raw_dir"], "archive", "mcp-audit.jsonl")
+    return vdirs["brain_dir"], vdirs["atoms_dir"], vdirs["inbox_dir"], audit_path
 
 
 # ─── Security & Authorization ─────────────────────────────────────────────────
+
+def _assert_no_symlink_ancestors(target: Path) -> None:
+    cur = Path(os.path.abspath(str(target)))
+    while True:
+        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+            raise PermissionError(f"Refusing to access MCP security path through a symlink or reparse point: {cur}")
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+
 
 def default_mcp_token_path() -> Path:
     override = (os.environ.get("BRAIN_MCP_TOKEN_FILE") or "").strip()
@@ -127,10 +280,7 @@ def save_bearer_token(token: str, token_path: Path | None = None) -> Path:
         raise ValueError(f"MCP bearer token must contain at least {MIN_BEARER_TOKEN_LENGTH} characters.")
     raw_path = Path(token_path or default_mcp_token_path()).expanduser()
     path = Path(os.path.abspath(str(raw_path)))
-    if (os.path.lexists(str(path)) and _is_reparse_or_link(str(path))) or (
-        os.path.lexists(str(path.parent)) and _is_reparse_or_link(str(path.parent))
-    ):
-        raise PermissionError("Refusing to write MCP bearer token through a symlink or reparse point.")
+    _assert_no_symlink_ancestors(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if _is_reparse_or_link(str(path.parent)) or (os.path.lexists(str(path)) and _is_reparse_or_link(str(path))):
         raise PermissionError("Refusing to write MCP bearer token through a symlink or reparse point.")
@@ -159,6 +309,33 @@ def save_bearer_token(token: str, token_path: Path | None = None) -> Path:
             except OSError:
                 pass
     return path
+
+
+def ensure_local_mcp_token(path: Path | None = None) -> str:
+    """Read or provision an owner-only local MCP token file, rejecting symlinks/reparse points."""
+    if path is None:
+        existing = get_configured_bearer_token()
+        if existing:
+            return existing
+        target = default_mcp_token_path()
+        _assert_no_symlink_ancestors(target)
+        created = generate_bearer_token()
+        save_bearer_token(created, target)
+        return created
+
+    target = Path(os.path.abspath(str(Path(path).expanduser())))
+    _assert_no_symlink_ancestors(target)
+    if os.path.lexists(str(target)):
+        try:
+            content = read_bounded_security_file(target, max_bytes=4096).strip()
+        except OSError as exc:
+            raise PermissionError(f"MCP token file could not be read safely: {exc}") from exc
+        if len(content) < MIN_BEARER_TOKEN_LENGTH:
+            raise PermissionError("MCP token file is empty or shorter than 16 characters.")
+        return content
+    created = generate_bearer_token()
+    save_bearer_token(created, target)
+    return created
 
 
 def _extract_token_from_meta(meta: object) -> str | None:
@@ -240,6 +417,7 @@ def get_allowed_tools() -> set[str]:
     allowed = {t.strip() for t in raw.split(",") if t.strip()}
     return allowed.intersection(TOOL_NAMES)
 
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def assert_mcp_loopback_transport(host: str | None = None) -> str:
@@ -263,8 +441,7 @@ def semantic_search(query: str, n_results: int = 5, project: str | None = None) 
     except (TypeError, ValueError):
         n_results = 5
     projects = (str(project).strip(),) if project and str(project).strip() else ()
-    brain_dir, atoms_dir, _, _ = _effective_mcp_paths()
-    vp = vault_paths_for(brain_dir)
+    vdirs = _resolve_vault_dirs()
     direct, neighbors = search_memory(
         query,
         RecallOptions(
@@ -273,9 +450,9 @@ def semantic_search(query: str, n_results: int = 5, project: str | None = None) 
             include_statuses={"accepted"},
             projects=projects,
         ),
-        atoms_dir=atoms_dir,
-        index_path=vp["lexical_index_path"],
-        chroma_path=vp["chroma_path"],
+        atoms_dir=vdirs["atoms_dir"],
+        index_path=vdirs["lexical_index_path"],
+        chroma_path=vdirs["chroma_path"],
     )
     return [item.as_dict() for item in direct + neighbors]
 
@@ -285,6 +462,100 @@ def read_file_safe(path: str | None) -> str:
         return ""
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def list_md_files(directory: str) -> list[str]:
+    if not os.path.exists(directory):
+        return []
+    return sorted([f for f in os.listdir(directory) if is_content_markdown(f)])
+
+
+def latest_briefing_path() -> str | None:
+    vdirs = _resolve_vault_dirs()
+    files = sorted(glob.glob(os.path.join(vdirs["briefings_dir"], "[0-9]*.md")), reverse=True)
+    return files[0] if files else None
+
+
+def _tags_strictly_in_project_scope(tags: list[str] | tuple[str, ...], project: str | None) -> bool:
+    """Enforce strict normalized multi-project containment (excluding unscoped & mixed-project items)."""
+    if not project or not str(project).strip():
+        return True
+    scope_tag = normalize_project_tag(str(project))
+    if not scope_tag:
+        return True
+    proj_tags = [str(t).strip() for t in (tags or ()) if str(t).strip().lower().startswith("project:")]
+    return bool(proj_tags) and all(bool(project_tags_match((t,), (scope_tag,))) for t in proj_tags)
+
+
+def _load_verified_non_preference_atom(
+    raw_atom_id: str,
+    *,
+    vdirs: dict[str, str],
+    project: str | None = None,
+) -> tuple[str, str, dict[str, Any]] | None:
+    """Validate safe basename, current CAS approval, non-superseded, non-preference, and project scope."""
+    cleaned = str(raw_atom_id or "").strip()
+    if (
+        not cleaned
+        or "../" in cleaned
+        or "..\\" in cleaned
+        or "/" in cleaned
+        or "\\" in cleaned
+        or ":" in cleaned
+        or "\x00" in cleaned
+    ):
+        return None
+    atom_id = normalize_markdown_filename(cleaned)
+    atoms_dir = vdirs["atoms_dir"]
+    if os.path.lexists(atoms_dir) and _is_reparse_or_link(atoms_dir):
+        return None
+    raw_candidate = os.path.join(atoms_dir, atom_id)
+    if os.path.lexists(raw_candidate) and _is_reparse_or_link(raw_candidate):
+        return None
+    path = safe_file_in_dir(atoms_dir, atom_id, allowed_exts={".md"}, must_exist=True)
+    if not path or not os.path.isfile(path) or _is_reparse_or_link(path):
+        return None
+    if not approved_revision_is_current(path, brain_dir=vdirs["brain_dir"], atoms_dir=atoms_dir):
+        return None
+    try:
+        raw_text = Path(path).read_text(encoding="utf-8")
+        record = parse_atom_record(path)
+    except Exception:
+        return None
+    if record.get("review_status") != "accepted" or bool(record.get("superseded_by")):
+        return None
+    fm_parsed = split_frontmatter(raw_text)
+    fm_vals = parse_frontmatter_values(fm_parsed[0]) if fm_parsed else {}
+    epistemic_label = str(fm_vals.get("epistemic_label") or record.get("epistemic_label") or "claim").strip()
+    if epistemic_label == "preference" or bool(fm_vals.get("epistemic_contract") or record.get("epistemic_contract")):
+        return None
+    contexts = list(record.get("contexts") or [])
+    if not _tags_strictly_in_project_scope(contexts, project):
+        return None
+    return atom_id, path, record
+
+
+def _bound_str_list(raw_val: Any, *, max_items: int = 32, max_len: int = 500) -> list[str]:
+    if raw_val is None:
+        return []
+    if not isinstance(raw_val, list):
+        raise ValueError("Expected an array of strings.")
+    out: list[str] = []
+    for item in raw_val[:max_items]:
+        s = str(item or "").strip()
+        if "\x00" in s:
+            raise ValueError("Null bytes are not allowed.")
+        if s:
+            out.append(s[:max_len])
+    return out
+
+
+def _resolve_default_audit_path() -> str:
+    cur_audit = os.path.abspath(MCP_AUDIT_PATH)
+    if cur_audit != _IMPORT_AUDIT_PATH:
+        return cur_audit
+    vdirs = _resolve_vault_dirs()
+    return os.path.join(vdirs["raw_dir"], "archive", "mcp-audit.jsonl")
 
 
 def audit_mcp_use(
@@ -305,11 +576,7 @@ def audit_mcp_use(
         raise ValueError("MCP audit action is not allowlisted.")
     if outcome not in {"authorized", "denied"}:
         raise ValueError("MCP audit outcome is not allowlisted.")
-    if audit_path is None:
-        _, _, _, default_audit = _effective_mcp_paths()
-        target_path = os.path.abspath(default_audit)
-    else:
-        target_path = os.path.abspath(audit_path)
+    target_path = os.path.abspath(audit_path or _resolve_default_audit_path())
     parent_dir = os.path.dirname(target_path)
     if (os.path.lexists(parent_dir) and _is_reparse_or_link(parent_dir)) or (
         os.path.lexists(target_path) and _is_reparse_or_link(target_path)
@@ -388,8 +655,9 @@ ALL_TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Keywords to search for."},
-                "limit": {"type": "integer", "description": "Max notes (default 6, max 20)."},
+                "query":   {"type": "string", "description": "Keywords to search for."},
+                "limit":   {"type": "integer", "description": "Max notes (default 6, max 20)."},
+                "project": {"type": "string", "description": "Optional project:<id> scope filter."},
             },
             "required": ["query"],
         },
@@ -417,6 +685,147 @@ ALL_TOOLS = [
                 "tags": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["content"],
+        },
+    ),
+    types.Tool(
+        name="list_playbooks",
+        description="List owner-promoted active Skill Playbooks verified against live backing atoms.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Optional project:<id> scope filter."},
+            },
+        },
+    ),
+    types.Tool(
+        name="get_playbook",
+        description="Read a verified active Skill Playbook by playbook_id or filename.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "playbook_id": {"type": "string", "description": "Playbook identifier or .md filename."},
+                "project":     {"type": "string", "description": "Optional project:<id> scope filter."},
+            },
+            "required": ["playbook_id"],
+        },
+    ),
+    types.Tool(
+        name="assemble_plan",
+        description="Assemble a read-only Executive Plan grounded strictly in active Playbooks and approved Atoms.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "goal":      {"type": "string", "description": "Objective or task goal to plan."},
+                "project":   {"type": "string", "description": "Optional project:<id> scope filter."},
+                "mode":      {"type": "string", "enum": ["deterministic", "model_assisted"], "description": "Planning mode (default deterministic)."},
+                "max_steps": {"type": "integer", "description": "Maximum number of plan steps (1-20)."},
+            },
+            "required": ["goal"],
+        },
+    ),
+    types.Tool(
+        name="list_contradictions",
+        description="Run the deterministic Contradiction & Drift Radar over owner-approved non-preference atoms.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Optional project:<id> scope filter."},
+            },
+        },
+    ),
+    types.Tool(
+        name="graph_neighbors",
+        description="Inspect 1-hop verified knowledge graph edges and contradictions for an approved atom.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "atom_id": {"type": "string", "description": "Approved atom filename (e.g. 2026-0619-sodium-ion.md)."},
+                "project": {"type": "string", "description": "Optional project:<id> scope filter."},
+            },
+            "required": ["atom_id"],
+        },
+    ),
+    types.Tool(
+        name="list_snapshots",
+        description="List content-free immutable Time-Travel snapshot headers.",
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    types.Tool(
+        name="recall_at_snapshot",
+        description="Run point-in-time BM25 recall over an immutable snapshot, filtered against live revocations.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query":       {"type": "string", "description": "Search query against the snapshot."},
+                "snapshot_id": {"type": "string", "description": "Snapshot ID from list_snapshots."},
+                "project":     {"type": "string", "description": "Optional project:<id> scope filter."},
+                "top_k":       {"type": "integer", "description": "Max results (default 5, max 25)."},
+            },
+            "required": ["query", "snapshot_id"],
+        },
+    ),
+    types.Tool(
+        name="verify_ledger",
+        description="Verify the tamper-evident vault Merkle ledger hash chain against the live vault Merkle root.",
+        inputSchema={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    types.Tool(
+        name="prove_leaf",
+        description="Export a portable offline SHA-256 Merkle inclusion proof for a verified atom or active playbook.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "leaf_id": {"type": "string", "description": "Atom or Playbook filename/identifier."},
+                "kind":    {"type": "string", "enum": ["auto", "atom", "playbook"], "description": "Leaf type (default auto)."},
+                "project": {"type": "string", "description": "Optional project:<id> scope filter."},
+            },
+            "required": ["leaf_id"],
+        },
+    ),
+    types.Tool(
+        name="record_experience",
+        description="Save a risk-scanned immutable Experience Record in 4-experiences/ (optionally staging a candidate skill to 0-raw/inbox/).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "goal":               {"type": "string", "maxLength": 500, "description": "Task goal."},
+                "result_summary":     {"type": "string", "maxLength": 4000, "description": "Outcome summary."},
+                "success":            {"type": "boolean", "description": "Whether the task succeeded."},
+                "context":            {"type": "string", "maxLength": 1000, "description": "Optional task context."},
+                "plan":               {"type": "array", "items": {"type": "string"}, "description": "Planned steps."},
+                "actions":            {"type": "array", "items": {"type": "string"}, "description": "Executed actions."},
+                "tools_used":         {"type": "array", "items": {"type": "string"}, "description": "Tools invoked."},
+                "referenced_atoms":   {"type": "array", "items": {"type": "string"}, "description": "Cited atom filenames."},
+                "reasoning_summary":  {"type": "string", "maxLength": 2000, "description": "High-level reasoning summary."},
+                "confidence_before":  {"type": "number", "description": "Confidence prior to execution (0.0-1.0)."},
+                "confidence_after":   {"type": "number", "description": "Confidence after execution (0.0-1.0)."},
+                "new_memories":       {"type": "array", "items": {"type": "string"}, "description": "New memory candidates."},
+                "updated_memories":   {"type": "array", "items": {"type": "string"}, "description": "Updated memory notes."},
+                "candidate_skills":   {"type": "array", "items": {"type": "string"}, "description": "Candidate procedural skill titles."},
+                "reflection":         {"type": "string", "maxLength": 2000, "description": "Post-task reflection."},
+                "lessons":            {"type": "array", "items": {"type": "string"}, "description": "Distilled lessons."},
+                "propose_to_inbox":   {"type": "boolean", "description": "Stage procedural draft into quarantined 0-raw/inbox/."},
+            },
+            "required": ["goal", "result_summary", "success"],
+        },
+    ),
+    types.Tool(
+        name="record_feedback",
+        description="Record helpful or correction feedback for an approved atom in disposable sidecar telemetry.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "atom_id": {"type": "string", "description": "Approved atom filename (e.g. 2026-0619-sodium-ion.md)."},
+                "helpful": {"type": "boolean", "description": "True if helpful; false to record correction telemetry."},
+                "project": {"type": "string", "description": "Optional project:<id> scope filter."},
+            },
+            "required": ["atom_id", "helpful"],
         },
     ),
 ]
@@ -462,6 +871,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
             isError=True,
         )
 
+    vdirs = _resolve_vault_dirs()
+
     if name == "search_memory":
         query = str(arguments.get("query") or "").strip()
         if not query:
@@ -495,10 +906,10 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         if not raw_atom_id or "../" in raw_atom_id or "..\\" in raw_atom_id or "/" in raw_atom_id or "\\" in raw_atom_id:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{raw_atom_id}' not found or invalid.")])
         atom_id = normalize_markdown_filename(raw_atom_id)
-        path    = safe_file_in_dir(eff_atoms_dir, atom_id, allowed_exts={".md"})
+        path    = safe_file_in_dir(vdirs["atoms_dir"], atom_id, allowed_exts={".md"})
         if not path:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{atom_id}' not found or invalid.")])
-        if not approved_revision_is_current(path, brain_dir=eff_brain_dir, atoms_dir=eff_atoms_dir):
+        if not approved_revision_is_current(path, brain_dir=vdirs["brain_dir"], atoms_dir=vdirs["atoms_dir"]):
             return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
         try:
             record = parse_atom_record(path)
@@ -526,11 +937,12 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
 
         source  = arguments.get("source", "MCP agent")
         source = str(source).replace("--", "—").replace("\r", " ").replace("\n", " ")[:500]
-        os.makedirs(eff_inbox_dir, exist_ok=True)
-        if _is_reparse_or_link(eff_inbox_dir):
+        inbox_dir = vdirs["inbox_dir"]
+        os.makedirs(inbox_dir, exist_ok=True)
+        if _is_reparse_or_link(inbox_dir):
             raise PermissionError("Refusing to write to a symlinked quarantined inbox directory.")
         filename = f"{now_slug()}-mcp-note.md"
-        target_path = safe_file_in_dir(eff_inbox_dir, filename, allowed_exts={".md"}, must_exist=False)
+        target_path = safe_file_in_dir(inbox_dir, filename, allowed_exts={".md"}, must_exist=False)
         if not target_path:
             raise ValueError("Path traversal attempt detected: destination outside inbox.")
 
@@ -553,7 +965,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                 break
             except FileExistsError:
                 filename = f"{now_slug()}-mcp-note-{suffix}.md"
-                target_path = safe_file_in_dir(eff_inbox_dir, filename, allowed_exts={".md"}, must_exist=False)
+                target_path = safe_file_in_dir(inbox_dir, filename, allowed_exts={".md"}, must_exist=False)
                 if not target_path:
                     raise ValueError("Path traversal attempt detected: destination outside inbox.")
                 suffix += 1
@@ -566,7 +978,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
     elif name in {"search_notes", "get_note", "remember"}:
         from notes_store import NoteError, NotePaths, create_note, get_note, search_notes
 
-        npaths = NotePaths.for_brain(eff_brain_dir)
+        npaths = NotePaths.for_brain(vdirs["brain_dir"])
         try:
             if name == "search_notes":
                 query = str(arguments.get("query") or "").strip()[:2000]
@@ -576,7 +988,16 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                     limit = max(1, min(int(arguments.get("limit", 6)), 20))
                 except (TypeError, ValueError):
                     limit = 6
-                hits = search_notes(query, limit=limit, paths=npaths)
+                raw_project = str(arguments.get("project") or "").strip()
+                scope_tag = normalize_project_tag(raw_project) if raw_project else ""
+                fetch_limit = max(limit * 8, 100) if scope_tag else limit
+                hits = search_notes(query, limit=fetch_limit, paths=npaths)
+                if scope_tag:
+                    hits = [
+                        h
+                        for h in hits
+                        if _tags_strictly_in_project_scope(h.tags, scope_tag)
+                    ][:limit]
                 if not hits:
                     text = "No matching notes."
                 else:
@@ -606,6 +1027,717 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
             return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
+    elif name == "list_playbooks":
+        from skill_playbooks import list_playbooks as _list_playbooks, playbook_visible_in_scope
+
+        project = str(arguments.get("project") or "").strip()
+        pbs = _list_playbooks(
+            playbooks_dir=vdirs["playbooks_dir"],
+            brain_dir=vdirs["brain_dir"],
+            atoms_dir=vdirs["atoms_dir"],
+            telemetry_db_path=vdirs["telemetry_db_path"],
+            active_only=True,
+        )
+        visible = [
+            pb
+            for pb in pbs
+            if pb.valid
+            and pb.status == "active"
+            and (not project or playbook_visible_in_scope(pb, (project,)))
+        ]
+        payload = {
+            "count": len(visible),
+            "playbooks": [
+                {
+                    "playbook_id": pb.playbook_id,
+                    "filename": pb.filename,
+                    "title": pb.title,
+                    "status": pb.status,
+                    "valid": pb.valid,
+                    "sha256": pb.sha256,
+                    "trigger": pb.trigger,
+                    "contexts": list(pb.contexts),
+                    "backing_atoms": list(pb.backing_atoms),
+                    "preconditions": list(pb.preconditions),
+                    "steps": list(pb.steps),
+                    "expected_outputs": list(pb.expected_outputs),
+                    "failure_recovery": list(pb.failure_recovery),
+                }
+                for pb in visible
+            ],
+        }
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+        )
+
+    elif name == "get_playbook":
+        from skill_playbooks import (
+            PlaybookValidationError,
+            _normalize_playbook_id,
+            playbook_visible_in_scope,
+            verify_playbook_integrity,
+        )
+
+        raw_id = str(arguments.get("playbook_id") or "").strip()
+        project = str(arguments.get("project") or "").strip()
+        if not raw_id or "/" in raw_id or "\\" in raw_id or ".." in raw_id or ":" in raw_id or "\x00" in raw_id:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_PLAYBOOK_MESSAGE)],
+                isError=True,
+            )
+        try:
+            norm_id = _normalize_playbook_id(raw_id)
+        except PlaybookValidationError:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_PLAYBOOK_MESSAGE)],
+                isError=True,
+            )
+        pb_dir = vdirs["playbooks_dir"]
+        if os.path.lexists(pb_dir) and _is_reparse_or_link(pb_dir):
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_PLAYBOOK_MESSAGE)],
+                isError=True,
+            )
+        pb_filename = f"{norm_id}.md"
+        raw_cand = os.path.join(pb_dir, pb_filename)
+        if os.path.lexists(raw_cand) and _is_reparse_or_link(raw_cand):
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_PLAYBOOK_MESSAGE)],
+                isError=True,
+            )
+        safe_pb = safe_file_in_dir(pb_dir, pb_filename, allowed_exts={".md"}, must_exist=True)
+        if not safe_pb or not os.path.isfile(safe_pb) or _is_reparse_or_link(safe_pb):
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_PLAYBOOK_MESSAGE)],
+                isError=True,
+            )
+        rep = verify_playbook_integrity(
+            safe_pb,
+            brain_dir=vdirs["brain_dir"],
+            atoms_dir=vdirs["atoms_dir"],
+            playbooks_dir=pb_dir,
+            telemetry_db_path=vdirs["telemetry_db_path"],
+        )
+        if not (rep.valid and rep.status == "active"):
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_PLAYBOOK_MESSAGE)],
+                isError=True,
+            )
+        if project and not playbook_visible_in_scope(rep, (project,)):
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_PLAYBOOK_MESSAGE)],
+                isError=True,
+            )
+        content = read_file_safe(safe_pb)
+        if not content:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_PLAYBOOK_MESSAGE)],
+                isError=True,
+            )
+        payload = {
+            "playbook_id": rep.playbook_id,
+            "filename": rep.filename,
+            "title": rep.title,
+            "status": rep.status,
+            "valid": rep.valid,
+            "sha256": rep.sha256,
+            "trigger": rep.trigger,
+            "contexts": list(rep.contexts),
+            "backing_atoms": list(rep.backing_atoms),
+            "preconditions": list(rep.preconditions),
+            "steps": list(rep.steps),
+            "expected_outputs": list(rep.expected_outputs),
+            "failure_recovery": list(rep.failure_recovery),
+            "content": content,
+        }
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+        )
+
+    elif name == "assemble_plan":
+        from executive_planner import ExecutivePlanRequest, assemble_executive_plan
+        from host_adapters import HostConsentError, OutboundSecretBlockedError
+
+        goal = str(arguments.get("goal") or "").strip()[:4000]
+        if not goal or "\x00" in goal:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Invalid plan request: 'goal' must be a non-empty string.")],
+                isError=True,
+            )
+        project = str(arguments.get("project") or "").strip() or None
+        mode = str(arguments.get("mode") or "deterministic").strip()
+        if mode not in {"deterministic", "model_assisted"}:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=f"Invalid planning mode: {mode!r}.")],
+                isError=True,
+            )
+        raw_max_steps = arguments.get("max_steps")
+        max_steps: int | None = None
+        if raw_max_steps is not None:
+            if isinstance(raw_max_steps, bool):
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text="'max_steps' must be an integer.")],
+                    isError=True,
+                )
+            try:
+                max_steps = max(1, min(int(raw_max_steps), 20))
+            except (TypeError, ValueError):
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text="'max_steps' must be an integer.")],
+                    isError=True,
+                )
+
+        req_params = inspect.signature(ExecutivePlanRequest).parameters
+        req_kwargs: dict[str, Any] = {
+            "goal": goal,
+            "project_scope": project,
+            "mode": mode,
+            "include_preferences": False,
+            "allow_cross_project": False,
+        }
+        has_native_max_steps = "max_steps" in req_params
+        if max_steps is not None:
+            if has_native_max_steps:
+                req_kwargs["max_steps"] = max_steps
+            elif "max_atoms" in req_params:
+                req_kwargs["max_atoms"] = max_steps
+
+        try:
+            plan_res = assemble_executive_plan(
+                ExecutivePlanRequest(**req_kwargs),
+                brain_dir=vdirs["brain_dir"],
+                atoms_dir=vdirs["atoms_dir"],
+                playbooks_dir=vdirs["playbooks_dir"],
+                briefings_dir=vdirs["briefings_dir"],
+                lexical_index_path=vdirs["lexical_index_path"],
+                chroma_path=vdirs["chroma_path"],
+                telemetry_db_path=vdirs["telemetry_db_path"],
+                save_briefing=False,
+            )
+        except (HostConsentError, OutboundSecretBlockedError, MemoryRecallUnavailable, ValueError) as exc:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
+
+        plan_dict = plan_res.as_dict()
+        if max_steps is not None and not has_native_max_steps and isinstance(plan_dict.get("steps"), list):
+            plan_dict["steps"] = plan_dict["steps"][:max_steps]
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(plan_dict, indent=2, ensure_ascii=False))]
+        )
+
+    elif name == "list_contradictions":
+        import knowledge_graph
+
+        project = str(arguments.get("project") or "").strip() or None
+        radar = knowledge_graph.detect_contradictions(
+            brain_dir=vdirs["brain_dir"],
+            atoms_dir=vdirs["atoms_dir"],
+            project_scope=project,
+            include_pending=False,
+            include_preferences=False,
+        )
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(radar, indent=2, ensure_ascii=False))]
+        )
+
+    elif name == "graph_neighbors":
+        import knowledge_graph
+
+        project = str(arguments.get("project") or "").strip() or None
+        verified = _load_verified_non_preference_atom(
+            str(arguments.get("atom_id") or ""),
+            vdirs=vdirs,
+            project=project,
+        )
+        if verified is None:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_GRAPH_ATOM_MESSAGE)],
+                isError=True,
+            )
+        atom_id, _atom_path, _record = verified
+        scoped_graph = knowledge_graph.build_knowledge_graph(
+            brain_dir=vdirs["brain_dir"],
+            atoms_dir=vdirs["atoms_dir"],
+            project_scope=project,
+            include_pending=False,
+            include_preferences=False,
+        )
+        scoped_filenames = {n["filename"] for n in scoped_graph.get("nodes", [])}
+        if atom_id not in scoped_filenames:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_GRAPH_ATOM_MESSAGE)],
+                isError=True,
+            )
+
+        gn_params = inspect.signature(knowledge_graph.graph_neighbors).parameters
+        if "graph" in gn_params:
+            gn_kwargs: dict[str, Any] = {
+                "brain_dir": vdirs["brain_dir"],
+                "atoms_dir": vdirs["atoms_dir"],
+                "include_pending": False,
+                "include_preferences": False,
+                "graph": scoped_graph,
+            }
+            if "project_scope" in gn_params:
+                gn_kwargs["project_scope"] = project
+            try:
+                gn_res = knowledge_graph.graph_neighbors(atom_id, **gn_kwargs)
+            except FileNotFoundError:
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=UNAVAILABLE_GRAPH_ATOM_MESSAGE)],
+                    isError=True,
+                )
+        else:
+            scoped_radar = knowledge_graph.detect_contradictions(
+                brain_dir=vdirs["brain_dir"],
+                atoms_dir=vdirs["atoms_dir"],
+                project_scope=project,
+                include_pending=False,
+                include_preferences=False,
+                graph=scoped_graph,
+            )
+            edges = [
+                e
+                for e in scoped_graph.get("edges", [])
+                if (e.get("from") == atom_id or e.get("to") == atom_id)
+                and e.get("from") in scoped_filenames
+                and e.get("to") in scoped_filenames
+            ]
+            contras = [
+                al
+                for al in scoped_radar.get("alerts", [])
+                if (al["atom_a"]["filename"] == atom_id or al["atom_b"]["filename"] == atom_id)
+                and al["atom_a"]["filename"] in scoped_filenames
+                and al["atom_b"]["filename"] in scoped_filenames
+            ]
+            gn_res = {
+                "atom": atom_id,
+                "edge_count": len(edges),
+                "edges": edges,
+                "contradictions": contras,
+            }
+
+        # Enforce defense-in-depth scope boundary on all returned edges and contradictions.
+        filtered_edges = [
+            e
+            for e in gn_res.get("edges", [])
+            if e.get("from") in scoped_filenames and e.get("to") in scoped_filenames
+        ]
+        filtered_contras = [
+            al
+            for al in gn_res.get("contradictions", [])
+            if al.get("atom_a", {}).get("filename") in scoped_filenames
+            and al.get("atom_b", {}).get("filename") in scoped_filenames
+        ]
+        gn_res = {
+            **gn_res,
+            "edge_count": len(filtered_edges),
+            "edges": filtered_edges,
+            "contradictions": filtered_contras,
+        }
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(gn_res, indent=2, ensure_ascii=False))]
+        )
+
+    elif name == "list_snapshots":
+        import time_travel
+
+        snaps = time_travel.list_snapshots(brain_dir=vdirs["brain_dir"])
+        headers = [
+            {
+                "snapshot_id": s.get("snapshot_id", ""),
+                "created_at": s.get("created_at", ""),
+                "label": s.get("label", ""),
+                "actor": s.get("actor", ""),
+                "merkle_root": s.get("merkle_root", ""),
+                "atom_count": int(s.get("atom_count", 0) or 0),
+                "playbook_count": int(s.get("playbook_count", 0) or 0),
+            }
+            for s in snaps
+        ]
+        return types.CallToolResult(
+            content=[
+                types.TextContent(
+                    type="text",
+                    text=json.dumps({"count": len(headers), "snapshots": headers}, indent=2, ensure_ascii=False),
+                )
+            ]
+        )
+
+    elif name == "recall_at_snapshot":
+        from skill_playbooks import playbook_visible_in_scope, verify_playbook_integrity
+        import time_travel
+
+        query = str(arguments.get("query") or "").strip()[:2000]
+        snapshot_id = str(arguments.get("snapshot_id") or "").strip()[:200]
+        project = str(arguments.get("project") or "").strip() or None
+        if not query or not snapshot_id or "\x00" in query or "\x00" in snapshot_id:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Both 'query' and 'snapshot_id' must be non-empty strings.")],
+                isError=True,
+            )
+        try:
+            top_k = max(1, min(int(arguments.get("top_k", 5)), 25))
+        except (TypeError, ValueError):
+            top_k = 5
+
+        rs_params = inspect.signature(time_travel.recall_at_snapshot).parameters
+        rs_kwargs: dict[str, Any] = {
+            "project_scope": project,
+            "include_preferences": False,
+            "top_k": 25,
+            "brain_dir": vdirs["brain_dir"],
+        }
+        if "atoms_dir" in rs_params:
+            rs_kwargs["atoms_dir"] = vdirs["atoms_dir"]
+        if "playbooks_dir" in rs_params:
+            rs_kwargs["playbooks_dir"] = vdirs["playbooks_dir"]
+
+        try:
+            raw_recall = time_travel.recall_at_snapshot(query, snapshot_id, **rs_kwargs)
+        except (FileNotFoundError, PermissionError, ValueError) as exc:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
+
+        # Mandatory post-snapshot live revocation & scope guard:
+        filtered_hits: list[dict[str, Any]] = []
+        for hit in raw_recall.get("results", []):
+            hit_kind = str(hit.get("kind") or "")
+            fname = str(hit.get("filename") or "").strip()
+            if not fname:
+                continue
+            if hit_kind == "atom":
+                if not _tags_strictly_in_project_scope(list(hit.get("contexts") or []), project):
+                    continue
+                if _load_verified_non_preference_atom(fname, vdirs=vdirs, project=project) is None:
+                    continue
+                filtered_hits.append(hit)
+            elif hit_kind == "playbook":
+                pb_dir = vdirs["playbooks_dir"]
+                if os.path.lexists(pb_dir) and _is_reparse_or_link(pb_dir):
+                    continue
+                raw_pb = os.path.join(pb_dir, fname)
+                if os.path.lexists(raw_pb) and _is_reparse_or_link(raw_pb):
+                    continue
+                safe_pb = safe_file_in_dir(pb_dir, fname, allowed_exts={".md"}, must_exist=True)
+                if not safe_pb or not os.path.isfile(safe_pb) or _is_reparse_or_link(safe_pb):
+                    continue
+                pb_rep = verify_playbook_integrity(
+                    safe_pb,
+                    brain_dir=vdirs["brain_dir"],
+                    atoms_dir=vdirs["atoms_dir"],
+                    playbooks_dir=pb_dir,
+                    telemetry_db_path=vdirs["telemetry_db_path"],
+                )
+                if not (pb_rep.valid and pb_rep.status == "active"):
+                    continue
+                if project and not playbook_visible_in_scope(pb_rep, (project,)):
+                    continue
+                filtered_hits.append(hit)
+
+        out_payload = {
+            **raw_recall,
+            "results": filtered_hits[:top_k],
+        }
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(out_payload, indent=2, ensure_ascii=False))]
+        )
+
+    elif name == "verify_ledger":
+        import vault_ledger
+
+        ledger_res = vault_ledger.verify_vault_ledger(
+            brain_dir=vdirs["brain_dir"],
+            atoms_dir=vdirs["atoms_dir"],
+            playbooks_dir=vdirs["playbooks_dir"],
+        )
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(ledger_res, indent=2, ensure_ascii=False))]
+        )
+
+    elif name == "prove_leaf":
+        from skill_playbooks import playbook_visible_in_scope, verify_playbook_integrity
+        import vault_ledger
+
+        leaf_id = str(arguments.get("leaf_id") or "").strip()
+        kind = str(arguments.get("kind") or "auto").strip().lower()
+        project = str(arguments.get("project") or "").strip() or None
+        if not leaf_id or kind not in {"auto", "atom", "playbook"}:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                isError=True,
+            )
+        try:
+            proof = vault_ledger.prove_leaf_membership(
+                leaf_id,
+                kind=kind,
+                brain_dir=vdirs["brain_dir"],
+                atoms_dir=vdirs["atoms_dir"],
+                playbooks_dir=vdirs["playbooks_dir"],
+            )
+        except (FileNotFoundError, PermissionError, ValueError, OSError):
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                isError=True,
+            )
+
+        rel_path = str(proof.get("rel_path") or "")
+        if rel_path.startswith("2-atoms/"):
+            atom_fname = rel_path[len("2-atoms/") :]
+            if _load_verified_non_preference_atom(atom_fname, vdirs=vdirs, project=project) is None:
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                    isError=True,
+                )
+        elif rel_path.startswith("5-playbooks/"):
+            pb_fname = rel_path[len("5-playbooks/") :]
+            safe_pb = safe_file_in_dir(vdirs["playbooks_dir"], pb_fname, allowed_exts={".md"}, must_exist=True)
+            if not safe_pb or _is_reparse_or_link(safe_pb):
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                    isError=True,
+                )
+            pb_rep = verify_playbook_integrity(
+                safe_pb,
+                brain_dir=vdirs["brain_dir"],
+                atoms_dir=vdirs["atoms_dir"],
+                playbooks_dir=vdirs["playbooks_dir"],
+                telemetry_db_path=vdirs["telemetry_db_path"],
+            )
+            if not (pb_rep.valid and pb_rep.status == "active"):
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                    isError=True,
+                )
+            if project and not playbook_visible_in_scope(pb_rep, (project,)):
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                    isError=True,
+                )
+        else:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                isError=True,
+            )
+
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(proof, indent=2, ensure_ascii=False))]
+        )
+
+    elif name == "record_experience":
+        import cognitive_core
+        from inbox_workflow import scan_inbox_payload_risks
+
+        raw_success = arguments.get("success")
+        if not isinstance(raw_success, bool):
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Invalid experience record: 'success' must be a boolean.")],
+                isError=True,
+            )
+        raw_goal = str(arguments.get("goal") or "")
+        raw_summary = str(arguments.get("result_summary") or "")
+        if "\x00" in raw_goal or "\x00" in raw_summary:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Invalid experience record: null bytes are not allowed.")],
+                isError=True,
+            )
+        goal = raw_goal.strip()[:500]
+        result_summary = raw_summary.strip()[:4000]
+        if not goal or not result_summary:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Invalid experience record: 'goal' and 'result_summary' must be non-empty.")],
+                isError=True,
+            )
+
+        raw_context = arguments.get("context")
+        if isinstance(raw_context, list):
+            try:
+                context_list = _bound_str_list(raw_context, max_items=16, max_len=500)
+            except ValueError as exc:
+                return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
+            context_str = "; ".join(context_list)[:1000]
+        elif raw_context is None:
+            context_str = ""
+            context_list = []
+        else:
+            raw_ctx_s = str(raw_context)
+            if "\x00" in raw_ctx_s:
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text="Invalid experience record: null bytes are not allowed.")],
+                    isError=True,
+                )
+            context_str = raw_ctx_s.strip()[:1000]
+            context_list = [context_str] if context_str else []
+
+        try:
+            plan_list = _bound_str_list(arguments.get("plan"), max_items=32, max_len=500)
+            actions_list = _bound_str_list(arguments.get("actions"), max_items=32, max_len=500)
+            tools_list = _bound_str_list(arguments.get("tools_used"), max_items=32, max_len=200)
+            ref_atoms_list = _bound_str_list(arguments.get("referenced_atoms"), max_items=32, max_len=200)
+            new_mem_list = _bound_str_list(arguments.get("new_memories"), max_items=32, max_len=500)
+            upd_mem_list = _bound_str_list(arguments.get("updated_memories"), max_items=32, max_len=500)
+            cand_skills_list = _bound_str_list(arguments.get("candidate_skills"), max_items=16, max_len=200)
+            lessons_list = _bound_str_list(arguments.get("lessons"), max_items=32, max_len=500)
+        except ValueError as exc:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
+
+        reasoning_summary = str(arguments.get("reasoning_summary") or "")
+        reflection = str(arguments.get("reflection") or "")
+        if "\x00" in reasoning_summary or "\x00" in reflection:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Invalid experience record: null bytes are not allowed.")],
+                isError=True,
+            )
+        reasoning_summary = reasoning_summary.strip()[:2000]
+        reflection = reflection.strip()[:2000]
+
+        def _parse_conf(val: Any, field_name: str) -> float | None:
+            if val is None:
+                return None
+            if isinstance(val, bool):
+                raise ValueError(f"'{field_name}' must be a number between 0.0 and 1.0.")
+            num = float(val)
+            if not (0.0 <= num <= 1.0):
+                raise ValueError(f"'{field_name}' must be between 0.0 and 1.0.")
+            return round(num, 4)
+
+        try:
+            conf_before = _parse_conf(arguments.get("confidence_before"), "confidence_before")
+            conf_after = _parse_conf(arguments.get("confidence_after"), "confidence_after")
+        except (TypeError, ValueError) as exc:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
+
+        propose_to_inbox = bool(arguments.get("propose_to_inbox", False))
+
+        all_text_parts = [
+            goal,
+            result_summary,
+            context_str,
+            reasoning_summary,
+            reflection,
+            *plan_list,
+            *actions_list,
+            *tools_list,
+            *ref_atoms_list,
+            *new_mem_list,
+            *upd_mem_list,
+            *cand_skills_list,
+            *lessons_list,
+        ]
+        risk_flags = scan_inbox_payload_risks("\n".join(p for p in all_text_parts if p))
+        if risk_flags:
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(
+                        type="text",
+                        text=f"Rejected experience record due to security risk flags: {', '.join(risk_flags)}.",
+                    )
+                ],
+                isError=True,
+            )
+
+        exp_sig = inspect.signature(cognitive_core.save_experience_record)
+        exp_params = exp_sig.parameters
+        exp_kwargs: dict[str, Any] = {
+            "goal": goal,
+            "result_summary": result_summary,
+            "success": raw_success,
+            "actions": actions_list,
+            "tools_used": tools_list,
+            "referenced_atoms": ref_atoms_list,
+            "propose_to_inbox": propose_to_inbox,
+            "experiences_dir": vdirs["experiences_dir"],
+            "inbox_dir": vdirs["inbox_dir"],
+            "brain_dir": vdirs["brain_dir"],
+        }
+        if "context" in exp_params:
+            ctx_annot = str(exp_params["context"].annotation or "")
+            if ctx_annot.startswith("str") and "list" not in ctx_annot:
+                exp_kwargs["context"] = context_str
+            else:
+                exp_kwargs["context"] = context_list
+
+        effective_lessons = list(lessons_list)
+        if "reflection" in exp_params:
+            if reflection:
+                exp_kwargs["reflection"] = reflection
+        elif reflection:
+            effective_lessons.append(f"Reflection: {reflection[:450]}")
+        exp_kwargs["lessons"] = effective_lessons
+
+        if "plan" in exp_params and plan_list:
+            exp_kwargs["plan"] = plan_list
+        if "reasoning_summary" in exp_params and reasoning_summary:
+            exp_kwargs["reasoning_summary"] = reasoning_summary
+        if "confidence_before" in exp_params and conf_before is not None:
+            exp_kwargs["confidence_before"] = conf_before
+        if "confidence_after" in exp_params and conf_after is not None:
+            exp_kwargs["confidence_after"] = conf_after
+        if "new_memories" in exp_params and new_mem_list:
+            exp_kwargs["new_memories"] = new_mem_list
+        if "updated_memories" in exp_params and upd_mem_list:
+            exp_kwargs["updated_memories"] = upd_mem_list
+        if "candidate_skills" in exp_params and cand_skills_list:
+            exp_kwargs["candidate_skills"] = cand_skills_list
+        if "candidate_procedure_title" in exp_params and cand_skills_list:
+            exp_kwargs["candidate_procedure_title"] = cand_skills_list[0]
+
+        try:
+            saved_exp = cognitive_core.save_experience_record(**exp_kwargs)
+        except (PermissionError, ValueError, OSError) as exc:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
+
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(saved_exp, indent=2, ensure_ascii=False))]
+        )
+
+    elif name == "record_feedback":
+        import cognitive_core
+
+        raw_helpful = arguments.get("helpful")
+        if not isinstance(raw_helpful, bool):
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Invalid feedback request: 'helpful' must be a boolean.")],
+                isError=True,
+            )
+        project = str(arguments.get("project") or "").strip() or None
+        verified = _load_verified_non_preference_atom(
+            str(arguments.get("atom_id") or ""),
+            vdirs=vdirs,
+            project=project,
+        )
+        if verified is None:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=UNAVAILABLE_FEEDBACK_ATOM_MESSAGE)],
+                isError=True,
+            )
+        atom_id, _atom_path, _record = verified
+        db_path = vdirs["telemetry_db_path"]
+
+        # MCP agents update disposable sidecar telemetry only — never writing
+        # unreviewed owner-attributed entries into canonical 0-raw/archive/atom-corrections.jsonl.
+        col = "positive_feedback" if raw_helpful else "corrections"
+        cognitive_core.init_telemetry_db(db_path)
+        with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+            conn.execute(
+                f"""
+                INSERT INTO atom_telemetry (atom_id, {col})
+                VALUES (?, 1)
+                ON CONFLICT(atom_id) DO UPDATE SET
+                    {col} = {col} + 1
+                """,
+                (atom_id,),
+            )
+            conn.commit()
+
+        payload = {
+            "status": "recorded",
+            "atom_id": atom_id,
+            "helpful": raw_helpful,
+            "target": "telemetry_sidecar",
+        }
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+        )
+
     return types.CallToolResult(content=[types.TextContent(type="text", text=f"Unknown tool: {name}")], isError=True)
 
 
@@ -621,7 +1753,8 @@ async def handle_list_resources(_ctx, _params) -> types.ListResourcesResult:
 
 async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) -> types.ReadResourceResult:
     assert_mcp_loopback_transport()
-    eff_brain_dir, eff_atoms_dir, _, eff_audit_path = _effective_mcp_paths()
+    vdirs = _resolve_vault_dirs()
+    eff_audit_path = _resolve_default_audit_path()
     auth_ok = is_authorized(params, _ctx)
     if not auth_ok:
         if os.path.isdir(os.path.dirname(os.path.abspath(eff_audit_path))):
@@ -634,8 +1767,8 @@ async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) ->
     uri = str(params.uri)
     if uri.startswith("brain://atoms/"):
         filename = uri.removeprefix("brain://atoms/")
-        path = safe_file_in_dir(eff_atoms_dir, filename, allowed_exts={".md"})
-        if not path or not approved_revision_is_current(path, brain_dir=eff_brain_dir, atoms_dir=eff_atoms_dir):
+        path = safe_file_in_dir(vdirs["atoms_dir"], filename, allowed_exts={".md"})
+        if not path or not approved_revision_is_current(path, brain_dir=vdirs["brain_dir"], atoms_dir=vdirs["atoms_dir"]):
             return types.ReadResourceResult(contents=[])
         try:
             record = parse_atom_record(path)
@@ -652,7 +1785,7 @@ async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) ->
 
 app = Server(
     "second-brain",
-    version="0.2.0",
+    version="0.3.0",
     on_list_tools=handle_list_tools,
     on_call_tool=handle_call_tool,
     on_list_resources=handle_list_resources,

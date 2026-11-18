@@ -868,6 +868,27 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(201, res)
 
+        if path == "/v1/notes/tasks" and method == "GET":
+            from notes_store import extract_action_items
+
+            proj = ((q.get("project") or [None])[0] or None)
+            if proj and len(proj) > 120:
+                raise ValueError("Invalid project query filter.")
+            tag_f = ((q.get("tag") or [None])[0] or None)
+            if tag_f and len(tag_f) > 80:
+                raise ValueError("Invalid tag query filter.")
+            inc_completed = (q.get("include_completed") or ["0"])[0] in {"1", "true", "yes"}
+            req_inc_raw = (q.get("include_raw") or ["0"])[0] in {"1", "true", "yes"}
+            inc_raw = bool(is_owner and req_inc_raw)
+            tasks = extract_action_items(
+                paths=paths,
+                include_completed=inc_completed,
+                include_raw=inc_raw,
+                project=proj,
+                tag=tag_f,
+            )
+            return send(200, {"count": len(tasks), "tasks": tasks, "items": tasks})
+
         if path.startswith("/v1/notes/"):
             rest = unquote(path[len("/v1/notes/"):])
             action = None
@@ -926,12 +947,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Streaming chat ──
         if path == "/v1/chat/stream" and method == "POST":
-            from streaming_chat import CHAT_MODES, ChatPaths, chat_events
+            from streaming_chat import ChatPaths, ChatStreamRequest, chat_events
 
-            mode = _str(body, "mode", max_len=16, required=False, default="stream")
-            if mode not in CHAT_MODES:
-                raise ValueError(f"mode must be one of {CHAT_MODES}")
-            query_str = _str(body, "query", max_len=2000)
+            chat_payload = dict(body)
+            if "mode" not in chat_payload or chat_payload.get("mode") is None or (
+                isinstance(chat_payload.get("mode"), str) and not str(chat_payload.get("mode")).strip()
+            ):
+                chat_payload["mode"] = "stream"
+            req = ChatStreamRequest.model_validate(chat_payload)
             stream_sem = getattr(handler.server, "_stream_slots", None)
             if stream_sem is not None and not stream_sem.acquire(blocking=False):
                 return send(429, {"error": "Too many concurrent chat streams."})
@@ -943,19 +966,23 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     chroma_path=rt.chroma_path,
                     policy_path=rt.policy_path,
                     telemetry_db_path=rt.telemetry_db_path,
+                    http_transport=rt.http_transport,
+                    skip_dns_check_for_mock_transport=rt.skip_dns_check_for_mock_transport,
+                    include_quarantined_inbox=bool(is_owner),
                 )
-                scope = body.get("project_scope") if isinstance(body.get("project_scope"), str) else None
-                model_ov = _str(body, "model_override", max_len=128, required=False) or None
-                inc_prefs = bool(is_owner and body.get("include_preferences", True))
+                inc_prefs = bool(is_owner and req.include_preferences)
                 stream_sse(
                     handler,
                     chat_events(
-                        query_str,
-                        mode=mode,
+                        req.query,
+                        mode=req.mode,
                         paths=cp,
-                        project_scope=scope,
-                        model_override=model_ov,
+                        project_scope=req.project_scope,
+                        model_override=req.model_override,
                         include_preferences=inc_prefs,
+                        host_id=req.host_id,
+                        retrieval_mode=req.retrieval_mode,
+                        allow_cross_project=req.allow_cross_project,
                     ),
                     on_open=lambda: _audit_fn(rt.brain_dir, path, method, 200),
                 )
@@ -1741,14 +1768,21 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if proj and len(proj) > 120:
                 raise ValueError("Invalid project query filter.")
             inc_pending = bool(is_owner and ((q.get("include_pending") or ["1"])[0] != "0"))
+            enable_nli = bool(is_owner and ((q.get("nli") or ["0"])[0] in {"1", "true", "yes"}))
+            dc_params = inspect.signature(detect_contradictions).parameters
             dc_kwargs: dict[str, object] = {
                 "brain_dir": rt.brain_dir,
                 "atoms_dir": rt.atoms_dir,
                 "project_scope": proj,
                 "include_pending": inc_pending,
             }
-            if "include_preferences" in inspect.signature(detect_contradictions).parameters:
+            if "include_preferences" in dc_params:
                 dc_kwargs["include_preferences"] = bool(is_owner)
+            if "enable_nli" in dc_params:
+                dc_kwargs["enable_nli"] = enable_nli
+                dc_kwargs["policy_path"] = rt.policy_path
+                dc_kwargs["http_transport"] = rt.http_transport
+                dc_kwargs["skip_dns_check_for_mock_transport"] = rt.skip_dns_check_for_mock_transport
             radar = detect_contradictions(**dc_kwargs)
             if not is_owner:
                 pref_files = {

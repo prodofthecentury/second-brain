@@ -11,6 +11,7 @@ from contextlib import closing
 from dataclasses import dataclass
 import datetime
 import json
+import math
 import os
 import re
 import sqlite3
@@ -26,9 +27,11 @@ from config import (
     INBOX_DIR,
     LEXICAL_INDEX_PATH,
     TELEMETRY_DB_PATH,
+    _WINDOWS_RESERVED_STEMS,
     _is_reparse_or_link,
     file_sha256,
     is_content_markdown,
+    normalize_markdown_filename,
     safe_file_in_dir,
 )
 from lexical_store import search_lexical_index
@@ -42,14 +45,22 @@ class ExperienceRecord:
     experience_id: str
     created_at: str
     goal: str
-    context: tuple[str, ...]
-    actions: tuple[str, ...]
-    tools_used: tuple[str, ...]
-    referenced_atoms: tuple[str, ...]
-    result_summary: str
-    success: bool
-    lessons: tuple[str, ...]
+    context: tuple[str, ...] = ()
+    actions: tuple[str, ...] = ()
+    tools_used: tuple[str, ...] = ()
+    referenced_atoms: tuple[str, ...] = ()
+    result_summary: str = ""
+    success: bool = True
+    lessons: tuple[str, ...] = ()
     candidate_procedure_title: str | None = None
+    plan: tuple[str, ...] = ()
+    reasoning_summary: str = ""
+    confidence_before: float | None = None
+    confidence_after: float | None = None
+    new_memories: tuple[str, ...] = ()
+    updated_memories: tuple[str, ...] = ()
+    candidate_skills: tuple[str, ...] = ()
+    reflection: str = ""
 
 
 def init_telemetry_db(db_path: str = TELEMETRY_DB_PATH) -> None:
@@ -573,21 +584,70 @@ def _yaml_quote(value: str) -> str:
     return json.dumps(cleaned, ensure_ascii=False)
 
 
+def _validate_confidence_score(value: float | int | None, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a finite float between 0.0 and 1.0, not bool.")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite float between 0.0 and 1.0.") from exc
+    if not math.isfinite(numeric) or numeric < 0.0 or numeric > 1.0:
+        raise ValueError(f"{field_name} must be between 0.0 and 1.0; got {value!r}.")
+    return round(numeric, 6)
+
+
+def _validate_memory_basenames(items: list[str] | tuple[str, ...] | None, field_name: str) -> tuple[str, ...]:
+    cleaned: list[str] = []
+    for raw_item in items or ():
+        raw = str(raw_item or "").strip()
+        if not raw:
+            continue
+        if (
+            "/" in raw
+            or "\\" in raw
+            or ":" in raw
+            or "\x00" in raw
+            or raw in {".", ".."}
+            or os.path.isabs(raw)
+        ):
+            raise ValueError(f"Unsafe memory basename in {field_name}: {raw_item!r}")
+        normalized = normalize_markdown_filename(raw)
+        stem = os.path.splitext(normalized)[0].rstrip(" .").lower()
+        first_stem = normalized.split(".", 1)[0].rstrip(" .").lower()
+        if (
+            not _valid_atom_id(normalized)
+            or normalized.startswith(".")
+            or normalized == "README.md"
+            or stem in _WINDOWS_RESERVED_STEMS
+            or first_stem in _WINDOWS_RESERVED_STEMS
+            or any(ord(ch) < 32 for ch in normalized)
+        ):
+            raise ValueError(f"Invalid memory basename in {field_name}: {raw_item!r}")
+        if normalized not in cleaned:
+            cleaned.append(normalized)
+    return tuple(cleaned)
+
+
 def save_experience_record(
     *,
     goal: str,
     result_summary: str,
     success: bool,
     context: list[str] | None = None,
+    plan: list[str] | None = None,
     actions: list[str] | None = None,
     tools_used: list[str] | None = None,
     referenced_atoms: list[str] | None = None,
-    lessons: list[str] | None = None,
-    plan: list[str] | None = None,
     reasoning_summary: str | None = None,
     confidence_before: float | None = None,
     confidence_after: float | None = None,
+    new_memories: list[str] | None = None,
+    updated_memories: list[str] | None = None,
+    candidate_skills: list[str] | None = None,
     reflection: str | None = None,
+    lessons: list[str] | None = None,
     candidate_procedure_title: str | None = None,
     propose_to_inbox: bool = False,
     experiences_dir: str = EXPERIENCES_DIR,
@@ -600,23 +660,36 @@ def save_experience_record(
     if not goal_clean or not summary_clean:
         raise ValueError("Experience record requires non-empty goal and result_summary.")
 
+    conf_before = _validate_confidence_score(confidence_before, "confidence_before")
+    conf_after = _validate_confidence_score(confidence_after, "confidence_after")
+    new_mem_tuple = _validate_memory_basenames(new_memories, "new_memories")
+    upd_mem_tuple = _validate_memory_basenames(updated_memories, "updated_memories")
+
     now = datetime.datetime.now(datetime.timezone.utc)
     ts_iso = now.isoformat(timespec="seconds")
     exp_slug = f"{now.strftime('%Y%m%d-%H%M%S')}-{_slugify(goal_clean)}"
 
     ctx_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (context or [])) if s)
-    act_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (actions or [])) if s)
     plan_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (plan or [])) if s)
+    act_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (actions or [])) if s)
     tools_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (tools_used or [])) if s)
     atoms_tuple = tuple(str(x).strip() for x in (referenced_atoms or []) if _valid_atom_id(str(x).strip()))
+    reasoning_clean = _sanitize_multiline_body(reasoning_summary, max_len=4000) if reasoning_summary else ""
+    reflection_clean = _sanitize_multiline_body(reflection, max_len=4000) if reflection else ""
     lessons_tuple = tuple(s for s in (_sanitize_single_line(x) for x in (lessons or [])) if s)
-    reasoning_clean = _sanitize_multiline_body(reasoning_summary or "", max_len=2000)
-    reflection_clean = _sanitize_multiline_body(reflection or "", max_len=2000)
-    conf_before_val = round(min(max(float(confidence_before), 0.0), 1.0), 2) if confidence_before is not None else None
-    conf_after_val = round(min(max(float(confidence_after), 0.0), 1.0), 2) if confidence_after is not None else None
     cand_title = _sanitize_single_line(candidate_procedure_title, max_len=200) if candidate_procedure_title else None
     if cand_title == "":
         cand_title = None
+
+    skills_list = list(
+        dict.fromkeys(
+            s for s in (_sanitize_single_line(x, max_len=200) for x in (candidate_skills or [])) if s
+        )
+    )
+    if cand_title and cand_title not in skills_list:
+        skills_list.append(cand_title)
+    skills_tuple = tuple(skills_list)
+    effective_proc_title = cand_title or (skills_tuple[0] if skills_tuple else None)
 
     lock_path = os.path.join(brain_dir, ".sidecar", "writer.lock")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
@@ -630,41 +703,73 @@ def save_experience_record(
             if not exp_path:
                 raise ValueError("Invalid experience filename.")
             exp_id = os.path.splitext(filename)[0]
+            record = ExperienceRecord(
+                experience_id=exp_id,
+                created_at=ts_iso,
+                goal=goal_clean,
+                context=ctx_tuple,
+                actions=act_tuple,
+                tools_used=tools_tuple,
+                referenced_atoms=atoms_tuple,
+                result_summary=summary_clean,
+                success=bool(success),
+                lessons=lessons_tuple,
+                candidate_procedure_title=effective_proc_title,
+                plan=plan_tuple,
+                reasoning_summary=reasoning_clean,
+                confidence_before=conf_before,
+                confidence_after=conf_after,
+                new_memories=new_mem_tuple,
+                updated_memories=upd_mem_tuple,
+                candidate_skills=skills_tuple,
+                reflection=reflection_clean,
+            )
             md_lines = [
                 "---",
-                f"experience_id: {_yaml_quote(exp_id)}",
+                f"experience_id: {_yaml_quote(record.experience_id)}",
                 "type: experience",
-                f"created_at: {_yaml_quote(ts_iso)}",
-                f"goal: {_yaml_quote(goal_clean)}",
-                f"success: {'true' if success else 'false'}",
-                f"confidence_before: {conf_before_val if conf_before_val is not None else 'null'}",
-                f"confidence_after: {conf_after_val if conf_after_val is not None else 'null'}",
-                f"context: {json.dumps(list(ctx_tuple), ensure_ascii=False)}",
-                f"plan: {json.dumps(list(plan_tuple), ensure_ascii=False)}",
-                f"tools_used: {json.dumps(list(tools_tuple), ensure_ascii=False)}",
-                f"referenced_atoms: {json.dumps(list(atoms_tuple), ensure_ascii=False)}",
-                f"candidate_procedure: {_yaml_quote(cand_title) if cand_title else 'null'}",
+                f"created_at: {_yaml_quote(record.created_at)}",
+                f"goal: {_yaml_quote(record.goal)}",
+                f"success: {'true' if record.success else 'false'}",
+                f"context: {json.dumps(list(record.context), ensure_ascii=False)}",
+                f"plan: {json.dumps(list(record.plan), ensure_ascii=False)}",
+                f"actions: {json.dumps(list(record.actions), ensure_ascii=False)}",
+                f"tools_used: {json.dumps(list(record.tools_used), ensure_ascii=False)}",
+                f"referenced_atoms: {json.dumps(list(record.referenced_atoms), ensure_ascii=False)}",
+                f"reasoning_summary: {_yaml_quote(record.reasoning_summary)}",
+                f"result: {_yaml_quote(record.result_summary)}",
+                f"confidence_before: {json.dumps(record.confidence_before)}",
+                f"confidence_after: {json.dumps(record.confidence_after)}",
+                f"new_memories: {json.dumps(list(record.new_memories), ensure_ascii=False)}",
+                f"updated_memories: {json.dumps(list(record.updated_memories), ensure_ascii=False)}",
+                f"candidate_skills: {json.dumps(list(record.candidate_skills), ensure_ascii=False)}",
+                f"candidate_procedure: {_yaml_quote(record.candidate_procedure_title) if record.candidate_procedure_title else 'null'}",
+                f"reflection: {_yaml_quote(record.reflection)}",
+                f"lessons: {json.dumps(list(record.lessons), ensure_ascii=False)}",
                 "---",
                 "",
                 "## Goal",
-                goal_clean,
+                record.goal,
+                "",
+                "## Plan",
+                *(f"- {item}" for item in (record.plan or ("No explicit plan steps recorded.",))),
                 "",
                 "## Actions",
-                *(f"- {item}" for item in (act_tuple or ("No explicit action steps recorded.",))),
+                *(f"- {item}" for item in (record.actions or ("No explicit action steps recorded.",))),
+                "",
+                "## Reasoning Summary",
+                record.reasoning_summary or "No explicit reasoning summary recorded.",
                 "",
                 "## Result",
-                summary_clean,
+                record.result_summary,
+                "",
+                "## Reflection",
+                record.reflection or "No explicit reflection recorded.",
+                "",
+                "## Lessons",
+                *(f"- {item}" for item in (record.lessons or ("No explicit lessons recorded.",))),
+                "",
             ]
-            if reasoning_clean:
-                md_lines.extend(["", "## Reasoning Summary", reasoning_clean])
-            if reflection_clean:
-                md_lines.extend(["", "## Reflection", reflection_clean])
-            md_lines.extend([
-                "",
-                "## Lessons & Reflection",
-                *(f"- {item}" for item in (lessons_tuple or ("No explicit lessons recorded.",))),
-                "",
-            ])
             payload = "\n".join(md_lines).encode("utf-8")
             try:
                 fd = os.open(exp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -680,7 +785,7 @@ def save_experience_record(
                 suffix += 1
 
         inbox_draft_filename = None
-        if propose_to_inbox and cand_title and success:
+        if propose_to_inbox and effective_proc_title and record.success:
             os.makedirs(inbox_dir, exist_ok=True)
             draft_name = f"proc-candidate-{exp_id}.md"
             draft_suffix = 2
@@ -691,12 +796,12 @@ def save_experience_record(
                 draft_text = (
                     "<!-- second_brain_origin: cognitive_experience -->\n"
                     f"<!-- derived_from_experience: 4-experiences/{filename} -->\n\n"
-                    f"# Candidate Procedure: {cand_title}\n\n"
-                    f"Derived from completed task goal: {goal_clean}\n\n"
+                    f"# Candidate Procedure: {effective_proc_title}\n\n"
+                    f"Derived from completed task goal: {record.goal}\n\n"
                     "Steps executed:\n"
-                    + "\n".join(f"1. {step}" for step in (act_tuple or (summary_clean,)))
+                    + "\n".join(f"1. {step}" for step in (record.actions or (record.result_summary,)))
                     + "\n\nLessons observed:\n"
-                    + "\n".join(f"- {lesson}" for lesson in (lessons_tuple or (summary_clean,)))
+                    + "\n".join(f"- {lesson}" for lesson in (record.lessons or (record.result_summary,)))
                     + "\n"
                 ).encode("utf-8")
                 try:
@@ -714,11 +819,43 @@ def save_experience_record(
                     draft_suffix += 1
 
     return {
-        "experience_id": exp_id,
+        "experience_id": record.experience_id,
         "filename": filename,
         "sha256": file_sha256(exp_path),
+        "created_at": record.created_at,
+        "goal": record.goal,
+        "success": record.success,
+        "context": list(record.context),
+        "plan": list(record.plan),
+        "actions": list(record.actions),
+        "tools_used": list(record.tools_used),
+        "referenced_atoms": list(record.referenced_atoms),
+        "reasoning_summary": record.reasoning_summary,
+        "result_summary": record.result_summary,
+        "confidence_before": record.confidence_before,
+        "confidence_after": record.confidence_after,
+        "new_memories": list(record.new_memories),
+        "updated_memories": list(record.updated_memories),
+        "candidate_skills": list(record.candidate_skills),
+        "candidate_procedure_title": record.candidate_procedure_title,
+        "reflection": record.reflection,
+        "lessons": list(record.lessons),
         "inbox_procedural_draft": inbox_draft_filename,
     }
+
+
+def _cli_cognitive_dirs() -> tuple[str, str, str, str, str]:
+    env_vault = (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
+    if env_vault and os.path.abspath(env_vault) != os.path.abspath(BRAIN_DIR):
+        b = os.path.abspath(env_vault)
+        return (
+            b,
+            os.path.join(b, "2-atoms"),
+            os.path.join(b, "4-experiences"),
+            os.path.join(b, "0-raw", "inbox"),
+            os.path.join(b, ".sidecar", "telemetry.sqlite3"),
+        )
+    return BRAIN_DIR, ATOMS_DIR, EXPERIENCES_DIR, INBOX_DIR, TELEMETRY_DB_PATH
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -737,14 +874,27 @@ def main(argv: list[str] | None = None) -> int:
     exp_p.add_argument("--goal", required=True)
     exp_p.add_argument("--result", required=True)
     exp_p.add_argument("--success", action="store_true")
+    exp_p.add_argument("--context", action="append", default=[])
+    exp_p.add_argument("--plan", action="append", default=[])
     exp_p.add_argument("--action", action="append", default=[])
+    exp_p.add_argument("--tool", action="append", default=[])
+    exp_p.add_argument("--referenced-atom", action="append", default=[])
+    exp_p.add_argument("--reasoning-summary", default=None)
+    exp_p.add_argument("--confidence-before", type=float, default=None)
+    exp_p.add_argument("--confidence-after", type=float, default=None)
+    exp_p.add_argument("--new-memory", action="append", default=[])
+    exp_p.add_argument("--updated-memory", action="append", default=[])
+    exp_p.add_argument("--candidate-skill", action="append", default=[])
+    exp_p.add_argument("--candidate-procedure", default=None)
+    exp_p.add_argument("--reflection", default=None)
     exp_p.add_argument("--lesson", action="append", default=[])
-    exp_p.add_argument("--candidate-procedure")
     exp_p.add_argument("--propose-inbox", action="store_true")
 
     args = parser.parse_args(argv)
+    eff_brain, eff_atoms, eff_exp, eff_inbox, eff_db = _cli_cognitive_dirs()
+
     if args.command == "fitness":
-        report = compute_memory_fitness_report()
+        report = compute_memory_fitness_report(atoms_dir=eff_atoms, brain_dir=eff_brain, db_path=eff_db)
         if args.json:
             print(json.dumps(report, indent=2, sort_keys=True))
         else:
@@ -760,7 +910,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.helpful == args.correction:
             print("Specify exactly one of --helpful or --correction.", file=sys.stderr)
             return 1
-        record_atom_feedback(args.atom_id, helpful=args.helpful)
+        record_atom_feedback(args.atom_id, helpful=args.helpful, db_path=eff_db, brain_dir=eff_brain)
         print(f"Recorded {'helpful' if args.helpful else 'correction'} feedback for {args.atom_id}.")
         return 0
 
@@ -769,10 +919,24 @@ def main(argv: list[str] | None = None) -> int:
             goal=args.goal,
             result_summary=args.result,
             success=args.success,
+            context=args.context,
+            plan=args.plan,
             actions=args.action,
-            lessons=args.lesson,
+            tools_used=args.tool,
+            referenced_atoms=args.referenced_atom,
+            reasoning_summary=args.reasoning_summary,
+            confidence_before=args.confidence_before,
+            confidence_after=args.confidence_after,
+            new_memories=args.new_memory,
+            updated_memories=args.updated_memory,
+            candidate_skills=args.candidate_skill,
             candidate_procedure_title=args.candidate_procedure,
+            reflection=args.reflection,
+            lessons=args.lesson,
             propose_to_inbox=args.propose_inbox,
+            experiences_dir=eff_exp,
+            inbox_dir=eff_inbox,
+            brain_dir=eff_brain,
         )
         print(json.dumps(saved, indent=2, sort_keys=True))
         return 0

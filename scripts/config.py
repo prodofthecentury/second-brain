@@ -215,6 +215,8 @@ WHISPER_SIZE = os.environ.get("BRAIN_WHISPER_SIZE","base")   # tiny/base/small/m
 AUDIO_EXTS   = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
 IMAGE_EXTS   = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 TEXT_EXTS    = {".md", ".txt"}
+# Deterministic, model-free local document extractors (scripts/doc_extractors.py).
+DOC_EXTS     = {".pdf", ".docx", ".epub", ".html", ".htm", ".csv", ".tsv"}
 VAULT_README = "README.md"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────

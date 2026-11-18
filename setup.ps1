@@ -1,7 +1,8 @@
 param(
     [switch]$NoLaunch,
     [switch]$PullModels,
-    [switch]$RebuildVectors
+    [switch]$RebuildVectors,
+    [switch]$IncludeMultimodal
 )
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -99,7 +100,12 @@ if ($LASTEXITCODE -ne 0) { throw 'uv could not install or locate managed Python 
 Push-Location -LiteralPath $ProjectRoot
 try {
     Write-Host '=== Synchronizing Locked Python Environment ===' -ForegroundColor Cyan
-    & $UvExe sync --frozen
+    if ($IncludeMultimodal) {
+        Write-Host 'Including optional multimodal dependencies (faster-whisper + Pillow)...' -ForegroundColor Cyan
+        & $UvExe sync --frozen --extra multimodal
+    } else {
+        & $UvExe sync --frozen
+    }
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
 
     Write-Host '=== Checking Local Ollama Daemon & Models ===' -ForegroundColor Cyan
@@ -201,7 +207,12 @@ try {
             $DisplayTarget = if ($OllamaBaseUrl) { $OllamaBaseUrl } else { $OllamaRawHost }
             throw ('PullModels requested, but Ollama CLI or local loopback daemon ({0}) is unavailable. Start `ollama serve` on loopback first.' -f $DisplayTarget)
         }
-        foreach ($ReqModel in @('nomic-embed-text', 'llama3.2:3b')) {
+        $ModelsToPull = @('nomic-embed-text', 'llama3.2:3b')
+        if ($IncludeMultimodal) {
+            $VisionTarget = if ($env:BRAIN_VISION_MODEL -and $env:BRAIN_VISION_MODEL.Trim()) { $env:BRAIN_VISION_MODEL.Trim() } else { 'llava' }
+            $ModelsToPull += $VisionTarget
+        }
+        foreach ($ReqModel in $ModelsToPull) {
             Write-Host "Pulling required local model: $ReqModel ..."
             & $OllamaCmd.Source pull $ReqModel
             if ($LASTEXITCODE -ne 0) { throw "Failed to pull model $ReqModel." }

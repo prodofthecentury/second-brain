@@ -12,9 +12,11 @@ preserves the subset of the Chroma collection API this project needs.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import math
 import os
+import tempfile
 from typing import Any
 
 
@@ -34,30 +36,140 @@ class JsonVectorCollection:
         self.path = path
         self.name = name
         self.fallback_reason = fallback_reason
+        self._items: dict[str, dict[str, Any]] | None = None
+        self._loaded_stat: tuple[int, int] | None = None
+        self._batch_depth: int = 0
+        self._dirty: bool = False
         if create_dir:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+    def _file_stat(self) -> tuple[int, int] | None:
+        try:
+            st = os.stat(self.path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
 
     def _load(self) -> dict[str, dict[str, Any]]:
-        if not os.path.exists(self.path):
-            return {}
+        if self._dirty and self._items is not None:
+            return self._items
+        current_stat = self._file_stat()
+        if current_stat is None:
+            self._items = {}
+            self._loaded_stat = None
+            return self._items
+        if self._items is not None and self._loaded_stat == current_stat:
+            return self._items
         with open(self.path, "r", encoding="utf-8") as file:
             payload = json.load(file)
-        return payload.get("items", {})
+        raw_items = payload.get("items", {}) if isinstance(payload, dict) else {}
+        self._items = dict(raw_items) if isinstance(raw_items, dict) else {}
+        self._loaded_stat = current_stat
+        return self._items
 
-    def _save(self, items: dict[str, dict[str, Any]]):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as file:
-            json.dump({"name": self.name, "items": items}, file, ensure_ascii=False, indent=2)
+    def _save(self, items: dict[str, dict[str, Any]] | None = None) -> None:
+        target_items = items if items is not None else (self._items if self._items is not None else {})
+        parent = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(parent, exist_ok=True)
+        descriptor, tmp_path = tempfile.mkstemp(prefix=".vec-", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                json.dump(
+                    {"name": self.name, "items": target_items},
+                    file,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(tmp_path, self.path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        self._items = target_items
+        self._loaded_stat = self._file_stat()
+        self._dirty = False
+
+    def begin_batch(self) -> None:
+        self._batch_depth += 1
+
+    def flush(self) -> None:
+        if self._dirty and self._items is not None:
+            self._save(self._items)
+
+    @contextmanager
+    def batch(self):
+        self.begin_batch()
+        try:
+            yield self
+        except Exception:
+            self._batch_depth = max(0, self._batch_depth - 1)
+            if self._batch_depth == 0:
+                self._dirty = False
+                self._items = None
+                self._loaded_stat = None
+            raise
+        else:
+            self._batch_depth = max(0, self._batch_depth - 1)
+            if self._batch_depth == 0:
+                self.flush()
+
+    def close(self) -> None:
+        self._batch_depth = 0
+        self.flush()
 
     def upsert(self, documents: list[str], embeddings: list[list[float]], metadatas: list[dict], ids: list[str]):
         items = self._load()
         for doc_id, document, embedding, metadata in zip(ids, documents, embeddings, metadatas):
             items[doc_id] = {
                 "document": document,
-                "embedding": embedding,
+                "embedding": embedding if isinstance(embedding, list) else [float(x) for x in embedding],
                 "metadata": metadata,
             }
-        self._save(items)
+        self._items = items
+        self._dirty = True
+        if self._batch_depth == 0:
+            self.flush()
+
+    def get(
+        self,
+        ids: list[str] | None = None,
+        where: dict[str, Any] | None = None,
+        include: list[str] | None = None,
+    ) -> dict[str, list[Any]]:
+        _ = include  # Accepted for ChromaDB API parity; all stored fields are cheap in memory.
+        items = self._load()
+        if isinstance(ids, str):
+            ids = [ids]
+        candidate_ids = [doc_id for doc_id in ids if doc_id in items] if ids is not None else list(items.keys())
+
+        out_ids: list[str] = []
+        out_embeddings: list[Any] = []
+        out_metadatas: list[Any] = []
+        out_documents: list[Any] = []
+        for doc_id in candidate_ids:
+            item = items.get(doc_id)
+            if not isinstance(item, dict):
+                continue
+            metadata = item.get("metadata", {})
+            meta_dict = metadata if isinstance(metadata, dict) else {}
+            if not self._matches_where(meta_dict, where):
+                continue
+            out_ids.append(doc_id)
+            out_embeddings.append(item.get("embedding", []))
+            out_metadatas.append(meta_dict)
+            out_documents.append(item.get("document", ""))
+        return {
+            "ids": out_ids,
+            "embeddings": out_embeddings,
+            "metadatas": out_metadatas,
+            "documents": out_documents,
+        }
 
     @staticmethod
     def _matches_where(metadata: dict[str, Any], where: dict[str, Any] | None) -> bool:

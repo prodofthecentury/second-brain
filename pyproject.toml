@@ -23,6 +23,7 @@ dependencies = [
     "watchdog>=6,<7",
     "filelock>=3.12,<4",
     "pydantic>=2.7,<3",
+    "pypdf>=5,<7",
     "rich>=13,<15",
 ]
 

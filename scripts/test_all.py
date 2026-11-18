@@ -69,6 +69,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "phase5_god_features_tests.py")),
     ),
     (
+        "goal2_completion_tests",
+        "Goal 2 document ingestion, chunked refinery/incremental vectors, research view, multi-host streaming DLP, NLI radar, 17-tool MCP, 6-host connectors & SOTA benchmark invariants (scripts/goal2_completion_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "goal2_completion_tests.py")),
+    ),
+    (
         "scale_benchmark_1500",
         "Corpus-scale correctness canary on a 1,500-note isolated vault (scripts/scale_benchmark.py)",
         (str(SCRIPTS_DIR / "scale_benchmark.py"), "--notes", "1500", "--queries", "20"),

@@ -29,7 +29,16 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
-from config import _is_reparse_or_link, resolve_active_brain_dir, safe_file_in_dir  # noqa: E402
+from config import (  # noqa: E402
+    DOC_EXTS,
+    _is_reparse_or_link,
+    append_archive_manifest_entry,
+    build_archive_manifest_entry,
+    file_sha256,
+    resolve_active_brain_dir,
+    safe_file_in_dir,
+)
+from doc_extractors import DocumentExtractionError, MAX_DOC_BINARY_BYTES, extract_document  # noqa: E402
 from lexical_store import sync_lexical_index  # noqa: E402
 from notes_store import (  # noqa: E402
     DEFAULT_PATHS,
@@ -41,6 +50,8 @@ from notes_store import (  # noqa: E402
     render_note,
     slugify,
 )
+import datetime  # noqa: E402
+import shutil  # noqa: E402
 
 _INITIAL_DEFAULT_PATHS = DEFAULT_PATHS
 
@@ -59,7 +70,8 @@ SKIP_DIRS = {
     ".aws",
     ".kube",
 }
-IMPORT_EXTS = {".md", ".markdown", ".txt"}
+TEXT_IMPORT_EXTS = {".md", ".markdown", ".txt"}
+IMPORT_EXTS = TEXT_IMPORT_EXTS | set(DOC_EXTS)
 MANIFEST_NAME = "notes-import-manifest.json"
 
 
@@ -135,6 +147,52 @@ def _note_name_for(rel: Path, used: set[str], notes_dir: Path) -> str:
     return name
 
 
+def _archive_imported_binary(src: Path, src_sha: str, brain: Path) -> str:
+    """Copy an imported document binary into <brain>/0-raw/archive/YYYY-MM/ with ARCHIVE_MANIFEST lineage."""
+    archive_month = brain / "0-raw" / "archive" / datetime.datetime.now().strftime("%Y-%m")
+    archive_month.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_link(str(archive_month)) or _is_reparse_or_link(str(archive_month.parent)):
+        raise PermissionError(f"Refusing to archive imported binary into symlinked folder: {archive_month}")
+    candidate = archive_month / src.name
+    stem = src.stem
+    ext = src.suffix
+    suffix = 2
+    while candidate.exists():
+        if file_sha256(str(candidate)) == src_sha:
+            return candidate.relative_to(brain).as_posix()
+        candidate = archive_month / f"{stem}-{suffix}{ext}"
+        suffix += 1
+    tmp_path = str(candidate) + ".partial"
+    try:
+        with open(src, "rb") as rf, open(tmp_path, "xb") as wf:
+            shutil.copyfileobj(rf, wf, length=1024 * 1024)
+            wf.flush()
+            os.fsync(wf.fileno())
+        if file_sha256(tmp_path) != src_sha:
+            raise OSError("Imported source binary changed during archival copy.")
+        os.replace(tmp_path, str(candidate))
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    manifest_file = brain / "0-raw" / "archive" / "manifest.jsonl"
+    rel_archived = candidate.relative_to(brain).as_posix()
+    entry = build_archive_manifest_entry(
+        original_path=str(src),
+        archived_path=str(candidate),
+        source_filename=src.name,
+        generated_atoms=[],
+        origin="owner_import",
+        source_sha256=src_sha,
+        archived_sha256=src_sha,
+    )
+    entry["archived_path"] = rel_archived
+    append_archive_manifest_entry(entry, manifest_path=str(manifest_file))
+    return rel_archived
+
+
 def import_folder(
     source_root: str | Path,
     *,
@@ -144,39 +202,59 @@ def import_folder(
     overwrite_modified: bool = False,
     progress=None,
 ) -> ImportStats:
-    if _is_reparse_or_link(str(Path(source_root).expanduser())) or _is_reparse_or_link(str(paths.notes_dir)):
+    expanded_source = Path(source_root).expanduser()
+    if _is_reparse_or_link(str(expanded_source)) or _is_reparse_or_link(str(paths.notes_dir)):
         raise PermissionError("Refusing to import from or into a symlink/junction directory.")
-    root = Path(source_root).expanduser().resolve()
-    if not root.is_dir():
-        raise NotADirectoryError(f"Import source is not a folder: {root}")
+    root = expanded_source.resolve()
+    single_file_mode = root.is_file()
+    if not single_file_mode and not root.is_dir():
+        raise NotADirectoryError(f"Import source is not a folder or supported file: {root}")
+    if single_file_mode and root.suffix.lower() not in IMPORT_EXTS:
+        raise ValueError(f"Unsupported import file type: {root.suffix}")
     notes_dir = Path(paths.notes_dir).resolve()
     brain = Path(paths.brain_dir).resolve()
-    if root == brain or brain in root.parents or root in brain.parents:
+    compare_root = root.parent if single_file_mode else root
+    if root == brain or brain in root.parents or (not single_file_mode and compare_root in brain.parents):
         raise ValueError("Refusing to import the Second Brain vault into itself (or a folder containing it).")
+    if single_file_mode and brain in root.parents:
+        raise ValueError("Refusing to import a file located inside the Second Brain vault.")
     notes_dir.mkdir(parents=True, exist_ok=True)
     if _is_reparse_or_link(str(notes_dir)):
         raise PermissionError("Refusing to import into a symlink/junction notes directory.")
     stats = ImportStats(dry_run=bool(dry_run), notes_dir=str(notes_dir))
     started = time.perf_counter()
-    root_tag = f"import:{slugify(root.name, max_len=40)}"
+    anchor_name = root.parent.name if single_file_mode else root.name
+    root_tag = f"import:{slugify(anchor_name or root.stem, max_len=40)}"
     all_tags = tuple(dict.fromkeys((root_tag, *tags)))
+    source_iter = [root] if single_file_mode else list(iter_source_files(root))
+    rel_base = root.parent if single_file_mode else root
 
     with review_lock(paths.lock_path):
         manifest = _load_manifest(paths)
         used: set[str] = set()
-        for src in iter_source_files(root):
+        for src in source_iter:
             stats.scanned += 1
-            rel = src.relative_to(root)
-            rel_key = f"{root.name}/{rel.as_posix()}"
+            rel = src.relative_to(rel_base)
+            rel_key = f"{rel_base.name}/{rel.as_posix()}"
             legacy_key = str(src)
+            ext = src.suffix.lower()
+            is_doc = ext in DOC_EXTS
             try:
-                raw = src.read_bytes()
-                text = raw.decode("utf-8-sig")
-            except (OSError, UnicodeDecodeError):
+                fsize = src.stat().st_size
+            except OSError:
                 stats.skipped_unreadable += 1
                 continue
-            if len(raw) > MAX_NOTE_BYTES:
+            size_cap = MAX_DOC_BINARY_BYTES if is_doc else MAX_NOTE_BYTES
+            if fsize <= 0 and is_doc:
+                stats.skipped_unreadable += 1
+                continue
+            if fsize > size_cap:
                 stats.skipped_too_large += 1
+                continue
+            try:
+                raw = src.read_bytes()
+            except OSError:
+                stats.skipped_unreadable += 1
                 continue
             src_sha = hashlib.sha256(raw).hexdigest()
             entry = manifest.get(rel_key) or manifest.get(legacy_key)
@@ -192,9 +270,40 @@ def import_folder(
                 if rel_key not in manifest and legacy_key in manifest:
                     manifest[rel_key] = manifest.pop(legacy_key)
                 continue
-            meta, body = parse_note(text, src.name)
-            title = str(meta.get("title") or src.stem)
-            src_tags = tuple(str(t) for t in meta.get("tags", []) or [])
+
+            archived_binary_rel = str((entry or {}).get("archived_binary") or "")
+            if is_doc:
+                try:
+                    extraction = extract_document(src, max_bytes=MAX_DOC_BINARY_BYTES)
+                except (DocumentExtractionError, OSError, PermissionError):
+                    stats.skipped_unreadable += 1
+                    continue
+                if len(extraction.markdown.encode("utf-8")) > MAX_NOTE_BYTES:
+                    stats.skipped_too_large += 1
+                    continue
+                if not dry_run:
+                    if not archived_binary_rel or not (brain / archived_binary_rel).is_file():
+                        archived_binary_rel = _archive_imported_binary(src, src_sha, brain)
+                else:
+                    archived_binary_rel = f"0-raw/archive/{src.name}"
+                title = extraction.title or src.stem
+                src_tags = (f"format:{ext.lstrip('.')}",)
+                provenance_block = (
+                    f"> Imported document `{src.name}` (`{extraction.extractor}`, sha256 `{src_sha}`, "
+                    f"archived binary `{archived_binary_rel}`).\n\n"
+                )
+                body = provenance_block + extraction.markdown
+                meta: dict[str, object] = {}
+            else:
+                try:
+                    text = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    stats.skipped_unreadable += 1
+                    continue
+                meta, body = parse_note(text, src.name)
+                title = str(meta.get("title") or src.stem)
+                src_tags = tuple(str(t) for t in meta.get("tags", []) or [])
+
             mtime = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(src.stat().st_mtime))
             rendered = render_note(
                 title=title,
@@ -203,8 +312,11 @@ def import_folder(
                 tags=_clean_tags((*all_tags, *src_tags)),
                 created=str(meta.get("created") or mtime),
                 updated=mtime,
-                source_path=rel.as_posix(),
+                source_path=archived_binary_rel or rel.as_posix(),
             ).encode("utf-8")
+            if len(rendered) > MAX_NOTE_BYTES + 8192:
+                stats.skipped_too_large += 1
+                continue
             rendered_sha = hashlib.sha256(rendered).hexdigest()
             if existing_note_path:
                 if _is_reparse_or_link(existing_note_path):
@@ -246,7 +358,10 @@ def import_folder(
                 stats.created += 1
             used.add(note_name)
             manifest.pop(legacy_key, None)
-            manifest[rel_key] = {"note": note_name, "source_sha256": src_sha, "note_sha256": rendered_sha}
+            manifest_record = {"note": note_name, "source_sha256": src_sha, "note_sha256": rendered_sha}
+            if archived_binary_rel:
+                manifest_record["archived_binary"] = archived_binary_rel
+            manifest[rel_key] = manifest_record
             if progress and stats.scanned % 250 == 0:
                 progress(stats)
         if not dry_run:
@@ -260,7 +375,7 @@ def import_folder(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", help="Folder to import (Obsidian vault, Markdown docs, notes).")
+    parser.add_argument("source", help="Folder or document file to import (Obsidian vault, Markdown, PDF, DOCX, EPUB, HTML, CSV).")
     parser.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Optional tag or comma-separated tags (repeatable).")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
