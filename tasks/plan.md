@@ -328,11 +328,29 @@ unified CI gate (`scripts/test_all.py`).
 2. Durable Three-Store migration of `vault-ledger.jsonl` and content-addressed `schema_version: 3` snapshot blobs into `brain/0-raw/archive/` (with transparent `.sidecar/` fallback), generalized atom+playbook Merkle proofs (`prove_leaf_membership`), Porter-stemmed BM25 recall, spec-compliant YAML/JSON frontmatter parsing, verified note `contexts:` propagation, durable `atom-corrections.jsonl` fitness merging (`ret_hits` loop removed), and strict non-owner revision/evidence/playbook redaction.
 3. Bounded `ThreadPoolExecutor` + SSE stream concurrency guards on `MemoryLoopbackHTTPServer`, FTS5-backed `GET /v1/atoms`, SHA-256-cached anchor/metadata verification, single-term (`min(2, len(query_terms))`) + calibrated dense/RRF synonym recall (`Recall@5 = 1.000`, `0/10` trap false positives, sub-15ms P95), and relocated operator runbooks (`docs/runbooks/`).
 
-**Verification:** `scripts/evaluate_retrieval.py` (`Recall@5 = 1.000`, `0/10` trap false positives), `second-brain doctor` (`exit 0`), and `scripts/test_all.py` (`12/12 PASS`, `100% PASS`).
+**Verification:** `scripts/evaluate_retrieval.py` (`Recall@5 = 1.000`, `0/10` trap false positives), `second-brain doctor` (`exit 0`), and `scripts/test_all.py` (`18/18 PASS`, `100% PASS`).
 
-## Completed product horizon (closed in Goals 17–18)
+### Goal 19 — Document Ingestion, Chunked Refinery, Incremental Vectors, Research View, Multi-Host DLP Chat, Semantic NLI Radar & 17-Tool MCP — COMPLETE
 
-Goals 0–18 complete the local pilot and `v0.2.0` verifiable Second Brain product: durable CAS Markdown vault, cryptographic byte-offset source anchoring, out-of-model epistemic grounding, universal loopback API + SDK, per-host online consent/redaction adapters, quarantined inbox promotion, hardware-tiered profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine, zero-friction notes with one-click excerpt verification, streaming chat, bulk Obsidian importer, IDE/Antigravity/Claude/VS Code connectors, OS-signed cross-platform desktop installers (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), comparative SOTA benchmark harness (`scripts/sota_benchmark.py`), Merkle audit ledger & proofs (`scripts/vault_ledger.py`), Contradiction & Drift Radar (`scripts/knowledge_graph.py`), content-addressed Time-Travel snapshots (`scripts/time_travel.py`), and the 12-suite unified release gate (`scripts/test_all.py`, `12/12 PASS`).
+**Why:** Support multi-format local document ingestion with cryptographic byte-offset anchoring, context-window-safe Refinery extraction, incremental vector carry-forward, deterministic `"research"` leads, multi-host DLP streaming chat, semantic NLI contradiction detection, 17-tool MCP parity, and 6-host rule-installed IDE connectors.
+
+**What was built:**
+1. Local document extraction & bulk import (`scripts/doc_extractors.py`, `scripts/ingest_multimodal.py`, `scripts/bulk_import.py`) for `.pdf`, `.docx`, `.epub`, `.html`, `.csv`, and `.tsv` with immutable binary archival, `ARCHIVE_MANIFEST` SHA-256 lineage, `[page N]` coordinate spans, `[MM:SS.mmm -> MM:SS.mmm]` Whisper timestamps, and fail-closed Pillow image checks.
+2. Context-window-safe Refinery chunking (`scripts/ollama_refinery.py`), incremental vector carry-forward (`scripts/rebuild_vectors.py`), batched atomic `JsonVectorCollection` writes (`scripts/vector_store.py`), hardware-gated watchdog daemon with debounced FTS5 sync (`scripts/watchdog_daemon.py`), honest Editor deferral & project scope partitioning (`scripts/ollama_editor.py`), 8-field `ExperienceRecord` spec (`scripts/cognitive_core.py`), and structured action-item extraction (`scripts/notes_store.py`).
+3. `"research"` answer mode with deterministic `[UNVERIFIED LEADS]` (`scripts/answer_policy.py`), multi-host DLP streaming chat with DNS pinning and PII redaction/rehydration (`scripts/streaming_chat.py`, `scripts/host_adapters.py`), semantic/NLI Contradiction & Drift Radar (`scripts/knowledge_graph.py`), 17-tool MCP server (`scripts/mcp_server.py`), 6-host rule-installed IDE connectors (`scripts/ide_connector.py`), and 9-system comparative SOTA benchmark (`scripts/sota_benchmark.py`, `docs/sota-benchmark-results-2026-11-19.json`), verified by `scripts/goal2_completion_tests.py`.
+
+### Goal 20 — Full Desktop/VS Code/Dashboard UI Parity, Clean Wheel Namespace, Offline Wheelhouse & 18-Suite Release Gate — COMPLETE
+
+**Why:** Bring full UI parity across Electron Desktop, VS Code, and Streamlit Dashboard, package a clean `second_brain` wheel namespace with offline wheelhouse and inner+outer Authenticode signing, and verify every frontend and packaging boundary in CI.
+
+**What was built:**
+1. Complete Phase 4/5 and Goal 2 UI parity across Electron Desktop (`desktop/`), VS Code extension (`extensions/vscode-second-brain/`), and Streamlit Dashboard (`dashboard/app.py`), including `"research"` mode & `[UNVERIFIED LEADS]`, multi-host streaming chat, document import, Merkle proof verification, Contradiction Radar, and Time-Travel snapshots (`docs/goal3-api-contract.md`).
+2. Clean `second_brain` Python wheel namespace (`second_brain/`), offline wheelhouse builder (`scripts/build_wheelhouse.py`), pure-Python `.vsix` builder (`scripts/build_vsix.py`), multi-format desktop icon generator (`scripts/make_icons.py`), and inner+outer Authenticode signing (`desktop/build/sign.js`, `scripts/sign_release.ps1`).
+3. Automated behavioral test suites for Electron Desktop DOM/XSS/graph/pagination (`scripts/run_desktop_tests.py`), VS Code extension SSE/singleton/governance (`scripts/run_vscode_tests.py`), Streamlit AppTest dashboard (`scripts/dashboard_apptest_tests.py`), backend contracts (`scripts/goal3_backend_contract_tests.py`), and clean wheel/VSIX/wheelhouse packaging (`scripts/wheel_packaging_tests.py`), integrated into the **18-suite unified release gate** (`scripts/test_all.py`, `18/18 PASS`).
+
+## Completed product horizon (closed in Goals 17–20)
+
+Goals 0–20 complete the local pilot and `v0.2.0` verifiable Second Brain product: durable CAS Markdown vault, cryptographic byte-offset source anchoring, out-of-model epistemic grounding, universal loopback API + SDK, per-host online consent/redaction adapters, quarantined inbox promotion, hardware-tiered profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine, zero-friction notes with one-click excerpt verification, local document ingestion (`.pdf`, `.docx`, `.epub`, `.html`, `.csv`, `.tsv`), `"research"` mode with deterministic `[UNVERIFIED LEADS]`, multi-host DLP streaming chat, bulk Obsidian importer, 17-tool MCP & 6-host IDE/Antigravity/Claude/VS Code connectors, OS-signed cross-platform desktop installers (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), clean `second_brain` wheel & offline wheelhouse, comparative 9-system SOTA benchmark harness (`scripts/sota_benchmark.py`), Merkle audit ledger & proofs (`scripts/vault_ledger.py`), semantic/NLI Contradiction & Drift Radar (`scripts/knowledge_graph.py`), content-addressed Time-Travel snapshots (`scripts/time_travel.py`), and the 18-suite unified release gate (`scripts/test_all.py`, `18/18 PASS`).
 
 ## Checkpoints
 
@@ -344,10 +362,12 @@ Goals 0–18 complete the local pilot and `v0.2.0` verifiable Second Brain produ
   offline FTS5 degradation verified.
 - **Goal 8 (Passed):** Independent adversarial review reconciled and
   `scripts/test_all.py` achieves 100% pass rate.
-- **Goals 9–18 (Passed):** Phase 2–5 product ecosystem, OS-signed desktop
-  installers, SOTA benchmark, Three-Store Merkle ledger & content-addressed
-  Time-Travel snapshots, Contradiction Radar, sub-15ms recall, and all
-  adversarial security audits verified (`12/12` suites PASS).
+- **Goals 9–20 (Passed):** Phase 2–5 product ecosystem, local document ingestion,
+  `"research"` leads view, multi-host DLP streaming chat, 17-tool MCP, OS-signed
+  desktop installers, clean wheel/wheelhouse packaging, 9-system SOTA benchmark,
+  Three-Store Merkle ledger & content-addressed Time-Travel snapshots, semantic/NLI
+  Contradiction Radar, sub-15ms recall, and all UI/E2E/security suites verified
+  (`18/18` suites PASS).
 
 ## Risks
 
