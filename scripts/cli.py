@@ -154,6 +154,7 @@ def doctor() -> int:
         "scout_http": _capability("httpx"),
         "extractor": _capability("trafilatura"),
         "document_pdf": _capability("pypdf"),
+        "vault_sync_crypto": _capability("cryptography"),
         "multimodal_audio": _capability("faster_whisper"),
         "image_processing_library": _capability("PIL"),
     }
@@ -440,6 +441,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("ledger", "Cryptographic Vault Merkle proof and tamper-evident audit ledger."),
         ("graph", "Contradiction & Drift Radar + temporal knowledge graph."),
         ("snapshot", "Time-travel vault snapshots, semantic diff, and point-in-time recall."),
+        ("sync", "Zero-Knowledge E2EE multi-device vault sync (init/join/status/push/pull/verify/conflicts)."),
         ("recall", "Search owner-approved memory atoms via lexical, dense, or hybrid RRF recall."),
         ("answer", "Generate a citation-validated grounded answer (standard, preference, or research)."),
         ("review", "Inspect, approve, reject, quarantine, demote, edit, or merge memory atoms."),
@@ -525,7 +527,7 @@ _PASSTHROUGH_COMMANDS = frozenset({
     "api",
     "inbox", "hosts", "cognitive", "playbooks", "playbook", "plan",
     "notes", "capture", "import", "chat", "connect", "benchmark",
-    "sota-benchmark", "ledger", "graph", "snapshot",
+    "sota-benchmark", "ledger", "graph", "snapshot", "sync",
     "recall", "answer", "review", "audit",
     "rebuild-lexical", "rebuild-vectors",
     "refinery", "editor", "scout", "ingest", "daemon", "mcp",
@@ -770,6 +772,10 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.time_travel import main as snap_main
 
         return snap_main(forwarded)
+    if command == "sync":
+        from scripts.vault_sync import main as sync_main
+
+        return sync_main(forwarded)
     if command == "recall":
         return _run_recall_cli(forwarded)
     if command == "answer":

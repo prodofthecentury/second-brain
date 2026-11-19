@@ -120,6 +120,7 @@ from scripts.notes_store import (
     backlinks,
     create_note,
     delete_note,
+    extract_action_items,
     get_note,
     list_notes,
     update_note,
@@ -151,6 +152,14 @@ from scripts.time_travel import (
     list_snapshots,
     recall_at_snapshot,
     verify_snapshot,
+)
+from scripts.vault_sync import (
+    init_sync as vault_init_sync,
+    join_sync as vault_join_sync,
+    sync_pull as vault_sync_pull,
+    sync_push as vault_sync_push,
+    sync_status as vault_sync_status,
+    sync_verify as vault_sync_verify,
 )
 
 # Resolve active vault directories dynamically so env overrides (BRAIN_VAULT_DIR) or persisted vault paths stay isolated per run.
@@ -2721,10 +2730,11 @@ elif nav_selection == "📝 Working Notes & Import":
         "Promote an exact excerpt into an immutable snapshot + SHA-256 anchored approved atom at any time."
     )
     note_paths = _active_note_paths()
-    tab_notes_browse, tab_notes_create, tab_notes_import = st.tabs([
+    tab_notes_browse, tab_notes_create, tab_notes_import, tab_notes_tasks = st.tabs([
         "📚 Browse, Edit & Verify Excerpt",
         "➕ New Working Note",
         "📦 Bulk & Document Import",
+        "✅ Action Items & Tasks",
     ])
 
     with tab_notes_browse:
@@ -2988,6 +2998,44 @@ elif nav_selection == "📝 Working Notes & Import":
                 except Exception as exc:
                     st.error(f"Single-document import blocked: {exc}")
 
+    with tab_notes_tasks:
+        st.markdown("#### ✅ Extracted Action Items & Tasks")
+        st.caption(
+            "Model-free deterministic task scanner across `brain/notes/` and local raw captures (`- [ ]`, `TODO:`, `ACTION:`, `FIXME:`)."
+        )
+        tc1, tc2, tc3 = st.columns([2.0, 1.0, 1.0])
+        with tc1:
+            tasks_proj_filter = st.text_input("Optional Project Scope", placeholder="e.g. project:second_brain", key="notes_tasks_proj")
+        with tc2:
+            tasks_inc_completed = st.checkbox("Include Completed", value=False, key="notes_tasks_completed")
+        with tc3:
+            tasks_inc_raw = st.checkbox("Include Raw Captures", value=True, key="notes_tasks_raw")
+        extracted_tasks = extract_action_items(
+            paths=note_paths,
+            include_completed=tasks_inc_completed,
+            include_raw=tasks_inc_raw,
+            project=tasks_proj_filter.strip() or None,
+        )
+        st.caption(f"Found {len(extracted_tasks)} matching action item(s).")
+        if extracted_tasks:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "status": "done" if t.get("completed") else "open",
+                            "priority": t.get("priority") or "",
+                            "due_date": t.get("due_date") or "",
+                            "source": f"{t.get('filename', '')}:{t.get('line_number', '')}",
+                            "task": t.get("text", ""),
+                        }
+                        for t in extracted_tasks
+                    ]
+                ),
+                width="stretch",
+            )
+        else:
+            st.info("No matching open tasks or action items found.")
+
 
 # PAGE: VAULT PROOF, CONTRADICTION RADAR & TIME-TRAVEL (PHASE 5)
 elif nav_selection == "🛡️ Vault Proof & Time-Travel":
@@ -3145,11 +3193,13 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                     st.caption("No checkpoints committed to `brain/.sidecar/vault-ledger.jsonl` yet.")
 
     with tab_radar:
-        rc1, rc2 = st.columns(2)
+        rc1, rc2, rc3 = st.columns([1.8, 1.3, 1.3])
         with rc1:
             radar_proj = st.text_input("Optional Project Scope", placeholder="e.g. project:second_brain", key="radar_proj")
         with rc2:
             radar_inc_pending = st.checkbox("Include Pending Drafts in Graph & Contradiction Scan", value=True, key="radar_pending")
+        with rc3:
+            radar_enable_nli = st.checkbox("Enable Local Ollama NLI Adjudication", value=False, key="radar_enable_nli")
         if st.button("📡 Scan Vault for Contradictions, Source Drift & Orphans", key="btn_scan_radar"):
             scope_arg = radar_proj.strip() or None
             graph_info = build_knowledge_graph(
@@ -3163,6 +3213,7 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                 atoms_dir=ATOMS_DIR,
                 project_scope=scope_arg,
                 include_pending=radar_inc_pending,
+                enable_nli=radar_enable_nli,
             )
             drift_alerts = radar_info.get("drift_alerts", [])
             drift_cnt = radar_info.get("drift_count", len(drift_alerts))
@@ -3174,6 +3225,11 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
             gc3.metric("Contradictions", radar_info["contradiction_count"])
             gc4.metric("High Severity", radar_info["high_severity_count"])
             gc5.metric("Source / CAS Drift", drift_cnt)
+            if radar_enable_nli or radar_info.get("nli_status"):
+                st.caption(
+                    f"Local NLI Adjudication: `{radar_info.get('nli_status', 'disabled')}` "
+                    f"({radar_info.get('nli_evaluated_pairs', 0)} pair(s) evaluated)"
+                )
 
             st.markdown("#### ⚡ Claim Polarity & Numeric Contradiction Alerts")
             if radar_info.get("alerts"):
@@ -3192,6 +3248,14 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                         st.code(str(b_info.get("claim", "")), language="text")
                         if alert.get("shared_terms"):
                             st.caption("Shared lexical terms: `" + "`, `".join(alert["shared_terms"]) + "`")
+                        if alert.get("exclusive_categories"):
+                            st.caption("Mutually exclusive categories: `" + "`, `".join(alert["exclusive_categories"]) + "`")
+                        if isinstance(alert.get("nli_adjudication"), dict) and alert["nli_adjudication"].get("verdict"):
+                            nli_adj = alert["nli_adjudication"]
+                            st.info(
+                                f"Local NLI Verdict: `{nli_adj.get('verdict')}` "
+                                f"(confidence: `{nli_adj.get('confidence', 'n/a')}`) — {nli_adj.get('rationale', '')}"
+                            )
             else:
                 st.success("Zero claim polarity or numeric contradictions detected in selected scope.")
 
@@ -3541,6 +3605,108 @@ elif nav_selection == "⚙️ System Control":
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Disconnect failed: {exc}")
+
+    # Zero-Knowledge E2EE Multi-Device Vault Sync
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🔐 Zero-Knowledge E2EE Multi-Device Vault Sync")
+        st.caption(
+            "AES-256-GCM + HKDF-SHA256 + Ed25519 signed heads. Syncs ONLY durable Markdown and append-only logs; "
+            "excludes `.sidecar/`, `.chroma/`, and security secrets."
+        )
+        try:
+            sync_st = vault_sync_status(brain_dir=BRAIN_DIR)
+        except Exception as sync_exc:
+            sync_st = {"configured": False, "error": str(sync_exc), "conflict_count": 0, "conflicts": []}
+
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1.metric("Sync Status", "Configured" if sync_st.get("configured") else "Not Configured")
+        sm2.metric("Local Epoch", sync_st.get("local_epoch", 0))
+        sm3.metric("Remote Epoch", sync_st.get("remote_epoch", 0))
+        sm4.metric("Conflicts", sync_st.get("conflict_count", 0))
+
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            sync_target_in = st.text_input(
+                "Sync Target (Local Folder or https:// URL)",
+                value=str(sync_st.get("target") or ""),
+                key="sys_sync_target",
+            )
+            sync_backend_in = st.selectbox(
+                "Backend",
+                options=["local_folder", "http_object"],
+                index=0 if sync_st.get("backend_type", "local_folder") == "local_folder" else 1,
+                key="sys_sync_backend",
+            )
+        with sc2:
+            sync_pass_in = st.text_input(
+                "Optional Passphrase (leave blank for keyfile)",
+                type="password",
+                key="sys_sync_passphrase",
+            )
+            sync_rec_in = st.text_input(
+                "Recovery Key (base64, required only for Join)",
+                type="password",
+                key="sys_sync_recovery",
+            )
+
+        sb1, sb2, sb3, sb4, sb5 = st.columns(5)
+        with sb1:
+            if st.button("🆕 Init Sync", key="btn_sync_init"):
+                try:
+                    res = vault_init_sync(
+                        sync_target_in.strip(),
+                        backend_type=sync_backend_in,
+                        brain_dir=BRAIN_DIR,
+                        passphrase=sync_pass_in or None,
+                    )
+                    st.success(f"Initialized E2EE vault `{res['vault_id']}` (device `{res['device_id']}`).")
+                    if res.get("recovery_key_b64"):
+                        st.code(f"Recovery Key (save offline safely): {res['recovery_key_b64']}", language="text")
+                except Exception as exc:
+                    st.error(f"Init failed: {exc}")
+        with sb2:
+            if st.button("🤝 Join Sync", key="btn_sync_join"):
+                try:
+                    res = vault_join_sync(
+                        sync_target_in.strip(),
+                        backend_type=sync_backend_in,
+                        brain_dir=BRAIN_DIR,
+                        passphrase=sync_pass_in or None,
+                        recovery_key_b64=sync_rec_in.strip() or None,
+                    )
+                    st.success(f"Joined E2EE vault `{res['vault_id']}` as `{res['device_id']}`.")
+                except Exception as exc:
+                    st.error(f"Join failed: {exc}")
+        with sb3:
+            if st.button("⬆️ Push Encrypted", key="btn_sync_push"):
+                try:
+                    res = vault_sync_push(brain_dir=BRAIN_DIR, passphrase=sync_pass_in or None)
+                    st.success(
+                        f"Pushed epoch `{res['epoch']}` ({res['uploaded_blobs']} uploaded, {res['reused_blobs']} reused)."
+                    )
+                except Exception as exc:
+                    st.error(f"Push failed: {exc}")
+        with sb4:
+            if st.button("⬇️ Pull & Merge", key="btn_sync_pull"):
+                try:
+                    res = vault_sync_pull(brain_dir=BRAIN_DIR, passphrase=sync_pass_in or None)
+                    st.success(
+                        f"Pulled epoch `{res['epoch']}` (+{res['added']} added, {res['updated']} updated, "
+                        f"{res['merged_jsonl']} JSONL merged, {res['conflict_count']} conflict(s))."
+                    )
+                except Exception as exc:
+                    st.error(f"Pull failed: {exc}")
+        with sb5:
+            if st.button("🛡️ Verify Remote", key="btn_sync_verify"):
+                try:
+                    res = vault_sync_verify(brain_dir=BRAIN_DIR, passphrase=sync_pass_in or None)
+                    if res.get("valid"):
+                        st.success(f"Verified remote vault cleanly ({res.get('verified_blobs', 0)} blobs).")
+                    else:
+                        st.error(f"Verification failed: {res.get('issues')}")
+                except Exception as exc:
+                    st.error(f"Verify failed: {exc}")
 
     # Briefing log
     st.divider()

@@ -4,6 +4,27 @@ All notable changes to **Second Brain** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-11-19
+
+Advanced multi-device release introducing **Zero-Knowledge E2EE Multi-Device Vault Sync**, complete **Action-Item Tasks / Local NLI Radar / E2EE Sync UI parity** across Electron Desktop, VS Code, and Streamlit Dashboard, hardened CI/release workflows, and the **19-suite unified verification gate**.
+
+### Added
+- **Zero-Knowledge E2EE Multi-Device Vault Sync (`scripts/vault_sync.py`, `second-brain sync`, `/v1/sync/*`, `MemoryApiClient.sync_*`):**
+  - Authenticated encryption (`AES-256-GCM`, per-object `HKDF-SHA256` subkeys, random 96-bit nonces, strict AAD binding, `HMAC-SHA256` blind blob IDs) with `scrypt` passphrase KDF or 256-bit keyfile mode.
+  - Per-device `Ed25519` signed heads with peer public-key pinning and monotonic anti-rollback epoch enforcement.
+  - Strict Three-Store isolation (syncs only durable Markdown & append-only logs; never `.sidecar/`, `.chroma/`, symlinks, or security secrets; auto-rebuilds local lexical & notes indexes on pull).
+  - Conflict-safe 3-way merge: deterministic set-union merge for append-only JSONL audit/lineage logs (`decision-record.jsonl`, `manifest.jsonl`, `atom-corrections.jsonl`, `mcp-audit.jsonl`), `.history/` backup before canonical fast-forward overwrites, and quarantined `0-raw/sync-conflicts/` copies on true divergence.
+  - Pluggable `LocalFolderSyncBackend` (OneDrive/iCloud/Syncthing/NAS/USB) and DNS-pinned `HttpObjectSyncBackend` (`https://`, no redirects).
+- **Complete 3-Surface UI Parity:**
+  - **Electron Desktop (`desktop/renderer/{index.html,app.js}`):** Action-Item Tasks panel (`/v1/notes/tasks`), Local NLI Contradiction Radar opt-in (`nli=1`) displaying `exclusive_categories` & `nli_adjudication`, and E2EE Multi-Device Vault Sync controls (`Init`, `Join`, `Push`, `Pull`, `Verify`, conflict view) under `System`.
+  - **VS Code Extension (`extensions/vscode-second-brain/`):** Added `secondBrain.showTasks`, `secondBrain.scanContradictionsNli`, and `secondBrain.syncVault` commands plus enriched Markdown formatters.
+  - **Streamlit Dashboard (`dashboard/app.py`):** Added `Action Items & Tasks` tab under Working Notes, `Enable Local Ollama NLI Adjudication` toggle in Contradiction Radar, and E2EE Vault Sync controls under System Control.
+- **Suite 19/19 Verification Gate (`scripts/goal4_sync_and_ui_tests.py`):** End-to-end 2-device sync, zero-knowledge leak checks, passphrase KDF fail-closed checks, JSONL set-union merge, conflict quarantine, ciphertext/AAD/Ed25519/rollback tamper rejection, mocked HTTPS object backend, owner-token API gating, UI parity, and CI/release pipeline hygiene.
+
+### Fixed
+- Added `-SkipSign` switch and SHA-256 manifest fallback to `scripts/package_desktop.ps1` so unsigned CI Windows runs in `.github/workflows/release.yml` succeed cleanly alongside signed Authenticode builds.
+- Added POSIX LF line-ending verification (`setup.sh`, `run_daemon.sh`, `scripts/package_desktop.sh`) and `goal4_sync_and_ui_tests` to `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
+
 ## [0.2.0] — 2026-11-19
 
 First unified production release consolidating **Core Runtime Parity & Three-Store Durability**, **Document Ingestion, Multi-Host DLP & 17-Tool MCP**, and **Cross-Platform Desktop/VS Code/Dashboard UI & Packaging**.

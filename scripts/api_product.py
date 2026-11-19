@@ -86,6 +86,18 @@ from notes_store import (  # noqa: E402
 )
 from recall import MemoryRecallUnavailable  # noqa: E402
 from skill_playbooks import PlaybookValidationError  # noqa: E402
+from vault_sync import (  # noqa: E402
+    SyncConflictError,
+    SyncError,
+    SyncSecurityError,
+    init_sync,
+    join_sync,
+    list_sync_conflicts,
+    sync_pull,
+    sync_push,
+    sync_status,
+    sync_verify,
+)
 
 OWNER_HEADER = "X-Owner-Token"
 MIN_OWNER_TOKEN_LEN = 32
@@ -2440,6 +2452,131 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 return send(404, {"error": "Job not found."})
             return send(200, rec)
 
+        # ── Zero-Knowledge E2EE Multi-Device Vault Sync (owner) ──
+        if path == "/v1/sync/status" and method == "GET":
+            if not owner_only():
+                return True
+            return send(
+                200,
+                sync_status(
+                    brain_dir=rt.brain_dir,
+                    state_dir=getattr(rt, "sync_state_dir", None),
+                    http_transport=getattr(rt, "http_transport", None),
+                    skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+                ),
+            )
+
+        if path == "/v1/sync/conflicts" and method == "GET":
+            if not owner_only():
+                return True
+            items = list_sync_conflicts(brain_dir=rt.brain_dir)
+            return send(200, {"count": len(items), "conflicts": items})
+
+        if path == "/v1/sync/init" and method == "POST":
+            if not owner_only():
+                return True
+            target = _str(body, "target", max_len=1000).strip()
+            backend_type = _str(body, "backend_type", default="local_folder", max_len=32, required=False).strip() or "local_folder"
+            device_name = _str(body, "device_name", max_len=80, required=False).strip() or None
+            passphrase = body.get("passphrase")
+            if passphrase is not None and not isinstance(passphrase, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(passphrase, str) and not passphrase:
+                passphrase = None
+            bearer_token_env = _str(body, "bearer_token_env", max_len=80, required=False).strip() or None
+            res = init_sync(
+                target,
+                backend_type=backend_type,
+                brain_dir=rt.brain_dir,
+                device_name=device_name,
+                passphrase=passphrase,
+                bearer_token_env=bearer_token_env,
+                state_dir=getattr(rt, "sync_state_dir", None),
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(201, res)
+
+        if path == "/v1/sync/join" and method == "POST":
+            if not owner_only():
+                return True
+            target = _str(body, "target", max_len=1000).strip()
+            backend_type = _str(body, "backend_type", default="local_folder", max_len=32, required=False).strip() or "local_folder"
+            device_name = _str(body, "device_name", max_len=80, required=False).strip() or None
+            passphrase = body.get("passphrase")
+            if passphrase is not None and not isinstance(passphrase, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(passphrase, str) and not passphrase:
+                passphrase = None
+            recovery_key_b64 = _str(body, "recovery_key_b64", max_len=256, required=False).strip() or None
+            bearer_token_env = _str(body, "bearer_token_env", max_len=80, required=False).strip() or None
+            res = join_sync(
+                target,
+                backend_type=backend_type,
+                brain_dir=rt.brain_dir,
+                device_name=device_name,
+                passphrase=passphrase,
+                recovery_key_b64=recovery_key_b64,
+                bearer_token_env=bearer_token_env,
+                state_dir=getattr(rt, "sync_state_dir", None),
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(200, res)
+
+        if path == "/v1/sync/push" and method == "POST":
+            if not owner_only():
+                return True
+            passphrase = body.get("passphrase")
+            if passphrase is not None and not isinstance(passphrase, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(passphrase, str) and not passphrase:
+                passphrase = None
+            res = sync_push(
+                brain_dir=rt.brain_dir,
+                passphrase=passphrase,
+                state_dir=getattr(rt, "sync_state_dir", None),
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(200, res)
+
+        if path == "/v1/sync/pull" and method == "POST":
+            if not owner_only():
+                return True
+            passphrase = body.get("passphrase")
+            if passphrase is not None and not isinstance(passphrase, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(passphrase, str) and not passphrase:
+                passphrase = None
+            trust_new_peers = bool(body.get("trust_new_peers", True))
+            res = sync_pull(
+                brain_dir=rt.brain_dir,
+                passphrase=passphrase,
+                trust_new_peers=trust_new_peers,
+                state_dir=getattr(rt, "sync_state_dir", None),
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(200, res)
+
+        if path == "/v1/sync/verify" and method == "POST":
+            if not owner_only():
+                return True
+            passphrase = body.get("passphrase")
+            if passphrase is not None and not isinstance(passphrase, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(passphrase, str) and not passphrase:
+                passphrase = None
+            res = sync_verify(
+                brain_dir=rt.brain_dir,
+                passphrase=passphrase,
+                state_dir=getattr(rt, "sync_state_dir", None),
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(200, res)
+
     except (MemoryRecallUnavailable, LexicalIndexUnavailable) as exc:
         return send(
             503,
@@ -2448,7 +2585,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 "remediation": "Run 'second-brain rebuild-lexical' or start local Ollama.",
             },
         )
-    except ReviewConflictError as exc:
+    except (ReviewConflictError, SyncConflictError) as exc:
         return send(409, {"error": str(exc), "conflict": True})
     except FileNotFoundError as exc:
         return send(404, {"error": str(exc)})
@@ -2456,9 +2593,9 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if str(exc).startswith("Note not found:"):
             return send(404, {"error": str(exc)})
         return send(422, {"error": str(exc)})
-    except (PlaybookValidationError, ReviewTransitionError, ValueError, NotADirectoryError) as exc:
+    except (PlaybookValidationError, ReviewTransitionError, SyncError, ValueError, NotADirectoryError) as exc:
         return send(422, {"error": str(exc)})
-    except HostConsentError as exc:
+    except (HostConsentError, SyncSecurityError) as exc:
         return send(403, {"error": str(exc)})
     except PermissionError as exc:
         return send(403, {"error": str(exc)})

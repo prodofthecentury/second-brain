@@ -2228,6 +2228,69 @@ class MemoryApiClient:
     def verify_snapshot(self, snapshot_id: str) -> dict[str, object]:
         return self._request("POST", "/v1/snapshots/verify", {"snapshot_id": snapshot_id})
 
+    def sync_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/sync/status")
+
+    def sync_conflicts(self) -> dict[str, object]:
+        return self._request("GET", "/v1/sync/conflicts")
+
+    def sync_init(
+        self,
+        target: str,
+        *,
+        backend_type: str = "local_folder",
+        device_name: str | None = None,
+        passphrase: str | None = None,
+        bearer_token_env: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {"target": target, "backend_type": backend_type}
+        if device_name:
+            payload["device_name"] = device_name
+        if passphrase:
+            payload["passphrase"] = passphrase
+        if bearer_token_env:
+            payload["bearer_token_env"] = bearer_token_env
+        return self._request("POST", "/v1/sync/init", payload)
+
+    def sync_join(
+        self,
+        target: str,
+        *,
+        backend_type: str = "local_folder",
+        device_name: str | None = None,
+        passphrase: str | None = None,
+        recovery_key_b64: str | None = None,
+        bearer_token_env: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {"target": target, "backend_type": backend_type}
+        if device_name:
+            payload["device_name"] = device_name
+        if passphrase:
+            payload["passphrase"] = passphrase
+        if recovery_key_b64:
+            payload["recovery_key_b64"] = recovery_key_b64
+        if bearer_token_env:
+            payload["bearer_token_env"] = bearer_token_env
+        return self._request("POST", "/v1/sync/join", payload)
+
+    def sync_push(self, *, passphrase: str | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        if passphrase:
+            payload["passphrase"] = passphrase
+        return self._request("POST", "/v1/sync/push", payload)
+
+    def sync_pull(self, *, passphrase: str | None = None, trust_new_peers: bool = True) -> dict[str, object]:
+        payload: dict[str, object] = {"trust_new_peers": bool(trust_new_peers)}
+        if passphrase:
+            payload["passphrase"] = passphrase
+        return self._request("POST", "/v1/sync/pull", payload)
+
+    def sync_verify(self, *, passphrase: str | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        if passphrase:
+            payload["passphrase"] = passphrase
+        return self._request("POST", "/v1/sync/verify", payload)
+
     # Convenience SDK method aliases
     inbox_item = inspect_inbox_item
     review_queue = list_review_queue
@@ -2317,6 +2380,13 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "POST /v1/snapshots/diff",
                 "POST /v1/snapshots/recall",
                 "POST /v1/snapshots/verify",
+                "GET /v1/sync/status",
+                "GET /v1/sync/conflicts",
+                "POST /v1/sync/init",
+                "POST /v1/sync/join",
+                "POST /v1/sync/push",
+                "POST /v1/sync/pull",
+                "POST /v1/sync/verify",
             ],
         },
         "local_ide_mcp_stdio": {

@@ -16,6 +16,7 @@ param(
     [string]$Thumbprint = $env:SECOND_BRAIN_CERT_THUMBPRINT,
     [string]$TimestampUrl = $(if ($env:SECOND_BRAIN_TIMESTAMP_URL) { $env:SECOND_BRAIN_TIMESTAMP_URL } else { "https://timestamp.digicert.com" }),
     [switch]$SelfSigned,
+    [switch]$SkipSign,
     [switch]$SkipBuild
 )
 
@@ -85,19 +86,21 @@ if (-not $SkipBuild) {
 
         # Stage 2: Deterministically sign inner `win-unpacked/Second Brain.exe` BEFORE wrapping in NSIS/MSI
         $innerExe = Join-Path $DistDir "win-unpacked\Second Brain.exe"
-        $innerSignArgs = @{
-            SingleFile   = $innerExe
-            TimestampUrl = $TimestampUrl
-            SkipManifest = $true
+        if (-not $SkipSign) {
+            $innerSignArgs = @{
+                SingleFile   = $innerExe
+                TimestampUrl = $TimestampUrl
+                SkipManifest = $true
+            }
+            if ($Thumbprint) { $innerSignArgs["Thumbprint"] = $Thumbprint }
+            elseif ($PfxPath) {
+                $innerSignArgs["PfxPath"] = $PfxPath
+                if ($PfxPassword) { $innerSignArgs["PfxPassword"] = $PfxPassword }
+            } elseif ($SelfSigned) {
+                $innerSignArgs["SelfSigned"] = $true
+            }
+            & $SignScript @innerSignArgs
         }
-        if ($Thumbprint) { $innerSignArgs["Thumbprint"] = $Thumbprint }
-        elseif ($PfxPath) {
-            $innerSignArgs["PfxPath"] = $PfxPath
-            if ($PfxPassword) { $innerSignArgs["PfxPassword"] = $PfxPassword }
-        } elseif ($SelfSigned) {
-            $innerSignArgs["SelfSigned"] = $true
-        }
-        & $SignScript @innerSignArgs
 
         # Stage 3: Package pre-signed `win-unpacked` into NSIS / MSI installers
         if ($Target -ne "pack") {
@@ -144,16 +147,27 @@ Get-ChildItem -Path $DistDir -Filter "*.nsis.7z" -ErrorAction SilentlyContinue |
 Remove-Item -Path (Join-Path $DistDir "builder-debug.yml") -Force -ErrorAction SilentlyContinue
 
 # Stage 4: Sign outer .exe/.msi installers, verify signatures, and emit SHA256SUMS.txt
-$outerSignArgs = @{
-    DistDir      = $DistDir
-    TimestampUrl = $TimestampUrl
-}
-if ($Thumbprint) { $outerSignArgs["Thumbprint"] = $Thumbprint }
-elseif ($PfxPath) {
-    $outerSignArgs["PfxPath"] = $PfxPath
-    if ($PfxPassword) { $outerSignArgs["PfxPassword"] = $PfxPassword }
-} elseif ($SelfSigned) {
-    $outerSignArgs["SelfSigned"] = $true
-}
+if ($SkipSign) {
+    $sumLines = @()
+    Get-ChildItem -Path $DistDir -File | Where-Object {
+        $_.Extension -in @(".exe", ".msi", ".whl", ".vsix", ".blockmap")
+    } | Sort-Object Name | ForEach-Object {
+        $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $sumLines += "$hash  $($_.Name)"
+    }
+    Set-Content -Path (Join-Path $DistDir "SHA256SUMS.txt") -Value ($sumLines -join "`n") -Encoding ascii
+} else {
+    $outerSignArgs = @{
+        DistDir      = $DistDir
+        TimestampUrl = $TimestampUrl
+    }
+    if ($Thumbprint) { $outerSignArgs["Thumbprint"] = $Thumbprint }
+    elseif ($PfxPath) {
+        $outerSignArgs["PfxPath"] = $PfxPath
+        if ($PfxPassword) { $outerSignArgs["PfxPassword"] = $PfxPassword }
+    } elseif ($SelfSigned) {
+        $outerSignArgs["SelfSigned"] = $true
+    }
 
-& $SignScript @outerSignArgs
+    & $SignScript @outerSignArgs
+}

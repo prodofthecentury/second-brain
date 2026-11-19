@@ -153,6 +153,20 @@
         "title": "Second Brain: Scan Contradiction & Drift Radar"
       },
       {
+        "command": "secondBrain.scanContradictionsNli",
+        "title": "Second Brain: Scan Contradictions with Local NLI (nli=1)"
+      },
+      {
+        "command": "secondBrain.showTasks",
+        "title": "Second Brain: Show Action Items & Tasks",
+        "icon": "$(tasklist)"
+      },
+      {
+        "command": "secondBrain.syncVault",
+        "title": "Second Brain: Encrypted E2EE Vault Sync (Status / Push / Pull / Verify)",
+        "icon": "$(sync)"
+      },
+      {
         "command": "secondBrain.createSnapshot",
         "title": "Second Brain: Create Vault Snapshot"
       },

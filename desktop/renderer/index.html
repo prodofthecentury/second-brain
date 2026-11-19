@@ -48,9 +48,20 @@
           <button class="btn primary" id="newNoteBtn" type="button">+ New Note</button>
           <button class="btn" id="saveNoteBtn" type="button">Save <span class="kbd">Ctrl+S</span></button>
           <button class="btn" id="togglePreviewBtn" type="button">Split Preview</button>
+          <button class="btn" id="toggleTasksBtn" type="button">Action Items</button>
           <button class="btn danger" id="deleteNoteBtn" type="button">Trash</button>
         </div>
         <div class="status-banner" id="notesBanner">Zero-friction owner notes index immediately. Highlight an excerpt (&gt;= 12 chars) below to promote it into a SHA-256 anchored Verified Atom.</div>
+        <div class="card" id="notesTasksCard" style="display:none; margin-bottom:10px;">
+          <div class="toolbar">
+            <strong>Extracted Action Items &amp; Tasks</strong>
+            <input type="text" id="tasksProjectInput" placeholder="project scope (optional)" style="width:170px; margin-left:auto;" />
+            <label class="inline-check"><input type="checkbox" id="tasksIncludeCompletedCheck" /> Completed</label>
+            <label class="inline-check"><input type="checkbox" id="tasksIncludeRawCheck" checked /> Raw Captures</label>
+            <button class="btn sm primary" id="refreshTasksBtn" type="button">Scan Tasks</button>
+          </div>
+          <div id="notesTasksList" class="sub-panel">Click Scan Tasks to inspect deterministic action items across working notes and local raw captures.</div>
+        </div>
         <div class="notes-grid">
           <div class="pane">
             <div class="scroll-list" id="notesList"></div>
@@ -311,6 +322,46 @@
           <div id="systemFitnessWrap"></div>
         </div>
 
+        <div class="card" id="systemSyncCard">
+          <div class="toolbar">
+            <strong>Zero-Knowledge E2EE Multi-Device Vault Sync</strong>
+            <button class="btn sm" id="syncRefreshBtn" type="button" style="margin-left:auto;">Refresh Status</button>
+            <button class="btn sm primary" id="syncPushBtn" type="button">Push Encrypted</button>
+            <button class="btn sm good" id="syncPullBtn" type="button">Pull &amp; Merge</button>
+            <button class="btn sm" id="syncVerifyBtn" type="button">Verify Remote</button>
+          </div>
+          <div class="note-item-meta">AES-256-GCM + HKDF-SHA256 + Ed25519 signed heads. Syncs ONLY durable Markdown &amp; append-only logs; never uploads plaintext paths, .sidecar/, or secrets.</div>
+          <div class="kpi-grid" id="syncStatusKpis"></div>
+          <div class="form-grid" style="margin-top:8px;">
+            <div class="field-col">
+              <span class="field-label">Sync Target (Local Folder or https:// Object Store)</span>
+              <input type="text" id="syncTargetInput" placeholder="e.g. C:\Users\you\OneDrive\SecondBrainSync or https://..." />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Backend</span>
+              <select id="syncBackendSelect" aria-label="Sync Backend">
+                <option value="local_folder">local_folder (OneDrive / iCloud / Syncthing / NAS)</option>
+                <option value="http_object">http_object (DNS-Pinned HTTPS Object Store)</option>
+              </select>
+            </div>
+            <div class="field-col">
+              <span class="field-label">Device Name (optional)</span>
+              <input type="text" id="syncDeviceNameInput" placeholder="e.g. workstation-win" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Optional Passphrase (blank = 256-bit keyfile)</span>
+              <input type="password" id="syncPassphraseInput" placeholder="Optional E2EE passphrase..." autocomplete="off" />
+            </div>
+          </div>
+          <div class="toolbar" style="margin-top:6px;">
+            <input type="password" id="syncRecoveryKeyInput" placeholder="Recovery Key (base64, required only to Join a keyfile vault)" style="flex:1; min-width:240px;" autocomplete="off" />
+            <button class="btn" id="syncInitBtn" type="button">Init New Sync Target</button>
+            <button class="btn" id="syncJoinBtn" type="button">Join Existing Target</button>
+          </div>
+          <div class="status-banner" id="syncOutput">Checking E2EE sync status...</div>
+          <div id="syncConflictsList"></div>
+        </div>
+
         <div class="card">
           <strong>Experience Logger (Layer 4 Episodic Learning)</strong>
           <div class="form-grid">
@@ -541,6 +592,10 @@
             <label class="inline-check" style="margin-left:auto;">
               <input type="checkbox" id="radarIncludePendingCheck" checked />
               Include pending atoms
+            </label>
+            <label class="inline-check">
+              <input type="checkbox" id="radarEnableNliCheck" />
+              Local NLI (nli=1)
             </label>
             <input type="text" id="radarScopeInput" placeholder="Filter project_scope (optional)" style="width:190px;" />
             <button class="btn primary" id="scanRadarBtn" type="button">Scan Contradictions</button>

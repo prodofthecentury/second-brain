@@ -136,6 +136,11 @@ function formatRadarMarkdown(data) {
     `- **Contradiction Alerts:** ${data?.contradiction_count ?? alerts.length} (${data?.high_severity_count ?? 0} high severity)`,
     `- **Source Anchor Drift Alerts:** ${data?.drift_count ?? drift.length}`,
     `- **Orphan Approved Atoms:** ${data?.orphan_approved_count ?? orphans.length}`,
+    ...(data?.nli_status
+      ? [
+          `- **Local NLI Adjudication:** \`${data.nli_status}\` (${data?.nli_evaluated_pairs ?? 0} pair(s) evaluated)`,
+        ]
+      : []),
     "",
   ];
 
@@ -149,6 +154,16 @@ function formatRadarMarkdown(data) {
       );
       if ((al.shared_terms || []).length) {
         lines.push(`- **Shared Terms:** \`${al.shared_terms.join("`, `")}\``);
+      }
+      if ((al.exclusive_categories || []).length) {
+        lines.push(`- **Mutually Exclusive Categories:** \`${al.exclusive_categories.join("`, `")}\``);
+      }
+      if (al.nli_adjudication && al.nli_adjudication.verdict) {
+        lines.push(
+          `- **Local NLI Verdict:** \`${al.nli_adjudication.verdict}\`${
+            al.nli_adjudication.rationale ? ` — ${al.nli_adjudication.rationale}` : ""
+          }`
+        );
       }
       if (al.atom_a) {
         lines.push(
@@ -399,6 +414,42 @@ function formatInboxPreviewMarkdown(filename, doc) {
   return lines.join("\n");
 }
 
+function formatTasksMarkdown(data) {
+  const tasks = data?.tasks || data?.items || [];
+  const lines = [
+    "# Second Brain — Extracted Action Items & Tasks",
+    "",
+    `- **Matching Tasks:** ${data?.count ?? tasks.length}`,
+    "",
+  ];
+  if (!tasks.length) {
+    lines.push("_No matching open tasks or action items found across working notes._", "");
+    return lines.join("\n");
+  }
+  for (const t of tasks) {
+    const mark = t.completed ? "[x]" : "[ ]";
+    const meta = [];
+    if (t.priority) meta.push(`priority:${t.priority}`);
+    if (t.due_date) meta.push(`due:${t.due_date}`);
+    meta.push(`\`${t.filename || ""}:${t.line_number ?? "?"}\``);
+    lines.push(`- ${mark} ${t.text || ""} — ${meta.join(" · ")}`);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+function formatSyncStatusMarkdown(action, data) {
+  const lines = [
+    `# Zero-Knowledge E2EE Vault Sync — ${String(action || "status").toUpperCase()}`,
+    "",
+    "```json",
+    JSON.stringify(data || {}, null, 2),
+    "```",
+    "",
+  ];
+  return lines.join("\n");
+}
+
 module.exports = {
   computeClaimGroundingUnits,
   formatPlanMarkdown,
@@ -409,4 +460,6 @@ module.exports = {
   formatPlaybookMarkdown,
   formatAtomProofMarkdown,
   formatInboxPreviewMarkdown,
+  formatTasksMarkdown,
+  formatSyncStatusMarkdown,
 };

@@ -80,6 +80,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "goal3_backend_contract_tests.py")),
     ),
     (
+        "goal4_sync_and_ui_tests",
+        "Goal 4 Zero-Knowledge E2EE multi-device vault sync, crypto tamper/rollback/AAD checks, API/SDK owner gating, UI parity & CI/release hygiene (scripts/goal4_sync_and_ui_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "goal4_sync_and_ui_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),

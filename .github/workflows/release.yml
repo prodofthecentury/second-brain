@@ -63,8 +63,9 @@ jobs:
             --only evaluation_dataset audit_sources system_safety_tests \
             phase2_safety_tests phase3_cognitive_tests phase4_product_tests \
             phase5_god_features_tests goal2_completion_tests \
-            goal3_backend_contract_tests dashboard_apptest_tests \
-            chroma_rebuild_canary archive_manifest_canary smoke_test
+            goal3_backend_contract_tests goal4_sync_and_ui_tests \
+            dashboard_apptest_tests chroma_rebuild_canary \
+            archive_manifest_canary smoke_test
 
       - name: Build Python wheel & VSIX and verify clean-wheel installation
         run: |

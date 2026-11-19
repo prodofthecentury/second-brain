@@ -337,7 +337,13 @@ synchronized across both files.
 - [x] Package clean `second_brain` Python wheel namespace (`second_brain/`), offline wheelhouse builder (`scripts/build_wheelhouse.py`), pure-Python `.vsix` builder (`scripts/build_vsix.py`), multi-format desktop icon generator (`scripts/make_icons.py`), and inner+outer Authenticode signing (`desktop/build/sign.js`, `scripts/sign_release.ps1`).
 - [x] Add automated behavioral test suites for Electron Desktop DOM/XSS/graph/pagination (`scripts/run_desktop_tests.py`), VS Code extension SSE/singleton/governance (`scripts/run_vscode_tests.py`), Streamlit AppTest dashboard (`scripts/dashboard_apptest_tests.py`), backend contracts (`scripts/goal3_backend_contract_tests.py`), and clean wheel/VSIX/wheelhouse packaging (`scripts/wheel_packaging_tests.py`), achieving `18/18 PASS` (`100% PASS`) in `scripts/test_all.py`.
 
-## Completed product horizon (closed in Goals 17–20)
+### Goal 21 — Zero-Knowledge E2EE Multi-Device Vault Sync, Full 3-Surface UI Parity & 19-Suite Gate (`v0.3.0`) — COMPLETE
+
+- [x] Implement Zero-Knowledge E2EE Multi-Device Vault Sync (`scripts/vault_sync.py`, `second-brain sync`, owner-gated `/v1/sync/*` routes in `scripts/api_product.py`, `MemoryApiClient.sync_*` in `scripts/memory_api.py`, `cryptography` promoted in `pyproject.toml`/`uv.lock`) with `AES-256-GCM`, `HKDF-SHA256`, `HMAC-SHA256` blind blob IDs, `Ed25519` signed heads, anti-rollback enforcement, Three-Store isolation, append-only JSONL set-union merge, `.history/` backups, `0-raw/sync-conflicts/` quarantine, and `local_folder` / DNS-pinned `http_object` backends.
+- [x] Complete 3-surface UI parity for Action-Item Tasks, Local NLI Contradiction Radar (`nli=1`), and E2EE Vault Sync across Electron Desktop (`desktop/renderer/`), VS Code (`extensions/vscode-second-brain/`), and Streamlit Dashboard (`dashboard/app.py`).
+- [x] Harden `.github/workflows/ci.yml`, `.github/workflows/release.yml`, and `scripts/package_desktop.ps1` (`-SkipSign` support + LF script checks), and add Suite `19/19` (`scripts/goal4_sync_and_ui_tests.py`) achieving `19/19 PASS` (`100% PASS`) in `scripts/test_all.py`.
+
+## Completed product horizon (closed in Goals 17–21)
 
 - [x] **OS-Signed Desktop Installers:** Native code-signed NSIS / MSI / DMG / AppImage / deb
   targets (`desktop/package.json`, `scripts/package_desktop.ps1`, `scripts/package_desktop.sh`)

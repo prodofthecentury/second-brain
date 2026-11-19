@@ -2413,6 +2413,7 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
+    { name = "cryptography" },
     { name = "filelock" },
     { name = "httpcore" },
     { name = "httpx" },
@@ -2497,6 +2498,7 @@ requires-dist = [
     { name = "chromadb", marker = "extra == 'dense'", specifier = ">=1.0,<2" },
     { name = "chromadb", marker = "extra == 'evaluation'", specifier = ">=1.0,<2" },
     { name = "chromadb", marker = "extra == 'online'", specifier = ">=1.0,<2" },
+    { name = "cryptography", specifier = ">=42,<51" },
     { name = "faster-whisper", marker = "extra == 'all'", specifier = ">=1.1,<2" },
     { name = "faster-whisper", marker = "extra == 'multimodal'", specifier = ">=1.1,<2" },
     { name = "filelock", specifier = ">=3.12,<4" },

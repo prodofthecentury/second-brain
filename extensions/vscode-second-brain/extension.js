@@ -17,6 +17,8 @@ const {
   formatPlaybookMarkdown,
   formatAtomProofMarkdown,
   formatInboxPreviewMarkdown,
+  formatTasksMarkdown,
+  formatSyncStatusMarkdown,
 } = require("./lib/markdown-formatters");
 const {
   isSafeNoteFilename,
@@ -2733,9 +2735,11 @@ function activate(context) {
       }
     }),
 
-    vscode.commands.registerCommand("secondBrain.scanContradictions", async () => {
+    vscode.commands.registerCommand("secondBrain.scanContradictions", async (arg) => {
       try {
-        const res = await apiRequest("GET", "/v1/graph/contradictions");
+        const enableNli = Boolean(arg && arg.enable_nli);
+        const querySuffix = enableNli ? "?nli=1" : "";
+        const res = await apiRequest("GET", `/v1/graph/contradictions${querySuffix}`);
         if (!res.ok) {
           vscode.window.showErrorMessage(
             `Contradiction scan failed: ${res.data?.error || res.status}`
@@ -2757,6 +2761,82 @@ function activate(context) {
         } else {
           await openMarkdownPreview(formatRadarMarkdown(res.data));
         }
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `Second Brain API unreachable: ${err.message}`
+        );
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.scanContradictionsNli", async () => {
+      return vscode.commands.executeCommand("secondBrain.scanContradictions", {
+        enable_nli: true,
+      });
+    }),
+
+    vscode.commands.registerCommand("secondBrain.showTasks", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        const params = [];
+        if (opts.project) params.push(`project=${encodeURIComponent(String(opts.project).trim())}`);
+        if (opts.include_completed) params.push("include_completed=1");
+        if (opts.include_raw !== false) params.push("include_raw=1");
+        const qs = params.length ? `?${params.join("&")}` : "";
+        const res = await apiRequest("GET", `/v1/notes/tasks${qs}`, null, {
+          useOwnerToken: true,
+        });
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Action items scan failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        await openMarkdownPreview(formatTasksMarkdown(res.data));
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `Second Brain API unreachable: ${err.message}`
+        );
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.syncVault", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        let action = opts.action ? String(opts.action).toLowerCase() : "";
+        if (!action) {
+          const pick = await vscode.window.showQuickPick(
+            [
+              { label: "Status", action: "status", description: "Inspect E2EE sync epochs & open conflicts" },
+              { label: "Push Encrypted", action: "push", description: "Encrypt durable vault files & push signed head" },
+              { label: "Pull & Merge", action: "pull", description: "Verify signatures, 3-way merge, rebuild indexes" },
+              { label: "Verify Remote", action: "verify", description: "Full cryptographic audit of remote encrypted blobs" },
+            ],
+            { placeHolder: "Zero-Knowledge E2EE Multi-Device Vault Sync" }
+          );
+          if (!pick) return;
+          action = pick.action;
+        }
+        let res;
+        if (action === "status") {
+          res = await apiRequest("GET", "/v1/sync/status", null, { useOwnerToken: true });
+        } else if (action === "push" || action === "pull" || action === "verify") {
+          const payload = opts.passphrase ? { passphrase: String(opts.passphrase) } : {};
+          if (action === "pull") payload.trust_new_peers = opts.trust_new_peers !== false;
+          res = await apiRequest("POST", `/v1/sync/${action}`, payload, {
+            useOwnerToken: true,
+          });
+        } else {
+          vscode.window.showErrorMessage(`Unsupported sync action: ${action}`);
+          return;
+        }
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `E2EE Vault Sync (${action}) failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        if (action === "pull") treeProvider.refresh();
+        await openMarkdownPreview(formatSyncStatusMarkdown(action, res.data));
       } catch (err) {
         vscode.window.showErrorMessage(
           `Second Brain API unreachable: ${err.message}`

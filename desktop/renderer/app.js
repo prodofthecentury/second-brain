@@ -1058,6 +1058,90 @@ document
   .getElementById("noteTagFilterInput")
   .addEventListener("input", () => loadNotes({ append: false }));
 
+let notesTasksOpen = false;
+
+async function loadNotesTasks() {
+  const wrap = document.getElementById("notesTasksList");
+  const proj = document.getElementById("tasksProjectInput").value.trim();
+  const incCompleted = Boolean(
+    document.getElementById("tasksIncludeCompletedCheck").checked
+  );
+  const incRaw = Boolean(
+    document.getElementById("tasksIncludeRawCheck").checked
+  );
+  const params = [
+    `include_completed=${incCompleted ? "1" : "0"}`,
+    `include_raw=${incRaw ? "1" : "0"}`,
+  ];
+  if (proj) params.push(`project=${encodeURIComponent(proj)}`);
+  wrap.replaceChildren(el("div", "note-item-meta", "Scanning action items..."));
+  try {
+    const res = await window.secondBrain.request(
+      "GET",
+      `/v1/notes/tasks?${params.join("&")}`
+    );
+    if (!res.ok) {
+      wrap.replaceChildren(
+        el("div", "status-banner banner-warn", apiErrorMessage(res, "Task scan failed"))
+      );
+      return;
+    }
+    const items = res.data?.tasks || res.data?.items || [];
+    wrap.replaceChildren();
+    if (!items.length) {
+      wrap.appendChild(
+        el("div", "note-item-meta", "No matching open tasks or action items found.")
+      );
+      return;
+    }
+    const list = el("div", "cards-grid");
+    for (const t of items.slice(0, 100)) {
+      const row = el("div", "sub-panel");
+      const head = el("div", "toolbar");
+      head.appendChild(
+        el("span", `badge ${t.completed ? "ok" : "warn"}`, t.completed ? "DONE" : "OPEN")
+      );
+      if (t.priority) {
+        head.appendChild(el("span", "badge danger", `P:${t.priority}`));
+      }
+      if (t.due_date) {
+        head.appendChild(el("span", "badge mono", `due:${t.due_date}`));
+      }
+      head.appendChild(
+        el(
+          "span",
+          "note-item-meta mono",
+          `${t.filename || ""}:${t.line_number ?? "?"}`
+        )
+      );
+      if (t.source_kind === "note" && t.filename) {
+        const openBtn = el("button", "btn sm", "Open Note");
+        openBtn.type = "button";
+        openBtn.style.marginLeft = "auto";
+        openBtn.onclick = () => selectNote(t.filename);
+        head.appendChild(openBtn);
+      }
+      row.appendChild(head);
+      row.appendChild(el("div", "", t.text || ""));
+      list.appendChild(row);
+    }
+    wrap.appendChild(list);
+  } catch (err) {
+    wrap.replaceChildren(
+      el("div", "status-banner banner-warn", `Task scan error: ${err?.message || String(err)}`)
+    );
+  }
+}
+
+document.getElementById("toggleTasksBtn").addEventListener("click", (e) => {
+  notesTasksOpen = !notesTasksOpen;
+  const card = document.getElementById("notesTasksCard");
+  card.style.display = notesTasksOpen ? "block" : "none";
+  e.currentTarget.classList.toggle("primary", notesTasksOpen);
+  if (notesTasksOpen) loadNotesTasks();
+});
+document.getElementById("refreshTasksBtn").addEventListener("click", loadNotesTasks);
+
 // ─── TAB 2: Upgraded Multi-Turn Streaming Chat ───────────────────────────────
 
 const chatOutputEl = document.getElementById("chatOutput");
@@ -3031,7 +3115,166 @@ async function loadSystemView() {
     }
     fitWrap.appendChild(procBar);
   }
+  loadSyncStatus();
 }
+
+async function loadSyncStatus() {
+  const kpiWrap = document.getElementById("syncStatusKpis");
+  const outEl = document.getElementById("syncOutput");
+  const confWrap = document.getElementById("syncConflictsList");
+  kpiWrap.replaceChildren();
+  confWrap.replaceChildren();
+  try {
+    const res = await window.secondBrain.request("GET", "/v1/sync/status");
+    if (!res.ok) {
+      outEl.textContent = apiErrorMessage(res, "Sync status unavailable");
+      return;
+    }
+    const s = res.data || {};
+    kpiWrap.appendChild(
+      makeKpiCard(
+        "E2EE Sync",
+        s.configured ? "CONFIGURED" : "NOT CONFIGURED",
+        s.backend_type || "local_folder / https",
+        s.configured ? "ok" : "warn"
+      )
+    );
+    kpiWrap.appendChild(makeKpiCard("Local Epoch", s.local_epoch ?? 0));
+    kpiWrap.appendChild(
+      makeKpiCard(
+        "Remote Epoch",
+        s.remote_epoch ?? 0,
+        s.remote_reachable === false ? "unreachable" : s.remote_device_id || ""
+      )
+    );
+    kpiWrap.appendChild(makeKpiCard("Durable Files", s.durable_file_count ?? 0));
+    kpiWrap.appendChild(
+      makeKpiCard(
+        "Conflicts",
+        s.conflict_count ?? 0,
+        "",
+        (s.conflict_count || 0) > 0 ? "danger" : "ok"
+      )
+    );
+
+    if (s.configured) {
+      const targetInput = document.getElementById("syncTargetInput");
+      if (!targetInput.value && s.target) targetInput.value = s.target;
+      const backendSel = document.getElementById("syncBackendSelect");
+      if (s.backend_type) backendSel.value = s.backend_type;
+      outEl.textContent = `Vault ${shortSha(s.vault_id || "")} · Device ${s.device_id || ""} · Mode ${s.kdf_mode || "keyfile"} · Local pending edits: ${s.local_changed_count ?? 0}`;
+    } else {
+      outEl.textContent =
+        "Not configured yet. Enter a local sync folder (OneDrive/Syncthing/NAS) or https:// target and click Init or Join.";
+    }
+
+    const conflicts = Array.isArray(s.conflicts) ? s.conflicts : [];
+    if (conflicts.length) {
+      confWrap.appendChild(
+        el("div", "field-label", `Quarantined Sync Conflicts (${conflicts.length}):`)
+      );
+      for (const c of conflicts.slice(0, 20)) {
+        confWrap.appendChild(
+          el(
+            "div",
+            "diff-card removed",
+            `${c.rel_path || "?"} -> quarantined remote copy: ${c.conflict_copy || "?"} (epoch ${c.remote_epoch ?? "?"})`
+          )
+        );
+      }
+    }
+  } catch (err) {
+    outEl.textContent = `Sync status error: ${err?.message || String(err)}`;
+  }
+}
+
+async function runSyncAction(endpoint, body, successLabel) {
+  const outEl = document.getElementById("syncOutput");
+  outEl.textContent = `Running ${endpoint}...`;
+  try {
+    const res = await window.secondBrain.request("POST", endpoint, body);
+    if (!res.ok) {
+      const msg = apiErrorMessage(res, `${successLabel} failed`);
+      outEl.textContent = msg;
+      showToast(msg, "danger");
+      return;
+    }
+    const d = res.data || {};
+    let detail = `${successLabel} complete`;
+    if (d.epoch !== undefined) detail += ` · epoch ${d.epoch}`;
+    if (d.uploaded_blobs !== undefined) {
+      detail += ` · uploaded ${d.uploaded_blobs}, reused ${d.reused_blobs ?? 0}`;
+    }
+    if (d.added !== undefined) {
+      detail += ` · added ${d.added}, updated ${d.updated ?? 0}, merged JSONL ${d.merged_jsonl ?? 0}, conflicts ${d.conflict_count ?? 0}`;
+    }
+    if (d.valid !== undefined) {
+      detail += ` · valid=${d.valid} (${d.verified_blobs ?? 0} verified blobs)`;
+    }
+    if (d.recovery_key_b64) {
+      detail += ` · Save Recovery Key safely: ${d.recovery_key_b64}`;
+    }
+    outEl.textContent = detail;
+    showToast(successLabel, d.valid === false ? "danger" : "ok");
+    await loadSyncStatus();
+  } catch (err) {
+    const msg = `${successLabel} error: ${err?.message || String(err)}`;
+    outEl.textContent = msg;
+    showToast(msg, "danger");
+  }
+}
+
+document.getElementById("syncRefreshBtn").addEventListener("click", loadSyncStatus);
+document.getElementById("syncInitBtn").addEventListener("click", () => {
+  const target = document.getElementById("syncTargetInput").value.trim();
+  if (!target) {
+    showToast("Enter a sync target folder or https:// URL first.", "danger");
+    return;
+  }
+  const body = {
+    target,
+    backend_type: document.getElementById("syncBackendSelect").value,
+  };
+  const dev = document.getElementById("syncDeviceNameInput").value.trim();
+  const pw = document.getElementById("syncPassphraseInput").value;
+  if (dev) body.device_name = dev;
+  if (pw) body.passphrase = pw;
+  runSyncAction("/v1/sync/init", body, "E2EE Sync Initialized");
+});
+document.getElementById("syncJoinBtn").addEventListener("click", () => {
+  const target = document.getElementById("syncTargetInput").value.trim();
+  if (!target) {
+    showToast("Enter a sync target folder or https:// URL first.", "danger");
+    return;
+  }
+  const body = {
+    target,
+    backend_type: document.getElementById("syncBackendSelect").value,
+  };
+  const dev = document.getElementById("syncDeviceNameInput").value.trim();
+  const pw = document.getElementById("syncPassphraseInput").value;
+  const rk = document.getElementById("syncRecoveryKeyInput").value.trim();
+  if (dev) body.device_name = dev;
+  if (pw) body.passphrase = pw;
+  if (rk) body.recovery_key_b64 = rk;
+  runSyncAction("/v1/sync/join", body, "Joined E2EE Sync Vault");
+});
+document.getElementById("syncPushBtn").addEventListener("click", () => {
+  const pw = document.getElementById("syncPassphraseInput").value;
+  runSyncAction("/v1/sync/push", pw ? { passphrase: pw } : {}, "Encrypted Sync Push");
+});
+document.getElementById("syncPullBtn").addEventListener("click", () => {
+  const pw = document.getElementById("syncPassphraseInput").value;
+  runSyncAction(
+    "/v1/sync/pull",
+    pw ? { passphrase: pw, trust_new_peers: true } : { trust_new_peers: true },
+    "Encrypted Sync Pull"
+  );
+});
+document.getElementById("syncVerifyBtn").addEventListener("click", () => {
+  const pw = document.getElementById("syncPassphraseInput").value;
+  runSyncAction("/v1/sync/verify", pw ? { passphrase: pw } : {}, "Cryptographic Sync Verify");
+});
 
 document
   .getElementById("refreshSystemBtn")
@@ -4549,7 +4792,11 @@ async function scanContradictions() {
   const incPending = Boolean(
     document.getElementById("radarIncludePendingCheck").checked
   );
+  const enableNli = Boolean(
+    document.getElementById("radarEnableNliCheck").checked
+  );
   const params = [`include_pending=${incPending ? "1" : "0"}`];
+  if (enableNli) params.push("nli=1");
   if (scope) params.push(`project=${encodeURIComponent(scope)}`);
 
   const [radarRes, summaryRes] = await Promise.all([
@@ -4611,6 +4858,16 @@ async function scanContradictions() {
   kpiGrid.appendChild(
     makeKpiCard("Orphan Approved", d.orphan_approved_count ?? orphans.length)
   );
+  if (d.nli_status || enableNli) {
+    kpiGrid.appendChild(
+      makeKpiCard(
+        "Local NLI",
+        String(d.nli_status || "disabled").toUpperCase(),
+        `${d.nli_evaluated_pairs ?? 0} pair(s) evaluated`,
+        d.nli_status === "completed" ? "ok" : "warn"
+      )
+    );
+  }
 
   if (!alerts.length) {
     grid.appendChild(
@@ -4635,7 +4892,25 @@ async function scanContradictions() {
       for (const r of al.reasons || []) {
         top.appendChild(el("span", "badge", r));
       }
+      for (const cat of al.exclusive_categories || []) {
+        top.appendChild(el("span", "badge warn", `exclusive:${cat}`));
+      }
+      if (al.nli_adjudication && al.nli_adjudication.verdict) {
+        const v = String(al.nli_adjudication.verdict);
+        top.appendChild(
+          el(
+            "span",
+            `badge ${v === "contradiction" ? "danger" : v === "compatible" ? "ok" : "warn"}`,
+            `NLI:${v}`
+          )
+        );
+      }
       card.appendChild(top);
+      if (al.nli_adjudication && al.nli_adjudication.rationale) {
+        card.appendChild(
+          el("div", "note-item-meta", `NLI Rationale: ${al.nli_adjudication.rationale}`)
+        );
+      }
 
       if ((al.shared_terms || []).length) {
         card.appendChild(
