@@ -18,6 +18,7 @@ if command -v uv >/dev/null 2>&1; then
   uv build --wheel --out-dir "$DIST_DIR"
   uv run --frozen python scripts/build_wheelhouse.py --out-dir "$DIST_DIR/wheelhouse"
   uv run --frozen python scripts/build_vsix.py --out-dir "$DIST_DIR"
+  uv run --frozen python scripts/build_clipper.py --out-dir "$DIST_DIR"
 fi
 
 cd "$DESKTOP_DIR"

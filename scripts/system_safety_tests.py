@@ -2487,6 +2487,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "goal2_completion_tests",
                 "goal3_backend_contract_tests",
                 "goal4_sync_and_ui_tests",
+                "goal5_clipper_and_workspaces_tests",
                 "desktop_ui_tests",
                 "vscode_extension_tests",
                 "dashboard_apptest_tests",

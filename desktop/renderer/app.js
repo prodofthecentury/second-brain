@@ -3116,6 +3116,8 @@ async function loadSystemView() {
     fitWrap.appendChild(procBar);
   }
   loadSyncStatus();
+  loadWorkspaces();
+  loadClipperPairings();
 }
 
 async function loadSyncStatus() {
@@ -3275,6 +3277,247 @@ document.getElementById("syncVerifyBtn").addEventListener("click", () => {
   const pw = document.getElementById("syncPassphraseInput").value;
   runSyncAction("/v1/sync/verify", pw ? { passphrase: pw } : {}, "Cryptographic Sync Verify");
 });
+
+// ─── Multi-Vault Workspaces & Browser Web Clipper (v0.3.0) ───────────────────
+
+async function loadWorkspaces() {
+  const sidebarSel = document.getElementById("sidebarVaultSelect");
+  const listWrap = document.getElementById("workspacesListWrap");
+  const outEl = document.getElementById("workspacesOutput");
+  if (!sidebarSel && !listWrap) return;
+  try {
+    const res = await window.secondBrain.request("GET", "/v1/vaults");
+    if (!res.ok) {
+      if (outEl) outEl.textContent = apiErrorMessage(res, "Workspaces unavailable");
+      return;
+    }
+    const data = res.data || {};
+    const vaults = Array.isArray(data.vaults) ? data.vaults : [];
+    if (sidebarSel) {
+      sidebarSel.replaceChildren();
+      for (const v of vaults) {
+        const opt = document.createElement("option");
+        opt.value = v.vault_id || "default";
+        opt.textContent = `${v.label || v.vault_id}${v.active ? " (Active)" : ""}`;
+        opt.selected = Boolean(v.active);
+        sidebarSel.appendChild(opt);
+      }
+    }
+    if (listWrap) {
+      listWrap.replaceChildren();
+      for (const v of vaults) {
+        const row = el("div", "toolbar");
+        row.style.marginBottom = "6px";
+        row.appendChild(el("strong", "", v.label || v.vault_id));
+        row.appendChild(el("span", `badge ${v.active ? "ok" : ""}`, v.active ? "active" : v.vault_id));
+        row.appendChild(
+          el(
+            "span",
+            `badge ${v.federated_searchable ? "ok" : "warn"}`,
+            v.federated_searchable ? "federated" : "isolated"
+          )
+        );
+        row.appendChild(
+          el("span", "note-item-meta", `${v.path || ""} (${v.atom_count ?? 0} atoms, ${v.note_count ?? 0} notes)`)
+        );
+        if (!v.active) {
+          const swBtn = el("button", "btn sm primary", "Switch");
+          swBtn.type = "button";
+          swBtn.style.marginLeft = "auto";
+          swBtn.onclick = () => switchWorkspaceVault(v.vault_id);
+          row.appendChild(swBtn);
+        }
+        const fedBtn = el("button", "btn sm", v.federated_searchable ? "Disable Fed" : "Opt-In Fed");
+        fedBtn.type = "button";
+        if (v.active) fedBtn.style.marginLeft = "auto";
+        fedBtn.onclick = async () => {
+          const r = await window.secondBrain.request("PATCH", `/v1/vaults/${encodeURIComponent(v.vault_id)}`, {
+            federated_searchable: !v.federated_searchable,
+          });
+          showToast(
+            r.ok ? `Updated ${v.vault_id} federated_searchable=${!v.federated_searchable}` : apiErrorMessage(r, "Update failed"),
+            r.ok ? "ok" : "danger"
+          );
+          await loadWorkspaces();
+        };
+        row.appendChild(fedBtn);
+        if (!v.active) {
+          const rmBtn = el("button", "btn sm danger", "Unregister");
+          rmBtn.type = "button";
+          rmBtn.onclick = async () => {
+            const r = await window.secondBrain.request("DELETE", `/v1/vaults/${encodeURIComponent(v.vault_id)}`, {});
+            showToast(r.ok ? `Unregistered ${v.vault_id} (files kept)` : apiErrorMessage(r, "Remove failed"), r.ok ? "ok" : "danger");
+            await loadWorkspaces();
+          };
+          row.appendChild(rmBtn);
+        }
+        listWrap.appendChild(row);
+      }
+    }
+    if (outEl) {
+      outEl.textContent = `Active workspace: ${data.active_vault_id || "default"} (${data.active_vault_path || ""}) · ${vaults.length} registered vault(s).`;
+    }
+  } catch (err) {
+    if (outEl) outEl.textContent = `Workspace error: ${err?.message || String(err)}`;
+  }
+}
+
+async function switchWorkspaceVault(vaultId) {
+  if (!vaultId) return;
+  const res = await window.secondBrain.request("POST", "/v1/vaults/switch", { vault_id: vaultId });
+  if (!res.ok) {
+    showToast(apiErrorMessage(res, "Vault switch failed"), "danger");
+    await loadWorkspaces();
+    return;
+  }
+  showToast(`Switched active vault -> ${res.data?.active_vault_id || vaultId}`, "ok");
+  await Promise.all([loadWorkspaces(), refreshHealth(), loadNotes({ append: false })]);
+}
+
+const sidebarVaultSelectEl = document.getElementById("sidebarVaultSelect");
+if (sidebarVaultSelectEl) {
+  sidebarVaultSelectEl.addEventListener("change", () => switchWorkspaceVault(sidebarVaultSelectEl.value));
+}
+
+const wsRefreshBtnEl = document.getElementById("workspacesRefreshBtn");
+if (wsRefreshBtnEl) wsRefreshBtnEl.addEventListener("click", loadWorkspaces);
+
+const wsCreateBtnEl = document.getElementById("wsCreateBtn");
+if (wsCreateBtnEl) {
+  wsCreateBtnEl.addEventListener("click", async () => {
+    const label = (document.getElementById("wsLabelInput")?.value || "").trim();
+    const vpath = (document.getElementById("wsPathInput")?.value || "").trim();
+    const outEl = document.getElementById("workspacesOutput");
+    if (!label || !vpath) {
+      showToast("Enter both a vault label and directory path.", "danger");
+      return;
+    }
+    const res = await window.secondBrain.request("POST", "/v1/vaults", {
+      label,
+      path: vpath,
+      isolated_token: Boolean(document.getElementById("wsIsolatedTokenCheck")?.checked),
+      federated_searchable: Boolean(document.getElementById("wsFederatedCheck")?.checked),
+      activate: Boolean(document.getElementById("wsActivateCheck")?.checked),
+    });
+    if (!res.ok) {
+      const msg = apiErrorMessage(res, "Create vault failed");
+      if (outEl) outEl.textContent = msg;
+      showToast(msg, "danger");
+      return;
+    }
+    const tokNote = res.data?.vault_token ? ` · Save isolated token: ${res.data.vault_token}` : "";
+    if (outEl) outEl.textContent = `Created vault '${res.data?.vault_id}' at ${res.data?.path}${tokNote}`;
+    showToast(`Created vault '${res.data?.vault_id}'`, "ok");
+    await loadWorkspaces();
+    if (res.data?.active) {
+      await Promise.all([refreshHealth(), loadNotes({ append: false })]);
+    }
+  });
+}
+
+const wsFedSearchBtnEl = document.getElementById("wsFedSearchBtn");
+if (wsFedSearchBtnEl) {
+  wsFedSearchBtnEl.addEventListener("click", async () => {
+    const q = (document.getElementById("wsFedQueryInput")?.value || "").trim();
+    const wrap = document.getElementById("wsFedResultsWrap");
+    if (!q) {
+      showToast("Enter a query for federated search.", "warn");
+      return;
+    }
+    const res = await window.secondBrain.request("POST", "/v1/vaults/federated-recall", { query: q, limit: 8 });
+    if (wrap) wrap.replaceChildren();
+    if (!res.ok) {
+      showToast(apiErrorMessage(res, "Federated recall failed"), "danger");
+      return;
+    }
+    const hits = res.data?.results || [];
+    if (!wrap) return;
+    if (!hits.length) {
+      wrap.appendChild(
+        el(
+          "div",
+          "note-item-meta",
+          `No approved matches across opted-in vaults (searched: ${(res.data?.searched_vaults || []).join(", ") || "none"}).`
+        )
+      );
+      return;
+    }
+    for (const h of hits) {
+      const card = el("div", "sub-panel");
+      card.style.marginTop = "6px";
+      card.appendChild(el("span", "badge ok", h.vault_label || h.vault_id || "vault"));
+      card.appendChild(el("strong", "", ` ${h.filename || ""}`));
+      card.appendChild(el("div", "note-item-meta", `score=${h.score ?? "?"}`));
+      wrap.appendChild(card);
+    }
+  });
+}
+
+async function loadClipperPairings() {
+  const wrap = document.getElementById("clipperPairingsWrap");
+  const outEl = document.getElementById("clipperOutput");
+  if (!wrap) return;
+  try {
+    const res = await window.secondBrain.request("GET", "/v1/clipper/pairings");
+    wrap.replaceChildren();
+    if (!res.ok) {
+      if (outEl) outEl.textContent = apiErrorMessage(res, "Clipper pairings unavailable");
+      return;
+    }
+    const items = res.data?.pairings || [];
+    if (!items.length) {
+      wrap.appendChild(el("div", "note-item-meta", "No browser extensions paired yet."));
+      return;
+    }
+    for (const p of items) {
+      const row = el("div", "toolbar");
+      row.style.marginTop = "6px";
+      row.appendChild(el("strong", "", p.label || "Browser Clipper"));
+      row.appendChild(el("span", "badge mono", p.origin || ""));
+      row.appendChild(el("span", "note-item-meta", p.token_preview || ""));
+      const revBtn = el("button", "btn sm danger", "Revoke");
+      revBtn.type = "button";
+      revBtn.style.marginLeft = "auto";
+      revBtn.onclick = async () => {
+        const r = await window.secondBrain.request("DELETE", `/v1/clipper/pair/${encodeURIComponent(p.pairing_id)}`, {});
+        showToast(r.ok ? `Revoked ${p.pairing_id}` : apiErrorMessage(r, "Revoke failed"), r.ok ? "ok" : "danger");
+        await loadClipperPairings();
+      };
+      row.appendChild(revBtn);
+      wrap.appendChild(row);
+    }
+  } catch (err) {
+    if (outEl) outEl.textContent = `Clipper error: ${err?.message || String(err)}`;
+  }
+}
+
+const clipperRefreshBtnEl = document.getElementById("clipperRefreshBtn");
+if (clipperRefreshBtnEl) clipperRefreshBtnEl.addEventListener("click", loadClipperPairings);
+
+const clipperPairBtnEl = document.getElementById("clipperPairBtn");
+if (clipperPairBtnEl) {
+  clipperPairBtnEl.addEventListener("click", async () => {
+    const origin = (document.getElementById("clipperOriginInput")?.value || "").trim();
+    const label = (document.getElementById("clipperLabelInput")?.value || "Browser Clipper").trim();
+    const outEl = document.getElementById("clipperOutput");
+    if (!origin) {
+      showToast("Paste a chrome-extension:// or moz-extension:// origin first.", "danger");
+      return;
+    }
+    const res = await window.secondBrain.request("POST", "/v1/clipper/pair", { origin, label });
+    if (!res.ok) {
+      const msg = apiErrorMessage(res, "Pairing failed");
+      if (outEl) outEl.textContent = msg;
+      showToast(msg, "danger");
+      return;
+    }
+    if (outEl) {
+      outEl.textContent = `Paired ${res.data?.label} (${res.data?.pairing_id}) · Copy scoped token into Clipper popup: ${res.data?.token}`;
+    }
+    showToast("Browser Clipper paired! Copy the scoped token from the status banner.", "ok");
+    await loadClipperPairings();
+  });
+}
 
 document
   .getElementById("refreshSystemBtn")
@@ -5868,4 +6111,5 @@ if (window.secondBrain) {
   }
   refreshHealth();
   loadNotes({ append: false });
+  loadWorkspaces();
 }

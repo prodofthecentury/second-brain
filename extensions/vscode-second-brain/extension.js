@@ -3296,7 +3296,134 @@ function activate(context) {
           );
         }
       }
-    )
+    ),
+
+    vscode.commands.registerCommand("secondBrain.switchVault", async () => {
+      try {
+        const listRes = await apiRequest("GET", "/v1/vaults", null, {
+          useOwnerToken: true,
+        });
+        if (!listRes.ok) {
+          vscode.window.showErrorMessage(
+            `Could not list vault workspaces: ${listRes.data?.error || listRes.status}`
+          );
+          return;
+        }
+        const vaults = listRes.data?.vaults || [];
+        if (!vaults.length) {
+          vscode.window.showInformationMessage("No vault workspaces registered.");
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          vaults.map((v) => ({
+            label: `${v.active ? "$(check) " : ""}${v.label || v.vault_id}`,
+            description: v.vault_id,
+            detail: `${v.path} (${v.atom_count ?? 0} atoms, ${v.note_count ?? 0} notes)`,
+            vaultId: v.vault_id,
+          })),
+          { placeHolder: "Select active Second Brain vault workspace" }
+        );
+        if (!picked) return;
+        const swRes = await apiRequest(
+          "POST",
+          "/v1/vaults/switch",
+          { vault_id: picked.vaultId },
+          { useOwnerToken: true }
+        );
+        if (!swRes.ok) {
+          vscode.window.showErrorMessage(
+            `Vault switch failed: ${swRes.data?.error || swRes.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Switched Second Brain workspace to '${swRes.data?.active_vault_id || picked.vaultId}'.`
+        );
+        treeProvider.refresh();
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.federatedSearch", async () => {
+      const query = await vscode.window.showInputBox({
+        prompt: "Opt-in read-only federated search across opted-in vaults",
+        placeHolder: "e.g. PostgreSQL migration policy",
+      });
+      if (!query || !query.trim()) return;
+      try {
+        const res = await apiRequest(
+          "POST",
+          "/v1/vaults/federated-recall",
+          { query: query.trim(), limit: 10 },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Federated search failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        const hits = res.data?.results || [];
+        const lines = [
+          `# Second Brain — Opt-In Federated Cross-Vault Search`,
+          ``,
+          `- **Query:** ${query.trim()}`,
+          `- **Searched Vaults:** ${(res.data?.searched_vaults || []).join(", ") || "(none opted-in)"}`,
+          `- **Matches:** ${hits.length}`,
+          ``,
+        ];
+        for (const h of hits) {
+          lines.push(`## [${h.vault_label || h.vault_id}] ${h.filename} (score ${h.score})`);
+          lines.push(``);
+          lines.push(String(h.content || "").trim());
+          lines.push(``);
+        }
+        const doc = await vscode.workspace.openTextDocument({
+          language: "markdown",
+          content: lines.join("\n"),
+        });
+        await vscode.window.showTextDocument(doc, { preview: true });
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.pairClipper", async () => {
+      const origin = await vscode.window.showInputBox({
+        prompt: "Browser extension origin (copy from Second Brain Clipper popup -> Pair)",
+        placeHolder: "chrome-extension://<32-char-id> or moz-extension://<uuid>",
+      });
+      if (!origin || !origin.trim()) return;
+      const label = await vscode.window.showInputBox({
+        prompt: "Browser label",
+        value: "Browser Clipper",
+      });
+      if (label === undefined) return;
+      try {
+        const res = await apiRequest(
+          "POST",
+          "/v1/clipper/pair",
+          { origin: origin.trim(), label: label.trim() || "Browser Clipper" },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Clipper pairing failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        const token = String(res.data?.token || "");
+        if (token && vscode.env && vscode.env.clipboard) {
+          await vscode.env.clipboard.writeText(token);
+        }
+        vscode.window.showInformationMessage(
+          `Paired '${res.data?.label}' (${res.data?.pairing_id}). Scoped clipper_* token copied to clipboard.`
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    })
   );
 }
 

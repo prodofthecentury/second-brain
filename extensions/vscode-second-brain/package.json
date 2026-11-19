@@ -2,7 +2,7 @@
   "name": "second-brain-vscode",
   "displayName": "Second Brain — Local AI Memory",
   "description": "Zero-friction notes, SHA-256 verified atoms, Merkle inclusion proofs, contradiction radar, instant recall, and streaming chat inside VS Code, Cursor, and Windsurf.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "second-brain",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -185,6 +185,18 @@
       {
         "command": "secondBrain.recordExperience",
         "title": "Second Brain: Record Episodic Experience"
+      },
+      {
+        "command": "secondBrain.switchVault",
+        "title": "Second Brain: Switch Vault Workspace"
+      },
+      {
+        "command": "secondBrain.federatedSearch",
+        "title": "Second Brain: Federated Cross-Vault Search"
+      },
+      {
+        "command": "secondBrain.pairClipper",
+        "title": "Second Brain: Pair Browser Web Clipper"
       },
       {
         "command": "secondBrain.refreshVault",

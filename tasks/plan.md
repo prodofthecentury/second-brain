@@ -357,9 +357,18 @@ unified CI gate (`scripts/test_all.py`).
 2. Full 3-Surface UI Parity across Electron Desktop (`desktop/renderer/{index.html,app.js}`), VS Code (`extensions/vscode-second-brain/{package.json,extension.js,lib/markdown-formatters.js}`), and Streamlit Dashboard (`dashboard/app.py`) for Action-Item Tasks (`/v1/notes/tasks` / `extract_action_items`), Local NLI Contradiction Radar (`nli=1` / `enable_nli`), and E2EE Vault Sync (`/v1/sync/*` / `vault_sync`).
 3. Hardened `.github/workflows/ci.yml`, `.github/workflows/release.yml`, and `scripts/package_desktop.ps1` (`-SkipSign` + LF checks), verified by Suite `19/19` (`scripts/goal4_sync_and_ui_tests.py`) in `scripts/test_all.py` (`19/19 PASS`).
 
-## Completed product horizon (closed in Goals 17–21)
+### Goal 22 — Local-First Browser Web Clipper (MV3), Multi-Vault Workspaces & 20-Suite Gate (`v0.3.0`) — COMPLETE
 
-Goals 0–20 complete the local pilot and `v0.2.0` verifiable Second Brain product: durable CAS Markdown vault, cryptographic byte-offset source anchoring, out-of-model epistemic grounding, universal loopback API + SDK, per-host online consent/redaction adapters, quarantined inbox promotion, hardware-tiered profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine, zero-friction notes with one-click excerpt verification, local document ingestion (`.pdf`, `.docx`, `.epub`, `.html`, `.csv`, `.tsv`), `"research"` mode with deterministic `[UNVERIFIED LEADS]`, multi-host DLP streaming chat, bulk Obsidian importer, 17-tool MCP & 6-host IDE/Antigravity/Claude/VS Code connectors, OS-signed cross-platform desktop installers (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), clean `second_brain` wheel & offline wheelhouse, comparative 9-system SOTA benchmark harness (`scripts/sota_benchmark.py`), Merkle audit ledger & proofs (`scripts/vault_ledger.py`), semantic/NLI Contradiction & Drift Radar (`scripts/knowledge_graph.py`), content-addressed Time-Travel snapshots (`scripts/time_travel.py`), and the 18-suite unified release gate (`scripts/test_all.py`, `18/18 PASS`).
+**Why:** Complete `v0.3.0` Milestones 2 & 3 so owners can clip web pages and verbatim quotes directly into `127.0.0.1` with SHA-256 immutable snapshots and zero cloud relay, switch cleanly across isolated named vaults (`work`, `personal`, `research`) with optional per-vault tokens and strictly opt-in read-only federated recall, and ship unified `v0.3.0` artifacts across every platform.
+
+**What was built:**
+1. Local-First Browser Web Clipper (`extensions/browser-clipper/`, `scripts/web_clipper.py`, `scripts/build_clipper.py`, `second-brain clipper`, `/v1/clipper/*`): Manifest V3 Chrome/Edge/Firefox extension restricted strictly to `http://127.0.0.1/*` with zero `.innerHTML`; owner-paired extension origins (`SecondBrain/security/clipper-pairings.json`, `0600`/NTFS DACL) with strict `OPTIONS` CORS preflight allowlisting and write-only SHA-256-hashed `clipper_*` bearer tokens; immutable UTF-8 source snapshots in `brain/0-raw/note-snapshots/clip-*.md` compatible with one-click `verify_note_excerpt` promotion; automatic server-side DLP secret & prompt-injection quarantine to `0-raw/inbox/`.
+2. Multi-Vault Workspaces & Opt-In Federated Recall (`scripts/vault_workspaces.py`, `second-brain vault`, `/v1/vaults*`, `MemoryApiClient.*vault*`): Named vault registry (`SecondBrain/security/vaults.json`, `0600`/NTFS DACL) with non-overlapping path validation, atomic active switching synced to `vault-path.txt` and live `MemoryLoopbackHTTPServer` runtime, non-destructive unregister, optional isolated per-vault `vb_*` bearer tokens failing closed (`403`) across vaults, and owner-gated opt-in (`federated_searchable: false` default) read-only federated search.
+3. Full 3-Surface UI Parity across Electron Desktop (Sidebar Vault Quick-Switcher + `System` Workspaces & Browser Clipper cards), VS Code (`secondBrain.switchVault`, `secondBrain.federatedSearch`, `secondBrain.pairClipper`), and Streamlit Dashboard (`dashboard/app.py`), aligned `v0.3.0` package manifests (`pyproject.toml`, `desktop/package.json`, `extensions/vscode-second-brain/package.json`, `plugins/`), and Suite `20/20` (`scripts/goal5_clipper_and_workspaces_tests.py`) in `scripts/test_all.py` (`20/20 PASS`).
+
+## Completed product horizon (closed in Goals 17–22)
+
+Goals 0–22 complete the local pilot and `v0.3.0` verifiable Second Brain product: durable CAS Markdown vault, cryptographic byte-offset source anchoring, out-of-model epistemic grounding, universal loopback API + SDK, per-host online consent/redaction adapters, quarantined inbox promotion, hardware-tiered profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine, zero-friction notes with one-click excerpt verification, local document ingestion (`.pdf`, `.docx`, `.epub`, `.html`, `.csv`, `.tsv`), `"research"` mode with deterministic `[UNVERIFIED LEADS]`, multi-host DLP streaming chat, bulk Obsidian importer, 17-tool MCP & 6-host IDE/Antigravity/Claude/VS Code connectors, OS-signed cross-platform desktop installers (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), clean `second_brain` wheel & offline wheelhouse, comparative 9-system SOTA benchmark harness (`scripts/sota_benchmark.py`), Merkle audit ledger & proofs (`scripts/vault_ledger.py`), semantic/NLI Contradiction & Drift Radar (`scripts/knowledge_graph.py`), content-addressed Time-Travel snapshots (`scripts/time_travel.py`), Zero-Knowledge E2EE Multi-Device Vault Sync (`scripts/vault_sync.py`), Local-First MV3 Browser Web Clipper (`extensions/browser-clipper/`, `scripts/web_clipper.py`), Multi-Vault Workspaces & Opt-In Federated Recall (`scripts/vault_workspaces.py`), and the 20-suite unified release gate (`scripts/test_all.py`, `20/20 PASS`).
 
 ## Checkpoints
 
@@ -371,12 +380,13 @@ Goals 0–20 complete the local pilot and `v0.2.0` verifiable Second Brain produ
   offline FTS5 degradation verified.
 - **Goal 8 (Passed):** Independent adversarial review reconciled and
   `scripts/test_all.py` achieves 100% pass rate.
-- **Goals 9–20 (Passed):** Phase 2–5 product ecosystem, local document ingestion,
+- **Goals 9–22 (Passed):** Phase 2–5 product ecosystem, local document ingestion,
   `"research"` leads view, multi-host DLP streaming chat, 17-tool MCP, OS-signed
   desktop installers, clean wheel/wheelhouse packaging, 9-system SOTA benchmark,
   Three-Store Merkle ledger & content-addressed Time-Travel snapshots, semantic/NLI
-  Contradiction Radar, sub-15ms recall, and all UI/E2E/security suites verified
-  (`18/18` suites PASS).
+  Contradiction Radar, sub-15ms recall, E2EE multi-device vault sync, MV3 Browser
+  Web Clipper, Multi-Vault Workspaces & opt-in federated recall, and all UI/E2E/security
+  suites verified (`20/20` suites PASS).
 
 ## Risks
 

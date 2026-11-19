@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [0.3.0] — 2026-11-19
 
-Advanced multi-device release introducing **Zero-Knowledge E2EE Multi-Device Vault Sync**, complete **Action-Item Tasks / Local NLI Radar / E2EE Sync UI parity** across Electron Desktop, VS Code, and Streamlit Dashboard, hardened CI/release workflows, and the **19-suite unified verification gate**.
+Advanced multi-device release completing **v0.3.0 Milestones 1–3**: **Zero-Knowledge E2EE Multi-Device Vault Sync**, **Local-First Browser Web Clipper (MV3 Chrome/Edge/Firefox)**, **Multi-Vault Workspaces & Opt-In Federated Recall**, complete **3-surface UI parity** across Electron Desktop, VS Code, and Streamlit Dashboard, hardened CI/release workflows, and the **20-suite unified verification gate**.
 
 ### Added
 - **Zero-Knowledge E2EE Multi-Device Vault Sync (`scripts/vault_sync.py`, `second-brain sync`, `/v1/sync/*`, `MemoryApiClient.sync_*`):**
@@ -15,15 +15,22 @@ Advanced multi-device release introducing **Zero-Knowledge E2EE Multi-Device Vau
   - Strict Three-Store isolation (syncs only durable Markdown & append-only logs; never `.sidecar/`, `.chroma/`, symlinks, or security secrets; auto-rebuilds local lexical & notes indexes on pull).
   - Conflict-safe 3-way merge: deterministic set-union merge for append-only JSONL audit/lineage logs (`decision-record.jsonl`, `manifest.jsonl`, `atom-corrections.jsonl`, `mcp-audit.jsonl`), `.history/` backup before canonical fast-forward overwrites, and quarantined `0-raw/sync-conflicts/` copies on true divergence.
   - Pluggable `LocalFolderSyncBackend` (OneDrive/iCloud/Syncthing/NAS/USB) and DNS-pinned `HttpObjectSyncBackend` (`https://`, no redirects).
+- **Local-First Browser Web Clipper (`extensions/browser-clipper/`, `scripts/web_clipper.py`, `scripts/build_clipper.py`, `second-brain clipper`, `/v1/clipper/*`):**
+  - Cross-browser Manifest V3 extension (Chrome, Edge, Firefox) restricted strictly to `http://127.0.0.1/*` with zero cloud relay and zero `.innerHTML`.
+  - Write-only scoped `clipper_*` bearer tokens stored exclusively as SHA-256 hashes under `SecondBrain/security/clipper-pairings.json` (`0600`/NTFS DACL), bound to owner-paired `chrome-extension://` / `moz-extension://` origins with strict `OPTIONS` CORS preflight allowlisting.
+  - Verifiable web provenance via immutable UTF-8 source snapshots in `brain/0-raw/note-snapshots/clip-*.md` (SHA-256 digest + URL + timestamp) compatible with one-click `verify_note_excerpt` promotion, plus automatic server-side DLP secret & prompt-injection quarantine to `0-raw/inbox/`.
+- **Multi-Vault Workspaces & Opt-In Federated Recall (`scripts/vault_workspaces.py`, `second-brain vault`, `/v1/vaults*`, `MemoryApiClient.*vault*`):**
+  - Named vault registry (`SecondBrain/security/vaults.json`, `0600`/NTFS DACL) with non-overlapping directory enforcement, non-destructive unregister, atomic active hot-switching synced to `vault-path.txt` and live `MemoryLoopbackHTTPServer` runtime, and optional isolated per-vault bearer tokens (`vb_*`) that fail closed (`403`) against other vaults.
+  - Strictly opt-in (`federated_searchable: false` by default), owner-gated read-only federated cross-vault search preserving independent vault approval, source-anchor, and preference filters.
 - **Complete 3-Surface UI Parity:**
-  - **Electron Desktop (`desktop/renderer/{index.html,app.js}`):** Action-Item Tasks panel (`/v1/notes/tasks`), Local NLI Contradiction Radar opt-in (`nli=1`) displaying `exclusive_categories` & `nli_adjudication`, and E2EE Multi-Device Vault Sync controls (`Init`, `Join`, `Push`, `Pull`, `Verify`, conflict view) under `System`.
-  - **VS Code Extension (`extensions/vscode-second-brain/`):** Added `secondBrain.showTasks`, `secondBrain.scanContradictionsNli`, and `secondBrain.syncVault` commands plus enriched Markdown formatters.
-  - **Streamlit Dashboard (`dashboard/app.py`):** Added `Action Items & Tasks` tab under Working Notes, `Enable Local Ollama NLI Adjudication` toggle in Contradiction Radar, and E2EE Vault Sync controls under System Control.
-- **Suite 19/19 Verification Gate (`scripts/goal4_sync_and_ui_tests.py`):** End-to-end 2-device sync, zero-knowledge leak checks, passphrase KDF fail-closed checks, JSONL set-union merge, conflict quarantine, ciphertext/AAD/Ed25519/rollback tamper rejection, mocked HTTPS object backend, owner-token API gating, UI parity, and CI/release pipeline hygiene.
+  - **Electron Desktop (`desktop/renderer/{index.html,app.js}`):** Sidebar Vault Quick-Switcher dropdown, Action-Item Tasks panel (`/v1/notes/tasks`), Local NLI Contradiction Radar opt-in (`nli=1`), E2EE Multi-Device Vault Sync controls, Multi-Vault Workspaces & Federated Search card, and Browser Web Clipper pairing panel under `System`.
+  - **VS Code Extension (`extensions/vscode-second-brain/`):** Added `secondBrain.showTasks`, `secondBrain.scanContradictionsNli`, `secondBrain.syncVault`, `secondBrain.switchVault`, `secondBrain.federatedSearch`, and `secondBrain.pairClipper` commands.
+  - **Streamlit Dashboard (`dashboard/app.py`):** Added `Action Items & Tasks` tab, Local NLI Adjudication toggle, E2EE Vault Sync controls, Multi-Vault Workspaces & Federated Search panel, and Browser Web Clipper pairing management.
+- **Suites 19–20/20 Unified Verification Gate (`scripts/goal4_sync_and_ui_tests.py`, `scripts/goal5_clipper_and_workspaces_tests.py`):** Full behavioral & security tests for E2EE sync, MV3 Browser Clipper CORS/DLP/provenance/revocation, Multi-Vault isolation/hot-switching/per-vault tokens/federated recall, CLI commands, and 3-surface UI parity.
 
 ### Fixed
 - Added `-SkipSign` switch and SHA-256 manifest fallback to `scripts/package_desktop.ps1` so unsigned CI Windows runs in `.github/workflows/release.yml` succeed cleanly alongside signed Authenticode builds.
-- Added POSIX LF line-ending verification (`setup.sh`, `run_daemon.sh`, `scripts/package_desktop.sh`) and `goal4_sync_and_ui_tests` to `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
+- Added POSIX LF line-ending verification (`setup.sh`, `run_daemon.sh`, `scripts/package_desktop.sh`), `goal4_sync_and_ui_tests`, and `goal5_clipper_and_workspaces_tests` to `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
 
 ## [0.2.0] — 2026-11-19
 

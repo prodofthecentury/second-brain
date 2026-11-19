@@ -85,7 +85,11 @@ from recall import (
     suggest_duplicate_atoms,
 )
 from skill_playbooks import list_playbooks, playbook_visible_in_scope
+from vault_workspaces import verify_per_vault_token
+from web_clipper import CLIPPER_TOKEN_PREFIX, is_paired_clipper_origin, verify_clipper_token
 import api_product
+
+CLIPPER_SCOPED_PATHS = frozenset({"/v1/clipper/ping", "/v1/clipper/status", "/v1/clipper/clip"})
 
 
 def _extract_claim_text(content: str) -> str:
@@ -440,6 +444,8 @@ def _check_and_record_auth(client_key: str, provided_header: str | None, expecte
 
 
 def _max_body_bytes_for_route(method: str, path: str, *, is_owner: bool = False) -> int:
+    if method == "POST" and path == "/v1/clipper/clip":
+        return 300_000
     if not is_owner:
         return MAX_API_BODY_BYTES
     if method == "POST" and path == "/v1/notes":
@@ -589,9 +595,11 @@ class MemoryApiRuntimeConfig:
         token_path: Path | None = None,
         owner_token_path: Path | None = None,
         policy_path: Path | None = None,
+        security_dir: Path | None = None,
         http_transport: httpx.BaseTransport | None = None,
         skip_dns_check_for_mock_transport: bool = False,
     ) -> None:
+        self._switch_lock = threading.RLock()
         module_brain = os.path.abspath(BRAIN_DIR)
         active_brain = _resolve_default_brain_dir()
         if brain_dir is None or (os.path.abspath(brain_dir) == module_brain and active_brain != module_brain):
@@ -617,8 +625,31 @@ class MemoryApiRuntimeConfig:
         self.token_path = token_path
         self.owner_token_path = owner_token_path
         self.policy_path = policy_path
+        self.security_dir = Path(security_dir).expanduser().resolve() if security_dir is not None else None
         self.http_transport = http_transport
         self.skip_dns_check_for_mock_transport = skip_dns_check_for_mock_transport
+
+    def switch_brain_dir(self, new_brain_dir: str) -> None:
+        """Hot-switch this live runtime config to another validated vault directory."""
+        abs_new = os.path.abspath(os.path.expanduser(new_brain_dir))
+        if os.path.lexists(abs_new) and _is_reparse_or_link(abs_new):
+            raise PermissionError(f"Refusing to switch runtime to symlinked vault: {abs_new}")
+        with self._switch_lock:
+            self.brain_dir = abs_new
+            self.atoms_dir = os.path.join(abs_new, "2-atoms")
+            self.inbox_dir = os.path.join(abs_new, "0-raw", "inbox")
+            self.experiences_dir = os.path.join(abs_new, "4-experiences")
+            self.playbooks_dir = os.path.join(abs_new, "5-playbooks")
+            self.lexical_index_path = os.path.join(abs_new, ".sidecar", "lexical.sqlite3")
+            self.chroma_path = os.path.join(abs_new, ".chroma")
+            self.telemetry_db_path = os.path.join(abs_new, ".sidecar", "telemetry.sqlite3")
+            if not os.path.exists(self.lexical_index_path):
+                try:
+                    os.makedirs(self.atoms_dir, exist_ok=True)
+                    os.makedirs(os.path.dirname(self.lexical_index_path), exist_ok=True)
+                    rebuild_lexical_index(self.atoms_dir, self.lexical_index_path)
+                except Exception:
+                    pass
 
     @property
     def owner_token(self) -> str | None:
@@ -820,6 +851,10 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            cors_origin = getattr(self, "_clipper_cors_origin", None)
+            if cors_origin:
+                self.send_header("Access-Control-Allow-Origin", cors_origin)
+                self.send_header("Vary", "Origin")
             if getattr(self, "close_connection", False):
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -828,7 +863,40 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
             return
 
+    def do_OPTIONS(self) -> None:
+        client_ip = self.client_address[0]
+        if client_ip != ALLOWED_API_BIND_HOST:
+            self._send_json(403, {"error": "403 Forbidden: non-loopback client rejected."})
+            return
+        bound_port = self.server.server_address[1]
+        allowed_hosts = {ALLOWED_API_BIND_HOST, f"{ALLOWED_API_BIND_HOST}:{bound_port}"}
+        host_hdr = (self.headers.get("Host") or "").strip().lower()
+        if host_hdr not in allowed_hosts:
+            self._send_json(403, {"error": "403 Forbidden: invalid Host header (DNS-rebinding protection)."})
+            return
+        req_path = urlparse(self.path).path
+        origin_hdr = (self.headers.get("Origin") or "").strip().lower().rstrip("/")
+        sec_dir = getattr(self.server.runtime, "security_dir", None)
+        if req_path not in CLIPPER_SCOPED_PATHS or not is_paired_clipper_origin(origin_hdr, security_dir=sec_dir):
+            self._send_json(403, {"error": "403 Forbidden: CORS preflight rejected."})
+            return
+        try:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin_hdr)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header("Access-Control-Max-Age", "300")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
+            return
+
     def _verify_security_envelope(self) -> bool:
+        self._clipper_pairing = None
+        self._clipper_cors_origin = None
+        self._vault_token_id = None
         client_ip = self.client_address[0]
         if client_ip != ALLOWED_API_BIND_HOST:
             self._send_json(403, {"error": "403 Forbidden: non-loopback client rejected."})
@@ -841,20 +909,85 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "403 Forbidden: invalid Host header (DNS-rebinding protection)."})
             return False
 
-        origin_hdr = (self.headers.get("Origin") or "").strip().lower()
+        req_path = urlparse(self.path).path
+        sec_dir = getattr(self.server.runtime, "security_dir", None)
+        origin_hdr = (self.headers.get("Origin") or "").strip().lower().rstrip("/")
+        paired_ext_origin = False
         if origin_hdr and origin_hdr != f"http://{ALLOWED_API_BIND_HOST}:{bound_port}":
-            self._send_json(403, {"error": "403 Forbidden: cross-origin browser request rejected."})
-            return False
+            if req_path in CLIPPER_SCOPED_PATHS and is_paired_clipper_origin(origin_hdr, security_dir=sec_dir):
+                paired_ext_origin = True
+            else:
+                self._send_json(403, {"error": "403 Forbidden: cross-origin browser request rejected."})
+                return False
 
         sec_fetch_site = self.headers.get("Sec-Fetch-Site")
         if sec_fetch_site is not None and sec_fetch_site.strip().lower() not in {"none", "same-origin"}:
             self._send_json(403, {"error": "403 Forbidden: cross-site browser request rejected."})
             return False
 
+        auth_hdr = self.headers.get("Authorization")
+        bearer_candidate = (
+            auth_hdr[7:].strip()
+            if isinstance(auth_hdr, str) and auth_hdr.lower().startswith("bearer ")
+            else ""
+        )
+
+        # Scoped Browser Web Clipper token path (strictly write-only capture on /v1/clipper/*)
+        if bearer_candidate.startswith(CLIPPER_TOKEN_PREFIX):
+            if req_path not in CLIPPER_SCOPED_PATHS:
+                self._send_json(
+                    403,
+                    {"error": "403 Forbidden: scoped browser clipper tokens may only access /v1/clipper/* endpoints."},
+                )
+                return False
+            pairing = verify_clipper_token(
+                auth_hdr,
+                origin=origin_hdr if paired_ext_origin else None,
+                security_dir=sec_dir,
+            )
+            if pairing is None:
+                _, fail_code = _check_and_record_auth(client_ip, auth_hdr, "__clipper_invalid_sentinel__")
+                msg = (
+                    "Too Many Requests: authentication rate limit exceeded."
+                    if fail_code == 429
+                    else "Unauthorized: invalid or revoked browser clipper token."
+                )
+                self._send_json(fail_code, {"error": msg})
+                return False
+            self._clipper_pairing = pairing
+            if paired_ext_origin:
+                self._clipper_cors_origin = origin_hdr
+            return True
+
+        # Browser extension Origin requests must present a valid paired Clipper token (never full agent token)
+        if paired_ext_origin:
+            self._send_json(
+                401,
+                {"error": "Unauthorized: browser extension origin requires a paired scoped clipper_* token."},
+            )
+            return False
+
+        # Isolated per-vault token path (vb_* valid strictly against its own active vault)
+        is_vtok, matched_vid, vtok_err = verify_per_vault_token(
+            auth_hdr,
+            active_vault_path=self.server.runtime.brain_dir,
+            security_dir=sec_dir,
+        )
+        if is_vtok:
+            if matched_vid is not None:
+                self._vault_token_id = matched_vid
+                return True
+            if vtok_err and vtok_err.startswith("403"):
+                self._send_json(403, {"error": vtok_err})
+                return False
+            _, fail_code = _check_and_record_auth(client_ip, auth_hdr, "__vtok_invalid_sentinel__")
+            self._send_json(fail_code, {"error": vtok_err or "Unauthorized: invalid vault bearer token."})
+            return False
+
         expected = get_configured_api_token(self.server.runtime.token_path)
         auth_ok, fail_code = _check_and_record_auth(
             client_ip,
-            self.headers.get("Authorization"),
+            auth_hdr,
             expected,
         )
         if not auth_ok:
@@ -1159,9 +1292,17 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
         if throttled_429:
             self._send_json(429, {"error": "Too Many Requests: owner token authentication rate limit exceeded."})
             return
-        raw_json = self._read_json_body(max_bytes=_max_body_bytes_for_route(method, path, is_owner=is_owner))
-        if raw_json is None:
-            return
+        if (
+            method == "DELETE"
+            and self.headers.get("Transfer-Encoding") is None
+            and (self.headers.get("Content-Length") or "0").strip() == "0"
+            and not (self.headers.get("Content-Type") or "").strip()
+        ):
+            raw_json: dict[str, object] | None = {}
+        else:
+            raw_json = self._read_json_body(max_bytes=_max_body_bytes_for_route(method, path, is_owner=is_owner))
+            if raw_json is None:
+                return
         try:
             if not api_product.dispatch(self, method, path, parsed_url.query, raw_json):
                 self._send_json(404, {"error": f"Unknown endpoint: {path}"})
@@ -1170,6 +1311,9 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         self._dispatch_body_method("PUT")
+
+    def do_PATCH(self) -> None:
+        self._dispatch_body_method("PATCH")
 
     def do_DELETE(self) -> None:
         self._dispatch_body_method("DELETE")
@@ -2291,6 +2435,104 @@ class MemoryApiClient:
             payload["passphrase"] = passphrase
         return self._request("POST", "/v1/sync/verify", payload)
 
+    # Browser Web Clipper SDK methods
+    def clipper_pairings(self) -> dict[str, object]:
+        return self._request("GET", "/v1/clipper/pairings")
+
+    def pair_clipper(self, origin: str, *, label: str = "Browser Clipper") -> dict[str, object]:
+        return self._request("POST", "/v1/clipper/pair", {"origin": origin, "label": label})
+
+    def revoke_clipper_pairing(self, pairing_id: str) -> dict[str, object]:
+        return self._request("DELETE", f"/v1/clipper/pair/{url_quote(pairing_id.strip(), safe='')}", {})
+
+    def clip_web_page(
+        self,
+        *,
+        url: str,
+        title: str = "",
+        selected_quote: str = "",
+        page_text: str = "",
+        tags: list[str] | None = None,
+        destination: str = "note",
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/clipper/clip",
+            {
+                "url": url,
+                "title": title,
+                "selected_quote": selected_quote,
+                "page_text": page_text,
+                "tags": list(tags or []),
+                "destination": destination,
+            },
+        )
+
+    # Multi-Vault Workspaces SDK methods
+    def list_vaults(self) -> dict[str, object]:
+        return self._request("GET", "/v1/vaults")
+
+    def create_vault(
+        self,
+        label: str,
+        path: str,
+        *,
+        vault_id: str | None = None,
+        isolated_token: bool = False,
+        default_host_policy: str = "local_only",
+        federated_searchable: bool = False,
+        activate: bool = False,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "label": label,
+            "path": path,
+            "isolated_token": bool(isolated_token),
+            "default_host_policy": default_host_policy,
+            "federated_searchable": bool(federated_searchable),
+            "activate": bool(activate),
+        }
+        if vault_id:
+            payload["vault_id"] = vault_id
+        return self._request("POST", "/v1/vaults", payload)
+
+    def switch_vault(self, vault_id: str) -> dict[str, object]:
+        return self._request("POST", "/v1/vaults/switch", {"vault_id": vault_id})
+
+    def update_vault_policy(
+        self,
+        vault_id: str,
+        *,
+        label: str | None = None,
+        default_host_policy: str | None = None,
+        federated_searchable: bool | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        if label is not None:
+            payload["label"] = label
+        if default_host_policy is not None:
+            payload["default_host_policy"] = default_host_policy
+        if federated_searchable is not None:
+            payload["federated_searchable"] = bool(federated_searchable)
+        return self._request("PATCH", f"/v1/vaults/{url_quote(vault_id.strip(), safe='')}", payload)
+
+    def remove_vault(self, vault_id: str) -> dict[str, object]:
+        return self._request("DELETE", f"/v1/vaults/{url_quote(vault_id.strip(), safe='')}", {})
+
+    def federated_recall(
+        self,
+        query: str,
+        *,
+        vault_ids: list[str] | None = None,
+        project_scope: str | None = None,
+        limit: int = 5,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {"query": query, "limit": int(limit)}
+        if vault_ids is not None:
+            payload["vault_ids"] = list(vault_ids)
+        if project_scope:
+            payload["project_scope"] = project_scope
+        return self._request("POST", "/v1/vaults/federated-recall", payload)
+
     # Convenience SDK method aliases
     inbox_item = inspect_inbox_item
     review_queue = list_review_queue
@@ -2387,6 +2629,18 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "POST /v1/sync/push",
                 "POST /v1/sync/pull",
                 "POST /v1/sync/verify",
+                "GET /v1/clipper/ping",
+                "GET /v1/clipper/status",
+                "POST /v1/clipper/clip",
+                "GET /v1/clipper/pairings",
+                "POST /v1/clipper/pair",
+                "DELETE /v1/clipper/pair/<pairing_id>",
+                "GET /v1/vaults",
+                "POST /v1/vaults",
+                "POST /v1/vaults/switch",
+                "PATCH /v1/vaults/<vault_id>",
+                "DELETE /v1/vaults/<vault_id>",
+                "POST /v1/vaults/federated-recall",
             ],
         },
         "local_ide_mcp_stdio": {

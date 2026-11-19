@@ -85,6 +85,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "goal4_sync_and_ui_tests.py")),
     ),
     (
+        "goal5_clipper_and_workspaces_tests",
+        "Goal 5 local-first Browser Web Clipper MV3/CORS/DLP/snapshot provenance & Multi-Vault Workspaces isolation, hot-switch, per-vault tokens & opt-in federated recall (scripts/goal5_clipper_and_workspaces_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "goal5_clipper_and_workspaces_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),

@@ -98,6 +98,24 @@ from vault_sync import (  # noqa: E402
     sync_status,
     sync_verify,
 )
+from vault_workspaces import (  # noqa: E402
+    VaultWorkspaceError,
+    VaultWorkspaceSecurityError,
+    create_vault,
+    federated_recall,
+    list_vaults,
+    remove_vault,
+    switch_vault,
+    update_vault_policy,
+)
+from web_clipper import (  # noqa: E402
+    ClipperError,
+    ClipperSecurityError,
+    create_clipper_pairing,
+    ingest_web_clip,
+    list_clipper_pairings,
+    revoke_clipper_pairing,
+)
 
 OWNER_HEADER = "X-Owner-Token"
 MIN_OWNER_TOKEN_LEN = 32
@@ -2577,6 +2595,168 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(200, res)
 
+        # ── Local-First Browser Web Clipper (scoped token on /ping,/status,/clip; owner-only on pairings) ──
+        sec_dir = getattr(rt, "security_dir", None)
+        if path == "/v1/clipper/ping" and method == "GET":
+            return send(
+                200,
+                {
+                    "ok": True,
+                    "service": "second-brain-clipper",
+                    "version": "0.3.0",
+                    "active_vault": os.path.basename(os.path.abspath(rt.brain_dir)),
+                },
+            )
+
+        if path == "/v1/clipper/status" and method == "GET":
+            pairing = getattr(handler, "_clipper_pairing", None)
+            return send(
+                200,
+                {
+                    "ok": True,
+                    "paired": bool(pairing),
+                    "pairing_id": pairing.get("pairing_id") if isinstance(pairing, dict) else None,
+                    "label": pairing.get("label") if isinstance(pairing, dict) else None,
+                    "origin": pairing.get("origin") if isinstance(pairing, dict) else None,
+                    "active_vault": os.path.basename(os.path.abspath(rt.brain_dir)),
+                },
+            )
+
+        if path == "/v1/clipper/clip" and method == "POST":
+            pairing = getattr(handler, "_clipper_pairing", None)
+            src_label = (
+                f"clipper:{pairing.get('pairing_id')}"
+                if isinstance(pairing, dict) and pairing.get("pairing_id")
+                else "browser-clipper"
+            )
+            raw_tags = body.get("tags", [])
+            if isinstance(raw_tags, str):
+                tags_val: list[str] | str = raw_tags[:1000]
+            elif isinstance(raw_tags, list):
+                tags_val = [str(t)[:64] for t in raw_tags[:32]]
+            else:
+                raise ClipperError("'tags' must be a list of strings or comma-separated string.")
+            res = ingest_web_clip(
+                url=_str(body, "url", max_len=2048),
+                title=_str(body, "title", max_len=240, required=False),
+                selected_quote=_str(body, "selected_quote", max_len=32_000, required=False),
+                page_text=_str(body, "page_text", max_len=200_000, required=False),
+                tags=tags_val,
+                destination=_str(body, "destination", default="note", max_len=16, required=False) or "note",
+                capture_source=src_label,
+                brain_dir=rt.brain_dir,
+            )
+            return send(201, res)
+
+        if path == "/v1/clipper/pairings" and method == "GET":
+            if not owner_only():
+                return True
+            items = list_clipper_pairings(security_dir=sec_dir)
+            return send(200, {"count": len(items), "pairings": items, "items": items})
+
+        if path == "/v1/clipper/pair" and method == "POST":
+            if not owner_only():
+                return True
+            origin = _str(body, "origin", max_len=200)
+            label = _str(body, "label", default="Browser Clipper", max_len=80, required=False) or "Browser Clipper"
+            res = create_clipper_pairing(origin, label=label, security_dir=sec_dir)
+            return send(201, res)
+
+        if path.startswith("/v1/clipper/pair/") and method == "DELETE":
+            if not owner_only():
+                return True
+            pid = unquote(path[len("/v1/clipper/pair/") :]).strip()
+            res = revoke_clipper_pairing(pid, security_dir=sec_dir)
+            return send(200, res)
+
+        # ── Multi-Vault Workspaces & Opt-In Federated Cross-Vault Recall (owner-only) ──
+        if path == "/v1/vaults" and method == "GET":
+            if not owner_only():
+                return True
+            return send(200, list_vaults(security_dir=sec_dir, current_brain_dir=rt.brain_dir))
+
+        if path == "/v1/vaults" and method == "POST":
+            if not owner_only():
+                return True
+            label = _str(body, "label", max_len=80)
+            vpath = _str(body, "path", max_len=1000)
+            vid = _str(body, "vault_id", max_len=64, required=False).strip() or None
+            host_policy = _str(body, "default_host_policy", default="local_only", max_len=32, required=False) or "local_only"
+            activate = bool(body.get("activate", False))
+            res = create_vault(
+                label,
+                vpath,
+                vault_id=vid,
+                isolated_token=bool(body.get("isolated_token", False)),
+                default_host_policy=host_policy,
+                federated_searchable=bool(body.get("federated_searchable", False)),
+                activate=activate,
+                security_dir=sec_dir,
+                current_brain_dir=rt.brain_dir,
+            )
+            if activate and hasattr(rt, "switch_brain_dir"):
+                rt.switch_brain_dir(str(res["path"]))
+            return send(201, res)
+
+        if path == "/v1/vaults/switch" and method == "POST":
+            if not owner_only():
+                return True
+            vid = _str(body, "vault_id", max_len=64)
+            res = switch_vault(vid, security_dir=sec_dir, current_brain_dir=rt.brain_dir)
+            if hasattr(rt, "switch_brain_dir"):
+                rt.switch_brain_dir(str(res["active_vault_path"]))
+            return send(200, res)
+
+        if path == "/v1/vaults/federated-recall" and method == "POST":
+            if not owner_only():
+                return True
+            q_str = _str(body, "query", max_len=2000)
+            raw_vids = body.get("vault_ids")
+            if raw_vids is not None:
+                if not isinstance(raw_vids, list):
+                    raise VaultWorkspaceError("'vault_ids' must be a list of vault IDs.")
+                vids_arg: list[str] | None = [str(x).strip() for x in raw_vids if str(x).strip()]
+            else:
+                vids_arg = None
+            raw_lim = body.get("limit", 5)
+            if isinstance(raw_lim, bool) or not isinstance(raw_lim, (int, str)):
+                raise VaultWorkspaceError("'limit' must be an integer between 1 and 25.")
+            lim = max(1, min(int(str(raw_lim).strip()[:6]), 25))
+            proj = _str(body, "project_scope", max_len=120, required=False).strip() or None
+            res = federated_recall(
+                q_str,
+                vault_ids=vids_arg,
+                project_scope=proj,
+                limit=lim,
+                security_dir=sec_dir,
+                current_brain_dir=rt.brain_dir,
+            )
+            return send(200, res)
+
+        if path.startswith("/v1/vaults/") and method == "PATCH":
+            if not owner_only():
+                return True
+            vid = unquote(path[len("/v1/vaults/") :]).strip()
+            lbl = _str(body, "label", max_len=80, required=False) if "label" in body else None
+            pol = _str(body, "default_host_policy", max_len=32, required=False) if "default_host_policy" in body else None
+            fed = bool(body["federated_searchable"]) if "federated_searchable" in body else None
+            res = update_vault_policy(
+                vid,
+                label=lbl,
+                default_host_policy=pol,
+                federated_searchable=fed,
+                security_dir=sec_dir,
+                current_brain_dir=rt.brain_dir,
+            )
+            return send(200, res)
+
+        if path.startswith("/v1/vaults/") and method == "DELETE":
+            if not owner_only():
+                return True
+            vid = unquote(path[len("/v1/vaults/") :]).strip()
+            res = remove_vault(vid, security_dir=sec_dir, current_brain_dir=rt.brain_dir)
+            return send(200, res)
+
     except (MemoryRecallUnavailable, LexicalIndexUnavailable) as exc:
         return send(
             503,
@@ -2593,9 +2773,17 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if str(exc).startswith("Note not found:"):
             return send(404, {"error": str(exc)})
         return send(422, {"error": str(exc)})
-    except (PlaybookValidationError, ReviewTransitionError, SyncError, ValueError, NotADirectoryError) as exc:
+    except (
+        PlaybookValidationError,
+        ReviewTransitionError,
+        SyncError,
+        ClipperError,
+        VaultWorkspaceError,
+        ValueError,
+        NotADirectoryError,
+    ) as exc:
         return send(422, {"error": str(exc)})
-    except (HostConsentError, SyncSecurityError) as exc:
+    except (HostConsentError, SyncSecurityError, ClipperSecurityError, VaultWorkspaceSecurityError) as exc:
         return send(403, {"error": str(exc)})
     except PermissionError as exc:
         return send(403, {"error": str(exc)})

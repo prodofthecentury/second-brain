@@ -17,6 +17,12 @@
         </div>
       </div>
 
+      <div style="padding: 0 2px 8px 2px;">
+        <select id="sidebarVaultSelect" aria-label="Active Vault Workspace" style="width:100%; font-size:12px;">
+          <option value="default">Default Vault</option>
+        </select>
+      </div>
+
       <button class="nav-btn active" data-view="notes" type="button">Notes <span class="kbd">Ctrl+1</span></button>
       <button class="nav-btn" data-view="chat" type="button">Streaming Chat <span class="kbd">Ctrl+2</span></button>
       <button class="nav-btn" data-view="review" type="button">Inbox &amp; Review <span class="kbd">Ctrl+3</span></button>
@@ -360,6 +366,60 @@
           </div>
           <div class="status-banner" id="syncOutput">Checking E2EE sync status...</div>
           <div id="syncConflictsList"></div>
+        </div>
+
+        <div class="card" id="systemWorkspacesCard">
+          <div class="toolbar">
+            <strong>Multi-Vault Workspaces &amp; Opt-In Federated Recall</strong>
+            <button class="btn sm" id="workspacesRefreshBtn" type="button" style="margin-left:auto;">Refresh Vaults</button>
+          </div>
+          <div class="note-item-meta">Isolated vault workspaces (each with its own writer.lock, ledger, and optional per-vault token). Switching syncs vault-path.txt across CLI, MCP, Dashboard, and Desktop.</div>
+          <div id="workspacesListWrap" style="margin-top:8px;"></div>
+          <div class="form-grid" style="margin-top:8px;">
+            <div class="field-col">
+              <span class="field-label">New Vault Label *</span>
+              <input type="text" id="wsLabelInput" placeholder="e.g. Work or Client-A" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Vault Directory Path *</span>
+              <input type="text" id="wsPathInput" placeholder="e.g. C:\Users\you\SecondBrain-Work" />
+            </div>
+          </div>
+          <div class="toolbar" style="margin-top:6px;">
+            <label class="inline-check"><input type="checkbox" id="wsIsolatedTokenCheck" /> Mint Isolated Per-Vault Token</label>
+            <label class="inline-check"><input type="checkbox" id="wsFederatedCheck" /> Opt-In Federated Search</label>
+            <label class="inline-check"><input type="checkbox" id="wsActivateCheck" /> Switch Immediately</label>
+            <button class="btn primary sm" id="wsCreateBtn" type="button" style="margin-left:auto;">Create Vault</button>
+          </div>
+          <div class="toolbar" style="margin-top:8px;">
+            <input type="text" id="wsFedQueryInput" placeholder="Read-only federated search across opted-in vaults..." style="flex:1; min-width:220px;" />
+            <button class="btn sm" id="wsFedSearchBtn" type="button">Federated Recall</button>
+          </div>
+          <div class="status-banner" id="workspacesOutput">Loading vault workspaces...</div>
+          <div id="wsFedResultsWrap"></div>
+        </div>
+
+        <div class="card" id="systemClipperCard">
+          <div class="toolbar">
+            <strong>Local-First Browser Web Clipper (Chrome / Edge / Firefox)</strong>
+            <button class="btn sm" id="clipperRefreshBtn" type="button" style="margin-left:auto;">Refresh Pairings</button>
+          </div>
+          <div class="note-item-meta">Strict 127.0.0.1 loopback capture with write-only scoped clipper_* tokens, SHA-256 web snapshots, and automatic DLP quarantine.</div>
+          <div class="form-grid" style="margin-top:8px;">
+            <div class="field-col">
+              <span class="field-label">Browser Extension Origin *</span>
+              <input type="text" id="clipperOriginInput" placeholder="chrome-extension://<32-char-id> or moz-extension://<uuid>" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Browser Label</span>
+              <input type="text" id="clipperLabelInput" value="Browser Clipper" placeholder="e.g. Chrome Work" />
+            </div>
+          </div>
+          <div class="toolbar" style="margin-top:6px;">
+            <button class="btn primary sm" id="clipperPairBtn" type="button">Pair Extension &amp; Mint Token</button>
+          </div>
+          <div class="status-banner" id="clipperOutput">Paste your extension origin from the Clipper popup and click Pair.</div>
+          <div id="clipperPairingsWrap"></div>
         </div>
 
         <div class="card">

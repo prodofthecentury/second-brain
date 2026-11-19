@@ -343,7 +343,13 @@ synchronized across both files.
 - [x] Complete 3-surface UI parity for Action-Item Tasks, Local NLI Contradiction Radar (`nli=1`), and E2EE Vault Sync across Electron Desktop (`desktop/renderer/`), VS Code (`extensions/vscode-second-brain/`), and Streamlit Dashboard (`dashboard/app.py`).
 - [x] Harden `.github/workflows/ci.yml`, `.github/workflows/release.yml`, and `scripts/package_desktop.ps1` (`-SkipSign` support + LF script checks), and add Suite `19/19` (`scripts/goal4_sync_and_ui_tests.py`) achieving `19/19 PASS` (`100% PASS`) in `scripts/test_all.py`.
 
-## Completed product horizon (closed in Goals 17–21)
+### Goal 22 — Local-First Browser Web Clipper (MV3), Multi-Vault Workspaces & 20-Suite Gate (`v0.3.0`) — COMPLETE
+
+- [x] Implement Local-First Browser Web Clipper (`extensions/browser-clipper/`, `scripts/web_clipper.py`, `scripts/build_clipper.py`, `second-brain clipper`, `/v1/clipper/*`) with strict `http://127.0.0.1/*` MV3 permissions, zero `.innerHTML`, SHA-256-hashed write-only `clipper_*` bearer tokens bound to owner-paired extension origins, immutable `brain/0-raw/note-snapshots/clip-*.md` snapshots compatible with `verify_note_excerpt`, and server-side DLP/prompt-injection quarantine.
+- [x] Implement Multi-Vault Workspaces & Opt-In Federated Recall (`scripts/vault_workspaces.py`, `second-brain vault`, `/v1/vaults*`, `MemoryApiClient.*vault*`) with `SecondBrain/security/vaults.json`, non-overlapping directory checks, atomic `vault-path.txt` + live API hot-switching, optional isolated per-vault `vb_*` tokens, non-destructive unregister, and strictly opt-in read-only federated search.
+- [x] Complete 3-surface UI parity (Electron Desktop sidebar switcher + System cards, VS Code commands, Streamlit Dashboard), align `v0.3.0` package manifests across Python/Electron/VS Code/plugins, and add Suite `20/20` (`scripts/goal5_clipper_and_workspaces_tests.py`) achieving `20/20 PASS` (`100% PASS`) in `scripts/test_all.py`.
+
+## Completed product horizon (closed in Goals 17–22)
 
 - [x] **OS-Signed Desktop Installers:** Native code-signed NSIS / MSI / DMG / AppImage / deb
   targets (`desktop/package.json`, `scripts/package_desktop.ps1`, `scripts/package_desktop.sh`)

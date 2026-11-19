@@ -161,6 +161,19 @@ from scripts.vault_sync import (
     sync_status as vault_sync_status,
     sync_verify as vault_sync_verify,
 )
+from scripts.vault_workspaces import (
+    create_vault as ws_create_vault,
+    federated_recall as ws_federated_recall,
+    list_vaults as ws_list_vaults,
+    remove_vault as ws_remove_vault,
+    switch_vault as ws_switch_vault,
+    update_vault_policy as ws_update_vault_policy,
+)
+from scripts.web_clipper import (
+    create_clipper_pairing as clipper_create_pairing,
+    list_clipper_pairings as clipper_list_pairings,
+    revoke_clipper_pairing as clipper_revoke_pairing,
+)
 
 # Resolve active vault directories dynamically so env overrides (BRAIN_VAULT_DIR) or persisted vault paths stay isolated per run.
 _env_vault_override = (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
@@ -3707,6 +3720,161 @@ elif nav_selection == "⚙️ System Control":
                         st.error(f"Verification failed: {res.get('issues')}")
                 except Exception as exc:
                     st.error(f"Verify failed: {exc}")
+
+    # Multi-Vault Workspaces & Opt-In Federated Cross-Vault Recall
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🗂️ Multi-Vault Workspaces & Opt-In Federated Recall")
+        st.caption(
+            "Maintain isolated vault workspaces (`SecondBrain/security/vaults.json`) with optional per-vault bearer tokens. "
+            "Switching atomically updates `vault-path.txt` for CLI, MCP, Dashboard, and Desktop."
+        )
+        try:
+            ws_info = ws_list_vaults(current_brain_dir=BRAIN_DIR)
+        except Exception as ws_exc:
+            ws_info = {"active_vault_id": "default", "active_vault_path": BRAIN_DIR, "vaults": [], "error": str(ws_exc)}
+
+        ws_list = list(ws_info.get("vaults") or [])
+        if ws_list:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Vault ID": v["vault_id"],
+                            "Label": v["label"],
+                            "Active": "✅" if v["active"] else "",
+                            "Federated": "opt-in" if v["federated_searchable"] else "isolated",
+                            "Atoms": v["atom_count"],
+                            "Notes": v["note_count"],
+                            "Path": v["path"],
+                        }
+                        for v in ws_list
+                    ]
+                ),
+                width="stretch",
+            )
+            ws_ids = [v["vault_id"] for v in ws_list]
+            sel_ws = st.selectbox("Select Registered Vault", options=ws_ids, key="sys_ws_select")
+            wc1, wc2, wc3 = st.columns(3)
+            with wc1:
+                if st.button("🔀 Switch Active Vault", key="btn_ws_switch"):
+                    try:
+                        sw_res = ws_switch_vault(sel_ws, current_brain_dir=BRAIN_DIR)
+                        st.success(f"Switched active vault to `{sw_res['active_vault_id']}` ({sw_res['active_vault_path']}).")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Switch failed: {exc}")
+            with wc2:
+                if st.button("🌐 Toggle Federated Opt-In", key="btn_ws_toggle_fed"):
+                    try:
+                        cur_v = next(v for v in ws_list if v["vault_id"] == sel_ws)
+                        upd = ws_update_vault_policy(
+                            sel_ws,
+                            federated_searchable=not bool(cur_v["federated_searchable"]),
+                            current_brain_dir=BRAIN_DIR,
+                        )
+                        st.success(f"`{sel_ws}` federated_searchable={upd['federated_searchable']}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Policy update failed: {exc}")
+            with wc3:
+                if st.button("🧹 Unregister Vault (Keep Files)", key="btn_ws_remove"):
+                    try:
+                        ws_remove_vault(sel_ws, current_brain_dir=BRAIN_DIR)
+                        st.success(f"Unregistered `{sel_ws}` (files preserved on disk).")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unregister failed: {exc}")
+
+        nc1, nc2 = st.columns(2)
+        with nc1:
+            new_ws_label = st.text_input("New Vault Label", placeholder="e.g. Work", key="sys_ws_new_label")
+        with nc2:
+            new_ws_path = st.text_input("New Vault Directory", placeholder="e.g. C:\\Users\\you\\SecondBrain-Work", key="sys_ws_new_path")
+        nc3, nc4, nc5 = st.columns(3)
+        with nc3:
+            new_ws_tok = st.checkbox("Mint Isolated Per-Vault Token", value=False, key="sys_ws_new_tok")
+        with nc4:
+            new_ws_fed = st.checkbox("Opt-In Federated Search", value=False, key="sys_ws_new_fed")
+        with nc5:
+            if st.button("➕ Create Vault Workspace", key="btn_ws_create"):
+                try:
+                    cr = ws_create_vault(
+                        new_ws_label.strip(),
+                        new_ws_path.strip(),
+                        isolated_token=new_ws_tok,
+                        federated_searchable=new_ws_fed,
+                        current_brain_dir=BRAIN_DIR,
+                    )
+                    st.success(f"Created workspace `{cr['vault_id']}` at `{cr['path']}`.")
+                    if cr.get("vault_token"):
+                        st.code(f"Isolated Vault Token (save safely): {cr['vault_token']}", language="text")
+                except Exception as exc:
+                    st.error(f"Create vault failed: {exc}")
+
+        fed_q = st.text_input("Opt-In Federated Cross-Vault Recall Query", key="sys_ws_fed_query")
+        if st.button("🔎 Search Opted-In Vaults (Read-Only)", key="btn_ws_fed_search"):
+            try:
+                fres = ws_federated_recall(fed_q.strip(), limit=8, current_brain_dir=BRAIN_DIR)
+                if fres["results"]:
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Vault": r.get("vault_label") or r.get("vault_id"),
+                                    "Atom": r.get("filename"),
+                                    "Score": r.get("score"),
+                                }
+                                for r in fres["results"]
+                            ]
+                        ),
+                        width="stretch",
+                    )
+                else:
+                    st.info(f"No approved matches across opted-in vaults ({fres.get('searched_vaults')}).")
+            except Exception as exc:
+                st.error(f"Federated search failed: {exc}")
+
+    # Local-First Browser Web Clipper Pairings
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🌐 Local-First Browser Web Clipper (Chrome / Edge / Firefox)")
+        st.caption(
+            "Loopback-only (`127.0.0.1`) MV3 web clipper with write-only scoped `clipper_*` tokens, "
+            "verifiable SHA-256 source snapshots, and automatic DLP quarantine."
+        )
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            clip_origin_in = st.text_input(
+                "Extension Origin",
+                placeholder="chrome-extension://<32-char-id> or moz-extension://<uuid>",
+                key="sys_clip_origin",
+            )
+        with cc2:
+            clip_label_in = st.text_input("Browser Label", value="Browser Clipper", key="sys_clip_label")
+        if st.button("🔗 Pair Browser Extension & Mint Scoped Token", key="btn_clip_pair"):
+            try:
+                pres = clipper_create_pairing(clip_origin_in.strip(), label=clip_label_in.strip() or "Browser Clipper")
+                st.success(f"Paired `{pres['label']}` (`{pres['pairing_id']}`). Paste this write-only token into the extension popup:")
+                st.code(str(pres["token"]), language="text")
+            except Exception as exc:
+                st.error(f"Pairing failed: {exc}")
+        try:
+            pairings = clipper_list_pairings()
+        except Exception:
+            pairings = []
+        if pairings:
+            st.dataframe(pd.DataFrame(pairings), width="stretch")
+            rev_id = st.selectbox("Revoke Paired Extension", [p["pairing_id"] for p in pairings], key="sys_clip_rev_sel")
+            if st.button("🚫 Revoke Clipper Pairing", key="btn_clip_revoke"):
+                try:
+                    clipper_revoke_pairing(rev_id)
+                    st.success(f"Revoked `{rev_id}`.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Revoke failed: {exc}")
+        else:
+            st.info("No browser clipper extensions paired yet.")
 
     # Briefing log
     st.divider()

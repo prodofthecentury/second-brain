@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Second Brain — Web Clipper</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="clipper-root">
+    <header class="header">
+      <div class="brand">
+        <span class="dot" id="statusDot"></span>
+        <div>
+          <div class="title">Second Brain Clipper</div>
+          <div class="subtitle" id="statusText">Checking local 127.0.0.1 API…</div>
+        </div>
+      </div>
+      <button type="button" class="btn-link" id="toggleSettingsBtn">Pair</button>
+    </header>
+
+    <section class="panel hidden" id="settingsPanel">
+      <div class="field-group">
+        <label for="originOutput">Extension Origin (paste into Desktop/CLI Pair)</label>
+        <div class="row">
+          <input type="text" id="originOutput" readonly />
+          <button type="button" class="btn sm" id="copyOriginBtn">Copy</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field-group" style="width: 96px;">
+          <label for="portInput">Loopback Port</label>
+          <input type="number" id="portInput" min="1" max="65535" value="8765" />
+        </div>
+        <div class="field-group flex1">
+          <label for="tokenInput">Scoped Clipper Token (clipper_…)</label>
+          <input type="password" id="tokenInput" placeholder="clipper_..." autocomplete="off" />
+        </div>
+      </div>
+      <div class="row">
+        <button type="button" class="btn primary sm" id="saveSettingsBtn">Save &amp; Test</button>
+        <span class="hint" id="settingsHint">Strict 127.0.0.1 loopback only.</span>
+      </div>
+    </section>
+
+    <section class="panel" id="clipPanel">
+      <div class="field-group">
+        <label for="titleInput">Page Title</label>
+        <input type="text" id="titleInput" placeholder="Document title…" />
+      </div>
+      <div class="field-group">
+        <label for="urlInput">Source URL</label>
+        <input type="text" id="urlInput" readonly />
+      </div>
+      <div class="field-group">
+        <label for="quoteInput">Highlighted Verbatim Quote</label>
+        <textarea id="quoteInput" rows="4" placeholder="Highlight text on the page or paste a quote to anchor…"></textarea>
+      </div>
+      <div class="row">
+        <div class="field-group flex1">
+          <label for="tagsInput">Tags (comma-separated)</label>
+          <input type="text" id="tagsInput" placeholder="project:alpha, research" />
+        </div>
+        <div class="field-group" style="width: 130px;">
+          <label for="destSelect">Destination</label>
+          <select id="destSelect">
+            <option value="note">Working Note</option>
+            <option value="inbox">Quarantined Inbox</option>
+          </select>
+        </div>
+      </div>
+      <label class="checkbox-row">
+        <input type="checkbox" id="includePageTextCheck" checked />
+        <span>Include cleaned page text snapshot (SHA-256 verifiable provenance)</span>
+      </label>
+      <div class="actions">
+        <button type="button" class="btn primary full" id="clipBtn">Clip to Second Brain</button>
+      </div>
+      <div class="result-box hidden" id="resultBox"></div>
+    </section>
+  </div>
+  <script src="lib/clipper-client.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

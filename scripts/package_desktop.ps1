@@ -56,6 +56,11 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "build_vsix.py exited with code $LASTEXITCODE"
     }
+
+    uv run --frozen python scripts/build_clipper.py --out-dir $DistDir | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "build_clipper.py exited with code $LASTEXITCODE"
+    }
 } finally {
     Pop-Location
 }
@@ -150,7 +155,7 @@ Remove-Item -Path (Join-Path $DistDir "builder-debug.yml") -Force -ErrorAction S
 if ($SkipSign) {
     $sumLines = @()
     Get-ChildItem -Path $DistDir -File | Where-Object {
-        $_.Extension -in @(".exe", ".msi", ".whl", ".vsix", ".blockmap")
+        $_.Extension -in @(".exe", ".msi", ".whl", ".vsix", ".zip", ".blockmap")
     } | Sort-Object Name | ForEach-Object {
         $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         $sumLines += "$hash  $($_.Name)"

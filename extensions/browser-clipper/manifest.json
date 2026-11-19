@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Second Brain — Local Web Clipper",
+  "version": "0.3.0",
+  "description": "Local-first, zero-cloud web clipper for Second Brain. Captures quotes and pages with verifiable SHA-256 snapshots directly to 127.0.0.1.",
+  "permissions": [
+    "activeTab",
+    "contextMenus",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Clip to Second Brain"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "clipper@secondbrain.local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; connect-src http://127.0.0.1:*; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none';"
+  }
+}
