@@ -153,11 +153,18 @@ def doctor() -> int:
         "dense_index": _capability("chromadb"),
         "scout_http": _capability("httpx"),
         "extractor": _capability("trafilatura"),
+        "document_pdf": _capability("pypdf"),
         "multimodal_audio": _capability("faster_whisper"),
         "image_processing_library": _capability("PIL"),
     }
     for name, ready in capabilities.items():
         print(f"{'ready' if ready else 'not installed':16} {name}")
+    if not capabilities["multimodal_audio"] or not capabilities["image_processing_library"]:
+        print(
+            "Multimodal optional extras: install via `./setup.ps1 -IncludeMultimodal`, "
+            "`./setup.sh --include-multimodal`, or `uv sync --frozen --extra multimodal` "
+            "(image ingestion fails closed without Pillow)."
+        )
     atoms_dir = Path(vp["atoms_dir"])
     atom_files = sorted(path for path in atoms_dir.glob("*.md") if path.name != "README.md") if atoms_dir.is_dir() else []
     print(f"Atoms: {len(atom_files)}")
@@ -423,10 +430,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("playbooks", "Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks."),
         ("playbook", "Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks."),
         ("plan", "Assemble a grounded, citation-verified Executive Plan from Playbooks and approved Atoms."),
-        ("notes", "Zero-friction notes: add, search, list, reindex, verify an excerpt."),
+        ("notes", "Zero-friction notes: add, search, list, tasks, reindex, verify an excerpt."),
         ("capture", "Quickly capture a working note or quarantined inbox item from the CLI."),
-        ("import", "Bulk-import an Obsidian vault or Markdown folder into notes."),
-        ("chat", "Chat with streaming answers over verified memory and notes."),
+        ("import", "Bulk-import Markdown, Obsidian, PDF, DOCX, EPUB, HTML, or CSV files into notes."),
+        ("chat", "Chat with instant, verified, streaming, or research answers over memory and notes."),
         ("connect", "One-click connect Claude Code/Desktop, Cursor, Windsurf, VS Code, or Antigravity."),
         ("benchmark", "Run the corpus-scale benchmark on a synthetic isolated vault."),
         ("sota-benchmark", "Run comparative SOTA benchmarks against external RAG/memory baselines."),
@@ -434,7 +441,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("graph", "Contradiction & Drift Radar + temporal knowledge graph."),
         ("snapshot", "Time-travel vault snapshots, semantic diff, and point-in-time recall."),
         ("recall", "Search owner-approved memory atoms via lexical, dense, or hybrid RRF recall."),
-        ("answer", "Generate a citation-validated grounded answer from owner-approved memory."),
+        ("answer", "Generate a citation-validated grounded answer (standard, preference, or research)."),
         ("review", "Inspect, approve, reject, quarantine, demote, edit, or merge memory atoms."),
         ("audit", "Audit canonical memory atoms against anchored source files."),
         ("rebuild-lexical", "Rebuild the SQLite FTS5 lexical recall sidecar index."),
@@ -442,7 +449,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("refinery", "Extract candidate atomic notes from raw captures via local Ollama."),
         ("editor", "Synthesize thematic threads and weekly briefings via local Ollama."),
         ("scout", "Fetch allowlisted reading-list sources into 0-raw/inbox/."),
-        ("ingest", "Ingest local audio or image files into 0-raw/ Markdown captures."),
+        ("ingest", "Ingest local PDF, DOCX, EPUB, HTML, CSV, audio, or image files into 0-raw/."),
         ("daemon", "Run the continuous local vault watchdog daemon."),
         ("mcp", "Run or configure the loopback stdio MCP server."),
         ("eval-retrieval", "Run retrieval quality evaluation over labeled suites."),
@@ -614,7 +621,7 @@ def _run_answer_cli(forwarded: list[str]) -> int:
 
     p = argparse.ArgumentParser(prog="second-brain answer", description="Generate a citation-validated grounded answer.")
     p.add_argument("query", help="Question to answer from approved memory.")
-    p.add_argument("--mode", choices=("standard", "preference"), default="standard")
+    p.add_argument("--mode", choices=("standard", "preference", "research"), default="standard")
     p.add_argument("--retrieval-mode", choices=("auto", "lexical", "dense", "rrf"), default="auto")
     p.add_argument("-n", "--limit", type=int, default=5)
     p.add_argument("--project", default=None)
@@ -653,21 +660,19 @@ def _run_answer_cli(forwarded: list[str]) -> int:
     if args.json:
         from dataclasses import asdict
 
-        print(
-            json.dumps(
-                {
-                    "answerable": ans.answerable,
-                    "text": ans.text,
-                    "reason": ans.reason,
-                    "claims": [
-                        {"text": c.text, "is_preference": c.is_preference, "evidence": [asdict(ev) for ev in c.evidence]}
-                        for c in ans.claims
-                    ],
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
+        payload: dict[str, object] = {
+            "answerable": ans.answerable,
+            "mode": args.mode,
+            "text": ans.text,
+            "reason": ans.reason,
+            "claims": [
+                {"text": c.text, "is_preference": c.is_preference, "evidence": [asdict(ev) for ev in c.evidence]}
+                for c in ans.claims
+            ],
+        }
+        if args.mode == "research":
+            payload["unverified_leads"] = [lead.as_dict() for lead in ans.unverified_leads]
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print(ans.text)
     return 0

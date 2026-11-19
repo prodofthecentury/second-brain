@@ -24,6 +24,8 @@ from scripts.answer_policy import (
     NO_APPROVED_MEMORY_RESPONSE,
     answer_from_memory,
     build_grounding_prompt,
+    collect_unverified_leads,
+    format_unverified_leads_section,
     validate_standard_answer,
 )
 from scripts.cognitive_core import (
@@ -128,9 +130,9 @@ def chat_loop(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--answer-mode",
-        choices=("standard", "preference"),
+        choices=("standard", "preference", "research"),
         default="standard",
-        help="Epistemic answer contract mode ('standard' empirical facts or 'preference' owner preferences).",
+        help="Epistemic answer contract mode ('standard' empirical facts, 'preference' owner preferences, or 'research' with unverified leads).",
     )
     parser.add_argument(
         "--host-id",
@@ -203,8 +205,35 @@ def chat_loop(argv: list[str] | None = None):
         else:
             console.print("[dim yellow]⚠ No relevant memories found.[/dim yellow]")
 
+        unverified_leads = ()
+        if args.answer_mode == "research":
+            if len(projects) <= 1:
+                unverified_leads = collect_unverified_leads(
+                    user_input,
+                    atoms_dir=ATOMS_DIR,
+                    brain_dir=BRAIN_DIR,
+                    project_scope=projects[0] if projects else None,
+                    allow_cross_project=args.allow_cross_project,
+                    retrieval_mode=args.mode,
+                )
+            else:
+                seen_leads: dict[str, object] = {}
+                for proj_item in projects:
+                    for ld in collect_unverified_leads(
+                        user_input,
+                        atoms_dir=ATOMS_DIR,
+                        brain_dir=BRAIN_DIR,
+                        project_scope=proj_item,
+                        allow_cross_project=args.allow_cross_project,
+                        retrieval_mode=args.mode,
+                    ):
+                        seen_leads.setdefault(ld.lead_id, ld)
+                unverified_leads = tuple(list(seen_leads.values())[:5])
+
         if not retrieved_atoms:
             full_response = answer_from_memory("", lambda: "")
+            if args.answer_mode == "research" and unverified_leads:
+                full_response = f"{full_response}\n\n{format_unverified_leads_section(unverified_leads)}"
             try:
                 record_grounded_answer_telemetry([], abstained=True, mode=args.answer_mode)
             except Exception:
@@ -215,7 +244,12 @@ def chat_loop(argv: list[str] | None = None):
 
         full_response = ""
         try:
-            ans_req = AnswerRequest(query=user_input, mode=args.answer_mode, result_limit=len(retrieved_atoms))
+            ans_req = AnswerRequest(
+                query=user_input,
+                mode=args.answer_mode,
+                project_scope=projects[0] if len(projects) == 1 else None,
+                result_limit=len(retrieved_atoms),
+            )
             if args.host_id != "ollama_local":
                 answer = generate_grounded_answer_via_host(
                     ans_req,
@@ -224,6 +258,7 @@ def chat_loop(argv: list[str] | None = None):
                     model_override=selected_model,
                     atoms_dir=ATOMS_DIR,
                     brain_dir=BRAIN_DIR,
+                    unverified_leads=unverified_leads if args.answer_mode == "research" else None,
                 )
             else:
                 policies = load_host_policies()
@@ -237,9 +272,17 @@ def chat_loop(argv: list[str] | None = None):
                     (selected_model or "").strip() or local_rule.default_model or GEN_MODEL,
                     provider="ollama",
                 )
-                scoped_atoms = filter_atoms_for_host(retrieved_atoms, local_rule, mode=args.answer_mode)
+                scoped_atoms = filter_atoms_for_host(
+                    retrieved_atoms,
+                    local_rule,
+                    mode=args.answer_mode,
+                    atoms_dir=ATOMS_DIR,
+                    brain_dir=BRAIN_DIR,
+                )
                 if not scoped_atoms:
                     full_response = NO_APPROVED_MEMORY_RESPONSE
+                    if args.answer_mode == "research" and unverified_leads:
+                        full_response = f"{full_response}\n\n{format_unverified_leads_section(unverified_leads)}"
                     try:
                         record_grounded_answer_telemetry([], abstained=True, mode=args.answer_mode)
                     except Exception:
@@ -247,7 +290,12 @@ def chat_loop(argv: list[str] | None = None):
                     console.print(f"\n[bold blue]{rich_escape(args.host_id)}>[/bold blue]")
                     console.print(full_response, markup=False)
                     continue
-                grounding_prompt = build_grounding_prompt(ans_req, scoped_atoms)
+                grounding_prompt = build_grounding_prompt(
+                    ans_req,
+                    scoped_atoms,
+                    atoms_dir=ATOMS_DIR,
+                    brain_dir=BRAIN_DIR,
+                )
                 redaction, pii_placeholder_map = _redact_outbound_with_map(
                     grounding_prompt,
                     redact_pii=local_rule.redact_pii,
@@ -265,7 +313,11 @@ def chat_loop(argv: list[str] | None = None):
                     full_response += content
                 rehydrated_draft = _rehydrate_draft_claims(full_response, pii_placeholder_map)
                 answer = validate_standard_answer(
-                    rehydrated_draft, scoped_atoms, atoms_dir=ATOMS_DIR, mode=args.answer_mode
+                    rehydrated_draft,
+                    scoped_atoms,
+                    atoms_dir=ATOMS_DIR,
+                    mode=args.answer_mode,
+                    unverified_leads=unverified_leads,
                 )
                 _audit_outbound_call(
                     brain_dir=BRAIN_DIR,

@@ -10,18 +10,27 @@
 # ///
 """
 Feature 2 — Real-Time Watchdog Daemon
-Monitors 0-raw/ around the clock. The instant a file lands in the folder,
-it fires the appropriate ingestion pipeline without waiting for a batch run.
+Monitors 0-raw/, notes/, and 2-atoms/ with hardware-tiered gating:
 
-  .md / .txt files  → Immediately routed to the Refinery (atom creation)
-  Audio files       → Multimodal ingestion (Whisper transcribe) → Refinery
-  Image files       → Multimodal ingestion (LLaVA describe)    → Refinery
+  Documents (.pdf/.docx/.epub/.html/.csv/.tsv) → Deterministic local extraction (all tiers)
+  Audio files                                  → faster-whisper transcribe (when installed & RAM >= 6 GiB)
+  Image files                                  → Pillow + Ollama vision (Tier 2+ with Ollama & Pillow)
+  .md / .txt / approved .intake                → Refinery LLM drafting (Tier 2+ with reachable Ollama)
+  notes/ & 2-atoms/                            → Debounced model-free FTS5 sync + read-only stale-anchor check
+
+Constrained tiers (Tier 0 / Tier 1 or offline Ollama) archive/retain captures safely in 0-raw/ and
+record a deferred-queue entry without counterfeiting atoms or spinning in a retry loop.
 
 Run this once and leave it running:
     uv run scripts/watchdog_daemon.py
 """
 
+from __future__ import annotations
+
 import argparse
+import datetime
+import importlib.util
+import json
 import logging
 import os
 import queue
@@ -29,11 +38,26 @@ import sys
 import threading
 import time
 
-from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import RAW_DIR, AUDIO_EXTS, IMAGE_EXTS, TEXT_EXTS, _is_reparse_or_link, ensure_dirs
+from atom_mutator import atomic_write_bytes, review_lock
+from config import (
+    ATOMS_DIR,
+    AUDIO_EXTS,
+    BRAIN_DIR,
+    DOC_EXTS,
+    IMAGE_EXTS,
+    LEXICAL_INDEX_PATH,
+    NOTES_DIR,
+    RAW_DIR,
+    SIDECAR_DIR,
+    TEXT_EXTS,
+    _is_reparse_or_link,
+    ensure_dirs,
+)
+from hardware_profile import HardwareCapabilityProfile, detect_hardware_profile
 from refinery_targets import intake_status, is_supported_refinery_target
 from stable_file import wait_for_stable_file
 
@@ -47,6 +71,7 @@ log = logging.getLogger("watchdog")
 # ─── Skip These Files ─────────────────────────────────────────────────────────
 SKIP_NAMES = {"reading-list.md", "README.md"}
 TEMP_SUFFIXES = (".tmp", ".part", ".crdownload", ".swp", ".bak", ".lock")
+CONSTRAINED_LLM_TIERS = frozenset({"tier_0_lexical_only", "tier_1_cpu_compact"})
 
 
 def should_ignore_watchdog_path(
@@ -79,8 +104,127 @@ def should_ignore_watchdog_path(
     return False
 
 
+def _should_ignore_markdown_watch_path(filepath: str, watched_dir: str) -> bool:
+    """Filter events inside notes/ or 2-atoms/ to direct top-level canonical .md files only."""
+    filename = os.path.basename(filepath)
+    if (
+        not filename
+        or filename == "README.md"
+        or filename.startswith((".", "~"))
+        or filename.lower().endswith(TEMP_SUFFIXES)
+        or os.path.splitext(filename)[1].lower() != ".md"
+    ):
+        return True
+    if os.path.lexists(filepath) and _is_reparse_or_link(filepath):
+        return True
+    abs_parent = os.path.normcase(os.path.abspath(os.path.dirname(os.path.abspath(filepath))))
+    abs_watched = os.path.normcase(os.path.abspath(watched_dir))
+    return abs_parent != abs_watched
+
+
+def get_daemon_hardware_profile() -> HardwareCapabilityProfile:
+    """Probe cached hardware/Ollama readiness before launching automatic model extraction."""
+    return detect_hardware_profile(ollama_timeout=2.0, use_cache=True)
+
+
+def _has_module(name: str) -> bool:
+    return importlib.util.find_spec(name) is not None
+
+
+def _sidecar_for_raw(raw_dir: str) -> str:
+    brain_root = os.path.dirname(os.path.abspath(raw_dir))
+    return os.path.join(brain_root, ".sidecar")
+
+
+def _record_deferred_capture(filepath: str, *, stage: str, reason: str, raw_dir: str | None = None) -> None:
+    """Persist a non-destructive deferred-queue entry in .sidecar/deferred-captures.json."""
+    active_raw = raw_dir or RAW_DIR
+    sidecar = _sidecar_for_raw(active_raw)
+    os.makedirs(sidecar, exist_ok=True)
+    if _is_reparse_or_link(sidecar):
+        return
+    queue_file = os.path.join(sidecar, "deferred-captures.json")
+    lock_file = os.path.join(sidecar, "writer.lock")
+    with review_lock(lock_file):
+        data: dict[str, dict[str, object]] = {}
+        if os.path.isfile(queue_file) and not _is_reparse_or_link(queue_file):
+            try:
+                with open(queue_file, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                    if isinstance(loaded, dict):
+                        data = loaded
+            except (OSError, json.JSONDecodeError):
+                data = {}
+        fname = os.path.basename(filepath)
+        try:
+            st = os.stat(filepath)
+            size_bytes = st.st_size
+        except OSError:
+            size_bytes = 0
+        data[fname] = {
+            "filename": fname,
+            "stage": stage,
+            "reason": reason,
+            "size_bytes": size_bytes,
+            "deferred_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        }
+        atomic_write_bytes(queue_file, json.dumps(data, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def _clear_deferred_capture(filename: str, *, raw_dir: str | None = None) -> None:
+    active_raw = raw_dir or RAW_DIR
+    sidecar = _sidecar_for_raw(active_raw)
+    queue_file = os.path.join(sidecar, "deferred-captures.json")
+    if not os.path.isfile(queue_file) or _is_reparse_or_link(queue_file):
+        return
+    lock_file = os.path.join(sidecar, "writer.lock")
+    with review_lock(lock_file):
+        try:
+            with open(queue_file, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(loaded, dict) and filename in loaded:
+            loaded.pop(filename, None)
+            atomic_write_bytes(queue_file, json.dumps(loaded, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def can_auto_run_stage(ext: str, profile: HardwareCapabilityProfile) -> tuple[bool, str]:
+    """Decide whether automatic background extraction may run on the current hardware profile."""
+    if ext in DOC_EXTS:
+        return True, "deterministic_document_extractor"
+    if ext in AUDIO_EXTS:
+        if not _has_module("faster_whisper"):
+            return False, "missing_faster_whisper"
+        if profile.total_ram_gib < 6.0:
+            return False, f"insufficient_ram:{profile.total_ram_gib:.1f}GiB"
+        return True, "whisper_ready"
+    if ext in IMAGE_EXTS:
+        if not _has_module("PIL"):
+            return False, "missing_pillow_image_gate"
+        if profile.tier_id in CONSTRAINED_LLM_TIERS:
+            return False, f"constrained_tier:{profile.tier_id}"
+        if not profile.ollama_reachable:
+            return False, "ollama_unreachable"
+        has_vision = any(
+            any(tok in str(m).lower() for tok in ("llava", "vision", "vl", "moondream", "minicpm-v"))
+            for m in profile.installed_ollama_models
+        )
+        if not has_vision:
+            return False, "no_installed_vision_model"
+        return True, "vision_ready"
+    # Refinery LLM stage (.md / .txt / .intake)
+    if profile.tier_id in CONSTRAINED_LLM_TIERS:
+        return False, f"constrained_tier:{profile.tier_id}"
+    if not profile.ollama_reachable:
+        return False, "ollama_unreachable"
+    if not profile.selected_installed_generation_model:
+        return False, "no_installed_generation_model"
+    return True, "refinery_ready"
+
+
 def handle_new_file(filepath: str) -> str | list[str] | None:
-    """Dispatch a newly arrived file to the right ingestion pipeline."""
+    """Dispatch a newly arrived file to the right ingestion pipeline, honoring hardware tier limits."""
     filename = os.path.basename(filepath)
     ext = os.path.splitext(filename)[1].lower()
 
@@ -93,36 +237,70 @@ def handle_new_file(filepath: str) -> str | list[str] | None:
         return None
 
     if not wait_for_stable_file(filepath):
-        log.warning(f"File did not become stable before timeout; leaving it in the inbox: {filename}")
+        log.warning(f"File did not become stable before timeout; leaving it in 0-raw/: {filename}")
         return None
 
     log.info(f"New file detected: {filename}")
+    profile = get_daemon_hardware_profile()
 
-    if ext in AUDIO_EXTS or ext in IMAGE_EXTS:
-        log.info("→ Routing to multimodal ingestion...")
+    if ext in DOC_EXTS:
+        log.info("→ Routing to deterministic document extractor...")
         try:
-            from ingest_multimodal import process_file
-            out_name = process_file(filepath)
-            log.info("  Multimodal ingestion complete.")
+            import ingest_multimodal as im_mod
+
+            im_mod.RAW_DIR = RAW_DIR
+            im_mod.INBOX_DIR = os.path.join(RAW_DIR, "inbox")
+            im_mod.SIDECAR_DIR = _sidecar_for_raw(RAW_DIR)
+            out_name = im_mod.process_file(filepath)
+            _clear_deferred_capture(filename, raw_dir=RAW_DIR)
+            log.info("  Document extraction complete.")
             return out_name
-        except Exception as e:
-            log.error(f"  Multimodal ingestion failed: {e}")
+        except Exception as exc:
+            log.error(f"  Document extraction failed: {exc}")
             return None
 
-    elif ext in TEXT_EXTS or is_supported_refinery_target(filepath):
+    if ext in AUDIO_EXTS or ext in IMAGE_EXTS:
+        allowed, reason = can_auto_run_stage(ext, profile)
+        if not allowed:
+            stage = "audio_transcription" if ext in AUDIO_EXTS else "image_vision"
+            log.info(f"→ Deferring {stage} for {filename} ({reason}); keeping file queued safely in 0-raw/.")
+            _record_deferred_capture(filepath, stage=stage, reason=reason, raw_dir=RAW_DIR)
+            return None
+        log.info("→ Routing to multimodal ingestion...")
+        try:
+            import ingest_multimodal as im_mod
+
+            im_mod.RAW_DIR = RAW_DIR
+            im_mod.INBOX_DIR = os.path.join(RAW_DIR, "inbox")
+            im_mod.SIDECAR_DIR = _sidecar_for_raw(RAW_DIR)
+            out_name = im_mod.process_file(filepath)
+            _clear_deferred_capture(filename, raw_dir=RAW_DIR)
+            log.info("  Multimodal ingestion complete.")
+            return out_name
+        except Exception as exc:
+            log.error(f"  Multimodal ingestion failed: {exc}")
+            return None
+
+    if ext in TEXT_EXTS or is_supported_refinery_target(filepath):
+        allowed, reason = can_auto_run_stage(".md", profile)
+        if not allowed:
+            log.info(f"→ Deferring automatic Refinery extraction for {filename} ({reason}); keeping capture in 0-raw/.")
+            _record_deferred_capture(filepath, stage="refinery_llm", reason=reason, raw_dir=RAW_DIR)
+            return None
         log.info("→ Routing to Refinery...")
         try:
             from ollama_refinery import process_single_file
+
             saved = process_single_file(filepath)
+            _clear_deferred_capture(filename, raw_dir=RAW_DIR)
             log.info("  Refinery complete.")
             return saved
-        except Exception as e:
-            log.error(f"  Refinery failed: {e}")
+        except Exception as exc:
+            log.error(f"  Refinery failed: {exc}")
             return None
 
-    else:
-        log.info(f"→ Unsupported extension '{ext}'. Ignoring.")
-        return None
+    log.info(f"→ Unsupported extension '{ext}'. Ignoring.")
+    return None
 
 
 class WatchdogDispatcher:
@@ -131,6 +309,7 @@ class WatchdogDispatcher:
     def __init__(self, *, auto_start: bool = False) -> None:
         self.queue: queue.Queue[str | None] = queue.Queue()
         self._pending: set[str] = set()
+        self._deferred_signatures: dict[str, tuple[int, int, str]] = {}
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._worker = threading.Thread(
@@ -148,13 +327,25 @@ class WatchdogDispatcher:
                 self._started = True
                 self._worker.start()
 
+    def _file_sig(self, filepath: str) -> tuple[int, int] | None:
+        try:
+            st = os.stat(filepath)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
     def enqueue(self, filepath: str) -> bool:
-        if self._stop_event.is_set() or should_ignore_watchdog_path(filepath):
+        if self._stop_event.is_set() or should_ignore_watchdog_path(filepath, raw_dir=RAW_DIR):
             return False
         abs_path = os.path.abspath(filepath)
         norm = os.path.normcase(abs_path)
+        sig = self._file_sig(abs_path)
+        profile = get_daemon_hardware_profile()
+        cap_sig = f"{profile.tier_id}:{int(profile.ollama_reachable)}:{profile.selected_installed_generation_model or ''}"
         with self._lock:
             if norm in self._pending:
+                return False
+            if sig is not None and self._deferred_signatures.get(norm) == (sig[0], sig[1], cap_sig):
                 return False
             self._pending.add(norm)
         self.queue.put(abs_path)
@@ -169,7 +360,16 @@ class WatchdogDispatcher:
             norm = os.path.normcase(os.path.abspath(item))
             try:
                 if not self._stop_event.is_set():
+                    before_sig = self._file_sig(item)
                     result = handle_new_file(item)
+                    if result is None and os.path.isfile(item) and before_sig is not None:
+                        prof = get_daemon_hardware_profile()
+                        cap_sig = f"{prof.tier_id}:{int(prof.ollama_reachable)}:{prof.selected_installed_generation_model or ''}"
+                        with self._lock:
+                            self._deferred_signatures[norm] = (before_sig[0], before_sig[1], cap_sig)
+                    else:
+                        with self._lock:
+                            self._deferred_signatures.pop(norm, None)
                     if isinstance(result, str) and result and not result.startswith("inbox/"):
                         generated_path = os.path.join(RAW_DIR, result)
                         if os.path.isfile(generated_path) and not _is_reparse_or_link(generated_path):
@@ -203,7 +403,7 @@ def scan_unprocessed_raw_files(dispatcher: WatchdogDispatcher, raw_dir: str | No
     enqueued: list[str] = []
     for entry in sorted(os.listdir(target_dir)):
         filepath = os.path.join(target_dir, entry)
-        if should_ignore_watchdog_path(filepath) or not os.path.isfile(filepath):
+        if should_ignore_watchdog_path(filepath, raw_dir=target_dir) or not os.path.isfile(filepath):
             continue
         ext = os.path.splitext(entry)[1].lower()
         if ext == ".intake":
@@ -213,7 +413,13 @@ def scan_unprocessed_raw_files(dispatcher: WatchdogDispatcher, raw_dir: str | No
                         continue
             except OSError:
                 continue
-        if ext in AUDIO_EXTS or ext in IMAGE_EXTS or ext in TEXT_EXTS or is_supported_refinery_target(filepath):
+        if (
+            ext in AUDIO_EXTS
+            or ext in IMAGE_EXTS
+            or ext in DOC_EXTS
+            or ext in TEXT_EXTS
+            or is_supported_refinery_target(filepath)
+        ):
             if dispatcher.enqueue(filepath):
                 enqueued.append(filepath)
     if enqueued:
@@ -221,7 +427,166 @@ def scan_unprocessed_raw_files(dispatcher: WatchdogDispatcher, raw_dir: str | No
     return enqueued
 
 
-# ─── File System Event Handler ────────────────────────────────────────────────
+# ─── Model-Free Debounced Watchers for notes/ & 2-atoms/ ─────────────────────
+
+def sync_notes_index_for_vault(*, brain_dir: str | None = None, notes_dir: str | None = None) -> dict[str, object]:
+    """Incrementally sync notes.sqlite3 FTS5 for brain/notes/ (100% model-free)."""
+    from dataclasses import replace as _dc_replace
+    from pathlib import Path as _Path
+    from notes_store import NotePaths, ensure_notes_index
+
+    resolved_brain = os.path.abspath(brain_dir or os.path.dirname(os.path.abspath(notes_dir or NOTES_DIR)))
+    npaths = NotePaths.for_brain(resolved_brain)
+    if notes_dir:
+        npaths = _dc_replace(npaths, notes_dir=_Path(os.path.abspath(notes_dir)))
+    if os.path.lexists(npaths.notes_dir) and _is_reparse_or_link(str(npaths.notes_dir)):
+        raise PermissionError(f"Refusing to sync symlinked notes directory: {npaths.notes_dir}")
+    os.makedirs(npaths.notes_dir, exist_ok=True)
+    return ensure_notes_index(npaths)
+
+
+def sync_atoms_and_detect_stale_anchors(
+    *,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
+    lexical_index_path: str | None = None,
+) -> dict[str, object]:
+    """Incrementally sync lexical.sqlite3 FTS5 and run read-only stale-anchor detection on 2-atoms/."""
+    from audit_sources import audit_sources
+    from lexical_store import sync_lexical_index
+
+    resolved_atoms = os.path.abspath(
+        atoms_dir or (os.path.join(brain_dir, "2-atoms") if brain_dir else ATOMS_DIR)
+    )
+    resolved_brain = os.path.abspath(brain_dir or os.path.dirname(resolved_atoms))
+    sidecar = os.path.join(resolved_brain, ".sidecar")
+    os.makedirs(sidecar, exist_ok=True)
+    os.makedirs(resolved_atoms, exist_ok=True)
+    if _is_reparse_or_link(resolved_atoms) or _is_reparse_or_link(sidecar):
+        raise PermissionError("Refusing to sync symlinked 2-atoms or .sidecar directory.")
+    resolved_lex = os.path.abspath(lexical_index_path or os.path.join(sidecar, "lexical.sqlite3"))
+    lock_file = os.path.join(sidecar, "writer.lock")
+    with review_lock(lock_file):
+        lex_stats = sync_lexical_index(resolved_atoms, resolved_lex)
+
+    reports = audit_sources(atoms_dir=resolved_atoms, brain_dir=resolved_brain, demote_stale=False)
+    stale = [
+        {
+            "atom_id": rep["atom_id"],
+            "anchor_status": rep["anchor_status"],
+            "source_status": rep["source_status"],
+            "action": rep["action"],
+        }
+        for rep in reports
+        if rep.get("action") == "review_required"
+        or rep.get("anchor_status") in {"stale_or_unverifiable", "unreadable"}
+    ]
+    if stale:
+        log.warning(f"Stale or unverifiable source anchors detected on {len(stale)} atom(s): {[s['atom_id'] for s in stale]}")
+    stale_report_path = os.path.join(sidecar, "stale-anchors.json")
+    with review_lock(lock_file):
+        atomic_write_bytes(
+            stale_report_path,
+            json.dumps(
+                {
+                    "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                    "total_atoms": len(reports),
+                    "stale_count": len(stale),
+                    "stale_atoms": stale,
+                },
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8"),
+        )
+    return {"lexical_sync": lex_stats, "total_atoms": len(reports), "stale_count": len(stale), "stale_atoms": stale}
+
+
+def sync_notes_and_atoms_once(
+    *,
+    brain_dir: str | None = None,
+    notes_dir: str | None = None,
+    atoms_dir: str | None = None,
+    lexical_index_path: str | None = None,
+) -> dict[str, object]:
+    """Run one model-free FTS5 sync + stale-anchor check across notes/ and 2-atoms/."""
+    notes_res = sync_notes_index_for_vault(brain_dir=brain_dir, notes_dir=notes_dir)
+    atoms_res = sync_atoms_and_detect_stale_anchors(
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        lexical_index_path=lexical_index_path,
+    )
+    return {"notes": notes_res, "atoms": atoms_res}
+
+
+class DebouncedMarkdownSyncHandler(FileSystemEventHandler):
+    """Lightweight debounced watcher coalescing rapid editor saves in notes/ or 2-atoms/."""
+
+    def __init__(self, watched_dir: str, callback, *, debounce_seconds: float = 0.35) -> None:
+        super().__init__()
+        self.watched_dir = os.path.abspath(watched_dir)
+        self.callback = callback
+        self.debounce_seconds = max(0.02, float(debounce_seconds))
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._stopped = False
+
+    def _schedule(self, path: str) -> None:
+        if _should_ignore_markdown_watch_path(path, self.watched_dir):
+            return
+        with self._lock:
+            if self._stopped:
+                return
+            if self._timer is not None:
+                self._timer.cancel()
+            timer = threading.Timer(self.debounce_seconds, self._fire)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+
+    def _fire(self) -> None:
+        with self._lock:
+            self._timer = None
+            if self._stopped:
+                return
+        try:
+            self.callback()
+        except Exception as exc:
+            log.error(f"Debounced index sync failed for {self.watched_dir}: {exc}")
+
+    def flush(self) -> None:
+        with self._lock:
+            pending = self._timer
+            self._timer = None
+        if pending is not None:
+            pending.cancel()
+            self._fire()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._schedule(event.src_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._schedule(event.src_path)
+
+    def on_deleted(self, event):
+        if not event.is_directory:
+            self._schedule(event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._schedule(event.src_path)
+            self._schedule(event.dest_path)
+
+
+# ─── Raw Inbox Event Handler ─────────────────────────────────────────────────
 
 class InboxHandler(FileSystemEventHandler):
 
@@ -234,7 +599,6 @@ class InboxHandler(FileSystemEventHandler):
             self.dispatcher.enqueue(event.src_path)
 
     def on_moved(self, event):
-        # A file dragged into the folder or atomically renamed shows as a 'moved' event
         if event.is_directory:
             return
         try:
@@ -250,27 +614,58 @@ class InboxHandler(FileSystemEventHandler):
 
 def run_daemon(*, once: bool = False) -> int:
     ensure_dirs()
-    if os.path.lexists(RAW_DIR) and _is_reparse_or_link(RAW_DIR):
-        log.error(f"Refusing to watch symlinked 0-raw directory: {RAW_DIR}")
-        return 1
+    for watched in (RAW_DIR, NOTES_DIR, ATOMS_DIR):
+        if os.path.lexists(watched) and _is_reparse_or_link(watched):
+            log.error(f"Refusing to watch symlinked vault directory: {watched}")
+            return 1
+
+    sync_notes_and_atoms_once(
+        brain_dir=BRAIN_DIR,
+        notes_dir=NOTES_DIR,
+        atoms_dir=ATOMS_DIR,
+        lexical_index_path=LEXICAL_INDEX_PATH,
+    )
 
     dispatcher = WatchdogDispatcher(auto_start=True)
     if once:
         scan_unprocessed_raw_files(dispatcher, RAW_DIR)
         dispatcher.drain()
         dispatcher.shutdown()
+        sync_notes_and_atoms_once(
+            brain_dir=BRAIN_DIR,
+            notes_dir=NOTES_DIR,
+            atoms_dir=ATOMS_DIR,
+            lexical_index_path=LEXICAL_INDEX_PATH,
+        )
         return 0
 
+    profile = get_daemon_hardware_profile()
     log.info("=" * 50)
     log.info("  Second Brain Watchdog Daemon — ACTIVE")
-    log.info(f"  Watching: {RAW_DIR}")
-    log.info("  Drop any file into 0-raw/ to process it instantly.")
+    log.info(f"  Hardware tier: {profile.tier_label} (Ollama reachable={profile.ollama_reachable})")
+    log.info(f"  Watching 0-raw/:   {RAW_DIR}")
+    log.info(f"  Watching notes/:   {NOTES_DIR}")
+    log.info(f"  Watching 2-atoms/: {ATOMS_DIR}")
     log.info("  Press Ctrl+C to stop.")
     log.info("=" * 50)
 
-    handler = InboxHandler(dispatcher=dispatcher)
+    raw_handler = InboxHandler(dispatcher=dispatcher)
+    notes_handler = DebouncedMarkdownSyncHandler(
+        NOTES_DIR,
+        lambda: sync_notes_index_for_vault(brain_dir=BRAIN_DIR, notes_dir=NOTES_DIR),
+    )
+    atoms_handler = DebouncedMarkdownSyncHandler(
+        ATOMS_DIR,
+        lambda: sync_atoms_and_detect_stale_anchors(
+            brain_dir=BRAIN_DIR,
+            atoms_dir=ATOMS_DIR,
+            lexical_index_path=LEXICAL_INDEX_PATH,
+        ),
+    )
     observer = Observer()
-    observer.schedule(handler, RAW_DIR, recursive=False)
+    observer.schedule(raw_handler, RAW_DIR, recursive=False)
+    observer.schedule(notes_handler, NOTES_DIR, recursive=False)
+    observer.schedule(atoms_handler, ATOMS_DIR, recursive=False)
     observer.start()
 
     try:
@@ -280,6 +675,8 @@ def run_daemon(*, once: bool = False) -> int:
     except KeyboardInterrupt:
         log.info("Shutting down watchdog...")
     finally:
+        notes_handler.stop()
+        atoms_handler.stop()
         observer.stop()
         observer.join(timeout=10.0)
         dispatcher.shutdown(timeout=10.0)
@@ -288,11 +685,11 @@ def run_daemon(*, once: bool = False) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run Second Brain continuous 0-raw/ watchdog daemon.")
+    parser = argparse.ArgumentParser(description="Run Second Brain continuous watchdog daemon.")
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Scan and process existing unhandled files in 0-raw/ once, then exit cleanly.",
+        help="Sync notes/atoms FTS + stale anchors and process unhandled 0-raw/ files once, then exit cleanly.",
     )
     args = parser.parse_args(argv)
     return run_daemon(once=args.once)

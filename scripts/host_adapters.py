@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 import datetime
+import hashlib
 import ipaddress
 import json
 import os
@@ -36,10 +38,14 @@ from answer_policy import (
     AnswerRequest,
     AnswerResult,
     NO_APPROVED_MEMORY_RESPONSE,
+    UnverifiedLead,
     build_grounding_prompt,
+    collect_unverified_leads,
+    format_unverified_leads_section,
     validate_standard_answer,
 )
 from config import ATOMS_DIR, BRAIN_DIR, GEN_MODEL, _is_reparse_or_link
+from evidence import ANCHOR_FIELDS
 from hardware_profile import loopback_ollama_base_url
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
@@ -108,6 +114,11 @@ class HostSharingRule:
     allow_preference_atoms: bool = False
     redact_pii: bool = True
     fail_on_secret_detection: bool = True
+    owner_consent_recorded: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.owner_consent_recorded is None:
+            object.__setattr__(self, "owner_consent_recorded", bool(self.enabled))
 
 
 @dataclass(frozen=True)
@@ -342,6 +353,12 @@ def load_host_policies(policy_path: Path | None = None) -> dict[str, HostSharing
         if transport not in {"local", "online"}:
             raise ValueError(f"Unsupported transport '{transport}' for host '{host_id}'")
         default_model = validate_model_identifier(str(entry.get("default_model", "")).strip(), provider=provider)
+        enabled_val = bool(entry.get("enabled", False))
+        consent_val = (
+            bool(entry["owner_consent_recorded"])
+            if ("owner_consent_recorded" in entry and entry["owner_consent_recorded"] is not None)
+            else enabled_val
+        )
         policies[host_id] = HostSharingRule(
             host_id=host_id,
             provider=provider,
@@ -349,12 +366,13 @@ def load_host_policies(policy_path: Path | None = None) -> dict[str, HostSharing
             endpoint_url=str(entry.get("endpoint_url", "")).strip().rstrip("/"),
             default_model=default_model,
             api_key_env=str(entry["api_key_env"]).strip() if entry.get("api_key_env") else None,
-            enabled=bool(entry.get("enabled", False)),
+            enabled=enabled_val,
             allowed_projects=tuple(str(p).strip() for p in entry.get("allowed_projects", []) if str(p).strip()),
             allow_unscoped_atoms=bool(entry.get("allow_unscoped_atoms", False)),
             allow_preference_atoms=bool(entry.get("allow_preference_atoms", False)),
             redact_pii=True if transport == "online" else bool(entry.get("redact_pii", False)),
             fail_on_secret_detection=True if transport == "online" else bool(entry.get("fail_on_secret_detection", True)),
+            owner_consent_recorded=consent_val,
         )
     return policies
 
@@ -487,6 +505,16 @@ def _redact_outbound_with_map(
     )
 
 
+def _rehydrate_text(text: str, placeholder_map: dict[str, str]) -> str:
+    """Replace exact per-call [REDACTED_PII:<kind>:<N>] tokens locally."""
+    if not placeholder_map or not isinstance(text, str) or "[REDACTED_PII:" not in text:
+        return text
+    return _PII_PLACEHOLDER_TOKEN_RE.sub(
+        lambda m: placeholder_map.get(m.group(0), m.group(0)),
+        text,
+    )
+
+
 def _rehydrate_draft_claims(draft_json: str, placeholder_map: dict[str, str]) -> str:
     """Replace exact per-call PII placeholder tokens inside parsed draft claims locally before grounding validation."""
     if not placeholder_map or not isinstance(draft_json, str) or len(draft_json) > 128_000:
@@ -502,10 +530,7 @@ def _rehydrate_draft_claims(draft_json: str, placeholder_map: dict[str, str]) ->
     rehydrated_claims: list[object] = []
     for item in payload["claims"]:
         if isinstance(item, str) and "[REDACTED_PII:" in item:
-            updated = _PII_PLACEHOLDER_TOKEN_RE.sub(
-                lambda m: placeholder_map.get(m.group(0), m.group(0)),
-                item,
-            )
+            updated = _rehydrate_text(item, placeholder_map)
             if updated != item:
                 changed = True
             rehydrated_claims.append(updated)
@@ -516,7 +541,11 @@ def _rehydrate_draft_claims(draft_json: str, placeholder_map: dict[str, str]) ->
     return json.dumps({**payload, "claims": rehydrated_claims}, ensure_ascii=False)
 
 
-def validate_endpoint_network_boundary(rule: HostSharingRule) -> ValidatedRemoteTarget | None:
+def validate_endpoint_network_boundary(
+    rule: HostSharingRule,
+    *,
+    skip_dns_resolution: bool = False,
+) -> ValidatedRemoteTarget | None:
     """Enforce strict 127.0.0.1 loopback for local hosts and DNS-pinned HTTPS:443 public IPs for online hosts."""
     try:
         parsed = urlsplit(str(rule.endpoint_url or "").strip())
@@ -549,7 +578,26 @@ def validate_endpoint_network_boundary(rule: HostSharingRule) -> ValidatedRemote
         raise HostConsentError(
             f"Online host '{rule.host_id}' must use standard HTTPS port 443 (got port {port})."
         )
+    if hostname == "localhost":
+        raise HostConsentError(f"SSRF blocked: online host '{hostname}' cannot target localhost.")
+    try:
+        literal_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None and not is_public_ip_address(str(literal_ip)):
+        raise HostConsentError(
+            f"SSRF blocked: online host '{hostname}' targets non-public IP {literal_ip}."
+        )
+
     effective_port = 443
+    if skip_dns_resolution:
+        return ValidatedRemoteTarget(
+            url=rule.endpoint_url.rstrip("/"),
+            hostname=_normalized_hostname(hostname),
+            port=effective_port,
+            addresses=(str(literal_ip),) if literal_ip is not None else (),
+        )
+
     try:
         addr_infos = socket.getaddrinfo(hostname, effective_port, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -588,8 +636,23 @@ def filter_atoms_for_host(
     rule: HostSharingRule,
     *,
     mode: str | None = None,
+    atoms_dir: str | Path | None = None,
+    brain_dir: str | Path | None = None,
 ) -> list:
-    """Filter retrieved atoms strictly to scopes and epistemic contracts permitted for this host."""
+    """Filter retrieved atoms strictly to approved revisions, scopes, and epistemic contracts permitted for this host."""
+    try:
+        from .atom_mutator import approved_revision_is_current
+    except ImportError:
+        from atom_mutator import approved_revision_is_current
+
+    atoms_root = Path(atoms_dir).resolve() if atoms_dir is not None else None
+    brain_root = (
+        Path(brain_dir).resolve()
+        if brain_dir is not None
+        else (atoms_root.parent if atoms_root is not None else None)
+    )
+    default_atoms_root = Path(ATOMS_DIR).resolve() if Path(ATOMS_DIR).is_dir() else None
+
     eligible = []
     allow_all_projects = any(str(p).strip() == "*" for p in rule.allowed_projects)
     normalized_allowed_projects = tuple(
@@ -602,12 +665,53 @@ def filter_atoms_for_host(
 
     for record in retrieved_atoms or []:
         content = record.get("content") if isinstance(record, dict) else getattr(record, "content", "")
+        filename = record.get("filename") if isinstance(record, dict) else getattr(record, "filename", "")
         if not isinstance(content, str):
             continue
         parsed = split_frontmatter(content)
         if parsed is None:
             continue
         fm = parse_frontmatter_values(parsed[0])
+
+        # Strictly require accepted + human_reviewed non-superseded atoms (unverified leads NEVER enter host scope).
+        rev_status = str(fm.get("review_status") or "").strip()
+        claim_state = str(fm.get("claim_state") or "").strip()
+        rec_status = record.get("review_status") if isinstance(record, dict) else getattr(record, "review_status", None)
+        if rev_status != "accepted" or claim_state != "human_reviewed":
+            continue
+        if rec_status is not None and str(rec_status).strip() != "accepted":
+            continue
+        sup_raw = fm.get("superseded_by") or []
+        sup_list = parse_scalar_list(sup_raw) if isinstance(sup_raw, str) else list(sup_raw)
+        if any(str(x).strip() for x in sup_list):
+            continue
+        if not all(fm.get(k) for k in ANCHOR_FIELDS):
+            continue
+
+        if isinstance(filename, str) and filename.endswith(".md") and Path(filename).name == filename:
+            check_root = atoms_root
+            check_brain = brain_root
+            if check_root is None and default_atoms_root is not None and (default_atoms_root / filename).is_file():
+                check_root = default_atoms_root
+                check_brain = default_atoms_root.parent
+            if check_root is not None:
+                cand_path = (check_root / filename).resolve()
+                if (
+                    cand_path.parent != check_root
+                    or not cand_path.is_file()
+                    or not approved_revision_is_current(
+                        str(cand_path),
+                        atoms_dir=str(check_root),
+                        brain_dir=str(check_brain or check_root.parent),
+                    )
+                ):
+                    continue
+                try:
+                    if hashlib.sha256(cand_path.read_bytes()).hexdigest() != hashlib.sha256(content.encode("utf-8")).hexdigest():
+                        continue
+                except OSError:
+                    continue
+
         epistemic_label = str(fm.get("epistemic_label", "claim"))
         is_pref = epistemic_label == "preference" or bool(fm.get("epistemic_contract"))
         if is_pref and not rule.allow_preference_atoms:
@@ -677,6 +781,37 @@ def _audit_outbound_call(
             restrict_security_file_permissions(audit_path)
 
 
+_GEMINI_TYPE_MAP = {
+    "object": "OBJECT",
+    "array": "ARRAY",
+    "string": "STRING",
+    "integer": "INTEGER",
+    "number": "NUMBER",
+    "boolean": "BOOLEAN",
+}
+
+
+def _to_gemini_response_schema(schema: dict) -> dict:
+    """Convert a JSON Schema subset into Gemini's OpenAPI responseSchema format."""
+    raw_type = str(schema.get("type", "object")).lower()
+    gem: dict[str, object] = {"type": _GEMINI_TYPE_MAP.get(raw_type, raw_type.upper())}
+    if isinstance(schema.get("description"), str):
+        gem["description"] = schema["description"]
+    if isinstance(schema.get("enum"), list):
+        gem["enum"] = list(schema["enum"])
+    if isinstance(schema.get("properties"), dict):
+        gem["properties"] = {
+            str(k): _to_gemini_response_schema(v)
+            for k, v in schema["properties"].items()
+            if isinstance(v, dict)
+        }
+    if isinstance(schema.get("required"), list):
+        gem["required"] = [str(r) for r in schema["required"]]
+    if isinstance(schema.get("items"), dict):
+        gem["items"] = _to_gemini_response_schema(schema["items"])
+    return gem
+
+
 def _invoke_provider_draft(
     rule: HostSharingRule,
     *,
@@ -693,17 +828,39 @@ def _invoke_provider_draft(
     effective_schema = json_schema or ANSWER_DRAFT_SCHEMA
     safe_model = validate_model_identifier(model, provider=rule.provider)
     if rule.provider == "ollama":
+        if http_transport is not None:
+            target_host = (loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url).rstrip("/")
+            with httpx.Client(
+                transport=http_transport,
+                timeout=timeout_s,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                resp = client.post(
+                    f"{target_host}/api/chat",
+                    json={
+                        "model": safe_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "format": effective_schema,
+                        "stream": False,
+                        "options": {"temperature": 0},
+                    },
+                )
+                if 300 <= resp.status_code < 400:
+                    raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
+                resp.raise_for_status()
+                data = resp.json()
+                return str((data.get("message") or {}).get("content") or data.get("response") or "{}")
+
         import ollama
 
-        client_kwargs: dict[str, object] = {
-            "timeout": timeout_s,
-            "follow_redirects": False,
-            "trust_env": False,
-        }
-        if http_transport is not None:
-            client_kwargs["transport"] = http_transport
         target_host = loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url
-        client = ollama.Client(host=target_host, **client_kwargs)
+        client = ollama.Client(
+            host=target_host,
+            timeout=timeout_s,
+            follow_redirects=False,
+            trust_env=False,
+        )
         resp = client.chat(
             model=safe_model,
             messages=[{"role": "user", "content": prompt}],
@@ -758,6 +915,8 @@ def _invoke_provider_draft(
                     },
                 }
                 resp = client.post(f"{rule.endpoint_url}/chat/completions", headers=headers, json=body)
+                if 300 <= resp.status_code < 400:
+                    raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
                 resp.raise_for_status()
                 data = resp.json()
                 return str(data["choices"][0]["message"]["content"])
@@ -784,6 +943,8 @@ def _invoke_provider_draft(
                     "messages": [{"role": "user", "content": prompt}],
                 }
                 resp = client.post(f"{rule.endpoint_url}/messages", headers=headers, json=body)
+                if 300 <= resp.status_code < 400:
+                    raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
                 resp.raise_for_status()
                 data = resp.json()
                 for block in data.get("content", []):
@@ -792,16 +953,20 @@ def _invoke_provider_draft(
                 return "{}"
 
             if rule.provider == "gemini":
-                default_gem_schema = {
-                    "type": "OBJECT",
-                    "properties": {
-                        "claims": {
-                            "type": "ARRAY",
-                            "items": {"type": "STRING"},
-                        }
-                    },
-                    "required": ["claims"],
-                }
+                gem_schema = gemini_response_schema or (
+                    _to_gemini_response_schema(json_schema)
+                    if json_schema is not None
+                    else {
+                        "type": "OBJECT",
+                        "properties": {
+                            "claims": {
+                                "type": "ARRAY",
+                                "items": {"type": "STRING"},
+                            }
+                        },
+                        "required": ["claims"],
+                    }
+                )
                 headers = {
                     "Content-Type": "application/json",
                     "x-goog-api-key": api_key,
@@ -811,7 +976,7 @@ def _invoke_provider_draft(
                     "generationConfig": {
                         "temperature": 0,
                         "responseMimeType": "application/json",
-                        "responseSchema": gemini_response_schema or default_gem_schema,
+                        "responseSchema": gem_schema,
                     },
                 }
                 encoded_model = url_quote(safe_model, safe="._-")
@@ -820,10 +985,274 @@ def _invoke_provider_draft(
                     headers=headers,
                     json=body,
                 )
+                if 300 <= resp.status_code < 400:
+                    raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
                 resp.raise_for_status()
                 data = resp.json()
                 parts = data["candidates"][0]["content"]["parts"]
                 return str(parts[0]["text"])
+    finally:
+        if owned_pinned_transport is not None and not client_entered:
+            owned_pinned_transport.close()
+
+    raise ValueError(f"Unsupported provider: {rule.provider}")
+
+
+def invoke_provider_stream(
+    *,
+    rule: HostSharingRule,
+    target: ValidatedRemoteTarget | None = None,
+    model: str,
+    system_prompt: str = "",
+    user_prompt: str,
+    http_transport: httpx.BaseTransport | None = None,
+    timeout_s: float = 60.0,
+) -> Iterator[str]:
+    """Stream text chunks across Ollama, OpenAI-compatible, Anthropic, and Gemini endpoints."""
+    safe_model = validate_model_identifier(model, provider=rule.provider)
+    messages: list[dict[str, str]] = []
+    if system_prompt and system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    if rule.provider == "ollama":
+        target_host = (loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url).rstrip("/")
+        if http_transport is None:
+            import ollama
+
+            client = ollama.Client(
+                host=target_host,
+                timeout=timeout_s,
+                follow_redirects=False,
+                trust_env=False,
+            )
+            for part in client.chat(
+                model=safe_model,
+                messages=messages,
+                stream=True,
+                options={"temperature": 0.2, "num_predict": 512},
+            ):
+                msg = part.get("message") if isinstance(part, dict) else getattr(part, "message", None)
+                piece = (msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")) or ""
+                if piece:
+                    yield str(piece)
+            return
+
+        with httpx.Client(
+            transport=http_transport,
+            timeout=timeout_s,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            with client.stream(
+                "POST",
+                f"{target_host}/api/chat",
+                json={
+                    "model": safe_model,
+                    "messages": messages,
+                    "stream": True,
+                    "options": {"temperature": 0.2, "num_predict": 512},
+                },
+            ) as resp:
+                if 300 <= resp.status_code < 400:
+                    raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line or line == "[DONE]":
+                        continue
+                    obj = json.loads(line)
+                    piece = ((obj.get("message") or {}).get("content")) or obj.get("response") or ""
+                    if piece:
+                        yield str(piece)
+        return
+
+    api_key = ""
+    if rule.api_key_env:
+        api_key = (os.environ.get(rule.api_key_env) or "").strip()
+    if rule.transport == "online" and not api_key:
+        raise HostConsentError(
+            f"Missing API credential in environment variable '{rule.api_key_env}' for online host '{rule.host_id}'."
+        )
+
+    owned_pinned_transport: PinnedHTTPTransport | None = None
+    effective_transport = http_transport
+    if effective_transport is None and rule.transport == "online":
+        resolved_target = target if target is not None else validate_endpoint_network_boundary(rule)
+        if resolved_target is not None:
+            owned_pinned_transport = PinnedHTTPTransport(resolved_target)
+            effective_transport = owned_pinned_transport
+
+    client_kwargs: dict[str, object] = {
+        "timeout": timeout_s,
+        "follow_redirects": False,
+        "trust_env": False,
+    }
+    if effective_transport is not None:
+        client_kwargs["transport"] = effective_transport
+
+    client_entered = False
+    try:
+        with httpx.Client(**client_kwargs) as client:
+            client_entered = True
+            if rule.provider == "openai_compatible":
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                }
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                body = {
+                    "model": safe_model,
+                    "temperature": 0.2,
+                    "stream": True,
+                    "messages": messages,
+                }
+                with client.stream(
+                    "POST",
+                    f"{rule.endpoint_url}/chat/completions",
+                    headers=headers,
+                    json=body,
+                ) as resp:
+                    if 300 <= resp.status_code < 400:
+                        raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
+                    resp.raise_for_status()
+                    for raw_line in resp.iter_lines():
+                        line = raw_line.strip()
+                        if not line or line.startswith(":"):
+                            continue
+                        payload_str = line[5:].strip() if line.startswith("data:") else (line if line.startswith("{") else "")
+                        if not payload_str:
+                            continue
+                        if payload_str == "[DONE]":
+                            break
+                        data = json.loads(payload_str)
+                        choices = data.get("choices") or []
+                        if choices:
+                            c0 = choices[0] or {}
+                            delta = c0.get("delta") if isinstance(c0.get("delta"), dict) else (c0.get("message") or {})
+                            piece = delta.get("content") if isinstance(delta, dict) else ""
+                            if piece:
+                                yield str(piece)
+                return
+
+            if rule.provider == "anthropic":
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                }
+                body: dict[str, object] = {
+                    "model": safe_model,
+                    "max_tokens": 1024,
+                    "temperature": 0.2,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": user_prompt}],
+                }
+                if system_prompt and system_prompt.strip():
+                    body["system"] = system_prompt
+                with client.stream(
+                    "POST",
+                    f"{rule.endpoint_url}/messages",
+                    headers=headers,
+                    json=body,
+                ) as resp:
+                    if 300 <= resp.status_code < 400:
+                        raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
+                    resp.raise_for_status()
+                    for raw_line in resp.iter_lines():
+                        line = raw_line.strip()
+                        if not line or line.startswith("event:") or line.startswith(":"):
+                            continue
+                        payload_str = line[5:].strip() if line.startswith("data:") else (line if line.startswith("{") else "")
+                        if not payload_str or payload_str == "[DONE]":
+                            continue
+                        data = json.loads(payload_str)
+                        ev_type = data.get("type")
+                        if ev_type == "content_block_delta":
+                            delta = data.get("delta") or {}
+                            piece = delta.get("text") or ""
+                            if piece:
+                                yield str(piece)
+                        elif ev_type == "message_stop":
+                            break
+                        elif ev_type == "error":
+                            err_msg = (data.get("error") or {}).get("message") or "Anthropic stream error"
+                            raise RuntimeError(str(err_msg))
+                        elif isinstance(data.get("content"), list):
+                            for blk in data["content"]:
+                                if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text"):
+                                    yield str(blk["text"])
+                return
+
+            if rule.provider == "gemini":
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                    "x-goog-api-key": api_key,
+                }
+                gem_body: dict[str, object] = {
+                    "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                    "generationConfig": {"temperature": 0.2},
+                }
+                if system_prompt and system_prompt.strip():
+                    gem_body["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+                encoded_model = url_quote(safe_model, safe="._-")
+
+                def _extract_gemini_parts(obj: object) -> Iterator[str]:
+                    if isinstance(obj, list):
+                        for elem in obj:
+                            yield from _extract_gemini_parts(elem)
+                        return
+                    if not isinstance(obj, dict):
+                        return
+                    for cand in obj.get("candidates") or ():
+                        if not isinstance(cand, dict):
+                            continue
+                        parts = (cand.get("content") or {}).get("parts") or ()
+                        for part in parts:
+                            if isinstance(part, dict) and part.get("text"):
+                                yield str(part["text"])
+
+                with client.stream(
+                    "POST",
+                    f"{rule.endpoint_url}/models/{encoded_model}:streamGenerateContent?alt=sse",
+                    headers=headers,
+                    json=gem_body,
+                ) as resp:
+                    if 300 <= resp.status_code < 400:
+                        raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
+                    resp.raise_for_status()
+                    non_sse_lines: list[str] = []
+                    for raw_line in resp.iter_lines():
+                        line = raw_line.strip()
+                        if not line or line.startswith("event:") or line.startswith(":"):
+                            continue
+                        if line.startswith("data:"):
+                            payload_str = line[5:].strip()
+                            if not payload_str or payload_str == "[DONE]":
+                                continue
+                            yield from _extract_gemini_parts(json.loads(payload_str))
+                        else:
+                            if line.startswith("{") and line.endswith("}"):
+                                try:
+                                    parsed_line = json.loads(line)
+                                except json.JSONDecodeError:
+                                    non_sse_lines.append(raw_line)
+                                else:
+                                    yield from _extract_gemini_parts(parsed_line)
+                            else:
+                                non_sse_lines.append(raw_line)
+                    if non_sse_lines:
+                        joined = "\n".join(non_sse_lines).strip()
+                        if joined:
+                            yield from _extract_gemini_parts(json.loads(joined))
+                return
     finally:
         if owned_pinned_transport is not None and not client_entered:
             owned_pinned_transport.close()
@@ -842,6 +1271,7 @@ def generate_grounded_answer_via_host(
     policy_path: Path | None = None,
     http_transport: httpx.BaseTransport | None = None,
     skip_dns_check_for_mock_transport: bool = False,
+    unverified_leads: Sequence[UnverifiedLead] | None = None,
 ) -> AnswerResult:
     """Execute consent check, scope filter, outbound redaction, DNS-pinned model call, and out-of-model grounding."""
     policies = load_host_policies(policy_path)
@@ -853,6 +1283,10 @@ def generate_grounded_answer_via_host(
             f"Host '{host_id}' ({rule.transport}) is disabled by default. "
             "Explicit owner opt-in is required before sharing vault context."
         )
+    if rule.transport == "online" and not rule.owner_consent_recorded:
+        raise HostConsentError(
+            f"Online host '{host_id}' lacks recorded owner sharing consent."
+        )
     if request.mode == "preference" and not rule.allow_preference_atoms:
         raise HostConsentError(
             f"Host '{host_id}' is not authorized to receive owner subjective preference memories."
@@ -863,15 +1297,54 @@ def generate_grounded_answer_via_host(
         provider=rule.provider,
     )
 
-    pinned_target: ValidatedRemoteTarget | None = None
-    if not (http_transport is not None and skip_dns_check_for_mock_transport):
-        pinned_target = validate_endpoint_network_boundary(rule)
+    pinned_target = validate_endpoint_network_boundary(
+        rule,
+        skip_dns_resolution=bool(http_transport is not None and skip_dns_check_for_mock_transport),
+    )
 
-    scoped_atoms = filter_atoms_for_host(retrieved_atoms, rule, mode=request.mode)
+    leads_tuple: tuple[UnverifiedLead, ...] = ()
+    if request.mode == "research":
+        if unverified_leads is None:
+            leads_tuple = collect_unverified_leads(
+                request.query,
+                atoms_dir=atoms_dir,
+                brain_dir=brain_dir,
+                project_scope=request.project_scope,
+                limit=request.result_limit,
+            )
+        else:
+            leads_tuple = tuple(unverified_leads)
+
+    scoped_atoms = filter_atoms_for_host(
+        retrieved_atoms,
+        rule,
+        mode=request.mode,
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     if not scoped_atoms:
-        return AnswerResult(False, NO_APPROVED_MEMORY_RESPONSE, reason="No eligible approved atoms permitted for this host.")
+        if request.mode == "research" and leads_tuple:
+            return AnswerResult(
+                False,
+                f"{NO_APPROVED_MEMORY_RESPONSE}\n\n{format_unverified_leads_section(leads_tuple)}",
+                (),
+                "no_approved_atoms_in_host_scope",
+                leads_tuple,
+            )
+        return AnswerResult(
+            False,
+            NO_APPROVED_MEMORY_RESPONSE,
+            (),
+            "No eligible approved atoms permitted for this host.",
+            leads_tuple if request.mode == "research" else (),
+        )
 
-    raw_prompt = build_grounding_prompt(request, scoped_atoms)
+    raw_prompt = build_grounding_prompt(
+        request,
+        scoped_atoms,
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     redaction, pii_placeholder_map = _redact_outbound_with_map(
         raw_prompt,
         redact_pii=rule.redact_pii,
@@ -908,6 +1381,7 @@ def generate_grounded_answer_via_host(
         scoped_atoms,
         atoms_dir=atoms_dir,
         mode=request.mode,
+        unverified_leads=leads_tuple,
     )
     _audit_outbound_call(
         brain_dir=brain_dir,

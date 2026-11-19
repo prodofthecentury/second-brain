@@ -378,20 +378,19 @@ Structured logs should use JSON and request IDs.
             )
         self.assertFalse(result.answerable)
 
-    def test_standard_prompt_rejects_unknown_mode_and_enforces_research_envelope(self):
+    def test_research_prompt_excludes_unverified_leads_and_rejects_unknown_mode(self):
         from answer_policy import AnswerRequest, build_grounding_prompt, format_research_leads
 
-        with self.assertRaises(ValueError):
-            build_grounding_prompt(AnswerRequest(query="question", mode="unverified_freeform"), [])
-
-        research_prompt = build_grounding_prompt(AnswerRequest(query="question", mode="research"), [])
-        self.assertIn("Do not use general knowledge.", research_prompt)
-        self.assertIn("These are the only allowed claim strings", research_prompt)
-
+        prompt = build_grounding_prompt(AnswerRequest(query="question", mode="research"), [])
+        self.assertIn("question", prompt)
+        self.assertIn("Do not use general knowledge.", prompt)
+        self.assertNotIn("[UNVERIFIED LEADS]", prompt)
         leads_block = format_research_leads(
             [{"filename": "note.md", "kind": "working_note", "title": "Draft", "excerpt": "Unverified lead"}]
         )
         self.assertIn("UNVERIFIED LEADS — NOT OWNER-APPROVED", leads_block)
+        with self.assertRaises(ValueError):
+            build_grounding_prompt(AnswerRequest(query="question", mode="unknown_mode"), [])
 
     def test_grounding_prompt_lists_only_exact_claim_sections_as_allowed_output(self):
         from answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, build_grounding_prompt
@@ -1164,7 +1163,29 @@ class MCPBoundaryTests(unittest.TestCase):
                 self.assertIsInstance(listed, types.ListToolsResult)
                 self.assertEqual(
                     {tool.name for tool in listed.tools},
-                    {"search_memory", "get_atom", "add_to_inbox", "search_notes", "get_note", "remember"},
+                    mcp_server.TOOL_NAMES,
+                )
+                self.assertEqual(
+                    mcp_server.TOOL_NAMES,
+                    {
+                        "search_memory",
+                        "get_atom",
+                        "add_to_inbox",
+                        "search_notes",
+                        "get_note",
+                        "remember",
+                        "list_playbooks",
+                        "get_playbook",
+                        "assemble_plan",
+                        "list_contradictions",
+                        "graph_neighbors",
+                        "list_snapshots",
+                        "recall_at_snapshot",
+                        "verify_ledger",
+                        "prove_leaf",
+                        "record_experience",
+                        "record_feedback",
+                    },
                 )
                 resources = await mcp_server.handle_list_resources(auth_ctx, None)
                 self.assertEqual(resources.resources, [])
@@ -2463,6 +2484,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "smoke_test",
                 "phase4_product_tests",
                 "phase5_god_features_tests",
+                "goal2_completion_tests",
                 "goal3_backend_contract_tests",
                 "desktop_ui_tests",
                 "vscode_extension_tests",

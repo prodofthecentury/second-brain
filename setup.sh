@@ -5,6 +5,7 @@ set -euo pipefail
 NO_LAUNCH=0
 PULL_MODELS=0
 REBUILD_VECTORS=0
+INCLUDE_MULTIMODAL=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -17,8 +18,11 @@ for arg in "$@"; do
         --rebuild-vectors)
             REBUILD_VECTORS=1
             ;;
+        --include-multimodal)
+            INCLUDE_MULTIMODAL=1
+            ;;
         -h|--help)
-            echo "Usage: ./setup.sh [--no-launch] [--pull-models] [--rebuild-vectors]"
+            echo "Usage: ./setup.sh [--no-launch] [--pull-models] [--rebuild-vectors] [--include-multimodal]"
             exit 0
             ;;
         *)
@@ -122,7 +126,12 @@ fi
 cd "${PROJECT_ROOT}"
 
 echo "=== Synchronizing Locked Python Environment ==="
-"${UV_EXE}" sync --frozen
+if [ "${INCLUDE_MULTIMODAL}" -eq 1 ]; then
+    echo "Including optional multimodal dependencies (faster-whisper + Pillow)..."
+    "${UV_EXE}" sync --frozen --extra multimodal
+else
+    "${UV_EXE}" sync --frozen
+fi
 
 echo "=== Checking Local Ollama Daemon & Models ==="
 OLLAMA_RAW_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
@@ -221,6 +230,11 @@ if [ "${PULL_MODELS}" -eq 1 ]; then
         echo "Pulling required local model: ${model} ..."
         ollama pull "${model}"
     done
+    if [ "${INCLUDE_MULTIMODAL}" -eq 1 ]; then
+        VISION_TARGET="${BRAIN_VISION_MODEL:-llava}"
+        echo "Pulling vision model: ${VISION_TARGET} ..."
+        ollama pull "${VISION_TARGET}"
+    fi
     TAGS_JSON="$(fetch_ollama_tags || true)"
 fi
 

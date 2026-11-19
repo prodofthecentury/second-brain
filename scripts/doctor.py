@@ -207,9 +207,35 @@ def run_checks() -> list[tuple[str, str, str]]:
         ("mcp", "mcp"),
         ("httpx", "scout"),
         ("trafilatura", "extractor"),
+        ("pypdf", "pdf"),
+        ("faster_whisper", "whisper"),
+        ("PIL", "pillow"),
     ):
         opt_caps.append(f"{label}={'yes' if importlib.util.find_spec(mod_name) else 'no'}")
     checks.append(ok("capabilities", ", ".join(opt_caps)))
+
+    has_whisper = importlib.util.find_spec("faster_whisper") is not None
+    has_pillow = importlib.util.find_spec("PIL") is not None
+    has_pypdf = importlib.util.find_spec("pypdf") is not None
+    if has_whisper and has_pillow and has_pypdf:
+        checks.append(ok(
+            "multimodal",
+            "Audio (faster-whisper), image safety gate (Pillow), and local PDF/DOCX/EPUB/HTML/CSV extractors ready",
+        ))
+    else:
+        missing_parts = []
+        if not has_whisper:
+            missing_parts.append("faster-whisper (audio ASR)")
+        if not has_pillow:
+            missing_parts.append("Pillow (image sanitization — image ingestion fails closed without it)")
+        if not has_pypdf:
+            missing_parts.append("pypdf (PDF extraction)")
+        checks.append(warn(
+            "multimodal",
+            "Missing optional multimodal package(s): "
+            + ", ".join(missing_parts)
+            + "; install via `setup.ps1 -IncludeMultimodal`, `./setup.sh --include-multimodal`, or `uv sync --frozen --extra multimodal`",
+        ))
 
     if shutil.which("uv"):
         checks.append(ok("uv", "uv is available on PATH"))

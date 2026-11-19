@@ -37,7 +37,7 @@ if __name__ in ("memory_api", "scripts.memory_api"):
     sys.modules.setdefault("memory_api", sys.modules[__name__])
     sys.modules.setdefault("scripts.memory_api", sys.modules[__name__])
 
-from answer_policy import AnswerRequest
+from answer_policy import AnswerRequest, collect_unverified_leads
 from atom_mutator import approved_revision_is_current
 from cognitive_core import (
     compute_memory_fitness_report,
@@ -513,15 +513,18 @@ class ApiExperienceCreateRequest(BaseModel):
     result_summary: str = Field(..., min_length=1, max_length=4000)
     success: bool = True
     context: list[BoundedExperienceItem] = Field(default_factory=list, max_length=20)
+    plan: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
     actions: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
     tools_used: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
     referenced_atoms: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
-    lessons: list[BoundedExperienceItem] = Field(default_factory=list, max_length=20)
-    plan: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
-    reasoning_summary: str | None = Field(default=None, max_length=2000)
+    reasoning_summary: str | None = Field(default=None, max_length=4000)
     confidence_before: float | None = Field(default=None, ge=0.0, le=1.0)
     confidence_after: float | None = Field(default=None, ge=0.0, le=1.0)
-    reflection: str | None = Field(default=None, max_length=2000)
+    new_memories: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
+    updated_memories: list[BoundedExperienceItem] = Field(default_factory=list, max_length=30)
+    candidate_skills: list[BoundedExperienceItem] = Field(default_factory=list, max_length=20)
+    reflection: str | None = Field(default=None, max_length=4000)
+    lessons: list[BoundedExperienceItem] = Field(default_factory=list, max_length=20)
     candidate_procedure_title: str | None = Field(default=None, max_length=200)
     propose_to_inbox: bool = False
 
@@ -1332,6 +1335,18 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     project_scope=req.project_scope,
                     result_limit=req.n_results,
                 )
+                leads = (
+                    collect_unverified_leads(
+                        req.query,
+                        atoms_dir=rt.atoms_dir,
+                        brain_dir=rt.brain_dir,
+                        project_scope=req.project_scope,
+                        limit=req.n_results,
+                        include_quarantined_inbox=bool(is_owner),
+                    )
+                    if req.mode == "research"
+                    else ()
+                )
                 ans = generate_grounded_answer_via_host(
                     ans_req,
                     list(direct) + list(neighbors),
@@ -1342,6 +1357,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     policy_path=rt.policy_path,
                     http_transport=rt.http_transport,
                     skip_dns_check_for_mock_transport=rt.skip_dns_check_for_mock_transport,
+                    unverified_leads=leads if req.mode == "research" else None,
                 )
                 elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
                 cited_atoms = [ev.atom_id for cl in ans.claims for ev in cl.evidence]
@@ -1356,25 +1372,25 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 _audit_api_event(rt.brain_dir, path, "POST", 200)
-                self._send_json(
-                    200,
-                    {
-                        "answerable": ans.answerable,
-                        "mode": req.mode,
-                        "host_id": req.host_id,
-                        "latency_ms": elapsed_ms,
-                        "text": ans.text,
-                        "reason": ans.reason,
-                        "claims": [
-                            {
-                                "text": cl.text,
-                                "is_preference": cl.is_preference,
-                                "evidence": [asdict(ev) for ev in cl.evidence],
-                            }
-                            for cl in ans.claims
-                        ],
-                    },
-                )
+                answer_payload: dict[str, object] = {
+                    "answerable": ans.answerable,
+                    "mode": req.mode,
+                    "host_id": req.host_id,
+                    "latency_ms": elapsed_ms,
+                    "text": ans.text,
+                    "reason": ans.reason,
+                    "claims": [
+                        {
+                            "text": cl.text,
+                            "is_preference": cl.is_preference,
+                            "evidence": [asdict(ev) for ev in cl.evidence],
+                        }
+                        for cl in ans.claims
+                    ],
+                }
+                if req.mode == "research":
+                    answer_payload["unverified_leads"] = [lead.as_dict() for lead in ans.unverified_leads]
+                self._send_json(200, answer_payload)
                 return
 
             if path == "/v1/inbox":
@@ -1452,15 +1468,18 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     result_summary=req.result_summary,
                     success=req.success,
                     context=req.context,
+                    plan=req.plan,
                     actions=req.actions,
                     tools_used=req.tools_used,
                     referenced_atoms=req.referenced_atoms,
-                    lessons=req.lessons,
-                    plan=req.plan,
                     reasoning_summary=req.reasoning_summary,
                     confidence_before=req.confidence_before,
                     confidence_after=req.confidence_after,
+                    new_memories=req.new_memories,
+                    updated_memories=req.updated_memories,
+                    candidate_skills=req.candidate_skills,
                     reflection=req.reflection,
+                    lessons=req.lessons,
                     candidate_procedure_title=req.candidate_procedure_title,
                     propose_to_inbox=req.propose_to_inbox,
                     experiences_dir=rt.experiences_dir,
@@ -1693,6 +1712,26 @@ class MemoryApiClient:
 
     def note_backlinks(self, filename: str) -> dict[str, object]:
         return self._request("GET", f"/v1/notes/{url_quote(filename.strip(), safe='')}/backlinks")
+
+    def note_tasks(
+        self,
+        *,
+        project: str | None = None,
+        tag: str | None = None,
+        include_completed: bool = False,
+        include_raw: bool = False,
+    ) -> dict[str, object]:
+        params: list[str] = []
+        if project and project.strip():
+            params.append(f"project={url_quote(project.strip(), safe=':_/-')}")
+        if tag and tag.strip():
+            params.append(f"tag={url_quote(tag.strip(), safe=':_/-')}")
+        if include_completed:
+            params.append("include_completed=1")
+        if include_raw:
+            params.append("include_raw=1")
+        suffix = f"?{'&'.join(params)}" if params else ""
+        return self._request("GET", f"/v1/notes/tasks{suffix}")
 
     def remember(
         self,
@@ -2058,7 +2097,18 @@ class MemoryApiClient:
         goal: str,
         result_summary: str,
         success: bool = True,
+        context: list[str] | None = None,
+        plan: list[str] | None = None,
         actions: list[str] | None = None,
+        tools_used: list[str] | None = None,
+        referenced_atoms: list[str] | None = None,
+        reasoning_summary: str | None = None,
+        confidence_before: float | None = None,
+        confidence_after: float | None = None,
+        new_memories: list[str] | None = None,
+        updated_memories: list[str] | None = None,
+        candidate_skills: list[str] | None = None,
+        reflection: str | None = None,
         lessons: list[str] | None = None,
         candidate_procedure_title: str | None = None,
         propose_to_inbox: bool = False,
@@ -2070,7 +2120,18 @@ class MemoryApiClient:
                 "goal": goal,
                 "result_summary": result_summary,
                 "success": success,
+                "context": context or [],
+                "plan": plan or [],
                 "actions": actions or [],
+                "tools_used": tools_used or [],
+                "referenced_atoms": referenced_atoms or [],
+                "reasoning_summary": reasoning_summary,
+                "confidence_before": confidence_before,
+                "confidence_after": confidence_after,
+                "new_memories": new_memories or [],
+                "updated_memories": updated_memories or [],
+                "candidate_skills": candidate_skills or [],
+                "reflection": reflection,
                 "lessons": lessons or [],
                 "candidate_procedure_title": candidate_procedure_title,
                 "propose_to_inbox": propose_to_inbox,
@@ -2106,12 +2167,15 @@ class MemoryApiClient:
         *,
         project_scope: str | None = None,
         include_pending: bool = False,
+        enable_nli: bool = False,
     ) -> dict[str, object]:
         params: list[str] = []
         if project_scope and project_scope.strip():
             params.append(f"project={url_quote(project_scope.strip(), safe=':_/-')}")
         if include_pending:
             params.append("include_pending=1")
+        if enable_nli:
+            params.append("nli=1")
         suffix = f"?{'&'.join(params)}" if params else ""
         return self._request("GET", f"/v1/graph/contradictions{suffix}")
 
@@ -2229,6 +2293,7 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "POST /v1/cognitive/experiences",
                 "GET /v1/notes",
                 "POST /v1/notes",
+                "GET /v1/notes/tasks",
                 "GET /v1/notes/<filename>",
                 "PUT /v1/notes/<filename>",
                 "DELETE /v1/notes/<filename>",

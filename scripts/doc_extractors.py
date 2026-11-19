@@ -40,6 +40,7 @@ MAX_ZIP_RATIO = 200
 MAX_PDF_PAGES = 2000
 MAX_TABLE_ROWS = 20000
 MAX_EXTRACTED_CHARS = 8_000_000
+EXTRACTION_BODY_MARKER = "<!-- extraction_body -->"
 
 _WS_RE = re.compile(r"[ \t\u00a0\u2000-\u200b\u3000]+")
 _HEADING_NAME_RE = re.compile(
@@ -264,9 +265,7 @@ def extract_pdf(path: str) -> DocumentExtraction:
 
         def flush() -> None:
             if paragraph:
-                joined = " ".join(paragraph)
-                joined = re.sub(r"(\w)- (\w)", r"\1\2", joined) if False else joined
-                parts.append(joined)
+                parts.append(" ".join(paragraph))
                 paragraph.clear()
 
         for line in lines:
@@ -303,8 +302,8 @@ def extract_pdf(path: str) -> DocumentExtraction:
     index_lines = "\n".join(f"- [page {s['page']}] span {s['start']}..{s['end']}" for s in spans)
     body_text += (
         "\n\n## Page Index\n\n"
-        "UTF-8 byte spans are measured from the first byte of the extraction body (the line after the "
-        "closing provenance frontmatter and origin comment).\n\n"
+        "UTF-8 byte spans are measured from the first byte after the extraction body marker line "
+        f"(`{EXTRACTION_BODY_MARKER}`).\n\n"
         f"{index_lines}\n"
     )
     markdown = body_text.replace("\r\n", "\n").rstrip() + "\n"

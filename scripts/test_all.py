@@ -6,6 +6,7 @@
 
 Executes environment diagnostics, curated dataset revision-binding validation,
 cryptographic source anchor auditing, unit/security/penetration regression tests,
+Goal 2 document/MCP/DLP/NLI tests, Goal 3 Desktop/VS Code/Dashboard/Wheel suites,
 real ChromaDB staged-generation canary, and live end-to-end smoke verification.
 
 Run:
@@ -67,6 +68,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "phase5_god_features_tests",
         "Desktop installers/tray, comparative SOTA benchmark, Merkle vault ledger, contradiction radar & time-travel snapshots (scripts/phase5_god_features_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "phase5_god_features_tests.py")),
+    ),
+    (
+        "goal2_completion_tests",
+        "Goal 2 document ingestion, chunked refinery/incremental vectors, research view, multi-host streaming DLP, NLI radar, 17-tool MCP, 6-host connectors & SOTA benchmark invariants (scripts/goal2_completion_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "goal2_completion_tests.py")),
     ),
     (
         "goal3_backend_contract_tests",
