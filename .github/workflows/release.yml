@@ -1,0 +1,297 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (defaults to ref name)"
+        required: false
+        default: ""
+      draft:
+        description: "Create GitHub Release as draft"
+        type: boolean
+        default: true
+      publish_pypi:
+        description: "Publish Python wheel to PyPI (requires Trusted Publisher or PYPI_API_TOKEN)"
+        type: boolean
+        default: false
+      publish_extensions:
+        description: "Publish VSIX to VS Code Marketplace / Open VSX (requires VSCE_PAT / OVSX_PAT)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-clean-tree:
+    name: Verify Code-Only Release Hygiene & Test Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Reject private vault data or secrets in release tree
+        run: |
+          set -euo pipefail
+          FORBIDDEN="$(git ls-files brain/ '.env*' '*token*' '*.pfx' '*.p12' '*.pem' '*.key' || true)"
+          if [ -n "$FORBIDDEN" ]; then
+            echo "ERROR: Refusing to release repository containing private vault or credential files:"
+            echo "$FORBIDDEN"
+            exit 1
+          fi
+
+      - name: Set up uv & Python 3.11
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync locked environment & run core test suites
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11
+          uv run --frozen python scripts/make_icons.py
+          uv run --frozen python scripts/test_all.py --fail-fast \
+            --only evaluation_dataset audit_sources system_safety_tests \
+            phase2_safety_tests phase3_cognitive_tests phase4_product_tests \
+            phase5_god_features_tests goal2_completion_tests \
+            goal3_backend_contract_tests dashboard_apptest_tests \
+            chroma_rebuild_canary archive_manifest_canary smoke_test
+
+      - name: Build Python wheel & VSIX and verify clean-wheel installation
+        run: |
+          mkdir -p release-artifacts
+          uv build --wheel --out-dir release-artifacts
+          uv run --frozen python scripts/build_vsix.py --out-dir release-artifacts
+          uv build --wheel --out-dir dist
+          uv run --frozen python -m unittest scripts.wheel_packaging_tests -v
+
+      - name: Upload cross-platform Python wheel & VS Code VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-packages
+          path: |
+            release-artifacts/*.whl
+            release-artifacts/*.vsix
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows Installers (.exe, .msi)
+    needs: verify-clean-tree
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv & Python 3.11
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync locked Python environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Decode optional production Authenticode PFX
+        shell: pwsh
+        env:
+          WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+        run: |
+          if ($env:WINDOWS_PFX_BASE64) {
+            $pfxPath = Join-Path $env:RUNNER_TEMP "release-signing.pfx"
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+            "SECOND_BRAIN_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Run Desktop UI tests & package Windows NSIS + MSI installers
+        shell: pwsh
+        env:
+          SECOND_BRAIN_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          SECOND_BRAIN_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          uv run --frozen python scripts/make_icons.py
+          Push-Location desktop
+          npm ci
+          npm test
+          Pop-Location
+          if ($env:SECOND_BRAIN_PFX_PATH) {
+            pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package_desktop.ps1 -PfxPath $env:SECOND_BRAIN_PFX_PATH -PfxPassword $env:SECOND_BRAIN_PFX_PASSWORD
+          } else {
+            pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package_desktop.ps1 -SkipSign
+          }
+
+      - name: Clean temporary PFX
+        if: always()
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "release-signing.pfx"
+          if (Test-Path $pfxPath) { Remove-Item -Force $pfxPath }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: |
+            dist/*.exe
+            dist/*.exe.blockmap
+            dist/*.msi
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS Universal Installers (.dmg, .zip)
+    needs: verify-clean-tree
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv & Python 3.11
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync locked Python environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run Desktop UI tests & package macOS universal DMG + ZIP
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.MAC_CSC_LINK != '' && 'true' || 'false' }}
+        run: |
+          uv run --frozen python scripts/make_icons.py
+          (cd desktop && npm ci && npm test)
+          bash scripts/package_desktop.sh
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux Installers (.AppImage, .deb)
+    needs: verify-clean-tree
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install headless GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libpango-1.0-0 libcairo2
+
+      - name: Set up uv & Python 3.11
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync locked Python environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run Desktop UI tests & package Linux AppImage + DEB
+        run: |
+          uv run --frozen python scripts/make_icons.py
+          (cd desktop && npm ci && xvfb-run -a npm test)
+          bash scripts/package_desktop.sh
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+          if-no-files-found: error
+
+  publish-release:
+    name: Merge Checksums & Publish Release
+    needs: [verify-clean-tree, build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: merged-dist
+          merge-multiple: true
+
+      - name: Generate unified SHA256SUMS.txt
+        working-directory: merged-dist
+        run: |
+          set -euo pipefail
+          rm -f SHA256SUMS.txt
+          LC_ALL=C sha256sum $(find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' | sort) > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          name: "Second Brain ${{ inputs.tag != '' && inputs.tag || github.ref_name }}"
+          body_path: CHANGELOG.md
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          generate_release_notes: true
+          files: |
+            merged-dist/*
+
+      - name: Publish Python wheel to PyPI (when configured)
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && secrets.PYPI_API_TOKEN != '') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: merged-dist
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Publish VSIX to VS Code Marketplace (when VSCE_PAT secret is set)
+        if: ${{ secrets.VSCE_PAT != '' && (github.event_name == 'push' || inputs.publish_extensions) }}
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          npx --yes @vscode/vsce publish --packagePath merged-dist/*.vsix --pat "$VSCE_PAT"
+
+      - name: Publish VSIX to Open VSX (when OVSX_PAT secret is set)
+        if: ${{ secrets.OVSX_PAT != '' && (github.event_name == 'push' || inputs.publish_extensions) }}
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          npx --yes ovsx publish merged-dist/*.vsix -p "$OVSX_PAT"
