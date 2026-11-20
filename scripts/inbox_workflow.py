@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Quarantined inbox inspection, adversarial risk scanning, and CAS-locked owner promotion."""
@@ -39,6 +39,7 @@ ALLOWED_INBOX_ORIGINS = frozenset({
     "mcp_local",
     "api_local",
     "cognitive_experience",
+    "web_clipper",
     "web_remote",
     "imported_unknown",
     "untrusted_inbox",

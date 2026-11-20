@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "cryptography>=42,<51",
 #     "httpx>=0.28,<1",
@@ -57,7 +57,12 @@ import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import atomic_write_bytes, content_sha256, review_lock  # noqa: E402
+from atom_mutator import (  # noqa: E402
+    atomic_write_bytes,
+    content_sha256,
+    invalidate_decision_log_cache,
+    review_lock,
+)
 from config import (  # noqa: E402
     BRAIN_DIR,
     _WINDOWS_RESERVED_STEMS,
@@ -84,12 +89,13 @@ KEY_BYTES = 32
 MAX_SYNC_FILE_BYTES = 50_000_000
 MAX_SYNC_MANIFEST_BYTES = 16_000_000
 MAX_SYNC_HEADER_BYTES = 65_536
+MAX_TRUSTED_PEERS = 32
 _SCRYPT_N = 2**15
 _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SCRYPT_MAXMEM = 64 * 1024 * 1024
 
-_HEX_ID_RE = re.compile(r"^[0-9a-f]{16,64}$")
+_HEX_ID_RE = re.compile(r"^(?:[0-9a-f]{2}){8,32}$")
 _DEVICE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{4,64}$")
 _ENV_VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 
@@ -354,12 +360,34 @@ def _sign_head(head: dict[str, Any], privkey_b64: str) -> str:
 
 def _verify_head_signature(head: dict[str, Any]) -> None:
     try:
+        dev_id = str(head["device_id"])
+        if not _DEVICE_ID_RE.fullmatch(dev_id):
+            raise SyncSecurityError(f"Invalid device_id format in remote sync head: {dev_id!r}")
         pub_raw = base64.b64decode(str(head["device_pubkey_b64"]))
         sig_raw = base64.b64decode(str(head["signature_b64"]))
         pub = Ed25519PublicKey.from_public_bytes(pub_raw)
         pub.verify(sig_raw, _head_signing_bytes(head))
+    except SyncSecurityError:
+        raise
     except (KeyError, ValueError, TypeError, InvalidSignature) as exc:
         raise SyncSecurityError(f"Invalid Ed25519 signature on remote sync head: {exc}") from exc
+
+
+def _compute_head_mac(master_key: bytes, vault_id: str, head: dict[str, Any]) -> str:
+    mac_key = _derive_subkey(master_key, vault_id, "head-auth")
+    return hmac.new(mac_key, _head_signing_bytes(head), hashlib.sha256).hexdigest()
+
+
+def _verify_head_mac(master_key: bytes, vault_id: str, head: dict[str, Any]) -> None:
+    supplied = str(head.get("head_mac") or "").strip().lower()
+    if not supplied:
+        raise SyncSecurityError("Missing master-key HMAC ('head_mac') on remote sync head.")
+    try:
+        expected = _compute_head_mac(master_key, vault_id, head)
+    except (KeyError, ValueError, TypeError) as exc:
+        raise SyncSecurityError(f"Malformed remote sync head: {exc}") from exc
+    if not hmac.compare_digest(supplied, expected):
+        raise SyncSecurityError("Master-key HMAC verification failed on remote sync head (unauthenticated head.json).")
 
 
 # ─── Pluggable Transport Backends ────────────────────────────────────────────
@@ -521,23 +549,57 @@ class HttpObjectSyncBackend(SyncBackend):
         return f"{self.endpoint_url}/{clean}"
 
     def exists(self, key: str) -> bool:
-        return self.get_object(key) is not None
+        url = self._url_for(key)
+        client, pinned = self._open_client()
+        try:
+            with client:
+                hdrs = self._headers()
+                head_resp = client.request("HEAD", url, headers=hdrs)
+                if 300 <= head_resp.status_code < 400:
+                    raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
+                if head_resp.status_code == 200:
+                    return True
+                if head_resp.status_code == 404:
+                    return False
+                if head_resp.status_code not in {405, 501}:
+                    head_resp.raise_for_status()
+                with client.stream("GET", url, headers=hdrs) as get_resp:
+                    if 300 <= get_resp.status_code < 400:
+                        raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
+                    if get_resp.status_code == 404:
+                        return False
+                    get_resp.raise_for_status()
+                    return True
+        finally:
+            if pinned is not None:
+                pinned.close()
 
     def get_object(self, key: str, *, max_bytes: int = MAX_SYNC_FILE_BYTES + 4096) -> bytes | None:
         url = self._url_for(key)
         client, pinned = self._open_client()
         try:
             with client:
-                resp = client.get(url, headers=self._headers())
-                if 300 <= resp.status_code < 400:
-                    raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
-                if resp.status_code == 404:
-                    return None
-                resp.raise_for_status()
-                body = resp.content
-                if len(body) > max_bytes:
-                    raise SyncSecurityError(f"Remote sync object '{key}' exceeds max size limit.")
-                return body
+                with client.stream("GET", url, headers=self._headers()) as resp:
+                    if 300 <= resp.status_code < 400:
+                        raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
+                    if resp.status_code == 404:
+                        return None
+                    resp.raise_for_status()
+                    clen = resp.headers.get("Content-Length")
+                    if clen is not None:
+                        try:
+                            if int(clen) > max_bytes:
+                                raise SyncSecurityError(f"Remote sync object '{key}' exceeds max size limit.")
+                        except ValueError:
+                            pass
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in resp.iter_bytes():
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise SyncSecurityError(f"Remote sync object '{key}' exceeds max size limit.")
+                        chunks.append(chunk)
+                    return b"".join(chunks)
         finally:
             if pinned is not None:
                 pinned.close()
@@ -630,9 +692,23 @@ def scan_durable_vault_files(brain_dir: str | Path) -> dict[str, dict[str, Any]]
     return inventory
 
 
+def _ts_sort_key(raw_ts: str) -> tuple[int, float | str]:
+    if not raw_ts:
+        return (1, "")
+    norm = raw_ts.replace("Z", "+00:00") if raw_ts.endswith("Z") else raw_ts
+    try:
+        dt = datetime.datetime.fromisoformat(norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return (0, dt.timestamp())
+    except ValueError:
+        return (0, raw_ts)
+
+
 def _merge_append_only_jsonl(local_bytes: bytes, remote_bytes: bytes) -> bytes:
     """Deterministic deduplicated set-union merge for append-only JSONL audit/lineage logs."""
-    by_hash: dict[str, tuple[str, str]] = {}
+    by_hash: dict[str, tuple[tuple[int, float | str], int, str]] = {}
+    seq_idx = 0
     for blob in (local_bytes, remote_bytes):
         for raw_line in blob.decode("utf-8", errors="replace").splitlines():
             stripped = raw_line.strip()
@@ -652,12 +728,13 @@ def _merge_append_only_jsonl(local_bytes: bytes, remote_bytes: bytes) -> bytes:
                             break
             except json.JSONDecodeError:
                 pass
-            by_hash[digest] = (sort_ts, stripped)
+            by_hash[digest] = (_ts_sort_key(sort_ts), seq_idx, stripped)
+            seq_idx += 1
 
-    ordered = sorted(by_hash.items(), key=lambda kv: (kv[1][0], kv[0]))
+    ordered = sorted(by_hash.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0]))
     if not ordered:
         return b""
-    return ("\n".join(item[1][1] for item in ordered) + "\n").encode("utf-8")
+    return ("\n".join(item[1][2] for item in ordered) + "\n").encode("utf-8")
 
 
 def _backup_before_sync_overwrite(brain_root: Path, rel_path: str, existing_bytes: bytes) -> None:
@@ -907,13 +984,26 @@ def join_sync(
     priv_b64, pub_b64 = _generate_device_keypair()
     trusted_peers: dict[str, str] = {device_id: pub_b64}
 
-    # If a valid signed remote head already exists, pin its device pubkey via authenticated TOFU
+    # If a valid signed + master-key-authenticated remote head already exists, pin its device pubkey
     raw_head = backend.get_object("head.json", max_bytes=MAX_SYNC_HEADER_BYTES)
     if raw_head is not None:
-        head = json.loads(raw_head.decode("utf-8"))
-        _verify_head_signature(head)
+        try:
+            head = json.loads(raw_head.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SyncSecurityError(f"Malformed remote head.json: {exc}") from exc
+        if not isinstance(head, dict):
+            raise SyncSecurityError("Malformed remote head.json.")
         if str(head.get("vault_id")) != vault_id:
             raise SyncSecurityError("Remote head.json vault_id does not match vault-header.json.")
+        _verify_head_mac(master_key, vault_id, head)
+        _verify_head_signature(head)
+        manifest_id = str(head.get("manifest_id") or "")
+        if not _HEX_ID_RE.fullmatch(manifest_id):
+            raise SyncSecurityError("Malformed manifest_id in remote head.json.")
+        manifest_ct = backend.get_object(f"manifests/{manifest_id}.enc", max_bytes=MAX_SYNC_MANIFEST_BYTES)
+        if manifest_ct is None or content_sha256(manifest_ct) != str(head.get("manifest_ciphertext_sha256") or ""):
+            raise SyncSecurityError("Remote head.json manifest ciphertext verification failed during join.")
+        decrypt_object(master_key, vault_id=vault_id, kind="manifest", object_id=manifest_id, envelope=manifest_ct)
         trusted_peers[str(head["device_id"])] = str(head["device_pubkey_b64"])
 
     cfg = {
@@ -1018,18 +1108,23 @@ def _verify_and_read_remote_head(
     backend: SyncBackend,
     cfg: dict[str, Any],
     *,
+    master_key: bytes,
     local_state: dict[str, Any],
     trust_new_peers: bool = False,
-    cfg_path: Path | None = None,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, tuple[str, str] | None]:
     raw_head = backend.get_object("head.json", max_bytes=MAX_SYNC_HEADER_BYTES)
     if raw_head is None:
-        return None
-    head = json.loads(raw_head.decode("utf-8"))
+        return None, None
+    try:
+        head = json.loads(raw_head.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SyncSecurityError(f"Malformed remote head.json: {exc}") from exc
     if not isinstance(head, dict):
         raise SyncSecurityError("Malformed remote head.json.")
-    if str(head.get("vault_id")) != str(cfg["vault_id"]):
+    vault_id = str(cfg["vault_id"])
+    if str(head.get("vault_id")) != vault_id:
         raise SyncSecurityError("Remote head.json belongs to a different vault_id.")
+    _verify_head_mac(master_key, vault_id, head)
     _verify_head_signature(head)
 
     remote_epoch = int(head.get("epoch", 0))
@@ -1041,7 +1136,10 @@ def _verify_and_read_remote_head(
 
     dev_id = str(head["device_id"])
     pub_b64 = str(head["device_pubkey_b64"])
+    if len(pub_b64) > 128:
+        raise SyncSecurityError("Oversized device_pubkey_b64 in remote sync head.")
     trusted = dict(cfg.get("trusted_peers") or {})
+    new_peer: tuple[str, str] | None = None
     if dev_id in trusted:
         if not hmac.compare_digest(trusted[dev_id], pub_b64):
             raise SyncSecurityError(f"Pinned Ed25519 key mismatch for peer device '{dev_id}'!")
@@ -1050,11 +1148,10 @@ def _verify_and_read_remote_head(
             raise SyncSecurityError(
                 f"Untrusted peer device '{dev_id}' signed remote head. Pass trust_new_peers=True or join/trust explicitly."
             )
-        trusted[dev_id] = pub_b64
-        cfg["trusted_peers"] = trusted
-        if cfg_path is not None:
-            _atomic_write_restricted_json(cfg_path, cfg)
-    return head
+        if len(trusted) >= MAX_TRUSTED_PEERS:
+            raise SyncSecurityError(f"Maximum trusted sync peers ({MAX_TRUSTED_PEERS}) exceeded.")
+        new_peer = (dev_id, pub_b64)
+    return head, new_peer
 
 
 def sync_push(
@@ -1067,6 +1164,7 @@ def sync_push(
 ) -> dict[str, Any]:
     """Encrypt durable vault files (deduplicated via blind blob IDs) and push a signed manifest."""
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    cfg_path = sync_config_path(active_brain, state_dir=state_dir)
     cfg = _load_sync_config(active_brain, state_dir=state_dir)
     master_key = _resolve_master_key(cfg, passphrase=passphrase)
     backend = _backend_from_config(
@@ -1079,7 +1177,13 @@ def sync_push(
 
     with review_lock(str(lock_path)):
         local_state = _load_local_sync_state(active_brain)
-        remote_head = _verify_and_read_remote_head(backend, cfg, local_state=local_state, trust_new_peers=True)
+        remote_head, _ = _verify_and_read_remote_head(
+            backend,
+            cfg,
+            master_key=master_key,
+            local_state=local_state,
+            trust_new_peers=True,
+        )
         local_epoch = int(local_state.get("last_seen_epoch", 0))
         if remote_head is not None and int(remote_head["epoch"]) > local_epoch:
             raise SyncConflictError(
@@ -1159,6 +1263,7 @@ def sync_push(
             "created_at": created_at,
         }
         head_doc["signature_b64"] = _sign_head(head_doc, str(cfg["device_privkey_b64"]))
+        head_doc["head_mac"] = _compute_head_mac(master_key, vault_id, head_doc)
         backend.put_object("head.json", (json.dumps(head_doc, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
         local_state["last_seen_epoch"] = new_epoch
@@ -1202,12 +1307,12 @@ def sync_pull(
 
     with review_lock(str(lock_path)):
         local_state = _load_local_sync_state(active_brain)
-        remote_head = _verify_and_read_remote_head(
+        remote_head, pending_new_peer = _verify_and_read_remote_head(
             backend,
             cfg,
+            master_key=master_key,
             local_state=local_state,
             trust_new_peers=trust_new_peers,
-            cfg_path=cfg_path,
         )
         if remote_head is None:
             return {
@@ -1215,6 +1320,7 @@ def sync_pull(
                 "epoch": int(local_state.get("last_seen_epoch", 0)),
                 "added": 0,
                 "updated": 0,
+                "deleted": 0,
                 "merged_jsonl": 0,
                 "conflicts": [],
             }
@@ -1239,6 +1345,13 @@ def sync_pull(
         manifest = json.loads(manifest_plain.decode("utf-8"))
         if str(manifest.get("vault_id")) != vault_id or int(manifest.get("epoch", -1)) != int(remote_head["epoch"]):
             raise SyncSecurityError("Decrypted manifest vault_id/epoch disagrees with signed head.json.")
+
+        # Persist newly learned peer pubkey ONLY after AEAD manifest decryption succeeded under master_key!
+        if pending_new_peer is not None:
+            trusted = dict(cfg.get("trusted_peers") or {})
+            trusted[pending_new_peer[0]] = pending_new_peer[1]
+            cfg["trusted_peers"] = trusted
+            _atomic_write_restricted_json(cfg_path, cfg)
 
         remote_files = manifest.get("files") or {}
         if not isinstance(remote_files, dict):
@@ -1281,7 +1394,9 @@ def sync_pull(
         # Phase 2: Apply conflict-safe 3-way merge atomically
         added = 0
         updated = 0
+        deleted = 0
         merged_jsonl = 0
+        decision_log_touched = False
         new_conflicts: list[dict[str, Any]] = []
         new_base_files = dict(base_files)
 
@@ -1297,6 +1412,8 @@ def sync_pull(
                 atomic_write_bytes(str(dest), remote_bytes)
                 new_base_files[clean_rel] = remote_sha
                 added += 1
+                if clean_rel == "0-raw/archive/decision-record.jsonl":
+                    decision_log_touched = True
                 continue
 
             local_sha = str(local_meta["sha256"])
@@ -1306,6 +1423,8 @@ def sync_pull(
                 atomic_write_bytes(str(dest), remote_bytes)
                 new_base_files[clean_rel] = remote_sha
                 updated += 1
+                if clean_rel == "0-raw/archive/decision-record.jsonl":
+                    decision_log_touched = True
                 continue
 
             if base_sha == remote_sha:
@@ -1318,6 +1437,8 @@ def sync_pull(
                 atomic_write_bytes(str(dest), merged)
                 new_base_files[clean_rel] = content_sha256(merged)
                 merged_jsonl += 1
+                if clean_rel == "0-raw/archive/decision-record.jsonl":
+                    decision_log_touched = True
             else:
                 conflict_rel = _quarantine_conflict_copy(
                     active_brain,
@@ -1338,6 +1459,40 @@ def sync_pull(
                     }
                 )
 
+        # Propagate remote file deletions (paths in base_files omitted from remote_files)
+        for prev_rel, base_sha in sorted(base_files.items()):
+            if prev_rel in remote_files or prev_rel in _APPEND_ONLY_JSONL_PATHS:
+                continue
+            clean_rel = validate_sync_rel_path(prev_rel)
+            local_meta = local_inventory.get(clean_rel)
+            if local_meta is None:
+                new_base_files.pop(clean_rel, None)
+                continue
+            local_sha = str(local_meta["sha256"])
+            dest = active_brain.joinpath(*clean_rel.split("/"))
+            _assert_no_symlink_chain(dest, stop_at=active_brain)
+            if local_sha == str(base_sha):
+                if dest.is_file():
+                    _backup_before_sync_overwrite(active_brain, clean_rel, dest.read_bytes())
+                    dest.unlink()
+                new_base_files.pop(clean_rel, None)
+                deleted += 1
+            else:
+                # Modify/delete divergence: preserve local modified file on disk & record conflict!
+                new_base_files.pop(clean_rel, None)
+                new_conflicts.append(
+                    {
+                        "rel_path": clean_rel,
+                        "conflict_copy": None,
+                        "conflict_kind": "modify_delete",
+                        "local_sha256": local_sha,
+                        "remote_sha256": None,
+                        "remote_device_id": str(remote_head["device_id"]),
+                        "remote_epoch": int(remote_head["epoch"]),
+                        "recorded_at": _utc_now_iso(),
+                    }
+                )
+
         # Record unchanged files that match remote in cursor
         for clean_rel, entry in remote_files.items():
             if clean_rel not in decrypted_incoming and clean_rel in local_inventory:
@@ -1351,15 +1506,18 @@ def sync_pull(
         local_state["conflicts"] = existing_conflicts
         _save_local_sync_state(active_brain, local_state)
 
+        if decision_log_touched:
+            invalidate_decision_log_cache()
+
         indexes_rebuilt = False
-        if added > 0 or updated > 0 or merged_jsonl > 0:
+        if added > 0 or updated > 0 or deleted > 0 or merged_jsonl > 0:
             atoms_dir = active_brain / "2-atoms"
             lex_path = active_brain / ".sidecar" / "lexical.sqlite3"
             atoms_dir.mkdir(parents=True, exist_ok=True)
             rebuild_lexical_index(str(atoms_dir), str(lex_path))
             indexes_rebuilt = True
 
-    if indexes_rebuilt:
+    if indexes_rebuilt or deleted > 0:
         try:
             ensure_notes_index(NotePaths.for_brain(active_brain))
         except Exception:
@@ -1373,6 +1531,7 @@ def sync_pull(
         "remote_device_id": str(remote_head["device_id"]),
         "added": added,
         "updated": updated,
+        "deleted": deleted,
         "merged_jsonl": merged_jsonl,
         "conflict_count": len(new_conflicts),
         "conflicts": new_conflicts,
@@ -1421,7 +1580,13 @@ def sync_verify(
 
     local_state = _load_local_sync_state(active_brain)
     try:
-        head = _verify_and_read_remote_head(backend, cfg, local_state=local_state, trust_new_peers=True)
+        head, _ = _verify_and_read_remote_head(
+            backend,
+            cfg,
+            master_key=master_key,
+            local_state=local_state,
+            trust_new_peers=True,
+        )
     except Exception as exc:
         return {"valid": False, "vault_id": vault_id, "verified_blobs": 0, "issues": [*issues, str(exc)]}
 

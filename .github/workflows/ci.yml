@@ -79,7 +79,7 @@ jobs:
           uv run --frozen python -c '
           from pathlib import Path
           import sys
-          bad = [str(p) for p in [Path("setup.sh"), Path("run_daemon.sh"), Path("scripts/package_desktop.sh")] if p.exists() and b"\r" in p.read_bytes()]
+          bad = [str(p) for p in [Path("setup.sh"), Path("run_daemon.sh"), Path("run_dashboard.sh"), Path("run_night_shift.sh"), Path("scripts/package_desktop.sh")] if p.exists() and b"\r" in p.read_bytes()]
           if bad:
               print("CRLF detected in POSIX shell scripts:", bad, file=sys.stderr)
               sys.exit(1)

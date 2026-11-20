@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Deterministic hardware capability profiling and model/retrieval tier selection."""

@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """CLI and compatibility exports for the canonical atom mutator."""

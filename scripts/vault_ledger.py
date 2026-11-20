@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Cryptographic Vault Merkle Proof & Tamper-Evident Audit Ledger.
@@ -32,6 +32,7 @@ from atom_mutator import approved_revision_is_current, content_sha256, review_lo
 from config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
+    PLAYBOOKS_DIR,
     _is_reparse_or_link,
     is_content_markdown,
     safe_file_in_dir,

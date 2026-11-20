@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Single canonical mutation path for atom edits and owner review decisions."""
@@ -310,7 +310,7 @@ def _write_mutation(
                 dense_state = "stale"
         record = {
             "schema_version": 1,
-            "recorded_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds"),
             "action": action,
             "actor": actor.strip(),
             "atom_filename": Path(atom_path).name,
@@ -634,7 +634,7 @@ def apply_atom_merge(
                 and bool(dense_manifest.get("generation_id"))
                 and index_manifest_is_current(dense_manifest, atoms_dir)
             )
-            now = datetime.datetime.now().isoformat(timespec="seconds")
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds")
             peer_paths = [superseded_path, survivor_path]
             records = []
             for index, path in enumerate(paths):

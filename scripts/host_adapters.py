@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "httpx>=0.28,<1",
 #     "ollama>=0.6,<1",
@@ -271,11 +271,15 @@ def restrict_security_file_permissions(path: Path | str) -> None:
         principal = _current_windows_principal()
         if not principal:
             return
-        if not parent_is_link and parent.exists() and parent.name in {"security", ".sidecar", "snapshots"}:
+        def _harden_win_dir(dir_path: Path) -> None:
+            if os.path.lexists(str(dir_path)) and _is_reparse_or_link(str(dir_path)):
+                return
+            if not dir_path.exists():
+                return
             subprocess.run(
                 [
                     icacls_exe,
-                    str(parent),
+                    str(dir_path),
                     "/inheritance:r",
                     "/grant:r",
                     "*S-1-5-18:(OI)(CI)(F)",
@@ -287,6 +291,11 @@ def restrict_security_file_permissions(path: Path | str) -> None:
                 timeout=5.0,
                 check=False,
             )
+
+        if parent.parent.name == "security":
+            _harden_win_dir(parent.parent)
+        if not parent_is_link and parent.exists() and parent.name in {"security", ".sidecar", "snapshots", "sync", "vault-tokens"}:
+            _harden_win_dir(parent)
         if path.exists():
             subprocess.run(
                 [
@@ -1260,6 +1269,33 @@ def invoke_provider_stream(
     raise ValueError(f"Unsupported provider: {rule.provider}")
 
 
+def enforce_vault_online_policy(
+    rule: HostSharingRule,
+    *,
+    brain_dir: str | Path | None,
+    policy_path: Path | None = None,
+    security_dir: str | Path | None = None,
+) -> None:
+    """Block outbound online model calls when a registered workspace enforces default_host_policy='local_only'."""
+    if rule.transport != "online" or not brain_dir:
+        return
+    try:
+        from .vault_workspaces import get_registered_vault_host_policy
+    except ImportError:
+        from vault_workspaces import get_registered_vault_host_policy
+
+    matched_vid, vault_policy = get_registered_vault_host_policy(
+        brain_dir,
+        security_dir=security_dir,
+        policy_path=policy_path,
+    )
+    if matched_vid is not None and vault_policy != "online_opt_in":
+        raise HostConsentError(
+            f"Vault workspace '{matched_vid}' enforces default_host_policy='{vault_policy}'; "
+            f"online AI host '{rule.host_id}' is forbidden for this vault."
+        )
+
+
 def generate_grounded_answer_via_host(
     request: AnswerRequest,
     retrieved_atoms: list,
@@ -1269,6 +1305,7 @@ def generate_grounded_answer_via_host(
     atoms_dir: str = ATOMS_DIR,
     brain_dir: str = BRAIN_DIR,
     policy_path: Path | None = None,
+    security_dir: str | Path | None = None,
     http_transport: httpx.BaseTransport | None = None,
     skip_dns_check_for_mock_transport: bool = False,
     unverified_leads: Sequence[UnverifiedLead] | None = None,
@@ -1287,6 +1324,12 @@ def generate_grounded_answer_via_host(
         raise HostConsentError(
             f"Online host '{host_id}' lacks recorded owner sharing consent."
         )
+    enforce_vault_online_policy(
+        rule,
+        brain_dir=brain_dir,
+        policy_path=policy_path,
+        security_dir=security_dir,
+    )
     if request.mode == "preference" and not rule.allow_preference_atoms:
         raise HostConsentError(
             f"Host '{host_id}' is not authorized to receive owner subjective preference memories."

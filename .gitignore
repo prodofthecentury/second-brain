@@ -9,7 +9,11 @@ brain/.obsidian/cache
 
 # Rebuildable indexes and inter-process coordination state
 brain/.chroma/
+brain/.chroma.previous-*/
 brain/.sidecar/
+
+# Virtual environments
+.venv/
 
 # Agent scratch space — never commit in-progress work
 brain/1-desk/*.draft
@@ -36,6 +40,7 @@ __pycache__/
 
 # Reproducible page previews rendered while preparing the learning-design memo.
 # Their source PDFs and SHA-256 inventory are recorded in docs/learning-and-memory-design-synthesis.md.
+tmp/
 tmp/pdfs/
 
 # Node dependencies and desktop/extension build artifacts
@@ -43,8 +48,17 @@ node_modules/
 desktop/node_modules/
 dist/
 desktop/dist/
+release-artifacts/
+merged-dist/
+*.whl
 *.exe
 *.msi
+*.dmg
+*.AppImage
+*.deb
 *.vsix
 *.pfx
+*.p12
+*.pem
+*.key
 *.cer

@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "httpx>=0.28,<1",
 # ]
@@ -48,6 +48,7 @@ from host_adapters import (
     _audit_outbound_call,
     _invoke_provider_draft,
     _redact_outbound_with_map,
+    enforce_vault_online_policy,
     filter_atoms_for_host,
     load_host_policies,
     validate_endpoint_network_boundary,
@@ -473,6 +474,7 @@ def assemble_executive_plan(
     chroma_path: str = CHROMA_PATH,
     telemetry_db_path: str = TELEMETRY_DB_PATH,
     policy_path: Path | None = None,
+    security_dir: str | Path | None = None,
     http_transport: httpx.BaseTransport | None = None,
     skip_dns_check_for_mock_transport: bool = False,
     save_briefing: bool = False,
@@ -497,6 +499,14 @@ def assemble_executive_plan(
         host_rule = policies[request.host_id]
         if not host_rule.enabled:
             raise HostConsentError(f"Host '{request.host_id}' is disabled by default; explicit owner consent required.")
+        if host_rule.transport == "online" and not host_rule.owner_consent_recorded:
+            raise HostConsentError(f"Online host '{request.host_id}' lacks recorded owner sharing consent.")
+        enforce_vault_online_policy(
+            host_rule,
+            brain_dir=brain_dir,
+            policy_path=policy_path,
+            security_dir=security_dir,
+        )
         chosen_model = validate_model_identifier(
             (request.model_override or "").strip() or host_rule.default_model,
             provider=host_rule.provider,

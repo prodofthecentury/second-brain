@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "pydantic>=2.7,<3",
 # ]
@@ -63,6 +63,7 @@ from host_adapters import (  # noqa: E402
     _redact_outbound_with_map,
     _rehydrate_text,
     builtin_default_policies,
+    enforce_vault_online_policy,
     filter_atoms_for_host,
     inspect_and_redact_outbound,
     invoke_provider_stream,
@@ -212,6 +213,7 @@ class ChatPaths:
     lexical_index_path: str = LEXICAL_INDEX_PATH
     chroma_path: str = CHROMA_PATH
     policy_path: Path | None = None
+    security_dir: str | Path | None = None
     telemetry_db_path: str | None = None
     http_transport: Any = None
     skip_dns_check_for_mock_transport: bool = False
@@ -250,6 +252,8 @@ def _resolve_chat_host_rule(
     host_id: str,
     policy_path: Path | None,
     *,
+    brain_dir: str | Path | None = None,
+    security_dir: str | Path | None = None,
     http_transport: Any = None,
     skip_dns_check_for_mock_transport: bool = False,
 ):
@@ -264,6 +268,7 @@ def _resolve_chat_host_rule(
         )
     if rule.transport == "online" and not rule.owner_consent_recorded:
         raise HostConsentError(f"Online host '{host_id}' lacks recorded owner sharing consent.")
+    enforce_vault_online_policy(rule, brain_dir=brain_dir, policy_path=policy_path, security_dir=security_dir)
     pinned_target = validate_endpoint_network_boundary(
         rule,
         skip_dns_resolution=bool(http_transport is not None and skip_dns_check_for_mock_transport),
@@ -840,7 +845,7 @@ def chat_events(
     retrieval_mode: str = "lexical",
     allow_cross_project: bool = False,
     answer_view: str = "standard",
-    allow_unverified_leads: bool = False,
+    allow_unverified_leads: bool = True,
 ) -> Iterator[dict[str, object]]:
     """Yield chat events: context → (tokens|verified_answer) → grounding → [research_leads] → done."""
     if mode not in CHAT_MODES:
@@ -879,7 +884,7 @@ def chat_events(
         allow_cross_project=allow_cross_project,
     )
     ctx = _filter_and_redact_context(raw_ctx, context_rule)
-    want_research = (mode == "research") or (answer_view == "research" and bool(allow_unverified_leads))
+    want_research = bool(allow_unverified_leads) and (mode == "research" or answer_view == "research")
     if not include_preferences or mode == "research" or answer_view == "research":
         ctx = {
             **ctx,
@@ -950,6 +955,8 @@ def chat_events(
         rule, pinned_target = _resolve_chat_host_rule(
             active_host_id,
             paths.policy_path,
+            brain_dir=paths.brain_dir,
+            security_dir=paths.security_dir,
             http_transport=paths.http_transport,
             skip_dns_check_for_mock_transport=paths.skip_dns_check_for_mock_transport,
         )

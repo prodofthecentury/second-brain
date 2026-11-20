@@ -3331,14 +3331,18 @@ async function loadWorkspaces() {
         fedBtn.type = "button";
         if (v.active) fedBtn.style.marginLeft = "auto";
         fedBtn.onclick = async () => {
-          const r = await window.secondBrain.request("PATCH", `/v1/vaults/${encodeURIComponent(v.vault_id)}`, {
-            federated_searchable: !v.federated_searchable,
-          });
-          showToast(
-            r.ok ? `Updated ${v.vault_id} federated_searchable=${!v.federated_searchable}` : apiErrorMessage(r, "Update failed"),
-            r.ok ? "ok" : "danger"
-          );
-          await loadWorkspaces();
+          try {
+            const r = await window.secondBrain.request("PATCH", `/v1/vaults/${encodeURIComponent(v.vault_id)}`, {
+              federated_searchable: !v.federated_searchable,
+            });
+            showToast(
+              r.ok ? `Updated ${v.vault_id} federated_searchable=${!v.federated_searchable}` : apiErrorMessage(r, "Update failed"),
+              r.ok ? "ok" : "danger"
+            );
+            await loadWorkspaces();
+          } catch (err) {
+            showToast(err?.message || "Update failed", "danger");
+          }
         };
         row.appendChild(fedBtn);
         if (!v.active) {

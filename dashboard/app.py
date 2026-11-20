@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "streamlit",
 #     "plotly",
@@ -3760,6 +3760,8 @@ elif nav_selection == "⚙️ System Control":
                 if st.button("🔀 Switch Active Vault", key="btn_ws_switch"):
                     try:
                         sw_res = ws_switch_vault(sel_ws, current_brain_dir=BRAIN_DIR)
+                        if (os.environ.get("BRAIN_VAULT_DIR") or "").strip():
+                            os.environ["BRAIN_VAULT_DIR"] = str(sw_res["active_vault_path"])
                         st.success(f"Switched active vault to `{sw_res['active_vault_id']}` ({sw_res['active_vault_path']}).")
                         st.rerun()
                     except Exception as exc:

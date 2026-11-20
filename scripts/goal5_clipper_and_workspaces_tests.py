@@ -186,6 +186,7 @@ class BrowserWebClipperTests(unittest.TestCase):
                     clip_headers = {
                         "Host": f"127.0.0.1:{port}",
                         "Origin": CHROME_ORIGIN_A,
+                        "Sec-Fetch-Site": "cross-site",
                         "Authorization": f"Bearer {pair_a['token']}",
                     }
                     self.assertEqual(client.get(f"{base}/v1/atoms", headers=clip_headers).status_code, 403)
@@ -196,16 +197,56 @@ class BrowserWebClipperTests(unittest.TestCase):
                         403,
                     )
 
-                    # 4. Token minted for Origin A fails if presented from Origin B (cross-extension isolation)
+                    # 3b. Plain agent token (without clipper_* or X-Owner-Token) CANNOT call /v1/clipper/*
+                    plain_agent_headers = {
+                        "Host": f"127.0.0.1:{port}",
+                        "Authorization": f"Bearer {agent_tok}",
+                    }
+                    self.assertEqual(client.get(f"{base}/v1/clipper/ping", headers=plain_agent_headers).status_code, 403)
+                    self.assertEqual(client.get(f"{base}/v1/clipper/status", headers=plain_agent_headers).status_code, 403)
+                    self.assertEqual(
+                        client.post(
+                            f"{base}/v1/clipper/clip",
+                            headers=plain_agent_headers,
+                            json={"url": "https://example.org/p", "selected_quote": "forged import"},
+                        ).status_code,
+                        403,
+                    )
+
+                    # 4. Token minted for Origin A fails if presented from Origin B OR loopback Origin (with CORS header on error!)
                     r_wrong_origin = client.get(
                         f"{base}/v1/clipper/status",
                         headers={
                             "Host": f"127.0.0.1:{port}",
                             "Origin": FIREFOX_ORIGIN,
+                            "Sec-Fetch-Site": "cross-site",
                             "Authorization": f"Bearer {pair_a['token']}",
                         },
                     )
                     self.assertEqual(r_wrong_origin.status_code, 401)
+                    self.assertEqual(r_wrong_origin.headers.get("access-control-allow-origin"), FIREFOX_ORIGIN)
+
+                    r_loopback_origin_spoof = client.get(
+                        f"{base}/v1/clipper/status",
+                        headers={
+                            "Host": f"127.0.0.1:{port}",
+                            "Origin": base,
+                            "Sec-Fetch-Site": "same-origin",
+                            "Authorization": f"Bearer {pair_a['token']}",
+                        },
+                    )
+                    self.assertEqual(r_loopback_origin_spoof.status_code, 401)
+
+                    # Firefox paired extension with Sec-Fetch-Site: cross-site succeeds cleanly
+                    ff_headers = {
+                        "Host": f"127.0.0.1:{port}",
+                        "Origin": FIREFOX_ORIGIN,
+                        "Sec-Fetch-Site": "cross-site",
+                        "Authorization": f"Bearer {pair_ff['token']}",
+                    }
+                    r_ff_status = client.get(f"{base}/v1/clipper/status", headers=ff_headers)
+                    self.assertEqual(r_ff_status.status_code, 200)
+                    self.assertEqual(r_ff_status.headers.get("access-control-allow-origin"), FIREFOX_ORIGIN)
 
                     # 5. Valid clip creates note + immutable SHA-256 snapshot and promotes via verify_note_excerpt!
                     r_status = client.get(f"{base}/v1/clipper/status", headers=clip_headers)
@@ -245,14 +286,15 @@ class BrowserWebClipperTests(unittest.TestCase):
                     )
                     self.assertEqual(promoted["status"], "verified")
 
-                    # 6. DLP secret quarantine: clip containing credential is diverted to 0-raw/inbox/
+                    # 6. DLP secret quarantine: clip containing credential (including URL & title!) is diverted to 0-raw/inbox/ WITHOUT writing unredacted snapshot or filename leak!
+                    leaked_secret = "sk-1234567890abcdef1234567890abcdef"
                     r_secret = client.post(
                         f"{base}/v1/clipper/clip",
                         headers=clip_headers,
                         json={
-                            "url": "https://docs.example.org/leaked",
-                            "title": "Leaked Credential Page",
-                            "selected_quote": "Use OPENAI_API_KEY=sk-1234567890abcdef1234567890abcdef in prod.",
+                            "url": f"https://docs.example.org/leaked?api_key={leaked_secret}",
+                            "title": f"Leaked {leaked_secret} Page",
+                            "selected_quote": f"Use OPENAI_API_KEY={leaked_secret} in prod.",
                             "destination": "note",
                         },
                     )
@@ -260,7 +302,14 @@ class BrowserWebClipperTests(unittest.TestCase):
                     sec_doc = r_secret.json()
                     self.assertTrue(sec_doc["quarantined"])
                     self.assertEqual(sec_doc["destination"], "inbox")
-                    self.assertTrue((brain / "0-raw" / "inbox" / str(sec_doc["filename"])).is_file())
+                    self.assertIsNone(sec_doc["snapshot_path"])
+                    self.assertNotIn(leaked_secret, str(sec_doc["filename"]))
+                    self.assertNotIn(leaked_secret, str(sec_doc["url"]))
+                    inbox_file = brain / "0-raw" / "inbox" / str(sec_doc["filename"])
+                    self.assertTrue(inbox_file.is_file())
+                    for p in (brain / "0-raw").rglob("*.md"):
+                        self.assertNotIn(leaked_secret, p.name)
+                        self.assertNotIn(leaked_secret, p.read_text(encoding="utf-8"))
 
                     # 7. Reject dangerous URL schemes (javascript:, file://, user:pass@)
                     r_bad_url = client.post(
@@ -541,6 +590,247 @@ class MultiVaultWorkspacesTests(unittest.TestCase):
         vs_cmds = {c["command"] for c in vs_pkg["contributes"]["commands"]}
         self.assertTrue({"secondBrain.switchVault", "secondBrain.federatedSearch", "secondBrain.pairClipper"}.issubset(vs_cmds))
         self.assertNotIn("innerHTML", vs_js)
+        main_js = (ROOT / "desktop" / "main.js").read_text(encoding="utf-8")
+        self.assertIn('"PATCH"', main_js)
+
+    def test_cross_boundary_security_remediations_local_only_policy_agent_redaction_and_snapshot_isolation(self) -> None:
+        from host_adapters import HostSharingRule, builtin_default_policies, save_host_policies
+        import mcp_server
+        import vault_ledger
+
+        # 1. Active-vault prove_leaf_membership works cleanly when brain_dir == BRAIN_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sec_dir = tmp_path / "security"
+            sec_dir.mkdir()
+            vault_local = tmp_path / "vault-local"
+            vault_other = tmp_path / "vault-other"
+            _seed_approved_atom(
+                vault_local,
+                filename="local-fact.md",
+                claim="Confidential architecture requires hardware security modules.",
+                project="project:work",
+                approve=True,
+            )
+            _seed_approved_atom(
+                vault_local,
+                filename="local-pref.md",
+                claim="Owner prefers compact monochrome terminal fonts.",
+                project="project:work",
+                epistemic_label="preference",
+                approve=True,
+            )
+            _seed_approved_atom(
+                vault_local,
+                filename="local-pending.md",
+                claim="Unreviewed pending architecture candidate must not leak to non-owner agents.",
+                project="project:work",
+                approve=False,
+            )
+            _seed_approved_atom(
+                vault_other,
+                filename="other-fact.md",
+                claim="Secondary vault independent claim.",
+                project="project:other",
+                approve=True,
+            )
+
+            # Verify PLAYBOOKS_DIR is defined and prove_leaf_membership succeeds when BRAIN_DIR == vault_local
+            with patch.object(vault_ledger, "BRAIN_DIR", str(vault_local)), patch.object(
+                vault_ledger, "ATOMS_DIR", str(vault_local / "2-atoms")
+            ), patch.object(vault_ledger, "PLAYBOOKS_DIR", str(vault_local / "5-playbooks")):
+                proof = vault_ledger.prove_leaf_membership(
+                    "local-fact.md",
+                    brain_dir=str(vault_local),
+                    atoms_dir=str(vault_local / "2-atoms"),
+                )
+                self.assertTrue(vault_ledger.verify_merkle_proof(proof))
+
+            # Configure a mock online host (enabled globally in policy.json) to test per-vault local_only enforcement
+            online_calls: list[str] = []
+
+            def mock_online_handler(request: httpx.Request) -> httpx.Response:
+                online_calls.append(str(request.url))
+                return httpx.Response(
+                    200,
+                    json={
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {"claims": ["Confidential architecture requires hardware security modules."]}
+                                    )
+                                }
+                            }
+                        ]
+                    },
+                )
+
+            policies = builtin_default_policies()
+            policies["openai_online"] = HostSharingRule(
+                host_id="openai_online",
+                provider="openai_compatible",
+                transport="online",
+                endpoint_url="https://api.openai.com/v1",
+                default_model="gpt-4o-mini",
+                enabled=True,
+                owner_consent_recorded=True,
+                allowed_projects=("*",),
+                allow_unscoped_atoms=True,
+                allow_preference_atoms=False,
+                redact_pii=True,
+                fail_on_secret_detection=True,
+                api_key_env="TEST_OPENAI_KEY",
+            )
+            pol_dir = tmp_path / "separate_policy_dir"
+            pol_dir.mkdir()
+            policy_path = pol_dir / "host-sharing-policy.json"
+            save_host_policies(policies, policy_path)
+
+            tok_path = sec_dir / "memory-api-token"
+            own_path = sec_dir / "owner-token"
+            agent_tok, _ = generate_memory_api_token(tok_path)
+            owner_tok = ensure_owner_token(own_path)
+            rt = MemoryApiRuntimeConfig(
+                brain_dir=str(vault_local),
+                token_path=tok_path,
+                owner_token_path=own_path,
+                policy_path=policy_path,
+                security_dir=sec_dir,
+                http_transport=httpx.MockTransport(mock_online_handler),
+                skip_dns_check_for_mock_transport=True,
+            )
+
+            # Verify snapshot() freezes vault paths across concurrent switch_brain_dir()
+            snap_before = rt.snapshot()
+            rt.switch_brain_dir(str(vault_other))
+            self.assertEqual(Path(snap_before.brain_dir).resolve(), vault_local.resolve())
+            self.assertEqual(Path(rt.brain_dir).resolve(), vault_other.resolve())
+            rt.switch_brain_dir(str(vault_local))
+
+            server = MemoryLoopbackHTTPServer("127.0.0.1", 0, rt)
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            try:
+                with patch.dict(os.environ, {"TEST_OPENAI_KEY": "test-dummy-key"}, clear=False):
+                    sdk_owner = MemoryApiClient(port=port, token=agent_tok, owner_token=owner_tok)
+                    sdk_agent = MemoryApiClient(port=port, token=agent_tok)
+
+                    # Register vaults in vaults.json by creating vault_other (vault_local becomes 'default' with local_only!)
+                    sdk_owner.create_vault("Other", str(vault_other), vault_id="other", default_host_policy="local_only")
+
+                    # 2. Per-vault default_host_policy='local_only' MUST block online host calls on /v1/answer & /v1/chat/stream!
+                    with self.assertRaises(httpx.HTTPStatusError) as cm_online:
+                        sdk_owner.answer(
+                            "hardware security modules",
+                            host_id="openai_online",
+                            project_scope="project:work",
+                            retrieval_mode="lexical",
+                        )
+                    self.assertEqual(cm_online.exception.response.status_code, 403)
+                    self.assertEqual(online_calls, [])
+
+                    base = f"http://127.0.0.1:{port}"
+                    with httpx.Client(trust_env=False, timeout=10.0) as client:
+                        r_stream_blocked = client.post(
+                            f"{base}/v1/chat/stream",
+                            headers={
+                                "Host": f"127.0.0.1:{port}",
+                                "Authorization": f"Bearer {agent_tok}",
+                                "X-Owner-Token": owner_tok,
+                            },
+                            json={"query": "hardware security modules", "mode": "stream", "host_id": "openai_online"},
+                        )
+                        self.assertIn("default_host_policy", r_stream_blocked.text)
+                        self.assertEqual(online_calls, [])
+
+                        r_plan_blocked = client.post(
+                            f"{base}/v1/plan",
+                            headers={
+                                "Host": f"127.0.0.1:{port}",
+                                "Authorization": f"Bearer {agent_tok}",
+                                "X-Owner-Token": owner_tok,
+                            },
+                            json={"goal": "hardware security modules", "mode": "model_assisted", "host_id": "openai_online"},
+                        )
+                        self.assertEqual(r_plan_blocked.status_code, 403)
+                        self.assertEqual(online_calls, [])
+
+                        # Opting 'default' vault into online_opt_in via PATCH /v1/vaults/default allows online host!
+                        r_patch = client.patch(
+                            f"{base}/v1/vaults/default",
+                            headers={
+                                "Host": f"127.0.0.1:{port}",
+                                "Authorization": f"Bearer {agent_tok}",
+                                "X-Owner-Token": owner_tok,
+                            },
+                            json={"default_host_policy": "online_opt_in"},
+                        )
+                        self.assertEqual(r_patch.status_code, 200)
+                        ans_ok = sdk_owner.answer(
+                            "hardware security modules",
+                            host_id="openai_online",
+                            project_scope="project:work",
+                            retrieval_mode="lexical",
+                        )
+                        self.assertTrue(ans_ok["answerable"])
+                        self.assertEqual(len(online_calls), 1)
+
+                        # 3. Non-owner agent redaction on /v1/answer, /v1/chat/stream & /v1/cognitive/experiences DLP
+                        r_ag_pref = client.post(
+                            f"{base}/v1/answer",
+                            headers={"Host": f"127.0.0.1:{port}", "Authorization": f"Bearer {agent_tok}"},
+                            json={"query": "monochrome terminal fonts", "mode": "preference", "retrieval_mode": "lexical"},
+                        )
+                        self.assertEqual(r_ag_pref.status_code, 403)
+
+                        ag_res = sdk_agent.answer(
+                            "pending architecture candidate",
+                            mode="research",
+                            project_scope="project:work",
+                            retrieval_mode="lexical",
+                        )
+                        self.assertEqual(ag_res["unverified_leads"], [])
+
+                        r_ag_sse_res = client.post(
+                            f"{base}/v1/chat/stream",
+                            headers={"Host": f"127.0.0.1:{port}", "Authorization": f"Bearer {agent_tok}"},
+                            json={"query": "pending architecture candidate", "mode": "research", "retrieval_mode": "lexical"},
+                        )
+                        self.assertEqual(r_ag_sse_res.status_code, 200)
+                        self.assertNotIn("local-pending.md", r_ag_sse_res.text)
+                        self.assertNotIn('"type": "research_leads"', r_ag_sse_res.text)
+
+                        r_ag_sse_pref = client.post(
+                            f"{base}/v1/chat/stream",
+                            headers={"Host": f"127.0.0.1:{port}", "Authorization": f"Bearer {agent_tok}"},
+                            json={"query": "monochrome terminal fonts", "mode": "instant", "answer_view": "preference"},
+                        )
+                        self.assertEqual(r_ag_sse_pref.status_code, 403)
+
+                        # DLP secret & prompt injection rejected on POST /v1/cognitive/experiences
+                        r_bad_exp = client.post(
+                            f"{base}/v1/cognitive/experiences",
+                            headers={"Host": f"127.0.0.1:{port}", "Authorization": f"Bearer {agent_tok}"},
+                            json={
+                                "goal": "Leak test",
+                                "result_summary": "Used OPENAI_API_KEY=sk-1234567890abcdef1234567890abcdef",
+                                "success": True,
+                            },
+                        )
+                        self.assertEqual(r_bad_exp.status_code, 422)
+
+                    # 4. MCP semantic_search & get_atom withhold subjective preference atoms
+                    with patch.dict(os.environ, {"BRAIN_VAULT_DIR": str(vault_local)}, clear=False):
+                        mcp_hits = mcp_server.semantic_search("monochrome terminal fonts", n_results=5)
+                        self.assertEqual([h["filename"] for h in mcp_hits], [])
+                        vdirs = mcp_server._resolve_vault_dirs()
+                        self.assertIsNone(mcp_server._load_verified_non_preference_atom("local-pref.md", vdirs=vdirs))
+                        self.assertIsNotNone(mcp_server._load_verified_non_preference_atom("local-fact.md", vdirs=vdirs))
+            finally:
+                server.shutdown()
+                server.server_close()
 
 
 if __name__ == "__main__":

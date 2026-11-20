@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Layer 4 Cognitive Core: Owner-gated Playbook/Skill promotion and cryptographic staleness re-gating."""

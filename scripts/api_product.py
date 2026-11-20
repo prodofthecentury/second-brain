@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Product routes for the loopback Memory API: notes, streaming chat, one-click review, import, governance.
@@ -880,7 +880,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
     The caller has already enforced loopback, Host/Origin/Sec-Fetch-Site, and the bearer token.
     """
-    rt = handler.server.runtime
+    rt = getattr(handler, "_request_runtime", None) or handler.server.runtime
     paths = _paths(rt)
     q = parse_qs(query or "")
     body = body if isinstance(body, dict) else {}
@@ -1071,11 +1071,17 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     lexical_index_path=rt.lexical_index_path,
                     chroma_path=rt.chroma_path,
                     policy_path=rt.policy_path,
+                    security_dir=getattr(rt, "security_dir", None),
                     telemetry_db_path=rt.telemetry_db_path,
                     http_transport=rt.http_transport,
                     skip_dns_check_for_mock_transport=rt.skip_dns_check_for_mock_transport,
                     include_quarantined_inbox=bool(is_owner),
                 )
+                if req.answer_view == "preference" and not is_owner:
+                    return send(
+                        403,
+                        {"error": "403 Forbidden: subjective preference view requires owner authorization."},
+                    )
                 inc_prefs = bool(is_owner and req.include_preferences)
                 stream_sse(
                     handler,
@@ -2595,8 +2601,17 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(200, res)
 
-        # ── Local-First Browser Web Clipper (scoped token on /ping,/status,/clip; owner-only on pairings) ──
+        # ── Local-First Browser Web Clipper (scoped token or owner-only on /ping,/status,/clip; owner-only on pairings) ──
         sec_dir = getattr(rt, "security_dir", None)
+        if path in {"/v1/clipper/ping", "/v1/clipper/status", "/v1/clipper/clip"}:
+            pairing = getattr(handler, "_clipper_pairing", None)
+            if pairing is None and not is_owner:
+                return send(
+                    403,
+                    {
+                        "error": "403 Forbidden: browser clipper endpoints require a paired scoped clipper_* token or owner authorization."
+                    },
+                )
         if path == "/v1/clipper/ping" and method == "GET":
             return send(
                 200,
@@ -2623,6 +2638,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/clipper/clip" and method == "POST":
+            client_ip = handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1"
+            if not check_capture_rate_limit(client_ip):
+                return send(
+                    429,
+                    {"error": "Too Many Requests: capture write rate limit exceeded (max 180 per minute)."},
+                )
             pairing = getattr(handler, "_clipper_pairing", None)
             src_label = (
                 f"clipper:{pairing.get('pairing_id')}"

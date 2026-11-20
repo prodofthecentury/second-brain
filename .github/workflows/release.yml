@@ -197,7 +197,7 @@ jobs:
           name: dist-macos
           path: |
             dist/*.dmg
-            dist/*.zip
+            dist/Second-Brain-*.zip
           if-no-files-found: error
 
   build-linux:

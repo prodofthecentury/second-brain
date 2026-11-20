@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """
@@ -23,6 +23,7 @@ VALID_ORIGINS = {
     "user_local",
     "mcp_local",
     "api_local",
+    "web_clipper",
     "web_remote",
     "cognitive_experience",
     "untrusted_inbox",
@@ -31,6 +32,7 @@ VALID_ORIGINS = {
 _NON_USER_ORIGINS = {
     "mcp_local",
     "api_local",
+    "web_clipper",
     "web_remote",
     "cognitive_experience",
     "untrusted_inbox",

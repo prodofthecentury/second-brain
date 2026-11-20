@@ -858,7 +858,7 @@ async function chooseVaultDirectory() {
     encoding: "utf8",
     mode: 0o600,
   });
-  activeVaultOverride = vaultDir;
+  activeVaultOverride = IS_SMOKE_TEST ? vaultDir : "";
 
   await stopApiServer();
   try {
@@ -877,7 +877,7 @@ async function chooseVaultDirectory() {
   return { ok: true, vaultDir, port: apiPort };
 }
 
-const ALLOWED_HTTP_METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
+const ALLOWED_HTTP_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 
 function apiRequest(method, apiPath, body = null) {
   const safeMethod = String(method || "").toUpperCase();
@@ -940,9 +940,23 @@ function apiRequest(method, apiPath, body = null) {
           } catch {
             data = { raw };
           }
+          const ok = res.statusCode >= 200 && res.statusCode < 300;
+          if (
+            ok &&
+            safeMethod === "POST" &&
+            (apiPath === "/v1/vaults/switch" ||
+              (apiPath === "/v1/vaults" && body && body.activate))
+          ) {
+            if (!IS_SMOKE_TEST) {
+              activeVaultOverride = "";
+            } else if (data && (data.active_vault_path || data.path)) {
+              activeVaultOverride = String(data.active_vault_path || data.path);
+            }
+            refreshTrayMenu();
+          }
           resolve({
             status: res.statusCode || 500,
-            ok: res.statusCode >= 200 && res.statusCode < 300,
+            ok,
             data,
           });
         });

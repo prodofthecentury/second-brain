@@ -358,9 +358,10 @@ def launch_dashboard(port: int = 8501) -> int:
     dash_env.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
     dash_env.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
     if not (dash_env.get("BRAIN_VAULT_DIR") or "").strip():
-        persisted_or_installed = _config.read_persisted_vault_dir() or _default_installed_vault()
-        if persisted_or_installed:
-            dash_env["BRAIN_VAULT_DIR"] = persisted_or_installed
+        if not _config.read_persisted_vault_dir():
+            installed_vault = _default_installed_vault()
+            if installed_vault:
+                dash_env["BRAIN_VAULT_DIR"] = installed_vault
     return subprocess.call(
         [
             sys.executable, "-m", "streamlit", "run", str(app_path),

@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = ["chromadb", "ollama"]
 # ///
 """Exercise a real Chroma staged rebuild and directory activation on this OS."""

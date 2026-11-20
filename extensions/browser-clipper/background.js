@@ -1,6 +1,6 @@
 "use strict";
 
-if (typeof importScripts === "function") {
+if (typeof SecondBrainClipper === "undefined" && typeof importScripts === "function") {
   importScripts("lib/clipper-client.js");
 }
 

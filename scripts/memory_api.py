@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "httpx>=0.28,<1",
 #     "pydantic>=2.7,<3",
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+import copy
 import datetime
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,7 +39,7 @@ if __name__ in ("memory_api", "scripts.memory_api"):
     sys.modules.setdefault("scripts.memory_api", sys.modules[__name__])
 
 from answer_policy import AnswerRequest, collect_unverified_leads
-from atom_mutator import approved_revision_is_current
+from atom_mutator import approved_revision_is_current, review_lock
 from cognitive_core import (
     compute_memory_fitness_report,
     peek_lexical_candidate_atom_ids,
@@ -443,8 +444,14 @@ def _check_and_record_auth(client_key: str, provided_header: str | None, expecte
         return (False, 429 if new_locked_until > 0.0 else 401)
 
 
-def _max_body_bytes_for_route(method: str, path: str, *, is_owner: bool = False) -> int:
-    if method == "POST" and path == "/v1/clipper/clip":
+def _max_body_bytes_for_route(
+    method: str,
+    path: str,
+    *,
+    is_owner: bool = False,
+    is_clipper: bool = False,
+) -> int:
+    if method == "POST" and path == "/v1/clipper/clip" and (is_owner or is_clipper):
         return 300_000
     if not is_owner:
         return MAX_API_BODY_BYTES
@@ -628,9 +635,20 @@ class MemoryApiRuntimeConfig:
         self.security_dir = Path(security_dir).expanduser().resolve() if security_dir is not None else None
         self.http_transport = http_transport
         self.skip_dns_check_for_mock_transport = skip_dns_check_for_mock_transport
+        self._live_parent: MemoryApiRuntimeConfig | None = None
+
+    def snapshot(self) -> MemoryApiRuntimeConfig:
+        """Return an immutable per-request snapshot of active vault paths under _switch_lock."""
+        root = self._live_parent or self
+        with root._switch_lock:
+            snap = copy.copy(root)
+            snap._live_parent = root
+            return snap
 
     def switch_brain_dir(self, new_brain_dir: str) -> None:
         """Hot-switch this live runtime config to another validated vault directory."""
+        if self._live_parent is not None:
+            self._live_parent.switch_brain_dir(new_brain_dir)
         abs_new = os.path.abspath(os.path.expanduser(new_brain_dir))
         if os.path.lexists(abs_new) and _is_reparse_or_link(abs_new):
             raise PermissionError(f"Refusing to switch runtime to symlinked vault: {abs_new}")
@@ -643,11 +661,14 @@ class MemoryApiRuntimeConfig:
             self.lexical_index_path = os.path.join(abs_new, ".sidecar", "lexical.sqlite3")
             self.chroma_path = os.path.join(abs_new, ".chroma")
             self.telemetry_db_path = os.path.join(abs_new, ".sidecar", "telemetry.sqlite3")
-            if not os.path.exists(self.lexical_index_path):
+            if self._live_parent is None and not os.path.exists(self.lexical_index_path):
                 try:
+                    sidecar_dir = os.path.dirname(self.lexical_index_path)
                     os.makedirs(self.atoms_dir, exist_ok=True)
-                    os.makedirs(os.path.dirname(self.lexical_index_path), exist_ok=True)
-                    rebuild_lexical_index(self.atoms_dir, self.lexical_index_path)
+                    os.makedirs(sidecar_dir, exist_ok=True)
+                    with review_lock(os.path.join(sidecar_dir, "writer.lock")):
+                        if not os.path.exists(self.lexical_index_path):
+                            rebuild_lexical_index(self.atoms_dir, self.lexical_index_path)
                 except Exception:
                     pass
 
@@ -910,18 +931,22 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             return False
 
         req_path = urlparse(self.path).path
-        sec_dir = getattr(self.server.runtime, "security_dir", None)
+        rt_snap = self.server.runtime.snapshot()
+        self._request_runtime = rt_snap
+        sec_dir = getattr(rt_snap, "security_dir", None)
         origin_hdr = (self.headers.get("Origin") or "").strip().lower().rstrip("/")
         paired_ext_origin = False
         if origin_hdr and origin_hdr != f"http://{ALLOWED_API_BIND_HOST}:{bound_port}":
             if req_path in CLIPPER_SCOPED_PATHS and is_paired_clipper_origin(origin_hdr, security_dir=sec_dir):
                 paired_ext_origin = True
+                self._clipper_cors_origin = origin_hdr
             else:
                 self._send_json(403, {"error": "403 Forbidden: cross-origin browser request rejected."})
                 return False
 
         sec_fetch_site = self.headers.get("Sec-Fetch-Site")
-        if sec_fetch_site is not None and sec_fetch_site.strip().lower() not in {"none", "same-origin"}:
+        allowed_fetch_sites = {"none", "same-origin", "cross-site"} if paired_ext_origin else {"none", "same-origin"}
+        if sec_fetch_site is not None and sec_fetch_site.strip().lower() not in allowed_fetch_sites:
             self._send_json(403, {"error": "403 Forbidden: cross-site browser request rejected."})
             return False
 
@@ -942,7 +967,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 return False
             pairing = verify_clipper_token(
                 auth_hdr,
-                origin=origin_hdr if paired_ext_origin else None,
+                origin=origin_hdr or None,
                 security_dir=sec_dir,
             )
             if pairing is None:
@@ -970,7 +995,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
         # Isolated per-vault token path (vb_* valid strictly against its own active vault)
         is_vtok, matched_vid, vtok_err = verify_per_vault_token(
             auth_hdr,
-            active_vault_path=self.server.runtime.brain_dir,
+            active_vault_path=rt_snap.brain_dir,
             security_dir=sec_dir,
         )
         if is_vtok:
@@ -984,7 +1009,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(fail_code, {"error": vtok_err or "Unauthorized: invalid vault bearer token."})
             return False
 
-        expected = get_configured_api_token(self.server.runtime.token_path)
+        expected = get_configured_api_token(rt_snap.token_path)
         auth_ok, fail_code = _check_and_record_auth(
             client_ip,
             auth_hdr,
@@ -1067,7 +1092,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
         return parsed
 
     def _handle_route_exception(self, method: str, path: str, exc: Exception) -> None:
-        rt = self.server.runtime
+        rt = getattr(self, "_request_runtime", None) or self.server.runtime
         if isinstance(exc, (MemoryRecallUnavailable, LexicalIndexUnavailable)):
             try:
                 _audit_api_event(rt.brain_dir, path, method, 503)
@@ -1101,7 +1126,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self._verify_security_envelope():
             return
-        rt = self.server.runtime
+        rt = getattr(self, "_request_runtime", None) or self.server.runtime.snapshot()
         parsed_url = urlparse(self.path)
         path = parsed_url.path
 
@@ -1283,7 +1308,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
     def _dispatch_body_method(self, method: str) -> None:
         if not self._verify_security_envelope():
             return
-        rt = self.server.runtime
+        rt = getattr(self, "_request_runtime", None) or self.server.runtime.snapshot()
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         is_owner, throttled_429, _ = api_product.evaluate_request_owner_auth(
@@ -1300,7 +1325,14 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
         ):
             raw_json: dict[str, object] | None = {}
         else:
-            raw_json = self._read_json_body(max_bytes=_max_body_bytes_for_route(method, path, is_owner=is_owner))
+            raw_json = self._read_json_body(
+                max_bytes=_max_body_bytes_for_route(
+                    method,
+                    path,
+                    is_owner=is_owner,
+                    is_clipper=bool(getattr(self, "_clipper_pairing", None)),
+                )
+            )
             if raw_json is None:
                 return
         try:
@@ -1321,7 +1353,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._verify_security_envelope():
             return
-        rt = self.server.runtime
+        rt = getattr(self, "_request_runtime", None) or self.server.runtime.snapshot()
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         is_owner, throttled_429, had_failed_owner_hdr = api_product.evaluate_request_owner_auth(
@@ -1330,7 +1362,14 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
         if throttled_429:
             self._send_json(429, {"error": "Too Many Requests: owner token authentication rate limit exceeded."})
             return
-        raw_json = self._read_json_body(max_bytes=_max_body_bytes_for_route("POST", path, is_owner=is_owner))
+        raw_json = self._read_json_body(
+            max_bytes=_max_body_bytes_for_route(
+                "POST",
+                path,
+                is_owner=is_owner,
+                is_clipper=bool(getattr(self, "_clipper_pairing", None)),
+            )
+        )
         if raw_json is None:
             return
 
@@ -1456,6 +1495,13 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 if had_failed_owner_hdr:
                     _audit_api_event(rt.brain_dir, path, "POST", 403)
                 req = ApiAnswerRequest.model_validate(raw_json)
+                if req.mode == "preference" and not is_owner:
+                    _audit_api_event(rt.brain_dir, path, "POST", 403)
+                    self._send_json(
+                        403,
+                        {"error": "403 Forbidden: subjective preference mode requires owner authorization."},
+                    )
+                    return
                 projects = (req.project_scope.strip(),) if req.project_scope and req.project_scope.strip() else ()
                 opts = RecallOptions(
                     n_results=req.n_results,
@@ -1486,9 +1532,9 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                         brain_dir=rt.brain_dir,
                         project_scope=req.project_scope,
                         limit=req.n_results,
-                        include_quarantined_inbox=bool(is_owner),
+                        include_quarantined_inbox=True,
                     )
-                    if req.mode == "research"
+                    if (req.mode == "research" and is_owner)
                     else ()
                 )
                 ans = generate_grounded_answer_via_host(
@@ -1499,6 +1545,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     atoms_dir=rt.atoms_dir,
                     brain_dir=rt.brain_dir,
                     policy_path=rt.policy_path,
+                    security_dir=rt.security_dir,
                     http_transport=rt.http_transport,
                     skip_dns_check_for_mock_transport=rt.skip_dns_check_for_mock_transport,
                     unverified_leads=leads if req.mode == "research" else None,
@@ -1606,6 +1653,14 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             if path == "/v1/cognitive/experiences":
                 if had_failed_owner_hdr:
                     _audit_api_event(rt.brain_dir, path, "POST", 403)
+                client_ip = self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1"
+                if not api_product.check_capture_rate_limit(client_ip):
+                    _audit_api_event(rt.brain_dir, path, "POST", 429)
+                    self._send_json(
+                        429,
+                        {"error": "Too Many Requests: capture write rate limit exceeded (max 180 per minute)."},
+                    )
+                    return
                 req = ApiExperienceCreateRequest.model_validate(raw_json)
                 saved = save_experience_record(
                     goal=req.goal,
@@ -1660,6 +1715,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     chroma_path=rt.chroma_path,
                     telemetry_db_path=rt.telemetry_db_path,
                     policy_path=rt.policy_path,
+                    security_dir=rt.security_dir,
                     http_transport=rt.http_transport,
                     skip_dns_check_for_mock_transport=rt.skip_dns_check_for_mock_transport,
                     save_briefing=False,
@@ -1711,7 +1767,7 @@ class MemoryApiClient:
         self._timeout = timeout
 
     def _request(self, method: str, path: str, json_body: dict[str, object] | None = None) -> dict[str, object]:
-        payload = json_body if json_body is not None else ({} if method in {"POST", "PUT", "DELETE"} else None)
+        payload = json_body if json_body is not None else ({} if method in {"POST", "PUT", "PATCH", "DELETE"} else None)
         with httpx.Client(timeout=self._timeout, follow_redirects=False, trust_env=False) as client:
             resp = client.request(method, f"{self.base_url}{path}", headers=self._headers, json=payload)
             resp.raise_for_status()

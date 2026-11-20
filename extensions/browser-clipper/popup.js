@@ -128,9 +128,12 @@ async function initPopup() {
         },
       });
       if (res.quarantined) {
+        const snapNote = res.snapshot_sha256
+          ? ` Snapshot SHA-256: ${String(res.snapshot_sha256).slice(0, 16)}…`
+          : " (snapshot withheld until owner inbox review)";
         showResult(
           "warn",
-          `Quarantined to ${res.location}${res.filename} (DLP/risk flags: ${(res.risk_flags || []).join(", ")}). Snapshot SHA-256: ${String(res.snapshot_sha256 || "").slice(0, 16)}…`
+          `Quarantined to ${res.location}${res.filename} (DLP/risk flags: ${(res.risk_flags || []).join(", ")}).${snapNote}`
         );
       } else {
         showResult(

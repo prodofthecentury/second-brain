@@ -17,7 +17,11 @@
     "default_title": "Clip to Second Brain"
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "scripts": [
+      "lib/clipper-client.js",
+      "background.js"
+    ]
   },
   "browser_specific_settings": {
     "gecko": {

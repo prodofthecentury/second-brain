@@ -15,6 +15,8 @@ test("manifest.json enforces MV3 loopback-only host_permissions and CSP", () => 
   assert.deepEqual(manifest.host_permissions, ["http://127.0.0.1/*"]);
   assert.ok(manifest.content_security_policy.extension_pages.includes("connect-src http://127.0.0.1:*"));
   assert.ok(manifest.browser_specific_settings && manifest.browser_specific_settings.gecko.id);
+  assert.equal(manifest.background.service_worker, "background.js");
+  assert.deepEqual(manifest.background.scripts, ["lib/clipper-client.js", "background.js"]);
 });
 
 test("zero innerHTML usage across all browser clipper JS files", () => {

@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Tests for OS-Signed Desktop Installers, SOTA Benchmark, Merkle Ledger, Contradiction Radar & Time-Travel."""

@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #     "mcp>=2.3,<3",
 #     "ollama>=0.6,<1",
@@ -446,6 +446,15 @@ def assert_mcp_loopback_transport(host: str | None = None) -> str:
     return candidate
 
 
+def _is_preference_atom_text(raw_text: str) -> bool:
+    fm_parsed = split_frontmatter(raw_text or "")
+    if not fm_parsed:
+        return False
+    fm_vals = parse_frontmatter_values(fm_parsed[0])
+    epistemic_label = str(fm_vals.get("epistemic_label") or "claim").strip().lower()
+    return epistemic_label == "preference" or bool(fm_vals.get("epistemic_contract"))
+
+
 def semantic_search(query: str, n_results: int = 5, project: str | None = None) -> list[dict]:
     query = str(query or "")[:4096]
     try:
@@ -457,7 +466,7 @@ def semantic_search(query: str, n_results: int = 5, project: str | None = None) 
     direct, neighbors = search_memory(
         query,
         RecallOptions(
-            n_results=n_results,
+            n_results=min(25, n_results * 2),
             follow_links=True,
             include_statuses={"accepted"},
             projects=projects,
@@ -466,7 +475,13 @@ def semantic_search(query: str, n_results: int = 5, project: str | None = None) 
         index_path=vdirs["lexical_index_path"],
         chroma_path=vdirs["chroma_path"],
     )
-    return [item.as_dict() for item in direct + neighbors]
+    filtered = [
+        item
+        for item in (direct + neighbors)
+        if not _is_preference_atom_text(item.content)
+        and _tags_strictly_in_project_scope(item.contexts, project)
+    ]
+    return [item.as_dict() for item in filtered[:n_results]]
 
 
 def read_file_safe(path: str | None) -> str:
@@ -922,18 +937,17 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         if not raw_atom_id or "../" in raw_atom_id or "..\\" in raw_atom_id or "/" in raw_atom_id or "\\" in raw_atom_id:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{raw_atom_id}' not found or invalid.")])
         atom_id = normalize_markdown_filename(raw_atom_id)
-        path    = safe_file_in_dir(vdirs["atoms_dir"], atom_id, allowed_exts={".md"})
-        if not path:
+        raw_exists = safe_file_in_dir(vdirs["atoms_dir"], atom_id, allowed_exts={".md"})
+        if not raw_exists:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{atom_id}' not found or invalid.")])
-        if not approved_revision_is_current(path, brain_dir=vdirs["brain_dir"], atoms_dir=vdirs["atoms_dir"]):
+        loaded = _load_verified_non_preference_atom(
+            atom_id,
+            vdirs=vdirs,
+            project=str(arguments.get("project") or "").strip() or None,
+        )
+        if loaded is None:
             return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
-        try:
-            record = parse_atom_record(path)
-            if record.get("review_status") != "accepted" or bool(record.get("superseded_by")):
-                return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
-        except Exception:
-            return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
-        content = read_file_safe(path)
+        content = read_file_safe(loaded[1])
         if not content:
             return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
         return types.CallToolResult(content=[types.TextContent(type="text", text=content)])
@@ -1783,16 +1797,10 @@ async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) ->
     uri = str(params.uri)
     if uri.startswith("brain://atoms/"):
         filename = uri.removeprefix("brain://atoms/")
-        path = safe_file_in_dir(vdirs["atoms_dir"], filename, allowed_exts={".md"})
-        if not path or not approved_revision_is_current(path, brain_dir=vdirs["brain_dir"], atoms_dir=vdirs["atoms_dir"]):
+        loaded = _load_verified_non_preference_atom(filename, vdirs=vdirs)
+        if loaded is None:
             return types.ReadResourceResult(contents=[])
-        try:
-            record = parse_atom_record(path)
-            if record.get("review_status") != "accepted" or bool(record.get("superseded_by")):
-                return types.ReadResourceResult(contents=[])
-        except Exception:
-            return types.ReadResourceResult(contents=[])
-        content = read_file_safe(path)
+        content = read_file_safe(loaded[1])
         if not content:
             return types.ReadResourceResult(contents=[])
         return types.ReadResourceResult(contents=[types.TextResourceContents(uri=uri, mimeType="text/markdown", text=content)])

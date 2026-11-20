@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Goal 4 verification suite: Zero-Knowledge E2EE Vault Sync, UI parity & CI/release hygiene."""
@@ -572,10 +572,98 @@ class Goal4VaultSyncAndUiParityTests(unittest.TestCase):
         pkg_ps1 = (REPO_ROOT / "scripts" / "package_desktop.ps1").read_text(encoding="utf-8")
         self.assertIn("[switch]$SkipSign", pkg_ps1)
 
-        for sh_rel in ("setup.sh", "run_daemon.sh", "scripts/package_desktop.sh"):
+        for sh_rel in ("setup.sh", "run_daemon.sh", "run_dashboard.sh", "run_night_shift.sh", "scripts/package_desktop.sh"):
             sh_path = REPO_ROOT / sh_rel
             self.assertTrue(sh_path.is_file())
             self.assertNotIn(b"\r", sh_path.read_bytes(), f"{sh_rel} must be strictly LF-only!")
+
+    def test_unauthenticated_head_rejection_remote_deletions_and_streamed_size_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            va, vb = root / "va", root / "vb"
+            sa, sb = root / "sa", root / "sb"
+            target = root / "sync"
+            _seed_sample_vault(va)
+            (va / "notes" / "ephemeral.md").write_text("---\ntitle: Ephemeral\n---\n\nTemp note.\n", encoding="utf-8")
+            (va / "notes" / "mod-del.md").write_text("---\ntitle: ModDel\n---\n\nInitial.\n", encoding="utf-8")
+            vb.mkdir(parents=True)
+
+            init_res = vault_sync.init_sync(str(target), brain_dir=va, device_name="dev-a", state_dir=sa)
+            vault_sync.sync_push(brain_dir=va, state_dir=sa)
+            vault_sync.join_sync(
+                str(target),
+                brain_dir=vb,
+                device_name="dev-b",
+                recovery_key_b64=init_res["recovery_key_b64"],
+                state_dir=sb,
+            )
+            vault_sync.sync_pull(brain_dir=vb, state_dir=sb)
+            self.assertTrue((vb / "notes" / "ephemeral.md").is_file())
+            self.assertTrue((vb / "notes" / "mod-del.md").is_file())
+
+            # 1) Unauthenticated remote head.json (valid Ed25519 signature by attacker WITHOUT master_key)
+            good_head = (target / "head.json").read_bytes()
+            cfg_b_path = vault_sync.sync_config_path(vb, state_dir=sb)
+            peers_before = json.loads(cfg_b_path.read_text(encoding="utf-8"))["trusted_peers"]
+
+            att_priv, att_pub = vault_sync._generate_device_keypair()
+            fake_head = json.loads(good_head.decode("utf-8"))
+            fake_head["device_id"] = "attacker-dev99"
+            fake_head["device_pubkey_b64"] = att_pub
+            fake_head["epoch"] = 50
+            fake_head["signature_b64"] = vault_sync._sign_head(fake_head, att_priv)
+            fake_head["head_mac"] = "0" * 64
+            (target / "head.json").write_text(json.dumps(fake_head), encoding="utf-8")
+
+            with self.assertRaises(vault_sync.SyncSecurityError):
+                vault_sync.sync_pull(brain_dir=vb, state_dir=sb)
+            peers_after = json.loads(cfg_b_path.read_text(encoding="utf-8"))["trusted_peers"]
+            self.assertEqual(peers_before, peers_after, "Attacker peer MUST NOT be persisted to trusted_peers!")
+
+            # Truncated / malformed head.json missing required fields must also raise SyncSecurityError (never KeyError)
+            (target / "head.json").write_text(json.dumps({"vault_id": init_res["vault_id"], "head_mac": "ab" * 32}), encoding="utf-8")
+            with self.assertRaises(vault_sync.SyncSecurityError):
+                vault_sync.sync_pull(brain_dir=vb, state_dir=sb)
+            (target / "head.json").write_bytes(good_head)
+
+            # 2) Remote deletion propagation + modify/delete conflict preservation
+            (va / "notes" / "ephemeral.md").unlink()
+            (va / "notes" / "mod-del.md").unlink()
+            (vb / "notes" / "mod-del.md").write_text("---\ntitle: ModDel\n---\n\nEdited locally on B.\n", encoding="utf-8")
+
+            vault_sync.sync_push(brain_dir=va, state_dir=sa)
+            pull_del = vault_sync.sync_pull(brain_dir=vb, state_dir=sb)
+            self.assertEqual(pull_del["deleted"], 1)
+            self.assertFalse((vb / "notes" / "ephemeral.md").exists(), "Cleanly deleted remote note must be removed on pull!")
+            self.assertTrue((vb / "notes" / "mod-del.md").is_file(), "Locally modified file must survive remote deletion!")
+            self.assertTrue(any(c.get("conflict_kind") == "modify_delete" for c in pull_del["conflicts"]))
+
+            # Next push from Device B must NOT resurrect ephemeral.md!
+            vault_sync.sync_push(brain_dir=vb, state_dir=sb)
+            vault_sync.sync_pull(brain_dir=va, state_dir=sa)
+            self.assertFalse((va / "notes" / "ephemeral.md").exists())
+
+            # 3) Streamed HttpObjectSyncBackend aborts immediately when streamed chunks exceed max_bytes
+            chunks_yielded = 0
+
+            class _OversizedStream(httpx.SyncByteStream):
+                def __iter__(self):
+                    nonlocal chunks_yielded
+                    for _ in range(10):
+                        chunks_yielded += 1
+                        yield b"X" * 1024
+
+            def stream_handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, stream=_OversizedStream())
+
+            http_backend = vault_sync.HttpObjectSyncBackend(
+                "https://sync.example.com/bucket",
+                http_transport=httpx.MockTransport(stream_handler),
+                skip_dns_check_for_mock_transport=True,
+            )
+            with self.assertRaises(vault_sync.SyncSecurityError):
+                http_backend.get_object("head.json", max_bytes=2048)
+            self.assertLessEqual(chunks_yielded, 3, "Stream must abort as soon as max_bytes is exceeded!")
 
 
 if __name__ == "__main__":

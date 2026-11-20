@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Cognitive Core layer: disposable sidecar telemetry, memory fitness reports, and experience records."""
@@ -737,6 +737,35 @@ def save_experience_record(
         skills_list.append(cand_title)
     skills_tuple = tuple(skills_list)
     effective_proc_title = cand_title or (skills_tuple[0] if skills_tuple else None)
+
+    from host_adapters import inspect_and_redact_outbound
+    from inbox_workflow import scan_inbox_payload_risks
+
+    all_text_parts = [
+        goal_clean,
+        summary_clean,
+        reasoning_clean,
+        reflection_clean,
+        cand_title or "",
+        *ctx_tuple,
+        *plan_tuple,
+        *act_tuple,
+        *tools_tuple,
+        *atoms_tuple,
+        *new_mem_tuple,
+        *upd_mem_tuple,
+        *skills_tuple,
+        *lessons_tuple,
+    ]
+    combined_payload = "\n".join(p for p in all_text_parts if p)
+    risk_flags = list(scan_inbox_payload_risks(combined_payload))
+    dlp_scan = inspect_and_redact_outbound(combined_payload, redact_pii=False, fail_on_secret_detection=False)
+    for sec_hit in dlp_scan.secret_hits:
+        flag = f"dlp_secret:{sec_hit}"
+        if flag not in risk_flags:
+            risk_flags.append(flag)
+    if risk_flags:
+        raise ValueError(f"Rejected experience record due to security/DLP risk flags: {', '.join(risk_flags)}.")
 
     lock_path = os.path.join(brain_dir, ".sidecar", "writer.lock")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)

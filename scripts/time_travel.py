@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Time-Travel Vault Snapshots, Semantic Diff & Point-in-Time Okapi BM25 Recall.

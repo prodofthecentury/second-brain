@@ -388,66 +388,93 @@ def ingest_web_clip(
     risks = _screen_clip_risks(clean_url, clean_title, clean_quote, clean_page)
     quarantined = bool(risks) or dest_norm == "inbox"
 
-    # Build immutable UTF-8 source snapshot so quotes can later be cryptographically anchored.
-    snap_sections = [
-        "---",
-        f"title: {json.dumps(clean_title, ensure_ascii=False)}",
-        "type: web_clip_snapshot",
-        f"source_url: {json.dumps(clean_url, ensure_ascii=False)}",
-        f"captured_at: {captured_at}",
-        f"capture_source: {json.dumps(str(capture_source or 'browser-clipper')[:64], ensure_ascii=False)}",
-        "---",
-        "",
-        f"# {clean_title}",
-        "",
-        f"Source URL: {clean_url}",
-        f"Captured At: {captured_at}",
-    ]
-    if clean_quote and (not clean_page or clean_quote not in clean_page):
-        snap_sections.extend(["", "## Selected Quote", "", clean_quote])
-    if clean_page:
-        snap_sections.extend(["", "## Captured Page Text", "", clean_page])
-    snapshot_bytes = ("\n".join(snap_sections).rstrip() + "\n").encode("utf-8")
-    snapshot_sha256 = content_sha256(snapshot_bytes)
+    snapshot_rel: str | None = None
+    snapshot_sha256: str | None = None
+    if not risks:
+        # Build immutable UTF-8 source snapshot so clean quotes can later be cryptographically anchored.
+        # Risk-flagged clips NEVER write unredacted snapshots to 0-raw/note-snapshots/.
+        snap_sections = [
+            "---",
+            f"title: {json.dumps(clean_title, ensure_ascii=False)}",
+            "type: web_clip_snapshot",
+            f"source_url: {json.dumps(clean_url, ensure_ascii=False)}",
+            f"captured_at: {captured_at}",
+            f"capture_source: {json.dumps(str(capture_source or 'browser-clipper')[:64], ensure_ascii=False)}",
+            "---",
+            "",
+            f"# {clean_title}",
+            "",
+            f"Source URL: {clean_url}",
+            f"Captured At: {captured_at}",
+        ]
+        if clean_quote and (not clean_page or clean_quote not in clean_page):
+            snap_sections.extend(["", "## Selected Quote", "", clean_quote])
+        if clean_page:
+            snap_sections.extend(["", "## Captured Page Text", "", clean_page])
+        snapshot_bytes = ("\n".join(snap_sections).rstrip() + "\n").encode("utf-8")
+        snapshot_sha256 = content_sha256(snapshot_bytes)
 
-    snap_dir = Path(resolved_brain) / "0-raw" / "note-snapshots"
-    os.makedirs(os.path.dirname(npaths.lock_path), exist_ok=True)
-    with review_lock(npaths.lock_path):
-        snap_name = _write_exclusive_snapshot(snap_dir, f"clip-{stamp}-{slug}", snapshot_bytes)
-    snapshot_rel = f"0-raw/note-snapshots/{snap_name}"
+        snap_dir = Path(resolved_brain) / "0-raw" / "note-snapshots"
+        os.makedirs(os.path.dirname(npaths.lock_path), exist_ok=True)
+        with review_lock(npaths.lock_path):
+            snap_name = _write_exclusive_snapshot(snap_dir, f"clip-{stamp}-{slug}", snapshot_bytes)
+        snapshot_rel = f"0-raw/note-snapshots/{snap_name}"
 
     if quarantined:
         inbox_dir = Path(npaths.inbox_dir)
         inbox_dir.mkdir(parents=True, exist_ok=True)
         if _is_reparse_or_link(str(inbox_dir)):
             raise ClipperSecurityError("Refusing to write quarantined clip to symlinked inbox directory.")
+        os.makedirs(os.path.dirname(npaths.lock_path), exist_ok=True)
+        safe_url = (
+            inspect_and_redact_outbound(clean_url, redact_pii=False, fail_on_secret_detection=False).sanitized_text
+            if risks and clean_url
+            else clean_url
+        )
+        safe_quote = (
+            inspect_and_redact_outbound(clean_quote, redact_pii=False, fail_on_secret_detection=False).sanitized_text
+            if risks and clean_quote
+            else clean_quote
+        )
+        safe_page = (
+            inspect_and_redact_outbound(clean_page, redact_pii=False, fail_on_secret_detection=False).sanitized_text
+            if risks and clean_page
+            else clean_page
+        )
+        safe_title = (
+            inspect_and_redact_outbound(clean_title, redact_pii=False, fail_on_secret_detection=False).sanitized_text
+            if risks and clean_title
+            else clean_title
+        )
+        inbox_slug = slugify(safe_title, max_len=48) if risks else slug
         safe_src = re.sub(r"-{2,}", "-", re.sub(r"[^A-Za-z0-9._:-]", "", str(capture_source or "browser-clipper")))[:64]
         inbox_lines = [
             "<!-- second_brain_origin: web_clipper -->",
             f"<!-- capture_source: {safe_src} -->",
-            f"<!-- source_url: {clean_url.replace('--', '—')} -->",
-            f"<!-- clip_snapshot: {snapshot_rel} -->",
-            f"<!-- clip_snapshot_sha256: {snapshot_sha256} -->",
+            f"<!-- source_url: {safe_url.replace('--', '—')} -->",
         ]
+        if snapshot_rel and snapshot_sha256:
+            inbox_lines.append(f"<!-- clip_snapshot: {snapshot_rel} -->")
+            inbox_lines.append(f"<!-- clip_snapshot_sha256: {snapshot_sha256} -->")
         if risks:
             inbox_lines.append(f"<!-- quarantine_risks: {', '.join(risks)} -->")
-        inbox_lines.extend(
-            [
-                "",
-                f"# {clean_title}",
-                "",
-                f"- Source: {clean_url}",
-                f"- Snapshot: `{snapshot_rel}` (`{snapshot_sha256}`)",
-                f"- Tags: {', '.join(merged_tags)}",
-            ]
-        )
-        if clean_quote:
-            inbox_lines.extend(["", "## Highlighted Quote", "", f"> {clean_quote}"])
-        if clean_page:
-            inbox_lines.extend(["", "## Page Text", "", clean_page])
+        meta_lines = [
+            "",
+            f"# {safe_title}",
+            "",
+            f"- Source: {safe_url}",
+        ]
+        if snapshot_rel and snapshot_sha256:
+            meta_lines.append(f"- Snapshot: `{snapshot_rel}` (`{snapshot_sha256}`)")
+        meta_lines.append(f"- Tags: {', '.join(merged_tags)}")
+        inbox_lines.extend(meta_lines)
+        if safe_quote:
+            inbox_lines.extend(["", "## Highlighted Quote", "", f"> {safe_quote}"])
+        if safe_page:
+            inbox_lines.extend(["", "## Page Text", "", safe_page])
         inbox_bytes = ("\n".join(inbox_lines).rstrip() + "\n").encode("utf-8")
         with review_lock(npaths.lock_path):
-            inbox_name = _write_exclusive_snapshot(inbox_dir, f"{stamp}-{slug}-clip", inbox_bytes)
+            inbox_name = _write_exclusive_snapshot(inbox_dir, f"{stamp}-{inbox_slug}-clip", inbox_bytes)
         return {
             "status": "quarantined" if risks else "queued_inbox",
             "destination": "inbox",
@@ -462,8 +489,8 @@ def ingest_web_clip(
                 if risks
                 else "Clipped directly to quarantined 0-raw/inbox/ as requested."
             ),
-            "url": clean_url,
-            "title": clean_title,
+            "url": safe_url,
+            "title": safe_title,
             "tags": merged_tags,
             "captured_at": captured_at,
         }

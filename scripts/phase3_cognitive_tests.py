@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11,<3.12"
+# requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
 """Phase 3A tests: Context-profile & fitness ranking, owner-gated Playbooks, and grounded Executive Planner."""

@@ -38,6 +38,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from atom_mutator import review_lock  # noqa: E402
 from config import (  # noqa: E402
     _is_reparse_or_link,
     ensure_dirs,
@@ -48,6 +49,8 @@ from config import (  # noqa: E402
 )
 from host_adapters import restrict_security_file_permissions  # noqa: E402
 from lexical_store import lexical_index_is_current, rebuild_lexical_index  # noqa: E402
+from memory_format import split_frontmatter  # noqa: E402
+from memory_review import parse_frontmatter_values  # noqa: E402
 from recall import RecallOptions, search_lexical_memory  # noqa: E402
 
 
@@ -104,22 +107,31 @@ def _slugify_vault_id(raw: str) -> str:
     return slug
 
 
+def _assert_no_symlink_ancestors(target: str) -> None:
+    cur = target
+    visited: set[str] = set()
+    while cur and cur not in visited:
+        visited.add(cur)
+        if os.path.lexists(cur) and _is_reparse_or_link(cur):
+            raise VaultWorkspaceSecurityError(f"Refusing to use vault path with symlinked or junctioned component: {cur}")
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            break
+        cur = parent
+
+
 def _norm_abs_path(path: str | Path) -> str:
     raw = str(path or "").strip()
     if not raw or "\x00" in raw or "\r" in raw or "\n" in raw:
         raise VaultWorkspaceError("Vault path must be a non-empty single-line filesystem path.")
     resolved = os.path.abspath(os.path.expanduser(raw))
-    if os.path.lexists(resolved) and _is_reparse_or_link(resolved):
-        raise VaultWorkspaceSecurityError(f"Refusing to use symlinked or junctioned vault directory: {resolved}")
-    parent = os.path.dirname(resolved)
-    if parent and os.path.lexists(parent) and _is_reparse_or_link(parent):
-        raise VaultWorkspaceSecurityError(f"Refusing to use vault under symlinked parent directory: {parent}")
+    _assert_no_symlink_ancestors(resolved)
     return resolved
 
 
 def _paths_overlap(path_a: str, path_b: str) -> bool:
-    a = os.path.normcase(os.path.abspath(path_a))
-    b = os.path.normcase(os.path.abspath(path_b))
+    a = os.path.normcase(os.path.realpath(os.path.abspath(path_a)))
+    b = os.path.normcase(os.path.realpath(os.path.abspath(path_b)))
     try:
         common = os.path.commonpath([a, b])
     except ValueError:
@@ -298,6 +310,10 @@ def create_vault(
     vid = _slugify_vault_id(vault_id if vault_id else clean_label)
     abs_path = _norm_abs_path(path)
 
+    sec_root = str(_sec_dir(security_dir))
+    if _paths_overlap(abs_path, sec_root):
+        raise VaultWorkspaceSecurityError("Vault directory must not overlap the SecondBrain security state directory.")
+
     with _VAULTS_LOCK:
         data = _load_registry_unlocked(security_dir=security_dir, default_active_path=current_brain_dir)
         vaults = [v for v in data.get("vaults", []) if isinstance(v, dict)]
@@ -315,8 +331,10 @@ def create_vault(
         # Initialize directory structure and empty FTS5 index so the vault is immediately usable.
         ensure_dirs(abs_path)
         vp = vault_paths_for(abs_path)
-        if not lexical_index_is_current(vp["atoms_dir"], vp["lexical_index_path"]):
-            rebuild_lexical_index(vp["atoms_dir"], vp["lexical_index_path"])
+        os.makedirs(vp["sidecar_dir"], exist_ok=True)
+        with review_lock(os.path.join(vp["sidecar_dir"], "writer.lock")):
+            if not lexical_index_is_current(vp["atoms_dir"], vp["lexical_index_path"]):
+                rebuild_lexical_index(vp["atoms_dir"], vp["lexical_index_path"])
 
         raw_vault_token: str | None = None
         token_sha: str | None = None
@@ -369,8 +387,10 @@ def switch_vault(
         target_path = _norm_abs_path(str(target.get("path") or ""))
         ensure_dirs(target_path)
         vp = vault_paths_for(target_path)
-        if not lexical_index_is_current(vp["atoms_dir"], vp["lexical_index_path"]):
-            rebuild_lexical_index(vp["atoms_dir"], vp["lexical_index_path"])
+        os.makedirs(vp["sidecar_dir"], exist_ok=True)
+        with review_lock(os.path.join(vp["sidecar_dir"], "writer.lock")):
+            if not lexical_index_is_current(vp["atoms_dir"], vp["lexical_index_path"]):
+                rebuild_lexical_index(vp["atoms_dir"], vp["lexical_index_path"])
         data["active_vault_id"] = vid
         _save_registry_unlocked(data, security_dir=security_dir)
         pointer_path = _write_active_vault_pointer(target_path, security_dir=security_dir)
@@ -491,6 +511,48 @@ def verify_per_vault_token(
     return True, str(owner_entry.get("vault_id") or ""), None
 
 
+def _is_preference_atom(content: str) -> bool:
+    fm_split = split_frontmatter(content or "")
+    if not fm_split:
+        return False
+    fm_vals = parse_frontmatter_values(fm_split[0])
+    label = str(fm_vals.get("epistemic_label") or "claim").strip().lower()
+    return label == "preference" or bool(fm_vals.get("epistemic_contract"))
+
+
+def get_registered_vault_host_policy(
+    brain_dir: str | Path,
+    *,
+    security_dir: str | Path | None = None,
+    policy_path: str | Path | None = None,
+) -> tuple[str | None, str | None]:
+    """Return (vault_id, default_host_policy) if brain_dir is registered in an existing vaults.json."""
+    candidate_sec = security_dir
+    if candidate_sec is None and policy_path is not None:
+        pol_parent = Path(policy_path).expanduser().resolve().parent
+        if os.path.lexists(str(pol_parent / VAULTS_REGISTRY_FILENAME)):
+            candidate_sec = pol_parent
+    reg_path = vaults_registry_path(candidate_sec)
+    if not os.path.lexists(str(reg_path)):
+        return None, None
+    norm_brain = os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser(str(brain_dir)))))
+    try:
+        with _VAULTS_LOCK:
+            data = _load_registry_unlocked(security_dir=candidate_sec, default_active_path=str(brain_dir))
+            vaults = [v for v in data.get("vaults", []) if isinstance(v, dict)]
+    except (OSError, ValueError, VaultWorkspaceSecurityError):
+        return "unknown", "local_only"
+    for item in vaults:
+        raw_p = str(item.get("path") or "")
+        if not raw_p:
+            continue
+        if os.path.normcase(os.path.realpath(os.path.abspath(raw_p))) == norm_brain:
+            vid = str(item.get("vault_id") or "default")
+            pol = str(item.get("default_host_policy") or "local_only").strip().lower()
+            return vid, pol
+    return None, None
+
+
 def federated_recall(
     query: str,
     *,
@@ -549,10 +611,13 @@ def federated_recall(
         if not os.path.isdir(vpath) or _is_reparse_or_link(vpath):
             continue
         vp = vault_paths_for(vpath)
-        if not os.path.isfile(vp["lexical_index_path"]):
-            continue
-        searched_ids.append(vid)
         try:
+            if not lexical_index_is_current(vp["atoms_dir"], vp["lexical_index_path"]):
+                os.makedirs(vp["sidecar_dir"], exist_ok=True)
+                os.makedirs(vp["atoms_dir"], exist_ok=True)
+                with review_lock(os.path.join(vp["sidecar_dir"], "writer.lock")):
+                    if not lexical_index_is_current(vp["atoms_dir"], vp["lexical_index_path"]):
+                        rebuild_lexical_index(vp["atoms_dir"], vp["lexical_index_path"])
             direct, _ = search_lexical_memory(
                 clean_query,
                 RecallOptions(
@@ -566,9 +631,10 @@ def federated_recall(
             )
         except Exception:
             continue
+        searched_ids.append(vid)
         for hit in direct:
             # Exclude subjective preferences in cross-vault federation by default.
-            if "epistemic_label: preference" in hit.content or "epistemic_contract:" in hit.content:
+            if _is_preference_atom(hit.content):
                 continue
             item = hit.as_dict()
             item["vault_id"] = vid
