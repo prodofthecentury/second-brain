@@ -55,7 +55,7 @@ from host_adapters import (
     validate_model_identifier,
 )
 from lexical_store import LexicalIndexUnavailable, TOKEN_PATTERN
-from memory_format import split_frontmatter
+from memory_format import evaluate_temporal_validity, split_frontmatter
 from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 from recall import (
     EXCLUDED_RECALL_STATUSES,
@@ -384,6 +384,12 @@ def _verified_atom_citation(atom_id: str, brain_dir: str, atoms_dir: str) -> str
     if parsed is None:
         return None
     fm = parse_frontmatter_values(parsed[0])
+    tv = evaluate_temporal_validity(
+        str(fm.get("valid_from") or "").strip(),
+        str(fm.get("valid_until") or "").strip(),
+    )
+    if not tv["active"] or tv["status"] != "active":
+        return None
     if not verify_evidence_anchor(text, fm, brain_dir):
         return None
     src = fm.get("evidence_source", "")

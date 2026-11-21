@@ -974,9 +974,31 @@ def recall_at_snapshot(
         docs.append(("atom", fname, atom_with_tv, weighted_tf, doc_len, doc_vocab, full_text))
 
     if include_playbooks:
+        snap_atoms_map = snap.get("atoms", {})
         for pb_fname, pb in sorted(snap.get("playbooks", {}).items()):
             contexts = list(pb.get("contexts") or [])
             if not _matches_proj(contexts):
+                continue
+            backing_names = [str(b).strip() for b in (pb.get("backing_atoms") or []) if str(b).strip()]
+            pb_backing_ok = True
+            for b_name in backing_names:
+                b_atom = snap_atoms_map.get(b_name)
+                if not isinstance(b_atom, dict):
+                    pb_backing_ok = False
+                    break
+                b_ctx = list(b_atom.get("contexts") or [])
+                if target and not _matches_proj(b_ctx):
+                    pb_backing_ok = False
+                    break
+                b_tv = evaluate_temporal_validity(
+                    str(b_atom.get("valid_from") or "").strip(),
+                    str(b_atom.get("valid_until") or "").strip(),
+                    as_of=eff_as_of,
+                )
+                if b_tv["status"] == "invalid_window" or (not b_tv["active"] and not include_expired):
+                    pb_backing_ok = False
+                    break
+            if not pb_backing_ok:
                 continue
             title_str = str(pb.get("title") or "").strip()
             trigger_str = str(pb.get("trigger") or "").strip()

@@ -69,7 +69,7 @@ from memory_format import split_frontmatter  # noqa: E402
 from memory_review import parse_frontmatter_values, parse_scalar_list  # noqa: E402
 from recall import normalize_project_tag, project_tags_match  # noqa: E402
 
-NOTE_ORIGINS = frozenset({"owner_note", "owner_import", "agent_capture"})
+NOTE_ORIGINS = frozenset({"owner_note", "owner_import", "agent_capture", "web_clipper"})
 AGENT_ORIGINS = frozenset({"agent_capture"})
 MAX_NOTE_BYTES = 2_000_000
 MAX_AGENT_CAPTURE_CHARS = 16_000
@@ -670,6 +670,14 @@ def verify_note_excerpt(
             else ""
         )
 
+        atom_origin_map = {
+            "owner_note": "user_local",
+            "owner_import": "imported_unknown",
+            "agent_capture": "mcp_local",
+            "web_clipper": "web_clipper",
+        }
+        preserved_atom_origin = atom_origin_map.get(str(parent_rec.origin or "").strip(), "imported_unknown")
+
         def _build_note_atom_text(excerpt_val: str) -> str:
             temporal_lines = ""
             if norm_vf:
@@ -695,7 +703,7 @@ def verify_note_excerpt(
                 "supersedes: []\n"
                 "superseded_by: []\n"
                 "contested_by: []\n"
-                "origin: user_local\n"
+                f"origin: {preserved_atom_origin}\n"
                 "citation_integrity: missing\n"
                 "claim_state: candidate\n"
                 "epistemic_label: claim\n"

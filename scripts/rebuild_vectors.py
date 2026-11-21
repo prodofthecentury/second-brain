@@ -552,6 +552,13 @@ def upsert_changed_vectors(
 
             batch_fn = getattr(collection, "batch", None)
             batch_ctx = batch_fn() if callable(batch_fn) else nullcontext()
+            if target_deleted or batch_ids:
+                manifest_file = os.path.join(store_path, "index-manifest.json")
+                if os.path.exists(manifest_file):
+                    try:
+                        os.remove(manifest_file)
+                    except OSError:
+                        pass
             with batch_ctx:
                 if target_deleted:
                     delete_fn = getattr(collection, "delete", None)

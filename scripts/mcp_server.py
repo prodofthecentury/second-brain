@@ -183,6 +183,7 @@ def _resolve_vault_dirs() -> dict[str, str]:
         else (_cfg.BRIEFINGS_DIR if cfg_matches else os.path.join(brain_dir, "briefings"))
     )
     playbooks_dir = _cfg.PLAYBOOKS_DIR if cfg_matches else os.path.join(brain_dir, "5-playbooks")
+    skills_dir = getattr(_cfg, "SKILLS_DIR", os.path.join(brain_dir, "6-skills")) if cfg_matches else os.path.join(brain_dir, "6-skills")
     experiences_dir = _cfg.EXPERIENCES_DIR if cfg_matches else os.path.join(brain_dir, "4-experiences")
     sidecar_dir = _cfg.SIDECAR_DIR if cfg_matches else os.path.join(brain_dir, ".sidecar")
     lexical_index_path = _cfg.LEXICAL_INDEX_PATH if cfg_matches else os.path.join(sidecar_dir, "lexical.sqlite3")
@@ -195,6 +196,7 @@ def _resolve_vault_dirs() -> dict[str, str]:
         "inbox_dir": inbox_dir,
         "briefings_dir": briefings_dir,
         "playbooks_dir": playbooks_dir,
+        "skills_dir": skills_dir,
         "experiences_dir": experiences_dir,
         "sidecar_dir": sidecar_dir,
         "lexical_index_path": lexical_index_path,
@@ -832,12 +834,12 @@ ALL_TOOLS = (
     ),
     types.Tool(
         name="prove_leaf",
-        description="Export a portable offline SHA-256 Merkle inclusion proof for a verified atom or active playbook.",
+        description="Export a portable offline SHA-256 Merkle inclusion proof for a verified atom, active playbook, or active executable skill.",
         inputSchema={
             "type": "object",
             "properties": {
-                "leaf_id": {"type": "string", "description": "Atom or Playbook filename/identifier."},
-                "kind":    {"type": "string", "enum": ["auto", "atom", "playbook"], "description": "Leaf type (default auto)."},
+                "leaf_id": {"type": "string", "description": "Atom, Playbook, or Executable Skill filename/identifier."},
+                "kind":    {"type": "string", "enum": ["auto", "atom", "playbook", "skill"], "description": "Leaf type (default auto)."},
                 "project": {"type": "string", "description": "Optional project:<id> scope filter."},
             },
             "required": ["leaf_id"],
@@ -1537,13 +1539,14 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "prove_leaf":
+        from executable_skills import skill_visible_in_scope, verify_executable_skill_integrity
         from skill_playbooks import playbook_visible_in_scope, verify_playbook_integrity
         import vault_ledger
 
         leaf_id = str(arguments.get("leaf_id") or "").strip()
         kind = str(arguments.get("kind") or "auto").strip().lower()
         project = str(arguments.get("project") or "").strip() or None
-        if not leaf_id or kind not in {"auto", "atom", "playbook"}:
+        if not leaf_id or kind not in {"auto", "atom", "playbook", "skill"}:
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
                 isError=True,
@@ -1555,6 +1558,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                 brain_dir=vdirs["brain_dir"],
                 atoms_dir=vdirs["atoms_dir"],
                 playbooks_dir=vdirs["playbooks_dir"],
+                skills_dir=vdirs["skills_dir"],
             )
         except (FileNotFoundError, PermissionError, ValueError, OSError):
             return types.CallToolResult(
@@ -1591,6 +1595,32 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                     isError=True,
                 )
             if project and not playbook_visible_in_scope(pb_rep, (project,)):
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                    isError=True,
+                )
+        elif rel_path.startswith("6-skills/"):
+            sk_fname = rel_path[len("6-skills/") :]
+            safe_sk = safe_file_in_dir(vdirs["skills_dir"], sk_fname, allowed_exts={".md"}, must_exist=True)
+            if not safe_sk or _is_reparse_or_link(safe_sk):
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                    isError=True,
+                )
+            sk_rep = verify_executable_skill_integrity(
+                safe_sk,
+                brain_dir=vdirs["brain_dir"],
+                atoms_dir=vdirs["atoms_dir"],
+                playbooks_dir=vdirs["playbooks_dir"],
+                skills_dir=vdirs["skills_dir"],
+                telemetry_db_path=vdirs["telemetry_db_path"],
+            )
+            if not (sk_rep.valid and sk_rep.status == "active"):
+                return types.CallToolResult(
+                    content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
+                    isError=True,
+                )
+            if project and not skill_visible_in_scope(sk_rep, (project,)):
                 return types.CallToolResult(
                     content=[types.TextContent(type="text", text=UNAVAILABLE_LEAF_PROOF_MESSAGE)],
                     isError=True,
@@ -1796,8 +1826,9 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         db_path = vdirs["telemetry_db_path"]
 
         # MCP agents update disposable sidecar telemetry only — never writing
-        # unreviewed owner-attributed entries into canonical 0-raw/archive/atom-corrections.jsonl.
-        col = "positive_feedback" if raw_helpful else "corrections"
+        # unreviewed owner-attributed entries into canonical 0-raw/archive/atom-corrections.jsonl
+        # and never incrementing owner `corrections` (which can auto-revoke active Playbooks).
+        col = "positive_feedback" if raw_helpful else "agent_negative_feedback"
         cognitive_core.init_telemetry_db(db_path)
         with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
             conn.execute(

@@ -79,11 +79,20 @@ class ReviewTransitionError(RuntimeError):
 @contextmanager
 def review_lock(lock_path: str):
     """Use one OS advisory lock for all local canonical and derived-state writers."""
-    directory = os.path.dirname(os.path.abspath(lock_path))
-    os.makedirs(directory, exist_ok=True)
-    with open(lock_path, "a+b") as lock_file:
-        lock_file.seek(0)
-        if not lock_file.read(1):
+    try:
+        fh = open(lock_path, "r+b")
+    except FileNotFoundError:
+        directory = os.path.dirname(os.path.abspath(lock_path))
+        os.makedirs(directory, exist_ok=True)
+        with open(lock_path, "a+b") as init_fh:
+            init_fh.seek(0)
+            if not init_fh.read(1):
+                init_fh.seek(0)
+                init_fh.write(b"0")
+                init_fh.flush()
+        fh = open(lock_path, "r+b")
+    with fh as lock_file:
+        if os.fstat(lock_file.fileno()).st_size < 1:
             lock_file.seek(0)
             lock_file.write(b"0")
             lock_file.flush()
@@ -932,11 +941,10 @@ def _lstat_regular_non_reparse(path: str) -> os.stat_result | None:
         return None
     if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
         return None
-    if os.name == "nt" and (getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-        return None
-    isjunction = getattr(os.path, "isjunction", None)
-    if callable(isjunction) and isjunction(path):
-        return None
+    if os.name == "nt":
+        if getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return None
+        return st
     return st
 
 

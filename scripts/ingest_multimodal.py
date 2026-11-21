@@ -333,8 +333,9 @@ def save_capture_and_archive(
                 origin=capture_origin_label,
                 source_sha256=expected_source_sha256,
                 archived_sha256=file_sha256(archived_path),
+                brain_dir=brain_root_dir,
             ),
-            manifest_path=os.path.join(RAW_DIR, "archive", "manifest.jsonl"),
+            manifest_path=os.path.join(eff_raw, "archive", "manifest.jsonl"),
         )
         return f"inbox/{candidate}" if risk_flags else candidate
 

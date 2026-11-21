@@ -2083,101 +2083,116 @@ def auto_link_vault_atoms(
             except Exception:
                 return False
 
-        for fname, new_stems in sorted(proposed_by_file.items()):
-            valid_new_stems = [s for s in new_stems if _live_stem_is_linkable(s)]
-            if not valid_new_stems:
-                continue
-            apath = safe_file_in_dir(atoms_dir, fname, allowed_exts={".md"}, must_exist=True)
-            if not apath or _is_reparse_or_link(apath):
-                continue
-            orig_bytes = Path(apath).read_bytes()
-            orig_sha = content_sha256(orig_bytes)
-            orig_text = orig_bytes.decode("utf-8")
-            parsed = split_frontmatter(orig_text)
-            if parsed is None:
-                continue
-            fm_lines, body_lines = parsed
-            fm_vals = parse_frontmatter_values(fm_lines)
-            live_sup = _parse_ref_list(fm_vals.get("superseded_by", ""))
-            live_status = str(fm_vals.get("review_status") or "").strip().lower()
-            if live_sup or live_status in {"merged", "rejected"}:
-                continue
-            was_approved = approved_revision_is_current(apath, brain_dir=brain_dir, atoms_dir=atoms_dir)
+        prior_bytes_by_path: dict[str, bytes] = {}
+        try:
+            for fname, new_stems in sorted(proposed_by_file.items()):
+                valid_new_stems = [s for s in new_stems if _live_stem_is_linkable(s)]
+                if not valid_new_stems:
+                    continue
+                apath = safe_file_in_dir(atoms_dir, fname, allowed_exts={".md"}, must_exist=True)
+                if not apath or _is_reparse_or_link(apath):
+                    continue
+                orig_bytes = Path(apath).read_bytes()
+                orig_sha = content_sha256(orig_bytes)
+                orig_text = orig_bytes.decode("utf-8")
+                parsed = split_frontmatter(orig_text)
+                if parsed is None:
+                    continue
+                fm_lines, body_lines = parsed
+                fm_vals = parse_frontmatter_values(fm_lines)
+                live_sup = _parse_ref_list(fm_vals.get("superseded_by", ""))
+                live_status = str(fm_vals.get("review_status") or "").strip().lower()
+                if live_sup or live_status in {"merged", "rejected"}:
+                    continue
+                was_approved = approved_revision_is_current(apath, brain_dir=brain_dir, atoms_dir=atoms_dir)
 
-            cur_links = _parse_ref_list(fm_vals.get("links", ""))
-            merged_links = list(dict.fromkeys([*cur_links, *valid_new_stems]))
-            if merged_links == cur_links:
-                continue
-
-            updated_fm = set_string_list_field(fm_lines, "links", merged_links, "sources")
-            updated_text = render_memory_document(updated_fm, body_lines)
-
-            anchor_dict: dict[str, Any] | None = None
-            if was_approved:
-                try:
-                    anchor_dict = find_evidence_anchor(updated_text, brain_dir)
-                except (EvidenceValidationError, OSError, ValueError):
-                    # Refuse to touch an approved atom whose source anchor cannot be re-verified
+                cur_links = _parse_ref_list(fm_vals.get("links", ""))
+                merged_links = list(dict.fromkeys([*cur_links, *valid_new_stems]))
+                if merged_links == cur_links:
                     continue
 
-            updated_bytes = updated_text.encode("utf-8")
-            after_sha = content_sha256(updated_bytes)
-            if after_sha == orig_sha:
-                continue
+                updated_fm = set_string_list_field(fm_lines, "links", merged_links, "sources")
+                updated_text = render_memory_document(updated_fm, body_lines)
 
-            bak_path = os.path.join(history_dir, f"{fname}.{orig_sha}.bak")
-            if not os.path.exists(bak_path):
-                atomic_write_bytes(bak_path, orig_bytes)
-            atomic_write_bytes(apath, updated_bytes)
-            updated_files.append(fname)
+                anchor_dict: dict[str, Any] | None = None
+                if was_approved:
+                    try:
+                        anchor_dict = find_evidence_anchor(updated_text, brain_dir)
+                    except (EvidenceValidationError, OSError, ValueError):
+                        # Refuse to touch an approved atom whose source anchor cannot be re-verified
+                        continue
 
-            rec_entry: dict[str, Any] = {
-                "schema_version": 1,
-                "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds"),
-                "action": "approve" if was_approved else "edit",
-                "sub_action": "auto_link_metadata",
-                "actor": clean_actor,
-                "atom_filename": fname,
-                "added_links": valid_new_stems,
-                "content_sha256_before": orig_sha,
-                "content_sha256_after": after_sha,
-                "backup_path": bak_path,
-            }
-            if anchor_dict:
-                rec_entry.update(anchor_dict)
-            pending_records.append(rec_entry)
+                updated_bytes = updated_text.encode("utf-8")
+                after_sha = content_sha256(updated_bytes)
+                if after_sha == orig_sha:
+                    continue
 
-        if updated_files:
-            lex_res = refresh_lexical_index(atoms_dir, brain_dir, changed_filenames=updated_files)
-            dense_state = "not_active"
-            dense_gen: str | None = None
-            dense_err: str | None = None
-            if dense_was_current and isinstance(dense_manifest, dict):
+                bak_path = os.path.join(history_dir, f"{fname}.{orig_sha}.bak")
+                if not os.path.exists(bak_path):
+                    atomic_write_bytes(bak_path, orig_bytes)
+                prior_bytes_by_path[apath] = orig_bytes
+                atomic_write_bytes(apath, updated_bytes)
+                updated_files.append(fname)
+
+                rec_entry: dict[str, Any] = {
+                    "schema_version": 1,
+                    "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds"),
+                    "action": "approve" if was_approved else "edit",
+                    "sub_action": "auto_link_metadata",
+                    "actor": clean_actor,
+                    "atom_filename": fname,
+                    "added_links": valid_new_stems,
+                    "content_sha256_before": orig_sha,
+                    "content_sha256_after": after_sha,
+                    "backup_path": bak_path,
+                }
+                if anchor_dict:
+                    rec_entry.update(anchor_dict)
+                pending_records.append(rec_entry)
+
+            if updated_files:
+                lex_res = refresh_lexical_index(atoms_dir, brain_dir, changed_filenames=updated_files)
+                dense_state = "not_active"
+                dense_gen: str | None = None
+                dense_err: str | None = None
+                if dense_was_current and isinstance(dense_manifest, dict):
+                    try:
+                        from rebuild_vectors import upsert_changed_vectors
+
+                        d_res = upsert_changed_vectors(
+                            atoms_dir=atoms_dir,
+                            store_path=chroma_dir,
+                            collection_name="atoms",
+                            model=str(dense_manifest.get("embedding_model")),
+                            changed_filenames=updated_files,
+                            pre_verified_current=True,
+                            _writer_lock_held=True,
+                        )
+                        dense_state = "current" if d_res.get("committed") else "stale"
+                        dense_gen = str(d_res.get("generation_id")) if dense_state == "current" and d_res.get("generation_id") else None
+                    except Exception as exc:
+                        dense_state = "stale"
+                        dense_err = str(exc)[:1000]
+                for r_entry in pending_records:
+                    r_entry["lexical_index_path"] = lex_res["index_path"]
+                    r_entry["dense_index_state"] = dense_state
+                    if dense_gen:
+                        r_entry["dense_index_generation"] = dense_gen
+                    if dense_err:
+                        r_entry["dense_index_error"] = dense_err
+                append_decision_records(pending_records, decision_log_path)
+        except Exception:
+            for written_path, orig_raw in prior_bytes_by_path.items():
                 try:
-                    from rebuild_vectors import upsert_changed_vectors
-
-                    d_res = upsert_changed_vectors(
-                        atoms_dir=atoms_dir,
-                        store_path=chroma_dir,
-                        collection_name="atoms",
-                        model=str(dense_manifest.get("embedding_model")),
-                        changed_filenames=updated_files,
-                        pre_verified_current=True,
-                        _writer_lock_held=True,
-                    )
-                    dense_state = "current" if d_res.get("committed") else "stale"
-                    dense_gen = str(d_res.get("generation_id")) if dense_state == "current" and d_res.get("generation_id") else None
-                except Exception as exc:
-                    dense_state = "stale"
-                    dense_err = str(exc)[:1000]
-            for r_entry in pending_records:
-                r_entry["lexical_index_path"] = lex_res["index_path"]
-                r_entry["dense_index_state"] = dense_state
-                if dense_gen:
-                    r_entry["dense_index_generation"] = dense_gen
-                if dense_err:
-                    r_entry["dense_index_error"] = dense_err
-            append_decision_records(pending_records, decision_log_path)
+                    atomic_write_bytes(written_path, orig_raw)
+                except Exception:
+                    pass
+            if prior_bytes_by_path:
+                try:
+                    refresh_lexical_index(atoms_dir, brain_dir)
+                except Exception:
+                    pass
+            raise
 
     graph_after = build_knowledge_graph(
         brain_dir=brain_dir,

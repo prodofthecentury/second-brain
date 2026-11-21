@@ -29,18 +29,14 @@ _WINDOWS_RESERVED_STEMS = frozenset({
 
 def _is_reparse_or_link(path: str) -> bool:
     """Return True if path itself (without following) is a symlink, junction, or reparse point."""
-    if os.path.islink(path):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
         return True
-    isjunction = getattr(os.path, "isjunction", None)
-    if callable(isjunction) and isjunction(path):
+    if os.name == "nt" and (getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
         return True
-    if os.name == "nt":
-        try:
-            attrs = getattr(os.lstat(path), "st_file_attributes", 0)
-            if attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-                return True
-        except OSError:
-            return False
     return False
 
 
@@ -159,6 +155,7 @@ def vault_paths_for(brain_dir: str | None = None) -> dict[str, str]:
         "threads_dir": os.path.join(b, "3-threads"),
         "experiences_dir": os.path.join(b, "4-experiences"),
         "playbooks_dir": os.path.join(b, "5-playbooks"),
+        "skills_dir": os.path.join(b, "6-skills"),
         "sources_dir": os.path.join(b, "sources"),
         "briefings_dir": os.path.join(b, "briefings"),
         "notes_dir": os.path.join(b, "notes"),
@@ -181,6 +178,7 @@ ATOMS_DIR    = os.path.join(BRAIN_DIR, "2-atoms")
 THREADS_DIR  = os.path.join(BRAIN_DIR, "3-threads")
 EXPERIENCES_DIR = os.path.join(BRAIN_DIR, "4-experiences")
 PLAYBOOKS_DIR = os.path.join(BRAIN_DIR, "5-playbooks")
+SKILLS_DIR   = os.path.join(BRAIN_DIR, "6-skills")
 SOURCES_DIR  = os.path.join(BRAIN_DIR, "sources")
 BRIEFINGS_DIR= os.path.join(BRAIN_DIR, "briefings")
 # Owner knowledge base: zero-friction, immediately searchable, never treated as verified claims.
@@ -232,6 +230,7 @@ def ensure_dirs(brain_dir: str | None = None):
             vp["threads_dir"],
             vp["experiences_dir"],
             vp["playbooks_dir"],
+            vp["skills_dir"],
             vp["sources_dir"],
             vp["briefings_dir"],
             vp["notes_dir"],
@@ -242,7 +241,7 @@ def ensure_dirs(brain_dir: str | None = None):
         ):
             os.makedirs(d, exist_ok=True)
         return
-    for d in [RAW_DIR, INBOX_DIR, DESK_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, PLAYBOOKS_DIR, SOURCES_DIR, BRIEFINGS_DIR, NOTES_DIR, NOTE_SNAPSHOTS_DIR, CHROMA_PATH, SIDECAR_DIR]:
+    for d in [RAW_DIR, INBOX_DIR, DESK_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, PLAYBOOKS_DIR, SKILLS_DIR, SOURCES_DIR, BRIEFINGS_DIR, NOTES_DIR, NOTE_SNAPSHOTS_DIR, CHROMA_PATH, SIDECAR_DIR]:
         os.makedirs(d, exist_ok=True)
     os.makedirs(os.path.dirname(ARCHIVE_MANIFEST), exist_ok=True)
 
@@ -294,10 +293,20 @@ def file_sha256(path: str) -> str | None:
     return digest.hexdigest()
 
 def append_archive_manifest_entry(entry: dict, manifest_path: str = ARCHIVE_MANIFEST):
-    """Append one JSONL archive manifest entry."""
-    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-    with open(manifest_path, "a", encoding="utf-8") as file:
-        file.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    """Append one JSONL archive manifest entry safely with O_APPEND + fsync."""
+    abs_manifest = os.path.abspath(manifest_path)
+    parent_dir = os.path.dirname(abs_manifest)
+    os.makedirs(parent_dir, exist_ok=True)
+    if _is_reparse_or_link(parent_dir) or (os.path.lexists(abs_manifest) and _is_reparse_or_link(abs_manifest)):
+        raise PermissionError(f"Refusing to append archive manifest through symlink or reparse point: {abs_manifest}")
+    payload = (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(abs_manifest, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        if os.write(fd, payload) != len(payload):
+            raise OSError("Incomplete archive manifest append.")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 def normalize_markdown_filename(value: str) -> str:
     """Return a markdown filename, preserving the caller's basename."""

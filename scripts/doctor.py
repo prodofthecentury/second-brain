@@ -368,6 +368,24 @@ def run_checks() -> list[tuple[str, str, str]]:
         except Exception:
             active_playbooks = 0
     checks.append(ok("playbooks", f"{playbook_total} playbook file(s) ({active_playbooks} active)"))
+    skills_dir = os.path.join(BRAIN_DIR, "6-skills")
+    skill_total = count_files(skills_dir, (".md",)) if os.path.isdir(skills_dir) else 0
+    active_skills = 0
+    if skill_total:
+        try:
+            from executable_skills import list_executable_skills
+
+            sk_reports = list_executable_skills(
+                skills_dir=skills_dir,
+                playbooks_dir=PLAYBOOKS_DIR,
+                atoms_dir=ATOMS_DIR,
+                brain_dir=BRAIN_DIR,
+                active_only=False,
+            )
+            active_skills = sum(1 for item in sk_reports if item.valid and item.status == "active")
+        except Exception:
+            active_skills = 0
+    checks.append(ok("executable skills", f"{skill_total} executable skill file(s) ({active_skills} active)"))
     checks.append(ok("sources", f"{count_files(SOURCES_DIR, ('.md',))} source file(s)"))
 
     notes_dir = os.path.join(BRAIN_DIR, "notes")
@@ -465,10 +483,31 @@ def print_checks(checks: list[tuple[str, str, str]]):
         print(f"[{status:<4}] {area:<{width}}  {detail}")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Second Brain health check.")
+    parser.add_argument("--json", action="store_true", help="Emit structured JSON health report.")
+    args = parser.parse_args(argv)
     checks = run_checks()
-    print_checks(checks)
-    return 1 if any(status == "FAIL" for status, _, _ in checks) else 0
+    failed = any(status == "FAIL" for status, _, _ in checks)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ok": not failed,
+                    "checks": [
+                        {"status": status, "area": area, "detail": detail}
+                        for status, area, detail in checks
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print_checks(checks)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

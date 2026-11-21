@@ -33,7 +33,7 @@ from config import (
     is_content_markdown,
     safe_file_in_dir,
 )
-from memory_format import remove_frontmatter_fields, split_frontmatter
+from memory_format import evaluate_temporal_validity, remove_frontmatter_fields, split_frontmatter
 from memory_review import parse_frontmatter_values, parse_scalar_list
 from notes_store import NotePaths, extract_action_items
 from hardware_profile import strip_reasoning_think_blocks
@@ -207,6 +207,12 @@ def load_atoms(
         review_status = str(fm.get("review_status", "") or "").strip().lower()
         claim_state = str(fm.get("claim_state", "") or "").strip().lower()
         if superseded_by or review_status == "merged" or claim_state == "superseded":
+            continue
+        tv_atom = evaluate_temporal_validity(
+            str(fm.get("valid_from") or "").strip(),
+            str(fm.get("valid_until") or "").strip(),
+        )
+        if not tv_atom["active"] or tv_atom["status"] != "active":
             continue
 
         epistemic_label = str(fm.get("epistemic_label", "claim") or "claim").strip().lower()

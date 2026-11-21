@@ -76,11 +76,17 @@ def init_telemetry_db(db_path: str = TELEMETRY_DB_PATH) -> None:
                 grounded_citations INTEGER NOT NULL DEFAULT 0,
                 positive_feedback INTEGER NOT NULL DEFAULT 0,
                 corrections INTEGER NOT NULL DEFAULT 0,
+                agent_negative_feedback INTEGER NOT NULL DEFAULT 0,
                 last_retrieved_at TEXT,
                 last_cited_at TEXT
             )
             """
         )
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(atom_telemetry)").fetchall()}
+        if "agent_negative_feedback" not in cols:
+            conn.execute(
+                "ALTER TABLE atom_telemetry ADD COLUMN agent_negative_feedback INTEGER NOT NULL DEFAULT 0"
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS query_telemetry (
@@ -449,21 +455,25 @@ def record_atom_feedback(
 
     owning_brain = brain_dir or _brain_dir_for_telemetry_db(db_path)
     if owning_brain:
-        _append_canonical_feedback(
-            owning_brain,
-            atom_id,
-            feedback_kind=resolved_kind,
-            helpful=(resolved_kind == "helpful"),
-            actor=clean_actor,
-            note=clean_note,
-        )
-        _append_durable_feedback(
-            owning_brain,
-            atom_id,
-            action=action,
-            actor=clean_actor,
-            note=clean_note,
-        )
+        from atom_mutator import review_lock
+
+        lock_path = os.path.join(owning_brain, ".sidecar", "writer.lock")
+        with review_lock(lock_path):
+            _append_canonical_feedback(
+                owning_brain,
+                atom_id,
+                feedback_kind=resolved_kind,
+                helpful=(resolved_kind == "helpful"),
+                actor=clean_actor,
+                note=clean_note,
+            )
+            _append_durable_feedback(
+                owning_brain,
+                atom_id,
+                action=action,
+                actor=clean_actor,
+                note=clean_note,
+            )
 
     init_telemetry_db(db_path)
     if resolved_kind in {"helpful", "correction"}:
@@ -582,6 +592,34 @@ def compute_memory_fitness_report(
                 else:
                     stage = "verified_procedure"
                 procedure_maturity.append({**entry, "maturity_stage": stage})
+
+    # Stage 4 promotion reflection: if an approved procedural atom with zero unacknowledged corrections
+    # backs an active, integrity-verified Executable Skill in 6-skills/, advance maturity_stage to "executable_skill".
+    skills_dir = os.path.join(brain_dir, "6-skills") if brain_dir else ""
+    if procedure_maturity and skills_dir and os.path.isdir(skills_dir) and not _is_reparse_or_link(skills_dir):
+        try:
+            from executable_skills import list_executable_skills
+
+            active_skills = list_executable_skills(
+                skills_dir=skills_dir,
+                brain_dir=brain_dir,
+                atoms_dir=atoms_dir,
+                telemetry_db_path=db_path,
+                active_only=True,
+            )
+            exec_skill_atoms: set[str] = set()
+            for sk in active_skills:
+                if sk.valid and sk.status == "active":
+                    exec_skill_atoms.update(sk.backing_atoms)
+            if exec_skill_atoms:
+                procedure_maturity = [
+                    {**pm, "maturity_stage": "executable_skill"}
+                    if pm.get("approved_current") and str(pm.get("atom_id")) in exec_skill_atoms
+                    else pm
+                    for pm in procedure_maturity
+                ]
+        except Exception:
+            pass
 
     high_utility.sort(key=lambda x: (-float(x["utility_score"]), str(x["atom_id"])))
     pending_bottlenecks.sort(key=lambda x: (-int(x["candidate_hits"]), str(x["atom_id"])))

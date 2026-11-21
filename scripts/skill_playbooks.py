@@ -38,6 +38,7 @@ from config import (
     safe_file_in_dir,
 )
 from memory_format import (
+    evaluate_temporal_validity,
     frontmatter_has_key,
     remove_frontmatter_fields,
     render_memory_document,
@@ -339,7 +340,7 @@ def inspect_skill_candidates(
                 **item,
                 "sha256": sha,
                 "already_in_active_playbook": atom_id in promoted_atoms,
-                "eligible_without_override": item.get("maturity_stage") == "skill_candidate",
+                "eligible_without_override": item.get("maturity_stage") in {"skill_candidate", "executable_skill"},
             }
         )
     return results
@@ -437,6 +438,14 @@ def promote_skill_playbook(
             if str(fm.get("epistemic_label", "")) == "preference" or fm.get("epistemic_contract"):
                 raise PlaybookValidationError(
                     f"Subjective preference atom '{atom_name}' cannot be promoted as an operational Playbook."
+                )
+            tv_promote = evaluate_temporal_validity(
+                str(fm.get("valid_from") or "").strip(),
+                str(fm.get("valid_until") or "").strip(),
+            )
+            if not tv_promote["active"] or tv_promote["status"] != "active":
+                raise PlaybookValidationError(
+                    f"Backing atom '{atom_name}' is not temporally active (status={tv_promote['status']}); refusing Playbook promotion."
                 )
 
             tele_counts = _load_telemetry_counts(atom_name, telemetry_db_path)
@@ -776,6 +785,14 @@ def verify_playbook_integrity(
         if str(atom_fm.get("epistemic_label", "claim")) == "preference" or bool(atom_fm.get("epistemic_contract")):
             return PlaybookIntegrityReport(
                 pb_id, fname, False, status, f"preference_backing_atom_forbidden:{atom_name}", title=title, sha256=sha
+            )
+        tv_verify = evaluate_temporal_validity(
+            str(atom_fm.get("valid_from") or "").strip(),
+            str(atom_fm.get("valid_until") or "").strip(),
+        )
+        if not tv_verify["active"] or tv_verify["status"] != "active":
+            return PlaybookIntegrityReport(
+                pb_id, fname, False, status, f"backing_atom_not_temporally_active:{atom_name}({tv_verify['status']})", title=title, sha256=sha
             )
         atom_ctx = _atom_contexts_from_frontmatter(atom_fm)
         per_atom_contexts.append(atom_ctx)
