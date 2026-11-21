@@ -444,6 +444,12 @@ def main(argv: list[str] | None = None) -> int:
     result: dict[str, Any] = {}
     if not args.manifests_only:
         result["inbox_drop_pwa"] = build_inbox_drop_pwa_zip(args.out_dir)
+        try:
+            from mobile_vault_client import export_mobile_vault_client_bundle
+
+            result["mobile_vault_client"] = export_mobile_vault_client_bundle(args.out_dir)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to build Mobile Vault Client bundle: {exc}") from exc
     if not args.pwa_only:
         result["manifests"] = build_package_manager_manifests(
             out_dir=args.out_dir,

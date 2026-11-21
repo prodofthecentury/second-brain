@@ -8,9 +8,11 @@ const path = require("path");
  *
  * Delegates to `scripts/sign_release.ps1 -SingleFile <path> -SkipManifest` when
  * code-signing credentials (`SECOND_BRAIN_CERT_THUMBPRINT`, `SECOND_BRAIN_PFX_PATH`,
- * or `SECOND_BRAIN_SELF_SIGNED=1`) are configured in the environment. When no
- * signing credentials are present (e.g., unsigned CI `--dir` smoke builds), skips
- * signing cleanly while keeping `rcedit` icon and version metadata embedding active.
+ * EV HSM `SECOND_BRAIN_CSP_NAME` + `SECOND_BRAIN_KEY_CONTAINER`, Azure Trusted Signing
+ * `SECOND_BRAIN_AZURE_TRUSTED_SIGNING_ENDPOINT`, or `SECOND_BRAIN_SELF_SIGNED=1`)
+ * are configured in the environment. When no signing credentials are present (e.g.,
+ * unsigned CI `--dir` smoke builds), skips signing cleanly unless
+ * `SECOND_BRAIN_REQUIRE_TRUSTED_SIGN=1` is enforced.
  */
 exports.default = async function sign(configuration) {
   if (process.platform !== "win32") {
@@ -24,11 +26,27 @@ exports.default = async function sign(configuration) {
 
   const thumbprint = (process.env.SECOND_BRAIN_CERT_THUMBPRINT || "").trim();
   const pfxPath = (process.env.SECOND_BRAIN_PFX_PATH || "").trim();
+  const cspName = (process.env.SECOND_BRAIN_CSP_NAME || "").trim();
+  const keyContainer = (process.env.SECOND_BRAIN_KEY_CONTAINER || "").trim();
+  const azureEndpoint = (process.env.SECOND_BRAIN_AZURE_TRUSTED_SIGNING_ENDPOINT || "").trim();
+  const azureAccount = (process.env.SECOND_BRAIN_AZURE_CODE_SIGNING_ACCOUNT || "").trim();
+  const azureProfile = (process.env.SECOND_BRAIN_AZURE_CERT_PROFILE || "").trim();
+  const requireTrusted =
+    (process.env.SECOND_BRAIN_REQUIRE_TRUSTED_SIGN || "").trim() === "1" ||
+    (process.env.SECOND_BRAIN_REQUIRE_TRUSTED_SIGN || "").trim().toLowerCase() === "true";
   const selfSigned =
     (process.env.SECOND_BRAIN_SELF_SIGNED || "").trim() === "1" ||
     (process.env.SECOND_BRAIN_SELF_SIGNED || "").trim().toLowerCase() === "true";
 
-  if (!thumbprint && !pfxPath && !selfSigned) {
+  const hasAnyProvider = Boolean(
+    thumbprint ||
+      pfxPath ||
+      (cspName && keyContainer) ||
+      (azureEndpoint && azureAccount && azureProfile) ||
+      selfSigned ||
+      requireTrusted
+  );
+  if (!hasAnyProvider) {
     return;
   }
 
@@ -48,8 +66,12 @@ exports.default = async function sign(configuration) {
     psArgs.push("-Thumbprint", thumbprint);
   } else if (pfxPath) {
     psArgs.push("-PfxPath", pfxPath);
-  } else if (selfSigned) {
+  } else if (selfSigned && !requireTrusted) {
     psArgs.push("-SelfSigned");
+  }
+
+  if (requireTrusted) {
+    psArgs.push("-RequireTrustedChain");
   }
 
   const timestampUrl = (process.env.SECOND_BRAIN_TIMESTAMP_URL || "").trim();

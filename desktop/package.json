@@ -24,6 +24,7 @@
     "appId": "com.secondbrain.desktop",
     "productName": "Second Brain",
     "afterPack": "./build/afterPack.js",
+    "afterSign": "./build/notarize.js",
     "toolsets": {
       "winCodeSign": "1.1.0"
     },
@@ -81,7 +82,11 @@
       },
       {
         "from": "../mobile",
-        "to": "backend/mobile"
+        "to": "backend/mobile",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**"
+        ]
       },
       {
         "from": "../setup.ps1",

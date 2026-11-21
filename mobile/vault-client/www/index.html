@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f8fafc" media="(prefers-color-scheme: light)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https: http://127.0.0.1:*; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Second Brain — Verifiable Mobile Vault</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-frame">
+    <header class="topbar">
+      <div class="brand-group">
+        <span class="eyebrow">On-Device E2EE Replica</span>
+        <h1 class="app-title">Second Brain</h1>
+      </div>
+      <div class="status-group">
+        <span id="networkBadge" class="pill pill-offline" aria-live="polite">100% Offline Ready</span>
+        <button id="vaultLockBtn" type="button" class="pill pill-btn pill-warn" title="Lock or unlock encrypted device store">Locked</button>
+      </div>
+    </header>
+
+    <section class="scope-bar" aria-label="Epistemic Scope Controls">
+      <label class="scope-chip" for="globalProjectInput">
+        <span class="scope-label">Scope</span>
+        <input id="globalProjectInput" type="text" maxlength="64" placeholder="all projects (or project:alpha)" autocomplete="off">
+      </label>
+      <label class="scope-chip" for="globalAsOfInput">
+        <span class="scope-label">As Of</span>
+        <input id="globalAsOfInput" type="date">
+      </label>
+      <button id="clearScopeBtn" type="button" class="btn-tiny" title="Reset scope and bi-temporal date">Reset</button>
+    </section>
+
+    <p id="statusBanner" class="banner hidden" role="status" aria-live="polite"></p>
+
+    <section id="lockGateCard" class="card lock-card" aria-labelledby="lockGateHeading">
+      <div class="row-between">
+        <h2 id="lockGateHeading">Encrypted Device Vault Lock</h2>
+        <span id="lockStateTag" class="badge badge-warn">AES-256-GCM Locked</span>
+      </div>
+      <p id="lockGateHint" class="hint">Plaintext memories never touch IndexedDB or localStorage. Enter your device PIN (PBKDF2-SHA256, 210,000 iterations) to unlock in RAM or initialize a new local vault store.</p>
+      <div class="grid-pin">
+        <label class="field">
+          <span>Device Lock PIN / Passphrase (min 4 chars)</span>
+          <input id="devicePinInput" type="password" autocomplete="off" placeholder="Enter device lock PIN">
+        </label>
+        <div class="actions-inline">
+          <button id="unlockVaultBtn" type="button" class="btn btn-primary">Unlock Vault</button>
+          <button id="wipeVaultBtn" type="button" class="btn btn-danger">Wipe Local Ciphertext</button>
+        </div>
+      </div>
+    </section>
+
+    <main class="view-container">
+      <!-- TAB 1: SYNC & BACKUP -->
+      <section id="tab-sync" class="tab-panel" aria-labelledby="syncHeading">
+        <div class="card">
+          <div class="row-between">
+            <h2 id="syncHeading">Zero-Knowledge E2EE Sync</h2>
+            <span id="syncEpochBadge" class="badge badge-neutral">Epoch 0</span>
+          </div>
+          <p class="hint">Pulls signed manifests &amp; blind-ID AES-256-GCM blobs directly from HTTPS / S3 / R2. Verifies Ed25519 peer signatures, master-key HMAC, and monotonic anti-rollback epoch.</p>
+
+          <label class="field">
+            <span>Sync Endpoint URL (HTTPS or http://127.0.0.1)</span>
+            <input id="syncEndpointInput" type="url" autocomplete="off" placeholder="https://bucket.account.r2.cloudflarestorage.com">
+          </label>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>Vault ID (hex)</span>
+              <input id="syncVaultIdInput" type="text" autocomplete="off" placeholder="Auto-filled from pairing or header">
+            </label>
+            <label class="field">
+              <span>Auth Mode</span>
+              <select id="syncAuthModeSelect">
+                <option value="none">None / Pre-signed</option>
+                <option value="s3_sigv4">AWS / R2 SigV4 (GET)</option>
+                <option value="bearer">Bearer Token</option>
+              </select>
+            </label>
+          </div>
+
+          <div id="sigv4Fields" class="subpanel hidden">
+            <div class="grid-2">
+              <label class="field">
+                <span>S3 Region</span>
+                <input id="syncS3RegionInput" type="text" value="auto" maxlength="32">
+              </label>
+              <label class="field">
+                <span>Read-Only Access Key ID</span>
+                <input id="syncS3AkInput" type="text" autocomplete="off" placeholder="AKIA...">
+              </label>
+            </div>
+            <label class="field">
+              <span>Read-Only Secret Access Key</span>
+              <input id="syncS3SkInput" type="password" autocomplete="off" placeholder="Read-only GetObject secret">
+            </label>
+          </div>
+
+          <div id="bearerFields" class="subpanel hidden">
+            <label class="field">
+              <span>Bearer Token</span>
+              <input id="syncBearerInput" type="password" autocomplete="off" placeholder="Bearer token">
+            </label>
+          </div>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>Vault E2EE Passphrase (scrypt)</span>
+              <input id="syncPassphraseInput" type="password" autocomplete="off" placeholder="If passphrase-mode vault">
+            </label>
+            <label class="field">
+              <span>Or Recovery Key (Base64)</span>
+              <input id="syncMasterKeyInput" type="password" autocomplete="off" placeholder="If keyfile-mode vault">
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="pullSyncBtn" type="button" class="btn btn-primary">Pull &amp; Verify E2EE Vault</button>
+          </div>
+          <p id="syncStatsLine" class="meta-line">No sync pull run in this session yet.</p>
+        </div>
+
+        <div class="card">
+          <h2>Air-Gapped `.sbvault` Import</h2>
+          <p class="hint">Import a portable `SBVBKP1` archive offline (Files / AirDrop / USB). Verifies scrypt + HKDF-SHA256 + AES-256-GCM outer tag, per-file SHA-256s, and Merkle root in memory.</p>
+          <label class="field">
+            <span>Backup Passphrase (leave empty only for explicit unencrypted archive)</span>
+            <input id="backupPassphraseInput" type="password" autocomplete="off" placeholder="Enter .sbvault passphrase">
+          </label>
+          <label class="field">
+            <span>Select `.sbvault` Archive</span>
+            <input id="sbvaultFileInput" type="file" accept=".sbvault,application/octet-stream">
+          </label>
+          <div class="actions">
+            <button id="importSbvaultBtn" type="button" class="btn btn-secondary">Decrypt &amp; Import `.sbvault`</button>
+          </div>
+        </div>
+
+        <details class="card">
+          <summary>Pair via `#vaultpair=` Link or Code</summary>
+          <div class="details-body">
+            <p class="hint">Paste a `#vaultpair=...` URI generated by `second-brain` on your desktop. URL fragments are never sent over HTTP and are scrubbed from browser history immediately.</p>
+            <label class="field">
+              <span>Pairing URI (`#vaultpair=...`)</span>
+              <input id="vaultPairInput" type="password" autocomplete="off" placeholder="#vaultpair=eyJ...">
+            </label>
+            <div class="actions">
+              <button id="applyVaultPairBtn" type="button" class="btn btn-secondary">Import Pairing Metadata</button>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <!-- TAB 2: OFFLINE SEARCH -->
+      <section id="tab-search" class="tab-panel hidden" aria-labelledby="searchHeading">
+        <div class="card">
+          <div class="row-between">
+            <h2 id="searchHeading">Offline Epistemic Search</h2>
+            <div class="seg-group" role="tablist" aria-label="Search Corpus">
+              <button id="searchCorpusVerifiedBtn" type="button" class="seg-btn seg-active" data-corpus="verified">Verified Atoms</button>
+              <button id="searchCorpusPrefBtn" type="button" class="seg-btn" data-corpus="preference">Preferences</button>
+              <button id="searchCorpusNotesBtn" type="button" class="seg-btn" data-corpus="notes">Working Notes</button>
+            </div>
+          </div>
+          <p class="hint">100% on-device Porter stemmer + Okapi BM25. Verified search enforces `decision-record.jsonl` owner approval, raw source SHA-256 + byte-offset slice verification, project containment, and bi-temporal bounds.</p>
+          <div class="search-row">
+            <input id="searchQueryInput" type="search" maxlength="300" placeholder="Search verified claims, evidence, or notes...">
+            <button id="runSearchBtn" type="button" class="btn btn-primary btn-compact">Search</button>
+          </div>
+        </div>
+        <div id="searchResultsList" class="stack-list" aria-live="polite"></div>
+      </section>
+
+      <!-- TAB 3: OFFLINE GROUNDED CHAT -->
+      <section id="tab-chat" class="tab-panel hidden" aria-labelledby="chatHeading">
+        <div class="card">
+          <div class="row-between">
+            <h2 id="chatHeading">Offline Grounded Chat</h2>
+            <select id="chatModeSelect" aria-label="Grounded Answer Mode">
+              <option value="verified">Verified (Strict Factual)</option>
+              <option value="instant">Instant (Zero-LLM Exact)</option>
+              <option value="research">Research (+ Unverified Leads)</option>
+              <option value="preference">Preference (Owner Taste)</option>
+            </select>
+          </div>
+          <p class="hint">Out-of-model validated answers. Renders only exact owner-approved Claims backed by verified byte-offset source slices, or abstains structurally when unsupported.</p>
+          <label class="field">
+            <span>Ask your Second Brain</span>
+            <textarea id="chatQueryInput" rows="3" maxlength="1000" placeholder="Ask a question grounded in your synced vault..."></textarea>
+          </label>
+          <div class="actions">
+            <button id="askChatBtn" type="button" class="btn btn-primary">Answer Offline</button>
+          </div>
+        </div>
+        <div id="chatOutputContainer" class="stack-list" aria-live="polite"></div>
+      </section>
+
+      <!-- TAB 4: NOTES & QUARANTINED INBOX DROP -->
+      <section id="tab-notes" class="tab-panel hidden" aria-labelledby="notesDropHeading">
+        <div class="card">
+          <div class="row-between">
+            <h2 id="notesDropHeading">Outbound `SBID1` Inbox Drop</h2>
+            <span id="dropPairBadge" class="badge badge-neutral">ECDH P-256</span>
+          </div>
+          <p class="hint">Forward-secret ECDH P-256 + HKDF-SHA256 + AES-256-GCM capture into `0-raw/inbox/`. Mobile captures are strictly quarantined until owner review on desktop.</p>
+          <label class="field">
+            <span>Title (optional)</span>
+            <input id="dropTitleInput" type="text" maxlength="240" placeholder="Capture title or summary">
+          </label>
+          <label class="field">
+            <span>URL (optional)</span>
+            <input id="dropUrlInput" type="url" maxlength="2048" placeholder="https://example.com/paper">
+          </label>
+          <label class="field">
+            <span>Note / Excerpt</span>
+            <textarea id="dropTextInput" rows="4" maxlength="32000" placeholder="Thought, quote, or mobile note..."></textarea>
+          </label>
+          <label class="field">
+            <span>Tags (comma-separated, e.g. `project:alpha, reading`)</span>
+            <input id="dropTagsInput" type="text" maxlength="240" placeholder="mobile, project:alpha">
+          </label>
+          <details class="sub-details">
+            <summary>Drop Pairing Key (`#pair=`)</summary>
+            <div class="details-body">
+              <label class="field">
+                <span>Paste `#pair=...` URI (if not bundled in `#vaultpair=`)</span>
+                <input id="dropPairInput" type="password" autocomplete="off" placeholder="#pair=eyJ...">
+              </label>
+              <button id="saveDropPairBtn" type="button" class="btn btn-tiny">Save Drop Pairing</button>
+            </div>
+          </details>
+          <div class="actions">
+            <button id="sendDropBtn" type="button" class="btn btn-primary">Encrypt &amp; Upload `SBID1`</button>
+            <button id="exportDropEncBtn" type="button" class="btn btn-ghost">Export `.enc`</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row-between">
+            <h2>Synced Working Notes</h2>
+            <span class="badge badge-warn">Unverified Tier</span>
+          </div>
+          <p class="hint">Working notes from `notes/*.md` are immediately readable offline and explicitly badged as unverified notes.</p>
+          <div id="notesBrowseList" class="stack-list"></div>
+        </div>
+      </section>
+
+      <!-- TAB 5: MERKLE AUDIT & LEDGER -->
+      <section id="tab-audit" class="tab-panel hidden" aria-labelledby="auditHeading">
+        <div class="card">
+          <div class="row-between">
+            <h2 id="auditHeading">Offline Merkle &amp; Ledger Audit</h2>
+            <button id="runAuditBtn" type="button" class="btn btn-secondary btn-compact">Verify Now</button>
+          </div>
+          <p class="hint">Recomputes SHA-256 leaf digests (`leaf:&lt;rel_path&gt;:&lt;sha256&gt;`), binary Merkle root over all current approved atoms &amp; active playbooks, and validates the `vault-ledger.jsonl` hash chain.</p>
+          <div id="auditSummaryBox" class="audit-box"></div>
+        </div>
+
+        <div class="card">
+          <h2>Portable Leaf Inclusion Proof</h2>
+          <p class="hint">Generate and verify an offline cryptographic Merkle inclusion proof for any accepted atom or active playbook.</p>
+          <div class="search-row">
+            <input id="proofTargetInput" type="text" maxlength="160" placeholder="e.g. 2-atoms/example.md or 5-playbooks/deploy.md">
+            <button id="proveLeafBtn" type="button" class="btn btn-primary btn-compact">Prove Leaf</button>
+          </div>
+          <pre id="proofOutputBox" class="code-box hidden"></pre>
+        </div>
+      </section>
+    </main>
+
+    <nav class="bottom-nav" aria-label="Primary Sections">
+      <button type="button" class="nav-tab nav-active" data-tab="sync">
+        <span class="nav-icon" aria-hidden="true">⇄</span>
+        <span class="nav-label">Sync</span>
+      </button>
+      <button type="button" class="nav-tab" data-tab="search">
+        <span class="nav-icon" aria-hidden="true">⌕</span>
+        <span class="nav-label">Search</span>
+      </button>
+      <button type="button" class="nav-tab" data-tab="chat">
+        <span class="nav-icon" aria-hidden="true">◈</span>
+        <span class="nav-label">Chat</span>
+      </button>
+      <button type="button" class="nav-tab" data-tab="notes">
+        <span class="nav-icon" aria-hidden="true">✎</span>
+        <span class="nav-label">Notes &amp; Drop</span>
+      </button>
+      <button type="button" class="nav-tab" data-tab="audit">
+        <span class="nav-icon" aria-hidden="true">✓</span>
+        <span class="nav-label">Audit</span>
+      </button>
+    </nav>
+  </div>
+
+  <script src="lib/vault-crypto.js"></script>
+  <script src="lib/vault-epistemic-engine.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

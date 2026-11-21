@@ -177,6 +177,13 @@ def doctor() -> int:
         else []
     )
     print(f"Playbooks: {len(playbook_files)}")
+    skills_dir = Path(vp.get("skills_dir") or os.path.join(active_brain_dir, "6-skills"))
+    skill_files = (
+        sorted(path for path in skills_dir.glob("*.md") if path.name != "README.md")
+        if skills_dir.is_dir()
+        else []
+    )
+    print(f"Executable skills: {len(skill_files)}")
     notes_dir = Path(vp["notes_dir"])
     note_files = (
         sorted(path for path in notes_dir.glob("*.md") if path.name != "README.md")
@@ -448,6 +455,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("cognitive", "Generate memory fitness reports, record feedback, and log experiences."),
         ("playbooks", "Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks."),
         ("playbook", "Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks."),
+        ("skills", "Stage 4 Executable Skills: candidates, promote, list, verify, execute in sandbox, kill-switch & audit."),
         ("plan", "Assemble a grounded, citation-verified Executive Plan from Playbooks and approved Atoms."),
         ("notes", "Zero-friction notes: add, search, list, tasks, reindex, verify an excerpt."),
         ("capture", "Quickly capture a working note or quarantined inbox item from the CLI."),
@@ -460,6 +468,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("graph", "Contradiction & Drift Radar + temporal knowledge graph."),
         ("snapshot", "Time-travel vault snapshots, semantic diff, and point-in-time recall."),
         ("sync", "Zero-Knowledge E2EE multi-device vault sync (init/join/status/push/pull/verify/conflicts)."),
+        ("mobile", "Full On-Device Mobile Vault Client (iOS / Android): pair, list, revoke, or export offline app bundle."),
+        ("media", "Local Creative Media Studio: hardware-gated offline image (.png/.webp) & video (.mp4/.gif) generation."),
+        ("release", "Release signature verification, store credential checks, WinGet validation & registry publishing."),
         ("models", "Download, SHA-256 verify, inspect, or remove local ONNX Cross-Encoder & NLI weights."),
         ("clipper", "Pair, manage, and capture via the local-first Browser Web Clipper."),
         ("vault", "Manage isolated Multi-Vault Workspaces and opt-in cross-vault federated recall."),
@@ -548,9 +559,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
 _PASSTHROUGH_COMMANDS = frozenset({
     "api",
-    "inbox", "hosts", "cognitive", "playbooks", "playbook", "plan",
+    "inbox", "hosts", "cognitive", "playbooks", "playbook", "skills", "plan",
     "notes", "capture", "import", "chat", "connect", "benchmark",
-    "sota-benchmark", "ledger", "graph", "snapshot", "sync", "models", "clipper", "vault",
+    "sota-benchmark", "ledger", "graph", "snapshot", "sync", "mobile", "media", "release",
+    "models", "clipper", "vault",
     "backup", "hook",
     "recall", "answer", "review", "audit",
     "rebuild-lexical", "rebuild-vectors",
@@ -829,6 +841,26 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.git_distiller import main as hook_main
 
         return hook_main(forwarded)
+    if command == "skills":
+        from scripts.executable_skills import main as skills_main
+
+        return skills_main(forwarded)
+    if command == "mobile":
+        from scripts.mobile_vault_client import main as mobile_main
+
+        return mobile_main(forwarded)
+    if command == "media":
+        from scripts.creative_media import main as media_main
+
+        return media_main(forwarded)
+    if command == "release":
+        if forwarded and forwarded[0] == "verify-signatures":
+            from scripts.verify_release_signatures import main as sig_main
+
+            return sig_main(forwarded[1:])
+        from scripts.publish_registries import main as pub_main
+
+        return pub_main(forwarded)
     if command == "recall":
         return _run_recall_cli(forwarded)
     if command == "answer":

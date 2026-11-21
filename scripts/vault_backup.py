@@ -78,6 +78,7 @@ DURABLE_TOP_DIRS: tuple[str, ...] = (
     "3-threads",
     "4-experiences",
     "5-playbooks",
+    "6-skills",
     "notes",
     "sources",
     "briefings",

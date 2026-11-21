@@ -83,9 +83,11 @@ def _collect_verified_leaves(
     brain_dir: str = BRAIN_DIR,
     atoms_dir: str = ATOMS_DIR,
     playbooks_dir: str | None = None,
+    skills_dir: str | None = None,
 ) -> list[dict[str, str]]:
-    """Collect sorted canonical leaves for all accepted atoms & playbooks."""
+    """Collect sorted canonical leaves for all accepted atoms, playbooks, & executable skills."""
     pb_dir = playbooks_dir if playbooks_dir is not None else os.path.join(brain_dir, "5-playbooks")
+    sk_dir = skills_dir if skills_dir is not None else os.path.join(brain_dir, "6-skills")
     telemetry_db = os.path.join(brain_dir, ".sidecar", "telemetry.sqlite3")
     leaves: list[dict[str, str]] = []
 
@@ -151,6 +153,45 @@ def _collect_verified_leaves(
                 }
             )
 
+    if os.path.isdir(sk_dir) and not _is_reparse_or_link(sk_dir):
+        try:
+            from executable_skills import verify_executable_skill_integrity
+        except Exception:
+            verify_executable_skill_integrity = None  # type: ignore[assignment]
+        if verify_executable_skill_integrity is not None:
+            for entry in sorted(os.scandir(sk_dir), key=lambda e: e.name):
+                if not is_content_markdown(entry.name):
+                    continue
+                path = os.path.join(sk_dir, entry.name)
+                if _is_reparse_or_link(path) or not os.path.isfile(path):
+                    continue
+                sk_rep = verify_executable_skill_integrity(
+                    path,
+                    brain_dir=brain_dir,
+                    atoms_dir=atoms_dir,
+                    playbooks_dir=pb_dir,
+                    skills_dir=sk_dir,
+                    telemetry_db_path=telemetry_db,
+                )
+                if not sk_rep.valid or sk_rep.status != "active":
+                    continue
+                try:
+                    raw_bytes = Path(path).read_bytes()
+                except OSError:
+                    continue
+                fhash = sk_rep.sha256 or content_sha256(raw_bytes)
+                if content_sha256(raw_bytes) != fhash:
+                    continue
+                rel = f"6-skills/{entry.name}"
+                leaves.append(
+                    {
+                        "rel_path": rel,
+                        "kind": "skill",
+                        "file_sha256": fhash,
+                        "leaf_sha256": _leaf_digest(rel, fhash),
+                    }
+                )
+
     leaves.sort(key=lambda item: item["rel_path"])
     return leaves
 
@@ -180,15 +221,22 @@ def compute_vault_merkle(
     brain_dir: str = BRAIN_DIR,
     atoms_dir: str = ATOMS_DIR,
     playbooks_dir: str | None = None,
+    skills_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Compute the deterministic Merkle root over all accepted atoms and playbooks."""
-    leaves = _collect_verified_leaves(brain_dir=brain_dir, atoms_dir=atoms_dir, playbooks_dir=playbooks_dir)
+    """Compute the deterministic Merkle root over all accepted atoms, playbooks, and executable skills."""
+    leaves = _collect_verified_leaves(
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        playbooks_dir=playbooks_dir,
+        skills_dir=skills_dir,
+    )
     levels = _build_merkle_levels([leaf["leaf_sha256"] for leaf in leaves])
     return {
         "merkle_root": levels[-1][0],
         "leaf_count": len(leaves),
         "approved_atoms": sum(1 for l in leaves if l["kind"] == "atom"),
         "accepted_playbooks": sum(1 for l in leaves if l["kind"] == "playbook"),
+        "active_skills": sum(1 for l in leaves if l["kind"] == "skill"),
         "leaves": leaves,
     }
 
@@ -450,11 +498,12 @@ def prove_leaf_membership(
     brain_dir: str = BRAIN_DIR,
     atoms_dir: str = ATOMS_DIR,
     playbooks_dir: str | None = None,
+    skills_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Generate a portable Merkle inclusion proof for a verified atom or active playbook leaf."""
+    """Generate a portable Merkle inclusion proof for a verified atom, active playbook, or active executable skill."""
     clean_kind = str(kind or "auto").strip().lower()
-    if clean_kind not in {"auto", "atom", "playbook"}:
-        raise ValueError(f"Unsupported leaf kind: {kind!r}. Expected 'auto', 'atom', or 'playbook'.")
+    if clean_kind not in {"auto", "atom", "playbook", "skill"}:
+        raise ValueError(f"Unsupported leaf kind: {kind!r}. Expected 'auto', 'atom', 'playbook', or 'skill'.")
 
     eff_atoms_dir = (
         os.path.join(brain_dir, "2-atoms")
@@ -467,14 +516,17 @@ def prove_leaf_membership(
         eff_pb_dir = os.path.join(brain_dir, "5-playbooks")
     else:
         eff_pb_dir = PLAYBOOKS_DIR
+    eff_sk_dir = skills_dir if skills_dir is not None else os.path.join(brain_dir, "6-skills")
 
     raw_target = str(target or "").strip()
     if not raw_target:
         raise FileNotFoundError("Leaf target must be non-empty.")
 
-    # Normalize explicit 'playbook:<name>' prefix while rejecting any other colon/drive/path tricks.
+    # Normalize explicit 'playbook:<name>' or 'skill:<name>' prefix while rejecting any other colon/drive/path tricks.
     if raw_target.startswith("playbook:"):
         raw_target = f"5-playbooks/{raw_target[len('playbook:'):]}"
+    elif raw_target.startswith("skill:"):
+        raw_target = f"6-skills/{raw_target[len('skill:'):]}"
     if (
         "\x00" in raw_target
         or ":" in raw_target
@@ -501,13 +553,17 @@ def prove_leaf_membership(
         return f"{prefix}/{os.path.basename(safe_path)}"
 
     if len(parts) == 2 and parts[0] == "2-atoms":
-        if clean_kind == "playbook":
-            raise PermissionError(f"Leaf prefix '2-atoms/' conflicts with kind='playbook': {target!r}")
+        if clean_kind in {"playbook", "skill"}:
+            raise PermissionError(f"Leaf prefix '2-atoms/' conflicts with kind={clean_kind!r}: {target!r}")
         target_rel = _resolve_leaf_file(eff_atoms_dir, parts[1], "2-atoms")
     elif len(parts) == 2 and parts[0] in {"5-playbooks", "playbooks"}:
-        if clean_kind == "atom":
-            raise PermissionError(f"Leaf prefix '{parts[0]}/' conflicts with kind='atom': {target!r}")
+        if clean_kind in {"atom", "skill"}:
+            raise PermissionError(f"Leaf prefix '{parts[0]}/' conflicts with kind={clean_kind!r}: {target!r}")
         target_rel = _resolve_leaf_file(eff_pb_dir, parts[1], "5-playbooks")
+    elif len(parts) == 2 and parts[0] in {"6-skills", "skills"}:
+        if clean_kind in {"atom", "playbook"}:
+            raise PermissionError(f"Leaf prefix '{parts[0]}/' conflicts with kind={clean_kind!r}: {target!r}")
+        target_rel = _resolve_leaf_file(eff_sk_dir, parts[1], "6-skills")
     elif len(parts) > 1:
         raise PermissionError(f"Unsupported leaf directory prefix in {target!r}")
     else:
@@ -516,10 +572,12 @@ def prove_leaf_membership(
             target_rel = _resolve_leaf_file(eff_atoms_dir, basename, "2-atoms")
         elif clean_kind == "playbook":
             target_rel = _resolve_leaf_file(eff_pb_dir, basename, "5-playbooks")
+        elif clean_kind == "skill":
+            target_rel = _resolve_leaf_file(eff_sk_dir, basename, "6-skills")
         else:
-            # Auto-detect across 2-atoms/ and 5-playbooks/, rejecting symlinks fail-closed first.
+            # Auto-detect across 2-atoms/, 5-playbooks/, and 6-skills/, rejecting symlinks fail-closed first.
             md_name = basename if basename.lower().endswith(".md") else f"{basename}.md"
-            for check_dir in (eff_atoms_dir, eff_pb_dir):
+            for check_dir in (eff_atoms_dir, eff_pb_dir, eff_sk_dir):
                 if os.path.lexists(check_dir) and _is_reparse_or_link(check_dir):
                     raise PermissionError(f"Refusing to resolve leaf under symlinked directory: {check_dir}")
                 cand = os.path.join(check_dir, md_name)
@@ -535,19 +593,29 @@ def prove_leaf_membership(
                 if os.path.isdir(eff_pb_dir)
                 else None
             )
-            merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=eff_atoms_dir, playbooks_dir=eff_pb_dir)
+            sk_safe = (
+                safe_file_in_dir(eff_sk_dir, md_name, allowed_exts={".md"}, must_exist=True)
+                if os.path.isdir(eff_sk_dir)
+                else None
+            )
+            merkle = compute_vault_merkle(
+                brain_dir=brain_dir,
+                atoms_dir=eff_atoms_dir,
+                playbooks_dir=eff_pb_dir,
+                skills_dir=eff_sk_dir,
+            )
             leaf_paths = {leaf["rel_path"] for leaf in merkle["leaves"]}
             atom_rel = f"2-atoms/{os.path.basename(atom_safe)}" if atom_safe else None
             pb_rel = f"5-playbooks/{os.path.basename(pb_safe)}" if pb_safe else None
-            in_atom = bool(atom_rel and atom_rel in leaf_paths)
-            in_pb = bool(pb_rel and pb_rel in leaf_paths)
-            if in_atom and in_pb:
+            sk_rel = f"6-skills/{os.path.basename(sk_safe)}" if sk_safe else None
+            matched_rels = [r for r in (atom_rel, pb_rel, sk_rel) if r and r in leaf_paths]
+            if len(matched_rels) > 1:
                 raise PermissionError(
-                    f"Ambiguous leaf target '{target}': present in both 2-atoms/ and 5-playbooks/; specify kind."
+                    f"Ambiguous leaf target '{target}': present across multiple verified stores ({', '.join(matched_rels)}); specify kind."
                 )
-            if in_atom and atom_rel is not None:
+            if len(matched_rels) == 1:
                 return _build_proof_from_merkle(
-                    atom_rel,
+                    matched_rels[0],
                     merkle=merkle,
                     brain_dir=brain_dir,
                     atoms_dir=eff_atoms_dir,
@@ -555,23 +623,18 @@ def prove_leaf_membership(
                     include_kind=True,
                     not_member_label=target,
                 )
-            if in_pb and pb_rel is not None:
-                return _build_proof_from_merkle(
-                    pb_rel,
-                    merkle=merkle,
-                    brain_dir=brain_dir,
-                    atoms_dir=eff_atoms_dir,
-                    playbooks_dir=eff_pb_dir,
-                    include_kind=True,
-                    not_member_label=target,
-                )
-            if atom_safe or pb_safe:
+            if atom_safe or pb_safe or sk_safe:
                 raise PermissionError(
                     f"Target '{target}' is not an accepted member of the verified vault Merkle tree."
                 )
             raise FileNotFoundError(f"Leaf target not found: {target}")
 
-    merkle = compute_vault_merkle(brain_dir=brain_dir, atoms_dir=eff_atoms_dir, playbooks_dir=eff_pb_dir)
+    merkle = compute_vault_merkle(
+        brain_dir=brain_dir,
+        atoms_dir=eff_atoms_dir,
+        playbooks_dir=eff_pb_dir,
+        skills_dir=eff_sk_dir,
+    )
     return _build_proof_from_merkle(
         target_rel,
         merkle=merkle,
