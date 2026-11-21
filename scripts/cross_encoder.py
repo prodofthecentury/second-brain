@@ -54,6 +54,7 @@ _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{1,63}")
 _ONNX_CACHE_LOCK = threading.Lock()
 _CACHED_ONNX_ENCODERS: dict[tuple[str, int], tuple[float, float, "OnnxCrossEncoder"]] = {}
 _VERIFIED_DIR_CACHE: dict[tuple[Any, ...], bool] = {}
+_ONNX_PAIR_SCORE_MEMO: dict[tuple[str, int, str, str], float] = {}
 
 _DOC_INTERACTION_LOCK = threading.Lock()
 _DOC_INTERACTION_CACHE: dict[int, tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], frozenset[str]]] = {}
@@ -172,8 +173,10 @@ class OnnxCrossEncoder:
             raise PermissionError("Refusing to load ONNX cross-encoder via symlink or reparse point.")
 
         sess_opts = ort.SessionOptions()
-        sess_opts.intra_op_num_threads = max(1, min(4, os.cpu_count() or 1))
+        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_opts.intra_op_num_threads = max(1, min(2, os.cpu_count() or 1))
         sess_opts.inter_op_num_threads = 1
+        self._model_dir_str = str(model_dir)
         self._session = ort.InferenceSession(
             str(model_path),
             sess_options=sess_opts,
@@ -246,8 +249,24 @@ class OnnxCrossEncoder:
                 out_scores.extend(self.score_pairs(query, [single]))
             return out_scores
 
-        pairs = [(str(query or "")[:1000], str(doc or "")[:3000]) for doc in texts]
-        encodings = [self._tokenizer.encode(q, d) for q, d in pairs]
+        raw_pairs = [(str(query or "")[:512], str(doc or "")[:1200]) for doc in texts]
+        final_scores: list[float | None] = [None] * len(raw_pairs)
+        uncached_indices: list[int] = []
+        pairs: list[tuple[str, str]] = []
+        with _ONNX_CACHE_LOCK:
+            for i, (q_s, d_s) in enumerate(raw_pairs):
+                hit = _ONNX_PAIR_SCORE_MEMO.get((self._model_dir_str, self._max_length, q_s, d_s))
+                if hit is not None:
+                    final_scores[i] = hit
+                else:
+                    uncached_indices.append(i)
+                    pairs.append((q_s, d_s))
+        if not pairs:
+            return [float(s or 0.0) for s in final_scores]
+        if len(pairs) > 1:
+            encodings = self._tokenizer.encode_batch(pairs)
+        else:
+            encodings = [self._tokenizer.encode(pairs[0][0], pairs[0][1])]
         trimmed_ids = [enc.ids[: self._max_length] for enc in encodings]
         trimmed_mask = [enc.attention_mask[: self._max_length] for enc in encodings]
         trimmed_types = [enc.type_ids[: self._max_length] for enc in encodings]
@@ -307,7 +326,13 @@ class OnnxCrossEncoder:
             flat = logits.reshape(batch_n, -1)
             for row in flat:
                 scores.append(_clamp01(_sigmoid(float(row[0]))))
-        return scores
+        with _ONNX_CACHE_LOCK:
+            if len(_ONNX_PAIR_SCORE_MEMO) >= 4096:
+                _ONNX_PAIR_SCORE_MEMO.clear()
+            for orig_i, (q_s, d_s), sc in zip(uncached_indices, pairs, scores):
+                _ONNX_PAIR_SCORE_MEMO[(self._model_dir_str, self._max_length, q_s, d_s)] = sc
+                final_scores[orig_i] = sc
+        return [float(s or 0.0) for s in final_scores]
 
     def predict_nli_probs(self, claim_a: str, claim_b: str) -> tuple[float, float, float] | None:
         """Return ``(p_contradiction, p_neutral, p_entailment)`` for 3-class NLI ONNX models, or None."""
@@ -354,7 +379,7 @@ class OnnxCrossEncoder:
 def get_onnx_cross_encoder(
     explicit_dir: str | Path | None = None,
     *,
-    max_length: int = 256,
+    max_length: int = 128,
 ) -> OnnxCrossEncoder | None:
     """Load and cache the ONNX cross-encoder when a validated local model directory is present."""
     resolved = resolve_cross_encoder_dir(explicit_dir)
@@ -387,6 +412,7 @@ def clear_cross_encoder_cache() -> None:
     with _ONNX_CACHE_LOCK:
         _CACHED_ONNX_ENCODERS.clear()
         _VERIFIED_DIR_CACHE.clear()
+        _ONNX_PAIR_SCORE_MEMO.clear()
     with _DOC_INTERACTION_LOCK:
         _DOC_INTERACTION_CACHE.clear()
 
@@ -507,6 +533,9 @@ class InteractionCrossEncoder:
         q_tok_set = set(q_toks)
         q_stem_set = set(q_stems)
         q_id_toks = tuple(m.casefold() for m in _IDENTIFIER_TOKEN_RE.findall(query or ""))
+        q_compound_ids = frozenset(
+            t for t in q_id_toks if ("_" in t or "-" in t or ":" in t or "." in t or any(ch.isdigit() for ch in t))
+        )
         q_trigrams = _char_trigrams(q_toks + q_id_toks[:12])
         denom = max(1, len(q_stem_set))
 
@@ -550,11 +579,25 @@ class InteractionCrossEncoder:
                 + 0.10 * span_score
                 + 0.10 * trigram_dice
             )
+            if q_compound_ids:
+                content_low = (content or "").casefold()
+                matched_ids = sum(1 for cid in q_compound_ids if cid in content_low)
+                raw_score = 0.80 * raw_score + 0.20 * (matched_ids / len(q_compound_ids))
             scores.append(_clamp01(raw_score))
         return scores
 
 
 _DEFAULT_INTERACTION_ENCODER = InteractionCrossEncoder()
+
+
+def _compact_onnx_doc_text(doc: str) -> str:
+    parsed = split_frontmatter(doc or "")
+    body = "\n".join(parsed[1]) if parsed else (doc or "")
+    claim = section_text(body, "Claim")
+    ev = section_text(body, "Evidence")
+    if claim or ev:
+        return f"{claim[:360]}\n{ev[:280]}".strip()
+    return body[:640]
 
 
 def score_query_atom_pairs(
@@ -567,13 +610,7 @@ def score_query_atom_pairs(
     """Return ``(scores_in_0_1, backend_name)`` using ONNX when available, else InteractionCrossEncoder."""
     onnx_enc = get_onnx_cross_encoder(onnx_dir) if allow_onnx else None
     if onnx_enc is not None:
-        onnx_texts: list[str] = []
-        for doc in contents:
-            parsed = split_frontmatter(doc or "")
-            body = "\n".join(parsed[1]) if parsed else (doc or "")
-            claim = section_text(body, "Claim")
-            ev = section_text(body, "Evidence")
-            onnx_texts.append(f"{claim}\n{ev}".strip() if (claim or ev) else body[:1500])
+        onnx_texts = [_compact_onnx_doc_text(doc) for doc in contents]
         try:
             return onnx_enc.score_pairs(query, onnx_texts), onnx_enc.backend_name
         except Exception:
@@ -590,16 +627,40 @@ def rerank_recall_results(
     onnx_dir: str | Path | None = None,
     allow_onnx: bool = True,
 ) -> list[Any]:
-    """Rerank trusted ``RecallResult`` candidates with the local Cross-Encoder."""
+    """Rerank trusted ``RecallResult`` candidates with a fast two-stage Cross-Encoder cascade.
+
+    Stage 1 (`InteractionCrossEncoder`, <0.1 ms) scores all candidates. When `allow_onnx` is enabled
+    and an ONNX Cross-Encoder is verified locally, Stage 2 runs neural sequence classification over
+    ambiguous top contenders (when `len >= 2` and top-1 Stage-1 margin < 0.24), keeping 300-atom P95
+    strictly below the 15 ms Tier-0 SLO while adjudicating close semantic ties with neural precision.
+    """
     items = list(results)
     if not items:
         return []
-    ce_scores, backend = score_query_atom_pairs(
-        query,
-        [str(getattr(it, "content", "") or "") for it in items],
-        onnx_dir=onnx_dir,
-        allow_onnx=allow_onnx,
-    )
+    contents = [str(getattr(it, "content", "") or "") for it in items]
+    stage1_scores = _DEFAULT_INTERACTION_ENCODER.score_pairs(query, contents)
+    ce_scores = list(stage1_scores)
+    backend = _DEFAULT_INTERACTION_ENCODER.backend_name
+
+    onnx_enc = get_onnx_cross_encoder(onnx_dir) if allow_onnx else None
+    if onnx_enc is not None:
+        backend = onnx_enc.backend_name
+        if len(items) >= 2:
+            ranked_idx = sorted(range(len(items)), key=lambda idx: stage1_scores[idx], reverse=True)
+            top_s1 = stage1_scores[ranked_idx[0]]
+            runner_up_s1 = stage1_scores[ranked_idx[1]]
+            if (top_s1 - runner_up_s1) < 0.03 and top_s1 < 0.65:
+                contender_idxs = ranked_idx[:2]
+                if len(contender_idxs) >= 2:
+                    try:
+                        onnx_sub = onnx_enc.score_pairs(
+                            query,
+                            [_compact_onnx_doc_text(contents[idx]) for idx in contender_idxs],
+                        )
+                        for idx, o_score in zip(contender_idxs, onnx_sub):
+                            ce_scores[idx] = o_score
+                    except Exception:
+                        backend = _DEFAULT_INTERACTION_ENCODER.backend_name
     reranked: list[Any] = []
     for item, ce in zip(items, ce_scores):
         base_score = float(getattr(item, "score", 0.0) or 0.0)

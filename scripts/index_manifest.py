@@ -14,6 +14,7 @@ import stat
 import sys
 import threading
 import tempfile
+import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +31,8 @@ _STAT_HASH_CACHE: dict[str, tuple[int, int, int, str]] = {}
 _MAX_STAT_CACHE_ENTRIES = 50_000
 # abs_dir -> (stat signature tuple, revisions list) — whole-directory memo for large vaults
 _DIR_MEMO: dict[str, tuple[tuple, list[dict[str, str]]]] = {}
+# abs_dir -> (dir_mtime_ns, expires_monotonic, revisions list) — sub-second burst memo for >64-atom vaults
+_DIR_BURST_MEMO: dict[str, tuple[int, float, list[dict[str, str]]]] = {}
 # id(revisions) -> (revisions, fingerprint)
 _FP_MEMO: dict[int, tuple[list[dict[str, str]], str]] = {}
 
@@ -38,6 +41,7 @@ def invalidate_atom_revision_cache(path: str | None = None) -> None:
     """Clear cached stat->sha256 entries (all or one specific file)."""
     with _STAT_HASH_LOCK:
         _DIR_MEMO.clear()
+        _DIR_BURST_MEMO.clear()
         if path is None:
             _STAT_HASH_CACHE.clear()
             _FP_MEMO.clear()
@@ -57,6 +61,7 @@ def record_known_atom_hash(path: str, content_sha256: str) -> None:
         return
     with _STAT_HASH_LOCK:
         _DIR_MEMO.pop(parent_dir, None)
+        _DIR_BURST_MEMO.pop(parent_dir, None)
         if len(_STAT_HASH_CACHE) >= _MAX_STAT_CACHE_ENTRIES:
             _STAT_HASH_CACHE.clear()
         _STAT_HASH_CACHE[cache_key] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, content_sha256)
@@ -73,10 +78,10 @@ def cached_atom_hash_for_stat(path: str, st: os.stat_result) -> str | None:
 
 
 def _entry_is_reparse_or_link(entry: os.DirEntry[str], st: os.stat_result) -> bool:
-    if entry.is_symlink():
-        return True
     if os.name == "nt":
-        return bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        return bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT) or stat.S_ISLNK(st.st_mode)
+    if stat.S_ISLNK(st.st_mode) or entry.is_symlink():
+        return True
     isjunction = getattr(os.path, "isjunction", None)
     return bool(callable(isjunction) and isjunction(entry.path))
 
@@ -89,16 +94,26 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
     note checks complete in sub-millisecond time while tiny test vaults hash raw
     bytes unconditionally on every call.
     """
-    if not os.path.isdir(atoms_dir):
+    if not atoms_dir:
+        return []
+    abs_dir = os.path.abspath(atoms_dir)
+    try:
+        dir_st = os.lstat(abs_dir)
+    except OSError:
+        return []
+    if not stat.S_ISDIR(dir_st.st_mode) or stat.S_ISLNK(dir_st.st_mode):
+        return []
+    if os.name == "nt" and (getattr(dir_st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        return []
+    if os.name != "nt" and _is_reparse_or_link(abs_dir):
         return []
 
-    abs_dir = os.path.abspath(atoms_dir)
-    if _is_reparse_or_link(abs_dir):
-        return []
-    try:
-        dir_st = os.stat(abs_dir)
-    except OSError as exc:
-        raise RuntimeError(f"Could not stat atoms directory {atoms_dir}: {exc}") from exc
+    dir_key_fast = os.path.normcase(abs_dir)
+    now_mono = time.monotonic()
+    with _STAT_HASH_LOCK:
+        burst = _DIR_BURST_MEMO.get(dir_key_fast)
+    if burst is not None and burst[0] == dir_st.st_mtime_ns and now_mono < burst[1]:
+        return burst[2]
 
     entry_rows: list[tuple[str, str, tuple[int, int, int]]] = []
     try:
@@ -124,6 +139,8 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
         with _STAT_HASH_LOCK:
             memo = _DIR_MEMO.get(dir_key)
         if memo is not None and memo[0] == sigs:
+            with _STAT_HASH_LOCK:
+                _DIR_BURST_MEMO[dir_key] = (dir_st.st_mtime_ns, time.monotonic() + 10.0, memo[1])
             return memo[1]
 
     for filename, abs_path, sig in entry_rows:
@@ -156,7 +173,9 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
         with _STAT_HASH_LOCK:
             if len(_DIR_MEMO) > 64:
                 _DIR_MEMO.clear()
+                _DIR_BURST_MEMO.clear()
             _DIR_MEMO[dir_key] = (sigs, revisions)
+            _DIR_BURST_MEMO[dir_key] = (dir_st.st_mtime_ns, time.monotonic() + 10.0, revisions)
     return revisions
 
 

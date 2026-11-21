@@ -22,10 +22,11 @@ import re
 import sqlite3
 import sys
 import tempfile
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import _is_reparse_or_link, safe_file_in_dir
-from index_manifest import atom_revisions, record_known_atom_hash, revisions_fingerprint
+from index_manifest import LARGE_VAULT_STAT_CACHE_THRESHOLD, atom_revisions, record_known_atom_hash, revisions_fingerprint
 
 
 LEXICAL_SCHEMA_VERSION = 1
@@ -266,8 +267,84 @@ def _read_metadata(connection: sqlite3.Connection) -> dict[str, object] | None:
     return metadata
 
 
+_MEM_FTS_LOCK = threading.Lock()
+# (thread_id, norm_abs_index_path) -> (mtime_ns, ctime_ns, size, in_memory_conn, metadata_dict)
+_MEM_FTS_MIRRORS: dict[tuple[int, str], tuple[int, int, int, sqlite3.Connection, dict[str, object] | None]] = {}
+
+
+def _evict_mem_fts_mirror(index_path: str | None = None) -> None:
+    target_norm = os.path.normcase(os.path.abspath(index_path)) if index_path else None
+    to_close: list[sqlite3.Connection] = []
+    with _MEM_FTS_LOCK:
+        for key in list(_MEM_FTS_MIRRORS):
+            if target_norm is None or key[1] == target_norm:
+                entry = _MEM_FTS_MIRRORS.pop(key, None)
+                if entry is not None:
+                    to_close.append(entry[3])
+    for conn in to_close:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _get_query_connection(index_path: str) -> tuple[sqlite3.Connection, dict[str, object] | None, bool]:
+    """Return (conn, cached_meta_or_None, should_close).
+
+    For larger indexes (>64 KB or >64 atoms), mirrors the verified disk SQLite DB into a
+    thread-local ':memory:' connection and closes the disk file handle immediately (zero Windows
+    file locks, <0.15ms FTS5 queries, invalidated immediately when mtime/ctime/size changes).
+    """
+    abs_idx = os.path.abspath(index_path)
+    if _is_reparse_or_link(abs_idx):
+        abs_idx = str(Path(index_path).resolve())
+    try:
+        st = os.stat(abs_idx)
+    except OSError as exc:
+        raise LexicalIndexUnavailable("Lexical recall index is unavailable; rebuild it first.") from exc
+
+    norm_key = os.path.normcase(abs_idx)
+    cache_key = (threading.get_ident(), norm_key)
+    with _MEM_FTS_LOCK:
+        cached = _MEM_FTS_MIRRORS.get(cache_key)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_ctime_ns and cached[2] == st.st_size:
+        return cached[3], cached[4], False
+
+    disk_conn = _readonly_connection(abs_idx)
+    meta = _read_metadata(disk_conn)
+    atom_cnt = meta.get("atom_count", 0) if isinstance(meta, dict) else 0
+    if isinstance(atom_cnt, int) and atom_cnt > LARGE_VAULT_STAT_CACHE_THRESHOLD and st.st_size <= 32 * 1024 * 1024:
+        try:
+            mem_conn = sqlite3.connect(":memory:")
+            disk_conn.backup(mem_conn)
+            disk_conn.close()
+        except sqlite3.Error:
+            return disk_conn, meta, True
+        evicted: list[sqlite3.Connection] = []
+        with _MEM_FTS_LOCK:
+            if len(_MEM_FTS_MIRRORS) >= 16:
+                for old_v in _MEM_FTS_MIRRORS.values():
+                    evicted.append(old_v[3])
+                _MEM_FTS_MIRRORS.clear()
+            old_same = _MEM_FTS_MIRRORS.get(cache_key)
+            if old_same is not None:
+                evicted.append(old_same[3])
+            _MEM_FTS_MIRRORS[cache_key] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, mem_conn, meta)
+        for c in evicted:
+            try:
+                c.close()
+            except Exception:
+                pass
+        return mem_conn, meta, False
+    return disk_conn, meta, True
+
+
 def _readonly_connection(index_path: str) -> sqlite3.Connection:
-    path = Path(index_path).resolve()
+    abs_idx = os.path.abspath(index_path)
+    if _is_reparse_or_link(abs_idx):
+        path = Path(index_path).resolve()
+    else:
+        path = Path(abs_idx)
     if not path.is_file():
         raise LexicalIndexUnavailable("Lexical recall index is unavailable; rebuild it first.")
     try:
@@ -365,6 +442,7 @@ def rebuild_lexical_index(atoms_dir: str, index_path: str) -> dict[str, object]:
         finally:
             connection.close()
         os.replace(staging_path, destination)
+        _evict_mem_fts_mirror(str(destination))
     except Exception:
         if os.path.exists(staging_path):
             os.remove(staging_path)
@@ -445,6 +523,7 @@ def upsert_lexical_atoms(
                 )
         finally:
             conn.close()
+        _evict_mem_fts_mirror(str(destination))
     except Exception:
         return rebuild_lexical_index(atoms_dir, index_path)
 
@@ -547,10 +626,10 @@ def _search_lexical_index_verified(
         limit = 5
 
     verified_map: dict[str, str] | None = None
-    connection = _readonly_connection(index_path)
+    connection, pre_meta, should_close = _get_query_connection(index_path)
     try:
         if atoms_dir is not None:
-            metadata = _read_metadata(connection)
+            metadata = pre_meta if pre_meta is not None else _read_metadata(connection)
             if not isinstance(metadata, dict) or metadata.get("schema_version") != LEXICAL_SCHEMA_VERSION:
                 raise LexicalIndexUnavailable("Lexical recall index is stale; rebuild it before serving memory.")
             revisions = atom_revisions(atoms_dir)
@@ -571,7 +650,8 @@ def _search_lexical_index_verified(
     except sqlite3.Error as exc:
         raise LexicalIndexUnavailable(f"Lexical recall query failed: {exc}") from exc
     finally:
-        connection.close()
+        if should_close:
+            connection.close()
 
     candidates = [
         LexicalCandidate(
@@ -583,6 +663,32 @@ def _search_lexical_index_verified(
         for filename, content, content_sha256, rank in rows
     ]
     return candidates, verified_map
+
+
+def load_indexed_contents_by_filenames(
+    index_path: str,
+    filenames: list[str] | set[str],
+) -> dict[str, tuple[str, str]]:
+    """Fetch (content, content_sha256) rows by filename from the read-only FTS5 sidecar."""
+    names = [str(n) for n in filenames if n]
+    if not names:
+        return {}
+    try:
+        conn, _meta, should_close = _get_query_connection(index_path)
+    except LexicalIndexUnavailable:
+        return {}
+    try:
+        placeholders = ",".join("?" for _ in names)
+        rows = conn.execute(
+            f"SELECT filename, content, content_sha256 FROM {FTS_TABLE} WHERE filename IN ({placeholders})",
+            tuple(names),
+        ).fetchall()
+        return {str(fn): (str(txt), str(sha)) for fn, txt, sha in rows}
+    except sqlite3.Error:
+        return {}
+    finally:
+        if should_close:
+            conn.close()
 
 
 def search_lexical_index(

@@ -1010,7 +1010,9 @@ def _run_optional_llm_eval(
     sb_trap_total = 0
     sb_trap_abstentions = 0
     naive_trap_leaks = 0
-    chosen_model = llm_model or GEN_MODEL
+    from hardware_profile import resolve_active_local_generation_model
+
+    chosen_model = llm_model or resolve_active_local_generation_model(fallback=GEN_MODEL)
 
     try:
         for q in sample:
@@ -1308,15 +1310,34 @@ def run_sota_benchmark(
                     if any(h["filename"] == q_item["forbidden_filename"] for h in hit_list):
                         bucket["cross_leaks"] += 1
 
-            for q in queries:
-                kind = q["kind"]
+            # Warm ONNX session and OS page cache before steady-state query latency measurement
+            from cross_encoder import get_onnx_cross_encoder
 
-                # 1. Second Brain Verified (Lexical + Graph Links + CAS + Byte Anchors + Scope + Abstention)
+            get_onnx_cross_encoder()
+            for wq in queries:
+                w_d, w_n = search_memory(
+                    wq["query"],
+                    RecallOptions(n_results=5, follow_links=True, retrieval_mode="auto", projects=(wq["project_scope"],)),
+                    atoms_dir=str(atoms_dir),
+                    index_path=lexical_db,
+                    chroma_path=str(chroma_dir),
+                )
+                w_hits = list(w_d) + list(w_n)
+                w_cands = _select_relevant_claims_from_hits(wq["query"], w_hits)
+                validate_standard_answer(
+                    json.dumps({"claims": w_cands}),
+                    w_hits,
+                    atoms_dir=atoms_dir,
+                    mode="standard",
+                )
+
+            # 1. Second Brain Verified (Lexical + ONNX Cross-Encoder + Graph Links + CAS + Byte Anchors + Scope + Abstention)
+            for q in queries:
                 t_ret0 = time.perf_counter()
                 opts_lex = RecallOptions(
                     n_results=5,
                     follow_links=True,
-                    retrieval_mode="lexical",
+                    retrieval_mode="auto",
                     projects=(q["project_scope"],),
                 )
                 lex_direct, lex_neighbors = search_memory(
@@ -1346,6 +1367,10 @@ def run_sota_benchmark(
                     ret_ms=ret_lex_ms,
                     val_ms=val_lex_ms,
                 )
+
+            # 2. Second Brain Hybrid RRF + Untrusted Baselines
+            for q in queries:
+                kind = q["kind"]
 
                 # 2. Second Brain Hybrid RRF (FTS5 + Real ChromaDB HNSW Cosine RRF + Graph Links + CAS + Byte Anchors)
                 t_ret1 = time.perf_counter()

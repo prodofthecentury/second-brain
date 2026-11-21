@@ -277,15 +277,12 @@ def metadata_contexts(record: dict) -> tuple[str, ...]:
 
 
 def _resolve_canonical_atoms_root(atoms_dir: str) -> str | None:
-    if not atoms_dir or not os.path.isdir(atoms_dir) or _is_reparse_or_link(atoms_dir):
+    if not atoms_dir:
         return None
-    try:
-        real_root = os.path.realpath(atoms_dir)
-    except OSError:
+    abs_root = os.path.abspath(atoms_dir)
+    if not os.path.isdir(abs_root) or _is_reparse_or_link(abs_root):
         return None
-    if not os.path.isdir(real_root) or _is_reparse_or_link(real_root):
-        return None
-    return real_root
+    return abs_root
 
 
 def _read_verified_atom_bytes_fast(
@@ -352,6 +349,46 @@ def _read_verified_atom_bytes_fast(
     return path, raw_bytes, content
 
 
+def _record_passes_pre_anchor_filters(record: dict, options: RecallOptions) -> bool:
+    """Fast in-memory pre-check before opening anchored source files on disk."""
+    status = str(record.get("review_status", "pending"))
+    claim_state = str(record.get("claim_state", "candidate"))
+    include_statuses = normalize_statuses(options.include_statuses)
+    exclude_statuses = normalize_statuses(options.exclude_statuses) or set()
+
+    superseded_by = record.get("superseded_by", [])
+    if isinstance(superseded_by, str):
+        superseded_by = parse_scalar_list(superseded_by)
+    if superseded_by:
+        return False
+    if status in exclude_statuses:
+        return False
+    if include_statuses is not None and status not in include_statuses:
+        return False
+    if include_statuses is None and status not in NORMAL_RECALL_STATUSES:
+        return False
+    if (not options.allow_unreviewed_exploratory or status == "accepted") and claim_state != "human_reviewed":
+        return False
+    if options.memory_types:
+        memory_type = str(record.get("memory_type", "semantic"))
+        if memory_type not in set(options.memory_types):
+            return False
+    if options.projects:
+        record_contexts = metadata_contexts(record)
+        if not project_tags_match(record_contexts, options.projects):
+            return False
+    tv = evaluate_temporal_validity(
+        record.get("valid_from"),
+        record.get("valid_until"),
+        as_of=options.as_of,
+    )
+    if tv["status"] == "invalid_window":
+        return False
+    if not options.include_expired and not tv["active"]:
+        return False
+    return True
+
+
 def load_memory_metadata(
     filename: str,
     atoms_dir: str = ATOMS_DIR,
@@ -361,6 +398,7 @@ def load_memory_metadata(
     _canonical_atoms_root: str | None = None,
     _decision_map: dict[str, dict] | None = None,
     _source_sha_memo: dict[str, str | None] | None = None,
+    _filter_options: RecallOptions | None = None,
 ) -> dict:
     pre_content: str | None = None
     if _preverified is not None:
@@ -408,6 +446,9 @@ def load_memory_metadata(
             "importance": "0.20",
             "contexts": [],
         }
+    if _filter_options is not None and not _record_passes_pre_anchor_filters(record, _filter_options):
+        record["approved_revision_current"] = False
+        return record
     effective_brain_dir = os.path.abspath(os.path.join(atoms_dir, os.pardir))
     decision_log = os.path.join(effective_brain_dir, "0-raw", "archive", "decision-record.jsonl")
     if os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR):
@@ -808,6 +849,11 @@ def linked_neighbors(
     atoms_dir: str = ATOMS_DIR,
     *,
     query: str,
+    _canonical_atoms_root: str | None = None,
+    _decision_map: dict[str, dict] | None = None,
+    _source_sha_memo: dict[str, str | None] | None = None,
+    _verified_rev_map: dict[str, str] | None = None,
+    _indexed_content_map: dict[str, tuple[str, str]] | None = None,
 ) -> list[RecallResult]:
     neighbors = []
     neighbor_options = (
@@ -815,22 +861,88 @@ def linked_neighbors(
         if options.projects and options.allow_cross_project
         else options
     )
+    use_fast = (
+        verified_atom_content is _ORIG_VERIFIED_ATOM_CONTENT
+        and load_memory_metadata is _ORIG_LOAD_MEMORY_METADATA
+        and _canonical_atoms_root is not None
+    )
     for target in wikilinks(result.content):
-        target_path = safe_file_in_dir(atoms_dir, target, allowed_exts={".md"})
-        if not target_path:
-            continue
-        with open(target_path, "r", encoding="utf-8") as file:
-            content = file.read()
-        if not candidate_has_query_overlap(query, content):
-            continue
-        neighbor = result_from_candidate(
-            content=content,
-            filename=target,
-            distance=0.35,
-            options=neighbor_options,
-            source="graph",
-            atoms_dir=atoms_dir,
-        )
+        if use_fast:
+            known_sha = _verified_rev_map.get(target) if _verified_rev_map is not None else None
+            idx_entry = _indexed_content_map.get(target) if _indexed_content_map is not None else None
+            cand_txt = idx_entry[0] if (idx_entry is not None and idx_entry[1] == known_sha) else None
+            if known_sha and cand_txt is not None:
+                cand_b = cand_txt.encode("utf-8")
+                if hashlib.sha256(cand_b).hexdigest() == known_sha:
+                    bundle = (os.path.join(_canonical_atoms_root, target), cand_b, cand_txt)
+                else:
+                    bundle = _read_verified_atom_bytes_fast(
+                        target,
+                        known_sha,
+                        canonical_atoms_root=_canonical_atoms_root,
+                        atoms_dir=atoms_dir,
+                        candidate_content=cand_txt,
+                    )
+            elif known_sha:
+                bundle = _read_verified_atom_bytes_fast(
+                    target,
+                    known_sha,
+                    canonical_atoms_root=_canonical_atoms_root,
+                    atoms_dir=atoms_dir,
+                    candidate_content=cand_txt,
+                )
+            else:
+                bundle = None
+                target_path = safe_file_in_dir(atoms_dir, target, allowed_exts={".md"})
+                if target_path:
+                    try:
+                        with open(target_path, "rb") as fh:
+                            raw_b = fh.read()
+                        c_txt = raw_b.decode("utf-8")
+                        known_sha = hashlib.sha256(raw_b).hexdigest()
+                        bundle = (target_path, raw_b, c_txt)
+                    except (OSError, UnicodeDecodeError):
+                        bundle = None
+            if bundle is None:
+                continue
+            content = bundle[2]
+            if not candidate_has_query_overlap(query, content, content_sha256=known_sha):
+                continue
+            rec = load_memory_metadata(
+                target,
+                atoms_dir=atoms_dir,
+                _preverified=bundle,
+                _known_sha256=known_sha,
+                _canonical_atoms_root=_canonical_atoms_root,
+                _decision_map=_decision_map,
+                _source_sha_memo=_source_sha_memo,
+                _filter_options=neighbor_options,
+            )
+            neighbor = result_from_candidate(
+                content=content,
+                filename=target,
+                distance=0.35,
+                options=neighbor_options,
+                source="graph",
+                atoms_dir=atoms_dir,
+                _preloaded_record=rec,
+            )
+        else:
+            target_path = safe_file_in_dir(atoms_dir, target, allowed_exts={".md"})
+            if not target_path:
+                continue
+            with open(target_path, "r", encoding="utf-8") as file:
+                content = file.read()
+            if not candidate_has_query_overlap(query, content):
+                continue
+            neighbor = result_from_candidate(
+                content=content,
+                filename=target,
+                distance=0.35,
+                options=neighbor_options,
+                source="graph",
+                atoms_dir=atoms_dir,
+            )
         if neighbor:
             extra_reasons = [f"linked_from:{result.filename}"]
             if options.projects and not project_tags_match(neighbor.contexts, options.projects):
@@ -1033,8 +1145,23 @@ def search_semantic_memory(
     neighbors = []
     seen = {item.filename for item in direct}
     if options.follow_links:
+        sem_fast = (
+            verified_atom_content is _ORIG_VERIFIED_ATOM_CONTENT
+            and load_memory_metadata is _ORIG_LOAD_MEMORY_METADATA
+        )
+        sem_root = _resolve_canonical_atoms_root(atoms_dir) if sem_fast else None
+        sem_decisions = _preload_batch_decision_map(atoms_dir) if sem_fast else None
+        sem_memo: dict[str, str | None] = {}
         for result in direct:
-            for neighbor in linked_neighbors(result, options, atoms_dir=atoms_dir, query=query):
+            for neighbor in linked_neighbors(
+                result,
+                options,
+                atoms_dir=atoms_dir,
+                query=query,
+                _canonical_atoms_root=sem_root,
+                _decision_map=sem_decisions,
+                _source_sha_memo=sem_memo,
+            ):
                 if neighbor.filename not in seen:
                     seen.add(neighbor.filename)
                     neighbors.append(neighbor)
@@ -1124,6 +1251,7 @@ def search_lexical_memory(
                 _canonical_atoms_root=canon_root,
                 _decision_map=decision_map,
                 _source_sha_memo=source_sha_memo,
+                _filter_options=options,
             )
         else:
             current_content = verified_atom_content(
@@ -1176,9 +1304,32 @@ def search_lexical_memory(
         direct = direct_sorted[: options.n_results]
     neighbors = []
     seen = {item.filename for item in direct}
-    if options.follow_links:
+    if options.follow_links and direct:
+        from lexical_store import load_indexed_contents_by_filenames
+
+        all_link_targets = {
+            target
+            for res in direct
+            for target in wikilinks(res.content)
+            if target and target not in seen
+        }
+        idx_content_map = (
+            load_indexed_contents_by_filenames(index_path, all_link_targets)
+            if (verified_rev_map is not None and all_link_targets)
+            else None
+        )
         for result in direct:
-            for neighbor in linked_neighbors(result, options, atoms_dir=atoms_dir, query=query):
+            for neighbor in linked_neighbors(
+                result,
+                options,
+                atoms_dir=atoms_dir,
+                query=query,
+                _canonical_atoms_root=canon_root,
+                _decision_map=decision_map,
+                _source_sha_memo=source_sha_memo,
+                _verified_rev_map=verified_rev_map,
+                _indexed_content_map=idx_content_map,
+            ):
                 if neighbor.filename not in seen:
                     seen.add(neighbor.filename)
                     neighbors.append(neighbor)

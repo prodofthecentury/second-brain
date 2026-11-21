@@ -235,10 +235,18 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
         for case in scored_cases:
             started = time.perf_counter()
             case_projects = (str(case["project_scope"]).strip(),) if case.get("project_scope") else ()
+            case_mode = str(case.get("answer_mode") or "standard").strip() or "standard"
+            include_prefs = case_mode == "preference"
             try:
                 direct, neighbors = search_memory(
                     case["query"],
-                    RecallOptions(n_results=5, follow_links=True, projects=case_projects),
+                    RecallOptions(
+                        n_results=5,
+                        follow_links=True,
+                        retrieval_mode="auto",
+                        include_preferences=include_prefs,
+                        projects=case_projects,
+                    ),
                 )
             except Exception as exc:
                 raise EvaluationRunError(f"Trusted recall failed for {case['id']}: {exc}") from exc
@@ -256,6 +264,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
             prompt = build_grounding_prompt(
                 AnswerRequest(
                     query=case["query"],
+                    mode=case_mode,
                     result_limit=5,
                     project_scope=str(case["project_scope"]).strip() if case.get("project_scope") else None,
                 ),
@@ -281,6 +290,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                         model=model,
                         messages=[{"role": "user", "content": redaction.sanitized_text}],
                         format=ANSWER_DRAFT_SCHEMA,
+                        options={"temperature": 0, "num_ctx": 2048},
                         stream=False,
                     )
                 raw_content = strip_reasoning_think_blocks(str(response["message"]["content"])) or "{}"
@@ -288,7 +298,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
             except Exception as exc:
                 raise EvaluationRunError(f"Generation failed for {case['id']} run {run_number}: {exc}") from exc
             try:
-                answer = validate_standard_answer(draft_json, retrieved, atoms_dir=ATOMS_DIR)
+                answer = validate_standard_answer(draft_json, retrieved, atoms_dir=ATOMS_DIR, mode=case_mode)
             except Exception as exc:
                 raise EvaluationRunError(f"Answer validation failed for {case['id']} run {run_number}: {exc}") from exc
             observations.append({
@@ -331,9 +341,12 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
 
 
 def main(argv: list[str] | None = None) -> int:
+    from hardware_profile import resolve_active_local_generation_model
+
+    default_model = resolve_active_local_generation_model(fallback=GEN_MODEL)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=int, default=3, help="Complete independent outputs per scored case (1-50).")
-    parser.add_argument("--model", default=GEN_MODEL, help="Installed Ollama generation model.")
+    parser.add_argument("--model", default=default_model, help="Installed Ollama generation model (defaults to hardware-tiered selection).")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT_PATH), help="Local JSON result path (default is ignored brain sidecar).")
     args = parser.parse_args(argv)
     try:

@@ -159,15 +159,45 @@ def _allow_heavy_qwen36_fallback(
 
 
 def generation_candidates(preferred: str | None = None) -> list[str]:
+    from hardware_profile import _model_fits_host_memory, detect_hardware_profile, probe_ollama_models_with_sizes
+
     installed = installed_model_names()
-    installed_bases = {name.split(":", 1)[0]: name for name in installed}
+    try:
+        hw = detect_hardware_profile(use_cache=True)
+        _, _, model_sizes = probe_ollama_models_with_sizes(timeout=0.8)
+        total_ram = float(getattr(hw, "total_ram_gib", 0.0) or 0.0)
+        gpu_backend = str(getattr(hw, "gpu_backend", "cpu") or "cpu")
+        vram_gib = float(getattr(hw, "vram_gib", 0.0) or 0.0)
+    except Exception:
+        total_ram, gpu_backend, vram_gib, model_sizes = 0.0, "cpu", 0.0, {}
+
+    def _fits(m_name: str) -> bool:
+        return _model_fits_host_memory(
+            m_name,
+            total_ram_gib=total_ram,
+            gpu_backend=gpu_backend,
+            vram_gib=vram_gib,
+            model_sizes_bytes=model_sizes,
+        )
+
+    installed_by_base: dict[str, list[str]] = {}
+    for m_name in installed:
+        installed_by_base.setdefault(m_name.split(":", 1)[0], []).append(m_name)
+
+    explicit_env = (os.environ.get("BRAIN_GEN_MODEL") or "").strip()
     pref_clean = (preferred or "").strip()
+    has_explicit_pin = bool(
+        (pref_clean and pref_clean.lower() != "auto")
+        or (explicit_env and explicit_env.lower() != "auto")
+    )
     if pref_clean and pref_clean.lower() != "auto":
         configured = pref_clean
     else:
         configured = resolve_active_local_generation_model(fallback=GEN_MODEL)
     fallback_env = os.environ.get("BRAIN_FALLBACK_MODELS", "")
     fallback_items = [item.strip() for item in fallback_env.split(",") if item.strip()]
+    explicit_allowed = {configured, *fallback_items} if has_explicit_pin else set(fallback_items)
+
     auto_fallbacks = ["qwen3-coder:8b", "qwen3:8b", "qwen2.5-coder:7b"]
     if _allow_heavy_qwen36_fallback(preferred, configured, fallback_items):
         auto_fallbacks.append("qwen3.6:latest")
@@ -178,16 +208,26 @@ def generation_candidates(preferred: str | None = None) -> list[str]:
         *auto_fallbacks,
     ]
 
-    candidates = []
+    candidates: list[str] = []
     for name in requested:
         if not name or name in candidates:
             continue
+        is_pinned = name in explicit_allowed
         if name in installed:
-            candidates.append(name)
+            if is_pinned or _fits(name):
+                candidates.append(name)
             continue
-        base = name.split(":", 1)[0]
-        if base in installed_bases and installed_bases[base] not in candidates:
-            candidates.append(installed_bases[base])
+        if f"{name}:latest" in installed and ":" not in name:
+            cand_latest = f"{name}:latest"
+            if cand_latest not in candidates and (is_pinned or _fits(cand_latest)):
+                candidates.append(cand_latest)
+            continue
+        # Only bare family names (no explicit ':tag') may match an installed variant, and only if RAM-fit passes
+        if ":" not in name and name in installed_by_base:
+            for matched in installed_by_base[name]:
+                if matched not in candidates and (is_pinned or _fits(matched)):
+                    candidates.append(matched)
+                    break
     return candidates or [configured]
 
 
