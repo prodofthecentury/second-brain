@@ -27,9 +27,11 @@ from evidence import (
 )
 from index_manifest import LARGE_VAULT_STAT_CACHE_THRESHOLD, record_known_atom_hash
 from memory_format import (
+    evaluate_temporal_validity,
     frontmatter_value,
     is_memory_document,
     normalize_memory_document,
+    normalize_temporal_bound_str,
     remove_frontmatter_fields,
     render_memory_document,
     set_scalar_field,
@@ -51,6 +53,23 @@ TRANSITIONS = {
 
 class ReviewConflictError(RuntimeError):
     """The atom changed since the owner inspected the revision they meant to change."""
+
+
+def _validate_frontmatter_temporal_bounds(fm_lines: list[str]) -> tuple[str, str]:
+    raw_vf = frontmatter_value(fm_lines, "valid_from")
+    raw_vu = frontmatter_value(fm_lines, "valid_until")
+    try:
+        norm_vf = normalize_temporal_bound_str(raw_vf) if raw_vf else ""
+        norm_vu = normalize_temporal_bound_str(raw_vu) if raw_vu else ""
+    except ValueError as exc:
+        raise ReviewTransitionError(f"Invalid temporal validity bound (expected ISO-8601 date or timestamp): {exc}") from exc
+    if norm_vf or norm_vu:
+        tv = evaluate_temporal_validity(norm_vf, norm_vu)
+        if tv["status"] == "invalid_window":
+            raise ReviewTransitionError(
+                f"Invalid temporal validity window: valid_from ({norm_vf}) must not be after valid_until ({norm_vu})."
+            )
+    return norm_vf, norm_vu
 
 
 class ReviewTransitionError(RuntimeError):
@@ -290,24 +309,33 @@ def _write_mutation(
         dense_generation = None
         dense_error = None
         if dense_refresh_required:
-            if int(index_result.get("atom_count", 0)) <= 64:
-                try:
-                    from rebuild_vectors import rebuild_vectors
+            try:
+                import rebuild_vectors as _rv_mod
 
-                    dense_result = rebuild_vectors(
+                upsert_fn = getattr(_rv_mod, "upsert_changed_vectors", None)
+                if callable(upsert_fn):
+                    dense_result = upsert_fn(
+                        atoms_dir=os.path.dirname(atom_path),
+                        store_path=os.path.join(brain_dir, ".chroma"),
+                        collection_name="atoms",
+                        model=dense_model,
+                        changed_filenames=(Path(atom_path).name,),
+                        pre_verified_current=True,
+                        _writer_lock_held=True,
+                    )
+                else:
+                    dense_result = _rv_mod.rebuild_vectors(
                         atoms_dir=os.path.dirname(atom_path),
                         store_path=os.path.join(brain_dir, ".chroma"),
                         collection_name="atoms",
                         model=dense_model,
                         _writer_lock_held=True,
                     )
-                    dense_state = "current" if dense_result.get("committed") else "stale"
-                    dense_generation = dense_result.get("generation_id") if dense_state == "current" else None
-                except Exception as exc:
-                    dense_state = "stale"
-                    dense_error = str(exc)[:1000]
-            else:
+                dense_state = "current" if dense_result.get("committed") else "stale"
+                dense_generation = dense_result.get("generation_id") if dense_state == "current" else None
+            except Exception as exc:
                 dense_state = "stale"
+                dense_error = str(exc)[:1000]
         record = {
             "schema_version": 1,
             "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds"),
@@ -404,18 +432,44 @@ def apply_atom_mutation(
                 "Merged or superseded atoms cannot be approved, edited, or demoted; choose and review the surviving atom instead."
             )
 
-        from index_manifest import index_manifest_is_current, load_index_manifest
+        from index_manifest import (
+            INDEX_SCHEMA_VERSION,
+            atom_revisions,
+            index_manifest_is_current,
+            load_index_manifest,
+            revisions_fingerprint,
+        )
 
         active_dense_manifest = load_index_manifest(os.path.join(brain_dir, ".chroma"))
-        dense_refresh_required = (
+        manifest_valid = (
             isinstance(active_dense_manifest, dict)
+            and active_dense_manifest.get("schema_version") == INDEX_SCHEMA_VERSION
             and active_dense_manifest.get("distance_metric") == "cosine"
             and isinstance(active_dense_manifest.get("embedding_model"), str)
             and bool(active_dense_manifest.get("embedding_model"))
             and isinstance(active_dense_manifest.get("embedding_dimensions"), int)
             and bool(active_dense_manifest.get("generation_id"))
-            and index_manifest_is_current(active_dense_manifest, atoms_dir)
         )
+        dense_refresh_required = False
+        if manifest_valid and isinstance(active_dense_manifest, dict):
+            if index_manifest_is_current(active_dense_manifest, atoms_dir):
+                dense_refresh_required = True
+            else:
+                # Also handle newly-created atoms (e.g. verify_note_excerpt / new draft approval)
+                # where all previously-indexed atoms are untouched and only this atom was added.
+                target_name = Path(atom_path).name
+                other_revs = [r for r in atom_revisions(atoms_dir) if r["filename"] != target_name]
+                indexed = active_dense_manifest.get("indexed_count")
+                skipped = active_dense_manifest.get("skipped_count", 0)
+                if (
+                    isinstance(indexed, int)
+                    and isinstance(skipped, int)
+                    and skipped >= 0
+                    and active_dense_manifest.get("atom_count") == len(other_revs)
+                    and (indexed + skipped) == len(other_revs)
+                    and active_dense_manifest.get("atom_revisions_sha256") == revisions_fingerprint(other_revs)
+                ):
+                    dense_refresh_required = True
 
         evidence_anchor = None
         if action == "edit":
@@ -423,8 +477,10 @@ def apply_atom_mutation(
                 edited_text = str(edited_content).encode("utf-8").decode("utf-8")
             except UnicodeEncodeError as exc:
                 raise ReviewTransitionError("Atom content must be valid UTF-8 Markdown.") from exc
-            if split_frontmatter(edited_text) is None or not is_memory_document(edited_text):
+            edit_parsed = split_frontmatter(edited_text)
+            if edit_parsed is None or not is_memory_document(edited_text):
                 raise ReviewTransitionError("Atom edits must retain valid frontmatter, Claim, and Evidence sections.")
+            _validate_frontmatter_temporal_bounds(edit_parsed[0])
             source_origin = str(current_values.get("origin", "imported_unknown"))
             updated_text = normalize_memory_document(
                 edited_text,
@@ -445,6 +501,7 @@ def apply_atom_mutation(
         else:
             frontmatter = remove_frontmatter_fields(frontmatter, {"epistemic_contract"})
             if action == "approve":
+                _validate_frontmatter_temporal_bounds(frontmatter)
                 epistemic_label = frontmatter_value(frontmatter, "epistemic_label")
                 if epistemic_label == "hypothesis":
                     raise ReviewTransitionError("Hypotheses cannot be promoted to factual standard recall.")
@@ -491,6 +548,166 @@ def apply_atom_edit(**kwargs) -> dict:
 def apply_review_transition(*, action: str, **kwargs) -> dict:
     """Compatibility wrapper; all behavior lives in apply_atom_mutation."""
     return apply_atom_mutation(action=action, **kwargs)
+
+
+_DISALLOWED_TEMPORAL_ACTORS = {
+    "",
+    "agent",
+    "ai",
+    "assistant",
+    "bot",
+    "claude",
+    "cursor",
+    "gemini",
+    "gpt",
+    "llm",
+    "mcp",
+    "model",
+    "ollama",
+    "system",
+}
+
+
+def set_atom_temporal_bounds(
+    atom_path: str,
+    *,
+    valid_from: str | None = None,
+    valid_until: str | None = None,
+    expected_sha256: str,
+    actor: str,
+    rationale: str = "",
+    decision_log_path: str | None = None,
+    history_dir: str | None = None,
+    brain_dir: str | None = None,
+    atoms_dir: str = ATOMS_DIR,
+) -> dict:
+    """Set or clear optional ``valid_from`` / ``valid_until`` bounds on an atom under ``writer.lock``.
+
+    Preserves owner approval currency on already-approved atoms by re-verifying source byte-offset
+    anchors and recording an attested owner approval; never promotes unapproved/pending atoms.
+    """
+    atoms_dir = os.path.abspath(atoms_dir)
+    brain_dir = os.path.abspath(brain_dir or os.path.dirname(atoms_dir))
+    atom_path = _canonical_atom_path(atom_path, atoms_dir)
+    decision_log_path = (
+        os.path.abspath(decision_log_path)
+        if decision_log_path is not None
+        else os.path.join(brain_dir, "0-raw", "archive", "decision-record.jsonl")
+    )
+    history_dir = os.path.abspath(history_dir or os.path.join(atoms_dir, ".history"))
+
+    clean_actor = str(actor or "").strip()[:120]
+    actor_tokens = {tok for tok in __import__("re").split(r"[^a-z0-9]+", clean_actor.casefold()) if tok}
+    if not clean_actor or bool(actor_tokens & _DISALLOWED_TEMPORAL_ACTORS):
+        raise ReviewTransitionError("Setting temporal validity bounds requires an explicit human owner actor.")
+    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+        raise ReviewConflictError("An exact 64-character expected SHA-256 is required.")
+
+    try:
+        norm_vf = normalize_temporal_bound_str(valid_from) if valid_from else ""
+        norm_vu = normalize_temporal_bound_str(valid_until) if valid_until else ""
+    except ValueError as exc:
+        raise ReviewTransitionError(f"Invalid temporal validity bound: {exc}") from exc
+    if norm_vf or norm_vu:
+        tv = evaluate_temporal_validity(norm_vf, norm_vu)
+        if tv["status"] == "invalid_window":
+            raise ReviewTransitionError(
+                f"Invalid temporal validity window: valid_from ({norm_vf}) must not be after valid_until ({norm_vu})."
+            )
+
+    lock_path = os.path.join(brain_dir, ".sidecar", "writer.lock")
+    with review_lock(lock_path):
+        original = Path(atom_path).read_bytes()
+        actual_hash = content_sha256(original)
+        if actual_hash != expected_sha256:
+            raise ReviewConflictError(
+                f"Atom revision changed (expected {expected_sha256}, found {actual_hash}); reopen it first."
+            )
+        original_text = original.decode("utf-8")
+        parsed = split_frontmatter(original_text)
+        if parsed is None or not is_memory_document(original_text):
+            raise ReviewTransitionError("Atom must contain valid frontmatter, Claim, and Evidence sections.")
+        frontmatter, body = parsed
+        values = parse_frontmatter_values(frontmatter)
+        sup_by = values.get("superseded_by", [])
+        if isinstance(sup_by, str):
+            sup_by = [sup_by] if sup_by.strip() else []
+        if values.get("review_status") == "merged" or values.get("claim_state") == "superseded" or bool(sup_by):
+            raise ReviewTransitionError("Merged or superseded atoms cannot be mutated.")
+
+        was_approved = approved_revision_is_current(
+            atom_path,
+            decision_log_path=decision_log_path,
+            brain_dir=brain_dir,
+            atoms_dir=atoms_dir,
+        )
+
+        updated_fm = list(frontmatter)
+        if norm_vf:
+            updated_fm = set_scalar_field(updated_fm, "valid_from", norm_vf, "last-reviewed")
+        else:
+            updated_fm = remove_frontmatter_fields(updated_fm, {"valid_from"})
+        if norm_vu:
+            updated_fm = set_scalar_field(
+                updated_fm,
+                "valid_until",
+                norm_vu,
+                "valid_from" if norm_vf else "last-reviewed",
+            )
+        else:
+            updated_fm = remove_frontmatter_fields(updated_fm, {"valid_until"})
+
+        evidence_anchor = None
+        recorded_action = "edit"
+        if was_approved:
+            candidate_doc = render_memory_document(updated_fm, body)
+            try:
+                evidence_anchor = find_evidence_anchor(candidate_doc, brain_dir)
+            except (EvidenceValidationError, OSError, ValueError) as exc:
+                raise ReviewTransitionError(f"Could not verify evidence anchor while setting temporal bounds: {exc}") from exc
+            updated_fm = set_scalar_field(updated_fm, "citation_integrity", "anchored", "origin")
+            for key in ANCHOR_FIELDS:
+                updated_fm = set_scalar_field(updated_fm, key, str(evidence_anchor[key]), "citation_integrity")
+            recorded_action = "approve"
+
+        updated_bytes = render_memory_document(updated_fm, body).encode("utf-8")
+
+        from index_manifest import INDEX_SCHEMA_VERSION, index_manifest_is_current, load_index_manifest
+
+        active_dense_manifest = load_index_manifest(os.path.join(brain_dir, ".chroma"))
+        dense_refresh_required = (
+            isinstance(active_dense_manifest, dict)
+            and active_dense_manifest.get("schema_version") == INDEX_SCHEMA_VERSION
+            and active_dense_manifest.get("distance_metric") == "cosine"
+            and isinstance(active_dense_manifest.get("embedding_model"), str)
+            and bool(active_dense_manifest.get("embedding_model"))
+            and isinstance(active_dense_manifest.get("embedding_dimensions"), int)
+            and bool(active_dense_manifest.get("generation_id"))
+            and index_manifest_is_current(active_dense_manifest, atoms_dir)
+        )
+
+        res = _write_mutation(
+            atom_path=atom_path,
+            original=original,
+            updated=updated_bytes,
+            action=recorded_action,
+            actor=clean_actor,
+            decision_log_path=decision_log_path,
+            history_dir=history_dir,
+            brain_dir=brain_dir,
+            evidence_anchor=evidence_anchor,
+            dense_refresh_required=dense_refresh_required,
+            dense_model=active_dense_manifest.get("embedding_model") if dense_refresh_required else None,
+        )
+        tv_now = evaluate_temporal_validity(norm_vf, norm_vu)
+        return {
+            **res,
+            "approved_current": bool(was_approved),
+            "valid_from": norm_vf,
+            "valid_until": norm_vu,
+            "temporal_status": tv_now["status"],
+            "rationale": str(rationale or "").strip()[:500],
+        }
 
 
 def apply_atom_merge(
@@ -611,6 +828,18 @@ def apply_atom_merge(
             render_memory_document(updated_superseded, superseded_body).encode("utf-8"),
         ]
 
+        from index_manifest import index_manifest_is_current, load_index_manifest
+
+        dense_manifest = load_index_manifest(os.path.join(brain_dir, ".chroma"))
+        dense_active = (
+            isinstance(dense_manifest, dict)
+            and dense_manifest.get("distance_metric") == "cosine"
+            and bool(dense_manifest.get("embedding_model"))
+            and isinstance(dense_manifest.get("embedding_dimensions"), int)
+            and bool(dense_manifest.get("generation_id"))
+            and index_manifest_is_current(dense_manifest, atoms_dir)
+        )
+
         os.makedirs(history_dir, exist_ok=True)
         backup_paths = []
         for path, original in zip(paths, originals):
@@ -623,22 +852,47 @@ def apply_atom_merge(
             for path, content in zip(paths, updated):
                 atomic_write_bytes(path, content)
                 written_paths.append(path)
-            index_result = refresh_lexical_index(atoms_dir, brain_dir)
-            from index_manifest import index_manifest_is_current, load_index_manifest
-            dense_manifest = load_index_manifest(os.path.join(brain_dir, ".chroma"))
-            dense_active = (
-                isinstance(dense_manifest, dict)
-                and dense_manifest.get("distance_metric") == "cosine"
-                and bool(dense_manifest.get("embedding_model"))
-                and isinstance(dense_manifest.get("embedding_dimensions"), int)
-                and bool(dense_manifest.get("generation_id"))
-                and index_manifest_is_current(dense_manifest, atoms_dir)
+            index_result = refresh_lexical_index(
+                atoms_dir,
+                brain_dir,
+                changed_filenames=[survivor_name, superseded_name],
             )
+            merge_dense_state = "not_active"
+            merge_dense_gen = None
+            merge_dense_error = None
+            if dense_active:
+                try:
+                    import rebuild_vectors as _rv_mod
+
+                    upsert_fn = getattr(_rv_mod, "upsert_changed_vectors", None)
+                    if callable(upsert_fn):
+                        dense_res = upsert_fn(
+                            atoms_dir=atoms_dir,
+                            store_path=os.path.join(brain_dir, ".chroma"),
+                            collection_name="atoms",
+                            model=str(dense_manifest.get("embedding_model")),
+                            changed_filenames=(survivor_name, superseded_name),
+                            pre_verified_current=True,
+                            _writer_lock_held=True,
+                        )
+                    else:
+                        dense_res = _rv_mod.rebuild_vectors(
+                            atoms_dir=atoms_dir,
+                            store_path=os.path.join(brain_dir, ".chroma"),
+                            collection_name="atoms",
+                            model=str(dense_manifest.get("embedding_model")),
+                            _writer_lock_held=True,
+                        )
+                    merge_dense_state = "current" if dense_res.get("committed") else "stale"
+                    merge_dense_gen = dense_res.get("generation_id") if merge_dense_state == "current" else None
+                except Exception as exc:
+                    merge_dense_state = "stale"
+                    merge_dense_error = str(exc)[:1000]
             now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds")
             peer_paths = [superseded_path, survivor_path]
             records = []
             for index, path in enumerate(paths):
-                records.append({
+                rec_entry = {
                     "schema_version": 1,
                     "recorded_at": now,
                     "action": "merge",
@@ -651,8 +905,13 @@ def apply_atom_merge(
                     "content_sha256_after": content_sha256(updated[index]),
                     "backup_path": backup_paths[index],
                     "lexical_index_path": index_result["index_path"],
-                    "dense_index_state": "stale" if dense_active else "not_active",
-                })
+                    "dense_index_state": merge_dense_state,
+                }
+                if merge_dense_gen:
+                    rec_entry["dense_index_generation"] = merge_dense_gen
+                if merge_dense_error:
+                    rec_entry["dense_index_error"] = merge_dense_error
+                records.append(rec_entry)
             append_decision_records(records, decision_log_path)
         except Exception:
             for path, original in zip(paths, originals):

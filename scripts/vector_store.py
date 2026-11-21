@@ -136,6 +136,34 @@ class JsonVectorCollection:
         if self._batch_depth == 0:
             self.flush()
 
+    def count(self) -> int:
+        return len(self._load())
+
+    def delete(self, ids: list[str] | None = None, where: dict[str, Any] | None = None) -> None:
+        items = self._load()
+        removed = False
+        if isinstance(ids, str):
+            ids = [ids]
+        if ids is not None:
+            for doc_id in ids:
+                if doc_id in items:
+                    items.pop(doc_id, None)
+                    removed = True
+        elif where:
+            to_drop = [
+                doc_id
+                for doc_id, item in items.items()
+                if isinstance(item, dict) and self._matches_where(item.get("metadata", {}), where)
+            ]
+            for doc_id in to_drop:
+                items.pop(doc_id, None)
+                removed = True
+        if removed:
+            self._items = items
+            self._dirty = True
+            if self._batch_depth == 0:
+                self.flush()
+
     def get(
         self,
         ids: list[str] | None = None,
@@ -279,7 +307,13 @@ def json_collection_path(store_path: str, name: str) -> str:
     return os.path.join(store_path, f"{name}.json")
 
 
-def get_vector_collection(store_path: str, name: str = "atoms", create: bool = True, announce: bool = False):
+def get_vector_collection(
+    store_path: str,
+    name: str = "atoms",
+    create: bool = True,
+    announce: bool = False,
+    prefer_json: bool = False,
+):
     if create:
         os.makedirs(store_path, exist_ok=True)
     elif not os.path.isdir(store_path):
@@ -289,12 +323,19 @@ def get_vector_collection(store_path: str, name: str = "atoms", create: bool = T
             fallback_reason="vector store directory not initialized",
             create_dir=False,
         )
-    elif not os.path.isfile(os.path.join(store_path, "chroma.sqlite3")):
+    elif prefer_json or not os.path.isfile(os.path.join(store_path, "chroma.sqlite3")):
         return JsonVectorCollection(
             json_collection_path(store_path, name),
             name,
-            fallback_reason="chroma.sqlite3 not initialized",
-            create_dir=False,
+            fallback_reason="prefer_json requested" if prefer_json else "chroma.sqlite3 not initialized",
+            create_dir=create,
+        )
+    if prefer_json:
+        return JsonVectorCollection(
+            json_collection_path(store_path, name),
+            name,
+            fallback_reason="prefer_json requested",
+            create_dir=create,
         )
 
     client = None

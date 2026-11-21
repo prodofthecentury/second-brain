@@ -36,6 +36,7 @@ from config import (
 from memory_format import remove_frontmatter_fields, split_frontmatter
 from memory_review import parse_frontmatter_values, parse_scalar_list
 from notes_store import NotePaths, extract_action_items
+from hardware_profile import strip_reasoning_think_blocks
 from ollama_utils import chat_with_fallback
 from recall import normalize_project_tag, project_tags_match
 from review_atom import approved_revision_is_current
@@ -115,8 +116,9 @@ def slugify(text: str, fallback: str = "general-synthesis") -> str:
 
 
 def extract_markdown_block(text: str) -> str:
-    match = re.search(r"```(?:markdown|md)?\s*\n(.*?)\n```", text, re.DOTALL)
-    return match.group(1).strip() if match else text.strip()
+    cleaned = strip_reasoning_think_blocks(text)
+    match = re.search(r"```(?:markdown|md)?\s*\n(.*?)\n```", cleaned, re.DOTALL)
+    return match.group(1).strip() if match else cleaned.strip()
 
 
 def frontmatter_value(content: str, key: str) -> str:
@@ -306,7 +308,7 @@ ATOMS:
 """
 
     try:
-        response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model or GEN_MODEL)
+        response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model)
         topics = parse_topic_mapping(response["message"]["content"], {a["filename"] for a in atoms})
         if topics:
             return topics
@@ -497,7 +499,7 @@ last-updated: {today}
 """
 
     try:
-        response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model or GEN_MODEL)
+        response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model)
         output = extract_markdown_block(response["message"]["content"])
         if (
             output.startswith("---")
@@ -791,7 +793,7 @@ RECENT EXPERIENCES (Last {window_days} days, 4-experiences/):
 """
 
     try:
-        response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model or GEN_MODEL)
+        response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model)
         raw_prose = extract_markdown_block(response["message"]["content"])
     except Exception as exc:
         print(f"[!] DEFERRED weekly briefing: Ollama unavailable ({exc}); no counterfeit briefing written.")

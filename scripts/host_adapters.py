@@ -46,7 +46,13 @@ from answer_policy import (
 )
 from config import ATOMS_DIR, BRAIN_DIR, GEN_MODEL, _is_reparse_or_link
 from evidence import ANCHOR_FIELDS
-from hardware_profile import loopback_ollama_base_url
+from hardware_profile import (
+    call_ollama_chat_maybe_no_think,
+    is_reasoning_model_name,
+    loopback_ollama_base_url,
+    resolve_active_local_generation_model,
+    strip_reasoning_think_blocks,
+)
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 from ollama_scout import (
@@ -149,13 +155,14 @@ def builtin_default_policies() -> dict[str, HostSharingRule]:
         ollama_url = normalized_loopback
     else:
         ollama_url = raw_ollama if raw_ollama.startswith(("http://", "https://")) else f"http://{raw_ollama}"
+    active_local_model = resolve_active_local_generation_model(fallback=GEN_MODEL)
     return {
         "ollama_local": HostSharingRule(
             host_id="ollama_local",
             provider="ollama",
             transport="local",
             endpoint_url=ollama_url,
-            default_model=GEN_MODEL,
+            default_model=active_local_model,
             api_key_env=None,
             enabled=True,
             allowed_projects=("*",),
@@ -292,9 +299,13 @@ def restrict_security_file_permissions(path: Path | str) -> None:
                 check=False,
             )
 
-        if parent.parent.name == "security":
+        if parent.parent.name in {"security", "models"}:
             _harden_win_dir(parent.parent)
-        if not parent_is_link and parent.exists() and parent.name in {"security", ".sidecar", "snapshots", "sync", "vault-tokens"}:
+        if (
+            not parent_is_link
+            and parent.exists()
+            and parent.name in {"security", ".sidecar", "snapshots", "sync", "vault-tokens", "keychain", "models", "cross-encoder", "nli"}
+        ):
             _harden_win_dir(parent)
         if path.exists():
             subprocess.run(
@@ -361,7 +372,10 @@ def load_host_policies(policy_path: Path | None = None) -> dict[str, HostSharing
             raise ValueError(f"Unsupported provider '{provider}' for host '{host_id}'")
         if transport not in {"local", "online"}:
             raise ValueError(f"Unsupported transport '{transport}' for host '{host_id}'")
-        default_model = validate_model_identifier(str(entry.get("default_model", "")).strip(), provider=provider)
+        raw_default_model = str(entry.get("default_model", "")).strip()
+        if provider == "ollama" and transport == "local" and (not raw_default_model or raw_default_model.lower() == "auto"):
+            raw_default_model = resolve_active_local_generation_model(fallback=GEN_MODEL)
+        default_model = validate_model_identifier(raw_default_model, provider=provider)
         enabled_val = bool(entry.get("enabled", False))
         consent_val = (
             bool(entry["owner_consent_recorded"])
@@ -839,6 +853,15 @@ def _invoke_provider_draft(
     if rule.provider == "ollama":
         if http_transport is not None:
             target_host = (loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url).rstrip("/")
+            req_json: dict[str, object] = {
+                "model": safe_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "format": effective_schema,
+                "stream": False,
+                "options": {"temperature": 0},
+            }
+            if is_reasoning_model_name(safe_model):
+                req_json["think"] = False
             with httpx.Client(
                 transport=http_transport,
                 timeout=timeout_s,
@@ -847,19 +870,14 @@ def _invoke_provider_draft(
             ) as client:
                 resp = client.post(
                     f"{target_host}/api/chat",
-                    json={
-                        "model": safe_model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "format": effective_schema,
-                        "stream": False,
-                        "options": {"temperature": 0},
-                    },
+                    json=req_json,
                 )
                 if 300 <= resp.status_code < 400:
                     raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
                 resp.raise_for_status()
                 data = resp.json()
-                return str((data.get("message") or {}).get("content") or data.get("response") or "{}")
+                raw_txt = str((data.get("message") or {}).get("content") or data.get("response") or "{}")
+                return strip_reasoning_think_blocks(raw_txt) or "{}"
 
         import ollama
 
@@ -870,13 +888,14 @@ def _invoke_provider_draft(
             follow_redirects=False,
             trust_env=False,
         )
-        resp = client.chat(
+        resp = call_ollama_chat_maybe_no_think(
+            client.chat,
             model=safe_model,
             messages=[{"role": "user", "content": prompt}],
             format=effective_schema,
             options={"temperature": 0},
         )
-        return str(resp["message"]["content"])
+        return strip_reasoning_think_blocks(str(resp["message"]["content"])) or "{}"
 
     api_key = ""
     if rule.api_key_env:
@@ -928,7 +947,7 @@ def _invoke_provider_draft(
                     raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
                 resp.raise_for_status()
                 data = resp.json()
-                return str(data["choices"][0]["message"]["content"])
+                return strip_reasoning_think_blocks(str(data["choices"][0]["message"]["content"])) or "{}"
 
             if rule.provider == "anthropic":
                 tool_name = "emit_grounded_claims" if json_schema is None else schema_name
@@ -1035,18 +1054,28 @@ def invoke_provider_stream(
                 follow_redirects=False,
                 trust_env=False,
             )
-            for part in client.chat(
+            stream_iter = call_ollama_chat_maybe_no_think(
+                client.chat,
                 model=safe_model,
                 messages=messages,
                 stream=True,
                 options={"temperature": 0.2, "num_predict": 512},
-            ):
+            )
+            for part in stream_iter:
                 msg = part.get("message") if isinstance(part, dict) else getattr(part, "message", None)
                 piece = (msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")) or ""
                 if piece:
                     yield str(piece)
             return
 
+        stream_body: dict[str, object] = {
+            "model": safe_model,
+            "messages": messages,
+            "stream": True,
+            "options": {"temperature": 0.2, "num_predict": 512},
+        }
+        if is_reasoning_model_name(safe_model):
+            stream_body["think"] = False
         with httpx.Client(
             transport=http_transport,
             timeout=timeout_s,
@@ -1056,12 +1085,7 @@ def invoke_provider_stream(
             with client.stream(
                 "POST",
                 f"{target_host}/api/chat",
-                json={
-                    "model": safe_model,
-                    "messages": messages,
-                    "stream": True,
-                    "options": {"temperature": 0.2, "num_predict": 512},
-                },
+                json=stream_body,
             ) as resp:
                 if 300 <= resp.status_code < 400:
                     raise HostConsentError("HTTP redirects are forbidden on model endpoints.")

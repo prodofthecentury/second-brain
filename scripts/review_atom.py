@@ -29,6 +29,7 @@ try:  # Supports both `python scripts/review_atom.py` and `import scripts.review
         atomic_write_bytes,
         content_sha256,
         review_lock,
+        set_atom_temporal_bounds,
     )
 except ImportError:
     from atom_mutator import (
@@ -46,6 +47,7 @@ except ImportError:
         atomic_write_bytes,
         content_sha256,
         review_lock,
+        set_atom_temporal_bounds,
     )
 
 
@@ -71,6 +73,13 @@ def parse_args(argv=None):
     merge.add_argument("--superseded-sha256", required=True, help="Exact superseded revision hash reviewed by owner.")
     merge.add_argument("--actor", required=True, help="Owner identity to record in the decision log.")
     merge.add_argument("--rationale", required=True, help="Why the two atoms should be linked and one superseded.")
+    validity = subparsers.add_parser("set-validity", help="Set or clear valid_from / valid_until temporal bounds on an atom.")
+    validity.add_argument("atom", help="Atom filename in brain/2-atoms.")
+    validity.add_argument("--expected-sha256", required=True, help="Exact SHA-256 revision hash.")
+    validity.add_argument("--actor", required=True, help="Owner identity to record in the decision log.")
+    validity.add_argument("--valid-from", default=None, help="ISO-8601 start date/timestamp (omit or '' to clear).")
+    validity.add_argument("--valid-until", default=None, help="ISO-8601 expiry date/timestamp (omit or '' to clear).")
+    validity.add_argument("--rationale", default="", help="Optional owner note.")
     parsed = parser.parse_args(argv)
     if parsed.command is None:
         # Keep the established `review_atom.py approve <atom> ...` interface.
@@ -111,6 +120,19 @@ def main(argv=None) -> int:
                 edited_content=edited_content,
                 expected_sha256=args.expected_sha256,
                 actor=args.actor,
+            )
+        elif args.command == "set-validity":
+            atom_path = safe_file_in_dir(ATOMS_DIR, args.atom, allowed_exts={".md"})
+            if not atom_path:
+                print("Error: atom filename is invalid or does not exist.")
+                return 1
+            result = set_atom_temporal_bounds(
+                atom_path,
+                valid_from=args.valid_from,
+                valid_until=args.valid_until,
+                expected_sha256=args.expected_sha256,
+                actor=args.actor,
+                rationale=args.rationale,
             )
         else:
             atom_path = safe_file_in_dir(ATOMS_DIR, args.atom, allowed_exts={".md"})

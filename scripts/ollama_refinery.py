@@ -31,6 +31,7 @@ from config import (
     file_sha256,
     safe_vault_reference,
 )
+from hardware_profile import strip_reasoning_think_blocks
 from ollama_utils import chat_with_fallback, embed_text, embedding_metadata
 from memory_format import (
     MEMORY_BOUNDARY,
@@ -430,8 +431,8 @@ RAW CAPTURE:
 {chunk_text}
 """
         try:
-            response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model or GEN_MODEL)
-            output = response["message"]["content"]
+            response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model)
+            output = strip_reasoning_think_blocks(response["message"]["content"])
         except Exception as exc:
             raise RuntimeError(f"LLM drafting unavailable; capture deferred: {exc}") from exc
 
@@ -514,7 +515,7 @@ If there is NO contradiction, return the NEW DRAFTED ATOM exactly as it was prov
 OUTPUT ONLY the markdown content.
 """
     try:
-        response = chat_with_fallback(messages=[{"role": "user", "content": critic_prompt}], model=GEN_MODEL)
+        response = chat_with_fallback(messages=[{"role": "user", "content": critic_prompt}], model=None)
         output = response["message"]["content"]
     except Exception as exc:
         print(f"[!] LLM critic unavailable; keeping drafted atom unchanged ({exc})")

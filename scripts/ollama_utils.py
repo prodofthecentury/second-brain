@@ -10,12 +10,24 @@ import inspect
 import math
 import os
 import sys
+import types
 
-import ollama
+try:
+    import ollama
+except ImportError:  # Clean minimal wheel without optional [online]/[dense] extra
+    ollama = types.SimpleNamespace(chat=None, embed=None, Client=None)  # type: ignore[assignment]
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import EMBED_MODEL, GEN_MODEL
-from hardware_profile import detect_hardware_profile, fetch_loopback_json, loopback_ollama_base_url
+from hardware_profile import (
+    call_ollama_chat_maybe_no_think,
+    detect_hardware_profile,
+    fetch_loopback_json,
+    is_reasoning_model_name,
+    loopback_ollama_base_url,
+    resolve_active_local_generation_model,
+    strip_reasoning_think_blocks,
+)
 import host_adapters as _host_adapters
 from host_adapters import (
     HostConsentError,
@@ -41,6 +53,8 @@ def load_host_sharing_policy(policy_path=None) -> dict[str, HostSharingRule]:
 
 
 def _is_monkeypatched_ollama_fn(fn, default_fn) -> bool:
+    if fn is None:
+        return False
     return fn is not default_fn or not getattr(fn, "__module__", "").startswith("ollama")
 
 
@@ -147,13 +161,17 @@ def _allow_heavy_qwen36_fallback(
 def generation_candidates(preferred: str | None = None) -> list[str]:
     installed = installed_model_names()
     installed_bases = {name.split(":", 1)[0]: name for name in installed}
-    configured = preferred or GEN_MODEL
+    pref_clean = (preferred or "").strip()
+    if pref_clean and pref_clean.lower() != "auto":
+        configured = pref_clean
+    else:
+        configured = resolve_active_local_generation_model(fallback=GEN_MODEL)
     fallback_env = os.environ.get("BRAIN_FALLBACK_MODELS", "")
     fallback_items = [item.strip() for item in fallback_env.split(",") if item.strip()]
-    auto_fallbacks = ["qwen2.5-coder:7b"]
+    auto_fallbacks = ["qwen3-coder:8b", "qwen3:8b", "qwen2.5-coder:7b"]
     if _allow_heavy_qwen36_fallback(preferred, configured, fallback_items):
         auto_fallbacks.append("qwen3.6:latest")
-    auto_fallbacks.extend(["llama3.2:3b", "mistral", "phi3"])
+    auto_fallbacks.extend(["qwen3:4b", "llama3.2:3b", "mistral", "phi3"])
     requested = [
         configured,
         *fallback_items,
@@ -194,19 +212,47 @@ def chat_with_fallback(messages: list[dict], model: str | None = None, **kwargs)
     rule, base_url = _resolve_local_ollama_rule_and_url()
     outbound_messages = _sanitize_messages_for_rule(messages, rule)
     errors = []
+    effective_target = (model or "").strip()
+    if not effective_target or effective_target.lower() == "auto":
+        effective_target = resolve_active_local_generation_model(fallback=rule.default_model or GEN_MODEL)
     for candidate in generation_candidates(model):
         try:
-            if candidate != (model or GEN_MODEL):
+            if candidate != effective_target:
                 print(f"[*] Trying fallback generation model: {candidate}")
             if _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
-                return ollama.chat(model=candidate, messages=outbound_messages, **kwargs)
-            client = ollama.Client(
-                host=base_url,
-                timeout=60.0,
-                follow_redirects=False,
-                trust_env=False,
-            )
-            return client.chat(model=candidate, messages=outbound_messages, **kwargs)
+                resp = call_ollama_chat_maybe_no_think(
+                    ollama.chat, model=candidate, messages=outbound_messages, **kwargs
+                )
+            else:
+                if getattr(ollama, "Client", None) is None:
+                    raise RuntimeError(
+                        "Python 'ollama' package is not installed; install 'second-brain[online]' for local model generation."
+                    )
+                timeout_val = 120.0 if is_reasoning_model_name(candidate) else 60.0
+                client = ollama.Client(
+                    host=base_url,
+                    timeout=timeout_val,
+                    follow_redirects=False,
+                    trust_env=False,
+                )
+                resp = call_ollama_chat_maybe_no_think(
+                    client.chat, model=candidate, messages=outbound_messages, **kwargs
+                )
+            if isinstance(resp, dict) and isinstance(resp.get("message"), dict) and isinstance(resp["message"].get("content"), str):
+                return {
+                    **resp,
+                    "message": {
+                        **resp["message"],
+                        "content": strip_reasoning_think_blocks(resp["message"]["content"]),
+                    },
+                }
+            msg_obj = getattr(resp, "message", None)
+            if msg_obj is not None and isinstance(getattr(msg_obj, "content", None), str):
+                try:
+                    msg_obj.content = strip_reasoning_think_blocks(msg_obj.content)
+                except Exception:
+                    pass
+            return resp
         except (HostConsentError, OutboundSecretBlockedError, PermissionError):
             raise
         except Exception as exc:
@@ -233,6 +279,10 @@ def embed_text(text: str, model: str | None = None) -> list[float]:
         if _is_monkeypatched_ollama_fn(ollama.embed, _DEFAULT_OLLAMA_EMBED):
             response = ollama.embed(model=model_name, input=outbound_text)
         else:
+            if getattr(ollama, "Client", None) is None:
+                raise EmbeddingUnavailableError(
+                    "Python 'ollama' package is not installed; install 'second-brain[dense]' for dense embeddings."
+                )
             client = ollama.Client(
                 host=base_url,
                 timeout=60.0,

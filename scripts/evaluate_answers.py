@@ -206,11 +206,16 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
     model = validate_model_identifier(model, provider="ollama")
 
     import ollama
+    from hardware_profile import (
+        call_ollama_chat_maybe_no_think,
+        is_reasoning_model_name,
+        strip_reasoning_think_blocks,
+    )
 
     rule, base_url = _resolve_local_ollama_rule_and_url()
     ollama_client = ollama.Client(
         host=base_url,
-        timeout=90.0,
+        timeout=240.0 if is_reasoning_model_name(model) else 180.0,
         follow_redirects=False,
         trust_env=False,
     )
@@ -249,7 +254,11 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                 continue
 
             prompt = build_grounding_prompt(
-                AnswerRequest(query=case["query"], result_limit=5, projects=case_projects),
+                AnswerRequest(
+                    query=case["query"],
+                    result_limit=5,
+                    project_scope=str(case["project_scope"]).strip() if case.get("project_scope") else None,
+                ),
                 retrieved,
             )
             redaction, pii_placeholder_map = _redact_outbound_with_map(
@@ -259,20 +268,23 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
             )
             try:
                 if _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
-                    response = ollama.chat(
+                    response = call_ollama_chat_maybe_no_think(
+                        ollama.chat,
                         model=model,
                         messages=[{"role": "user", "content": redaction.sanitized_text}],
                         format=ANSWER_DRAFT_SCHEMA,
                         stream=False,
                     )
                 else:
-                    response = ollama_client.chat(
+                    response = call_ollama_chat_maybe_no_think(
+                        ollama_client.chat,
                         model=model,
                         messages=[{"role": "user", "content": redaction.sanitized_text}],
                         format=ANSWER_DRAFT_SCHEMA,
                         stream=False,
                     )
-                draft_json = _rehydrate_draft_claims(response["message"]["content"], pii_placeholder_map)
+                raw_content = strip_reasoning_think_blocks(str(response["message"]["content"])) or "{}"
+                draft_json = _rehydrate_draft_claims(raw_content, pii_placeholder_map)
             except Exception as exc:
                 raise EvaluationRunError(f"Generation failed for {case['id']} run {run_number}: {exc}") from exc
             try:

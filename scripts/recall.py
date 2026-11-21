@@ -32,6 +32,7 @@ if __name__ in ("recall", "scripts.recall"):
     sys.modules.setdefault("scripts.recall", sys.modules[__name__])
 
 from atom_mutator import latest_decisions_by_atom
+from cross_encoder import rerank_recall_results
 from config import (
     ATOMS_DIR,
     BRAIN_DIR,
@@ -54,7 +55,7 @@ from lexical_store import (
     porter_stem,
     search_lexical_index,
 )
-from memory_format import split_frontmatter
+from memory_format import evaluate_temporal_validity, normalize_temporal_bound_str, split_frontmatter
 from memory_review import REVIEW_STATUSES, parse_atom_record, parse_atom_record_text, parse_scalar_list, section_text
 from review_atom import approved_revision_is_current
 from vector_store import close_vector_collection, get_vector_collection
@@ -137,8 +138,11 @@ class RecallOptions:
     candidate_multiplier: int = 4
     retrieval_mode: str = "auto"  # 'auto', 'rrf', 'lexical', 'dense'
     enable_fitness_boost: bool = False
+    enable_reranker: bool = True
     active_context_profile: tuple[str, ...] = ()
     telemetry_db_path: str | None = None
+    include_expired: bool = False
+    as_of: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +220,9 @@ class RecallResult:
     importance: float
     contexts: tuple[str, ...] = ()
     match_reasons: tuple[str, ...] = ()
+    valid_from: str = ""
+    valid_until: str = ""
+    temporal_status: str = "active"
 
     def as_dict(self) -> dict:
         return {
@@ -230,6 +237,9 @@ class RecallResult:
             "importance": self.importance,
             "contexts": list(self.contexts),
             "match_reasons": list(self.match_reasons),
+            "valid_from": self.valid_from,
+            "valid_until": self.valid_until,
+            "temporal_status": self.temporal_status,
         }
 
 
@@ -467,6 +477,16 @@ def should_include_record(record: dict, options: RecallOptions) -> bool:
         if not project_tags_match(record_contexts, options.projects):
             return False
 
+    tv = evaluate_temporal_validity(
+        record.get("valid_from"),
+        record.get("valid_until"),
+        as_of=options.as_of,
+    )
+    if tv["status"] == "invalid_window":
+        return False
+    if not tv["active"] and not options.include_expired:
+        return False
+
     return True
 
 
@@ -666,6 +686,13 @@ def result_from_candidate(
             score += freshness
             reasons.append(f"freshness:+{freshness:.4f}")
 
+    valid_from = str(record.get("valid_from") or "").strip()
+    valid_until = str(record.get("valid_until") or "").strip()
+    tv = evaluate_temporal_validity(valid_from, valid_until, as_of=options.as_of)
+    temporal_status = str(tv["status"])
+    if valid_from or valid_until or temporal_status != "active":
+        reasons.append(f"temporal:{temporal_status}")
+
     return RecallResult(
         filename=filename,
         content=content,
@@ -678,6 +705,9 @@ def result_from_candidate(
         importance=importance,
         contexts=contexts,
         match_reasons=tuple(reasons),
+        valid_from=valid_from,
+        valid_until=valid_until,
+        temporal_status=temporal_status,
     )
 
 
@@ -934,7 +964,19 @@ def rerank_candidates(
             if candidate_has_semantic_corroboration(query, current_content, distance=distance):
                 ranked.append(result)
 
-    return sorted(ranked, key=lambda item: item.score, reverse=True)[: options.n_results]
+    ranked_sorted = sorted(ranked, key=lambda item: item.score, reverse=True)
+    if options.enable_reranker and ranked_sorted:
+        pool = ranked_sorted[: max(options.n_results * 3, 15)]
+        return rerank_recall_results(query, pool, top_k=options.n_results, mode="vector")
+    return ranked_sorted[: options.n_results]
+
+
+def _validate_options_as_of(options: RecallOptions) -> None:
+    if options.as_of and str(options.as_of).strip():
+        try:
+            normalize_temporal_bound_str(str(options.as_of))
+        except ValueError as exc:
+            raise ValueError(f"Invalid 'as_of' ISO-8601 date or timestamp: {options.as_of!r}") from exc
 
 
 def search_semantic_memory(
@@ -947,6 +989,7 @@ def search_semantic_memory(
     from ollama_utils import EmbeddingUnavailableError, embed_text
 
     options = options or RecallOptions()
+    _validate_options_as_of(options)
     if not os.path.exists(chroma_path):
         raise MemoryRecallUnavailable("Dense vector store directory is missing; run scripts/rebuild_vectors.py.")
 
@@ -1006,9 +1049,11 @@ def search_lexical_memory(
     *,
     atoms_dir: str = ATOMS_DIR,
     index_path: str = LEXICAL_INDEX_PATH,
+    _allow_neural_rerank: bool = False,
 ) -> tuple[list[RecallResult], list[RecallResult]]:
     """Retrieve through the model-free sidecar, then apply the canonical trust filter."""
     options = options or RecallOptions()
+    _validate_options_as_of(options)
     candidate_count = max(options.n_results, options.n_results * max(1, options.candidate_multiplier))
     use_fast_verify = (
         verified_atom_content is _ORIG_VERIFIED_ATOM_CONTENT
@@ -1117,7 +1162,18 @@ def search_lexical_memory(
         if result:
             direct.append(result)
 
-    direct = sorted(direct, key=lambda item: item.score, reverse=True)[: options.n_results]
+    direct_sorted = sorted(direct, key=lambda item: item.score, reverse=True)
+    if options.enable_reranker and direct_sorted:
+        pool = direct_sorted[: max(options.n_results * 3, 15)]
+        direct = rerank_recall_results(
+            query,
+            pool,
+            top_k=options.n_results,
+            mode="lexical",
+            allow_onnx=_allow_neural_rerank,
+        )
+    else:
+        direct = direct_sorted[: options.n_results]
     neighbors = []
     seen = {item.filename for item in direct}
     if options.follow_links:
@@ -1156,7 +1212,7 @@ def search_hybrid_rrf_memory(
     """Reciprocal Rank Fusion (RRF) combining SQLite FTS5 (lexical) and Chroma (dense)."""
     options = options or RecallOptions()
     pool_size = max(options.n_results * 4, 20)
-    pool_options = replace(options, n_results=pool_size, follow_links=False)
+    pool_options = replace(options, n_results=pool_size, follow_links=False, enable_reranker=False)
 
     lex_pool, _ = search_lexical_memory(
         query, pool_options, atoms_dir=atoms_dir, index_path=index_path
@@ -1167,7 +1223,15 @@ def search_hybrid_rrf_memory(
         )
     except MemoryRecallUnavailable as exc:
         emit_degradation_warning(str(exc))
-        fallback_direct = lex_pool[: options.n_results]
+        if options.enable_reranker and lex_pool:
+            fallback_direct = rerank_recall_results(
+                query,
+                lex_pool[: max(options.n_results * 3, 15)],
+                top_k=options.n_results,
+                mode="lexical",
+            )
+        else:
+            fallback_direct = lex_pool[: options.n_results]
         fallback_neighbors = []
         seen_fb = {item.filename for item in fallback_direct}
         if options.follow_links:
@@ -1195,8 +1259,9 @@ def search_hybrid_rrf_memory(
         if res.filename not in candidate_map:
             candidate_map[res.filename] = res
 
+    fused_pool_cap = max(options.n_results * 3, 15) if options.enable_reranker else options.n_results
     fused: list[RecallResult] = []
-    for filename, rrf_score in sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)[: options.n_results]:
+    for filename, rrf_score in sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)[:fused_pool_cap]:
         base = candidate_map[filename]
         extra = ["retrieval:rrf_hybrid", f"rrf_score:{round(rrf_score, 6)}"]
         if filename in lex_ranks:
@@ -1205,20 +1270,18 @@ def search_hybrid_rrf_memory(
             extra.append(f"dense_rank:{dense_ranks[filename]}")
         base_reasons = tuple(r for r in base.match_reasons if not r.startswith("retrieval:"))
         fused.append(
-            RecallResult(
-                filename=base.filename,
-                content=base.content,
+            replace(
+                base,
                 source="rrf_hybrid",
                 score=round(rrf_score, 6),
-                similarity=base.similarity,
-                review_status=base.review_status,
-                memory_type=base.memory_type,
-                confidence=base.confidence,
-                importance=base.importance,
-                contexts=base.contexts,
                 match_reasons=base_reasons + tuple(extra),
             )
         )
+
+    if options.enable_reranker and fused:
+        fused = rerank_recall_results(query, fused, top_k=options.n_results, mode="rrf")
+    else:
+        fused = fused[: options.n_results]
 
     neighbors = []
     seen = {item.filename for item in fused}
@@ -1260,9 +1323,15 @@ def search_memory(
     if options.retrieval_mode == "lexical":
         return search_lexical_memory(query, options, atoms_dir=atoms_dir, index_path=index_path)
 
-    # auto mode: use lexical if sidecar exists, else dense
+    # auto mode: use lexical candidate retrieval + neural cross-encoder rerank if sidecar exists, else dense
     if os.path.exists(index_path):
-        return search_lexical_memory(query, options, atoms_dir=atoms_dir, index_path=index_path)
+        return search_lexical_memory(
+            query,
+            options,
+            atoms_dir=atoms_dir,
+            index_path=index_path,
+            _allow_neural_rerank=True,
+        )
     return search_semantic_memory(query, options, atoms_dir=atoms_dir, chroma_path=chroma_path)
 
 

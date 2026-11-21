@@ -57,6 +57,137 @@ def today() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d")
 
 
+_ISO_DATE_ONLY_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+
+def parse_temporal_bound(raw: str | None, *, is_end: bool = False) -> datetime.datetime | None:
+    """Parse an ISO-8601 date (YYYY-MM-DD) or timestamp into a UTC datetime.
+
+    Date-only bounds are inclusive: 00:00:00 UTC for ``valid_from`` (``is_end=False``)
+    and 23:59:59.999999 UTC for ``valid_until`` (``is_end=True``).
+    """
+    text = str(raw or "").strip().strip("\"'")
+    if not text:
+        return None
+    m = _ISO_DATE_ONLY_RE.match(text)
+    if m:
+        d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if is_end:
+            return datetime.datetime(d.year, d.month, d.day, 23, 59, 59, 999999, tzinfo=datetime.timezone.utc)
+        return datetime.datetime(d.year, d.month, d.day, 0, 0, 0, 0, tzinfo=datetime.timezone.utc)
+    iso_norm = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    dt = datetime.datetime.fromisoformat(iso_norm)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def normalize_temporal_bound_str(raw: str | None) -> str:
+    """Validate and canonicalize an optional temporal bound string ('' when unset)."""
+    text = str(raw or "").strip().strip("\"'")
+    if not text:
+        return ""
+    m = _ISO_DATE_ONLY_RE.match(text)
+    if m:
+        d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return d.isoformat()
+    dt = parse_temporal_bound(text, is_end=False)
+    assert dt is not None
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _resolve_as_of_utc(as_of: str | datetime.date | datetime.datetime | None = None) -> datetime.datetime:
+    if as_of is None or (isinstance(as_of, str) and not as_of.strip()):
+        return datetime.datetime.now(datetime.timezone.utc)
+    if isinstance(as_of, datetime.datetime):
+        return as_of.replace(tzinfo=datetime.timezone.utc) if as_of.tzinfo is None else as_of.astimezone(datetime.timezone.utc)
+    if isinstance(as_of, datetime.date):
+        return datetime.datetime(as_of.year, as_of.month, as_of.day, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    raw = str(as_of).strip().strip("\"'")
+    m = _ISO_DATE_ONLY_RE.match(raw)
+    if m:
+        d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return datetime.datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    dt = parse_temporal_bound(raw, is_end=False)
+    assert dt is not None
+    return dt
+
+
+def evaluate_temporal_validity(
+    valid_from: str | None,
+    valid_until: str | None,
+    *,
+    as_of: str | datetime.date | datetime.datetime | None = None,
+) -> dict[str, object]:
+    """Evaluate bi-temporal fact validity at ``as_of`` (default: current UTC instant).
+
+    Returns ``{"status": "active"|"expired"|"not_yet_valid"|"invalid_window", "active": bool, ...}``.
+    """
+    ref_dt = _resolve_as_of_utc(as_of)
+    vf_raw = str(valid_from or "").strip()
+    vu_raw = str(valid_until or "").strip()
+    try:
+        start_dt = parse_temporal_bound(vf_raw, is_end=False) if vf_raw else None
+        end_dt = parse_temporal_bound(vu_raw, is_end=True) if vu_raw else None
+    except ValueError:
+        return {
+            "status": "invalid_window",
+            "active": False,
+            "valid_from": vf_raw,
+            "valid_until": vu_raw,
+        }
+    if start_dt is not None and end_dt is not None and start_dt > end_dt:
+        return {
+            "status": "invalid_window",
+            "active": False,
+            "valid_from": vf_raw,
+            "valid_until": vu_raw,
+        }
+    if start_dt is not None and ref_dt < start_dt:
+        return {
+            "status": "not_yet_valid",
+            "active": False,
+            "valid_from": vf_raw,
+            "valid_until": vu_raw,
+        }
+    if end_dt is not None and ref_dt > end_dt:
+        return {
+            "status": "expired",
+            "active": False,
+            "valid_from": vf_raw,
+            "valid_until": vu_raw,
+        }
+    return {
+        "status": "active",
+        "active": True,
+        "valid_from": vf_raw,
+        "valid_until": vu_raw,
+    }
+
+
+def temporal_windows_overlap(
+    valid_from_a: str | None,
+    valid_until_a: str | None,
+    valid_from_b: str | None,
+    valid_until_b: str | None,
+) -> bool:
+    """Return True if two [valid_from, valid_until] windows overlap in time."""
+    try:
+        sa = parse_temporal_bound(valid_from_a, is_end=False)
+        ea = parse_temporal_bound(valid_until_a, is_end=True)
+        sb = parse_temporal_bound(valid_from_b, is_end=False)
+        eb = parse_temporal_bound(valid_until_b, is_end=True)
+    except ValueError:
+        return False
+    if (sa is not None and ea is not None and sa > ea) or (sb is not None and eb is not None and sb > eb):
+        return False
+    if ea is not None and sb is not None and ea < sb:
+        return False
+    if eb is not None and sa is not None and eb < sa:
+        return False
+    return True
+
+
 def markdown_blocks(text: str) -> list[str]:
     """Return fenced markdown blocks, or the raw text if no fences exist."""
     blocks = [match.group(1).strip() for match in CODE_BLOCK_RE.finditer(text or "")]
@@ -277,6 +408,32 @@ def normalize_memory_document(
     frontmatter = set_scalar_field(frontmatter, "review_status", "pending", "epistemic_label")
     frontmatter = normalize_enum_field(frontmatter, "epistemic_label", VALID_EPISTEMIC_LABELS, "claim")
     frontmatter = normalize_enum_field(frontmatter, "review_status", VALID_REVIEW_STATUSES, "pending")
+
+    raw_vf = frontmatter_value(frontmatter, "valid_from")
+    raw_vu = frontmatter_value(frontmatter, "valid_until")
+    if raw_vf or raw_vu:
+        try:
+            norm_vf = normalize_temporal_bound_str(raw_vf)
+            norm_vu = normalize_temporal_bound_str(raw_vu)
+            tv_check = evaluate_temporal_validity(norm_vf, norm_vu)
+            if tv_check["status"] == "invalid_window":
+                frontmatter = remove_frontmatter_fields(frontmatter, {"valid_from", "valid_until"})
+            else:
+                if norm_vf:
+                    frontmatter = set_scalar_field(frontmatter, "valid_from", norm_vf, "last-reviewed")
+                else:
+                    frontmatter = remove_frontmatter_fields(frontmatter, {"valid_from"})
+                if norm_vu:
+                    frontmatter = set_scalar_field(
+                        frontmatter,
+                        "valid_until",
+                        norm_vu,
+                        "valid_from" if norm_vf else "last-reviewed",
+                    )
+                else:
+                    frontmatter = remove_frontmatter_fields(frontmatter, {"valid_until"})
+        except ValueError:
+            frontmatter = remove_frontmatter_fields(frontmatter, {"valid_from", "valid_until"})
 
     return render_memory_document(frontmatter, body)
 

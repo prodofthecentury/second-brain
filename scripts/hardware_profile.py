@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -113,6 +114,38 @@ class HardwareCapabilityProfile:
     retrieval_p95_slo_ms: float
     answer_p95_slo_ms: float | None
     rationale: str
+    oversized_installed_models: tuple[str, ...] = ()
+
+
+_THINK_CLOSED_RE = re.compile(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>\s*")
+_THINK_UNCLOSED_RE = re.compile(r"(?is)<think(?:ing)?>.*$")
+_REASONING_MODEL_RE = re.compile(r"^(?:.*/)?(?:qwen3(?:\.\d+|-coder|-vl)?|qwq|deepseek-r1)(?:[:_-]|$)", re.IGNORECASE)
+
+
+def is_reasoning_model_name(model: str | None) -> bool:
+    """Return True when model belongs to a thinking-capable family (qwen3*, qwq*, deepseek-r1*)."""
+    return bool(_REASONING_MODEL_RE.match((model or "").strip()))
+
+
+def strip_reasoning_think_blocks(text: str | None) -> str:
+    """Remove <think>...</think> chain-of-thought blocks (closed or truncated) from model output."""
+    if not text:
+        return ""
+    cleaned = _THINK_CLOSED_RE.sub("", str(text))
+    if "<think" in cleaned.lower():
+        cleaned = _THINK_UNCLOSED_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def call_ollama_chat_maybe_no_think(chat_fn, /, **kwargs):
+    """Invoke ollama chat passing think=False for reasoning models when supported by client/mock."""
+    model_name = str(kwargs.get("model") or "")
+    if "think" not in kwargs and is_reasoning_model_name(model_name):
+        try:
+            return chat_fn(**kwargs, think=False)
+        except TypeError:
+            pass
+    return chat_fn(**kwargs)
 
 
 def probe_memory_gib() -> tuple[float, float]:
@@ -206,10 +239,10 @@ def probe_gpu(total_ram_gib: float) -> tuple[str, str, float]:
     return ("cpu", "CPU inference mode (no CUDA/Metal accelerator)", 0.0)
 
 
-def probe_ollama_models(
+def probe_ollama_models_with_sizes(
     host: str | float | None = None,
     timeout: float = 3.0,
-) -> tuple[bool, list[str]]:
+) -> tuple[bool, list[str], dict[str, int]]:
     if isinstance(host, (int, float)):
         timeout = float(host)
         raw_host = None
@@ -217,31 +250,109 @@ def probe_ollama_models(
         raw_host = host
     base = loopback_ollama_base_url(raw_host)
     if not base:
-        return (False, [])
+        return (False, [], {})
     payload = fetch_loopback_json(f"{base}/api/tags", timeout=timeout, max_bytes=65536)
     if not isinstance(payload, dict):
-        return (False, [])
-    names = sorted(
-        {
-            str(item.get("name") or item.get("model"))
-            for item in payload.get("models", [])
-            if isinstance(item, dict) and (item.get("name") or item.get("model"))
-        }
-    )
-    return (True, names)
+        return (False, [], {})
+    names_set: set[str] = set()
+    sizes: dict[str, int] = {}
+    for item in payload.get("models", []):
+        if not isinstance(item, dict):
+            continue
+        raw_name = item.get("name") or item.get("model")
+        if not raw_name:
+            continue
+        m_name = str(raw_name)
+        names_set.add(m_name)
+        raw_sz = item.get("size")
+        if isinstance(raw_sz, int) and raw_sz > 0:
+            sizes[m_name] = raw_sz
+            sizes.setdefault(m_name.split(":", 1)[0], raw_sz)
+    return (True, sorted(names_set), sizes)
 
 
-def _match_installed_model(candidates: list[str], installed: tuple[str, ...]) -> str | None:
+def probe_ollama_models(
+    host: str | float | None = None,
+    timeout: float = 3.0,
+) -> tuple[bool, list[str]]:
+    reachable, names, _ = probe_ollama_models_with_sizes(host, timeout=timeout)
+    return (reachable, names)
+
+
+_DEFAULT_PROBE_OLLAMA_MODELS = probe_ollama_models
+
+
+def _model_fits_host_memory(
+    model_name: str,
+    *,
+    total_ram_gib: float | None = 0.0,
+    gpu_backend: str = "cpu",
+    vram_gib: float | None = 0.0,
+    model_sizes_bytes: dict[str, int] | None = None,
+) -> bool:
+    """Return True if a local GGUF model fits host VRAM/RAM without severe pagefile thrashing."""
+    total_ram_gib = float(total_ram_gib or 0.0)
+    vram_gib = float(vram_gib or 0.0)
+    clean = (model_name or "").strip()
+    if not clean:
+        return False
+    if model_sizes_bytes:
+        sz = model_sizes_bytes.get(clean) or model_sizes_bytes.get(clean.split(":", 1)[0]) or 0
+        if sz > 0:
+            gib = sz / (1024 ** 3)
+            if gpu_backend == "cuda" and vram_gib > 0:
+                cap = max(vram_gib * 1.15, total_ram_gib * 0.68 if total_ram_gib > 0 else vram_gib * 1.15)
+                return gib <= cap
+            if total_ram_gib > 0:
+                return gib <= total_ram_gib * 0.68
+            return True
+
+    if total_ram_gib <= 0 and vram_gib <= 0:
+        return True
+    low = clean.lower()
+    if low.startswith("qwen3.6") or any(t in low for t in (":30b", ":32b", ":36b", ":70b", ":72b")):
+        return (gpu_backend == "cuda" and vram_gib >= 20.0) or total_ram_gib >= 32.0
+    if ":14b" in low:
+        return (gpu_backend == "cuda" and vram_gib >= 10.0) or total_ram_gib >= 20.0
+    return True
+
+
+def _match_installed_model(
+    candidates: list[str],
+    installed: tuple[str, ...],
+    *,
+    total_ram_gib: float = 0.0,
+    gpu_backend: str = "cpu",
+    vram_gib: float = 0.0,
+    model_sizes_bytes: dict[str, int] | None = None,
+    enforce_memory_fit: bool = False,
+) -> str | None:
     installed_set = set(installed)
-    installed_roots = {m.split(":", 1)[0]: m for m in installed}
+    installed_roots: dict[str, list[str]] = {}
+    for m in installed:
+        installed_roots.setdefault(m.split(":", 1)[0], []).append(m)
+
+    def _ok(name: str) -> bool:
+        if not enforce_memory_fit:
+            return True
+        return _model_fits_host_memory(
+            name,
+            total_ram_gib=total_ram_gib,
+            gpu_backend=gpu_backend,
+            vram_gib=vram_gib,
+            model_sizes_bytes=model_sizes_bytes,
+        )
+
     for candidate in candidates:
-        if candidate in installed_set:
+        if candidate in installed_set and _ok(candidate):
             return candidate
-        if f"{candidate}:latest" in installed_set:
+        if f"{candidate}:latest" in installed_set and _ok(f"{candidate}:latest"):
             return f"{candidate}:latest"
         root = candidate.split(":", 1)[0]
         if root in installed_roots and ":" not in candidate:
-            return installed_roots[root]
+            for matched in installed_roots[root]:
+                if _ok(matched):
+                    return matched
     return None
 
 
@@ -251,17 +362,21 @@ def classify_hardware_tier(
     os_release: str,
     architecture: str,
     cpu_threads: int,
-    total_ram_gib: float,
-    available_ram_gib: float,
+    total_ram_gib: float | None,
+    available_ram_gib: float | None,
     cpp_runtime_ready: bool,
     cpp_runtime_detail: str,
     gpu_backend: str,
     gpu_name: str,
-    vram_gib: float,
+    vram_gib: float | None,
     ollama_reachable: bool,
     installed_ollama_models: tuple[str, ...] | list[str],
+    model_sizes_bytes: dict[str, int] | None = None,
 ) -> HardwareCapabilityProfile:
     """Deterministically classify host hardware into one of four truthful capability tiers."""
+    total_ram_gib = float(total_ram_gib or 0.0)
+    available_ram_gib = float(available_ram_gib or 0.0)
+    vram_gib = float(vram_gib or 0.0)
     installed_ollama_models = tuple(installed_ollama_models)
     if not ollama_reachable or (total_ram_gib > 0 and total_ram_gib < 6.0):
         reason = (
@@ -296,10 +411,48 @@ def classify_hardware_tier(
 
     has_embedder = _match_installed_model([EMBED_MODEL, "nomic-embed-text"], installed_ollama_models) is not None
     can_use_hybrid = cpp_runtime_ready and has_embedder
+    oversized = tuple(
+        m
+        for m in installed_ollama_models
+        if not _model_fits_host_memory(
+            m,
+            total_ram_gib=total_ram_gib,
+            gpu_backend=gpu_backend,
+            vram_gib=vram_gib,
+            model_sizes_bytes=model_sizes_bytes,
+        )
+    )
 
     if (gpu_backend == "cuda" and vram_gib >= 8.0) or (gpu_backend == "metal" and total_ram_gib >= 16.0):
-        preferred = ["qwen2.5:14b", "qwen2.5-coder:14b", "qwen2.5-coder:7b", "qwen2.5:7b", "llama3.1:8b", "llama3.2:3b"]
-        selected = _match_installed_model(preferred, installed_ollama_models)
+        preferred = [
+            "qwen3.6",
+            "qwen3-coder:30b",
+            "qwen3:32b",
+            "qwen3:30b",
+            "qwen3.5:14b",
+            "qwen3:14b",
+            "qwen3-coder:14b",
+            "qwen2.5:14b",
+            "qwen2.5-coder:14b",
+            "qwen3-coder:8b",
+            "qwen3.5:8b",
+            "qwen3:8b",
+            "qwen3",
+            "qwen2.5-coder:7b",
+            "qwen2.5:7b",
+            "llama3.1:8b",
+            "qwen3:4b",
+            "llama3.2:3b",
+        ]
+        selected = _match_installed_model(
+            preferred,
+            installed_ollama_models,
+            total_ram_gib=total_ram_gib,
+            gpu_backend=gpu_backend,
+            vram_gib=vram_gib,
+            model_sizes_bytes=model_sizes_bytes,
+            enforce_memory_fit=True,
+        )
         return HardwareCapabilityProfile(
             os_name=os_name,
             os_release=os_release,
@@ -322,12 +475,42 @@ def classify_hardware_tier(
             recommended_retrieval_mode="rrf" if can_use_hybrid else "lexical",
             retrieval_p95_slo_ms=50.0 if can_use_hybrid else 15.0,
             answer_p95_slo_ms=5000.0,
-            rationale=f"Hardware accelerator ({gpu_name}, {vram_gib:.1f} GiB VRAM) supports low-latency 7B-14B grounded inference.",
+            rationale=f"Hardware accelerator ({gpu_name}, {vram_gib:.1f} GiB VRAM) supports low-latency 7B-14B+ grounded inference.",
+            oversized_installed_models=oversized,
         )
 
     if total_ram_gib >= 12.0:
-        preferred = ["qwen2.5-coder:7b", "qwen2.5:7b", "mistral:7b", "llama3.2:3b"]
-        selected = _match_installed_model(preferred, installed_ollama_models)
+        preferred = [
+            "qwen3.6",
+            "qwen3-coder:30b",
+            "qwen3:32b",
+            "qwen3.5:14b",
+            "qwen3:14b",
+            "qwen3-coder:14b",
+            "qwen3-coder:8b",
+            "qwen3.5:8b",
+            "qwen3:8b",
+            "qwen3",
+            "qwen2.5-coder:7b",
+            "qwen2.5:7b",
+            "mistral:7b",
+            "qwen3:4b",
+            "llama3.2:3b",
+        ]
+        selected = _match_installed_model(
+            preferred,
+            installed_ollama_models,
+            total_ram_gib=total_ram_gib,
+            gpu_backend=gpu_backend,
+            vram_gib=vram_gib,
+            model_sizes_bytes=model_sizes_bytes,
+            enforce_memory_fit=True,
+        )
+        oversized_note = (
+            f" Oversized model(s) skipped for auto-default to prevent swap thrashing: {', '.join(oversized)} (override via BRAIN_GEN_MODEL)."
+            if oversized
+            else ""
+        )
         return HardwareCapabilityProfile(
             os_name=os_name,
             os_release=os_release,
@@ -351,13 +534,23 @@ def classify_hardware_tier(
             retrieval_p95_slo_ms=15.0,
             answer_p95_slo_ms=35000.0,
             rationale=(
-                f"CPU host with {total_ram_gib:.1f} GiB RAM comfortably fits quantized 7B models "
-                "(94% benchmarked positive coverage on qwen2.5-coder:7b); lexical FTS5 stays default for sub-10ms recall, with RRF opt-in."
+                f"CPU host with {total_ram_gib:.1f} GiB RAM comfortably fits quantized 7B/8B models "
+                "(94%+ benchmarked positive coverage on qwen2.5-coder:7b / qwen3); lexical FTS5 stays default for sub-10ms recall, with RRF opt-in."
+                + oversized_note
             ),
+            oversized_installed_models=oversized,
         )
 
-    preferred = ["llama3.2:3b", "qwen2.5:3b"]
-    selected = _match_installed_model(preferred, installed_ollama_models)
+    preferred = ["qwen3:4b", "qwen3.5:4b", "llama3.2:3b", "qwen2.5:3b", "qwen3:1.7b"]
+    selected = _match_installed_model(
+        preferred,
+        installed_ollama_models,
+        total_ram_gib=total_ram_gib,
+        gpu_backend=gpu_backend,
+        vram_gib=vram_gib,
+        model_sizes_bytes=model_sizes_bytes,
+        enforce_memory_fit=True,
+    )
     return HardwareCapabilityProfile(
         os_name=os_name,
         os_release=os_release,
@@ -380,7 +573,8 @@ def classify_hardware_tier(
         recommended_retrieval_mode="lexical",
         retrieval_p95_slo_ms=15.0,
         answer_p95_slo_ms=18000.0,
-        rationale=f"Constrained RAM ({total_ram_gib:.1f} GiB) selects compact 3B quantized inference and fast FTS5 lexical recall.",
+        rationale=f"Constrained RAM ({total_ram_gib:.1f} GiB) selects compact 3B/4B quantized inference and fast FTS5 lexical recall.",
+        oversized_installed_models=oversized,
     )
 
 
@@ -398,7 +592,11 @@ def detect_hardware_profile(*, ollama_timeout: float = 3.0, use_cache: bool = Fa
     total_ram, avail_ram = probe_memory_gib()
     cpp_ok, cpp_detail = probe_cpp_runtime()
     gpu_backend, gpu_name, vram_gib = probe_gpu(total_ram)
-    ollama_ok, models = probe_ollama_models(timeout=ollama_timeout)
+    if probe_ollama_models is _DEFAULT_PROBE_OLLAMA_MODELS:
+        ollama_ok, models, model_sizes = probe_ollama_models_with_sizes(timeout=ollama_timeout)
+    else:
+        ollama_ok, models = probe_ollama_models(timeout=ollama_timeout)
+        model_sizes = {}
     profile = classify_hardware_tier(
         os_name=platform.system(),
         os_release=platform.release(),
@@ -413,10 +611,62 @@ def detect_hardware_profile(*, ollama_timeout: float = 3.0, use_cache: bool = Fa
         vram_gib=vram_gib,
         ollama_reachable=ollama_ok,
         installed_ollama_models=models,
+        model_sizes_bytes=model_sizes,
     )
     with _PROFILE_CACHE_LOCK:
         _CACHED_PROFILE = (time.monotonic(), env_key, profile)
     return profile
+
+
+def invalidate_hardware_profile_cache() -> None:
+    """Clear the cached hardware capability profile so the next probe re-evaluates live state."""
+    global _CACHED_PROFILE
+    with _PROFILE_CACHE_LOCK:
+        _CACHED_PROFILE = None
+
+
+_SAFE_LOCAL_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def resolve_active_local_generation_model(
+    *,
+    fallback: str | None = None,
+    ollama_timeout: float = 0.8,
+    use_cache: bool = True,
+) -> str:
+    """Resolve the active local Ollama generation model from explicit env override or hardware tier.
+
+    Precedence:
+    1. Explicit ``BRAIN_GEN_MODEL`` environment variable (unless empty, ``"auto"``, or malformed).
+    2. Hardware-tier ``selected_installed_generation_model`` (e.g. ``qwen2.5-coder:7b`` on Tier 2+).
+    3. Explicit ``fallback`` argument or ``GEN_MODEL`` baseline (``llama3.2:3b``).
+    """
+    explicit_env = (os.environ.get("BRAIN_GEN_MODEL") or "").strip()
+    if (
+        explicit_env
+        and explicit_env.lower() != "auto"
+        and ".." not in explicit_env
+        and _SAFE_LOCAL_MODEL_RE.fullmatch(explicit_env)
+    ):
+        return explicit_env
+    try:
+        profile = detect_hardware_profile(ollama_timeout=ollama_timeout, use_cache=use_cache)
+    except TypeError:
+        try:
+            profile = detect_hardware_profile()
+        except Exception:
+            profile = None
+    except Exception:
+        profile = None
+    if profile is not None:
+        selected = getattr(profile, "selected_installed_generation_model", None)
+        if isinstance(selected, str) and selected.strip():
+            return selected.strip()
+        if fallback is None:
+            rec = getattr(profile, "recommended_generation_model", None)
+            if isinstance(rec, str) and rec.strip():
+                return rec.strip()
+    return (fallback or GEN_MODEL).strip()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -425,9 +675,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     profile = detect_hardware_profile()
+    active_model = resolve_active_local_generation_model(fallback=GEN_MODEL)
     if args.json:
         payload = asdict(profile)
         payload["installed_ollama_models"] = list(profile.installed_ollama_models)
+        payload["oversized_installed_models"] = list(profile.oversized_installed_models)
+        payload["active_generation_model"] = active_model
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
@@ -436,6 +689,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Physical Memory:       {profile.available_ram_gib:.1f} GiB free / {profile.total_ram_gib:.1f} GiB total")
     print(f"Accelerator:           {profile.gpu_name} [{profile.gpu_backend}, {profile.vram_gib:.1f} GiB VRAM]")
     print(f"Native C++ ABI:        {'Ready' if profile.cpp_runtime_ready else 'Missing'} ({profile.cpp_runtime_detail})")
+    print(f"Active Default Model:  {active_model}")
     print(f"Recommended Model:     {profile.recommended_generation_model} (installed match: {profile.selected_installed_generation_model or 'none'})")
     print(f"Recommended Retrieval: {profile.recommended_retrieval_mode} (P95 target <= {profile.retrieval_p95_slo_ms:.0f} ms)")
     if profile.answer_p95_slo_ms is not None:

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "second-brain"
-version = "0.3.0"
+version = "1.0.0"
 description = "A local-first, evidence-grounded memory core for AI hosts"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -29,9 +29,13 @@ scout = ["httpx>=0.28,<1", "httpcore>=1,<2", "trafilatura>=2,<3", "beautifulsoup
 watchdog = ["watchdog>=6,<7"]
 evaluation = ["ollama>=0.6,<1", "chromadb>=1.0,<2"]
 multimodal = ["faster-whisper>=1.1,<2", "Pillow>=11,<13"]
+reranker = ["onnxruntime>=1.19,<2", "tokenizers>=0.20,<1", "numpy>=1.26,<3"]
 dev = []
 all = [
     "chromadb>=1.0,<2",
+    "onnxruntime>=1.19,<2",
+    "tokenizers>=0.20,<1",
+    "numpy>=1.26,<3",
     "streamlit>=1.66,<2",
     "plotly>=6,<7",
     "networkx>=3.4,<4",
@@ -47,6 +51,9 @@ all = [
 [dependency-groups]
 dev = [
     "chromadb>=1.0,<2",
+    "onnxruntime>=1.19,<2",
+    "tokenizers>=0.20,<1",
+    "numpy>=1.26,<3",
     "streamlit>=1.66,<2",
     "plotly>=6,<7",
     "networkx>=3.4,<4",
@@ -74,6 +81,7 @@ exclude = [
 "scripts" = "second_brain/scripts"
 "dashboard" = "second_brain/dashboard"
 "plugins" = "second_brain/plugins"
+"mobile" = "second_brain/mobile"
 ".streamlit/config.toml" = "second_brain/_streamlit/config.toml"
 
 [tool.uv]

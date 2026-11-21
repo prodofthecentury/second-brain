@@ -15,6 +15,7 @@ resets the rebuildable vector collection and re-indexes those atom files.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from contextlib import nullcontext
 from functools import wraps
 import gc
@@ -35,7 +36,14 @@ from config import (
     is_content_markdown,
     safe_file_in_dir,
 )
-from index_manifest import atom_revisions, build_index_manifest, write_index_manifest
+from index_manifest import (
+    INDEX_SCHEMA_VERSION,
+    VECTOR_DISTANCE_METRIC,
+    atom_revisions,
+    build_index_manifest,
+    load_index_manifest,
+    write_index_manifest,
+)
 from memory_format import is_memory_document
 from ollama_utils import embed_text, embedding_metadata
 from vector_store import close_vector_collection, get_vector_collection, reset_vector_collection
@@ -393,6 +401,210 @@ def rebuild_vectors(
     return stats
 
 
+def upsert_changed_vectors(
+    atoms_dir: str = ATOMS_DIR,
+    store_path: str = CHROMA_PATH,
+    collection_name: str = "atoms",
+    model: str | None = None,
+    *,
+    changed_filenames: Sequence[str] = (),
+    deleted_filenames: Sequence[str] = (),
+    require_valid_memory: bool = True,
+    pre_verified_current: bool = False,
+    prefer_json: bool = False,
+    _writer_lock_held: bool = False,
+) -> dict:
+    """Perform an O(|changed|) in-place Chroma/JSON vector upsert + manifest refresh.
+
+    Serializes all live ``.chroma`` mutations strictly under ``writer.lock`` (avoiding AB/BA
+    lock inversion with ``vector-rebuild.lock``). Falls back to ``rebuild_vectors`` when no
+    compatible active cosine manifest exists yet.
+    """
+    effective_model = (model or EMBED_MODEL).strip() or EMBED_MODEL
+    if _is_reparse_or_link(atoms_dir) or (os.path.lexists(store_path) and _is_reparse_or_link(store_path)):
+        raise PermissionError("Refusing to update vector store through a symlink or reparse point.")
+
+    def _is_compatible(m: dict | None) -> bool:
+        return (
+            isinstance(m, dict)
+            and m.get("schema_version") == INDEX_SCHEMA_VERSION
+            and m.get("distance_metric") == VECTOR_DISTANCE_METRIC
+            and m.get("collection_name") == collection_name
+            and m.get("embedding_model") == effective_model
+            and isinstance(m.get("embedding_dimensions"), int)
+            and int(m["embedding_dimensions"]) > 0
+            and isinstance(m.get("generation_id"), str)
+            and bool(str(m["generation_id"]).strip())
+        )
+
+    initial_manifest = load_index_manifest(store_path) if os.path.isdir(store_path) else None
+    if not _is_compatible(initial_manifest):
+        return rebuild_vectors(
+            atoms_dir=atoms_dir,
+            store_path=store_path,
+            collection_name=collection_name,
+            model=effective_model,
+            require_valid_memory=require_valid_memory,
+            prefer_json=prefer_json,
+            _writer_lock_held=_writer_lock_held,
+        )
+
+    writer_lock_path = os.path.join(
+        os.path.dirname(os.path.abspath(atoms_dir)),
+        ".sidecar",
+        "writer.lock",
+    )
+    lock_ctx = nullcontext() if _writer_lock_held else review_lock(writer_lock_path)
+    with lock_ctx:
+        manifest = load_index_manifest(store_path) if os.path.isdir(store_path) else None
+        if not _is_compatible(manifest):
+            return rebuild_vectors(
+                atoms_dir=atoms_dir,
+                store_path=store_path,
+                collection_name=collection_name,
+                model=effective_model,
+                require_valid_memory=require_valid_memory,
+                prefer_json=prefer_json,
+                _writer_lock_held=True,
+            )
+
+        assert isinstance(manifest, dict)
+        generation_id = str(manifest["generation_id"])
+        expected_dims = int(manifest["embedding_dimensions"])
+        revisions_before = atom_revisions(atoms_dir)
+        rev_sha_by_file = {r["filename"]: r["content_sha256"] for r in revisions_before}
+
+        target_changed: set[str] = {str(f).strip() for f in (changed_filenames or ()) if str(f or "").strip()}
+        target_deleted: set[str] = {str(f).strip() for f in (deleted_filenames or ()) if str(f or "").strip()}
+
+        for fname in list(target_changed):
+            if fname not in rev_sha_by_file:
+                target_changed.discard(fname)
+                target_deleted.add(fname)
+
+        collection = get_vector_collection(
+            store_path,
+            name=collection_name,
+            create=False,
+            prefer_json=prefer_json,
+        )
+        try:
+            if not pre_verified_current:
+                existing_payload = collection.get(include=["metadatas"])
+                raw_ids = existing_payload.get("ids") or []
+                raw_metas = existing_payload.get("metadatas") or []
+                stored_meta_by_id: dict[str, dict] = {}
+                for idx, doc_id in enumerate(raw_ids):
+                    if isinstance(doc_id, str):
+                        meta_obj = raw_metas[idx] if idx < len(raw_metas) and isinstance(raw_metas[idx], dict) else {}
+                        stored_meta_by_id[doc_id] = meta_obj
+                for doc_id in stored_meta_by_id:
+                    if doc_id not in rev_sha_by_file:
+                        target_deleted.add(doc_id)
+                for fname, disk_sha in rev_sha_by_file.items():
+                    meta = stored_meta_by_id.get(fname)
+                    if (
+                        meta is None
+                        or meta.get("content_sha256") != disk_sha
+                        or meta.get("embedding_model") != effective_model
+                        or meta.get("index_generation") != generation_id
+                        or meta.get("embedding_dimensions") != expected_dims
+                    ):
+                        target_changed.add(fname)
+
+            target_deleted -= target_changed
+
+            batch_ids: list[str] = []
+            batch_docs: list[str] = []
+            batch_embs: list[list[float]] = []
+            batch_metas: list[dict] = []
+
+            for fname in sorted(target_changed):
+                path = safe_file_in_dir(atoms_dir, fname, allowed_exts={".md"}, must_exist=True)
+                if not path or _is_reparse_or_link(path):
+                    raise PermissionError(f"Refusing to index missing or symlinked atom: {fname}")
+                with open(path, "rb") as fh:
+                    content_bytes = fh.read()
+                content_sha = hashlib.sha256(content_bytes).hexdigest()
+                if rev_sha_by_file.get(fname) != content_sha:
+                    raise RuntimeError(f"Canonical atom {fname} changed concurrently during incremental vector upsert.")
+                content = content_bytes.decode("utf-8")
+                if require_valid_memory and not is_memory_document(content):
+                    target_deleted.add(fname)
+                    continue
+                emb = embed_text(content, model=effective_model)
+                if len(emb) != expected_dims:
+                    raise RuntimeError(
+                        f"Embedding dimensions changed from {expected_dims} to {len(emb)} during incremental upsert."
+                    )
+                meta = embedding_metadata(
+                    fname,
+                    content,
+                    effective_model,
+                    emb,
+                    content_sha256=content_sha,
+                )
+                meta["index_generation"] = generation_id
+                batch_ids.append(fname)
+                batch_docs.append(content)
+                batch_embs.append(emb)
+                batch_metas.append(meta)
+
+            batch_fn = getattr(collection, "batch", None)
+            batch_ctx = batch_fn() if callable(batch_fn) else nullcontext()
+            with batch_ctx:
+                if target_deleted:
+                    delete_fn = getattr(collection, "delete", None)
+                    if callable(delete_fn):
+                        delete_fn(ids=sorted(target_deleted))
+                for start_idx in range(0, len(batch_ids), UPSERT_BATCH_SIZE):
+                    end_idx = start_idx + UPSERT_BATCH_SIZE
+                    collection.upsert(
+                        documents=batch_docs[start_idx:end_idx],
+                        embeddings=batch_embs[start_idx:end_idx],
+                        metadatas=batch_metas[start_idx:end_idx],
+                        ids=batch_ids[start_idx:end_idx],
+                    )
+
+            count_fn = getattr(collection, "count", None)
+            if callable(count_fn):
+                indexed_count = int(count_fn())
+            else:
+                indexed_count = len((collection.get(include=[]) or {}).get("ids") or [])
+        finally:
+            close_vector_collection(collection)
+
+        skipped_count = max(0, len(revisions_before) - indexed_count)
+        current_revisions = atom_revisions(atoms_dir)
+        if current_revisions != revisions_before:
+            raise RuntimeError("Canonical atoms changed while committing incremental vector manifest.")
+        updated_manifest = build_index_manifest(
+            atoms_dir=atoms_dir,
+            collection_name=collection_name,
+            embedding_model=effective_model,
+            embedding_dimensions=expected_dims,
+            indexed_count=indexed_count,
+            generation_id=generation_id,
+            skipped_count=skipped_count,
+        )
+        write_index_manifest(store_path, updated_manifest)
+
+    return {
+        "indexed": indexed_count,
+        "reused": max(0, indexed_count - len(batch_ids)),
+        "embedded": len(batch_ids),
+        "deleted": len(target_deleted),
+        "skipped": skipped_count,
+        "failed": 0,
+        "collection": collection_name,
+        "store_path": store_path,
+        "committed": True,
+        "backup_path": None,
+        "generation_id": generation_id,
+        "incremental": True,
+    }
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Rebuild Second Brain vector recall from Markdown atoms.")
     parser.add_argument("--atoms-dir", default=ATOMS_DIR, help="Directory containing atom Markdown files.")
@@ -409,19 +621,34 @@ def parse_args(argv=None):
         action="store_true",
         help="Force the JSON vector fallback instead of ChromaDB.",
     )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Perform an in-place incremental upsert/delete against the active generation manifest.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    stats = rebuild_vectors(
-        atoms_dir=args.atoms_dir,
-        store_path=args.store_path,
-        collection_name=args.collection,
-        model=args.model,
-        require_valid_memory=not args.include_invalid,
-        prefer_json=args.json,
-    )
+    if args.incremental:
+        stats = upsert_changed_vectors(
+            atoms_dir=args.atoms_dir,
+            store_path=args.store_path,
+            collection_name=args.collection,
+            model=args.model,
+            require_valid_memory=not args.include_invalid,
+            prefer_json=args.json,
+        )
+    else:
+        stats = rebuild_vectors(
+            atoms_dir=args.atoms_dir,
+            store_path=args.store_path,
+            collection_name=args.collection,
+            model=args.model,
+            require_valid_memory=not args.include_invalid,
+            prefer_json=args.json,
+        )
     print(
         "VECTOR_REBUILD_COMPLETE "
         f"indexed={stats['indexed']} reused={stats['reused']} embedded={stats['embedded']} "

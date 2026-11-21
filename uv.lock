@@ -2409,7 +2409,7 @@ wheels = [
 
 [[package]]
 name = "second-brain"
-version = "0.3.0"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -2429,11 +2429,14 @@ all = [
     { name = "faster-whisper" },
     { name = "mcp" },
     { name = "networkx" },
+    { name = "numpy" },
     { name = "ollama" },
+    { name = "onnxruntime" },
     { name = "pandas" },
     { name = "pillow" },
     { name = "plotly" },
     { name = "streamlit" },
+    { name = "tokenizers" },
     { name = "trafilatura" },
     { name = "watchdog" },
 ]
@@ -2465,6 +2468,11 @@ online = [
     { name = "ollama" },
     { name = "rich" },
 ]
+reranker = [
+    { name = "numpy" },
+    { name = "onnxruntime" },
+    { name = "tokenizers" },
+]
 scout = [
     { name = "beautifulsoup4" },
     { name = "httpcore" },
@@ -2481,11 +2489,14 @@ dev = [
     { name = "faster-whisper" },
     { name = "mcp" },
     { name = "networkx" },
+    { name = "numpy" },
     { name = "ollama" },
+    { name = "onnxruntime" },
     { name = "pandas" },
     { name = "pillow" },
     { name = "plotly" },
     { name = "streamlit" },
+    { name = "tokenizers" },
     { name = "trafilatura" },
     { name = "watchdog" },
 ]
@@ -2510,12 +2521,16 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3,<3" },
     { name = "networkx", marker = "extra == 'all'", specifier = ">=3.4,<4" },
     { name = "networkx", marker = "extra == 'dashboard'", specifier = ">=3.4,<4" },
+    { name = "numpy", marker = "extra == 'all'", specifier = ">=1.26,<3" },
+    { name = "numpy", marker = "extra == 'reranker'", specifier = ">=1.26,<3" },
     { name = "ollama", marker = "extra == 'all'", specifier = ">=0.6,<1" },
     { name = "ollama", marker = "extra == 'dashboard'", specifier = ">=0.6,<1" },
     { name = "ollama", marker = "extra == 'dense'", specifier = ">=0.6,<1" },
     { name = "ollama", marker = "extra == 'evaluation'", specifier = ">=0.6,<1" },
     { name = "ollama", marker = "extra == 'mcp'", specifier = ">=0.6,<1" },
     { name = "ollama", marker = "extra == 'online'", specifier = ">=0.6,<1" },
+    { name = "onnxruntime", marker = "extra == 'all'", specifier = ">=1.19,<2" },
+    { name = "onnxruntime", marker = "extra == 'reranker'", specifier = ">=1.19,<2" },
     { name = "pandas", marker = "extra == 'all'", specifier = ">=2.2,<3" },
     { name = "pandas", marker = "extra == 'dashboard'", specifier = ">=2.2,<3" },
     { name = "pillow", marker = "extra == 'all'", specifier = ">=11,<13" },
@@ -2529,12 +2544,14 @@ requires-dist = [
     { name = "rich", marker = "extra == 'online'", specifier = ">=13,<15" },
     { name = "streamlit", marker = "extra == 'all'", specifier = ">=1.66,<2" },
     { name = "streamlit", marker = "extra == 'dashboard'", specifier = ">=1.66,<2" },
+    { name = "tokenizers", marker = "extra == 'all'", specifier = ">=0.20,<1" },
+    { name = "tokenizers", marker = "extra == 'reranker'", specifier = ">=0.20,<1" },
     { name = "trafilatura", marker = "extra == 'all'", specifier = ">=2,<3" },
     { name = "trafilatura", marker = "extra == 'scout'", specifier = ">=2,<3" },
     { name = "watchdog", marker = "extra == 'all'", specifier = ">=6,<7" },
     { name = "watchdog", marker = "extra == 'watchdog'", specifier = ">=6,<7" },
 ]
-provides-extras = ["dashboard", "online", "dense", "mcp", "scout", "watchdog", "evaluation", "multimodal", "dev", "all"]
+provides-extras = ["dashboard", "online", "dense", "mcp", "scout", "watchdog", "evaluation", "multimodal", "reranker", "dev", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2542,11 +2559,14 @@ dev = [
     { name = "faster-whisper", specifier = ">=1.1,<2" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "networkx", specifier = ">=3.4,<4" },
+    { name = "numpy", specifier = ">=1.26,<3" },
     { name = "ollama", specifier = ">=0.6,<1" },
+    { name = "onnxruntime", specifier = ">=1.19,<2" },
     { name = "pandas", specifier = ">=2.2,<3" },
     { name = "pillow", specifier = ">=11,<13" },
     { name = "plotly", specifier = ">=6,<7" },
     { name = "streamlit", specifier = ">=1.66,<2" },
+    { name = "tokenizers", specifier = ">=0.20,<1" },
     { name = "trafilatura", specifier = ">=2,<3" },
     { name = "watchdog", specifier = ">=6,<7" },
 ]

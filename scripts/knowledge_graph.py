@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+import datetime
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -34,11 +36,29 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import approved_revision_is_current, latest_decisions_by_atom  # noqa: E402
+from atom_mutator import (  # noqa: E402
+    append_decision_record,
+    append_decision_records,
+    approved_revision_is_current,
+    atomic_write_bytes,
+    content_sha256,
+    latest_decisions_by_atom,
+    refresh_lexical_index,
+    review_lock,
+)
 from audit_sources import _source_snapshot  # noqa: E402
-from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown  # noqa: E402
+from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown, normalize_markdown_filename, safe_file_in_dir, security_state_dir  # noqa: E402
+from cross_encoder import get_onnx_cross_encoder, score_query_atom_pairs  # noqa: E402
 from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor  # noqa: E402
-from memory_format import split_frontmatter  # noqa: E402
+from lexical_store import porter_stem  # noqa: E402
+from memory_format import (  # noqa: E402
+    evaluate_temporal_validity,
+    normalize_temporal_bound_str,
+    render_memory_document,
+    set_string_list_field,
+    split_frontmatter,
+    temporal_windows_overlap,
+)
 from memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list  # noqa: E402
 from recall import normalize_project_tag, project_tags_match, wikilinks  # noqa: E402
 
@@ -58,23 +78,45 @@ _DOUBLE_NEGATION_RE = re.compile(
     re.IGNORECASE,
 )
 _NEGATION_RE = re.compile(
-    r"\b(?:never|must\s+not|do\s+not|don't|cannot|can't|avoid|forbid|forbidden|"
-    r"disable|disabled|deprecated|no\s+longer|prohibited)\b",
+    r"\b(?:never|must\s+not|mustn't|should\s+not|shouldn't|do\s+not|don't|does\s+not|doesn't|"
+    r"cannot|can't|is\s+not|isn't|are\s+not|aren't|was\s+not|wasn't|were\s+not|weren't|"
+    r"avoid|forbid|forbidden|disable|disabled|deprecated|no\s+longer|prohibited)\b",
     re.IGNORECASE,
 )
 _NEGATED_WORD_RE = re.compile(
-    r"\b(?:not|never|must\s+not|do\s+not|don't|cannot|can't|avoid)\s+([a-z0-9_-]+)\b",
+    r"\b(?:not|never|must\s+not|should\s+not|do\s+not|don't|does\s+not|doesn't|cannot|can't|avoid)\s+([a-z0-9_-]+)\b",
     re.IGNORECASE,
 )
+_PREFIX_NEGATION_SPAN_RE = re.compile(
+    r"\b(is\s+not|isn't|are\s+not|aren't|was\s+not|wasn't|were\s+not|weren't|"
+    r"must\s+not|mustn't|should\s+not|shouldn't|do\s+not|don't|does\s+not|doesn't|"
+    r"cannot|can't|never|avoid|forbid|prohibit|disable|no\s+longer)\b\s+([^.;,()]+)",
+    re.IGNORECASE,
+)
+_STATE_NEGATION_RE = re.compile(
+    r"\b(?:disabled|forbidden|prohibited|deprecated)\b",
+    re.IGNORECASE,
+)
+_NEG_FILLER_WORDS = frozenset(
+    {
+        "be", "being", "been", "have", "has", "had", "do", "does", "did",
+        "treated", "merely", "simply", "just", "ever", "across", "inside",
+        "into", "onto", "upon", "over", "under", "between", "through",
+        "during", "because", "when", "where", "while", "whether",
+    }
+)
 _NON_QUANTITY_LITERAL_RE = re.compile(
-    r"(?ix)"
-    r"\b\d{4}-\d{2}-\d{2}\b"
+    r"(?imx)"
+    r"^\s*\d+(?:\.\d+)*[.)]\s+"
+    r"|\b\d{4}-\d{2}-\d{2}\b"
     r"|\bv?\d+\.\d+\.\d+(?:-[a-z0-9.]+)?\b"
     r"|\b\d{1,3}(?:\.\d{1,3}){3}\b"
     r"|\b(?:sha|aes|rsa|ed|utf|http|rfc|iso|tls|ipv|erc|eip|x509|pkcs)[-\s]?\d+(?:\.\d+)?\b"
 )
 _CLAUSE_SPLIT_RE = re.compile(
-    r"(?:;|\.\s+|,\s+(?:but|whereas|while)\s+|\s+however\b\s*,?\s*)",
+    r"(?:;|(?<!\b\d)\.(?:[*_`)\"'\]]*)\s+|,?\s+\b(?:but|whereas|while|although|though)\b\s+|"
+    r"\s+\b(?:so\s+that|so\s+(?=[a-z0-9_]+(?:\s+[a-z0-9_]+){0,2}\s+(?:never|not|cannot|can't|do\s+not|don't|must\s+not)))\b\s+|"
+    r"\s+however\b\s*,?\s*)",
     re.IGNORECASE,
 )
 _SUBPHRASE_SPLIT_RE = re.compile(
@@ -398,10 +440,73 @@ def _aligned_clause_pairs(text_a: str, text_b: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def _negated_target_stems_conflict(neg_clause: str, pos_clause: str) -> bool:
+    """Return True iff the negated predicate/complement in ``neg_clause`` is positively asserted in ``pos_clause``."""
+    neg_scrubbed = _DOUBLE_NEGATION_RE.sub(" affirm_keep ", neg_clause or "")
+    pos_scrubbed = _REJECTED_ALT_RE.sub(" ", _DOUBLE_NEGATION_RE.sub(" affirm_keep ", pos_clause or ""))
+
+    pos_words = [
+        w for w in _TOKEN_RE.findall(pos_scrubbed.lower())
+        if w not in _STOPWORDS and w not in _NEG_FILLER_WORDS and not w.isdigit() and w != "affirm_keep"
+    ]
+    pos_stems = {porter_stem(w) for w in pos_words}
+    if not pos_stems:
+        return False
+
+    matched_any_prefix = False
+    for m in _PREFIX_NEGATION_SPAN_RE.finditer(neg_scrubbed):
+        matched_any_prefix = True
+        cue = re.sub(r"\s+", " ", m.group(1).lower()).strip()
+        tail = m.group(2)
+        pre_text = neg_scrubbed[: m.start()]
+        pre_stems = {
+            porter_stem(w)
+            for w in _TOKEN_RE.findall(pre_text.lower())
+            if w not in _STOPWORDS and w not in _NEG_FILLER_WORDS and not w.isdigit()
+        }
+        tail_words = [
+            w for w in _TOKEN_RE.findall(tail.lower())
+            if w not in _STOPWORDS and w not in _NEG_FILLER_WORDS and not w.isdigit() and w != "affirm_keep"
+        ][:4]
+        if not tail_words:
+            continue
+        tail_stems = [porter_stem(w) for w in tail_words]
+        is_copular = cue in {"is not", "isn't", "are not", "aren't", "was not", "wasn't", "were not", "weren't"}
+        if is_copular and len(tail_stems) >= 2:
+            # In copular identity negations ("Trust is not model self-confidence"), the head noun
+            # of the complement phrase (not a leading noun modifier shared with the topic) must align.
+            head_candidates = {tail_stems[-1], tail_stems[-2]} - pre_stems
+            if not head_candidates:
+                head_candidates = {tail_stems[-1]}
+            if head_candidates & pos_stems:
+                return True
+        else:
+            # Action/modal negation ("must never enforce writer lock", "never verify anchors"):
+            # check the primary negated verb/head (first 2 content stems) against pos_stems.
+            primary_heads = [s for s in tail_stems[:2] if s not in pre_stems] or tail_stems[:2]
+            if set(primary_heads) & pos_stems:
+                return True
+
+    if not matched_any_prefix and _STATE_NEGATION_RE.search(neg_scrubbed):
+        neg_subj_stems = {
+            porter_stem(w)
+            for w in _TOKEN_RE.findall(neg_scrubbed.lower())
+            if w not in _STOPWORDS and w not in _NEG_FILLER_WORDS and not _STATE_NEGATION_RE.fullmatch(w) and not w.isdigit()
+        }
+        if len(neg_subj_stems & pos_stems) >= 2:
+            return True
+
+    return False
+
+
 def _has_clause_polarity_conflict(text_a: str, text_b: str) -> bool:
     for ca, cb in _aligned_clause_pairs(text_a, text_b):
-        if _is_negative_claim(ca) != _is_negative_claim(cb):
-            return True
+        neg_a = _is_negative_claim(ca)
+        neg_b = _is_negative_claim(cb)
+        if neg_a != neg_b:
+            neg_c, pos_c = (ca, cb) if neg_a else (cb, ca)
+            if _negated_target_stems_conflict(neg_c, pos_c):
+                return True
     return False
 
 
@@ -774,16 +879,42 @@ def _inspect_drift_alert(
                 anchor_error = str(exc)
 
     if not reasons:
-        return None
+        raw_vf = str(fm_vals.get("valid_from") or "").strip()
+        raw_vu = str(fm_vals.get("valid_until") or "").strip()
+        if raw_vf or raw_vu:
+            tv = evaluate_temporal_validity(raw_vf, raw_vu)
+            if tv["status"] == "expired":
+                reasons.append("expired_validity")
+            elif tv["status"] == "invalid_window":
+                reasons.append("invalid_validity_window")
+        if not reasons:
+            return None
+    else:
+        raw_vf = str(fm_vals.get("valid_from") or "").strip()
+        raw_vu = str(fm_vals.get("valid_until") or "").strip()
+        if raw_vf or raw_vu:
+            tv = evaluate_temporal_validity(raw_vf, raw_vu)
+            if tv["status"] == "expired":
+                reasons.append("expired_validity")
+            elif tv["status"] == "invalid_window":
+                reasons.append("invalid_validity_window")
 
+    rec_action = (
+        "extend_or_supersede"
+        if reasons == ["expired_validity"]
+        else "demote_or_reapprove"
+    )
     return {
         "filename": os.path.basename(path),
         "review_status": review_status,
         "claim_state": claim_state,
         "drift_reasons": reasons,
+        "reason": ", ".join(reasons),
+        "valid_from": str(fm_vals.get("valid_from") or "").strip(),
+        "valid_until": str(fm_vals.get("valid_until") or "").strip(),
         "evidence_source": evidence_source,
         "anchor_error": anchor_error,
-        "recommended_action": "demote_or_reapprove",
+        "recommended_action": rec_action,
     }
 
 
@@ -794,10 +925,21 @@ def build_knowledge_graph(
     project_scope: str | None = None,
     include_pending: bool = False,
     include_preferences: bool = True,
+    as_of: str | None = None,
+    include_expired: bool = True,
 ) -> dict[str, Any]:
-    """Build deterministic nodes and edges across vault atoms."""
+    """Build deterministic nodes and edges across vault atoms (with optional point-in-time `as_of`)."""
+    clean_as_of = str(as_of).strip() if (as_of is not None and str(as_of).strip()) else None
+    if clean_as_of is not None:
+        if len(clean_as_of) > 64:
+            raise ValueError("Invalid 'as_of' filter: exceeds 64 characters.")
+        normalize_temporal_bound_str(clean_as_of)
+
     nodes: list[dict[str, Any]] = []
     by_id: dict[str, dict[str, Any]] = {}
+    active_temporal_count = 0
+    expired_temporal_count = 0
+    future_temporal_count = 0
     latest_decisions: dict[str, dict[str, Any]] = {}
     dlog = os.path.join(brain_dir, "0-raw", "archive", "decision-record.jsonl")
     if os.path.isfile(dlog) and not _is_reparse_or_link(dlog):
@@ -867,6 +1009,17 @@ def build_knowledge_graph(
                 if (status == "accepted" and not sup_list and not is_approved_current)
                 else str(status or "")
             )
+            valid_from_val = str(rec.get("valid_from") or fm_vals.get("valid_from") or "").strip()
+            valid_until_val = str(rec.get("valid_until") or fm_vals.get("valid_until") or "").strip()
+            tv_node = evaluate_temporal_validity(valid_from_val, valid_until_val, as_of=clean_as_of)
+            if not tv_node["active"] and not include_expired:
+                continue
+            if tv_node["status"] == "expired":
+                expired_temporal_count += 1
+            elif tv_node["status"] == "not_yet_valid":
+                future_temporal_count += 1
+            elif tv_node["active"]:
+                active_temporal_count += 1
             node = {
                 "atom_id": atom_id,
                 "filename": rec.get("filename", entry.name),
@@ -880,6 +1033,9 @@ def build_knowledge_graph(
                 "supersedes": supersedes_list,
                 "contested_by": contested_by_list,
                 "superseded_by": superseded_by,
+                "valid_from": valid_from_val,
+                "valid_until": valid_until_val,
+                "temporal_status": str(tv_node["status"]),
                 "claim": claim_text,
                 "negative_polarity": _is_negative_claim(claim_text),
                 "numbers": sorted(_extract_numbers(claim_text)),
@@ -975,6 +1131,10 @@ def build_knowledge_graph(
     return {
         "node_count": len(nodes),
         "edge_count": len(edges),
+        "as_of": clean_as_of,
+        "active_temporal_count": active_temporal_count,
+        "expired_temporal_count": expired_temporal_count,
+        "future_temporal_count": future_temporal_count,
         "orphan_approved_atoms": orphans,
         "nodes": nodes,
         "edges": edges,
@@ -995,8 +1155,11 @@ def _build_nli_prompt(claim_a: str, claim_b: str) -> str:
 
 def _normalize_nli_verdict(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, str):
+        from hardware_profile import strip_reasoning_think_blocks
+
+        cleaned_raw = strip_reasoning_think_blocks(raw)
         try:
-            raw = json.loads(raw)
+            raw = json.loads(cleaned_raw)
         except json.JSONDecodeError:
             return None
     if not isinstance(raw, dict):
@@ -1011,6 +1174,165 @@ def _normalize_nli_verdict(raw: Any) -> dict[str, Any] | None:
     conf = max(0.0, min(1.0, round(conf, 4)))
     rationale = str(raw.get("rationale") or "").strip()[:300]
     return {"verdict": verdict, "confidence": conf, "rationale": rationale}
+
+
+_SEMANTIC_CONFLICT_PAIRS: tuple[tuple[re.Pattern[str], re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"\b(?:exclusively|strictly|only)\s+(?:through|via|over|behind)\b", re.IGNORECASE),
+        re.compile(r"\b(?:bypass(?:es|ing)?|direct\s+origin|skip(?:s|ping)?\s+proxy|circumvent)\b", re.IGNORECASE),
+        "Exclusive routing constraint vs direct bypass.",
+    ),
+    (
+        re.compile(r"\b(?:immutable|append[- ]only|never\s+overwrit(?:e|ten))\b", re.IGNORECASE),
+        re.compile(r"\b(?:overwrite[sd]?|mutat(?:e|es|ed)\s+in[- ]place|truncat(?:e|es|ed))\b", re.IGNORECASE),
+        "Immutable/append-only invariant vs in-place overwrite.",
+    ),
+    (
+        re.compile(r"\b(?:zero[- ]network|strictly\s+offline|air[- ]gapped|never\s+contact\s+remote)\b", re.IGNORECASE),
+        re.compile(r"\b(?:uploads?\s+to\s+cloud|phones?\s+home|sends?\s+telemetry\s+online)\b", re.IGNORECASE),
+        "Offline/air-gapped boundary vs outbound cloud transmission.",
+    ),
+    (
+        re.compile(r"\b(?:mandatory|always\s+required|enforced\s+on\s+every)\b", re.IGNORECASE),
+        re.compile(r"\b(?:optional|best[- ]effort|skipped\s+by\s+default)\b", re.IGNORECASE),
+        "Mandatory enforcement vs optional/skipped behavior.",
+    ),
+)
+
+
+_LEAD_LIST_PREFIX_RE = re.compile(r"^\s*(?:\d+[.)]\s+|[-*+]\s+)")
+_BOLD_TITLE_PREFIX_RE = re.compile(r"^\s*\*\*[^*]{2,80}?\*\*[:.]?\s*")
+_COLON_HEADER_PREFIX_RE = re.compile(r"^\s*[A-Z][A-Za-z0-9 _/-]{2,34}:\s+")
+_MD_INLINE_FORMAT_RE = re.compile(r"(\*\*|__|`+)")
+_HAS_FINITE_PREDICATE_RE = re.compile(
+    r"\b(?:is|are|was|were|be|been|being|am|must|should|shall|may|might|can|cannot|can't|could|"
+    r"will|would|won't|do|does|did|don't|doesn't|didn't|has|have|had|need|needs|needed|"
+    r"require|requires|required|enforce|enforces|enforced|allow|allows|allowed|use|uses|used|"
+    r"bind|binds|bound|run|runs|ran|pass|passes|passed|bypass|bypasses|bypassed|connect|connects|"
+    r"verify|verifies|verified|remain|remains|accept|accepts|reject|rejects|replace|replaces|"
+    r"support|supports|store|stores|stored|write|writes|read|reads|send|sends|sent|block|blocks|"
+    r"forbid|forbids|prohibit|prohibits|disable|disables|disabled|enable|enables|enabled|"
+    r"keep|keeps|kept|stay|stays|leave|leaves|enter|enters|set|sets|record|records|make|makes|"
+    r"retain|retains|delete|deletes|deleted|expire|expires|overwrite|overwrites|mutate|mutates|"
+    r"upload|uploads|phone|phones|skip|skips|skipped|route|routes|encrypt|encrypts|encrypted)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_claim_for_nli(text: str) -> str:
+    s = (text or "").strip()
+    s = _LEAD_LIST_PREFIX_RE.sub("", s)
+    s = _BOLD_TITLE_PREFIX_RE.sub("", s)
+    s = _COLON_HEADER_PREFIX_RE.sub("", s)
+    s = _MD_INLINE_FORMAT_RE.sub("", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _has_equivalent_aligned_quantities_without_conflict(text_a: str, text_b: str) -> bool:
+    q_a = _extract_contextual_quantities(text_a)
+    q_b = _extract_contextual_quantities(text_b)
+    if not q_a or not q_b or _has_numeric_conflict(q_a, q_b):
+        return False
+    return any(_quantities_aligned(qa, qb) for qa in q_a for qb in q_b)
+
+
+def _local_fast_nli_verdict(claim_a: str, claim_b: str) -> dict[str, Any]:
+    """Fast (< 5 ms) clause-aligned local ONNX + predicate-interaction NLI adjudicator (zero network)."""
+    ca_clean = _clean_claim_for_nli(claim_a)
+    cb_clean = _clean_claim_for_nli(claim_b)
+    nli_dir_raw = (os.environ.get("BRAIN_NLI_ONNX_DIR") or "").strip()
+    nli_dir = Path(os.path.abspath(os.path.expanduser(nli_dir_raw))) if nli_dir_raw else (security_state_dir() / "models" / "nli")
+    enc = get_onnx_cross_encoder(nli_dir, max_length=384)
+    if (
+        enc is not None
+        and _HAS_FINITE_PREDICATE_RE.search(ca_clean)
+        and _HAS_FINITE_PREDICATE_RE.search(cb_clean)
+    ):
+        try:
+            aligned_pairs = _aligned_clause_pairs(ca_clean, cb_clean)
+            best_contra = 0.0
+            best_entail = 0.0
+            best_neutral = 0.0
+            evaluated_sub = False
+            for sub_a, sub_b in aligned_pairs:
+                if not (_HAS_FINITE_PREDICATE_RE.search(sub_a) and _HAS_FINITE_PREDICATE_RE.search(sub_b)):
+                    continue
+                ta = _topic_tokens(sub_a)
+                tb = _topic_tokens(sub_b)
+                shared_sub = ta & tb
+                jac_sub = len(shared_sub) / max(1, len(ta | tb))
+                if jac_sub < 0.25 and len(shared_sub) < 4:
+                    continue
+                probs_ab = enc.predict_nli_probs(sub_a, sub_b)
+                probs_ba = enc.predict_nli_probs(sub_b, sub_a)
+                if probs_ab is None or probs_ba is None:
+                    continue
+                evaluated_sub = True
+                # Guard unit-converted numeric equivalences (e.g. 30s == 0.5m, 1024 MiB == 1 GiB)
+                if (
+                    _has_equivalent_aligned_quantities_without_conflict(sub_a, sub_b)
+                    and not _has_clause_polarity_conflict(sub_a, sub_b)
+                    and not _has_antonym_conflict(sub_a, sub_b)
+                ):
+                    best_entail = max(best_entail, 0.90)
+                    continue
+                min_contra = min(probs_ab[0], probs_ba[0])
+                max_entail = max(probs_ab[2], probs_ba[2])
+                avg_neutral = 0.5 * (probs_ab[1] + probs_ba[1])
+                best_contra = max(best_contra, min_contra)
+                best_entail = max(best_entail, max_entail)
+                best_neutral = max(best_neutral, avg_neutral)
+
+            if evaluated_sub:
+                if best_contra >= 0.80:
+                    return {
+                        "verdict": "contradiction",
+                        "confidence": round(best_contra, 4),
+                        "rationale": "ONNX NLI contradiction probability.",
+                    }
+                if (
+                    best_entail >= 0.80
+                    and best_contra < 0.35
+                    and not _has_numeric_conflict(
+                        _extract_contextual_quantities(ca_clean),
+                        _extract_contextual_quantities(cb_clean),
+                    )
+                    and not _has_exclusive_entity_conflict(ca_clean, cb_clean)
+                ):
+                    return {
+                        "verdict": "compatible",
+                        "confidence": round(best_entail, 4),
+                        "rationale": "ONNX NLI entailment/compatible.",
+                    }
+        except Exception:
+            pass
+
+    toks_a = _topic_tokens(claim_a)
+    toks_b = _topic_tokens(claim_b)
+    shared = toks_a & toks_b
+    if len(shared) < 2:
+        return {"verdict": "unrelated", "confidence": 0.85, "rationale": "Insufficient shared subject vocabulary."}
+
+    for pat_left, pat_right, desc in _SEMANTIC_CONFLICT_PAIRS:
+        if (pat_left.search(claim_a) and pat_right.search(claim_b)) or (
+            pat_right.search(claim_a) and pat_left.search(claim_b)
+        ):
+            return {"verdict": "contradiction", "confidence": 0.88, "rationale": desc}
+
+    if _has_clause_polarity_conflict(claim_a, claim_b):
+        return {"verdict": "contradiction", "confidence": 0.86, "rationale": "Aligned negated predicate conflict."}
+    if _has_antonym_conflict(claim_a, claim_b):
+        return {"verdict": "contradiction", "confidence": 0.87, "rationale": "Aligned technical antonym conflict."}
+    if _has_exclusive_entity_conflict(claim_a, claim_b):
+        return {"verdict": "contradiction", "confidence": 0.89, "rationale": "Mutually exclusive system entity conflict."}
+    if _has_numeric_conflict(_extract_contextual_quantities(claim_a), _extract_contextual_quantities(claim_b)):
+        return {"verdict": "contradiction", "confidence": 0.90, "rationale": "Aligned parameter value conflict."}
+
+    # Check if an apparent polarity mismatch actually targets disjoint predicates -> compatible!
+    if _is_negative_claim(claim_a) != _is_negative_claim(claim_b) and not _has_clause_polarity_conflict(claim_a, claim_b):
+        return {"verdict": "compatible", "confidence": 0.84, "rationale": "Negation targets a distinct predicate/sub-clause."}
+
+    return {"verdict": "compatible", "confidence": 0.72, "rationale": "Compatible statements on shared topic."}
 
 
 def _make_local_ollama_nli_adjudicator(
@@ -1090,6 +1412,7 @@ def detect_contradictions(
     include_preferences: bool = False,
     graph: dict[str, Any] | None = None,
     enable_nli: bool = False,
+    nli_mode: str = "llm",
     model: str | None = None,
     policy_path: Path | None = None,
     nli_fn: Callable[[str, str], dict[str, Any]] | None = None,
@@ -1156,6 +1479,15 @@ def detect_contradictions(
             pair_key = tuple(sorted((a["filename"], b["filename"])))
             explicitly_contested = (pair_key[0], pair_key[1]) in contested_pairs
 
+            # Disjoint [valid_from, valid_until] windows represent temporal succession, not contradiction
+            if not explicitly_contested and not temporal_windows_overlap(
+                a.get("valid_from"),
+                a.get("valid_until"),
+                b.get("valid_from"),
+                b.get("valid_until"),
+            ):
+                continue
+
             topic_match = (len(toks_a) >= 2 and len(toks_b) >= 2) and (jaccard >= 0.30 or len(shared) >= 3)
             entity_match_eligible = (len(toks_a) >= 2 and len(toks_b) >= 2) and len(shared) >= 2 and jaccard >= 0.20
             if not topic_match and not entity_match_eligible and not explicitly_contested:
@@ -1213,7 +1545,11 @@ def detect_contradictions(
     nli_evaluated = 0
     nli_suppressed = 0
     nli_promoted = 0
-    if enable_nli:
+    clean_nli_mode = str(nli_mode or "llm").strip().lower()
+    if clean_nli_mode not in {"llm", "fast", "hybrid"}:
+        raise ValueError("nli_mode must be one of ('llm', 'fast', 'hybrid').")
+    if enable_nli or clean_nli_mode in {"fast", "hybrid"}:
+        enable_nli = True
         max_budget = max(1, min(int(nli_max_pairs), 100))
         adjudicator: Callable[[str, str, list[str]], dict[str, Any] | None] | None
         if nli_fn is not None:
@@ -1222,15 +1558,39 @@ def detect_contradictions(
 
             adjudicator = _wrapped_nli
             nli_status = "completed"
+        elif clean_nli_mode == "fast":
+            def _fast_only(ca: str, cb: str, _ids: list[str]) -> dict[str, Any] | None:
+                return _local_fast_nli_verdict(ca, cb)
+
+            adjudicator = _fast_only
+            nli_status = "completed_fast"
         else:
-            adjudicator, init_status = _make_local_ollama_nli_adjudicator(
+            llm_adj, init_status = _make_local_ollama_nli_adjudicator(
                 brain_dir=brain_dir,
                 model=model,
                 policy_path=policy_path,
                 http_transport=http_transport,
                 skip_dns_check_for_mock_transport=skip_dns_check_for_mock_transport,
             )
-            nli_status = "completed" if init_status == "ready" else init_status
+            if clean_nli_mode == "hybrid":
+                def _hybrid_adj(ca: str, cb: str, ids: list[str]) -> dict[str, Any] | None:
+                    fast_res = _local_fast_nli_verdict(ca, cb)
+                    if fast_res["verdict"] == "contradiction" and fast_res["confidence"] >= 0.86:
+                        return fast_res
+                    if llm_adj is not None:
+                        try:
+                            llm_res = llm_adj(ca, cb, ids)
+                            if llm_res is not None:
+                                return llm_res
+                        except Exception:
+                            pass
+                    return fast_res
+
+                adjudicator = _hybrid_adj
+                nli_status = "completed_hybrid" if init_status == "ready" else "completed_fast_fallback"
+            else:
+                adjudicator = llm_adj
+                nli_status = "completed" if init_status == "ready" else init_status
 
         if adjudicator is not None:
             offline = False
@@ -1332,13 +1692,28 @@ def detect_contradictions(
             except (OSError, UnicodeDecodeError, ValueError):
                 continue
 
+    expired_atoms = [
+        {
+            "filename": n["filename"],
+            "claim": n["claim"],
+            "valid_from": n.get("valid_from", ""),
+            "valid_until": n.get("valid_until", ""),
+            "temporal_status": n.get("temporal_status", "expired"),
+            "approved_current": bool(n.get("approved_current")),
+        }
+        for n in active
+        if n.get("temporal_status") in {"expired", "invalid_window"}
+    ]
+
     return {
         "contradiction_count": len(alerts),
         "high_severity_count": sum(1 for al in alerts if al["severity"] == "high"),
         "drift_count": len(drift_alerts),
+        "expired_count": len(expired_atoms),
         "orphan_approved_count": len(graph["orphan_approved_atoms"]),
         "alerts": alerts,
         "drift_alerts": drift_alerts,
+        "expired_atoms": expired_atoms,
         "orphan_approved_atoms": graph["orphan_approved_atoms"],
         "nli_enabled": bool(enable_nli),
         "nli_status": nli_status,
@@ -1401,6 +1776,431 @@ def graph_neighbors(
     }
 
 
+_DISALLOWED_AUTOLINK_ACTORS = frozenset({"", "agent", "mcp", "model", "llm", "assistant", "system", "auto", "bot"})
+
+
+def _scopes_compatible_for_autolink(ctx_a: Sequence[str], ctx_b: Sequence[str]) -> bool:
+    """Enforce strict project-scope equivalence (unscoped<->unscoped or mutual project:* containment)."""
+    projs_a = tuple(c for c in ctx_a if str(c).strip().lower().startswith("project:"))
+    projs_b = tuple(c for c in ctx_b if str(c).strip().lower().startswith("project:"))
+    if not projs_a and not projs_b:
+        return True
+    if bool(projs_a) != bool(projs_b):
+        return False
+    return bool(
+        all(project_tags_match((t,), projs_b) for t in projs_a)
+        and all(project_tags_match((t,), projs_a) for t in projs_b)
+    )
+
+
+def suggest_atom_graph_links_for_claim(
+    claim_text: str,
+    *,
+    exclude_filename: str | None = None,
+    contexts: Sequence[str] = (),
+    project_scope: str | None = None,
+    brain_dir: str = BRAIN_DIR,
+    atoms_dir: str = ATOMS_DIR,
+    include_pending: bool = False,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """Identify verified ``[[wikilink]]`` targets, duplicate candidates, and contradiction alerts for a claim."""
+    clean_claim = (claim_text or "").strip()
+    if not clean_claim:
+        return {"related_links": [], "duplicate_candidates": [], "contradiction_alerts": []}
+
+    graph = build_knowledge_graph(
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        project_scope=project_scope,
+        include_pending=include_pending,
+        include_preferences=False,
+    )
+    claim_toks = _topic_tokens(clean_claim)
+    claim_stems = {porter_stem(t) for t in claim_toks}
+    claim_quants = _extract_contextual_quantities(clean_claim)
+    cap = max(1, min(int(top_k), 15))
+
+    candidates = [
+        n for n in graph["nodes"]
+        if not n["superseded_by"]
+        and n["filename"] != (exclude_filename or "")
+        and _scopes_compatible_for_autolink(contexts, n.get("contexts") or ())
+    ]
+    if not candidates:
+        return {"related_links": [], "duplicate_candidates": [], "contradiction_alerts": []}
+
+    ce_scores, _ = score_query_atom_pairs(
+        clean_claim,
+        [f"## Claim\n{n['claim']}\n" for n in candidates],
+    )
+
+    related: list[dict[str, Any]] = []
+    duplicates: list[dict[str, Any]] = []
+    contradictions: list[dict[str, Any]] = []
+
+    for node, ce_score in zip(candidates, ce_scores):
+        node_toks = set(node["topic_tokens"])
+        node_stems = {porter_stem(t) for t in node_toks}
+        shared_stems = sorted(claim_stems & node_stems)
+        union_stems = claim_stems | node_stems
+        stem_jaccard = len(shared_stems) / len(union_stems) if union_stems else 0.0
+        shared_exact = sorted(claim_toks & node_toks)
+
+        topic_match = (len(claim_stems) >= 2 and len(node_stems) >= 2) and (
+            stem_jaccard >= 0.25 or len(shared_stems) >= 3
+        )
+        entity_eligible = (len(claim_stems) >= 2 and len(node_stems) >= 2) and len(shared_stems) >= 2 and stem_jaccard >= 0.18
+
+        c_reasons: list[str] = []
+        if topic_match:
+            if _has_clause_polarity_conflict(clean_claim, node["claim"]):
+                c_reasons.append("polarity_conflict")
+            if _has_antonym_conflict(clean_claim, node["claim"]):
+                c_reasons.append("antonym_conflict")
+            if _has_numeric_conflict(claim_quants, _extract_contextual_quantities(node["claim"])):
+                c_reasons.append("numeric_value_conflict")
+        if topic_match or entity_eligible:
+            if _has_exclusive_entity_conflict(clean_claim, node["claim"]):
+                c_reasons.append("exclusive_entity_conflict")
+            else:
+                fast_v = _local_fast_nli_verdict(clean_claim, node["claim"])
+                if fast_v["verdict"] == "contradiction" and fast_v["confidence"] >= 0.86:
+                    c_reasons.append("nli_contradiction")
+
+        if c_reasons:
+            contradictions.append(
+                {
+                    "filename": node["filename"],
+                    "stem": Path(node["filename"]).stem,
+                    "claim": node["claim"],
+                    "reasons": c_reasons,
+                    "jaccard": round(stem_jaccard, 3),
+                }
+            )
+            continue
+
+        if stem_jaccard >= 0.52 or (ce_score >= 0.78 and stem_jaccard >= 0.40):
+            duplicates.append(
+                {
+                    "filename": node["filename"],
+                    "stem": Path(node["filename"]).stem,
+                    "claim": node["claim"],
+                    "jaccard": round(stem_jaccard, 3),
+                    "cross_encoder_score": round(float(ce_score), 3),
+                }
+            )
+
+        link_score = round(0.55 * stem_jaccard + 0.45 * float(ce_score), 4)
+        if (len(shared_stems) >= 2 and link_score >= 0.28) or len(shared_stems) >= 3:
+            related.append(
+                {
+                    "filename": node["filename"],
+                    "stem": Path(node["filename"]).stem,
+                    "claim": node["claim"],
+                    "score": link_score,
+                    "jaccard": round(stem_jaccard, 3),
+                    "shared_terms": (shared_exact or shared_stems)[:8],
+                }
+            )
+
+    related.sort(key=lambda r: (-r["score"], r["filename"]))
+    duplicates.sort(key=lambda d: (-d["jaccard"], d["filename"]))
+    contradictions.sort(key=lambda c: (-c["jaccard"], c["filename"]))
+    return {
+        "related_links": related[:cap],
+        "duplicate_candidates": duplicates[:cap],
+        "contradiction_alerts": contradictions[:cap],
+    }
+
+
+def suggest_atom_graph_links(
+    atom_filename: str,
+    *,
+    project_scope: str | None = None,
+    brain_dir: str = BRAIN_DIR,
+    atoms_dir: str = ATOMS_DIR,
+    include_pending: bool = False,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """Suggest ``[[wikilink]]``, duplicate, and contradiction candidates for an existing atom file."""
+    norm_name = normalize_markdown_filename(str(atom_filename or "").strip())
+    path = safe_file_in_dir(atoms_dir, norm_name, allowed_exts={".md"}, must_exist=True)
+    if not path or _is_reparse_or_link(path):
+        raise FileNotFoundError(f"Atom not found: {atom_filename}")
+    rec = parse_atom_record(path)
+    res = suggest_atom_graph_links_for_claim(
+        rec.get("claim") or "",
+        exclude_filename=norm_name,
+        contexts=list(rec.get("contexts") or []),
+        project_scope=project_scope,
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        include_pending=include_pending,
+        top_k=top_k,
+    )
+    return {"atom": norm_name, **res}
+
+
+def auto_link_vault_atoms(
+    *,
+    actor: str = "owner",
+    brain_dir: str = BRAIN_DIR,
+    atoms_dir: str = ATOMS_DIR,
+    project_scope: str | None = None,
+    include_pending: bool = False,
+    dry_run: bool = False,
+    max_links_per_atom: int = 4,
+) -> dict[str, Any]:
+    """Attach verified ``links`` (``[[wikilink]]`` edges) across related vault atoms under ``writer.lock``.
+
+    Preserves all 5 core invariants:
+    - Never alters ``## Claim``, ``## Evidence``, ``contexts``, or ``epistemic_label``.
+    - Never promotes pending/unapproved atoms to ``accepted``.
+    - For already-approved atoms, re-verifies exact byte-offset evidence anchors and appends
+      an attested owner ``approve`` decision record so ``approved_revision_is_current`` stays True.
+    """
+    clean_actor = str(actor or "").strip()[:120]
+    if not dry_run and clean_actor.casefold() in _DISALLOWED_AUTOLINK_ACTORS:
+        raise PermissionError("Auto-linking canonical atoms requires an explicit human owner actor.")
+
+    cap = max(1, min(int(max_links_per_atom), 10))
+    graph_before = build_knowledge_graph(
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        project_scope=project_scope,
+        include_pending=include_pending,
+        include_preferences=False,
+    )
+    nodes = [n for n in graph_before["nodes"] if not n["superseded_by"]]
+    if len(nodes) < 2:
+        orphan_n = len(graph_before["orphan_approved_atoms"])
+        return {
+            "status": "dry_run" if dry_run else "completed",
+            "updated_count": 0,
+            "updated_atom_count": 0,
+            "updated_atoms": [],
+            "orphans_before": orphan_n,
+            "orphans_after": orphan_n,
+            "orphan_before": orphan_n,
+            "orphan_after": orphan_n,
+            "duplicate_candidates": [],
+            "contradiction_alerts": [],
+        }
+
+    # Compute symmetric candidate links across nodes
+    proposed_by_file: dict[str, list[str]] = defaultdict(list)
+    dup_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+    contra_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for node in nodes:
+        fname = node["filename"]
+        sug = suggest_atom_graph_links_for_claim(
+            node["claim"],
+            exclude_filename=fname,
+            contexts=node.get("contexts") or (),
+            project_scope=project_scope,
+            brain_dir=brain_dir,
+            atoms_dir=atoms_dir,
+            include_pending=include_pending,
+            top_k=cap,
+        )
+        existing_stems = {
+            Path(str(t).strip().removesuffix(".md")).stem
+            for t in (node.get("links") or ())
+            if str(t).strip()
+        }
+        for rel in sug["related_links"]:
+            target_stem = str(rel["stem"])
+            if target_stem and target_stem != Path(fname).stem and target_stem not in existing_stems:
+                if target_stem not in proposed_by_file[fname] and len(proposed_by_file[fname]) < cap:
+                    proposed_by_file[fname].append(target_stem)
+        for d in sug["duplicate_candidates"]:
+            pk = tuple(sorted((fname, str(d["filename"]))))
+            dup_pairs.setdefault((pk[0], pk[1]), {"atom_a": pk[0], "atom_b": pk[1], "jaccard": d["jaccard"]})
+        for c in sug["contradiction_alerts"]:
+            pk = tuple(sorted((fname, str(c["filename"]))))
+            contra_pairs.setdefault(
+                (pk[0], pk[1]),
+                {"atom_a": pk[0], "atom_b": pk[1], "reasons": c["reasons"], "jaccard": c["jaccard"]},
+            )
+
+    if dry_run:
+        linked_Sim = set()
+        for n in nodes:
+            if n.get("links") or proposed_by_file.get(n["filename"]):
+                linked_Sim.add(n["filename"])
+                for st in [*(n.get("links") or ()), *proposed_by_file.get(n["filename"], ())]:
+                    linked_Sim.add(f"{Path(str(st)).stem}.md")
+        est_orphans = [fn for fn in graph_before["orphan_approved_atoms"] if fn not in linked_Sim]
+        return {
+            "status": "dry_run",
+            "updated_count": len(proposed_by_file),
+            "updated_atom_count": len(proposed_by_file),
+            "proposed_links": dict(sorted(proposed_by_file.items())),
+            "orphans_before": len(graph_before["orphan_approved_atoms"]),
+            "orphans_after": len(est_orphans),
+            "orphan_before": len(graph_before["orphan_approved_atoms"]),
+            "orphan_after": len(est_orphans),
+            "duplicate_candidates": list(dup_pairs.values()),
+            "contradiction_alerts": list(contra_pairs.values()),
+        }
+
+    lock_path = os.path.join(brain_dir, ".sidecar", "writer.lock")
+    history_dir = os.path.join(atoms_dir, ".history")
+    decision_log_path = os.path.join(brain_dir, "0-raw", "archive", "decision-record.jsonl")
+    updated_files: list[str] = []
+
+    with review_lock(lock_path):
+        from index_manifest import index_manifest_is_current, load_index_manifest
+
+        chroma_dir = os.path.join(brain_dir, ".chroma")
+        dense_manifest = load_index_manifest(chroma_dir)
+        dense_was_current = bool(
+            isinstance(dense_manifest, dict)
+            and dense_manifest.get("distance_metric") == "cosine"
+            and bool(dense_manifest.get("embedding_model"))
+            and isinstance(dense_manifest.get("embedding_dimensions"), int)
+            and bool(dense_manifest.get("generation_id"))
+            and index_manifest_is_current(dense_manifest, atoms_dir)
+        )
+
+        os.makedirs(history_dir, exist_ok=True)
+        pending_records: list[dict[str, Any]] = []
+
+        def _live_stem_is_linkable(stem_val: str) -> bool:
+            t_path = safe_file_in_dir(atoms_dir, f"{stem_val}.md", allowed_exts={".md"}, must_exist=True)
+            if not t_path or _is_reparse_or_link(t_path):
+                return False
+            try:
+                t_parsed = split_frontmatter(Path(t_path).read_text(encoding="utf-8"))
+                if t_parsed is None:
+                    return False
+                t_vals = parse_frontmatter_values(t_parsed[0])
+                t_sup = _parse_ref_list(t_vals.get("superseded_by", ""))
+                t_status = str(t_vals.get("review_status") or "").strip().lower()
+                return not t_sup and t_status not in {"merged", "rejected"}
+            except Exception:
+                return False
+
+        for fname, new_stems in sorted(proposed_by_file.items()):
+            valid_new_stems = [s for s in new_stems if _live_stem_is_linkable(s)]
+            if not valid_new_stems:
+                continue
+            apath = safe_file_in_dir(atoms_dir, fname, allowed_exts={".md"}, must_exist=True)
+            if not apath or _is_reparse_or_link(apath):
+                continue
+            orig_bytes = Path(apath).read_bytes()
+            orig_sha = content_sha256(orig_bytes)
+            orig_text = orig_bytes.decode("utf-8")
+            parsed = split_frontmatter(orig_text)
+            if parsed is None:
+                continue
+            fm_lines, body_lines = parsed
+            fm_vals = parse_frontmatter_values(fm_lines)
+            live_sup = _parse_ref_list(fm_vals.get("superseded_by", ""))
+            live_status = str(fm_vals.get("review_status") or "").strip().lower()
+            if live_sup or live_status in {"merged", "rejected"}:
+                continue
+            was_approved = approved_revision_is_current(apath, brain_dir=brain_dir, atoms_dir=atoms_dir)
+
+            cur_links = _parse_ref_list(fm_vals.get("links", ""))
+            merged_links = list(dict.fromkeys([*cur_links, *valid_new_stems]))
+            if merged_links == cur_links:
+                continue
+
+            updated_fm = set_string_list_field(fm_lines, "links", merged_links, "sources")
+            updated_text = render_memory_document(updated_fm, body_lines)
+
+            anchor_dict: dict[str, Any] | None = None
+            if was_approved:
+                try:
+                    anchor_dict = find_evidence_anchor(updated_text, brain_dir)
+                except (EvidenceValidationError, OSError, ValueError):
+                    # Refuse to touch an approved atom whose source anchor cannot be re-verified
+                    continue
+
+            updated_bytes = updated_text.encode("utf-8")
+            after_sha = content_sha256(updated_bytes)
+            if after_sha == orig_sha:
+                continue
+
+            bak_path = os.path.join(history_dir, f"{fname}.{orig_sha}.bak")
+            if not os.path.exists(bak_path):
+                atomic_write_bytes(bak_path, orig_bytes)
+            atomic_write_bytes(apath, updated_bytes)
+            updated_files.append(fname)
+
+            rec_entry: dict[str, Any] = {
+                "schema_version": 1,
+                "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds"),
+                "action": "approve" if was_approved else "edit",
+                "sub_action": "auto_link_metadata",
+                "actor": clean_actor,
+                "atom_filename": fname,
+                "added_links": valid_new_stems,
+                "content_sha256_before": orig_sha,
+                "content_sha256_after": after_sha,
+                "backup_path": bak_path,
+            }
+            if anchor_dict:
+                rec_entry.update(anchor_dict)
+            pending_records.append(rec_entry)
+
+        if updated_files:
+            lex_res = refresh_lexical_index(atoms_dir, brain_dir, changed_filenames=updated_files)
+            dense_state = "not_active"
+            dense_gen: str | None = None
+            dense_err: str | None = None
+            if dense_was_current and isinstance(dense_manifest, dict):
+                try:
+                    from rebuild_vectors import upsert_changed_vectors
+
+                    d_res = upsert_changed_vectors(
+                        atoms_dir=atoms_dir,
+                        store_path=chroma_dir,
+                        collection_name="atoms",
+                        model=str(dense_manifest.get("embedding_model")),
+                        changed_filenames=updated_files,
+                        pre_verified_current=True,
+                        _writer_lock_held=True,
+                    )
+                    dense_state = "current" if d_res.get("committed") else "stale"
+                    dense_gen = str(d_res.get("generation_id")) if dense_state == "current" and d_res.get("generation_id") else None
+                except Exception as exc:
+                    dense_state = "stale"
+                    dense_err = str(exc)[:1000]
+            for r_entry in pending_records:
+                r_entry["lexical_index_path"] = lex_res["index_path"]
+                r_entry["dense_index_state"] = dense_state
+                if dense_gen:
+                    r_entry["dense_index_generation"] = dense_gen
+                if dense_err:
+                    r_entry["dense_index_error"] = dense_err
+            append_decision_records(pending_records, decision_log_path)
+
+    graph_after = build_knowledge_graph(
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        project_scope=project_scope,
+        include_pending=include_pending,
+        include_preferences=False,
+    )
+    return {
+        "status": "completed",
+        "updated_count": len(updated_files),
+        "updated_atom_count": len(updated_files),
+        "updated_atoms": updated_files,
+        "added_links_by_atom": {k: proposed_by_file[k] for k in updated_files},
+        "orphans_before": len(graph_before["orphan_approved_atoms"]),
+        "orphans_after": len(graph_after["orphan_approved_atoms"]),
+        "orphan_before": len(graph_before["orphan_approved_atoms"]),
+        "orphan_after": len(graph_after["orphan_approved_atoms"]),
+        "duplicate_candidates": list(dup_pairs.values()),
+        "contradiction_alerts": list(contra_pairs.values()),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Contradiction & Drift Radar + Knowledge Graph")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1409,7 +2209,8 @@ def main(argv: list[str] | None = None) -> int:
     p_c.add_argument("--project", default=None)
     p_c.add_argument("--accepted-only", action="store_true")
     p_c.add_argument("--include-preferences", action="store_true")
-    p_c.add_argument("--nli", action="store_true", help="Enable optional local Ollama NLI contradiction adjudication.")
+    p_c.add_argument("--nli", action="store_true", help="Enable optional local NLI contradiction adjudication.")
+    p_c.add_argument("--nli-mode", choices=("llm", "fast", "hybrid"), default="llm", help="NLI adjudicator backend.")
     p_c.add_argument("--model", default=None, help="Optional local Ollama model override when --nli is enabled.")
     p_c.add_argument("--json", action="store_true")
 
@@ -1423,13 +2224,27 @@ def main(argv: list[str] | None = None) -> int:
     p_n.add_argument("--include-pending", action="store_true")
     p_n.add_argument("--json", action="store_true")
 
+    p_sug = sub.add_parser("suggestions", help="Suggest [[wikilinks]], duplicate candidates & contradictions for an atom")
+    p_sug.add_argument("filename")
+    p_sug.add_argument("--include-pending", action="store_true")
+    p_sug.add_argument("--json", action="store_true")
+
+    p_al = sub.add_parser("auto-link", help="Attach verified [[wikilink]] edges across related vault atoms")
+    p_al.add_argument("--actor", default="owner")
+    p_al.add_argument("--project", default=None)
+    p_al.add_argument("--include-pending", action="store_true")
+    p_al.add_argument("--dry-run", action="store_true")
+    p_al.add_argument("--max-links", type=int, default=4)
+    p_al.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
     if args.cmd == "contradictions":
         res = detect_contradictions(
             project_scope=args.project,
             include_pending=not args.accepted_only,
             include_preferences=bool(args.include_preferences),
-            enable_nli=bool(args.nli),
+            enable_nli=bool(args.nli or args.nli_mode != "llm"),
+            nli_mode=args.nli_mode,
             model=args.model,
         )
         print(
@@ -1453,6 +2268,28 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(res, indent=2)
             if args.json
             else f"atom={res['atom']} edges={res['edge_count']} contradictions={len(res['contradictions'])}"
+        )
+        return 0
+    if args.cmd == "suggestions":
+        res = suggest_atom_graph_links(args.filename, include_pending=bool(args.include_pending))
+        print(
+            json.dumps(res, indent=2)
+            if args.json
+            else f"atom={res['atom']} links={len(res['related_links'])} duplicates={len(res['duplicate_candidates'])} contradictions={len(res['contradiction_alerts'])}"
+        )
+        return 0
+    if args.cmd == "auto-link":
+        res = auto_link_vault_atoms(
+            actor=args.actor,
+            project_scope=args.project,
+            include_pending=bool(args.include_pending),
+            dry_run=bool(args.dry_run),
+            max_links_per_atom=args.max_links,
+        )
+        print(
+            json.dumps(res, indent=2)
+            if args.json
+            else f"status={res['status']} updated={res['updated_count']} orphans={res['orphans_before']}->{res['orphans_after']}"
         )
         return 0
     return 1

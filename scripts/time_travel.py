@@ -37,8 +37,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import approved_revision_is_current, content_sha256, review_lock  # noqa: E402
 from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown, safe_file_in_dir  # noqa: E402
+from cross_encoder import score_query_atom_pairs  # noqa: E402
 from host_adapters import restrict_security_file_permissions  # noqa: E402
 from lexical_store import porter_stem, tokenize  # noqa: E402
+from memory_format import evaluate_temporal_validity, normalize_temporal_bound_str  # noqa: E402
 from memory_review import parse_atom_record  # noqa: E402
 from recall import QUERY_STOP_WORDS, normalize_project_tag, project_tags_match  # noqa: E402
 from skill_playbooks import verify_playbook_integrity  # noqa: E402
@@ -245,6 +247,8 @@ def _capture_live_state(
                 "contexts": list(rec.get("contexts") or []),
                 "claim": rec.get("claim") or "",
                 "evidence": rec.get("evidence") or "",
+                "valid_from": str(rec.get("valid_from") or ""),
+                "valid_until": str(rec.get("valid_until") or ""),
             }
 
     playbooks: dict[str, dict[str, Any]] = {}
@@ -780,6 +784,12 @@ def diff_snapshots(
             "new_contexts": list(a_after[k].get("contexts") or []),
             "before_epistemic_label": a_before[k].get("epistemic_label", "claim"),
             "after_epistemic_label": a_after[k].get("epistemic_label", "claim"),
+            "before_epistemic_contract": str(a_before[k].get("epistemic_contract") or ""),
+            "after_epistemic_contract": str(a_after[k].get("epistemic_contract") or ""),
+            "old_valid_from": str(a_before[k].get("valid_from") or ""),
+            "new_valid_from": str(a_after[k].get("valid_from") or ""),
+            "old_valid_until": str(a_before[k].get("valid_until") or ""),
+            "new_valid_until": str(a_after[k].get("valid_until") or ""),
         }
         for k in sorted(a_before.keys() & a_after.keys())
         if a_before[k]["file_sha256"] != a_after[k]["file_sha256"]
@@ -868,16 +878,28 @@ def recall_at_snapshot(
     include_preferences: bool = False,
     top_k: int = 5,
     include_playbooks: bool = True,
+    as_of: str | None = None,
+    include_expired: bool = False,
+    enable_reranker: bool = True,
     brain_dir: str = BRAIN_DIR,
 ) -> dict[str, Any]:
-    """Field-weighted Okapi BM25 + phrase/bigram + light-stem point-in-time recall over snapshot_id."""
+    """Field-weighted Okapi BM25 + bi-temporal validity + Cross-Encoder point-in-time recall over snapshot_id."""
+    explicit_as_of = str(as_of).strip() if (as_of is not None and str(as_of).strip()) else None
+    if explicit_as_of is not None:
+        if len(explicit_as_of) > 64:
+            raise ValueError("Invalid 'as_of' timestamp: exceeds 64 characters.")
+        normalize_temporal_bound_str(explicit_as_of)
+
     snap = load_snapshot(snapshot_id, brain_dir=brain_dir)
+    eff_as_of = explicit_as_of or (str(snap.get("created_at") or "").strip() or None)
     q_seq = _meaningful_tokens(query)
     if not q_seq:
         return {
             "snapshot_id": snap["snapshot_id"],
             "created_at": snap["created_at"],
+            "as_of": eff_as_of,
             "merkle_root": snap["merkle_root"],
+            "rerank_backend": "none",
             "results": [],
         }
 
@@ -913,6 +935,14 @@ def recall_at_snapshot(
         if not _matches_proj(contexts):
             continue
 
+        vf_str = str(atom.get("valid_from") or "").strip()
+        vu_str = str(atom.get("valid_until") or "").strip()
+        tv = evaluate_temporal_validity(vf_str, vu_str, as_of=eff_as_of)
+        if tv["status"] == "invalid_window":
+            continue
+        if not tv["active"] and not include_expired:
+            continue
+
         claim_str = str(atom.get("claim") or "")
         ev_str = str(atom.get("evidence") or "")
         claim_toks = _meaningful_tokens(claim_str)
@@ -935,7 +965,13 @@ def recall_at_snapshot(
             df_counts[st] += 1
         doc_len = float(sum(weighted_tf.values())) or 1.0
         full_text = f"{claim_str}\n{ev_str}".strip()
-        docs.append(("atom", fname, atom, weighted_tf, doc_len, doc_vocab, full_text))
+        atom_with_tv = {
+            **atom,
+            "valid_from": vf_str,
+            "valid_until": vu_str,
+            "temporal_status": str(tv["status"]),
+        }
+        docs.append(("atom", fname, atom_with_tv, weighted_tf, doc_len, doc_vocab, full_text))
 
     if include_playbooks:
         for pb_fname, pb in sorted(snap.get("playbooks", {}).items()):
@@ -985,7 +1021,9 @@ def recall_at_snapshot(
         return {
             "snapshot_id": snap["snapshot_id"],
             "created_at": snap["created_at"],
+            "as_of": eff_as_of,
             "merkle_root": snap["merkle_root"],
+            "rerank_backend": "none",
             "results": [],
         }
 
@@ -1016,29 +1054,58 @@ def recall_at_snapshot(
         score = bm25 + coverage_bonus + phrase_boost + bigram_boost + atom_bonus
 
         matched_surface = {stem_to_surface.get(st, st) for st in matched_stems}
-        scored.append(
-            (
-                score,
-                {
-                    "kind": kind,
-                    "filename": fname,
-                    "atom_id": rec.get("atom_id", ""),
-                    "claim": str(rec.get("claim") or ""),
-                    "evidence": str(rec.get("evidence") or ""),
-                    "snippet": _matched_snippet(full_text, matched_surface),
-                    "contexts": list(rec.get("contexts") or []),
-                    "file_sha256": rec.get("file_sha256", ""),
-                    "matched_terms": sorted(matched_surface),
-                    "score": round(score, 4),
-                },
-            )
-        )
+        hit_obj: dict[str, Any] = {
+            "kind": kind,
+            "filename": fname,
+            "atom_id": rec.get("atom_id", ""),
+            "claim": str(rec.get("claim") or ""),
+            "evidence": str(rec.get("evidence") or ""),
+            "snippet": _matched_snippet(full_text, matched_surface),
+            "contexts": list(rec.get("contexts") or []),
+            "file_sha256": rec.get("file_sha256", ""),
+            "matched_terms": sorted(matched_surface),
+            "score": round(score, 4),
+        }
+        if kind == "atom":
+            hit_obj["valid_from"] = str(rec.get("valid_from") or "")
+            hit_obj["valid_until"] = str(rec.get("valid_until") or "")
+            hit_obj["temporal_status"] = str(rec.get("temporal_status") or "unbounded")
+        scored.append((score, hit_obj))
+
     scored.sort(key=lambda item: (-item[0], 0 if item[1]["kind"] == "atom" else 1, item[1]["filename"]))
+    bounded_k = max(1, min(int(top_k), 25))
+    rerank_backend = "none"
+    if enable_reranker and scored:
+        pool_n = min(len(scored), max(bounded_k * 3, 15))
+        pool = scored[:pool_n]
+        max_bm25 = max((s for s, _ in pool), default=1.0) or 1.0
+        ce_docs = [
+            f"## Claim\n{item[1]['claim']}\n\n## Evidence\n{item[1]['evidence']}"
+            for item in pool
+        ]
+        ce_scores, rerank_backend = score_query_atom_pairs(query, ce_docs, allow_onnx=True)
+        reranked_pool: list[tuple[float, dict[str, Any]]] = []
+        for (raw_s, hit_d), ce_s in zip(pool, ce_scores):
+            norm_b = max(0.0, min(1.0, raw_s / max_bm25))
+            atom_tie = 0.05 if hit_d["kind"] == "atom" else 0.0
+            if rerank_backend == "onnx_cross_encoder":
+                blended = 0.30 * norm_b + 0.65 * float(ce_s) + atom_tie
+            else:
+                blended = 0.77 * norm_b + 0.18 * float(ce_s) + atom_tie
+            upd_hit = {**hit_d, "score": round(blended, 4), "rerank_score": round(float(ce_s), 4)}
+            reranked_pool.append((blended, upd_hit))
+        reranked_pool.sort(key=lambda item: (-item[0], 0 if item[1]["kind"] == "atom" else 1, item[1]["filename"]))
+        final_items = [item[1] for item in reranked_pool[:bounded_k]]
+    else:
+        final_items = [item[1] for item in scored[:bounded_k]]
+
     return {
         "snapshot_id": snap["snapshot_id"],
         "created_at": snap["created_at"],
+        "as_of": eff_as_of,
         "merkle_root": snap["merkle_root"],
-        "results": [item[1] for item in scored[: max(1, min(int(top_k), 25))]],
+        "rerank_backend": rerank_backend,
+        "results": final_items,
     }
 
 
@@ -1064,6 +1131,8 @@ def main(argv: list[str] | None = None) -> int:
     p_recall.add_argument("query")
     p_recall.add_argument("--project", default=None)
     p_recall.add_argument("--limit", "--top-k", dest="top_k", type=int, default=5)
+    p_recall.add_argument("--as-of", default=None, help="Optional ISO-8601 date/timestamp override (defaults to snapshot created_at).")
+    p_recall.add_argument("--include-expired", action="store_true", help="Include atoms expired or not yet valid at snapshot/as_of time.")
     p_recall.add_argument("--include-preferences", action="store_true")
     p_recall.add_argument("--no-playbooks", action="store_true")
     p_recall.add_argument("--json", action="store_true")
@@ -1100,6 +1169,8 @@ def main(argv: list[str] | None = None) -> int:
             args.snapshot_id,
             project_scope=args.project,
             top_k=args.top_k,
+            as_of=args.as_of,
+            include_expired=bool(args.include_expired),
             include_preferences=args.include_preferences,
             include_playbooks=not args.no_playbooks,
         )

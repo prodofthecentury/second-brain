@@ -458,6 +458,8 @@ def parse_atom_record_text(filename: str, content: str) -> dict:
         "evidence": section_text(body, "Evidence"),
         "confidence": str(values.get("confidence", "")),
         "importance": str(values.get("importance", "")),
+        "valid_from": str(values.get("valid_from", "") or "").strip(),
+        "valid_until": str(values.get("valid_until", "") or "").strip(),
         "sources": list(sources),
         "contexts": list(contexts),
         "supersedes": list(supersedes),
