@@ -24,8 +24,7 @@ on:
         default: false
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -64,16 +63,18 @@ jobs:
             phase2_safety_tests phase3_cognitive_tests phase4_product_tests \
             phase5_god_features_tests goal2_completion_tests \
             goal3_backend_contract_tests goal4_sync_and_ui_tests \
-            goal5_clipper_and_workspaces_tests \
+            goal5_clipper_and_workspaces_tests v040_sota_upgrades_tests \
+            v050_sota_complete_tests v100_final_completion_tests \
             dashboard_apptest_tests chroma_rebuild_canary \
             archive_manifest_canary smoke_test
 
-      - name: Build Python wheel, VSIX & Browser Clipper and verify clean-wheel installation
+      - name: Build Python wheel, VSIX, Browser Clipper & Mobile Inbox Drop PWA and verify clean-wheel installation
         run: |
           mkdir -p release-artifacts
           uv build --wheel --out-dir release-artifacts
           uv run --frozen python scripts/build_vsix.py --out-dir release-artifacts
           uv run --frozen python scripts/build_clipper.py --out-dir release-artifacts
+          uv run --frozen python scripts/build_distribution_manifests.py --pwa-only --out-dir release-artifacts
           uv build --wheel --out-dir dist
           uv run --frozen python -m unittest scripts.wheel_packaging_tests -v
 
@@ -250,9 +251,20 @@ jobs:
     name: Merge Checksums & Publish Release
     needs: [verify-clean-tree, build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up uv & Python 3.11
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.11
+        run: uv python install 3.11
 
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
@@ -260,13 +272,26 @@ jobs:
           path: merged-dist
           merge-multiple: true
 
-      - name: Generate unified SHA256SUMS.txt
+      - name: Generate unified SHA256SUMS.txt & WinGet / Homebrew Cask manifests
         working-directory: merged-dist
+        env:
+          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           rm -f SHA256SUMS.txt
           LC_ALL=C sha256sum $(find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' | sort) > SHA256SUMS.txt
           cat SHA256SUMS.txt
+          uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python scripts/build_distribution_manifests.py \
+            --manifests-only --dist-dir "$PWD" --out-dir "$PWD" --version "${RELEASE_TAG}" --repo-slug "${GITHUB_REPOSITORY}" --require-checksums
+          cp manifests/winget/SecondBrain.SecondBrain.yaml ./SecondBrain.SecondBrain.yaml
+          cp manifests/homebrew/second-brain.rb ./second-brain.rb
+          rm -rf manifests
+          LC_ALL=C sha256sum $(find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' | sort) > SHA256SUMS.txt
+
+      - name: Stage Python wheel for PyPI
+        run: |
+          mkdir -p pypi-dist
+          cp merged-dist/*.whl pypi-dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -280,10 +305,10 @@ jobs:
             merged-dist/*
 
       - name: Publish Python wheel to PyPI (when configured)
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && secrets.PYPI_API_TOKEN != '') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && (vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: merged-dist
+          packages-dir: pypi-dist
           password: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Publish VSIX to VS Code Marketplace (when VSCE_PAT secret is set)
@@ -291,11 +316,11 @@ jobs:
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
-          npx --yes @vscode/vsce publish --packagePath merged-dist/*.vsix --pat "$VSCE_PAT"
+          npx --yes @vscode/vsce@3.3.2 publish --packagePath merged-dist/*.vsix --pat "$VSCE_PAT"
 
       - name: Publish VSIX to Open VSX (when OVSX_PAT secret is set)
         if: ${{ secrets.OVSX_PAT != '' && (github.event_name == 'push' || inputs.publish_extensions) }}
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
-          npx --yes ovsx publish merged-dist/*.vsix -p "$OVSX_PAT"
+          npx --yes ovsx@0.10.1 publish merged-dist/*.vsix -p "$OVSX_PAT"

@@ -4,6 +4,73 @@ All notable changes to **Second Brain** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] — 2026-11-21
+
+Production `v1.0.0` completion release delivering **6 end-to-end tracks**: **Multimodal Voice Memo, Screenshot Paste & Media Upload (`/v1/ingest/media` + DLP Quarantine)**, **Git Post-Commit & Coding Session Memory Distiller (`second-brain hook`, `/v1/git/*`)**, **Bi-Temporal + Cross-Encoder Time-Travel Snapshot Recall & Plugin Schema Sync**, **Autonomous Watchdog Daemon (`--auto-sync` & Live Vector Upserts)**, **Portable Encrypted `.sbvault` Backup & Disaster-Recovery Restore (`second-brain backup`, `/v1/vault/backup/*`)**, and **WinGet / Homebrew Cask Manifests + Mobile PWA Release Artifact + 300-Atom ONNX/Bi-Temporal SOTA Benchmark** across Python/CLI, Loopback API/SDK, 17-tool MCP, Electron Desktop, VS Code, and Streamlit Dashboard (`23/23` suites passing).
+
+### Added
+- **Multimodal Voice Memo, Screenshot Paste & Media Upload (`scripts/ingest_multimodal.py`, `POST /v1/ingest/media`, `MemoryApiClient.ingest_media`):**
+  - Owner-gated raw binary (`application/octet-stream`) and base64 JSON media ingestion capped at `24 MiB` (`MAX_API_MEDIA_UPLOAD_BYTES`) without relaxing global JSON memory bounds on non-media endpoints.
+  - Pillow image verification/sanitization, `faster-whisper` timestamped audio transcription, multi-format document extraction, and post-extraction DLP secret scrubbing with automatic `0-raw/inbox/` quarantine.
+  - Clipboard screenshot paste (`Ctrl+V` / `Cmd+V`), `MediaRecorder` voice memo capture, and media upload across Electron Quick Capture (`capture.html`/`capture.js`) and `Import, Scout & Jobs`, VS Code (`secondBrain.ingestMedia`), and Streamlit Dashboard (`st.audio_input` + media uploader).
+- **Git Post-Commit & Coding Session Memory Distiller (`scripts/git_distiller.py`, `second-brain hook`, `/v1/git/*`):**
+  - Non-destructive managed `.git/hooks/post-commit` block (`# >>> second-brain-post-commit >>>`) preserving pre-existing user hooks, using space/metacharacter-safe POSIX single-quoting across editable checkouts, clean wheels, and Git worktrees.
+  - Distills commits into `4-experiences/` and DLP-screened `0-raw/inbox/` captures while scrubbing outbound secrets before disk writes and rejecting option-injection/symlink traversal; surfaced across Desktop `IDE Hub`, VS Code (`secondBrain.installGitHook`, `secondBrain.uninstallGitHook`, `secondBrain.distillGitCommits`), and Dashboard.
+- **Bi-Temporal + Cross-Encoder Snapshot Recall & MCP Plugin Parity (`scripts/time_travel.py`, `scripts/mcp_server.py`, `scripts/api_product.py`, `plugins/`):**
+  - Point-in-time `as_of` & `include_expired` filtering and `score_query_atom_pairs()` Cross-Encoder reranking across `recall_at_snapshot()`, MCP `recall_at_snapshot`, `POST /v1/snapshots/recall`, `MemoryApiClient.snapshot_recall()`, and all 3 UIs.
+  - Validity-window diffing (`old_valid_from`, `new_valid_from`, `old_valid_until`, `new_valid_until`) with strict non-owner redaction on revoked/superseded atoms, plus full `SKILL.md` schema alignment across Antigravity and Claude Code plugin bundles.
+- **Watchdog Daemon Lifecycle (`scripts/watchdog_daemon.py`, `run_daemon.ps1`, `run_daemon.sh`, `/v1/daemon/*`):**
+  - Live `O(|changed|)` Chroma vector upserts and `--auto-sync` / `--sync-interval` background E2EE scheduling inside `watchdog_daemon.py`, CLI flag forwarding in `run_daemon.ps1` / LF-clean `run_daemon.sh`, and `/v1/daemon/status` + `/v1/daemon/sync-once` controls across Desktop and Dashboard.
+- **Portable Three-Store `.sbvault` Backup & Disaster-Recovery Restore (`scripts/vault_backup.py`, `second-brain backup`, `/v1/vault/backup/*`):**
+  - `SBVBKP1` `AES-256-GCM` (`scrypt` + `HKDF-SHA256` with canonical JSON header AAD) or `--unencrypted` checksummed archives covering durable Three-Store Markdown and source/audit state while strictly excluding `.sidecar/`, `.chroma/`, locks, symlinks, and OS keys.
+  - In-memory AEAD, per-file SHA-256, and Merkle tree verification (`verify`), safe disaster-recovery restore with automatic `.pre-restore-*.sbvault` safety archives on `--force`, and automatic SQLite FTS5 (`lexical.sqlite3` & `notes.sqlite3`) index rebuilds.
+- **Distribution Manifests, Mobile PWA Release Zip & 300-Atom SOTA Benchmark (`scripts/build_distribution_manifests.py`, `docs/sota-benchmark-results-2026-11-21.json`):**
+  - Automated WinGet (`SecondBrain.SecondBrain.yaml`), Homebrew Cask (`second-brain.rb`), and static Mobile Inbox Drop PWA (`second-brain-inbox-drop-pwa.zip`) builders integrated into `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
+  - Updated 300-atom SOTA benchmark evaluating ONNX Cross-Encoder reranking and 15 bi-temporal expired traps (`100.0%` recall, `100.0%` claim precision, `100.0%` citation grounding, `0.0%` trap leakage, `6.81 ms` P50 verified recall), verified by **Suite 23/23 (`scripts/v100_final_completion_tests.py`)**.
+
+## [0.5.0] — 2026-11-20
+
+Complete neural, temporal, reasoning, and mobile quick-capture release delivering **4 end-to-end tracks**: **Verified ONNX Weights Downloader (`second-brain models pull`) + `[reranker]` Extra**, **`qwen3` Family Hardware Profiling & `<think>` Stripping**, **Bi-Temporal Fact Validity (`valid_from` / `valid_until` / `as_of`)**, and **Zero-Knowledge Mobile Inbox Drop (`SBID1` E2EE Static PWA + iOS Shortcut)** across Python/CLI, Loopback API/SDK, 17-tool MCP, Electron Desktop, VS Code, and Streamlit Dashboard (`22/22` suites passing).
+
+### Added
+- **Verified ONNX Weights Downloader & Explicit `[reranker]` Extra (`scripts/onnx_models.py`, `scripts/cross_encoder.py`, `scripts/knowledge_graph.py`, `pyproject.toml`):**
+  - Dedicated `[reranker]` optional dependency extra (`onnxruntime`, `tokenizers`, `numpy`) while keeping the minimal core wheel lightweight.
+  - SHA-256-pinned + immutable HuggingFace commit-pinned downloader (`second-brain models status|pull|verify|remove`, `/v1/models/onnx*`, `MemoryApiClient.*onnx*`) with DNS-pinned HTTPS redirect validation, `.models.lock`, CPU smoke inference, and atomic staging swap for `Xenova/ms-marco-MiniLM-L-6-v2` (int8 Cross-Encoder) and `Xenova/nli-deberta-v3-xsmall` (int8 NLI).
+  - Dynamic `config.json` `id2label` resolution in `OnnxFastNliClassifier` and clause-aligned bidirectional ONNX NLI adjudication (`0` false positives across the live 78-atom vault; `1.000` Recall@5 and `0/10` traps).
+- **`qwen3` Family Support, GGUF RAM-Fit Gating & `<think>` Stripping (`scripts/hardware_profile.py`, `scripts/streaming_chat.py`, `scripts/host_adapters.py`):**
+  - Full `qwen3` / `qwen3.5` / `qwen3.6` / `qwen3-coder` tier catalog rankings combined with live `/api/tags` GGUF byte-size memory-fit gating (`_model_fits_host_memory` + `oversized_installed_models`) so oversized MoE/dense models never thrash host swap unless explicitly pinned via `BRAIN_GEN_MODEL`.
+  - Automatic `think=False` request negotiation (`call_ollama_chat_maybe_no_think`) and stateful chunk-boundary `<think>...</think>` stripping (`_iter_strip_think_stream`, `strip_reasoning_think_blocks`) across streaming chat, JSON schema validation, Refinery, Editor, and NLI.
+- **Bi-Temporal Fact Validity (`scripts/memory_format.py`, `scripts/atom_mutator.py`, `scripts/recall.py`, `scripts/knowledge_graph.py`, `scripts/mcp_server.py`):**
+  - Optional ISO-8601 `valid_from` and `valid_until` frontmatter bounds with CAS-preserving `set_atom_temporal_bounds()` (`POST /v1/atoms/<name>/validity`, `review_atom.py set-validity`) that updates validity windows on approved atoms without invalidating current owner approval.
+  - Default exclusion of expired/future atoms across `recall.py`, `mcp_server.py` (`search_memory` & `get_atom`), non-owner `GET /v1/atoms*`, `streaming_chat.py`, and `federated_recall()`, plus point-in-time `as_of` and `include_expired` queries.
+  - Disjoint temporal-window contradiction suppression and `expired_validity` / `invalid_validity_window` drift alerts in `knowledge_graph.py`.
+- **Zero-Knowledge Mobile Inbox Drop (`scripts/inbox_drop.py`, `mobile/inbox-drop/`, `scripts/vault_sync.py`):**
+  - Forward-secret `SBID1\x00` envelope (`ECDH P-256 + HKDF-SHA256 + AES-256-GCM`) + revocable per-device `HMAC-SHA256` Encrypt-then-MAC (`second-brain sync drop-pair|drop-list|drop-revoke|pull-drops|export-pwa`, `/v1/sync/inbox-drop/*`) so mobile devices hold only the public `P-256` key and never see the vault master key or `Ed25519` signing key.
+  - Self-contained offline-capable static WebCrypto PWA (`mobile/inbox-drop/`) + iOS Shortcut Share Sheet recipe with `#pair=` hash-scrubbing, client-side `AWS4-HMAC-SHA256` S3/R2 SigV4 `PUT` to `inbox-drops/<drop_id>.enc`, and automatic `sync_pull()` / `AutoSyncScheduler` decryption straight into quarantined `0-raw/inbox/mobile-drop-*.md`.
+- **Suite 22/22 (`scripts/v050_sota_complete_tests.py`):** Comprehensive end-to-end & adversarial security verification across all 4 `v0.5.0` tracks.
+
+## [0.4.0] — 2026-11-20
+
+SOTA upgrade release completing **4 end-to-end engineering tracks**: **Retrieval & Model Upgrade**, **Real NLI & Auto-Linking Knowledge Graph**, **SOTA Browser Clipper & Layout/OCR PDF Extraction**, and **Production Cloud Sync (S3/R2 SigV4, OS Keychain/DPAPI, Auto-Sync & Interactive 3-Way Conflict Resolver)** across Python/CLI, Loopback API/SDK, Electron Desktop, VS Code, and Streamlit Dashboard (`21/21` suites passing).
+
+### Added
+- **Retrieval & Model Upgrade (`scripts/hardware_profile.py`, `scripts/rebuild_vectors.py`, `scripts/cross_encoder.py`, `scripts/chat_threads.py`):**
+  - Auto-wired hardware-profile generation model selection (`qwen2.5-coder:7b` on Tier 2+ GPU workstations) honoring explicit `BRAIN_GEN_MODEL`, host policy pins, and per-request overrides.
+  - `O(|changed|)` in-place Chroma/JSON vector upserts (`upsert_changed_vectors`) serialized under `writer.lock` so single-atom approvals, edits, merges, auto-links, and `sync_pull` updates keep `.chroma` `"current"` above 64 atoms without full re-embedding.
+  - Local Cross-Encoder reranker (`OnnxCrossEncoder` + `< 1 ms` zero-network `InteractionCrossEncoder`) wired across lexical, semantic, RRF, and federated recall (`Recall@5 = 1.000`, `MRR = 0.975`, `0/10` traps).
+  - Persistent owner-gated multi-turn chat history (`brain/.sidecar/chat_threads.sqlite3`) with recursive secret scrubbing, coreference/ellipsis follow-up expansion, and 1-click turn pinning to Working Notes across CLI, API/SDK, Desktop, VS Code, and Dashboard.
+- **Real NLI & Auto-Linking Knowledge Graph (`scripts/knowledge_graph.py`, `scripts/notes_store.py`, `plugins/antigravity/`):**
+  - Clause-aligned negated-stem conflict detection + fast local ONNX/predicate NLI pre-adjudicator (`nli_mode="llm"|"fast"|"hybrid"`, `0` false positives on live vault).
+  - Strict project-scoped automatic `[[wikilink]]`, duplicate, and contradiction candidate linking during `verify_note_excerpt()` and vault-wide `auto_link_vault_atoms()` (`/v1/graph/auto-link`, `second-brain graph auto-link`), plus refreshed 17/17 Antigravity MCP plugin bundle.
+- **SOTA Browser Clipper & Layout/OCR PDF Extraction (`extensions/browser-clipper/`, `scripts/web_clipper.py`, `scripts/doc_extractors.py`):**
+  - Pure-DOM Readability-style semantic article scorer & HTML-to-Markdown converter (`lib/readability-markdown.js`) + server-side `trafilatura` clean-HTML fallback, plus 1-click single-use `SBC-XXXX-XXXX-XXXX` pairing codes (`/v1/clipper/pair-code` & `/v1/clipper/redeem`) with two-tier per-origin/per-IP rate limiting.
+  - Coordinate-aware 2-column academic PDF de-interleaving, GFM pipe-table reconstruction, and Pillow-sanitized local OCR (`tesseract` / policy-gated loopback Vision) preserving exact `[page N]` UTF-8 byte-offset source anchors.
+- **Production Cloud Sync (`scripts/keychain_store.py`, `scripts/vault_sync.py`, `scripts/watchdog_daemon.py`):**
+  - Pure-Python RFC-compliant AWS S3 / Cloudflare R2 / Backblaze B2 SigV4 (`AWS4-HMAC-SHA256`) object backend (`s3_sigv4` over `PinnedHTTPTransport` for both path-style and virtual-hosted buckets) + signed-head-verified `sync gc` orphan pruning.
+  - Native OS Keychain / Windows DPAPI secret sealing (`CryptProtectData`/`CryptUnprotectData` with entropy & heap zeroing, macOS `security -i`, Linux `secret-tool`) + `migrate_sync_key_to_keychain()`.
+  - `AutoSyncScheduler` background sync loop (reconciled across Multi-Vault hot-switches, pausing automatically on conflicts) and interactive 3-way conflict resolution (`keep_local`, `accept_remote`, `keep_both`, `manual_merge` with `.sidecar/sync-base/` common-ancestor diffs, CAS, `.history/` backup, and canonical atom trust demotion) across all 3 UIs.
+- **Suite 21/21 (`scripts/v040_sota_upgrades_tests.py`):** End-to-end verification and adversarial security tests across all 4 SOTA tracks.
+
 ## [0.3.0] — 2026-11-19
 
 Advanced multi-device release completing **v0.3.0 Milestones 1–3**: **Zero-Knowledge E2EE Multi-Device Vault Sync**, **Local-First Browser Web Clipper (MV3 Chrome/Edge/Firefox)**, **Multi-Vault Workspaces & Opt-In Federated Recall**, complete **3-surface UI parity** across Electron Desktop, VS Code, and Streamlit Dashboard, hardened CI/release workflows, and the **20-suite unified verification gate**.

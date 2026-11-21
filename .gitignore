@@ -62,3 +62,7 @@ merged-dist/
 *.pem
 *.key
 *.cer
+*.sbvault
+.env
+.env.*
+pypi-dist/

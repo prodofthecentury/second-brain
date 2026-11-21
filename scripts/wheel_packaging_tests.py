@@ -137,6 +137,8 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
             "second_brain/scripts/config.py",
             "second_brain/scripts/memory_api.py",
             "second_brain/dashboard/app.py",
+            "second_brain/mobile/inbox-drop/index.html",
+            "second_brain/mobile/inbox-drop/drop-crypto.js",
             "second_brain/_streamlit/config.toml",
         ):
             self.assertIn(expected, names, f"Missing expected wheel entry: {expected}")
@@ -149,7 +151,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         polluted = [
             n
             for n in names
-            if n.startswith(("scripts/", "dashboard/", "plugins/", ".streamlit/"))
+            if n.startswith(("scripts/", "dashboard/", "plugins/", "mobile/", ".streamlit/"))
         ]
         self.assertEqual(
             polluted,

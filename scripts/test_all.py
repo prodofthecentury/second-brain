@@ -90,6 +90,21 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "goal5_clipper_and_workspaces_tests.py")),
     ),
     (
+        "v040_sota_upgrades_tests",
+        "v0.4.0 SOTA upgrades: auto-wired qwen2.5-coder:7b, >64-atom O(1) Chroma upserts, ONNX/interaction cross-encoder, multi-turn chat threads, 0-FP NLI & auto-linking graph, Readability/1-click clipper, layout/OCR PDF, S3 SigV4, DPAPI/Keychain, Auto-Sync & 3-way conflict resolver (scripts/v040_sota_upgrades_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "v040_sota_upgrades_tests.py")),
+    ),
+    (
+        "v050_sota_complete_tests",
+        "v0.5.0 complete SOTA suite: SHA-256 ONNX downloader & [reranker] extra, clause-aligned DeBERTa NLI, qwen3 GGUF RAM-fit & <think> stripping, bi-temporal valid_from/valid_until/as_of, and SBID1 E2EE Mobile Inbox Drop PWA + S3 SigV4 (scripts/v050_sota_complete_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "v050_sota_complete_tests.py")),
+    ),
+    (
+        "v100_final_completion_tests",
+        "v1.0.0 production completion suite: multimodal /v1/ingest/media & DLP quarantine, Git post-commit distiller, bi-temporal Cross-Encoder snapshot recall, daemon vector/auto-sync, portable .sbvault backup/restore & WinGet/Homebrew/PWA manifests (scripts/v100_final_completion_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "v100_final_completion_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),

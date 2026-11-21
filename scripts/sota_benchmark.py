@@ -85,7 +85,7 @@ from recall import QUERY_STOP_WORDS, RecallOptions, project_tags_match, search_m
 import rebuild_vectors as _rv_mod  # noqa: E402
 from vector_store import _close_chroma_client, get_vector_collection  # noqa: E402
 
-_TRAP_PREFIXES = ("trap-", "stale-", "tampered-", "drifted-", "distractor-")
+_TRAP_PREFIXES = ("trap-", "stale-", "tampered-", "drifted-", "distractor-", "expired-")
 _TOKEN_RE = re.compile(r"[a-z0-9_]{3,}")
 _DOMAINS = ("telemetry", "gateway", "storage", "identity", "scheduler", "ledger")
 _DENSE_DIM = 384
@@ -206,7 +206,8 @@ def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], d
     pending_trap_count = max(12, int(total_atoms * 0.20))
     tampered_count = max(4, int(total_atoms * 0.06))
     drifted_count = max(4, int(total_atoms * 0.06))
-    superseded_count = max(6, int(total_atoms * 0.08))
+    superseded_count = max(6, int(total_atoms * 0.06))
+    expired_count = max(4, int(total_atoms * 0.05))
     cross_proj_count = max(8, int(total_atoms * 0.10))
 
     allocated = (
@@ -217,6 +218,7 @@ def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], d
         + tampered_count
         + drifted_count
         + superseded_count
+        + expired_count
         + cross_proj_count
     )
     approved_count = max(20, total_atoms - allocated)
@@ -235,6 +237,8 @@ def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], d
         source_rel: str | None = None,
         links: list[str] | None = None,
         entity_key: str | None = None,
+        valid_from: str | None = None,
+        valid_until: str | None = None,
     ) -> tuple[Path, Path]:
         if source_rel is None:
             src_name = f"src-{stem}.md"
@@ -247,6 +251,8 @@ def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], d
         atom_path = atoms_dir / f"{stem}.md"
         sup_line = f"superseded_by: {superseded_by}\n" if superseded_by else ""
         links_line = f"links: {json.dumps(links)}\n" if links else ""
+        vf_line = f"valid_from: {valid_from}\n" if valid_from else ""
+        vu_line = f"valid_until: {valid_until}\n" if valid_until else ""
         atom_path.write_text(
             "---\n"
             f"id: {stem}\n"
@@ -261,6 +267,8 @@ def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], d
             "review_status: pending\n"
             "claim_state: candidate\n"
             "citation_integrity: missing\n"
+            f"{vf_line}"
+            f"{vu_line}"
             f"{sup_line}"
             "---\n\n"
             "## Claim\n"
@@ -579,6 +587,32 @@ def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], d
                 }
             )
 
+    # 5b. Bi-temporal expired claims (owner-approved & untampered on disk, but valid_until has elapsed!)
+    expired_query_budget = max(4, expired_count)
+    for idx in range(expired_count):
+        proj = f"project:alpha_{idx % 5}"
+        exp_topic = f"rotation_{idx:03d}_q1"
+        exp_claim = f"Temporary freeze {exp_topic} routes traffic to deprecated staging VIP 10.99.0.{idx + 1}."
+        write_atom(
+            f"expired-{idx:04d}",
+            claim=exp_claim,
+            evidence=f"Q1 rotation notice: {exp_claim}",
+            project=proj,
+            approve=True,
+            valid_from="2024-01-01",
+            valid_until="2024-12-31",
+            entity_key=f"expired:{exp_topic}",
+        )
+        if idx < expired_query_budget:
+            queries.append(
+                {
+                    "kind": "adversarial_trap",
+                    "query": f"Which VIP does Temporary freeze {exp_topic} route traffic to?",
+                    "project_scope": proj,
+                    "trap_filename": f"expired-{idx:04d}.md",
+                }
+            )
+
     # 6. Domain-adjacent unanswerable out-of-corpus queries (tests abstention vs ungrounded synthesis)
     unanswerable_budget = max(4, total_atoms // 25)
     for idx in range(unanswerable_budget):
@@ -623,6 +657,7 @@ def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], d
         "actual_corpus_files": actual_files,
         "pdf_papers_ingested": pdf_paper_count,
         "multihop_pairs_seeded": hop_pair_count,
+        "bitemporal_expired_traps": expired_count,
         "mem0_events": mem0_events,
     }
     return queries, meta
@@ -1500,11 +1535,15 @@ def run_sota_benchmark(
                 "p99_latency_ms": _pct(s["latencies_ms"], 99),
             }
 
+        from cross_encoder import score_query_atom_pairs
+
+        _, active_rerank_backend = score_query_atom_pairs("latency probe", ["latency probe"], allow_onnx=True)
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "corpus_atoms": atoms,
             **corpus_meta,
             "query_count": len(queries),
+            "rerank_backend": active_rerank_backend,
             "embedding_backend": (
                 f"ollama:{EMBED_MODEL}" if include_dense_ollama else f"deterministic_feature_hash_{_DENSE_DIM}d_chroma_hnsw"
             ),
@@ -1542,7 +1581,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"Comparative SOTA Benchmark — {result['corpus_atoms']} atoms "
-        f"(PDFs={result['pdf_papers_ingested']}, 2-hop pairs={result['multihop_pairs_seeded']}) | "
+        f"(PDFs={result['pdf_papers_ingested']}, 2-hop pairs={result['multihop_pairs_seeded']}, "
+        f"expired_traps={result['bitemporal_expired_traps']}, reranker={result['rerank_backend']}) | "
         f"Hardware: {result['hardware_profile']['tier_id']}"
     )
     for name, m in result["systems"].items():

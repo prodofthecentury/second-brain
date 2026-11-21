@@ -349,7 +349,22 @@ synchronized across both files.
 - [x] Implement Multi-Vault Workspaces & Opt-In Federated Recall (`scripts/vault_workspaces.py`, `second-brain vault`, `/v1/vaults*`, `MemoryApiClient.*vault*`) with `SecondBrain/security/vaults.json`, non-overlapping directory checks, atomic `vault-path.txt` + live API hot-switching, optional isolated per-vault `vb_*` tokens, non-destructive unregister, and strictly opt-in read-only federated search.
 - [x] Complete 3-surface UI parity (Electron Desktop sidebar switcher + System cards, VS Code commands, Streamlit Dashboard), align `v0.3.0` package manifests across Python/Electron/VS Code/plugins, and add Suite `20/20` (`scripts/goal5_clipper_and_workspaces_tests.py`) achieving `20/20 PASS` (`100% PASS`) in `scripts/test_all.py`.
 
-## Completed product horizon (closed in Goals 17–22)
+### Goal 23 — SOTA Retrieval, Auto-Linking Knowledge Graph, Layout/OCR PDF & Cloud Sync (`v0.4.0`) — COMPLETE
+
+- [x] Auto-wire `qwen2.5-coder:7b` on Tier 2+, `O(|changed|)` >64-atom Chroma vector upserts, local Cross-Encoder reranker (`scripts/cross_encoder.py`), and persistent multi-turn chat threads (`scripts/chat_threads.py`).
+- [x] Ship clause-aligned 0-FP NLI contradiction detection + automatic project-scoped `[[wikilink]]` graph linking (`scripts/knowledge_graph.py`), Readability MV3 clipper + 1-click `SBC-*` pairing codes, 2-column/table/OCR PDF extraction, and S3 SigV4 + DPAPI/Keychain + `AutoSyncScheduler` + 3-way conflict resolution (`21/21 PASS` via `scripts/v040_sota_upgrades_tests.py`).
+
+### Goal 24 — Verified ONNX Weights, `qwen3` Hardware Gating, Bi-Temporal Validity & Mobile Inbox Drop (`v0.5.0`) — COMPLETE
+
+- [x] Add SHA-256 + commit-pinned ONNX downloader (`scripts/onnx_models.py`, `second-brain models pull`, `[reranker]` extra), `qwen3` GGUF RAM-fit gating + `<think>` stripping, bi-temporal `valid_from`/`valid_until`/`as_of` validity across recall/MCP/API/graph, and Zero-Knowledge `SBID1` Mobile Inbox Drop PWA + iOS Shortcut (`scripts/inbox_drop.py`, `mobile/inbox-drop/`), achieving `22/22 PASS` (`scripts/v050_sota_complete_tests.py`).
+
+### Goal 25 — Multimodal API/UI Upload, Git Distiller, Bi-Temporal Snapshot Recall, Portable `.sbvault` Backup & `v1.0.0` Distribution — COMPLETE
+
+- [x] Wire owner-gated `POST /v1/ingest/media` (`24 MiB` binary & base64 JSON upload, Pillow gate, Whisper timestamps, DLP quarantine) + clipboard screenshot paste, voice memos, and media uploads across Desktop, VS Code (`secondBrain.ingestMedia`), and Dashboard.
+- [x] Harden and wire `scripts/git_distiller.py` (`second-brain hook`, `/v1/git/*`) across CLI, API/SDK, Desktop `IDE Hub`, VS Code (`secondBrain.{installGitHook,uninstallGitHook,distillGitCommits}`), and Dashboard; complete bi-temporal + Cross-Encoder `recall_at_snapshot()` & `diff_snapshots()` redaction + `SKILL.md` parity + live Antigravity connector sync; and expose `watchdog_daemon.py` `--auto-sync` & incremental vector sync (`/v1/daemon/*`, `run_daemon.ps1`, LF `run_daemon.sh`).
+- [x] Implement portable Three-Store `AES-256-GCM` `.sbvault` backup, in-memory Merkle verification, and FTS5-rebuilding restore (`scripts/vault_backup.py`, `second-brain backup`, `/v1/vault/backup/*`), automated WinGet / Homebrew Cask / Mobile PWA release builders (`scripts/build_distribution_manifests.py`), 300-atom ONNX/bi-temporal SOTA benchmark (`docs/sota-benchmark-results-2026-11-21.json`), unified `1.0.0` manifests, adversarial security/code audits, and Suite `23/23` (`scripts/v100_final_completion_tests.py`) achieving `23/23 PASS` (`100% PASS`) in `scripts/test_all.py`.
+
+## Completed product horizon (closed in Goals 17–25, `v1.0.0`)
 
 - [x] **OS-Signed Desktop Installers:** Native code-signed NSIS / MSI / DMG / AppImage / deb
   targets (`desktop/package.json`, `scripts/package_desktop.ps1`, `scripts/package_desktop.sh`)

@@ -366,9 +366,33 @@ unified CI gate (`scripts/test_all.py`).
 2. Multi-Vault Workspaces & Opt-In Federated Recall (`scripts/vault_workspaces.py`, `second-brain vault`, `/v1/vaults*`, `MemoryApiClient.*vault*`): Named vault registry (`SecondBrain/security/vaults.json`, `0600`/NTFS DACL) with non-overlapping path validation, atomic active switching synced to `vault-path.txt` and live `MemoryLoopbackHTTPServer` runtime, non-destructive unregister, optional isolated per-vault `vb_*` bearer tokens failing closed (`403`) across vaults, and owner-gated opt-in (`federated_searchable: false` default) read-only federated search.
 3. Full 3-Surface UI Parity across Electron Desktop (Sidebar Vault Quick-Switcher + `System` Workspaces & Browser Clipper cards), VS Code (`secondBrain.switchVault`, `secondBrain.federatedSearch`, `secondBrain.pairClipper`), and Streamlit Dashboard (`dashboard/app.py`), aligned `v0.3.0` package manifests (`pyproject.toml`, `desktop/package.json`, `extensions/vscode-second-brain/package.json`, `plugins/`), and Suite `20/20` (`scripts/goal5_clipper_and_workspaces_tests.py`) in `scripts/test_all.py` (`20/20 PASS`).
 
-## Completed product horizon (closed in Goals 17–22)
+### Goal 23 — SOTA Retrieval, Auto-Linking Knowledge Graph, Layout/OCR PDF & Cloud Sync (`v0.4.0`) — COMPLETE
 
-Goals 0–22 complete the local pilot and `v0.3.0` verifiable Second Brain product: durable CAS Markdown vault, cryptographic byte-offset source anchoring, out-of-model epistemic grounding, universal loopback API + SDK, per-host online consent/redaction adapters, quarantined inbox promotion, hardware-tiered profiling, Cognitive Core Layers 1–5 (telemetry, fitness, episodes, owner-gated Skill Playbooks, grounded Executive Planner), corpus-scale FTS5 engine, zero-friction notes with one-click excerpt verification, local document ingestion (`.pdf`, `.docx`, `.epub`, `.html`, `.csv`, `.tsv`), `"research"` mode with deterministic `[UNVERIFIED LEADS]`, multi-host DLP streaming chat, bulk Obsidian importer, 17-tool MCP & 6-host IDE/Antigravity/Claude/VS Code connectors, OS-signed cross-platform desktop installers (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), clean `second_brain` wheel & offline wheelhouse, comparative 9-system SOTA benchmark harness (`scripts/sota_benchmark.py`), Merkle audit ledger & proofs (`scripts/vault_ledger.py`), semantic/NLI Contradiction & Drift Radar (`scripts/knowledge_graph.py`), content-addressed Time-Travel snapshots (`scripts/time_travel.py`), Zero-Knowledge E2EE Multi-Device Vault Sync (`scripts/vault_sync.py`), Local-First MV3 Browser Web Clipper (`extensions/browser-clipper/`, `scripts/web_clipper.py`), Multi-Vault Workspaces & Opt-In Federated Recall (`scripts/vault_workspaces.py`), and the 20-suite unified release gate (`scripts/test_all.py`, `20/20 PASS`).
+**What was built:**
+1. Hardware-profiled `qwen2.5-coder:7b` selection, `O(|changed|)` >64-atom Chroma vector upserts (`scripts/rebuild_vectors.py`), local Cross-Encoder reranking (`scripts/cross_encoder.py`), and persistent owner-gated multi-turn chat threads (`scripts/chat_threads.py`).
+2. Clause-aligned zero-false-positive NLI contradiction detection + automatic project-scoped `[[wikilink]]` graph linking (`scripts/knowledge_graph.py`).
+3. Pure-DOM Readability web clipper + 1-click `SBC-*` pairing codes (`extensions/browser-clipper/`, `scripts/web_clipper.py`) and 2-column/table/OCR PDF extraction (`scripts/doc_extractors.py`).
+4. RFC-compliant `AWS4-HMAC-SHA256` S3/R2/B2 SigV4 sync, OS Keychain / Windows DPAPI secret sealing (`scripts/keychain_store.py`), `AutoSyncScheduler`, `sync gc`, and interactive 3-way conflict resolution across all 3 UIs, verified by Suite `21/21` (`scripts/v040_sota_upgrades_tests.py`).
+
+### Goal 24 — Verified ONNX Weights, `qwen3` Hardware Gating, Bi-Temporal Validity & Mobile Inbox Drop (`v0.5.0`) — COMPLETE
+
+**What was built:**
+1. SHA-256 + commit-pinned ONNX downloader (`scripts/onnx_models.py`, `second-brain models pull`, `[reranker]` extra) for int8 Cross-Encoder (`Xenova/ms-marco-MiniLM-L-6-v2`) and clause-aligned DeBERTa NLI (`Xenova/nli-deberta-v3-xsmall`).
+2. `qwen3` family hardware-tier catalog with live `/api/tags` GGUF RAM-fit gating (`_model_fits_host_memory`) and stateful `<think>...</think>` stripping.
+3. Bi-temporal fact validity (`valid_from` / `valid_until`, CAS-preserving `set_atom_temporal_bounds`, point-in-time `as_of`, disjoint-window contradiction suppression, and `expired_validity` drift alerts).
+4. Zero-Knowledge `SBID1` Mobile Inbox Drop (`scripts/inbox_drop.py`, `mobile/inbox-drop/` static WebCrypto PWA + iOS Shortcut -> `inbox-drops/<id>.enc` -> quarantined `0-raw/inbox/`), verified by Suite `22/22` (`scripts/v050_sota_complete_tests.py`).
+
+### Goal 25 — Multimodal API/UI Upload, Git Distiller, Bi-Temporal Snapshot Recall, Portable `.sbvault` Backup & `v1.0.0` Distribution — COMPLETE
+
+**What was built:**
+1. Owner-gated `POST /v1/ingest/media` (`24 MiB` raw binary & base64 JSON upload, Pillow verification, Whisper timestamps, document extraction, and DLP secret quarantine), wired with clipboard screenshot paste (`Ctrl+V`), `MediaRecorder` voice memos, and media uploads across Electron Quick Capture & Import, VS Code (`secondBrain.ingestMedia`), and Streamlit Dashboard.
+2. Git Post-Commit & Coding Session Memory Distiller (`scripts/git_distiller.py`, `second-brain hook`, `/v1/git/*`) with space-safe POSIX single-quoting, worktree/clean-wheel compatibility, user-hook preservation, and pre-write DLP secret redaction across CLI, API/SDK, Desktop `IDE Hub`, VS Code (`secondBrain.installGitHook`, `secondBrain.uninstallGitHook`, `secondBrain.distillGitCommits`), and Dashboard.
+3. Bi-temporal `as_of` / `include_expired` + Cross-Encoder `recall_at_snapshot()` and validity-window `diff_snapshots()` wired across MCP, `/v1/snapshots/*` (with non-owner redaction), all 3 UIs, and synced Antigravity + Claude Code `SKILL.md` bundles; plus `watchdog_daemon.py` `--auto-sync` & incremental vector sync (`/v1/daemon/*`, `run_daemon.ps1` / LF `run_daemon.sh`).
+4. Portable Three-Store `.sbvault` encrypted (`AES-256-GCM` + `scrypt` + `HKDF-SHA256`) backup, in-memory Merkle/SHA-256 verification, and disaster-recovery restore with automatic FTS5 rebuilds (`scripts/vault_backup.py`, `second-brain backup`, `/v1/vault/backup/*`), plus automated WinGet / Homebrew Cask / Mobile PWA release builders (`scripts/build_distribution_manifests.py`), 300-atom ONNX/bi-temporal SOTA benchmark (`docs/sota-benchmark-results-2026-11-21.json`), and Suite `23/23` (`scripts/v100_final_completion_tests.py`) in `scripts/test_all.py` (`23/23 PASS`).
+
+## Completed product horizon (closed in Goals 17–25, `v1.0.0`)
+
+Goals 0–25 complete the `v1.0.0` verifiable Second Brain platform across Python/CLI, Loopback HTTP API/SDK, 17-tool MCP, 6-host IDE connectors, Electron Desktop, VS Code, Browser Web Clipper MV3, Mobile Inbox Drop PWA, Streamlit Dashboard, WinGet/Homebrew manifests, and the 23-suite unified release gate (`scripts/test_all.py`, `23/23 PASS`).
 
 ## Checkpoints
 
@@ -380,13 +404,13 @@ Goals 0–22 complete the local pilot and `v0.3.0` verifiable Second Brain produ
   offline FTS5 degradation verified.
 - **Goal 8 (Passed):** Independent adversarial review reconciled and
   `scripts/test_all.py` achieves 100% pass rate.
-- **Goals 9–22 (Passed):** Phase 2–5 product ecosystem, local document ingestion,
-  `"research"` leads view, multi-host DLP streaming chat, 17-tool MCP, OS-signed
-  desktop installers, clean wheel/wheelhouse packaging, 9-system SOTA benchmark,
-  Three-Store Merkle ledger & content-addressed Time-Travel snapshots, semantic/NLI
-  Contradiction Radar, sub-15ms recall, E2EE multi-device vault sync, MV3 Browser
-  Web Clipper, Multi-Vault Workspaces & opt-in federated recall, and all UI/E2E/security
-  suites verified (`20/20` suites PASS).
+- **Goals 9–25 (Passed):** Phase 2–5 product ecosystem, local document + multimodal `/v1/ingest/media` ingestion,
+  `"research"` leads view, multi-host DLP streaming chat & persistent chat threads, 17-tool MCP, OS-signed
+  desktop installers, clean wheel/wheelhouse + WinGet/Homebrew/PWA packaging, 9-system 300-atom SOTA benchmark,
+  Three-Store Merkle ledger & bi-temporal Cross-Encoder Time-Travel snapshots, verified ONNX Cross-Encoder & DeBERTa NLI,
+  sub-15ms recall, E2EE S3/DPAPI multi-device vault sync, Mobile Inbox Drop PWA, MV3 Browser Web Clipper,
+  Multi-Vault Workspaces, Git post-commit distiller, portable `.sbvault` backup/restore, and all UI/E2E/security
+  suites verified (`23/23` suites PASS).
 
 ## Risks
 

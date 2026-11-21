@@ -92,7 +92,8 @@ jobs:
           phase2_safety_tests phase3_cognitive_tests phase4_product_tests
           phase5_god_features_tests goal2_completion_tests
           goal3_backend_contract_tests goal4_sync_and_ui_tests
-          goal5_clipper_and_workspaces_tests
+          goal5_clipper_and_workspaces_tests v040_sota_upgrades_tests
+          v050_sota_complete_tests v100_final_completion_tests
           dashboard_apptest_tests chroma_rebuild_canary
           archive_manifest_canary smoke_test
 
@@ -101,10 +102,11 @@ jobs:
           uv build --wheel --out-dir dist
           uv run --frozen python -m unittest scripts.wheel_packaging_tests -v
 
-      - name: Build VS Code VSIX & Browser Web Clipper MV3 packages
+      - name: Build VS Code VSIX, Browser Web Clipper MV3, Mobile PWA & Package Manager Manifests
         run: |
           uv run --frozen python scripts/build_vsix.py --out-dir dist
           uv run --frozen python scripts/build_clipper.py --out-dir dist
+          uv run --frozen python scripts/build_distribution_manifests.py --out-dir dist
 
       - name: Run VS Code extension tests
         if: ${{ !matrix.skip_gui_pack }}
