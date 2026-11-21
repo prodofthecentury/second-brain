@@ -175,7 +175,66 @@ def _match_artifact(
     return None
 
 
+def _collect_homebrew_resources() -> list[tuple[str, str, str]]:
+    """Extract (name, url, sha256) for transitive core PyPI dependencies from uv.lock."""
+    lock_path = ROOT / "uv.lock"
+    if not lock_path.is_file():
+        return []
+    try:
+        import tomllib
+
+        data = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    packages = data.get("package")
+    if not isinstance(packages, list):
+        return []
+    by_name = {str(p.get("name")): p for p in packages if isinstance(p, dict) and p.get("name")}
+    sb = by_name.get("second-brain")
+    if not isinstance(sb, dict):
+        return []
+
+    seen: set[str] = set()
+    queue: list[str] = [
+        str(dep["name"])
+        for dep in (sb.get("dependencies") or [])
+        if isinstance(dep, dict) and dep.get("name") and "win32" not in str(dep.get("marker") or "")
+    ]
+    while queue:
+        pkg_name = queue.pop(0)
+        if pkg_name in seen or pkg_name == "second-brain" or pkg_name not in by_name:
+            continue
+        seen.add(pkg_name)
+        for dep in (by_name[pkg_name].get("dependencies") or []):
+            if isinstance(dep, dict) and dep.get("name") and "win32" not in str(dep.get("marker") or ""):
+                queue.append(str(dep["name"]))
+
+    resources: list[tuple[str, str, str]] = []
+    for pkg_name in sorted(seen):
+        sdist = by_name[pkg_name].get("sdist")
+        if not isinstance(sdist, dict):
+            continue
+        url = str(sdist.get("url") or "").strip()
+        raw_hash = str(sdist.get("hash") or "").strip()
+        if raw_hash.startswith("sha256:"):
+            raw_hash = raw_hash[len("sha256:") :]
+        if url.startswith("https://") and len(raw_hash) == 64:
+            resources.append((pkg_name, url, raw_hash.lower()))
+    return resources
+
+
 def _render_homebrew_formula(*, slug: str, version: str, base_download: str, artifact_name: str, artifact_sha: str) -> str:
+    resources = _collect_homebrew_resources()
+    resource_stanzas = ""
+    if resources:
+        blocks = [
+            f'  resource "{r_name}" do\n'
+            f'    url "{r_url}"\n'
+            f'    sha256 "{r_sha}"\n'
+            "  end\n"
+            for r_name, r_url, r_sha in resources
+        ]
+        resource_stanzas = "\n" + "\n".join(blocks)
     return (
         "class SecondBrain < Formula\n"
         "  include Language::Python::Virtualenv\n\n"
@@ -185,12 +244,16 @@ def _render_homebrew_formula(*, slug: str, version: str, base_download: str, art
         f'  version "{version}"\n'
         f'  sha256 "{artifact_sha.lower()}"\n'
         '  license "MIT"\n\n'
-        '  depends_on "python@3.11"\n\n'
+        '  depends_on "rust" => :build\n'
+        '  depends_on "python@3.11"\n'
+        f"{resource_stanzas}\n"
         "  def install\n"
         "    virtualenv_install_with_resources\n"
         "  end\n\n"
         "  test do\n"
+        '    ENV["BRAIN_VAULT_DIR"] = (testpath/"brain").to_s\n'
         '    assert_predicate bin/"second-brain", :exist?\n'
+        '    system bin/"second-brain", "install"\n'
         '    system bin/"second-brain", "doctor"\n'
         "  end\n"
         "end\n"

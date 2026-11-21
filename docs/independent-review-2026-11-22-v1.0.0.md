@@ -28,7 +28,7 @@ An independent, read-only staff-level security and architecture audit inspected 
 | **5. Human Edits Re-Gate Trust** (CAS under `writer.lock`; edits demote trust; merged/superseded permanently terminal; rollback on partial error) | **VERIFIED** | `scripts/atom_mutator.py`, `scripts/knowledge_graph.py` (`apply_atom_mutation` and `set_atom_temporal_bounds` enforce CAS + `.history/` backup; `auto_link_vault_atoms` captures `prior_bytes_by_path` and rolls back all modified atom files on index/log error). |
 | **6. External Isolation** (Scout, Clipper, Mobile Drop, Multimodal, and 17-tool MCP quarantine untrusted input, pin DNS, and preserve sticky `origin`) | **VERIFIED** | `scripts/ollama_scout.py`, `scripts/web_clipper.py` (`origin="web_clipper"`), `scripts/notes_store.py` (`verify_note_excerpt` maps sticky `origin` without laundering to `user_local`), `scripts/inbox_drop.py`, `scripts/mcp_server.py`. |
 | **7. Single Writer** (`writer.lock` across canonical atom, playbook, feedback, manifest, sync, and index mutations) | **VERIFIED** | `scripts/atom_mutator.py` (`review_lock`), `scripts/cognitive_core.py` (`writer.lock` around canonical feedback JSONL appends), `scripts/config.py` (`O_APPEND` + `os.fsync` on `manifest.jsonl`). |
-| **8. Hardware Truth** (runtime-probed capability tiers, GGUF RAM-fit gating, measured CPU & ONNX latency inside SLOs) | **VERIFIED** | `scripts/hardware_profile.py`, `scripts/ollama_utils.py` (`tier_2_cpu_balanced` detected on 15.9 GiB RAM / 8 threads; `qwen2.5-coder:7b` selected; `23 GB` `qwen3.6:latest` gated into `oversized_installed_models`; 300-atom ONNX Cross-Encoder total P95 = `13.59 ms < 15.0 ms`; warm CPU answer P95 = `38.86 s <= 45.0 s` 8-thread CPU SLO, `21.37 s` single-hop). |
+| **8. Hardware Truth** (runtime-probed capability tiers, GGUF RAM-fit gating, measured CPU & ONNX latency inside SLOs) | **VERIFIED** | `scripts/hardware_profile.py`, `scripts/ollama_utils.py` (`tier_2_cpu_balanced` detected on 15.9 GiB RAM / 8 threads; `qwen2.5-coder:7b` selected; `23 GB` `qwen3.6:latest` gated into `oversized_installed_models`; 300-atom ONNX Cross-Encoder total P95 = `13.645 ms < 15.0 ms`; warm CPU answer P95 = `38.86 s <= 45.0 s` 8-thread CPU SLO, `21.37 s` single-hop). |
 | **9. No Autonomous Irreversible Authority** (owner-only approvals, merges, playbook promotions, sync/backup mutations; unprivileged MCP isolation) | **VERIFIED** | `scripts/api_product.py` (`owner_only()` `X-Owner-Token`), `scripts/mcp_server.py` (`record_feedback` writes `agent_negative_feedback` and cannot deactivate owner-promoted Playbooks). |
 
 ---
@@ -73,6 +73,12 @@ An independent, read-only staff-level security and architecture audit inspected 
 
 ---
 
-## 5. Final Post-Tag Independent Review Sign-Off
+## 5. Final Post-Tag Independent Review Sign-Off (`d3e540c7-8fad-4b77-9387-4c415cb7011d`)
 
-*(Pending final `v1.0.0` installer rebuild, tag update, and isolated read-only `code-reviewer` sign-off pass.)*
+Following remediation of all 11 primary audit findings, execution of the 26-suite `scripts/test_all.py` gate (`26/26 PASS`), and rebuild of all `1.0.0` installers and manifests, an independent read-only staff `code-reviewer` subagent (`d3e540c7-8fad-4b77-9387-4c415cb7011d`) audited annotated tag `v1.0.0` against `CODEX_CLI_GOAL.md` and all 6 gap-closure acceptance criteria:
+
+- **Final Verdict:** **`APPROVED`** (`0` Critical, `0` High, `0` Medium, `0` Blocking Issues).
+- **Post-Review Polish (`3 / 3` Low Follow-Ups Closed — `14 / 14` Total Findings Remediated):**
+  1. **`[LOW-A]` Homebrew `Formula` `test do` & PyPI Resources (`scripts/build_distribution_manifests.py`):** Added `_collect_homebrew_resources()` emitting all `23` SHA-256-pinned transitive PyPI `resource` stanzas from `uv.lock` plus `depends_on "rust" => :build`, and updated `test do` to isolate `ENV["BRAIN_VAULT_DIR"] = (testpath/"brain").to_s` and run `second-brain install` prior to `second-brain doctor`.
+  2. **`[LOW-B]` Mobile Recall Key Rotation CLI & API (`scripts/vault_sync.py`, `scripts/api_product.py`):** Exposed `second-brain sync rotate-recall` and owner-gated `POST /v1/sync/inbox-drop/rotate-recall` wrapping `rotate_mobile_recall_key()` + automatic `export_mobile_recall_index()`.
+  3. **`[LOW-C]` Documentation & Suite-Count Alignment (`README.md`, `docs/independent-review-2026-11-22-v1.0.0.md`):** Updated remaining `23-suite` prose references to `26` suites and recorded final post-tag sign-off.

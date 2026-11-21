@@ -3209,6 +3209,22 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(200, res)
 
+        if path == "/v1/sync/inbox-drop/rotate-recall" and method == "POST":
+            if not owner_only():
+                return True
+            from inbox_drop import export_mobile_recall_index, rotate_mobile_recall_key
+
+            rot = rotate_mobile_recall_key(brain_dir=rt.brain_dir, state_dir=_drop_state_dir)
+            if bool(body.get("reexport", True)):
+                exp = export_mobile_recall_index(
+                    brain_dir=rt.brain_dir,
+                    state_dir=_drop_state_dir,
+                    http_transport=getattr(rt, "http_transport", None),
+                    skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+                )
+                rot = {**rot, "reexported_object_key": exp["object_key"], "atom_count": exp["atom_count"]}
+            return send(200, rot)
+
         if path == "/v1/sync/inbox-drop/pull" and method == "POST":
             if not owner_only():
                 return True

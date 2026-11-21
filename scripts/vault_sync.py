@@ -3288,6 +3288,10 @@ def main(argv: list[str] | None = None) -> int:
     p_drev.add_argument("token_id", help="16-char hex token_id")
     p_drev.add_argument("--json", action="store_true")
 
+    p_mrot = sub.add_parser("rotate-recall", help="Rotate the E2EE mobile recall key (`SBMR1`) and re-export encrypted catalog")
+    p_mrot.add_argument("--no-export", action="store_true", help="Rotate key without re-exporting mobile-recall/<vault_id>.enc")
+    p_mrot.add_argument("--json", action="store_true")
+
     p_dpull = sub.add_parser("pull-drops", help="Pull and decrypt E2EE mobile inbox-drops/*.enc into 0-raw/inbox/")
     p_dpull.add_argument("--json", action="store_true")
 
@@ -3436,6 +3440,15 @@ def main(argv: list[str] | None = None) -> int:
 
         res = revoke_mobile_drop_pairing(args.token_id, brain_dir=brain_dir)
         print(json.dumps(res, indent=2) if args.json else f"Revoked mobile drop pairing {res['token_id']}")
+        return 0
+    if args.cmd == "rotate-recall":
+        from inbox_drop import export_mobile_recall_index, rotate_mobile_recall_key
+
+        res = rotate_mobile_recall_key(brain_dir=brain_dir)
+        if not bool(args.no_export):
+            exp = export_mobile_recall_index(brain_dir=brain_dir)
+            res = {**res, "reexported_object_key": exp["object_key"], "atom_count": exp["atom_count"]}
+        print(json.dumps(res, indent=2) if args.json else f"Rotated mobile recall key -> {res['recall_key_id']}")
         return 0
     if args.cmd == "pull-drops":
         res = pull_mobile_inbox_drops(brain_dir=brain_dir)
