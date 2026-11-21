@@ -37,12 +37,24 @@ New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 
 Push-Location $RepoRoot
 try {
+    $CurrentVersion = (uv run --frozen python -c "import second_brain; print(second_brain.__version__)" | Select-Object -Last 1).Trim()
+    if (-not $CurrentVersion) {
+        throw "Failed to resolve second_brain.__version__"
+    }
+
+    # Remove stale prior-version artifacts from dist/ so SHA256SUMS.txt and manifests stay strictly aligned
+    Get-ChildItem -Path $DistDir -File -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -ne "SHA256SUMS.txt" -and
+        $_.Name -ne "second-brain-inbox-drop-pwa.zip" -and
+        $_.Name -notmatch [regex]::Escape($CurrentVersion)
+    } | Remove-Item -Force -ErrorAction SilentlyContinue
+
     uv run --frozen python scripts/make_icons.py | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "make_icons.py exited with code $LASTEXITCODE"
     }
 
-    uv build --wheel --out-dir $DistDir | Out-Host
+    uv build --out-dir $DistDir | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "uv build exited with code $LASTEXITCODE"
     }
@@ -60,6 +72,11 @@ try {
     uv run --frozen python scripts/build_clipper.py --out-dir $DistDir | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "build_clipper.py exited with code $LASTEXITCODE"
+    }
+
+    uv run --frozen python scripts/build_distribution_manifests.py --pwa-only --out-dir $DistDir | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "build_distribution_manifests.py --pwa-only exited with code $LASTEXITCODE"
     }
 } finally {
     Pop-Location
@@ -155,12 +172,16 @@ Remove-Item -Path (Join-Path $DistDir "builder-debug.yml") -Force -ErrorAction S
 if ($SkipSign) {
     $sumLines = @()
     Get-ChildItem -Path $DistDir -File | Where-Object {
-        $_.Extension -in @(".exe", ".msi", ".whl", ".vsix", ".zip", ".blockmap")
+        $_.Extension -in @(".exe", ".msi", ".whl", ".vsix", ".zip", ".blockmap") -or $_.Name.EndsWith(".tar.gz")
     } | Sort-Object Name | ForEach-Object {
         $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         $sumLines += "$hash  $($_.Name)"
     }
-    Set-Content -Path (Join-Path $DistDir "SHA256SUMS.txt") -Value ($sumLines -join "`n") -Encoding ascii
+    [System.IO.File]::WriteAllText(
+        (Join-Path $DistDir "SHA256SUMS.txt"),
+        ($sumLines -join "`n") + "`n",
+        (New-Object System.Text.UTF8Encoding $false)
+    )
 } else {
     $outerSignArgs = @{
         DistDir      = $DistDir
@@ -175,4 +196,17 @@ if ($SkipSign) {
     }
 
     & $SignScript @outerSignArgs
+}
+
+# Stage 5: Regenerate WinGet and Homebrew manifests strictly bound to current version & SHA256SUMS.txt
+if ($Target -ne "pack") {
+    Push-Location $RepoRoot
+    try {
+        uv run --frozen python scripts/build_distribution_manifests.py --manifests-only --out-dir $DistDir --dist-dir $DistDir --require-checksums | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "build_distribution_manifests.py --manifests-only exited with code $LASTEXITCODE"
+        }
+    } finally {
+        Pop-Location
+    }
 }

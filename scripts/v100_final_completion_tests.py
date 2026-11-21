@@ -635,18 +635,24 @@ class V100FinalCompletionTests(unittest.TestCase):
             dist_dir = Path(tmp) / "dist"
             dist_dir.mkdir(parents=True, exist_ok=True)
 
-            # Seed mock cross-platform artifacts + SHA256SUMS.txt
+            # Seed BOTH stale 0.5.0 artifacts (lexicographically earlier!) AND current 1.0.0 artifacts
+            stale_exe = b"MZ_STALE_050_INSTALLER"
             exe_bytes = b"MZ_MOCK_WINDOWS_INSTALLER_100"
             msi_bytes = b"MSI_MOCK_WINDOWS_INSTALLER_100"
             dmg_bytes = b"DMG_MOCK_MACOS_INSTALLER_100"
+            sdist_bytes = b"TAR_GZ_MOCK_SDIST_100"
+            (dist_dir / "Second-Brain-Setup-0.5.0-x64.exe").write_bytes(stale_exe)
             (dist_dir / "Second-Brain-Setup-1.0.0-x64.exe").write_bytes(exe_bytes)
             (dist_dir / "Second-Brain-Setup-1.0.0-x64.msi").write_bytes(msi_bytes)
             (dist_dir / "Second-Brain-1.0.0-universal.dmg").write_bytes(dmg_bytes)
+            (dist_dir / "second_brain-1.0.0.tar.gz").write_bytes(sdist_bytes)
             sums = "\n".join(
                 [
+                    f"{hashlib.sha256(stale_exe).hexdigest()}  Second-Brain-Setup-0.5.0-x64.exe",
                     f"{hashlib.sha256(exe_bytes).hexdigest()}  Second-Brain-Setup-1.0.0-x64.exe",
                     f"{hashlib.sha256(msi_bytes).hexdigest()}  Second-Brain-Setup-1.0.0-x64.msi",
                     f"{hashlib.sha256(dmg_bytes).hexdigest()}  Second-Brain-1.0.0-universal.dmg",
+                    f"{hashlib.sha256(sdist_bytes).hexdigest()}  second_brain-1.0.0.tar.gz",
                 ]
             )
             (dist_dir / "SHA256SUMS.txt").write_text(sums + "\n", encoding="utf-8")
@@ -665,6 +671,8 @@ class V100FinalCompletionTests(unittest.TestCase):
             winget_doc = yaml.safe_load(Path(mf_res["winget_manifest"]).read_text(encoding="utf-8"))
             self.assertEqual(winget_doc["PackageIdentifier"], "SecondBrain.SecondBrain")
             self.assertEqual(winget_doc["PackageVersion"], "1.0.0")
+            self.assertIn("Second-Brain-Setup-1.0.0-x64.exe", winget_doc["Installers"][0]["InstallerUrl"])
+            self.assertNotIn("0.5.0", winget_doc["Installers"][0]["InstallerUrl"])
             self.assertEqual(
                 winget_doc["Installers"][0]["InstallerSha256"],
                 hashlib.sha256(exe_bytes).hexdigest().upper(),
@@ -672,6 +680,42 @@ class V100FinalCompletionTests(unittest.TestCase):
             brew_txt = Path(mf_res["homebrew_cask"]).read_text(encoding="utf-8")
             self.assertIn('version "1.0.0"', brew_txt)
             self.assertIn(hashlib.sha256(dmg_bytes).hexdigest(), brew_txt)
+            self.assertNotIn(":no_check", brew_txt)
+            self.assertNotIn("#{version}", brew_txt)
+
+            # Windows/Linux-only dist (no .dmg, real .tar.gz + .exe) emits valid Formula with real sha256 & URL
+            nodmg_dir = Path(tmp) / "dist_nodmg"
+            nodmg_dir.mkdir(parents=True, exist_ok=True)
+            (nodmg_dir / "Second-Brain-Setup-1.0.0-x64.exe").write_bytes(exe_bytes)
+            (nodmg_dir / "second_brain-1.0.0.tar.gz").write_bytes(sdist_bytes)
+            (nodmg_dir / "SHA256SUMS.txt").write_text(
+                f"{hashlib.sha256(exe_bytes).hexdigest()}  Second-Brain-Setup-1.0.0-x64.exe\n"
+                f"{hashlib.sha256(sdist_bytes).hexdigest()}  second_brain-1.0.0.tar.gz\n",
+                encoding="utf-8",
+            )
+            mf_nodmg = build_package_manager_manifests(
+                out_dir=nodmg_dir,
+                dist_dir=nodmg_dir,
+                repo_slug="second-brain/second-brain",
+            )
+            formula_txt = Path(mf_nodmg["homebrew_cask"]).read_text(encoding="utf-8")
+            self.assertIn("class SecondBrain < Formula", formula_txt)
+            self.assertIn('version "1.0.0"', formula_txt)
+            self.assertIn(hashlib.sha256(sdist_bytes).hexdigest(), formula_txt)
+            self.assertIn("second_brain-1.0.0.tar.gz", formula_txt)
+            self.assertNotIn(":no_check", formula_txt)
+            self.assertNotIn("#{version}", formula_txt)
+
+            # Stale-only dist (only 0.5.0 present when building 1.0.0) fails closed instead of binding 0.5.0
+            stale_only_dir = Path(tmp) / "dist_stale_only"
+            stale_only_dir.mkdir(parents=True, exist_ok=True)
+            (stale_only_dir / "Second-Brain-Setup-0.5.0-x64.exe").write_bytes(stale_exe)
+            with self.assertRaises(FileNotFoundError):
+                build_package_manager_manifests(
+                    out_dir=stale_only_dir,
+                    dist_dir=stale_only_dir,
+                    version="1.0.0",
+                )
 
         # Verify unified 1.0.0 version across all manifests & 3-surface UI parity
         import second_brain

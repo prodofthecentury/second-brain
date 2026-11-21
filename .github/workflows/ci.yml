@@ -99,14 +99,14 @@ jobs:
 
       - name: Build wheel & run isolated clean-wheel venv tests
         run: |
-          uv build --wheel --out-dir dist
+          uv build --out-dir dist
           uv run --frozen python -m unittest scripts.wheel_packaging_tests -v
 
-      - name: Build VS Code VSIX, Browser Web Clipper MV3, Mobile PWA & Package Manager Manifests
+      - name: Build VS Code VSIX, Browser Web Clipper MV3 & Mobile PWA
         run: |
           uv run --frozen python scripts/build_vsix.py --out-dir dist
           uv run --frozen python scripts/build_clipper.py --out-dir dist
-          uv run --frozen python scripts/build_distribution_manifests.py --out-dir dist
+          uv run --frozen python scripts/build_distribution_manifests.py --pwa-only --out-dir dist
 
       - name: Run VS Code extension tests
         if: ${{ !matrix.skip_gui_pack }}
