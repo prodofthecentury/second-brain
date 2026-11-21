@@ -706,6 +706,7 @@ class MemoryApiRuntimeConfig:
         self.inbox_dir = _resolve_child(inbox_dir, INBOX_DIR, ("0-raw", "inbox"))
         self.experiences_dir = _resolve_child(experiences_dir, EXPERIENCES_DIR, ("4-experiences",))
         self.playbooks_dir = _resolve_child(playbooks_dir, PLAYBOOKS_DIR, ("5-playbooks",))
+        self.skills_dir = os.path.join(self.brain_dir, "6-skills")
         self.lexical_index_path = _resolve_child(lexical_index_path, LEXICAL_INDEX_PATH, (".sidecar", "lexical.sqlite3"))
         self.chroma_path = _resolve_child(chroma_path, CHROMA_PATH, (".chroma",))
         self.telemetry_db_path = _resolve_child(telemetry_db_path, TELEMETRY_DB_PATH, (".sidecar", "telemetry.sqlite3"))
@@ -740,6 +741,7 @@ class MemoryApiRuntimeConfig:
             self.inbox_dir = os.path.join(abs_new, "0-raw", "inbox")
             self.experiences_dir = os.path.join(abs_new, "4-experiences")
             self.playbooks_dir = os.path.join(abs_new, "5-playbooks")
+            self.skills_dir = os.path.join(abs_new, "6-skills")
             self.lexical_index_path = os.path.join(abs_new, ".sidecar", "lexical.sqlite3")
             self.chroma_path = os.path.join(abs_new, ".chroma")
             self.telemetry_db_path = os.path.join(abs_new, ".sidecar", "telemetry.sqlite3")
@@ -1994,9 +1996,17 @@ class MemoryApiClient:
             self._headers[api_product.OWNER_HEADER] = self._owner_token
         self._timeout = timeout
 
-    def _request(self, method: str, path: str, json_body: dict[str, object] | None = None) -> dict[str, object]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        json_body: dict[str, object] | None = None,
+        *,
+        timeout_override: float | None = None,
+    ) -> dict[str, object]:
         payload = json_body if json_body is not None else ({} if method in {"POST", "PUT", "PATCH", "DELETE"} else None)
-        with httpx.Client(timeout=self._timeout, follow_redirects=False, trust_env=False) as client:
+        eff_timeout = timeout_override if timeout_override is not None else self._timeout
+        with httpx.Client(timeout=eff_timeout, follow_redirects=False, trust_env=False) as client:
             resp = client.request(method, f"{self.base_url}{path}", headers=self._headers, json=payload)
             resp.raise_for_status()
             return dict(resp.json())
@@ -3205,6 +3215,7 @@ class MemoryApiClient:
                 "filename": str(filename or "").strip(),
                 "content_base64": _b64.b64encode(bytes(raw_bytes)).decode("ascii"),
             },
+            timeout_override=max(float(self._timeout), 180.0),
         )
 
     def git_hook_status(self, repo: str = ".") -> dict[str, object]:
@@ -3290,6 +3301,230 @@ class MemoryApiClient:
         if passphrase is not None:
             payload["passphrase"] = passphrase
         return self._request("POST", "/v1/vault/backup/restore", payload)
+
+    # ─── Stage 4 Executable Skills ───────────────────────────────────────────
+
+    def list_skills(self, *, project: str | None = None, include_inactive: bool = False) -> dict[str, object]:
+        params: list[str] = []
+        if project:
+            params.append(f"project={quote(project, safe=':')}")
+        if include_inactive:
+            params.append("include_inactive=1")
+        qs = f"?{'&'.join(params)}" if params else ""
+        return self._request("GET", f"/v1/skills{qs}")
+
+    def list_skill_candidates(self) -> dict[str, object]:
+        return self._request("GET", "/v1/skills/candidates")
+
+    def list_skill_executions(self, *, skill_id: str | None = None, limit: int = 50) -> dict[str, object]:
+        params = [f"limit={int(limit)}"]
+        if skill_id:
+            params.append(f"skill_id={quote(skill_id, safe='')}")
+        return self._request("GET", f"/v1/skills/executions?{'&'.join(params)}")
+
+    def promote_skill(
+        self,
+        *,
+        skill_id: str,
+        playbook_id: str,
+        expected_playbook_sha256: str,
+        step_actions: list[dict[str, object]],
+        actor: str,
+        input_schema: dict[str, dict[str, object]] | None = None,
+        timeout_seconds: float = 15.0,
+        max_output_bytes: int = 65536,
+        rationale: str = "",
+        allow_early_owner_override: bool = False,
+        expected_skill_sha256: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "skill_id": skill_id,
+            "playbook_id": playbook_id,
+            "expected_playbook_sha256": expected_playbook_sha256,
+            "step_actions": list(step_actions),
+            "timeout_seconds": float(timeout_seconds),
+            "max_output_bytes": int(max_output_bytes),
+            "actor": actor,
+            "rationale": rationale,
+            "allow_early_owner_override": bool(allow_early_owner_override),
+        }
+        if input_schema is not None:
+            payload["input_schema"] = input_schema
+        if expected_skill_sha256:
+            payload["expected_skill_sha256"] = expected_skill_sha256
+        return self._request("POST", "/v1/skills/promote", payload)
+
+    def execute_skill(
+        self,
+        skill_id: str,
+        *,
+        actor: str,
+        inputs: dict[str, object] | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            f"/v1/skills/{quote(skill_id, safe='')}/execute",
+            {"actor": actor, "inputs": inputs or {}, "dry_run": bool(dry_run)},
+        )
+
+    def revoke_skill(
+        self,
+        skill_id: str,
+        *,
+        expected_skill_sha256: str,
+        actor: str,
+        reason: str,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            f"/v1/skills/{quote(skill_id, safe='')}/revoke",
+            {
+                "expected_skill_sha256": expected_skill_sha256,
+                "actor": actor,
+                "reason": reason,
+            },
+        )
+
+    def set_skill_kill_switch(
+        self,
+        *,
+        engaged: bool,
+        actor: str,
+        scope: str = "global",
+        reason: str = "",
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/skills/kill-switch",
+            {"engaged": bool(engaged), "scope": scope, "actor": actor, "reason": reason},
+        )
+
+    # ─── Mobile Vault Client (iOS / Android) ─────────────────────────────────
+
+    def mobile_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/mobile/status")
+
+    def mobile_pair(
+        self,
+        *,
+        label: str = "Mobile Vault Client",
+        include_passphrase_hint: str = "",
+        sync_endpoint_override: str | None = None,
+        include_recovery_key: bool = False,
+        include_inbox_drop_pairing: bool = True,
+        pwa_base_url: str = "https://localhost/vault-client/",
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "label": label,
+            "include_passphrase_hint": include_passphrase_hint,
+            "include_recovery_key": bool(include_recovery_key),
+            "include_inbox_drop_pairing": bool(include_inbox_drop_pairing),
+            "pwa_base_url": pwa_base_url,
+        }
+        if sync_endpoint_override:
+            payload["sync_endpoint_override"] = sync_endpoint_override
+        return self._request("POST", "/v1/mobile/pair", payload)
+
+    def mobile_revoke(self, pairing_id: str) -> dict[str, object]:
+        return self._request("POST", "/v1/mobile/revoke", {"pairing_id": pairing_id})
+
+    def mobile_export(self, out_dir: str = "") -> dict[str, object]:
+        return self._request("POST", "/v1/mobile/export", {"out_dir": out_dir})
+
+    # ─── Local Creative Media Studio ─────────────────────────────────────────
+
+    def media_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/media/status")
+
+    def media_gallery(
+        self,
+        *,
+        media_type: str | None = None,
+        project: str | None = None,
+        limit: int = 30,
+    ) -> dict[str, object]:
+        params = [f"limit={int(limit)}"]
+        if media_type:
+            params.append(f"media_type={quote(media_type, safe='')}")
+        if project:
+            params.append(f"project={quote(project, safe=':')}")
+        return self._request("GET", f"/v1/media/gallery?{'&'.join(params)}")
+
+    def media_file_base64(self, media_id: str) -> dict[str, object]:
+        return self._request("GET", f"/v1/media/file/{quote(media_id, safe='')}?encoding=base64")
+
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        backend: str = "auto",
+        style: str = "concept_card",
+        output_format: str = "png",
+        width: int = 768,
+        height: int = 512,
+        seed: int | None = None,
+        title: str = "",
+        ground_in_vault: bool = False,
+        project_scope: str | None = None,
+        attach_to_note: bool = False,
+        allow_hardware_override: bool = False,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "prompt": prompt,
+            "backend": backend,
+            "style": style,
+            "output_format": output_format,
+            "width": int(width),
+            "height": int(height),
+            "title": title,
+            "ground_in_vault": bool(ground_in_vault),
+            "attach_to_note": bool(attach_to_note),
+            "allow_hardware_override": bool(allow_hardware_override),
+        }
+        if seed is not None:
+            payload["seed"] = int(seed)
+        if project_scope:
+            payload["project_scope"] = project_scope
+        return self._request("POST", "/v1/media/image", payload)
+
+    def generate_video(
+        self,
+        prompt: str,
+        *,
+        backend: str = "auto",
+        style: str = "concept_card",
+        output_format: str = "mp4",
+        width: int = 640,
+        height: int = 384,
+        frames: int = 16,
+        fps: int = 12,
+        seed: int | None = None,
+        title: str = "",
+        ground_in_vault: bool = False,
+        project_scope: str | None = None,
+        attach_to_note: bool = False,
+        allow_hardware_override: bool = False,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "prompt": prompt,
+            "backend": backend,
+            "style": style,
+            "output_format": output_format,
+            "width": int(width),
+            "height": int(height),
+            "frames": int(frames),
+            "fps": int(fps),
+            "title": title,
+            "ground_in_vault": bool(ground_in_vault),
+            "attach_to_note": bool(attach_to_note),
+            "allow_hardware_override": bool(allow_hardware_override),
+        }
+        if seed is not None:
+            payload["seed"] = int(seed)
+        if project_scope:
+            payload["project_scope"] = project_scope
+        return self._request("POST", "/v1/media/video", payload)
 
     # Convenience SDK method aliases
     inbox_item = inspect_inbox_item
@@ -3434,6 +3669,22 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "POST /v1/vault/backup/create",
                 "POST /v1/vault/backup/verify",
                 "POST /v1/vault/backup/restore",
+                "GET /v1/skills",
+                "GET /v1/skills/candidates",
+                "GET /v1/skills/executions",
+                "POST /v1/skills/promote",
+                "POST /v1/skills/kill-switch",
+                "POST /v1/skills/<skill_id>/execute",
+                "POST /v1/skills/<skill_id>/revoke",
+                "GET /v1/mobile/status",
+                "POST /v1/mobile/pair",
+                "POST /v1/mobile/revoke",
+                "POST /v1/mobile/export",
+                "GET /v1/media/status",
+                "GET /v1/media/gallery",
+                "GET /v1/media/file/<media_id>",
+                "POST /v1/media/image",
+                "POST /v1/media/video",
             ],
         },
         "local_ide_mcp_stdio": {

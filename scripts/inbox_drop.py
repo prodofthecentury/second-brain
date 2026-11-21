@@ -57,9 +57,12 @@ from memory_format import normalize_temporal_bound_str  # noqa: E402
 
 SBID_MAGIC = b"SBID1\x00"
 SBID_VERSION = 1
+SBMR_MAGIC = b"SBMR1\x00"
+SBMR_VERSION = 1
 NONCE_BYTES = 12
 GCM_TAG_BYTES = 16
 MAX_DROP_ENVELOPE_BYTES = 262_144  # 256 KiB hard ceiling per mobile quick-capture
+MAX_RECALL_ENVELOPE_BYTES = 16_777_216  # 16 MiB ceiling for encrypted mobile recall catalog
 MAX_DROP_HEADER_BYTES = 4096
 MAX_DROPS_PER_CYCLE = 50
 MAX_SKIPPED_CLEANUP_PER_CYCLE = 100
@@ -229,6 +232,11 @@ def _ensure_inbox_drop_keypair_unlocked(
 ) -> dict[str, Any]:
     existing = _load_drop_state(active_brain, state_dir=state_dir)
     if isinstance(existing, dict) and existing.get("vault_id") == vault_id and existing.get("privkey_pkcs8_b64"):
+        if not existing.get("recall_key_b64") or not existing.get("recall_key_id"):
+            rk = secrets.token_bytes(32)
+            existing["recall_key_b64"] = base64.b64encode(rk).decode("ascii")
+            existing["recall_key_id"] = hashlib.sha256(rk).hexdigest()[:16]
+            _atomic_write_restricted_json(inbox_drop_state_path(active_brain, state_dir=state_dir), existing)
         return existing
 
     priv = ec.generate_private_key(ec.SECP256R1())
@@ -243,6 +251,8 @@ def _ensure_inbox_drop_keypair_unlocked(
     )
     pub_b64 = base64.b64encode(pub_raw).decode("ascii")
     key_id = hashlib.sha256(pub_raw).hexdigest()[:16]
+    recall_key = secrets.token_bytes(32)
+    recall_key_id = hashlib.sha256(recall_key).hexdigest()[:16]
 
     doc: dict[str, Any] = {
         "schema_version": 1,
@@ -251,6 +261,8 @@ def _ensure_inbox_drop_keypair_unlocked(
         "curve": "P-256",
         "pubkey_uncompressed_b64": pub_b64,
         "privkey_pkcs8_b64": base64.b64encode(priv_der).decode("ascii"),
+        "recall_key_id": recall_key_id,
+        "recall_key_b64": base64.b64encode(recall_key).decode("ascii"),
         "pairings": list(existing.get("pairings") or []) if isinstance(existing, dict) else [],
         "created_at": _utc_now_iso(),
     }
@@ -289,10 +301,11 @@ def create_mobile_drop_pairing(
     s3_access_key_id: str = "",
     s3_secret_access_key: str = "",
     pwa_base_url: str = "https://localhost/inbox-drop/",
+    include_recall: bool = False,
     brain_dir: str | Path | None = None,
     state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Create a per-device zero-knowledge mobile inbox drop pairing bundle + `#pair=` URI."""
+    """Create a per-device zero-knowledge mobile inbox drop (and optional E2EE recall) pairing bundle + `#pair=` URI."""
     if not _HEX32_RE.fullmatch(str(vault_id or "")):
         raise InboxDropError(f"Invalid 32-char hex vault_id: {vault_id!r}")
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
@@ -318,6 +331,7 @@ def create_mobile_drop_pairing(
             "token_id": token_id,
             "label": clean_label,
             "drop_secret_b64": drop_secret_b64,
+            "include_recall": bool(include_recall),
             "created_at": created_at,
             "revoked": False,
         }
@@ -337,6 +351,11 @@ def create_mobile_drop_pairing(
         "target_url": str(sync_target_url or "").strip().rstrip("/"),
         "s3_region": str(s3_region or "auto").strip() or "auto",
     }
+    if include_recall:
+        client_bundle["include_recall"] = True
+        client_bundle["recall_key_id"] = str(state["recall_key_id"])
+        client_bundle["recall_key_b64"] = str(state["recall_key_b64"])
+        client_bundle["recall_object_key"] = f"mobile-recall/{vault_id}.enc"
     if s3_access_key_id and s3_secret_access_key:
         client_bundle["s3_access_key_id"] = s3_access_key_id.strip()
         client_bundle["s3_secret_access_key"] = s3_secret_access_key.strip()
@@ -364,6 +383,8 @@ def create_mobile_drop_pairing(
         "label": clean_label,
         "vault_id": vault_id,
         "key_id": state["key_id"],
+        "include_recall": bool(include_recall),
+        "recall_key_id": state.get("recall_key_id") if include_recall else None,
         "recipient_pubkey_b64": state["pubkey_uncompressed_b64"],
         "created_at": created_at,
         "pairing_bundle": client_bundle,
@@ -396,6 +417,7 @@ def list_mobile_drop_pairings(
         {
             "token_id": str(p.get("token_id") or ""),
             "label": str(p.get("label") or ""),
+            "include_recall": bool(p.get("include_recall", False)),
             "created_at": str(p.get("created_at") or ""),
             "revoked": bool(p.get("revoked", False)),
             "revoked_at": p.get("revoked_at"),
@@ -407,8 +429,10 @@ def list_mobile_drop_pairings(
         "initialized": True,
         "vault_id": state.get("vault_id"),
         "key_id": state.get("key_id"),
+        "recall_key_id": state.get("recall_key_id"),
         "recipient_pubkey_b64": state.get("pubkey_uncompressed_b64"),
         "count": sum(1 for x in items if not x["revoked"]),
+        "recall_enabled_count": sum(1 for x in items if not x["revoked"] and x["include_recall"]),
         "pairings": items,
     }
 
@@ -1068,3 +1092,405 @@ def pull_inbox_drops_from_backend(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with review_lock(str(lock_path)):
         return _run_under_lock()
+
+
+# ─── Mobile E2EE Recall / Search / Review Catalog (`SBMR1\x00`) ──────────────
+
+def _derive_mobile_recall_aes_key(
+    recall_key: bytes,
+    *,
+    vault_id: str,
+    recall_key_id: str,
+    salt: bytes,
+) -> bytes:
+    info = f"SecondBrain-MobileRecall-v1|{vault_id}|{recall_key_id}".encode("utf-8")
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        info=info,
+    ).derive(recall_key)
+
+
+def rotate_mobile_recall_key(
+    *,
+    vault_id: str,
+    brain_dir: str | Path | None = None,
+    state_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Rotate the per-vault mobile recall key so lost recall-enabled pairings lose future index decryption."""
+    if not _HEX32_RE.fullmatch(str(vault_id or "")):
+        raise InboxDropError(f"Invalid 32-char hex vault_id: {vault_id!r}")
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    lock_file = _inbox_drop_lock_path(active_brain, state_dir=state_dir)
+    _assert_no_symlinks(lock_file)
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    restrict_security_file_permissions(lock_file.parent)
+    with _INBOX_DROP_STATE_LOCK, FileLock(str(lock_file), timeout=30):
+        state = _ensure_inbox_drop_keypair_unlocked(
+            vault_id=vault_id,
+            active_brain=active_brain,
+            state_dir=state_dir,
+        )
+        new_rk = secrets.token_bytes(32)
+        new_rk_id = hashlib.sha256(new_rk).hexdigest()[:16]
+        state["recall_key_b64"] = base64.b64encode(new_rk).decode("ascii")
+        state["recall_key_id"] = new_rk_id
+        _atomic_write_restricted_json(inbox_drop_state_path(active_brain, state_dir=state_dir), state)
+    return {
+        "status": "rotated",
+        "vault_id": vault_id,
+        "recall_key_id": new_rk_id,
+    }
+
+
+def build_mobile_recall_catalog(
+    *,
+    brain_dir: str | Path | None = None,
+    include_pending_review: bool = True,
+) -> dict[str, Any]:
+    """Build a DLP-screened, provenance-verified catalog of approved atoms and pending review items."""
+    from atom_mutator import approved_revision_is_current, latest_decisions_by_atom
+    from config import is_content_markdown
+    from memory_format import evaluate_temporal_validity, split_frontmatter
+    from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
+
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    atoms_dir = active_brain / "2-atoms"
+    if not atoms_dir.is_dir():
+        return {"exported_at": _utc_now_iso(), "atoms": [], "review_queue": []}
+    if _is_reparse_or_link(str(atoms_dir)):
+        raise InboxDropSecurityError(f"Refusing to read atoms from symlinked directory: {atoms_dir}")
+
+    decision_log = str(active_brain / "0-raw" / "archive" / "decision-record.jsonl")
+    try:
+        decision_map = latest_decisions_by_atom(decision_log)
+    except Exception:
+        decision_map = None
+    source_memo: dict[str, str | None] = {}
+    canon_atoms_str = str(atoms_dir)
+
+    def _to_list(val: object) -> list[str]:
+        if isinstance(val, str):
+            return [str(x).strip() for x in parse_scalar_list(val) if str(x).strip()]
+        if isinstance(val, (list, tuple)):
+            return [str(x).strip() for x in val if str(x).strip()]
+        return []
+
+    def _dlp_clean(txt: str, max_chars: int) -> str:
+        clipped = str(txt or "").strip()[:max_chars]
+        if not clipped:
+            return ""
+        rep = inspect_and_redact_outbound(clipped, redact_pii=False, fail_on_secret_detection=False)
+        return rep.sanitized_text
+
+    approved_atoms: list[dict[str, Any]] = []
+    review_queue: list[dict[str, Any]] = []
+
+    for fname in sorted(os.listdir(canon_atoms_str)):
+        if not is_content_markdown(fname):
+            continue
+        apath = safe_file_in_dir(canon_atoms_str, fname, allowed_exts={".md"}, must_exist=True)
+        if not apath or _is_reparse_or_link(apath) or not os.path.isfile(apath):
+            continue
+        try:
+            raw_bytes = Path(apath).read_bytes()
+            text = raw_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        parsed = split_frontmatter(text)
+        if parsed is None:
+            continue
+        fm = parse_frontmatter_values(parsed[0])
+        body = "\n".join(parsed[1])
+
+        sup_by = _to_list(fm.get("superseded_by", []))
+        rev_status = str(fm.get("review_status") or "pending").strip().lower()
+        claim_state = str(fm.get("claim_state") or "candidate").strip().lower()
+        if sup_by or rev_status in {"merged", "rejected"} or claim_state in {"superseded", "rejected"}:
+            continue
+
+        ep_label = str(fm.get("epistemic_label") or "claim").strip().lower()
+        ep_contract = str(fm.get("epistemic_contract") or "").strip()
+        if ep_label == "preference" or bool(ep_contract):
+            continue
+
+        vf = str(fm.get("valid_from") or "").strip()
+        vu = str(fm.get("valid_until") or "").strip()
+        tv = evaluate_temporal_validity(vf, vu)
+        if tv["status"] == "invalid_window":
+            continue
+
+        atom_sha = content_sha256(raw_bytes)
+        is_verified = (
+            rev_status == "accepted"
+            and bool(tv["active"])
+            and approved_revision_is_current(
+                apath,
+                decision_log_path=decision_log,
+                atoms_dir=canon_atoms_str,
+                brain_dir=str(active_brain),
+                known_atom_bytes=raw_bytes,
+                known_atom_sha256=atom_sha,
+                known_decision_map=decision_map,
+                source_sha_memo=source_memo,
+                canonical_atoms_root=canon_atoms_str,
+            )
+        )
+
+        atom_id = str(fm.get("id") or Path(fname).stem).strip()
+        claim = _dlp_clean(section_text(body, "Claim"), 2000)
+        evidence = _dlp_clean(section_text(body, "Evidence"), 2000)
+        why_matters = _dlp_clean(section_text(body, "Why It Matters"), 1000)
+        if not claim:
+            continue
+        contexts = _to_list(fm.get("contexts", []))
+        tags = _to_list(fm.get("tags", []))
+        links = _to_list(fm.get("links", []))
+
+        if is_verified:
+            approved_atoms.append(
+                {
+                    "filename": fname,
+                    "id": atom_id,
+                    "verified": True,
+                    "review_status": "accepted",
+                    "memory_type": str(fm.get("memory_type") or "semantic"),
+                    "claim": claim,
+                    "evidence": evidence,
+                    "why_it_matters": why_matters,
+                    "contexts": contexts,
+                    "tags": tags,
+                    "links": links,
+                    "evidence_source": str(fm.get("evidence_source") or ""),
+                    "valid_from": vf,
+                    "valid_until": vu,
+                    "sha256": atom_sha,
+                }
+            )
+        elif include_pending_review and rev_status in {"pending", "needs_edit"}:
+            review_queue.append(
+                {
+                    "filename": fname,
+                    "id": atom_id,
+                    "verified": False,
+                    "review_status": rev_status,
+                    "memory_type": str(fm.get("memory_type") or "semantic"),
+                    "claim": claim,
+                    "evidence": evidence,
+                    "contexts": contexts,
+                    "tags": tags,
+                    "links": links,
+                    "sha256": atom_sha,
+                }
+            )
+
+    return {
+        "exported_at": _utc_now_iso(),
+        "atoms": approved_atoms,
+        "review_queue": review_queue,
+    }
+
+
+def encrypt_mobile_recall_envelope(
+    catalog: dict[str, Any],
+    *,
+    vault_id: str,
+    recall_key_b64: str,
+    recall_key_id: str,
+) -> bytes:
+    """Encrypt a mobile recall catalog with HKDF-SHA256 + AES-256-GCM (`SBMR1\\x00`)."""
+    if not _HEX32_RE.fullmatch(str(vault_id or "")):
+        raise InboxDropError(f"Invalid 32-char hex vault_id: {vault_id!r}")
+    if not _HEX16_RE.fullmatch(str(recall_key_id or "")):
+        raise InboxDropError(f"Invalid 16-char hex recall_key_id: {recall_key_id!r}")
+    recall_key = base64.b64decode(recall_key_b64)
+    if len(recall_key) != 32 or hashlib.sha256(recall_key).hexdigest()[:16] != recall_key_id:
+        raise InboxDropSecurityError("Mobile recall key fingerprint mismatch.")
+
+    atoms = list(catalog.get("atoms") or [])
+    review_queue = list(catalog.get("review_queue") or [])
+    exported_at = str(catalog.get("exported_at") or _utc_now_iso())
+    payload_doc = {
+        "v": SBMR_VERSION,
+        "vault_id": vault_id,
+        "exported_at": exported_at,
+        "atoms": atoms,
+        "review_queue": review_queue,
+    }
+    plaintext = json.dumps(payload_doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    salt = secrets.token_bytes(16)
+    iv = secrets.token_bytes(NONCE_BYTES)
+    aes_key = _derive_mobile_recall_aes_key(
+        recall_key,
+        vault_id=vault_id,
+        recall_key_id=recall_key_id,
+        salt=salt,
+    )
+    aad = f"SBMR1|{vault_id}|{recall_key_id}|{exported_at}|{len(atoms)}|{len(review_queue)}".encode("utf-8")
+    ct = AESGCM(aes_key).encrypt(iv, plaintext, aad)
+
+    header = {
+        "atom_count": len(atoms),
+        "exported_at": exported_at,
+        "recall_key_id": recall_key_id,
+        "review_count": len(review_queue),
+        "salt_hex": salt.hex(),
+        "v": SBMR_VERSION,
+        "vault_id": vault_id,
+    }
+    header_bytes = json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    if len(header_bytes) > MAX_DROP_HEADER_BYTES:
+        raise InboxDropError("Mobile recall header exceeded size bound.")
+    envelope = SBMR_MAGIC + struct.pack(">H", len(header_bytes)) + header_bytes + iv + ct
+    if len(envelope) > MAX_RECALL_ENVELOPE_BYTES:
+        raise InboxDropError("Encrypted mobile recall index exceeded 16 MiB ceiling.")
+    return envelope
+
+
+def decrypt_mobile_recall_envelope(
+    envelope: bytes,
+    *,
+    vault_id: str,
+    recall_key_b64: str,
+    recall_key_id: str,
+) -> dict[str, Any]:
+    """Verify AAD + AES-256-GCM tag and decrypt an `SBMR1\\x00` mobile recall envelope."""
+    if not isinstance(envelope, (bytes, bytearray)) or len(envelope) < 8 + NONCE_BYTES + GCM_TAG_BYTES:
+        raise InboxDropSecurityError("Truncated or invalid SBMR1 recall envelope.")
+    if len(envelope) > MAX_RECALL_ENVELOPE_BYTES:
+        raise InboxDropSecurityError("Oversized SBMR1 recall envelope.")
+    raw = bytes(envelope)
+    if raw[:6] != SBMR_MAGIC:
+        raise InboxDropSecurityError("Invalid SBMR1 magic header.")
+    header_len = struct.unpack(">H", raw[6:8])[0]
+    if header_len <= 0 or header_len > MAX_DROP_HEADER_BYTES or len(raw) < 8 + header_len + NONCE_BYTES + GCM_TAG_BYTES:
+        raise InboxDropSecurityError("Malformed SBMR1 header length.")
+    try:
+        header = json.loads(raw[8 : 8 + header_len].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InboxDropSecurityError("Invalid SBMR1 header JSON.") from exc
+    if not isinstance(header, dict) or header.get("v") != SBMR_VERSION:
+        raise InboxDropSecurityError("Unsupported SBMR1 envelope version.")
+    if str(header.get("vault_id") or "") != vault_id:
+        raise InboxDropSecurityError("SBMR1 vault_id mismatch.")
+    if str(header.get("recall_key_id") or "") != recall_key_id:
+        raise InboxDropSecurityError("SBMR1 recall_key_id mismatch (device pairing may need rotation update).")
+    salt_hex = str(header.get("salt_hex") or "")
+    if not _HEX32_RE.fullmatch(salt_hex):
+        raise InboxDropSecurityError("Invalid SBMR1 HKDF salt.")
+
+    recall_key = base64.b64decode(recall_key_b64)
+    if len(recall_key) != 32 or hashlib.sha256(recall_key).hexdigest()[:16] != recall_key_id:
+        raise InboxDropSecurityError("Invalid recall_key_b64.")
+    aes_key = _derive_mobile_recall_aes_key(
+        recall_key,
+        vault_id=vault_id,
+        recall_key_id=recall_key_id,
+        salt=bytes.fromhex(salt_hex),
+    )
+    body = raw[8 + header_len :]
+    iv = body[:NONCE_BYTES]
+    ct = body[NONCE_BYTES:]
+    exported_at = str(header.get("exported_at") or "")
+    atom_count = int(header.get("atom_count", -1))
+    review_count = int(header.get("review_count", -1))
+    aad = f"SBMR1|{vault_id}|{recall_key_id}|{exported_at}|{atom_count}|{review_count}".encode("utf-8")
+    try:
+        pt = AESGCM(aes_key).decrypt(iv, ct, aad)
+        doc = json.loads(pt.decode("utf-8"))
+    except (InvalidTag, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InboxDropSecurityError("SBMR1 recall index authentication or decryption failed.") from exc
+    if not isinstance(doc, dict) or doc.get("vault_id") != vault_id:
+        raise InboxDropSecurityError("Decrypted SBMR1 catalog vault_id mismatch.")
+    return doc
+
+
+def export_mobile_recall_index(
+    *,
+    brain_dir: str | Path | None = None,
+    state_dir: str | Path | None = None,
+    output_file: str | Path | None = None,
+    include_pending_review: bool = True,
+    sync_to_backend: bool = True,
+    http_transport: Any = None,
+    skip_dns_check_for_mock_transport: bool = False,
+) -> dict[str, Any]:
+    """Build, encrypt (`SBMR1\\x00`), and publish `mobile-recall/<vault_id>.enc` to the sync target and/or file."""
+    from vault_sync import _backend_from_config, _load_sync_config, sync_config_path
+
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    cfg_path = sync_config_path(active_brain, state_dir=state_dir)
+    state = _load_drop_state(active_brain, state_dir=state_dir)
+
+    vault_id = ""
+    cfg: dict[str, Any] | None = None
+    if cfg_path.exists():
+        cfg = _load_sync_config(active_brain, state_dir=state_dir)
+        vault_id = str(cfg.get("vault_id") or "")
+    elif isinstance(state, dict) and state.get("vault_id"):
+        vault_id = str(state["vault_id"])
+    if not _HEX32_RE.fullmatch(vault_id):
+        raise InboxDropError("Initialize E2EE vault sync first (`second-brain sync init`) before exporting mobile recall.")
+
+    ensured = ensure_inbox_drop_keypair(
+        vault_id=vault_id,
+        brain_dir=active_brain,
+        state_dir=state_dir,
+    )
+    catalog = build_mobile_recall_catalog(
+        brain_dir=active_brain,
+        include_pending_review=include_pending_review,
+    )
+    envelope = encrypt_mobile_recall_envelope(
+        catalog,
+        vault_id=vault_id,
+        recall_key_b64=str(ensured["recall_key_b64"]),
+        recall_key_id=str(ensured["recall_key_id"]),
+    )
+    object_key = f"mobile-recall/{vault_id}.enc"
+
+    written_file: str | None = None
+    if output_file is not None:
+        out_p = Path(output_file).expanduser().resolve()
+        _assert_no_symlinks(out_p)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        tmp_p = out_p.parent / f".tmp-recall-{secrets.token_hex(6)}.enc"
+        fd = os.open(str(tmp_p), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(envelope)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(str(tmp_p), str(out_p))
+            restrict_security_file_permissions(out_p)
+            written_file = str(out_p)
+        finally:
+            if tmp_p.exists():
+                try:
+                    tmp_p.unlink()
+                except OSError:
+                    pass
+
+    uploaded_to_sync = False
+    if sync_to_backend and isinstance(cfg, dict):
+        backend = _backend_from_config(
+            cfg,
+            http_transport=http_transport,
+            skip_dns_check_for_mock_transport=skip_dns_check_for_mock_transport,
+        )
+        backend.put_object(object_key, envelope)
+        uploaded_to_sync = True
+
+    return {
+        "status": "exported",
+        "vault_id": vault_id,
+        "recall_key_id": str(ensured["recall_key_id"]),
+        "object_key": object_key,
+        "atom_count": len(catalog["atoms"]),
+        "review_count": len(catalog["review_queue"]),
+        "envelope_bytes": len(envelope),
+        "exported_at": catalog["exported_at"],
+        "uploaded_to_sync": uploaded_to_sync,
+        "output_file": written_file,
+    }

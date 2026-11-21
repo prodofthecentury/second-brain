@@ -72,8 +72,11 @@ from inbox_drop import (  # noqa: E402
     InboxDropSecurityError,
     MAX_DROP_ENVELOPE_BYTES,
     create_mobile_drop_pairing,
+    decrypt_mobile_recall_envelope,
     encrypt_inbox_drop_envelope,
+    export_mobile_recall_index,
     pull_inbox_drops_from_backend,
+    rotate_mobile_recall_key,
 )
 from ingest_multimodal import MAX_API_MEDIA_UPLOAD_BYTES  # noqa: E402
 from lexical_store import rebuild_lexical_index  # noqa: E402
@@ -989,6 +992,179 @@ class V100FinalCompletionTests(unittest.TestCase):
                 delete_consumed=False,
             )
             self.assertEqual(pull2["rejected_count"], 0)
+
+    def test_track7_mobile_bidirectional_drop_and_e2ee_recall_search_review(self) -> None:
+        """Mobile client supports both E2EE note drop (`SBID1`) and E2EE vault recall/search/review (`SBMR1`)."""
+        from vault_sync import init_sync, sync_push
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = _init_vault(root)
+            sync_target = root / "sync_bucket"
+            sync_state = root / "sync_state"
+
+            # Seed 2 approved atoms across two project scopes + 1 pending review candidate + 1 expired atom
+            _seed_approved_atom(
+                brain,
+                "logging-json-policy",
+                claim="Production services emit structured JSON logs with trace IDs.",
+                evidence="Engineering standard: Production services emit structured JSON logs with trace IDs.",
+                project="project:core",
+            )
+            _seed_approved_atom(
+                brain,
+                "consensus-quorum-policy",
+                claim="Raft consensus clusters require 3-of-5 quorum acknowledgment before commit.",
+                evidence="Consensus spec: Raft consensus clusters require 3-of-5 quorum acknowledgment before commit.",
+                project="project:infra",
+            )
+            _seed_approved_atom(
+                brain,
+                "expired-legacy-policy",
+                claim="Legacy v0 endpoints allow deprecated TLS 1.1 handshakes.",
+                evidence="Historical note: Legacy v0 endpoints allow deprecated TLS 1.1 handshakes.",
+                project="project:core",
+                valid_from="2020-01-01",
+                valid_until="2021-01-01",
+            )
+            pending_atom = brain / "2-atoms" / "pending-sodium-claim.md"
+            pending_atom.write_text(
+                "---\n"
+                "id: pending-sodium-claim\n"
+                "type: atom\n"
+                "memory_type: semantic\n"
+                "epistemic_label: claim\n"
+                "contexts: [project:core]\n"
+                "tags: [battery, unverified]\n"
+                "review_status: pending\n"
+                "claim_state: candidate\n"
+                "citation_integrity: missing\n"
+                "---\n\n"
+                "## Claim\nUnverified sodium-ion cell cost target is $38/kWh.\n\n"
+                "## Evidence\nDraft capture note.\n",
+                encoding="utf-8",
+            )
+
+            init_res = init_sync(
+                str(sync_target),
+                backend_type="local_folder",
+                brain_dir=brain,
+                kdf_mode="keyfile",
+                state_dir=sync_state,
+            )
+            vault_id = str(init_res["vault_id"])
+
+            # 1. Default pairing is strictly write-only; `--include-recall` adds `SBMR1` recall key
+            drop_only = create_mobile_drop_pairing(
+                label="Drop Only Phone",
+                vault_id=vault_id,
+                brain_dir=brain,
+                state_dir=sync_state,
+            )
+            self.assertFalse(drop_only["include_recall"])
+            self.assertNotIn("recall_key_b64", drop_only["pairing_bundle"])
+
+            bidir = create_mobile_drop_pairing(
+                label="Owner Bidirectional Phone",
+                vault_id=vault_id,
+                include_recall=True,
+                brain_dir=brain,
+                state_dir=sync_state,
+            )
+            self.assertTrue(bidir["include_recall"])
+            self.assertIn("recall_key_b64", bidir["pairing_bundle"])
+
+            # 2. sync_push automatically exports `mobile-recall/<vault_id>.enc` when recall pairing is active
+            push_res = sync_push(brain_dir=brain, state_dir=sync_state)
+            self.assertTrue(push_res["mobile_recall_exported"])
+            enc_recall_file = sync_target / "mobile-recall" / f"{vault_id}.enc"
+            self.assertTrue(enc_recall_file.is_file())
+
+            # Python roundtrip decrypts 2 active approved atoms (expired atom excluded!) + 1 pending review item
+            py_cat = decrypt_mobile_recall_envelope(
+                enc_recall_file.read_bytes(),
+                vault_id=vault_id,
+                recall_key_b64=bidir["pairing_bundle"]["recall_key_b64"],
+                recall_key_id=bidir["pairing_bundle"]["recall_key_id"],
+            )
+            self.assertEqual(len(py_cat["atoms"]), 2)
+            self.assertEqual(len(py_cat["review_queue"]), 1)
+
+            # 3. Real Node WebCrypto (`mobile/inbox-drop/drop-crypto.js`) decrypts, searches, filters, AND drops a review note!
+            drop_crypto_js = (REPO_ROOT / "mobile" / "inbox-drop" / "drop-crypto.js").as_posix()
+            node_out_drop = root / "mobile_review_drop.enc"
+            node_script = f"""
+const fs = require("fs");
+const dc = require({json.dumps(drop_crypto_js)});
+(async () => {{
+  const bidir = dc.parsePairingFragment({json.dumps(bidir["pairing_fragment"])});
+  const dropOnly = dc.parsePairingFragment({json.dumps(drop_only["pairing_fragment"])});
+  const encBytes = new Uint8Array(fs.readFileSync({json.dumps(enc_recall_file.as_posix())}));
+
+  let dropOnlyBlocked = false;
+  try {{
+    await dc.decryptMobileRecallEnvelope(encBytes, dropOnly);
+  }} catch (_e) {{
+    dropOnlyBlocked = true;
+  }}
+  if (!dropOnlyBlocked) throw new Error("Write-only pairing decrypted recall catalog!");
+
+  const cat = await dc.decryptMobileRecallEnvelope(encBytes, bidir);
+  const qHits = dc.searchMobileRecallCatalog(cat, "structured JSON logs", {{ view: "verified" }});
+  const scopedHits = dc.searchMobileRecallCatalog(cat, "", {{ view: "verified", projectScope: "project:infra" }});
+  const revHits = dc.searchMobileRecallCatalog(cat, "sodium", {{ view: "review" }});
+
+  const drop = await dc.encryptInboxDropEnvelope({{
+    title: "Review candidate: " + revHits[0].filename,
+    text: "Verified source excerpt check requested from mobile review.",
+    tags: ["mobile-review", "project:core"]
+  }}, bidir);
+  fs.writeFileSync({json.dumps(node_out_drop.as_posix())}, Buffer.from(drop.envelopeBytes));
+
+  console.log(JSON.stringify({{
+    atomCount: cat.atomCount,
+    reviewCount: cat.reviewCount,
+    topVerified: qHits.map(x => x.filename),
+    infraScoped: scopedHits.map(x => x.filename),
+    reviewFound: revHits.map(x => x.filename),
+    dropId: drop.dropId
+  }}));
+}})().catch(err => {{ console.error(err); process.exit(1); }});
+"""
+            proc = subprocess.run(
+                ["node", "-e", node_script],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            js_res = json.loads(proc.stdout.strip())
+            self.assertEqual(js_res["atomCount"], 2)
+            self.assertEqual(js_res["reviewCount"], 1)
+            self.assertEqual(js_res["topVerified"][0], "logging-json-policy.md")
+            self.assertEqual(js_res["infraScoped"], ["consensus-quorum-policy.md"])
+            self.assertEqual(js_res["reviewFound"], ["pending-sodium-claim.md"])
+
+            # Ingest the mobile review drop back into quarantined 0-raw/inbox/
+            (sync_target / "inbox-drops").mkdir(parents=True, exist_ok=True)
+            (sync_target / "inbox-drops" / f"{js_res['dropId']}.enc").write_bytes(node_out_drop.read_bytes())
+            ingested = pull_inbox_drops_from_backend(
+                LocalFolderSyncBackend(sync_target),
+                brain_dir=brain,
+                state_dir=sync_state,
+            )
+            self.assertEqual(ingested["ingested_count"], 1)
+
+            # 4. Rotating recall key invalidates old pairing on newly exported catalog
+            rotate_mobile_recall_key(vault_id=vault_id, brain_dir=brain, state_dir=sync_state)
+            export_mobile_recall_index(brain_dir=brain, state_dir=sync_state)
+            with self.assertRaises(InboxDropSecurityError):
+                decrypt_mobile_recall_envelope(
+                    enc_recall_file.read_bytes(),
+                    vault_id=vault_id,
+                    recall_key_b64=bidir["pairing_bundle"]["recall_key_b64"],
+                    recall_key_id=bidir["pairing_bundle"]["recall_key_id"],
+                )
 
 
 if __name__ == "__main__":

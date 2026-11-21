@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "second-brain-inbox-drop-v1";
+const CACHE_NAME = "second-brain-inbox-drop-v2";
 const APP_SHELL = [
   "./index.html",
   "./styles.css",

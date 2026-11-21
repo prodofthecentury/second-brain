@@ -6,7 +6,7 @@
   <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#0b0f19">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https: http://127.0.0.1:*; manifest-src 'self'; base-uri 'none'; form-action 'none'">
-  <title>Second Brain — E2EE Mobile Inbox Drop</title>
+  <title>Second Brain — E2EE Mobile Companion</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -14,56 +14,107 @@
   <main class="shell">
     <header class="topbar">
       <div>
-        <span class="eyebrow">Zero-Knowledge Mobile Capture</span>
-        <h1>Second Brain Drop</h1>
+        <span class="eyebrow">Zero-Knowledge Mobile Capture &amp; Recall</span>
+        <h1>Second Brain Mobile</h1>
       </div>
       <span id="pairingBadge" class="badge badge-warn">Unpaired</span>
     </header>
 
+    <nav class="tabbar" role="tablist" aria-label="Mobile workspace">
+      <button id="tabCaptureBtn" type="button" role="tab" aria-selected="true" class="tab-btn tab-active">Drop Note</button>
+      <button id="tabRecallBtn" type="button" role="tab" aria-selected="false" class="tab-btn">Recall &amp; Review</button>
+    </nav>
+
     <p id="statusBanner" class="banner hidden" role="status" aria-live="polite"></p>
 
-    <section class="card" aria-labelledby="captureHeading">
-      <h2 id="captureHeading">Quick-Capture to Quarantined Inbox</h2>
-      <p class="hint">Client-side encrypted with forward-secret ECDH P-256 + AES-256-GCM before leaving your phone. Zero relay server.</p>
+    <div id="panelCapture" role="tabpanel" aria-labelledby="tabCaptureBtn">
+      <section class="card" aria-labelledby="captureHeading">
+        <h2 id="captureHeading">Quick-Capture to Quarantined Inbox</h2>
+        <p class="hint">Client-side encrypted with forward-secret ECDH P-256 + AES-256-GCM before leaving your phone. Zero relay server.</p>
 
-      <label class="field">
-        <span>Title (optional)</span>
-        <input id="dropTitle" type="text" maxlength="240" placeholder="Article or idea summary">
-      </label>
+        <label class="field">
+          <span>Title (optional)</span>
+          <input id="dropTitle" type="text" maxlength="240" placeholder="Article or idea summary">
+        </label>
 
-      <label class="field">
-        <span>URL (optional)</span>
-        <input id="dropUrl" type="url" maxlength="2048" placeholder="https://example.com/article">
-      </label>
+        <label class="field">
+          <span>URL (optional)</span>
+          <input id="dropUrl" type="url" maxlength="2048" placeholder="https://example.com/article">
+        </label>
 
-      <label class="field">
-        <span>Note / Quote</span>
-        <textarea id="dropText" rows="5" maxlength="64000" placeholder="Key takeaway, excerpt, or thought..."></textarea>
-      </label>
+        <label class="field">
+          <span>Note / Quote</span>
+          <textarea id="dropText" rows="5" maxlength="64000" placeholder="Key takeaway, excerpt, or thought..."></textarea>
+        </label>
 
-      <label class="field">
-        <span>Tags (comma-separated)</span>
-        <input id="dropTags" type="text" maxlength="240" placeholder="mobile, reading, project:research">
-      </label>
+        <label class="field">
+          <span>Tags (comma-separated)</span>
+          <input id="dropTags" type="text" maxlength="240" placeholder="mobile, reading, project:research">
+        </label>
 
-      <div class="actions">
-        <button id="sendDropBtn" type="button" class="btn btn-primary">Encrypt &amp; Drop to S3/R2</button>
-        <button id="downloadEncBtn" type="button" class="btn btn-ghost">Save .enc File</button>
-      </div>
-    </section>
+        <div class="actions">
+          <button id="sendDropBtn" type="button" class="btn btn-primary">Encrypt &amp; Drop to S3/R2</button>
+          <button id="downloadEncBtn" type="button" class="btn btn-ghost">Save .enc File</button>
+        </div>
+      </section>
 
-    <section id="outboxCard" class="card hidden" aria-labelledby="outboxHeading">
-      <div class="row-between">
-        <h2 id="outboxHeading">Offline Outbox (<span id="outboxCount">0</span>)</h2>
-        <button id="flushOutboxBtn" type="button" class="btn btn-small">Retry All</button>
-      </div>
-      <p class="hint">Encrypted envelopes queued offline; only ciphertext is stored locally.</p>
-    </section>
+      <section id="outboxCard" class="card hidden" aria-labelledby="outboxHeading">
+        <div class="row-between">
+          <h2 id="outboxHeading">Offline Outbox (<span id="outboxCount">0</span>)</h2>
+          <button id="flushOutboxBtn" type="button" class="btn btn-small">Retry All</button>
+        </div>
+        <p class="hint">Encrypted envelopes queued offline; only ciphertext is stored locally.</p>
+      </section>
+    </div>
+
+    <div id="panelRecall" role="tabpanel" aria-labelledby="tabRecallBtn" class="hidden">
+      <section class="card" aria-labelledby="recallHeading">
+        <div class="row-between">
+          <h2 id="recallHeading">Vault Recall, Search &amp; Review</h2>
+          <span id="recallCapabilityBadge" class="badge badge-warn">Drop-Only Key</span>
+        </div>
+        <p class="hint">Decrypts <code>mobile-recall/&lt;vault_id&gt;.enc</code> (`SBMR1` AES-256-GCM) in RAM. Only ciphertext is cached offline.</p>
+
+        <div class="actions recall-sync-actions">
+          <button id="syncRecallBtn" type="button" class="btn btn-primary">Sync Encrypted Vault</button>
+          <label class="btn btn-ghost file-btn-label">
+            Load .enc File
+            <input id="importRecallInput" type="file" accept=".enc,application/octet-stream" class="visually-hidden">
+          </label>
+        </div>
+
+        <div class="recall-controls">
+          <label class="field">
+            <span>Search Approved Claims, Evidence &amp; Tags</span>
+            <input id="recallQueryInput" type="search" maxlength="240" placeholder="Search structured logging, consensus, auth...">
+          </label>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>Project Scope</span>
+              <select id="recallProjectSelect">
+                <option value="">All Scopes</option>
+              </select>
+            </label>
+            <div class="field">
+              <span>View Mode</span>
+              <div class="seg-group" role="group" aria-label="Atom status view">
+                <button id="viewVerifiedBtn" type="button" class="seg-btn seg-active">Verified (<span id="verifiedCount">0</span>)</button>
+                <button id="viewReviewBtn" type="button" class="seg-btn">Review (<span id="reviewCount">0</span>)</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <p id="recallMetaLine" class="hint meta-line">No encrypted vault catalog loaded yet. Pair with <code>--include-recall</code> and tap Sync or Load .enc File.</p>
+        <div id="recallResultsList" class="results-list" aria-live="polite"></div>
+      </section>
+    </div>
 
     <details id="pairingDetails" class="card">
       <summary>Device Pairing &amp; S3/R2 Target</summary>
       <div class="details-body">
-        <p id="pairingSummary" class="hint">Open your `#pair=...` link or paste the pairing URI generated by `second-brain sync drop-pair`.</p>
+        <p id="pairingSummary" class="hint">Open your `#pair=...` link or paste the pairing URI generated by `second-brain sync drop-pair --include-recall`.</p>
         <label class="field">
           <span>Pairing URI or `#pair=` Fragment</span>
           <input id="pairInput" type="password" autocomplete="off" placeholder="#pair=eyJ...">
@@ -78,13 +129,13 @@
             <input id="s3RegionInput" type="text" value="auto" maxlength="32">
           </label>
           <label class="field">
-            <span>Write-Only Access Key ID</span>
+            <span>Scoped Access Key ID</span>
             <input id="s3AccessKeyInput" type="text" autocomplete="off" placeholder="AKIA...">
           </label>
         </div>
         <label class="field">
-          <span>Write-Only Secret Access Key (`inbox-drops/*` PutObject)</span>
-          <input id="s3SecretKeyInput" type="password" autocomplete="off" placeholder="Secret key scoped to PutObject">
+          <span>Scoped Secret Access Key (`inbox-drops/*` PutObject &amp; optional `mobile-recall/*` GetObject)</span>
+          <input id="s3SecretKeyInput" type="password" autocomplete="off" placeholder="Scoped S3/R2 secret key">
         </label>
         <div class="actions">
           <button id="savePairingBtn" type="button" class="btn btn-primary">Save Pairing</button>

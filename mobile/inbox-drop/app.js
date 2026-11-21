@@ -3,9 +3,15 @@
 
   const STORAGE_PAIRING_KEY = "sb_inbox_drop_pairing_v1";
   const STORAGE_OUTBOX_KEY = "sb_inbox_drop_outbox_v1";
+  const STORAGE_RECALL_CIPHER_KEY = "sb_mobile_recall_cipher_v1";
 
   const elBadge = document.getElementById("pairingBadge");
   const elBanner = document.getElementById("statusBanner");
+  const elTabCaptureBtn = document.getElementById("tabCaptureBtn");
+  const elTabRecallBtn = document.getElementById("tabRecallBtn");
+  const elPanelCapture = document.getElementById("panelCapture");
+  const elPanelRecall = document.getElementById("panelRecall");
+
   const elTitle = document.getElementById("dropTitle");
   const elUrl = document.getElementById("dropUrl");
   const elText = document.getElementById("dropText");
@@ -15,6 +21,19 @@
   const elOutboxCard = document.getElementById("outboxCard");
   const elOutboxCount = document.getElementById("outboxCount");
   const elFlushBtn = document.getElementById("flushOutboxBtn");
+
+  const elRecallCapBadge = document.getElementById("recallCapabilityBadge");
+  const elSyncRecallBtn = document.getElementById("syncRecallBtn");
+  const elImportRecallInput = document.getElementById("importRecallInput");
+  const elRecallQuery = document.getElementById("recallQueryInput");
+  const elRecallProj = document.getElementById("recallProjectSelect");
+  const elViewVerifiedBtn = document.getElementById("viewVerifiedBtn");
+  const elViewReviewBtn = document.getElementById("viewReviewBtn");
+  const elVerifiedCount = document.getElementById("verifiedCount");
+  const elReviewCount = document.getElementById("reviewCount");
+  const elRecallMeta = document.getElementById("recallMetaLine");
+  const elRecallResults = document.getElementById("recallResultsList");
+
   const elPairingDetails = document.getElementById("pairingDetails");
   const elPairingSummary = document.getElementById("pairingSummary");
   const elPairInput = document.getElementById("pairInput");
@@ -25,10 +44,23 @@
   const elSavePairingBtn = document.getElementById("savePairingBtn");
   const elClearPairingBtn = document.getElementById("clearPairingBtn");
 
+  let decryptedCatalog = null;
+  let activeRecallView = "verified";
+
   function showStatus(msg, isError) {
     elBanner.textContent = String(msg || "");
     elBanner.classList.remove("hidden", "banner-error", "banner-ok");
     elBanner.classList.add(isError ? "banner-error" : "banner-ok");
+  }
+
+  function switchTab(tabName) {
+    const isRecall = tabName === "recall";
+    elTabCaptureBtn.setAttribute("aria-selected", isRecall ? "false" : "true");
+    elTabRecallBtn.setAttribute("aria-selected", isRecall ? "true" : "false");
+    elTabCaptureBtn.classList.toggle("tab-active", !isRecall);
+    elTabRecallBtn.classList.toggle("tab-active", isRecall);
+    elPanelCapture.classList.toggle("hidden", isRecall);
+    elPanelRecall.classList.toggle("hidden", !isRecall);
   }
 
   function loadPairing() {
@@ -73,14 +105,22 @@
   function refreshPairingUi() {
     const p = loadPairing();
     if (p && p.vault_id && p.recipient_pubkey_b64) {
-      elBadge.textContent = "Paired (" + String(p.key_id || "").slice(0, 8) + ")";
+      const hasRecall = Boolean(p.recall_key_b64 && p.recall_key_id);
+      elBadge.textContent =
+        (hasRecall ? "Drop + Recall (" : "Paired (") + String(p.key_id || "").slice(0, 8) + ")";
       elBadge.className = "badge badge-ok";
+      elRecallCapBadge.textContent = hasRecall
+        ? "E2EE Recall (" + String(p.recall_key_id).slice(0, 8) + ")"
+        : "Drop-Only Key";
+      elRecallCapBadge.className = hasRecall ? "badge badge-ok" : "badge badge-warn";
       elPairingSummary.textContent =
         "Paired to vault " +
         String(p.vault_id).slice(0, 12) +
         "… (token " +
         String(p.token_id).slice(0, 8) +
-        "…).";
+        "…, recall=" +
+        (hasRecall ? "enabled" : "off") +
+        ").";
       if (p.target_url) {
         elTargetInput.value = p.target_url;
       }
@@ -93,6 +133,8 @@
     } else {
       elBadge.textContent = "Unpaired";
       elBadge.className = "badge badge-warn";
+      elRecallCapBadge.textContent = "Unpaired";
+      elRecallCapBadge.className = "badge badge-warn";
       elPairingDetails.open = true;
     }
   }
@@ -132,7 +174,7 @@
         prev
       );
       savePairing(parsed);
-      showStatus("Paired zero-knowledge P-256 drop key and scrubbed URL hash.", false);
+      showStatus("Paired zero-knowledge device keys and scrubbed URL hash.", false);
     } catch (err) {
       showStatus("Pairing import failed: " + err.message, true);
     } finally {
@@ -150,6 +192,13 @@
     }
     const params = new URLSearchParams(window.location.search);
     let consumed = false;
+    if (params.get("tab") === "recall") {
+      switchTab("recall");
+      if (params.get("q")) {
+        elRecallQuery.value = params.get("q");
+      }
+      consumed = true;
+    }
     if (params.get("title")) {
       elTitle.value = params.get("title");
       consumed = true;
@@ -204,7 +253,7 @@
     const sk = String(pairing.s3_secret_access_key || elSkInput.value || "").trim();
     const region = String(pairing.s3_region || elRegionInput.value || "auto").trim() || "auto";
     if (!targetBase || !ak || !sk) {
-      throw new Error("Configure S3/R2 endpoint and write-scoped credentials (or use Save .enc File).");
+      throw new Error("Configure S3/R2 endpoint and scoped credentials (or use Save .enc File).");
     }
     const putUrl = targetBase + "/" + objectKey;
     const signed = await window.SecondBrainDropCrypto.signS3PutRequest({
@@ -243,6 +292,291 @@
     }
     return u8;
   }
+
+  function refreshProjectOptions(catalog) {
+    const current = elRecallProj.value;
+    const scopes = new Set();
+    const allItems = []
+      .concat(Array.isArray(catalog.atoms) ? catalog.atoms : [])
+      .concat(Array.isArray(catalog.reviewQueue) ? catalog.reviewQueue : []);
+    for (const item of allItems) {
+      for (const ctx of Array.isArray(item.contexts) ? item.contexts : []) {
+        const clean = String(ctx || "").trim().toLowerCase();
+        if (clean.startsWith("project:")) {
+          scopes.add(clean);
+        }
+      }
+    }
+    while (elRecallProj.options.length > 1) {
+      elRecallProj.remove(1);
+    }
+    for (const sc of Array.from(scopes).sort()) {
+      const opt = document.createElement("option");
+      opt.value = sc;
+      opt.textContent = sc;
+      elRecallProj.appendChild(opt);
+    }
+    if (current && scopes.has(current)) {
+      elRecallProj.value = current;
+    }
+  }
+
+  function prepareReviewNoteDrop(item) {
+    const fname = String(item.filename || item.id || "atom.md");
+    const revPrefix = String(item.sha256 || "").slice(0, 12);
+    const isPending = !item.verified;
+    elTitle.value = (isPending ? "Review candidate: " : "Correction / note on: ") + fname;
+    elUrl.value = "";
+    elTags.value = "mobile-review, atom:" + String(item.id || fname.replace(/\.md$/, ""));
+    elText.value =
+      "Target Atom: " + fname + (revPrefix ? " (rev " + revPrefix + ")" : "") + "\n" +
+      "Current Claim: " + String(item.claim || "") + "\n\n" +
+      (isPending ? "Owner Review Note (confirm / edit / reject): " : "Follow-up / Correction Note: ");
+    switchTab("capture");
+    elText.focus();
+    showStatus("Prepared encrypted review note for " + fname + " in Drop Note tab.", false);
+  }
+
+  function renderRecallResults() {
+    while (elRecallResults.firstChild) {
+      elRecallResults.removeChild(elRecallResults.firstChild);
+    }
+    if (!decryptedCatalog) {
+      elVerifiedCount.textContent = "0";
+      elReviewCount.textContent = "0";
+      return;
+    }
+    elVerifiedCount.textContent = String(decryptedCatalog.atomCount || 0);
+    elReviewCount.textContent = String(decryptedCatalog.reviewCount || 0);
+
+    const results = window.SecondBrainDropCrypto.searchMobileRecallCatalog(
+      decryptedCatalog,
+      elRecallQuery.value,
+      {
+        view: activeRecallView,
+        projectScope: elRecallProj.value,
+        limit: 50,
+      }
+    );
+    elRecallMeta.textContent =
+      "Snapshot " +
+      String(decryptedCatalog.exportedAt || "") +
+      " • Showing " +
+      results.length +
+      " " +
+      (activeRecallView === "review" ? "pending candidate(s)" : "verified atom(s)") +
+      ".";
+
+    if (results.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "hint";
+      empty.textContent =
+        activeRecallView === "review"
+          ? "No matching pending review items."
+          : "No matching owner-verified atoms found.";
+      elRecallResults.appendChild(empty);
+      return;
+    }
+
+    for (const item of results) {
+      const article = document.createElement("article");
+      article.className = "atom-card";
+
+      const topRow = document.createElement("div");
+      topRow.className = "row-between atom-card-head";
+
+      const fnameSpan = document.createElement("span");
+      fnameSpan.className = "atom-filename";
+      fnameSpan.textContent = String(item.filename || item.id || "");
+      topRow.appendChild(fnameSpan);
+
+      const statusBadge = document.createElement("span");
+      statusBadge.className = item.verified ? "badge badge-ok" : "badge badge-warn";
+      statusBadge.textContent = item.verified ? "Verified" : "Unverified (" + String(item.review_status || "pending") + ")";
+      topRow.appendChild(statusBadge);
+      article.appendChild(topRow);
+
+      const claimP = document.createElement("p");
+      claimP.className = "atom-claim";
+      claimP.textContent = String(item.claim || "");
+      article.appendChild(claimP);
+
+      const chipList = []
+        .concat(Array.isArray(item.contexts) ? item.contexts : [])
+        .concat(Array.isArray(item.tags) ? item.tags : []);
+      if (chipList.length > 0) {
+        const chipsDiv = document.createElement("div");
+        chipsDiv.className = "chip-row";
+        for (const tag of chipList.slice(0, 8)) {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.textContent = String(tag);
+          chipsDiv.appendChild(chip);
+        }
+        article.appendChild(chipsDiv);
+      }
+
+      const details = document.createElement("details");
+      details.className = "atom-details";
+      const summary = document.createElement("summary");
+      summary.textContent = "Evidence & Provenance";
+      details.appendChild(summary);
+
+      const evQuote = document.createElement("blockquote");
+      evQuote.className = "atom-evidence";
+      evQuote.textContent = String(item.evidence || "(no excerpt)");
+      details.appendChild(evQuote);
+
+      if (item.evidence_source) {
+        const srcLine = document.createElement("p");
+        srcLine.className = "atom-meta";
+        srcLine.textContent = "Source: " + String(item.evidence_source);
+        details.appendChild(srcLine);
+      }
+      if (Array.isArray(item.links) && item.links.length > 0) {
+        const linkLine = document.createElement("p");
+        linkLine.className = "atom-meta";
+        linkLine.textContent = "Linked: " + item.links.join(", ");
+        details.appendChild(linkLine);
+      }
+
+      const reviewBtn = document.createElement("button");
+      reviewBtn.type = "button";
+      reviewBtn.className = "btn btn-small review-drop-btn";
+      reviewBtn.textContent = item.verified ? "Drop Correction / Follow-up Note" : "Drop Review Decision Note";
+      reviewBtn.addEventListener("click", function () {
+        prepareReviewNoteDrop(item);
+      });
+      details.appendChild(reviewBtn);
+
+      article.appendChild(details);
+      elRecallResults.appendChild(article);
+    }
+  }
+
+  async function ingestEncryptedRecallBytes(envelopeBytes, persistCipher) {
+    const pairing = loadPairing();
+    if (!pairing) {
+      throw new Error("Pair this device first under 'Device Pairing & S3/R2 Target'.");
+    }
+    const catalog = await window.SecondBrainDropCrypto.decryptMobileRecallEnvelope(envelopeBytes, pairing);
+    decryptedCatalog = catalog;
+    if (persistCipher) {
+      try {
+        localStorage.setItem(STORAGE_RECALL_CIPHER_KEY, bytesToBase64Local(envelopeBytes));
+      } catch (_storageErr) {
+        // Ignore quota limits on very large vaults; in-memory catalog stays active.
+      }
+    }
+    refreshProjectOptions(catalog);
+    renderRecallResults();
+    return catalog;
+  }
+
+  async function restoreCachedRecallIfAvailable() {
+    const pairing = loadPairing();
+    if (!pairing || !pairing.recall_key_b64) {
+      return;
+    }
+    const cachedB64 = localStorage.getItem(STORAGE_RECALL_CIPHER_KEY);
+    if (!cachedB64) {
+      return;
+    }
+    try {
+      await ingestEncryptedRecallBytes(base64ToBytesLocal(cachedB64), false);
+    } catch (_err) {
+      localStorage.removeItem(STORAGE_RECALL_CIPHER_KEY);
+    }
+  }
+
+  elTabCaptureBtn.addEventListener("click", function () {
+    switchTab("capture");
+  });
+  elTabRecallBtn.addEventListener("click", function () {
+    switchTab("recall");
+  });
+
+  elViewVerifiedBtn.addEventListener("click", function () {
+    activeRecallView = "verified";
+    elViewVerifiedBtn.classList.add("seg-active");
+    elViewReviewBtn.classList.remove("seg-active");
+    renderRecallResults();
+  });
+
+  elViewReviewBtn.addEventListener("click", function () {
+    activeRecallView = "review";
+    elViewReviewBtn.classList.add("seg-active");
+    elViewVerifiedBtn.classList.remove("seg-active");
+    renderRecallResults();
+  });
+
+  elRecallQuery.addEventListener("input", renderRecallResults);
+  elRecallProj.addEventListener("change", renderRecallResults);
+
+  elSyncRecallBtn.addEventListener("click", async function () {
+    elSyncRecallBtn.disabled = true;
+    try {
+      const pairing = loadPairing();
+      if (!pairing) {
+        throw new Error("Pair this device first.");
+      }
+      if (!pairing.recall_key_b64 || !pairing.recall_key_id) {
+        throw new Error("Re-pair with `second-brain sync drop-pair --include-recall` to enable E2EE Recall.");
+      }
+      const targetBase = String(pairing.target_url || elTargetInput.value || "").trim().replace(/\/+$/, "");
+      const ak = String(pairing.s3_access_key_id || elAkInput.value || "").trim();
+      const sk = String(pairing.s3_secret_access_key || elSkInput.value || "").trim();
+      const region = String(pairing.s3_region || elRegionInput.value || "auto").trim() || "auto";
+      if (!targetBase || !ak || !sk) {
+        throw new Error("Configure S3/R2 endpoint & credentials, or tap 'Load .enc File' to import offline.");
+      }
+      const objKey = String(pairing.recall_object_key || ("mobile-recall/" + pairing.vault_id + ".enc"));
+      const signed = await window.SecondBrainDropCrypto.signS3GetRequest({
+        url: targetBase + "/" + objKey,
+        accessKeyId: ak,
+        secretAccessKey: sk,
+        region: region,
+      });
+      const resp = await fetch(signed.url, {
+        method: "GET",
+        headers: signed.headers,
+        mode: "cors",
+        credentials: "omit",
+      });
+      if (!resp.ok) {
+        throw new Error("S3/R2 GET " + objKey + " failed with HTTP " + resp.status);
+      }
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      const cat = await ingestEncryptedRecallBytes(buf, true);
+      showStatus(
+        "Synced & decrypted " + cat.atomCount + " verified atom(s) + " + cat.reviewCount + " review item(s).",
+        false
+      );
+    } catch (err) {
+      showStatus(err.message, true);
+    } finally {
+      elSyncRecallBtn.disabled = false;
+    }
+  });
+
+  elImportRecallInput.addEventListener("change", async function (ev) {
+    const file = ev.target && ev.target.files ? ev.target.files[0] : null;
+    if (!file) {
+      return;
+    }
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const cat = await ingestEncryptedRecallBytes(buf, true);
+      showStatus(
+        "Loaded & decrypted " + cat.atomCount + " verified atom(s) + " + cat.reviewCount + " review item(s).",
+        false
+      );
+    } catch (err) {
+      showStatus("Recall decrypt failed: " + err.message, true);
+    } finally {
+      elImportRecallInput.value = "";
+    }
+  });
 
   elSendBtn.addEventListener("click", async function () {
     elSendBtn.disabled = true;
@@ -286,6 +620,8 @@
       showStatus("Saved encrypted " + built.enc.dropId + ".enc (place inside sync inbox-drops/ folder).", false);
     } catch (err) {
       showStatus(err.message, true);
+    } finally {
+      elDownloadBtn.disabled = false;
     }
   });
 
@@ -341,21 +677,26 @@
       elPairInput.value = "";
       elSkInput.value = "";
       showStatus("Saved zero-knowledge pairing configuration.", false);
+      restoreCachedRecallIfAvailable();
     } catch (err) {
       showStatus(err.message, true);
     }
   });
 
   elClearPairingBtn.addEventListener("click", function () {
+    decryptedCatalog = null;
     localStorage.removeItem(STORAGE_PAIRING_KEY);
+    localStorage.removeItem(STORAGE_RECALL_CIPHER_KEY);
     refreshPairingUi();
-    showStatus("Cleared device pairing keys from browser storage.", false);
+    renderRecallResults();
+    showStatus("Cleared device pairing keys and cached recall ciphertext from browser storage.", false);
   });
 
   importHashIfPresent();
   populateShareTargetParams();
   refreshPairingUi();
   refreshOutboxUi();
+  restoreCachedRecallIfAvailable();
 
   if ("serviceWorker" in navigator && window.location.protocol === "https:") {
     navigator.serviceWorker.register("sw.js").catch(function () {});

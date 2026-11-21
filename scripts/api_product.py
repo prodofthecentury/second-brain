@@ -822,6 +822,12 @@ def _live_approved_atom_sha(fname: object, rt) -> str | None:
         return None
     if rec.get("review_status") != "accepted" or bool(rec.get("superseded_by")):
         return None
+    tv_live_atom = evaluate_temporal_validity(
+        str(rec.get("valid_from") or "").strip(),
+        str(rec.get("valid_until") or "").strip(),
+    )
+    if not tv_live_atom["active"] or tv_live_atom["status"] != "active":
+        return None
     if not approved_revision_is_current(ap, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir):
         return None
     return content_sha256(raw_bytes)
@@ -891,16 +897,26 @@ def _prove_leaf_fallback(
             if not pp:
                 raise FileNotFoundError(f"Playbook not found: {leaf_ref}")
             candidates.append(f"5-playbooks/{os.path.basename(pp)}")
+        elif prefix in {"6-skills", "skills"}:
+            skills_dir = os.path.join(brain_dir, "6-skills")
+            sp = safe_file_in_dir(skills_dir, raw_name, allowed_exts={".md"}, must_exist=True)
+            if not sp:
+                raise FileNotFoundError(f"Executable skill not found: {leaf_ref}")
+            candidates.append(f"6-skills/{os.path.basename(sp)}")
         else:
             raise FileNotFoundError(f"Unknown vault leaf prefix: {leaf_ref}")
     elif len(parts) == 1:
         raw_name = normalize_markdown_filename(parts[0])
+        skills_dir = os.path.join(brain_dir, "6-skills")
         ap = safe_file_in_dir(atoms_dir, raw_name, allowed_exts={".md"}, must_exist=True)
         pp = safe_file_in_dir(playbooks_dir, raw_name, allowed_exts={".md"}, must_exist=True)
+        sp = safe_file_in_dir(skills_dir, raw_name, allowed_exts={".md"}, must_exist=True) if os.path.isdir(skills_dir) else None
         if ap:
             candidates.append(f"2-atoms/{os.path.basename(ap)}")
         if pp:
             candidates.append(f"5-playbooks/{os.path.basename(pp)}")
+        if sp:
+            candidates.append(f"6-skills/{os.path.basename(sp)}")
         if not candidates:
             raise FileNotFoundError(f"Leaf not found: {leaf_ref}")
     else:
@@ -1481,8 +1497,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     base = _atom_summary_from_indexed_row(fname, row.content, row.content_sha256)
                     if base is None:
                         continue
-                    if proj_filter and not project_tags_match(tuple(base["contexts"]), (proj_filter,)):  # type: ignore[arg-type]
-                        continue
+                    if proj_filter:
+                        if is_owner:
+                            if not project_tags_match(tuple(base["contexts"]), (proj_filter,)):  # type: ignore[arg-type]
+                                continue
+                        elif not _tags_strictly_in_project_scope(tuple(base["contexts"]), proj_filter):  # type: ignore[arg-type]
+                            continue
                     if not is_owner and (
                         base.get("epistemic_label") == "preference" or bool(base.get("epistemic_contract"))
                     ):
@@ -1529,8 +1549,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         )
                         if not (q_terms & haystack):
                             continue
-                    if proj_filter and not project_tags_match(tuple(card.get("contexts") or ()), (proj_filter,)):  # type: ignore[arg-type]
-                        continue
+                    if proj_filter:
+                        if is_owner:
+                            if not project_tags_match(tuple(card.get("contexts") or ()), (proj_filter,)):  # type: ignore[arg-type]
+                                continue
+                        elif not _tags_strictly_in_project_scope(tuple(card.get("contexts") or ()), proj_filter):  # type: ignore[arg-type]
+                            continue
                     if not is_owner:
                         if not card["verified"]:
                             continue
@@ -2197,6 +2221,22 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     pb_fname = os.path.basename(rel_p)
                     pb_rep = _live_active_playbook_report(pb_fname, rt)
                     if pb_rep is None or pb_rep.sha256 != proof.get("file_sha256"):
+                        return send(404, {"error": "Verified atom proof not found."})
+                elif rel_p.startswith("6-skills/"):
+                    from executable_skills import verify_executable_skill_integrity
+
+                    sk_fname = os.path.basename(rel_p)
+                    sk_dir = getattr(rt, "skills_dir", None) or os.path.join(rt.brain_dir, "6-skills")
+                    sk_rep = verify_executable_skill_integrity(
+                        sk_fname,
+                        brain_dir=rt.brain_dir,
+                        atoms_dir=rt.atoms_dir,
+                        playbooks_dir=rt.playbooks_dir,
+                        skills_dir=sk_dir,
+                        telemetry_db_path=rt.telemetry_db_path,
+                        security_dir=getattr(rt, "security_dir", None),
+                    )
+                    if not (sk_rep.valid and sk_rep.status == "active" and sk_rep.sha256 == proof.get("file_sha256")):
                         return send(404, {"error": "Verified atom proof not found."})
             return send(200, proof)
 
@@ -3148,11 +3188,26 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 s3_access_key_id=ak_id,
                 s3_secret_access_key=sk_id,
                 pwa_base_url=pwa_url,
+                include_recall=bool(body.get("include_recall", False)),
                 brain_dir=rt.brain_dir,
                 state_dir=_drop_state_dir,
             )
             res["device_label"] = res.get("label", label)
             return send(201, res)
+
+        if path == "/v1/sync/inbox-drop/export-recall" and method == "POST":
+            if not owner_only():
+                return True
+            from inbox_drop import export_mobile_recall_index
+
+            res = export_mobile_recall_index(
+                brain_dir=rt.brain_dir,
+                state_dir=_drop_state_dir,
+                include_pending_review=bool(body.get("include_pending_review", True)),
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(200, res)
 
         if path == "/v1/sync/inbox-drop/pull" and method == "POST":
             if not owner_only():
@@ -3623,6 +3678,328 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             force_r = bool(body.get("force", False))
             return send(200, restore_vault_backup(b_p, t_p, passphrase=pw, force=force_r))
 
+        # ── Stage 4 Executable Skills (Sandboxed Runtime, Kill-Switch & Audit Trail) ──
+        if path == "/v1/skills" and method == "GET":
+            from executable_skills import (
+                get_skill_kill_switch_status,
+                list_executable_skills,
+                skill_visible_in_scope,
+            )
+
+            proj = ((q.get("project") or [None])[0] or None)
+            if proj and len(proj) > 120:
+                raise ValueError("Invalid project query filter.")
+            inc_inactive = bool(is_owner and ((q.get("include_inactive") or ["0"])[0] in {"1", "true", "yes"}))
+            sk_dir = getattr(rt, "skills_dir", None) or os.path.join(rt.brain_dir, "6-skills")
+            sec_dir = getattr(rt, "security_dir", None)
+            skills = list_executable_skills(
+                skills_dir=sk_dir,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                playbooks_dir=rt.playbooks_dir,
+                telemetry_db_path=rt.telemetry_db_path,
+                security_dir=sec_dir,
+                active_only=not inc_inactive,
+            )
+            if proj:
+                skills = [s for s in skills if skill_visible_in_scope(s, (proj,))]
+            ks_status = get_skill_kill_switch_status(brain_dir=rt.brain_dir, security_dir=sec_dir)
+            return send(
+                200,
+                {
+                    "count": len(skills),
+                    "kill_switch": ks_status if is_owner else {"global_engaged": bool(ks_status.get("global_engaged"))},
+                    "skills": [s.as_dict() for s in skills],
+                },
+            )
+
+        if path == "/v1/skills/candidates" and method == "GET":
+            if not owner_only():
+                return True
+            from executable_skills import inspect_executable_skill_candidates
+
+            sk_dir = getattr(rt, "skills_dir", None) or os.path.join(rt.brain_dir, "6-skills")
+            sec_dir = getattr(rt, "security_dir", None)
+            cands = inspect_executable_skill_candidates(
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                playbooks_dir=rt.playbooks_dir,
+                skills_dir=sk_dir,
+                experiences_dir=rt.experiences_dir,
+                telemetry_db_path=rt.telemetry_db_path,
+                security_dir=sec_dir,
+            )
+            return send(200, {"count": len(cands), "candidates": cands})
+
+        if path == "/v1/skills/executions" and method == "GET":
+            if not owner_only():
+                return True
+            from executable_skills import list_skill_executions, verify_skill_execution_audit_chain
+
+            skill_filter = ((q.get("skill_id") or [None])[0] or None)
+            limit_val = _parse_bounded_int(q, "limit", default=50, min_val=1, max_val=500)
+            execs = list_skill_executions(brain_dir=rt.brain_dir, skill_id=skill_filter, limit=limit_val)
+            chain = verify_skill_execution_audit_chain(brain_dir=rt.brain_dir)
+            return send(200, {"count": len(execs), "audit_chain": chain, "executions": execs})
+
+        if path == "/v1/skills/promote" and method == "POST":
+            if not owner_only():
+                return True
+            from executable_skills import promote_playbook_to_executable_skill
+
+            sk_dir = getattr(rt, "skills_dir", None) or os.path.join(rt.brain_dir, "6-skills")
+            sec_dir = getattr(rt, "security_dir", None)
+            raw_actions = body.get("step_actions")
+            if not isinstance(raw_actions, list) or not raw_actions:
+                raise ValueError("'step_actions' must be a non-empty list of sandboxed action objects.")
+            raw_schema = body.get("input_schema")
+            if raw_schema is not None and not isinstance(raw_schema, dict):
+                raise ValueError("'input_schema' must be an object mapping parameter names to definitions.")
+            exp_sk = _str(body, "expected_skill_sha256", max_len=64, required=False).strip() or None
+            res = promote_playbook_to_executable_skill(
+                skill_id=_str(body, "skill_id", max_len=64),
+                playbook_id=_str(body, "playbook_id", max_len=64),
+                expected_playbook_sha256=_str(body, "expected_playbook_sha256", max_len=64),
+                step_actions=raw_actions,
+                input_schema=raw_schema,
+                timeout_seconds=float(body.get("timeout_seconds", 15.0)),
+                max_output_bytes=int(body.get("max_output_bytes", 65536)),
+                actor=_str(body, "actor", max_len=120),
+                rationale=_str(body, "rationale", max_len=500, required=False),
+                allow_early_owner_override=bool(body.get("allow_early_owner_override", False)),
+                expected_skill_sha256=exp_sk,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                playbooks_dir=rt.playbooks_dir,
+                skills_dir=sk_dir,
+                experiences_dir=rt.experiences_dir,
+                telemetry_db_path=rt.telemetry_db_path,
+                security_dir=sec_dir,
+            )
+            return send(201, res)
+
+        if path == "/v1/skills/kill-switch" and method == "POST":
+            if not owner_only():
+                return True
+            from executable_skills import set_skill_kill_switch
+
+            sec_dir = getattr(rt, "security_dir", None)
+            res = set_skill_kill_switch(
+                engaged=bool(body.get("engaged", True)),
+                scope=_str(body, "scope", max_len=64, required=False, default="global") or "global",
+                actor=_str(body, "actor", max_len=120),
+                reason=_str(body, "reason", max_len=500, required=False),
+                brain_dir=rt.brain_dir,
+                security_dir=sec_dir,
+            )
+            return send(200, res)
+
+        if path.startswith("/v1/skills/") and method == "POST":
+            sk_tail = path[len("/v1/skills/") :]
+            sk_parts = [p for p in sk_tail.split("/") if p]
+            if len(sk_parts) == 2 and sk_parts[1] in {"execute", "revoke"}:
+                if not owner_only():
+                    return True
+                sk_id = unquote(sk_parts[0]).strip()
+                sk_dir = getattr(rt, "skills_dir", None) or os.path.join(rt.brain_dir, "6-skills")
+                sec_dir = getattr(rt, "security_dir", None)
+                if sk_parts[1] == "execute":
+                    from executable_skills import execute_promoted_skill
+
+                    raw_inputs = body.get("inputs")
+                    if raw_inputs is not None and not isinstance(raw_inputs, dict):
+                        raise ValueError("'inputs' must be a JSON object.")
+                    exec_res = execute_promoted_skill(
+                        sk_id,
+                        inputs=raw_inputs,
+                        actor=_str(body, "actor", max_len=120),
+                        dry_run=bool(body.get("dry_run", False)),
+                        brain_dir=rt.brain_dir,
+                        atoms_dir=rt.atoms_dir,
+                        playbooks_dir=rt.playbooks_dir,
+                        skills_dir=sk_dir,
+                        experiences_dir=rt.experiences_dir,
+                        lexical_index_path=rt.lexical_index_path,
+                        chroma_path=rt.chroma_path,
+                        telemetry_db_path=rt.telemetry_db_path,
+                        security_dir=sec_dir,
+                    )
+                    return send(200, exec_res)
+                if sk_parts[1] == "revoke":
+                    from executable_skills import revoke_executable_skill
+
+                    rev_res = revoke_executable_skill(
+                        sk_id,
+                        expected_skill_sha256=_str(body, "expected_skill_sha256", max_len=64),
+                        actor=_str(body, "actor", max_len=120),
+                        reason=_str(body, "reason", max_len=500),
+                        brain_dir=rt.brain_dir,
+                        skills_dir=sk_dir,
+                    )
+                    return send(200, rev_res)
+
+        # ── Full On-Device Mobile Vault Client (iOS / Android) Pairing & Bundle Export ──
+        if path == "/v1/mobile/status" and method == "GET":
+            if not owner_only():
+                return True
+            from mobile_vault_client import list_mobile_vault_pairings
+
+            sec_dir = getattr(rt, "security_dir", None) or getattr(rt, "sync_state_dir", None)
+            return send(200, list_mobile_vault_pairings(brain_dir=rt.brain_dir, state_dir=sec_dir))
+
+        if path == "/v1/mobile/pair" and method == "POST":
+            if not owner_only():
+                return True
+            from mobile_vault_client import create_mobile_vault_pairing
+
+            sec_dir = getattr(rt, "security_dir", None) or getattr(rt, "sync_state_dir", None)
+            res = create_mobile_vault_pairing(
+                brain_dir=rt.brain_dir,
+                label=_str(body, "label", max_len=120, required=False, default="Mobile Vault Client") or "Mobile Vault Client",
+                include_passphrase_hint=_str(body, "include_passphrase_hint", max_len=200, required=False),
+                sync_endpoint_override=_str(body, "sync_endpoint_override", max_len=1024, required=False).strip() or None,
+                s3_read_access_key_id=_str(body, "s3_read_access_key_id", max_len=256, required=False),
+                s3_read_secret_access_key=_str(body, "s3_read_secret_access_key", max_len=256, required=False),
+                include_recovery_key=bool(body.get("include_recovery_key", False)),
+                include_inbox_drop_pairing=bool(body.get("include_inbox_drop_pairing", True)),
+                pwa_base_url=_str(body, "pwa_base_url", max_len=512, required=False, default="https://localhost/vault-client/") or "https://localhost/vault-client/",
+                state_dir=sec_dir,
+            )
+            return send(201, res)
+
+        if path == "/v1/mobile/revoke" and method == "POST":
+            if not owner_only():
+                return True
+            from mobile_vault_client import revoke_mobile_vault_pairing
+
+            sec_dir = getattr(rt, "security_dir", None) or getattr(rt, "sync_state_dir", None)
+            pid = _str(body, "pairing_id", max_len=64)
+            return send(200, revoke_mobile_vault_pairing(pid, brain_dir=rt.brain_dir, state_dir=sec_dir))
+
+        if path == "/v1/mobile/export" and method == "POST":
+            if not owner_only():
+                return True
+            from mobile_vault_client import export_mobile_vault_client_bundle
+
+            default_out = str(Path(__file__).resolve().parents[1] / "dist")
+            out_d = _str(body, "out_dir", max_len=1000, required=False, default=default_out).strip() or default_out
+            return send(201, export_mobile_vault_client_bundle(out_d))
+
+        # ── Local Creative Media Generation Studio (Offline Image & Video) ──
+        if path == "/v1/media/status" and method == "GET":
+            from creative_media import get_creative_media_status
+
+            st = get_creative_media_status()
+            return send(200, st.as_dict())
+
+        if path == "/v1/media/gallery" and method == "GET":
+            from creative_media import list_generated_media
+
+            mtype = ((q.get("media_type") or [None])[0] or None)
+            proj = ((q.get("project") or [None])[0] or None)
+            if proj and len(proj) > 120:
+                raise ValueError("Invalid project query filter.")
+            limit_val = _parse_bounded_int(q, "limit", default=30, min_val=1, max_val=200)
+            items = list_generated_media(brain_dir=rt.brain_dir, media_type=mtype, project_scope=proj, limit=limit_val)
+            return send(200, {"count": len(items), "items": items})
+
+        if path.startswith("/v1/media/file/") and method == "GET":
+            import base64
+            from creative_media import get_generated_media_file
+
+            media_id = unquote(path[len("/v1/media/file/") :]).strip()
+            rec = get_generated_media_file(brain_dir=rt.brain_dir, media_id=media_id, verify_sha256=True)
+            raw_bytes = Path(str(rec["file_path"])).read_bytes()
+            mime = str(rec.get("mime_type") or "application/octet-stream")
+            enc_mode = str((q.get("encoding") or ["binary"])[0] or "binary").strip().lower()
+            if enc_mode in {"base64", "json", "data_uri"}:
+                b64 = base64.b64encode(raw_bytes).decode("ascii")
+                return send(
+                    200,
+                    {
+                        "media_id": rec["media_id"],
+                        "filename": rec.get("filename"),
+                        "mime_type": mime,
+                        "size_bytes": len(raw_bytes),
+                        "sha256": rec.get("sha256"),
+                        "data_uri": f"data:{mime};base64,{b64}",
+                        "metadata": {k: v for k, v in rec.items() if k not in {"file_path", "metadata_path"}},
+                    },
+                )
+            handler.send_response(200)
+            handler.send_header("Content-Type", mime)
+            handler.send_header("Content-Length", str(len(raw_bytes)))
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header("X-Content-Type-Options", "nosniff")
+            handler.end_headers()
+            handler.wfile.write(raw_bytes)
+            return True
+
+        if path == "/v1/media/image" and method == "POST":
+            if not owner_only():
+                return True
+            from creative_media import generate_local_image
+
+            seed_raw = body.get("seed")
+            seed_val = int(seed_raw) if seed_raw is not None and str(seed_raw).strip() != "" else None
+            art = generate_local_image(
+                _str(body, "prompt", max_len=4000),
+                brain_dir=rt.brain_dir,
+                backend=_str(body, "backend", max_len=64, required=False, default="auto") or "auto",
+                style=_str(body, "style", max_len=64, required=False, default="concept_card") or "concept_card",
+                output_format=_str(body, "output_format", max_len=16, required=False, default="png") or "png",
+                width=int(body.get("width", 768)),
+                height=int(body.get("height", 512)),
+                seed=seed_val,
+                negative_prompt=_str(body, "negative_prompt", max_len=2000, required=False),
+                title=_str(body, "title", max_len=200, required=False),
+                ground_in_vault=bool(body.get("ground_in_vault", False)),
+                project_scope=_str(body, "project_scope", max_len=120, required=False).strip() or None,
+                include_preferences=bool(body.get("include_preferences", False)),
+                attach_to_note=bool(body.get("attach_to_note", False)),
+                redact_pii=bool(body.get("redact_pii", True)),
+                strict_dlp=bool(body.get("strict_dlp", True)),
+                allow_hardware_override=bool(body.get("allow_hardware_override", False)),
+                policy_path=getattr(rt, "policy_path", None),
+                sd_webui_url=_str(body, "sd_webui_url", max_len=256, required=False).strip() or None,
+                comfyui_url=_str(body, "comfyui_url", max_len=256, required=False).strip() or None,
+                http_transport=getattr(rt, "http_transport", None),
+            )
+            return send(201, art.as_dict())
+
+        if path == "/v1/media/video" and method == "POST":
+            if not owner_only():
+                return True
+            from creative_media import generate_local_video
+
+            seed_raw = body.get("seed")
+            seed_val = int(seed_raw) if seed_raw is not None and str(seed_raw).strip() != "" else None
+            art = generate_local_video(
+                _str(body, "prompt", max_len=4000),
+                brain_dir=rt.brain_dir,
+                backend=_str(body, "backend", max_len=64, required=False, default="auto") or "auto",
+                style=_str(body, "style", max_len=64, required=False, default="concept_card") or "concept_card",
+                output_format=_str(body, "output_format", max_len=16, required=False, default="mp4") or "mp4",
+                width=int(body.get("width", 640)),
+                height=int(body.get("height", 384)),
+                frames=int(body.get("frames", 16)),
+                fps=int(body.get("fps", 12)),
+                seed=seed_val,
+                negative_prompt=_str(body, "negative_prompt", max_len=2000, required=False),
+                title=_str(body, "title", max_len=200, required=False),
+                ground_in_vault=bool(body.get("ground_in_vault", False)),
+                project_scope=_str(body, "project_scope", max_len=120, required=False).strip() or None,
+                include_preferences=bool(body.get("include_preferences", False)),
+                attach_to_note=bool(body.get("attach_to_note", False)),
+                redact_pii=bool(body.get("redact_pii", True)),
+                strict_dlp=bool(body.get("strict_dlp", True)),
+                allow_hardware_override=bool(body.get("allow_hardware_override", False)),
+                policy_path=getattr(rt, "policy_path", None),
+                comfyui_url=_str(body, "comfyui_url", max_len=256, required=False).strip() or None,
+                http_transport=getattr(rt, "http_transport", None),
+            )
+            return send(201, art.as_dict())
+
     except (MemoryRecallUnavailable, LexicalIndexUnavailable) as exc:
         return send(
             503,
@@ -3639,6 +4016,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if str(exc).startswith("Note not found:"):
             return send(404, {"error": str(exc)})
         return send(422, {"error": str(exc)})
+    except PermissionError as exc:
+        err_body: dict[str, object] = {"error": str(exc)}
+        audit_rec = getattr(exc, "audit_record", None)
+        if isinstance(audit_rec, dict):
+            err_body["audit_record"] = audit_rec
+        return send(403, err_body)
     except (
         PlaybookValidationError,
         ReviewTransitionError,
@@ -3652,17 +4035,29 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         ValueError,
         NotADirectoryError,
     ) as exc:
+        from host_adapters import OutboundSecretBlockedError
+
         if isinstance(
             exc,
             (
+                PermissionError,
+                OutboundSecretBlockedError,
                 OnnxModelSecurityError,
                 InboxDropSecurityError,
                 GitDistillerSecurityError,
                 VaultBackupSecurityError,
             ),
         ):
-            return send(403, {"error": str(exc)})
-        return send(422, {"error": str(exc)})
+            err_body = {"error": str(exc)}
+            audit_rec = getattr(exc, "audit_record", None)
+            if isinstance(audit_rec, dict):
+                err_body["audit_record"] = audit_rec
+            return send(403, err_body)
+        err_body = {"error": str(exc)}
+        audit_rec = getattr(exc, "audit_record", None)
+        if isinstance(audit_rec, dict):
+            err_body["audit_record"] = audit_rec
+        return send(422, err_body)
     except (
         HostConsentError,
         SyncSecurityError,
@@ -3674,10 +4069,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         VaultBackupSecurityError,
     ) as exc:
         return send(403, {"error": str(exc)})
-    except PermissionError as exc:
-        return send(403, {"error": str(exc)})
     except RuntimeError as exc:
         if "CAS mismatch" in str(exc):
             return send(409, {"error": str(exc), "conflict": True})
+        if exc.__class__.__name__ in {"MobileVaultError", "CreativeMediaError"}:
+            return send(422, {"error": str(exc)})
+        raise
+    except Exception as exc:
+        if exc.__class__.__name__ == "CreativeMediaError":
+            return send(422, {"error": str(exc)})
         raise
     return False

@@ -9,9 +9,16 @@
 
   const SBID_MAGIC = new Uint8Array([0x53, 0x42, 0x49, 0x44, 0x31, 0x00]); // "SBID1\0"
   const SBID_VERSION = 1;
+  const SBMR_MAGIC = new Uint8Array([0x53, 0x42, 0x4d, 0x52, 0x31, 0x00]); // "SBMR1\0"
+  const SBMR_VERSION = 1;
   const HEX32_RE = /^[0-9a-f]{32}$/;
   const HEX16_RE = /^[0-9a-f]{16}$/;
   const S3_REGION_RE = /^[a-zA-Z0-9-]{2,32}$/;
+  const QUERY_STOP_WORDS = new Set([
+    "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for", "from",
+    "how", "in", "is", "it", "of", "on", "or", "should", "that", "the", "to", "what",
+    "when", "where", "which", "who", "why", "with"
+  ]);
 
   function getWebCrypto() {
     const c = typeof globalThis !== "undefined" ? globalThis.crypto : null;
@@ -141,6 +148,11 @@
     }
     if (!parsed.recipient_pubkey_b64 || !parsed.drop_secret_b64) {
       throw new Error("Incomplete cryptographic keys in pairing bundle.");
+    }
+    if (parsed.recall_key_b64 || parsed.recall_key_id) {
+      if (!HEX16_RE.test(String(parsed.recall_key_id || "")) || !parsed.recall_key_b64) {
+        throw new Error("Invalid recall_key_id or recall_key_b64 in pairing bundle.");
+      }
     }
     return parsed;
   }
@@ -357,7 +369,6 @@
     const signature = bytesToHex(await hmacSha256Bytes(kSigning, utf8Bytes(stringToSign)));
 
     const outHeaders = {
-      "Content-Type": "application/octet-stream",
       "x-amz-content-sha256": payloadHash,
       "x-amz-date": amzDate,
       Authorization:
@@ -370,6 +381,9 @@
         ", Signature=" +
         signature,
     };
+    if (method === "PUT" || method === "POST") {
+      outHeaders["Content-Type"] = "application/octet-stream";
+    }
     if (params.sessionToken) {
       outHeaders["x-amz-security-token"] = String(params.sessionToken).trim();
     }
@@ -379,11 +393,284 @@
     return { url: parsed.toString(), headers: outHeaders };
   }
 
+  async function signS3GetRequest(params) {
+    return signS3PutRequest(Object.assign({}, params, {
+      method: "GET",
+      payloadBytes: new Uint8Array(0),
+    }));
+  }
+
+  async function decryptMobileRecallEnvelope(envelopeBytes, pairing) {
+    const subtle = getWebCrypto().subtle;
+    const raw = envelopeBytes instanceof Uint8Array ? envelopeBytes : new Uint8Array(envelopeBytes || 0);
+    if (raw.length < 8 + 12 + 16) {
+      throw new Error("Truncated or invalid SBMR1 recall envelope.");
+    }
+    if (raw.length > 16777216) {
+      throw new Error("Oversized SBMR1 recall envelope.");
+    }
+    for (let i = 0; i < SBMR_MAGIC.length; i += 1) {
+      if (raw[i] !== SBMR_MAGIC[i]) {
+        throw new Error("Invalid SBMR1 magic header.");
+      }
+    }
+    const vaultId = String((pairing && pairing.vault_id) || "");
+    const recallKeyId = String((pairing && pairing.recall_key_id) || "");
+    const recallKeyB64 = String((pairing && pairing.recall_key_b64) || "");
+    if (!HEX32_RE.test(vaultId)) {
+      throw new Error("Invalid vault_id in pairing.");
+    }
+    if (!HEX16_RE.test(recallKeyId) || !recallKeyB64) {
+      throw new Error("This pairing is write-only. Re-pair with `--include-recall` to decrypt vault recall.");
+    }
+    const recallKeyBytes = base64ToBytes(recallKeyB64);
+    if (recallKeyBytes.length !== 32 || (await sha256Hex(recallKeyBytes)).slice(0, 16) !== recallKeyId) {
+      throw new Error("Recall key fingerprint mismatch.");
+    }
+
+    const headerLen = (raw[6] << 8) | raw[7];
+    if (headerLen <= 0 || headerLen > 4096 || raw.length < 8 + headerLen + 12 + 16) {
+      throw new Error("Malformed SBMR1 header length.");
+    }
+    const headerText = new TextDecoder("utf-8", { fatal: true }).decode(raw.subarray(8, 8 + headerLen));
+    const header = JSON.parse(headerText);
+    if (!header || typeof header !== "object" || header.v !== SBMR_VERSION) {
+      throw new Error("Unsupported SBMR1 envelope version.");
+    }
+    if (String(header.vault_id || "") !== vaultId) {
+      throw new Error("SBMR1 vault_id mismatch.");
+    }
+    if (String(header.recall_key_id || "") !== recallKeyId) {
+      throw new Error("SBMR1 recall_key_id mismatch (pairing needs rotated recall key).");
+    }
+    const saltHex = String(header.salt_hex || "");
+    if (!HEX32_RE.test(saltHex)) {
+      throw new Error("Invalid SBMR1 HKDF salt.");
+    }
+
+    const hkdfBase = await subtle.importKey("raw", recallKeyBytes, "HKDF", false, ["deriveKey"]);
+    const aesKey = await subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: hexToBytes(saltHex),
+        info: utf8Bytes("SecondBrain-MobileRecall-v1|" + vaultId + "|" + recallKeyId),
+      },
+      hkdfBase,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["decrypt"]
+    );
+
+    const bodyStart = 8 + headerLen;
+    const iv = raw.subarray(bodyStart, bodyStart + 12);
+    const ct = raw.subarray(bodyStart + 12);
+    const exportedAt = String(header.exported_at || "");
+    const atomCount = Number(header.atom_count);
+    const reviewCount = Number(header.review_count);
+    const aadBytes = utf8Bytes(
+      "SBMR1|" + vaultId + "|" + recallKeyId + "|" + exportedAt + "|" + atomCount + "|" + reviewCount
+    );
+    let plainBuf;
+    try {
+      plainBuf = await subtle.decrypt(
+        { name: "AES-GCM", iv: iv, additionalData: aadBytes, tagLength: 128 },
+        aesKey,
+        ct
+      );
+    } catch (_err) {
+      throw new Error("SBMR1 recall index authentication or decryption failed.");
+    }
+    const doc = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(plainBuf)));
+    if (!doc || typeof doc !== "object" || String(doc.vault_id || "") !== vaultId) {
+      throw new Error("Decrypted SBMR1 catalog vault_id mismatch.");
+    }
+    return {
+      vaultId: vaultId,
+      exportedAt: String(doc.exported_at || exportedAt),
+      atomCount: Array.isArray(doc.atoms) ? doc.atoms.length : 0,
+      reviewCount: Array.isArray(doc.review_queue) ? doc.review_queue.length : 0,
+      atoms: Array.isArray(doc.atoms) ? doc.atoms : [],
+      reviewQueue: Array.isArray(doc.review_queue) ? doc.review_queue : [],
+    };
+  }
+
+  function lightStem(word) {
+    const w = String(word || "").toLowerCase();
+    if (w.length <= 4) {
+      return w;
+    }
+    if (w.endsWith("ies") && w.length > 5) {
+      return w.slice(0, -3) + "y";
+    }
+    if (w.endsWith("ing") && w.length > 5) {
+      return w.slice(0, -3);
+    }
+    if (w.endsWith("ed") && w.length > 4) {
+      return w.slice(0, -2);
+    }
+    if (w.endsWith("es") && w.length > 4) {
+      return w.slice(0, -2);
+    }
+    if (w.endsWith("s") && !w.endsWith("ss") && w.length > 4) {
+      return w.slice(0, -1);
+    }
+    return w;
+  }
+
+  function tokenizeTerms(text) {
+    const matches = String(text || "").toLowerCase().match(/[a-z0-9][a-z0-9_-]*/g);
+    if (!matches) {
+      return [];
+    }
+    const out = [];
+    for (const raw of matches) {
+      if (raw.length > 1 && !QUERY_STOP_WORDS.has(raw)) {
+        out.push(lightStem(raw));
+      }
+      if (raw.indexOf("-") >= 0 || raw.indexOf("_") >= 0) {
+        for (const sub of raw.split(/[-_]+/)) {
+          if (sub.length > 1 && !QUERY_STOP_WORDS.has(sub)) {
+            out.push(lightStem(sub));
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  function normalizeProjectScope(scope) {
+    const raw = String(scope || "").trim().toLowerCase();
+    if (!raw) {
+      return "";
+    }
+    return raw.startsWith("project:") ? raw : "project:" + raw;
+  }
+
+  function itemMatchesProjectScope(item, normScope) {
+    if (!normScope) {
+      return true;
+    }
+    const ctxs = Array.isArray(item.contexts) ? item.contexts : [];
+    const projTags = [];
+    for (const c of ctxs) {
+      const lc = String(c || "").trim().toLowerCase();
+      if (lc.startsWith("project:")) {
+        projTags.push(lc);
+      }
+    }
+    if (projTags.length === 0) {
+      return false;
+    }
+    return projTags.every((t) => t === normScope);
+  }
+
+  function searchMobileRecallCatalog(catalog, query, opts) {
+    const options = opts || {};
+    const view = options.view === "review" ? "review" : "verified";
+    const limit = Math.max(1, Math.min(Number(options.limit) || 50, 500));
+    const normScope = normalizeProjectScope(options.projectScope || "");
+    const sourceList = view === "review"
+      ? (Array.isArray(catalog && catalog.reviewQueue) ? catalog.reviewQueue : [])
+      : (Array.isArray(catalog && catalog.atoms) ? catalog.atoms : []);
+
+    const scoped = sourceList.filter((item) => item && itemMatchesProjectScope(item, normScope));
+    const qTerms = Array.from(new Set(tokenizeTerms(query || "")));
+    if (qTerms.length === 0) {
+      return scoped
+        .slice()
+        .sort((a, b) => String(a.filename || "").localeCompare(String(b.filename || "")))
+        .slice(0, limit)
+        .map((item) => Object.assign({}, item, { score: 1.0 }));
+    }
+
+    const qRawLower = String(query || "").trim().toLowerCase();
+    const docs = scoped.map((item) => {
+      const claimToks = tokenizeTerms(item.claim || "");
+      const idToks = tokenizeTerms((item.id || "") + " " + (item.filename || ""));
+      const tagToks = tokenizeTerms(
+        (Array.isArray(item.tags) ? item.tags.join(" ") : "") +
+          " " +
+          (Array.isArray(item.contexts) ? item.contexts.join(" ") : "")
+      );
+      const evToks = tokenizeTerms((item.evidence || "") + " " + (item.why_it_matters || ""));
+      const tf = new Map();
+      const addWeight = (toks, w) => {
+        for (const t of toks) {
+          tf.set(t, (tf.get(t) || 0) + w);
+        }
+      };
+      addWeight(claimToks, 3.0);
+      addWeight(idToks, 2.0);
+      addWeight(tagToks, 2.0);
+      addWeight(evToks, 1.2);
+      let dlen = 0;
+      for (const v of tf.values()) {
+        dlen += v;
+      }
+      return { item: item, tf: tf, dlen: dlen || 1.0 };
+    });
+
+    const df = new Map();
+    for (const d of docs) {
+      for (const term of d.tf.keys()) {
+        df.set(term, (df.get(term) || 0) + 1);
+      }
+    }
+    const nDocs = Math.max(1, docs.length);
+    const avgDl = docs.reduce((acc, d) => acc + d.dlen, 0) / nDocs || 1.0;
+    const k1 = 1.5;
+    const b = 0.75;
+
+    const scored = [];
+    for (const d of docs) {
+      let matched = 0;
+      let bm25 = 0;
+      const norm = k1 * (1 - b + b * (d.dlen / avgDl));
+      for (const term of qTerms) {
+        const freq = d.tf.get(term) || 0;
+        if (freq > 0) {
+          matched += 1;
+          const docFreq = df.get(term) || 0;
+          const idf = Math.log(1 + (nDocs - docFreq + 0.5) / (docFreq + 0.5));
+          bm25 += idf * ((freq * (k1 + 1)) / (freq + norm));
+        }
+      }
+      if (matched === 0) {
+        continue;
+      }
+      if (qRawLower.length >= 4 && String(d.item.claim || "").toLowerCase().indexOf(qRawLower) >= 0) {
+        bm25 += 2.0;
+      }
+      scored.push({
+        item: d.item,
+        matched: matched,
+        score: Math.round(bm25 * 10000) / 10000,
+      });
+    }
+
+    scored.sort((a, b) => {
+      if (b.matched !== a.matched) {
+        return b.matched - a.matched;
+      }
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+      return String(a.item.filename || "").localeCompare(String(b.item.filename || ""));
+    });
+
+    return scored.slice(0, limit).map((entry) => Object.assign({}, entry.item, { score: entry.score }));
+  }
+
   return {
     SBID_VERSION: SBID_VERSION,
+    SBMR_VERSION: SBMR_VERSION,
     parsePairingFragment: parsePairingFragment,
     encryptInboxDropEnvelope: encryptInboxDropEnvelope,
+    decryptMobileRecallEnvelope: decryptMobileRecallEnvelope,
+    searchMobileRecallCatalog: searchMobileRecallCatalog,
     signS3PutRequest: signS3PutRequest,
+    signS3GetRequest: signS3GetRequest,
     sha256Hex: sha256Hex,
   };
 });

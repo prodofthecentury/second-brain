@@ -124,6 +124,7 @@ _ALLOWED_ROOT_DIRS = frozenset(
         "3-threads",
         "4-experiences",
         "5-playbooks",
+        "6-skills",
         "notes",
         "sources",
         "briefings",
@@ -144,10 +145,14 @@ _APPEND_ONLY_JSONL_PATHS = frozenset(
         "0-raw/archive/decision-record.jsonl",
         "0-raw/archive/manifest.jsonl",
         "0-raw/archive/atom-corrections.jsonl",
+        "0-raw/archive/atom-feedback.jsonl",
+        "0-raw/archive/playbook-decisions.jsonl",
+        "0-raw/archive/skill-decisions.jsonl",
+        "0-raw/archive/creative-media-audit.jsonl",
         "0-raw/archive/mcp-audit.jsonl",
     }
 )
-_HISTORY_PROTECTED_PREFIXES = ("2-atoms/", "5-playbooks/")
+_HISTORY_PROTECTED_PREFIXES = ("2-atoms/", "5-playbooks/", "6-skills/")
 
 
 class SyncError(RuntimeError):
@@ -436,11 +441,11 @@ def _validate_backend_key(key: str) -> str:
     parts = key.split("/")
     if any(seg in {"", ".", ".."} for seg in parts):
         raise SyncSecurityError(f"Unsafe sync object key traversal: {key!r}")
-    if parts[0] not in {"vault-header.json", "head.json", "manifests", "objects", "inbox-drops"}:
+    if parts[0] not in {"vault-header.json", "head.json", "manifests", "objects", "inbox-drops", "mobile-recall"}:
         raise SyncSecurityError(f"Disallowed sync object namespace: {key!r}")
-    if parts[0] == "inbox-drops":
+    if parts[0] in {"inbox-drops", "mobile-recall"}:
         if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{32}\.enc", parts[1]):
-            raise SyncSecurityError(f"Invalid inbox-drop object key format: {key!r}")
+            raise SyncSecurityError(f"Invalid {parts[0]} object key format: {key!r}")
     return key
 
 
@@ -653,7 +658,7 @@ class LocalFolderSyncBackend(SyncBackend):
 
     def list_objects(self, prefix: str = "") -> list[str]:
         clean_pref = prefix.strip().strip("/")
-        if clean_pref and clean_pref.split("/")[0] not in {"vault-header.json", "head.json", "manifests", "objects", "inbox-drops"}:
+        if clean_pref and clean_pref.split("/")[0] not in {"vault-header.json", "head.json", "manifests", "objects", "inbox-drops", "mobile-recall"}:
             raise SyncSecurityError(f"Disallowed sync list prefix: {prefix!r}")
         if not self.root.is_dir():
             return []
@@ -955,7 +960,7 @@ class HttpObjectSyncBackend(SyncBackend):
 
     def list_objects(self, prefix: str = "") -> list[str]:
         clean_pref = prefix.strip().strip("/")
-        if clean_pref and clean_pref.split("/")[0] not in {"vault-header.json", "head.json", "manifests", "objects", "inbox-drops"}:
+        if clean_pref and clean_pref.split("/")[0] not in {"vault-header.json", "head.json", "manifests", "objects", "inbox-drops", "mobile-recall"}:
             raise SyncSecurityError(f"Disallowed sync list prefix: {prefix!r}")
         parsed_ep = urlparse(self.endpoint_url)
         path_segments = [s for s in (parsed_ep.path or "").split("/") if s]
@@ -1968,6 +1973,29 @@ def sync_push(
         }
         _prune_sync_base_cache(active_brain, keep_shas)
 
+        mobile_recall_exported = False
+        try:
+            from inbox_drop import build_mobile_recall_catalog, encrypt_mobile_recall_envelope, list_mobile_drop_pairings, _load_drop_state
+
+            cand_drop_dirs = [state_dir, sync_key_dir(state_dir)] if state_dir is not None else [None]
+            for d_dir in cand_drop_dirs:
+                drop_info = list_mobile_drop_pairings(vault_id=vault_id, brain_dir=active_brain, state_dir=d_dir)
+                if int(drop_info.get("recall_enabled_count") or 0) > 0:
+                    d_state = _load_drop_state(active_brain, state_dir=d_dir)
+                    if isinstance(d_state, dict) and d_state.get("recall_key_b64") and d_state.get("recall_key_id"):
+                        cat = build_mobile_recall_catalog(brain_dir=active_brain, include_pending_review=True)
+                        env = encrypt_mobile_recall_envelope(
+                            cat,
+                            vault_id=vault_id,
+                            recall_key_b64=str(d_state["recall_key_b64"]),
+                            recall_key_id=str(d_state["recall_key_id"]),
+                        )
+                        backend.put_object(f"mobile-recall/{vault_id}.enc", env)
+                        mobile_recall_exported = True
+                        break
+        except Exception:
+            mobile_recall_exported = False
+
         return {
             "status": "pushed",
             "vault_id": vault_id,
@@ -1977,6 +2005,7 @@ def sync_push(
             "total_files": len(manifest_files),
             "uploaded_blobs": uploaded_blobs,
             "reused_blobs": reused_blobs,
+            "mobile_recall_exported": mobile_recall_exported,
         }
 
 
@@ -2650,14 +2679,39 @@ def _demote_unapproved_canonical_merge(
         normalized = normalize_memory_document(text, source_filename=Path(clean_rel).name, origin="user_local")
         return normalized.encode("utf-8"), True
     if clean_rel.startswith("5-playbooks/") and clean_rel.count("/") == 1 and clean_rel.endswith(".md"):
+        if not force_demote:
+            try:
+                from skill_playbooks import _latest_playbook_decision
+
+                pb_fname = Path(clean_rel).name
+                log_ok, latest_pb_dec = _latest_playbook_decision(str(active_brain), pb_fname)
+                if (
+                    log_ok
+                    and isinstance(latest_pb_dec, dict)
+                    and latest_pb_dec.get("action") == "promote_playbook"
+                    and str(latest_pb_dec.get("new_sha256") or "") == content_sha256(candidate_bytes)
+                ):
+                    return candidate_bytes, False
+            except Exception:
+                pass
         text = candidate_bytes.decode("utf-8", errors="replace")
         parsed = split_frontmatter(text)
         if parsed is not None:
             fm_lines, body_lines = parsed
-            updated_fm = set_scalar_field(fm_lines, "status", "draft", "type")
+            updated_fm = set_scalar_field(fm_lines, "playbook_status", "draft", "type")
+            updated_fm = set_scalar_field(updated_fm, "status", "draft", "playbook_status")
             return render_memory_document(updated_fm, body_lines).encode("utf-8"), True
-        rebuilt_pb = f"---\ntype: playbook\nstatus: draft\n---\n\n{text.strip()}\n"
+        rebuilt_pb = f"---\ntype: playbook\nplaybook_status: draft\nstatus: draft\n---\n\n{text.strip()}\n"
         return rebuilt_pb.encode("utf-8"), True
+    if clean_rel.startswith("6-skills/") and clean_rel.count("/") == 1 and clean_rel.endswith(".md"):
+        text = candidate_bytes.decode("utf-8", errors="replace")
+        parsed = split_frontmatter(text)
+        if parsed is not None:
+            fm_lines, body_lines = parsed
+            updated_fm = set_scalar_field(fm_lines, "skill_status", "revoked", "type")
+            return render_memory_document(updated_fm, body_lines).encode("utf-8"), True
+        rebuilt_sk = f"---\ntype: executable_skill\nskill_status: revoked\n---\n\n{text.strip()}\n"
+        return rebuilt_sk.encode("utf-8"), True
     return candidate_bytes, False
 
 
@@ -3219,7 +3273,13 @@ def main(argv: list[str] | None = None) -> int:
     p_dpair.add_argument("--s3-access-key-env", default=None, help="Optional env var with write-scoped S3 Access Key ID")
     p_dpair.add_argument("--s3-secret-key-env", default=None, help="Optional env var with write-scoped S3 Secret Access Key")
     p_dpair.add_argument("--pwa-url", default="https://localhost/inbox-drop/")
+    p_dpair.add_argument("--include-recall", action="store_true", help="Include E2EE mobile recall/search/review key (`SBMR1`)")
     p_dpair.add_argument("--json", action="store_true")
+
+    p_mrec = sub.add_parser("export-mobile-recall", help="Encrypt and export E2EE mobile recall/search/review catalog (`mobile-recall/<vault_id>.enc`)")
+    p_mrec.add_argument("--output", default=None, help="Optional local output path for encrypted .enc catalog")
+    p_mrec.add_argument("--no-pending", action="store_true", help="Exclude pending review queue from mobile catalog")
+    p_mrec.add_argument("--json", action="store_true")
 
     p_dlist = sub.add_parser("drop-list", help="List configured Mobile Inbox Drop pairings")
     p_dlist.add_argument("--json", action="store_true")
@@ -3346,9 +3406,20 @@ def main(argv: list[str] | None = None) -> int:
             s3_access_key_id=ak,
             s3_secret_access_key=sk,
             pwa_base_url=args.pwa_url,
+            include_recall=bool(args.include_recall),
             brain_dir=brain_dir,
         )
-        print(json.dumps(res, indent=2) if args.json else f"Paired mobile drop token_id={res['token_id']} pwa_url={res['pwa_pairing_url']}")
+        print(json.dumps(res, indent=2) if args.json else f"Paired mobile drop token_id={res['token_id']} include_recall={res['include_recall']} pwa_url={res['pwa_pairing_url']}")
+        return 0
+    if args.cmd == "export-mobile-recall":
+        from inbox_drop import export_mobile_recall_index
+
+        res = export_mobile_recall_index(
+            brain_dir=brain_dir,
+            output_file=args.output,
+            include_pending_review=not bool(args.no_pending),
+        )
+        print(json.dumps(res, indent=2) if args.json else f"Exported mobile recall index {res['object_key']} (atoms={res['atom_count']}, review_queue={res['review_count']}, bytes={res['envelope_bytes']})")
         return 0
     if args.cmd == "drop-list":
         from inbox_drop import list_mobile_drop_pairings
