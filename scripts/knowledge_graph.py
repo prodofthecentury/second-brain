@@ -1803,30 +1803,41 @@ def suggest_atom_graph_links_for_claim(
     atoms_dir: str = ATOMS_DIR,
     include_pending: bool = False,
     top_k: int = 5,
+    _prebuilt_nodes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Identify verified ``[[wikilink]]`` targets, duplicate candidates, and contradiction alerts for a claim."""
     clean_claim = (claim_text or "").strip()
     if not clean_claim:
         return {"related_links": [], "duplicate_candidates": [], "contradiction_alerts": []}
 
-    graph = build_knowledge_graph(
-        brain_dir=brain_dir,
-        atoms_dir=atoms_dir,
-        project_scope=project_scope,
-        include_pending=include_pending,
-        include_preferences=False,
-    )
+    if _prebuilt_nodes is None:
+        graph = build_knowledge_graph(
+            brain_dir=brain_dir,
+            atoms_dir=atoms_dir,
+            project_scope=project_scope,
+            include_pending=include_pending,
+            include_preferences=False,
+        )
+        source_nodes = graph["nodes"]
+    else:
+        source_nodes = _prebuilt_nodes
+
     claim_toks = _topic_tokens(clean_claim)
     claim_stems = {porter_stem(t) for t in claim_toks}
     claim_quants = _extract_contextual_quantities(clean_claim)
     cap = max(1, min(int(top_k), 15))
 
-    candidates = [
-        n for n in graph["nodes"]
-        if not n["superseded_by"]
-        and n["filename"] != (exclude_filename or "")
-        and _scopes_compatible_for_autolink(contexts, n.get("contexts") or ())
-    ]
+    candidates = []
+    for n in source_nodes:
+        if (
+            n["superseded_by"]
+            or n["filename"] == (exclude_filename or "")
+            or not _scopes_compatible_for_autolink(contexts, n.get("contexts") or ())
+        ):
+            continue
+        node_stems_pre = {porter_stem(t) for t in n["topic_tokens"]}
+        if len(claim_stems & node_stems_pre) >= 2:
+            candidates.append(n)
     if not candidates:
         return {"related_links": [], "duplicate_candidates": [], "contradiction_alerts": []}
 
@@ -1951,6 +1962,7 @@ def auto_link_vault_atoms(
     include_pending: bool = False,
     dry_run: bool = False,
     max_links_per_atom: int = 4,
+    connect_orphans: bool = False,
 ) -> dict[str, Any]:
     """Attach verified ``links`` (``[[wikilink]]`` edges) across related vault atoms under ``writer.lock``.
 
@@ -2004,6 +2016,7 @@ def auto_link_vault_atoms(
             atoms_dir=atoms_dir,
             include_pending=include_pending,
             top_k=cap,
+            _prebuilt_nodes=nodes,
         )
         existing_stems = {
             Path(str(t).strip().removesuffix(".md")).stem
@@ -2025,13 +2038,102 @@ def auto_link_vault_atoms(
                 {"atom_a": pk[0], "atom_b": pk[1], "reasons": c["reasons"], "jaccard": c["jaccard"]},
             )
 
-    if dry_run:
-        linked_Sim = set()
+    node_by_fname = {n["filename"]: n for n in nodes}
+    node_stems_map = {
+        n["filename"]: {porter_stem(t) for t in n["topic_tokens"]}
+        for n in nodes
+    }
+
+    def _compute_linked_filenames() -> set[str]:
+        linked_set: set[str] = set()
         for n in nodes:
-            if n.get("links") or proposed_by_file.get(n["filename"]):
-                linked_Sim.add(n["filename"])
-                for st in [*(n.get("links") or ()), *proposed_by_file.get(n["filename"], ())]:
-                    linked_Sim.add(f"{Path(str(st)).stem}.md")
+            fn = n["filename"]
+            all_stems = [
+                Path(str(t).strip().removesuffix(".md")).stem
+                for t in [*(n.get("links") or ()), *proposed_by_file.get(fn, ())]
+                if str(t).strip()
+            ]
+            for st in all_stems:
+                target_fn = f"{st}.md"
+                if target_fn in node_by_fname and target_fn != fn:
+                    linked_set.add(fn)
+                    linked_set.add(target_fn)
+        return linked_set
+
+    if connect_orphans and len(nodes) >= 2:
+        # Pass 2: connect remaining approved orphans via shared source document or closest semantic/tag peer
+        source_by_fname: dict[str, str] = {}
+        tags_by_fname: dict[str, set[str]] = {}
+        for n in nodes:
+            fn = n["filename"]
+            ap = safe_file_in_dir(atoms_dir, fn, allowed_exts={".md"}, must_exist=True)
+            if ap and not _is_reparse_or_link(ap):
+                try:
+                    p_fm = split_frontmatter(Path(ap).read_text(encoding="utf-8"))
+                    if p_fm is not None:
+                        vals = parse_frontmatter_values(p_fm[0])
+                        ev_src = str(vals.get("evidence_source") or "").replace("\\", "/").strip()
+                        if not ev_src:
+                            srcs = _parse_ref_list(vals.get("sources", ""))
+                            ev_src = srcs[0] if srcs else ""
+                        source_by_fname[fn] = ev_src
+                        tags_by_fname[fn] = {t.lower() for t in _parse_ref_list(vals.get("tags", "")) if t}
+                except Exception:
+                    pass
+
+        currently_linked = _compute_linked_filenames()
+        for n in nodes:
+            fn = n["filename"]
+            if not n.get("approved_current") or fn in currently_linked:
+                continue
+            my_src = source_by_fname.get(fn, "")
+            my_stems = node_stems_map.get(fn, set())
+            my_tags = tags_by_fname.get(fn, set())
+            my_ctx = n.get("contexts") or ()
+            my_proj_tags = [str(c).strip() for c in my_ctx if str(c).strip().lower().startswith("project:")]
+
+            # 1) Prefer scope-compatible approved peers sharing the exact source document or >=1 stem/tag
+            compat_peers = [
+                p for p in nodes
+                if p["filename"] != fn
+                and p.get("approved_current")
+                and _scopes_compatible_for_autolink(my_ctx, p.get("contexts") or ())
+            ]
+            # 2) If sole atom in a project:* scope, allow unidirectional outgoing link to an unscoped foundation atom
+            if not compat_peers and my_proj_tags:
+                compat_peers = [
+                    p for p in nodes
+                    if p["filename"] != fn
+                    and p.get("approved_current")
+                    and not any(str(c).strip().lower().startswith("project:") for c in (p.get("contexts") or ()))
+                ]
+            if not compat_peers:
+                continue
+
+            ce_vals, _ = score_query_atom_pairs(
+                n["claim"],
+                [f"## Claim\n{p['claim']}\n" for p in compat_peers],
+            )
+            best_peer = None
+            best_rank = -1.0
+            for p, ce_v in zip(compat_peers, ce_vals):
+                pfn = p["filename"]
+                same_src = 1.0 if (my_src and source_by_fname.get(pfn) == my_src) else 0.0
+                shared_st = len(my_stems & node_stems_map.get(pfn, set()))
+                shared_tg = len(my_tags & tags_by_fname.get(pfn, set()))
+                rank_val = same_src * 2.0 + shared_st * 0.4 + shared_tg * 0.3 + float(ce_v)
+                if rank_val > best_rank:
+                    best_rank = rank_val
+                    best_peer = p
+            if best_peer is not None:
+                target_stem = Path(best_peer["filename"]).stem
+                if target_stem not in proposed_by_file[fn] and len(proposed_by_file[fn]) < cap:
+                    proposed_by_file[fn].append(target_stem)
+                    currently_linked.add(fn)
+                    currently_linked.add(best_peer["filename"])
+
+    if dry_run:
+        linked_Sim = _compute_linked_filenames()
         est_orphans = [fn for fn in graph_before["orphan_approved_atoms"] if fn not in linked_Sim]
         return {
             "status": "dry_run",
@@ -2250,6 +2352,7 @@ def main(argv: list[str] | None = None) -> int:
     p_al.add_argument("--include-pending", action="store_true")
     p_al.add_argument("--dry-run", action="store_true")
     p_al.add_argument("--max-links", type=int, default=4)
+    p_al.add_argument("--connect-orphans", action="store_true", help="Connect remaining approved orphans via shared source document or closest semantic peer")
     p_al.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
@@ -2300,6 +2403,7 @@ def main(argv: list[str] | None = None) -> int:
             include_pending=bool(args.include_pending),
             dry_run=bool(args.dry_run),
             max_links_per_atom=args.max_links,
+            connect_orphans=bool(args.connect_orphans),
         )
         print(
             json.dumps(res, indent=2)

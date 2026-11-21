@@ -409,8 +409,10 @@ def list_mobile_drop_pairings(
             "initialized": False,
             "vault_id": vault_id,
             "key_id": None,
+            "recall_key_id": None,
             "recipient_pubkey_b64": None,
             "count": 0,
+            "recall_enabled_count": 0,
             "pairings": [],
         }
     items = [
