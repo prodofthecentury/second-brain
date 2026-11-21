@@ -390,9 +390,18 @@ unified CI gate (`scripts/test_all.py`).
 3. Bi-temporal `as_of` / `include_expired` + Cross-Encoder `recall_at_snapshot()` and validity-window `diff_snapshots()` wired across MCP, `/v1/snapshots/*` (with non-owner redaction), all 3 UIs, and synced Antigravity + Claude Code `SKILL.md` bundles; plus `watchdog_daemon.py` `--auto-sync` & incremental vector sync (`/v1/daemon/*`, `run_daemon.ps1` / LF `run_daemon.sh`).
 4. Portable Three-Store `.sbvault` encrypted (`AES-256-GCM` + `scrypt` + `HKDF-SHA256`) backup, in-memory Merkle/SHA-256 verification, and disaster-recovery restore with automatic FTS5 rebuilds (`scripts/vault_backup.py`, `second-brain backup`, `/v1/vault/backup/*`), plus automated WinGet / Homebrew Cask / Mobile PWA release builders (`scripts/build_distribution_manifests.py`), 300-atom ONNX/bi-temporal SOTA benchmark (`docs/sota-benchmark-results-2026-11-21.json`), and Suite `23/23` (`scripts/v100_final_completion_tests.py`) in `scripts/test_all.py` (`23/23 PASS`).
 
-## Completed product horizon (closed in Goals 17–25, `v1.0.0`)
+### Goal 26 — `v1.0.0` Partial-Gap Closure, 90-Case Live Third-Party Benchmarks, Operational Vault & Bidirectional Mobile Recall — COMPLETE
 
-Goals 0–25 complete the `v1.0.0` verifiable Second Brain platform across Python/CLI, Loopback HTTP API/SDK, 17-tool MCP, 6-host IDE connectors, Electron Desktop, VS Code, Browser Web Clipper MV3, Mobile Inbox Drop PWA, Streamlit Dashboard, WinGet/Homebrew manifests, and the 23-suite unified release gate (`scripts/test_all.py`, `23/23 PASS`).
+**What was built:**
+1. **Git Hygiene & Independent Security Reconciliation (`docs/independent-review-2026-11-22-v1.0.0.md`):** Scrubbed legacy 18-file vault commit `bffca9e` from `master` root history so both `master` and `release-code-only` share code-only root `98ce98a`, remediated 11/11 adversarial audit findings (`[HIGH-01]`..`[INFO-01]`), and synchronized `master`, `release-code-only`, and annotated tag `v1.0.0`.
+2. **Distribution & Installers (`scripts/build_distribution_manifests.py`, `dist/`):** Enforced exact semver boundary artifact selection, UTF-8 BOM handling, on-disk SHA-256 verification, valid WinGet 1.6.0 manifests (`winget validate`), and concrete Homebrew `Formula` generation (real URL + `sha256`, zero `:no_check`) across rebuilt `1.0.0` `.exe`, `.msi`, `.whl`, `.tar.gz`, `.vsix`, clipper, and mobile bundles.
+3. **Runtime & Sub-15ms Latency (`scripts/config.py`, `scripts/atom_mutator.py`, `scripts/answer_policy.py`):** Verified live Ollama models with `23 GB` `qwen3.6:latest` RAM-fit gating on `tier_2_cpu_balanced`, eliminated redundant Windows `CreateFileW` reparse checks to achieve `13.59 ms` 300-atom ONNX Cross-Encoder total P95 (`< 15.0 ms` target), and optimized grounding prompt context to bring warm CPU `qwen2.5-coder:7b` P95 inside the `35.0 s` SLO.
+4. **90-Case Human-Curated & Live Third-Party Benchmarks (`docs/retrieval-evaluation-proposed.json`, `scripts/live_third_party_benchmark.py`, `scripts/sota_benchmark.py`, `docs/benchmark-report-v1.0.0.md`):** Expanded curated evaluation to 90 cases (`25` answerable, `15` preference, `25` exploratory, `25` traps across `30/30/30` splits) and benchmarked Second Brain live against real `mem0ai`, `faiss-cpu`, `chromadb`, `rank-bm25`, and `SQLite FTS5`.
+5. **Live Operational Vault & Bidirectional Mobile Footprint (`mobile/inbox-drop/`, `scripts/inbox_drop.py`, `scripts/test_all.py`):** Linked all `75` approved vault atoms (`0` orphans, `141` edges), populated `brain/4-experiences/`, installed `.git/hooks/post-commit`, provisioned live DPAPI E2EE Sync + Mobile + Clipper + Multi-Vault state in `%LOCALAPPDATA%\SecondBrain\security`, added `SBMR1` encrypted mobile recall/search/review, and expanded `scripts/test_all.py` to **26/26 suites (`100% PASS`)**.
+
+## Completed product horizon & Former Partial Section (closed in Goals 17–26, `v1.0.0`)
+
+Goals 0–26 complete the `v1.0.0` verifiable Second Brain platform and close **100% of the former Partial section** across Python/CLI, Loopback HTTP API/SDK, 17-tool MCP, 6-host IDE connectors, Electron Desktop, VS Code, Browser Web Clipper MV3, Bidirectional Mobile Drop & Recall PWA, Mobile Vault Client, Streamlit Dashboard, WinGet/Homebrew manifests, live third-party SOTA benchmarks (`docs/benchmark-report-v1.0.0.md`), independent review (`docs/independent-review-2026-11-22-v1.0.0.md`), and the 26-suite unified release gate (`scripts/test_all.py`, `26/26 PASS`).
 
 ## Checkpoints
 
@@ -421,4 +430,4 @@ Goals 0–25 complete the `v1.0.0` verifiable Second Brain platform across Pytho
 | Interface hardening locks out local users | Medium | Salted `scrypt` CLI password reset (`dashboard_auth.py set-password`) & loopback policy |
 | Dependency lock omits native runtime needs | High | `uv.lock` + `setup.ps1`/`setup.sh` C++ ABI checks (`vcruntime140.dll`/`libstdc++`) |
 | Dense embedder offline drops user queries | Medium | Automatic dynamic fallback to SQLite FTS5 with explicit `[WARNING]` banner |
-| Legacy history leaked on future remote push | High | Audited `bffca9e` and prepared clean `release-code-only` orphan branch |
+| Legacy history leaked on future remote push | High | Scrubbed `bffca9e` from `master` root history (`98ce98a` code-only root) and synchronized `release-code-only` |
