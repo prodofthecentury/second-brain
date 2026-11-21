@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none';" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'none'; img-src 'self' data:; media-src 'self' blob:; object-src 'none'; base-uri 'none';" />
   <title>Quick Capture</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -24,9 +24,13 @@
       <input type="text" id="qcTags" class="no-drag" placeholder="Tags (comma-separated, e.g. quick-capture)" style="flex:1;" />
     </div>
     <input type="text" id="qcTitle" class="no-drag" placeholder="Optional title..." />
-    <textarea id="qcBody" class="no-drag" placeholder="Capture a thought, snippet, or decision... (Ctrl+Enter to save)" style="flex:1; resize:none;"></textarea>
+    <textarea id="qcBody" class="no-drag" placeholder="Capture a thought, snippet, decision, or paste a screenshot (Ctrl+V)... (Ctrl+Enter to save)" style="flex:1; resize:none;"></textarea>
+    <div id="qcMediaBadge" class="note-item-meta no-drag" style="display:none;"></div>
     <div class="capture-footer no-drag">
-      <button class="btn no-drag" id="qcCancel" type="button">Cancel</button>
+      <input type="file" id="qcMediaFileInput" class="no-drag" style="display:none;" accept="image/*,audio/*,.pdf,.docx,.epub,.html,.csv,.tsv" />
+      <button class="btn sm no-drag" id="qcAttachMediaBtn" type="button">Attach Media</button>
+      <button class="btn sm no-drag" id="qcRecordAudioBtn" type="button">Record Voice</button>
+      <button class="btn no-drag" id="qcCancel" type="button" style="margin-left:auto;">Cancel</button>
       <button class="btn primary no-drag" id="qcSave" type="button">Save Note</button>
     </div>
   </div>

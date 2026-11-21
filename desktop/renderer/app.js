@@ -222,6 +222,24 @@ function closeModal() {
   modalCtrl.close();
 }
 
+function appendTemporalValidityBadges(container, atom) {
+  if (!atom || typeof atom !== "object") return;
+  const vf = String(atom.valid_from || "").trim();
+  const vu = String(atom.valid_until || "").trim();
+  const ts = String(atom.temporal_status || "").trim();
+  if (!vf && !vu && (!ts || ts === "active")) return;
+  const cls =
+    ts === "expired" || ts === "invalid_window"
+      ? "danger"
+      : ts === "not_yet_valid"
+      ? "warn"
+      : "ok";
+  const winLabel = `${vf || "−∞"} -> ${vu || "+∞"}`;
+  container.appendChild(
+    el("span", `badge ${cls}`, `${ts ? ts.toUpperCase() + " " : ""}[${winLabel}]`)
+  );
+}
+
 async function openAtomInspectorModal(filename, fallbackData = null) {
   if (!filename) return;
   modalCtrl.open({
@@ -263,6 +281,7 @@ async function openAtomInspectorModal(filename, fallbackData = null) {
   if (atom.sha256) {
     badges.appendChild(el("span", "badge mono", `sha256:${shortSha(atom.sha256)}`));
   }
+  appendTemporalValidityBadges(badges, atom);
   const revDetails = atom.review_details || {};
   const meta = atom.metadata || {};
   const anchorVerified =
@@ -422,13 +441,69 @@ async function openAtomEditorModal(atomSummary) {
   });
 
   claimWrap.appendChild(claimInput);
+
+  const temporalRow = el("div", "form-grid");
+  const vfCol = el("div", "field-col");
+  vfCol.appendChild(el("span", "field-label", "Bi-Temporal valid_from (YYYY-MM-DD, optional)"));
+  const vfInput = el("input");
+  vfInput.type = "text";
+  vfInput.placeholder = "e.g. 2026-01-01";
+  vfInput.value = fullAtom.valid_from || "";
+  vfCol.appendChild(vfInput);
+
+  const vuCol = el("div", "field-col");
+  vuCol.appendChild(el("span", "field-label", "Bi-Temporal valid_until (YYYY-MM-DD, optional)"));
+  const vuInput = el("input");
+  vuInput.type = "text";
+  vuInput.placeholder = "e.g. 2026-12-31";
+  vuInput.value = fullAtom.valid_until || "";
+  vuCol.appendChild(vuInput);
+  temporalRow.appendChild(vfCol);
+  temporalRow.appendChild(vuCol);
+
   modalBodyEl.appendChild(info);
   modalBodyEl.appendChild(claimWrap);
+  modalBodyEl.appendChild(temporalRow);
   modalBodyEl.appendChild(ta);
 
   const cancelBtn = el("button", "btn", "Cancel");
   cancelBtn.type = "button";
   cancelBtn.onclick = closeModal;
+
+  const saveValidityBtn = el("button", "btn good", "Save Validity Window Only");
+  saveValidityBtn.type = "button";
+  saveValidityBtn.onclick = async () => {
+    saveValidityBtn.disabled = true;
+    try {
+      const res = await window.secondBrain.api(
+        "POST",
+        `/v1/atoms/${encodeURIComponent(filename)}/validity`,
+        {
+          expected_sha256: fullAtom.sha256 || "",
+          valid_from: vfInput.value.trim() || null,
+          valid_until: vuInput.value.trim() || null,
+          actor: "desktop_owner",
+        }
+      );
+      if (res.ok) {
+        showToast(
+          `Updated validity window for ${filename} (${res.data?.temporal_status || "active"})`,
+          "ok"
+        );
+        closeModal();
+        if (activeView === "review") loadReviewQueue();
+        if (activeView === "proof") loadProofView();
+        if (activeView === "graph") loadGraphView();
+        refreshHealth();
+      } else {
+        showToast(apiErrorMessage(res, "Validity update failed"), "danger");
+      }
+    } catch (err) {
+      showToast(`Validity error: ${err?.message || String(err)}`, "danger");
+    } finally {
+      saveValidityBtn.disabled = false;
+    }
+  };
 
   const saveBtn = el("button", "btn primary", "Save Atom (CAS)");
   saveBtn.type = "button";
@@ -436,14 +511,21 @@ async function openAtomEditorModal(atomSummary) {
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving...";
     try {
+      const putPayload = {
+        content: ta.value,
+        expected_sha256: fullAtom.sha256 || "",
+        actor: "desktop_owner",
+      };
+      if (vfInput.value.trim() !== String(fullAtom.valid_from || "").trim()) {
+        putPayload.valid_from = vfInput.value.trim() || null;
+      }
+      if (vuInput.value.trim() !== String(fullAtom.valid_until || "").trim()) {
+        putPayload.valid_until = vuInput.value.trim() || null;
+      }
       const res = await window.secondBrain.api(
         "PUT",
         `/v1/atoms/${encodeURIComponent(filename)}`,
-        {
-          content: ta.value,
-          expected_sha256: fullAtom.sha256 || "",
-          actor: "desktop_owner",
-        }
+        putPayload
       );
       if (res.ok) {
         showToast(`Saved atom ${filename}`, "ok");
@@ -462,7 +544,7 @@ async function openAtomEditorModal(atomSummary) {
       saveBtn.textContent = "Save Atom (CAS)";
     }
   };
-  modalFooterEl.replaceChildren(cancelBtn, saveBtn);
+  modalFooterEl.replaceChildren(cancelBtn, saveValidityBtn, saveBtn);
 }
 
 // ─── View Navigation & Backend Status ────────────────────────────────────────
@@ -478,8 +560,14 @@ function switchView(name) {
   if (name === "chat") loadChatHosts();
   if (name === "review") loadReviewQueue();
   if (name === "import") loadScoutQueue();
-  if (name === "ide") loadIdeStatus();
-  if (name === "system") loadSystemView();
+  if (name === "ide") {
+    loadIdeStatus();
+    loadGitHookStatus();
+  }
+  if (name === "system") {
+    loadSystemView();
+    loadDaemonStatus();
+  }
   if (name === "planner") loadPlannerView();
   if (name === "proof") loadProofView();
   if (name === "graph") loadGraphView();
@@ -941,6 +1029,10 @@ async function verifySelectionAsAtom() {
   if (claimOverride) {
     payload.claim = claimOverride;
   }
+  const verifyValidFrom = document.getElementById("verifyValidFromInput")?.value.trim();
+  const verifyValidUntil = document.getElementById("verifyValidUntilInput")?.value.trim();
+  if (verifyValidFrom) payload.valid_from = verifyValidFrom;
+  if (verifyValidUntil) payload.valid_until = verifyValidUntil;
 
   try {
     const res = await window.secondBrain.request(
@@ -950,11 +1042,18 @@ async function verifySelectionAsAtom() {
     );
     if (res.ok) {
       const atomFn = res.data?.atom_filename || res.data?.filename || "atom";
+      const linked = Array.isArray(res.data?.auto_linked_atoms) ? res.data.auto_linked_atoms : [];
+      const dupes = Array.isArray(res.data?.duplicate_candidates) ? res.data.duplicate_candidates : [];
+      const conflicts = Array.isArray(res.data?.contradiction_alerts) ? res.data.contradiction_alerts : [];
       document.getElementById("verifyClaimInput").value = "";
+      let linkInfo = "";
+      if (linked.length) linkInfo += ` · Auto-linked: ${linked.join(", ")}`;
+      if (dupes.length) linkInfo += ` · ${dupes.length} duplicate candidate(s)`;
+      if (conflicts.length) linkInfo += ` · ${conflicts.length} contradiction alert(s)`;
       banner.textContent = `Verified Atom anchored: ${atomFn} (${
         res.data?.memory_type || memory_type
-      })`;
-      showToast(`Promoted excerpt to Verified Atom: ${atomFn}`, "ok");
+      })${linkInfo}`;
+      showToast(`Promoted excerpt to Verified Atom: ${atomFn}${linkInfo}`, conflicts.length ? "warn" : "ok");
       refreshHealth();
     } else {
       const errMsg = apiErrorMessage(res, "Verify excerpt failed");
@@ -1204,6 +1303,34 @@ async function loadChatHosts() {
         document.getElementById("planHostSelect"),
         resolved
       );
+    }
+    await loadChatThreads();
+  } catch {}
+}
+
+async function loadChatThreads() {
+  const sel = document.getElementById("chatThreadSelect");
+  if (!sel) return;
+  try {
+    const res = await window.secondBrain.request("GET", "/v1/chat/threads?limit=50");
+    if (!res.ok) return;
+    const threads = Array.isArray(res.data?.threads) ? res.data.threads : [];
+    const curId = chatSession.getThreadId() || sel.value || "";
+    sel.replaceChildren();
+    const blankOpt = el("option", "", "(New / Unsaved Session)");
+    blankOpt.value = "";
+    sel.appendChild(blankOpt);
+    for (const th of threads) {
+      const opt = el(
+        "option",
+        "",
+        `${th.title || th.thread_id} (${th.turn_count ?? 0} turns)`
+      );
+      opt.value = th.thread_id;
+      sel.appendChild(opt);
+    }
+    if ([...sel.options].some((o) => o.value === curId)) {
+      sel.value = curId;
     }
   } catch {}
 }
@@ -1563,6 +1690,7 @@ if (window.secondBrain && typeof window.secondBrain.onChatEvent === "function") 
         chatBannerEl.textContent += ` · Completed in ${turn.total_ms} ms`;
       }
       setChatStreamingState(false);
+      loadChatThreads();
     }
 
     renderAllChatTurns();
@@ -1606,6 +1734,10 @@ async function sendChat() {
     },
   });
 
+  const priorHistory = chatSession.buildPriorHistory();
+  const threadSelVal = document.getElementById("chatThreadSelect")?.value || "";
+  const activeTid = chatSession.getThreadId() || threadSelVal;
+
   const reqPayload = ChatHelper.buildChatStreamRequest({
     query,
     mode: document.getElementById("chatModeSelect").value,
@@ -1616,6 +1748,12 @@ async function sendChat() {
     project_scope: document.getElementById("chatScopeInput").value,
     include_preferences: document.getElementById("chatIncludePrefsCheck")
       .checked,
+    include_expired: Boolean(
+      document.getElementById("chatIncludeExpiredCheck")?.checked
+    ),
+    as_of: document.getElementById("chatAsOfInput")?.value || "",
+    thread_id: activeTid,
+    history: priorHistory,
   });
 
   const turn = chatSession.startTurn(reqPayload);
@@ -1684,8 +1822,128 @@ document
       chatSourcesHeaderEl.textContent = "Retrieved Sources (Click to Inspect)";
     }
     chatBannerEl.textContent = "Cleared multi-turn chat session history.";
+    chatSession.setThreadId("");
+    const thSel = document.getElementById("chatThreadSelect");
+    if (thSel) thSel.value = "";
     renderAllChatTurns();
   });
+
+const chatThreadSelEl = document.getElementById("chatThreadSelect");
+if (chatThreadSelEl) {
+  chatThreadSelEl.addEventListener("change", async () => {
+    const tid = chatThreadSelEl.value;
+    if (!tid) {
+      chatSession.clearHistory();
+      chatSession.setThreadId("");
+      renderAllChatTurns();
+      chatSourcesEl.replaceChildren();
+      return;
+    }
+    const res = await window.secondBrain.request("GET", `/v1/chat/threads/${encodeURIComponent(tid)}`);
+    if (!res.ok) {
+      showToast(apiErrorMessage(res, "Could not load chat thread"), "danger");
+      return;
+    }
+    const count = chatSession.loadThreadTurns(res.data || {});
+    renderAllChatTurns();
+    renderChatSourceCards(chatSession.getSelectedTurn());
+    chatBannerEl.textContent = `Loaded thread '${res.data?.title || tid}' (${count} turn(s)).`;
+  });
+}
+
+const chatNewThreadBtnEl = document.getElementById("chatNewThreadBtn");
+if (chatNewThreadBtnEl) {
+  chatNewThreadBtnEl.addEventListener("click", async () => {
+    const scope = document.getElementById("chatScopeInput")?.value.trim() || undefined;
+    const host_id = document.getElementById("chatHostSelect")?.value || "ollama_local";
+    const mode = document.getElementById("chatModeSelect")?.value || "stream";
+    const res = await window.secondBrain.request("POST", "/v1/chat/threads", {
+      title: "",
+      project_scope: scope,
+      host_id,
+      mode,
+    });
+    if (!res.ok) {
+      showToast(apiErrorMessage(res, "Could not create chat thread"), "danger");
+      return;
+    }
+    chatSession.clearHistory();
+    chatSession.setThreadId(res.data?.thread_id || "");
+    await loadChatThreads();
+    if (chatThreadSelEl && res.data?.thread_id) {
+      chatThreadSelEl.value = res.data.thread_id;
+    }
+    renderAllChatTurns();
+    chatSourcesEl.replaceChildren();
+    chatBannerEl.textContent = `Started persistent thread ${res.data?.thread_id || ""}.`;
+    showToast("Started new multi-turn chat thread", "ok");
+  });
+}
+
+const chatPinTurnBtnEl = document.getElementById("chatPinTurnBtn");
+if (chatPinTurnBtnEl) {
+  chatPinTurnBtnEl.addEventListener("click", async () => {
+    const tid = chatSession.getThreadId() || document.getElementById("chatThreadSelect")?.value || "";
+    if (!tid) {
+      const sel = chatSession.getSelectedTurn();
+      if (!sel || !sel.assistantText) {
+        showToast("Ask a question first to pin an answer to Working Notes.", "warn");
+        return;
+      }
+      const nRes = await window.secondBrain.request("POST", "/v1/notes", {
+        title: `Pinned Answer: ${sel.query.slice(0, 60)}`,
+        body: `## Question\n${sel.query}\n\n## Answer\n${sel.assistantText}\n`,
+        tags: ["pinned-chat"],
+      });
+      if (nRes.ok) {
+        showToast(`Pinned answer to note ${nRes.data?.filename || ""}`, "ok");
+        await loadNotes({ append: false });
+      } else {
+        showToast(apiErrorMessage(nRes, "Pin to note failed"), "danger");
+      }
+      return;
+    }
+    const sel = chatSession.getSelectedTurn();
+    const payload = sel && sel.dbTurnId ? { turn_id: sel.dbTurnId } : {};
+    const res = await window.secondBrain.request(
+      "POST",
+      `/v1/chat/threads/${encodeURIComponent(tid)}/pin`,
+      payload
+    );
+    if (res.ok) {
+      showToast(`Pinned turn to Working Note: ${res.data?.filename || ""}`, "ok");
+      await loadNotes({ append: false });
+    } else {
+      showToast(apiErrorMessage(res, "Pin turn failed"), "danger");
+    }
+  });
+}
+
+const chatDeleteThreadBtnEl = document.getElementById("chatDeleteThreadBtn");
+if (chatDeleteThreadBtnEl) {
+  chatDeleteThreadBtnEl.addEventListener("click", async () => {
+    const tid = chatSession.getThreadId() || document.getElementById("chatThreadSelect")?.value || "";
+    if (!tid) {
+      showToast("Select a saved chat thread to delete.", "warn");
+      return;
+    }
+    const res = await window.secondBrain.request(
+      "DELETE",
+      `/v1/chat/threads/${encodeURIComponent(tid)}`,
+      {}
+    );
+    if (res.ok) {
+      chatSession.clearHistory();
+      chatSession.setThreadId("");
+      await loadChatThreads();
+      renderAllChatTurns();
+      chatSourcesEl.replaceChildren();
+      showToast(`Deleted thread ${tid}`, "ok");
+    } else {
+      showToast(apiErrorMessage(res, "Delete thread failed"), "danger");
+    }
+  });
+}
 document
   .getElementById("chatExportMdBtn")
   .addEventListener("click", async () => {
@@ -1918,6 +2176,7 @@ function buildAtomReviewCard(atom) {
   if (atom.sha256) {
     top.appendChild(el("span", "badge mono", shortSha(atom.sha256)));
   }
+  appendTemporalValidityBadges(top, atom);
   card.appendChild(top);
 
   card.appendChild(el("div", "", atom.claim || atom.title || "(no claim)"));
@@ -1984,6 +2243,7 @@ function buildApprovedAtomCard(atom) {
   top.appendChild(el("span", "badge ok", "accepted"));
   if (atom.memory_type) top.appendChild(el("span", "badge", atom.memory_type));
   top.appendChild(el("span", "badge mono", shortSha(atom.sha256)));
+  appendTemporalValidityBadges(top, atom);
   card.appendChild(top);
   card.appendChild(el("div", "", atom.claim || ""));
 
@@ -3049,6 +3309,16 @@ async function loadSystemView() {
     }
   }
   hwCard.appendChild(modelsRow);
+  const oversized = hw.oversized_installed_models || [];
+  if (oversized.length) {
+    hwCard.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        `Skipped oversized GGUF model(s) exceeding host RAM/VRAM budget: ${oversized.join(", ")}`
+      )
+    );
+  }
 
   const resolvedHosts =
     hostsRes.ok &&
@@ -3115,9 +3385,228 @@ async function loadSystemView() {
     }
     fitWrap.appendChild(procBar);
   }
+  loadOnnxModelsStatus();
   loadSyncStatus();
+  loadInboxDropPairings();
   loadWorkspaces();
   loadClipperPairings();
+}
+
+async function loadOnnxModelsStatus() {
+  const kpiWrap = document.getElementById("onnxStatusKpis");
+  const outEl = document.getElementById("onnxOutput");
+  if (!kpiWrap || !outEl) return;
+  kpiWrap.replaceChildren();
+  try {
+    const res = await window.secondBrain.request("GET", "/v1/models/onnx");
+    if (!res.ok) {
+      outEl.textContent = apiErrorMessage(res, "ONNX status unavailable");
+      return;
+    }
+    const d = res.data || {};
+    const slots = d.slots || {};
+    const rtReady = Boolean(d.onnx_runtime_ready ?? d.runtime_available);
+    kpiWrap.appendChild(
+      makeKpiCard(
+        "Runtime",
+        rtReady ? "ONNXRUNTIME READY" : "FALLBACK ONLY",
+        d.models_root || "",
+        rtReady ? "ok" : "warn"
+      )
+    );
+    const ce = slots["cross-encoder"] || {};
+    kpiWrap.appendChild(
+      makeKpiCard(
+        "Cross-Encoder Reranker",
+        ce.verified ? "VERIFIED" : ce.installed ? "NEEDS VERIFY" : "NOT PULLED",
+        ce.model_id || ce.repo_id || "ms-marco-MiniLM-L-6-v2",
+        ce.verified ? "ok" : "warn"
+      )
+    );
+    const nli = slots.nli || {};
+    kpiWrap.appendChild(
+      makeKpiCard(
+        "Bidirectional NLI",
+        nli.verified ? "VERIFIED" : nli.installed ? "NEEDS VERIFY" : "NOT PULLED",
+        nli.model_id || nli.repo_id || "nli-deberta-v3-xsmall",
+        nli.verified ? "ok" : "warn"
+      )
+    );
+    outEl.textContent = d.all_verified
+      ? `All pinned ONNX weights verified in ${d.models_root || "security/models"} (neural CPU reranking & clause-aligned NLI active).`
+      : "ONNX weights not yet installed — deterministic fallback engines active until you click Pull Verified Weights.";
+  } catch (err) {
+    outEl.textContent = `ONNX status error: ${err?.message || String(err)}`;
+  }
+}
+
+const onnxRefreshBtnEl = document.getElementById("onnxRefreshBtn");
+if (onnxRefreshBtnEl) onnxRefreshBtnEl.addEventListener("click", loadOnnxModelsStatus);
+
+const onnxPullBtnEl = document.getElementById("onnxPullBtn");
+if (onnxPullBtnEl) {
+  onnxPullBtnEl.addEventListener("click", async () => {
+    const outEl = document.getElementById("onnxOutput");
+    onnxPullBtnEl.disabled = true;
+    if (outEl) outEl.textContent = "Pulling & SHA-256 verifying pinned HuggingFace ONNX weights...";
+    try {
+      const res = await window.secondBrain.request("POST", "/v1/models/onnx/pull", { slot: "all" });
+      if (!res.ok) {
+        const msg = apiErrorMessage(res, "ONNX pull failed");
+        if (outEl) outEl.textContent = msg;
+        showToast(msg, "danger");
+        return;
+      }
+      showToast("Pulled & verified local ONNX weights!", "ok");
+      await loadOnnxModelsStatus();
+    } catch (err) {
+      showToast(`ONNX pull error: ${err?.message || String(err)}`, "danger");
+    } finally {
+      onnxPullBtnEl.disabled = false;
+    }
+  });
+}
+
+const onnxVerifyBtnEl = document.getElementById("onnxVerifyBtn");
+if (onnxVerifyBtnEl) {
+  onnxVerifyBtnEl.addEventListener("click", async () => {
+    const outEl = document.getElementById("onnxOutput");
+    onnxVerifyBtnEl.disabled = true;
+    try {
+      const res = await window.secondBrain.request("POST", "/v1/models/onnx/verify", {
+        slot: "all",
+        smoke_test: true,
+      });
+      if (!res.ok) {
+        const msg = apiErrorMessage(res, "ONNX verification failed");
+        if (outEl) outEl.textContent = msg;
+        showToast(msg, "danger");
+        return;
+      }
+      const ok = Boolean(res.data?.all_verified);
+      if (outEl) {
+        outEl.textContent = ok
+          ? "SHA-256 digests and CPU smoke inference passed on both Cross-Encoder and DeBERTa NLI!"
+          : `ONNX verification reported missing/invalid slot(s) (all_verified=${ok}).`;
+      }
+      showToast(ok ? "ONNX weights & smoke inference verified!" : "ONNX weights missing or invalid", ok ? "ok" : "warn");
+      await loadOnnxModelsStatus();
+    } catch (err) {
+      showToast(`ONNX verify error: ${err?.message || String(err)}`, "danger");
+    } finally {
+      onnxVerifyBtnEl.disabled = false;
+    }
+  });
+}
+
+async function loadInboxDropPairings() {
+  const wrap = document.getElementById("inboxDropPairingsWrap");
+  const outEl = document.getElementById("inboxDropOutput");
+  if (!wrap) return;
+  try {
+    const res = await window.secondBrain.request("GET", "/v1/sync/inbox-drop/pairings");
+    wrap.replaceChildren();
+    if (!res.ok) {
+      if (outEl) outEl.textContent = apiErrorMessage(res, "Mobile inbox drop unavailable");
+      return;
+    }
+    const pairings = Array.isArray(res.data?.pairings) ? res.data.pairings : [];
+    const activeCount = pairings.filter((p) => !p.revoked).length;
+    if (res.data?.key_id && outEl && outEl.textContent.startsWith("Configure E2EE Sync")) {
+      outEl.textContent = `Vault P-256 Drop Key ID: ${res.data.key_id} · ${activeCount} active mobile pairing(s).`;
+    }
+    if (!pairings.length) {
+      wrap.appendChild(el("div", "note-item-meta", "No mobile quick-capture devices paired yet."));
+      return;
+    }
+    for (const p of pairings) {
+      const row = el("div", "toolbar");
+      row.style.marginTop = "6px";
+      row.appendChild(el("strong", "", p.label || p.device_label || "Mobile Device"));
+      row.appendChild(el("span", "badge mono", `token:${p.token_id || ""}`));
+      row.appendChild(
+        el("span", `badge ${p.revoked ? "danger" : "ok"}`, p.revoked ? "revoked" : "active")
+      );
+      if (!p.revoked) {
+        const revBtn = el("button", "btn sm danger", "Revoke");
+        revBtn.type = "button";
+        revBtn.style.marginLeft = "auto";
+        revBtn.onclick = async () => {
+          const r = await window.secondBrain.request(
+            "DELETE",
+            `/v1/sync/inbox-drop/${encodeURIComponent(p.token_id)}`,
+            {}
+          );
+          showToast(
+            r.ok ? `Revoked mobile drop token ${p.token_id}` : apiErrorMessage(r, "Revoke failed"),
+            r.ok ? "ok" : "danger"
+          );
+          await loadInboxDropPairings();
+        };
+        row.appendChild(revBtn);
+      }
+      wrap.appendChild(row);
+    }
+  } catch (err) {
+    if (outEl) outEl.textContent = `Mobile drop error: ${err?.message || String(err)}`;
+  }
+}
+
+const inboxDropRefreshBtnEl = document.getElementById("inboxDropRefreshBtn");
+if (inboxDropRefreshBtnEl) inboxDropRefreshBtnEl.addEventListener("click", loadInboxDropPairings);
+
+const inboxDropPairBtnEl = document.getElementById("inboxDropPairBtn");
+if (inboxDropPairBtnEl) {
+  inboxDropPairBtnEl.addEventListener("click", async () => {
+    const label = (document.getElementById("inboxDropDeviceLabelInput")?.value || "Mobile Quick-Capture").trim();
+    const pwaUrl = (document.getElementById("inboxDropPwaUrlInput")?.value || "").trim();
+    const incS3 = Boolean(document.getElementById("inboxDropIncludeS3Check")?.checked);
+    const outEl = document.getElementById("inboxDropOutput");
+    const res = await window.secondBrain.request("POST", "/v1/sync/inbox-drop/pair", {
+      device_label: label || "Mobile Quick-Capture",
+      pwa_base_url: pwaUrl,
+      include_s3_credentials: incS3,
+    });
+    if (!res.ok) {
+      const msg = apiErrorMessage(res, "Mobile pairing failed");
+      if (outEl) outEl.textContent = msg;
+      showToast(msg, "danger");
+      return;
+    }
+    const shareTarget = res.data?.pwa_pairing_url || res.data?.pairing_fragment || "";
+    try {
+      if (shareTarget && navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(shareTarget);
+      }
+    } catch {}
+    if (outEl) {
+      outEl.textContent = `Paired '${res.data?.device_label}' (token_id=${res.data?.token_id}, copied to clipboard): ${shareTarget}`;
+    }
+    showToast("Mobile E2EE Inbox Drop pairing copied to clipboard!", "ok");
+    await loadInboxDropPairings();
+  });
+}
+
+const inboxDropPullBtnEl = document.getElementById("inboxDropPullBtn");
+if (inboxDropPullBtnEl) {
+  inboxDropPullBtnEl.addEventListener("click", async () => {
+    const outEl = document.getElementById("inboxDropOutput");
+    const res = await window.secondBrain.request("POST", "/v1/sync/inbox-drop/pull", {
+      delete_consumed: true,
+    });
+    if (!res.ok) {
+      const msg = apiErrorMessage(res, "Pull mobile drops failed");
+      if (outEl) outEl.textContent = msg;
+      showToast(msg, "danger");
+      return;
+    }
+    const d = res.data || {};
+    if (outEl) {
+      outEl.textContent = `Pulled mobile inbox drops: ${d.ingested_count ?? 0} staged into 0-raw/inbox/, ${d.skipped_duplicate_count ?? 0} duplicate(s) skipped, ${d.rejected_count ?? 0} rejected.`;
+    }
+    showToast(`Pulled ${d.ingested_count ?? 0} mobile drop(s) into Quarantined Inbox`, "ok");
+    refreshHealth();
+  });
 }
 
 async function loadSyncStatus() {
@@ -3152,6 +3641,23 @@ async function loadSyncStatus() {
     kpiWrap.appendChild(makeKpiCard("Durable Files", s.durable_file_count ?? 0));
     kpiWrap.appendChild(
       makeKpiCard(
+        "Key Sealing",
+        s.keychain_sealed ? "OS KEYCHAIN" : String(s.kdf_mode || "keyfile").toUpperCase(),
+        s.keychain_backend || "",
+        s.keychain_sealed ? "ok" : ""
+      )
+    );
+    const autoSt = s.auto_sync || {};
+    kpiWrap.appendChild(
+      makeKpiCard(
+        "Auto-Sync",
+        autoSt.enabled ? "ENABLED" : "OFF",
+        autoSt.enabled ? `${autoSt.interval_seconds || 300}s · ${autoSt.last_status || "idle"}` : "",
+        autoSt.enabled ? "ok" : ""
+      )
+    );
+    kpiWrap.appendChild(
+      makeKpiCard(
         "Conflicts",
         s.conflict_count ?? 0,
         "",
@@ -3164,10 +3670,14 @@ async function loadSyncStatus() {
       if (!targetInput.value && s.target) targetInput.value = s.target;
       const backendSel = document.getElementById("syncBackendSelect");
       if (s.backend_type) backendSel.value = s.backend_type;
-      outEl.textContent = `Vault ${shortSha(s.vault_id || "")} · Device ${s.device_id || ""} · Mode ${s.kdf_mode || "keyfile"} · Local pending edits: ${s.local_changed_count ?? 0}`;
+      const authSel = document.getElementById("syncAuthModeSelect");
+      if (authSel && s.auth_mode) authSel.value = s.auth_mode;
+      const regIn = document.getElementById("syncS3RegionInput");
+      if (regIn && s.s3_region) regIn.value = s.s3_region;
+      outEl.textContent = `Vault ${shortSha(s.vault_id || "")} · Device ${s.device_id || ""} · Auth ${s.auth_mode || "bearer"} · Mode ${s.kdf_mode || "keyfile"}${s.keychain_sealed ? " (DPAPI/Keychain)" : ""} · Local pending edits: ${s.local_changed_count ?? 0}`;
     } else {
       outEl.textContent =
-        "Not configured yet. Enter a local sync folder (OneDrive/Syncthing/NAS) or https:// target and click Init or Join.";
+        "Not configured yet. Enter a local sync folder (OneDrive/Syncthing/NAS) or https:// S3/R2 target and click Init or Join.";
     }
 
     const conflicts = Array.isArray(s.conflicts) ? s.conflicts : [];
@@ -3176,18 +3686,150 @@ async function loadSyncStatus() {
         el("div", "field-label", `Quarantined Sync Conflicts (${conflicts.length}):`)
       );
       for (const c of conflicts.slice(0, 20)) {
-        confWrap.appendChild(
+        const row = el("div", "diff-card removed");
+        const bar = el("div", "toolbar");
+        bar.appendChild(
           el(
-            "div",
-            "diff-card removed",
-            `${c.rel_path || "?"} -> quarantined remote copy: ${c.conflict_copy || "?"} (epoch ${c.remote_epoch ?? "?"})`
+            "span",
+            "",
+            `${c.rel_path || "?"} · epoch ${c.remote_epoch ?? "?"} (${c.conflict_kind || "divergent_edit"})`
           )
         );
+        const resBtn = el("button", "btn sm primary", "Resolve 3-Way…");
+        resBtn.type = "button";
+        resBtn.style.marginLeft = "auto";
+        resBtn.onclick = () => openSyncConflictResolverModal(c);
+        bar.appendChild(resBtn);
+        row.appendChild(bar);
+        confWrap.appendChild(row);
       }
     }
   } catch (err) {
     outEl.textContent = `Sync status error: ${err?.message || String(err)}`;
   }
+}
+
+async function openSyncConflictResolverModal(conflictSummary) {
+  const cid = conflictSummary?.conflict_id || conflictSummary?.rel_path || "";
+  if (!cid) return;
+  modalCtrl.open({
+    title: `3-Way Conflict Resolver: ${conflictSummary.rel_path || cid}`,
+    renderBody(body) {
+      body.appendChild(el("div", "status-banner", "Loading 3-way conflict versions & unified diff..."));
+    },
+  });
+
+  const res = await window.secondBrain.request(
+    "GET",
+    `/v1/sync/conflicts/${encodeURIComponent(cid)}`
+  );
+  modalBodyEl.replaceChildren();
+  modalFooterEl.replaceChildren();
+  if (!res.ok || !res.data) {
+    modalBodyEl.appendChild(
+      el("div", "status-banner banner-danger", apiErrorMessage(res, "Failed to load conflict detail"))
+    );
+    const closeBtn = el("button", "btn", "Close");
+    closeBtn.type = "button";
+    closeBtn.onclick = closeModal;
+    modalFooterEl.appendChild(closeBtn);
+    return;
+  }
+
+  const det = res.data;
+  modalBodyEl.appendChild(
+    el(
+      "div",
+      "status-banner banner-warn",
+      `Path: ${det.rel_path} · Local SHA: ${shortSha(det.current_local_sha256)} · Remote SHA: ${shortSha(det.remote_sha256 || "")}${
+        det.is_canonical_atom
+          ? " · Manual merges on canonical atoms automatically reset review_status=pending until owner re-approval."
+          : ""
+      }`
+    )
+  );
+
+  if (det.base_content) {
+    const baseCol = el("div", "field-col");
+    baseCol.appendChild(el("span", "field-label", "Common Ancestor (Base)"));
+    baseCol.appendChild(el("pre", "mono-box", det.base_content));
+    modalBodyEl.appendChild(baseCol);
+  }
+
+  const diffCol = el("div", "field-col");
+  diffCol.appendChild(el("span", "field-label", "Unified Diff (Local vs Remote)"));
+  diffCol.appendChild(el("pre", "mono-box", det.unified_diff || "(no line diff)"));
+  modalBodyEl.appendChild(diffCol);
+
+  const mergeCol = el("div", "field-col");
+  mergeCol.appendChild(
+    el("span", "field-label", "Manual 3-Way Merge Editor (edit below and click Save Manual Merge)")
+  );
+  const mergeTa = el("textarea", "editor-textarea");
+  mergeTa.style.minHeight = "180px";
+  mergeTa.value = det.local_content || det.remote_content || "";
+  mergeCol.appendChild(mergeTa);
+  modalBodyEl.appendChild(mergeCol);
+
+  async function applyResolution(strategy) {
+    const payload = {
+      conflict_id: det.conflict_id || det.rel_path,
+      resolution: strategy,
+      expected_local_sha256: det.current_local_sha256 || undefined,
+      actor: "desktop_owner",
+    };
+    if (strategy === "manual_merge") {
+      payload.merged_content = mergeTa.value;
+    }
+    const r = await window.secondBrain.request("POST", "/v1/sync/conflicts/resolve", payload);
+    if (!r.ok) {
+      showToast(apiErrorMessage(r, "Conflict resolution failed"), "danger");
+      return;
+    }
+    showToast(`Resolved ${det.rel_path} (${strategy})`, "ok");
+    closeModal();
+    await Promise.all([loadSyncStatus(), refreshHealth(), loadNotes({ append: false })]);
+  }
+
+  const cancelBtn = el("button", "btn", "Cancel");
+  cancelBtn.type = "button";
+  cancelBtn.onclick = closeModal;
+
+  const keepLocalBtn = el("button", "btn", "Keep Local");
+  keepLocalBtn.type = "button";
+  keepLocalBtn.onclick = () => applyResolution("keep_local");
+
+  const acceptRemoteBtn = el("button", "btn warn", "Accept Remote");
+  acceptRemoteBtn.type = "button";
+  acceptRemoteBtn.onclick = () => applyResolution("accept_remote");
+
+  const keepBothBtn = el("button", "btn", "Keep Both");
+  keepBothBtn.type = "button";
+  keepBothBtn.onclick = () => applyResolution("keep_both");
+
+  const manualBtn = el("button", "btn primary", "Save Manual Merge");
+  manualBtn.type = "button";
+  manualBtn.onclick = () => applyResolution("manual_merge");
+
+  modalFooterEl.replaceChildren(cancelBtn, keepLocalBtn, acceptRemoteBtn, keepBothBtn, manualBtn);
+}
+
+function collectSyncInitJoinOptions() {
+  const authMode = document.getElementById("syncAuthModeSelect")?.value || "bearer";
+  const useKc = Boolean(document.getElementById("syncUseKeychainCheck")?.checked);
+  const s3Reg = (document.getElementById("syncS3RegionInput")?.value || "auto").trim() || "auto";
+  const s3Ak = (document.getElementById("syncS3AccessEnvInput")?.value || "").trim();
+  const s3Sk = (document.getElementById("syncS3SecretEnvInput")?.value || "").trim();
+  const opts = {
+    auth_mode: authMode,
+    use_keychain: useKc,
+    s3_region: s3Reg,
+  };
+  if (authMode === "s3_sigv4") {
+    if (s3Ak) opts.s3_access_key_env = s3Ak;
+    if (s3Sk) opts.s3_secret_key_env = s3Sk;
+  }
+  return opts;
 }
 
 async function runSyncAction(endpoint, body, successLabel) {
@@ -3236,6 +3878,7 @@ document.getElementById("syncInitBtn").addEventListener("click", () => {
   const body = {
     target,
     backend_type: document.getElementById("syncBackendSelect").value,
+    ...collectSyncInitJoinOptions(),
   };
   const dev = document.getElementById("syncDeviceNameInput").value.trim();
   const pw = document.getElementById("syncPassphraseInput").value;
@@ -3252,6 +3895,7 @@ document.getElementById("syncJoinBtn").addEventListener("click", () => {
   const body = {
     target,
     backend_type: document.getElementById("syncBackendSelect").value,
+    ...collectSyncInitJoinOptions(),
   };
   const dev = document.getElementById("syncDeviceNameInput").value.trim();
   const pw = document.getElementById("syncPassphraseInput").value;
@@ -3277,6 +3921,39 @@ document.getElementById("syncVerifyBtn").addEventListener("click", () => {
   const pw = document.getElementById("syncPassphraseInput").value;
   runSyncAction("/v1/sync/verify", pw ? { passphrase: pw } : {}, "Cryptographic Sync Verify");
 });
+const syncGcBtnEl = document.getElementById("syncGcBtn");
+if (syncGcBtnEl) {
+  syncGcBtnEl.addEventListener("click", () => {
+    const pw = document.getElementById("syncPassphraseInput").value;
+    runSyncAction("/v1/sync/gc", pw ? { passphrase: pw } : {}, "Pruned Orphan Sync Blobs");
+  });
+}
+const syncSealKcBtnEl = document.getElementById("syncSealKeychainBtn");
+if (syncSealKcBtnEl) {
+  syncSealKcBtnEl.addEventListener("click", () => {
+    const pw = document.getElementById("syncPassphraseInput").value;
+    runSyncAction("/v1/sync/seal-keychain", pw ? { passphrase: pw } : {}, "Sealed Master Key in Keychain/DPAPI");
+  });
+}
+const syncAutoEnableBtnEl = document.getElementById("syncAutoEnableBtn");
+if (syncAutoEnableBtnEl) {
+  syncAutoEnableBtnEl.addEventListener("click", () => {
+    const iv = Number.parseInt(document.getElementById("syncAutoIntervalInput")?.value || "300", 10) || 300;
+    runSyncAction("/v1/sync/auto", { enabled: true, interval_seconds: iv }, "Enabled Background Auto-Sync");
+  });
+}
+const syncAutoDisableBtnEl = document.getElementById("syncAutoDisableBtn");
+if (syncAutoDisableBtnEl) {
+  syncAutoDisableBtnEl.addEventListener("click", () => {
+    runSyncAction("/v1/sync/auto", { enabled: false }, "Disabled Background Auto-Sync");
+  });
+}
+const syncAutoRunOnceBtnEl = document.getElementById("syncAutoRunOnceBtn");
+if (syncAutoRunOnceBtnEl) {
+  syncAutoRunOnceBtnEl.addEventListener("click", () => {
+    runSyncAction("/v1/sync/auto", { run_once: true }, "Executed Auto-Sync Cycle");
+  });
+}
 
 // ─── Multi-Vault Workspaces & Browser Web Clipper (v0.3.0) ───────────────────
 
@@ -3497,6 +4174,34 @@ async function loadClipperPairings() {
 
 const clipperRefreshBtnEl = document.getElementById("clipperRefreshBtn");
 if (clipperRefreshBtnEl) clipperRefreshBtnEl.addEventListener("click", loadClipperPairings);
+
+const clipperPairCodeBtnEl = document.getElementById("clipperPairCodeBtn");
+if (clipperPairCodeBtnEl) {
+  clipperPairCodeBtnEl.addEventListener("click", async () => {
+    const label = (document.getElementById("clipperLabelInput")?.value || "Browser Clipper").trim();
+    const outEl = document.getElementById("clipperOutput");
+    const res = await window.secondBrain.request("POST", "/v1/clipper/pair-code", {
+      label,
+      ttl_seconds: 300,
+    });
+    if (!res.ok) {
+      const msg = apiErrorMessage(res, "Generate pairing code failed");
+      if (outEl) outEl.textContent = msg;
+      showToast(msg, "danger");
+      return;
+    }
+    const code = res.data?.code || "";
+    try {
+      if (code && navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(code);
+      }
+    } catch {}
+    if (outEl) {
+      outEl.textContent = `1-Click Pairing Code (copied to clipboard, valid 5 min): ${code} — Paste into Clipper popup and click 'Pair in 1 Click'.`;
+    }
+    showToast(`Copied 1-Click Pairing Code: ${code}`, "ok");
+  });
+}
 
 const clipperPairBtnEl = document.getElementById("clipperPairBtn");
 if (clipperPairBtnEl) {
@@ -5103,6 +5808,14 @@ async function scanContradictions() {
     )
   );
   kpiGrid.appendChild(
+    makeKpiCard(
+      "Expired Validity",
+      d.expired_count ?? (d.expired_atoms || []).length,
+      "",
+      (d.expired_count || 0) > 0 ? "warn" : "ok"
+    )
+  );
+  kpiGrid.appendChild(
     makeKpiCard("Orphan Approved", d.orphan_approved_count ?? orphans.length)
   );
   if (d.nli_status || enableNli) {
@@ -5377,6 +6090,22 @@ function renderSnapshotDiff(outEl, d) {
     );
     c.appendChild(el("div", "note-item-meta", `Before: ${m.old_claim || ""}`));
     c.appendChild(el("div", "", `After: ${m.new_claim || ""}`));
+    if (
+      m.old_valid_from ||
+      m.new_valid_from ||
+      m.old_valid_until ||
+      m.new_valid_until
+    ) {
+      c.appendChild(
+        el(
+          "div",
+          "note-item-meta",
+          `Validity: [${m.old_valid_from || "—"} .. ${
+            m.old_valid_until || "—"
+          }] -> [${m.new_valid_from || "—"} .. ${m.new_valid_until || "—"}]`
+        )
+      );
+    }
     outEl.appendChild(c);
   }
 
@@ -5402,6 +6131,12 @@ function renderSnapshotRecall(outEl, d, query) {
     el("span", "badge ok", `Point-in-Time Recall @ ${d.snapshot_id}`)
   );
   top.appendChild(el("span", "badge mono", `Merkle: ${shortSha(d.merkle_root)}`));
+  if (d.as_of) {
+    top.appendChild(el("span", "badge mono", `as_of: ${d.as_of}`));
+  }
+  if (d.rerank_backend) {
+    top.appendChild(el("span", "badge", `reranker: ${d.rerank_backend}`));
+  }
   outEl.appendChild(top);
 
   const results = d.results || [];
@@ -5430,6 +6165,24 @@ function renderSnapshotRecall(outEl, d, query) {
     row.appendChild(
       el("span", "badge mono", `sha:${shortSha(r.file_sha256)}`)
     );
+    if (r.temporal_status && r.temporal_status !== "unbounded") {
+      row.appendChild(
+        el(
+          "span",
+          `badge ${r.temporal_status === "active" ? "ok" : "warn"}`,
+          `validity: ${r.temporal_status}`
+        )
+      );
+    }
+    if (r.valid_from || r.valid_until) {
+      row.appendChild(
+        el(
+          "span",
+          "badge mono",
+          `${r.valid_from || "—"}..${r.valid_until || "—"}`
+        )
+      );
+    }
     for (const ctx of r.contexts || []) {
       row.appendChild(el("span", "pill", ctx));
     }
@@ -5706,6 +6459,11 @@ document
     const project_scope =
       document.getElementById("snapshotRecallScopeInput").value.trim() ||
       undefined;
+    const as_of =
+      document.getElementById("snapshotAsOfInput").value.trim() || undefined;
+    const include_expired = Boolean(
+      document.getElementById("snapshotIncludeExpiredCheck").checked
+    );
     if (!snapshot_id || !query) {
       showToast("Select a snapshot and enter a recall query.", "warn");
       return;
@@ -5717,6 +6475,8 @@ document
         snapshot_id,
         query,
         project_scope,
+        as_of,
+        include_expired,
         limit: 10,
       }
     );
@@ -5924,6 +6684,29 @@ document.getElementById("graphZoomOutBtn").addEventListener("click", () => {
 document.getElementById("graphResetViewBtn").addEventListener("click", () => {
   ensureGraphViewerInitialized().resetView();
 });
+const graphAutoLinkBtnEl = document.getElementById("graphAutoLinkBtn");
+if (graphAutoLinkBtnEl) {
+  graphAutoLinkBtnEl.addEventListener("click", async () => {
+    const proj = document.getElementById("graphProjectInput")?.value.trim() || undefined;
+    const incPending = Boolean(document.getElementById("graphIncludePendingCheck")?.checked);
+    const res = await window.secondBrain.request("POST", "/v1/graph/auto-link", {
+      actor: "desktop_owner",
+      project_scope: proj,
+      include_pending: incPending,
+      dry_run: false,
+    });
+    if (!res.ok) {
+      showToast(apiErrorMessage(res, "Auto-link graph failed"), "danger");
+      return;
+    }
+    const d = res.data || {};
+    showToast(
+      `Auto-linked ${d.updated_atom_count ?? 0} atom(s) · Orphans ${d.orphan_before ?? "?"} -> ${d.orphan_after ?? "?"}`,
+      "ok"
+    );
+    await loadGraphView();
+  });
+}
 document
   .getElementById("refreshGraphBtn")
   .addEventListener("click", loadGraphView);
@@ -6070,6 +6853,451 @@ document.getElementById("vaultRenderModeBtn").addEventListener("click", () => {
 document
   .getElementById("refreshVaultBtn")
   .addEventListener("click", () => loadVaultBrowser({ append: false }));
+
+// ─── v1.0.0: Multimodal Media Upload, Git Distiller, Daemon & Portable Backup ──
+
+function readBlobAsBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const str = String(reader.result || "");
+      const idx = str.indexOf(",");
+      resolve(idx >= 0 ? str.slice(idx + 1) : str);
+    };
+    reader.onerror = () => reject(new Error("Could not read file bytes."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function uploadMediaBlobToVault(blob, filename) {
+  const outEl = document.getElementById("mediaUploadResult");
+  if (!blob || blob.size === 0) {
+    showToast("Select or record non-empty media first.", "warn");
+    return;
+  }
+  if (blob.size > 24 * 1024 * 1024) {
+    outEl.textContent = "Rejected: media payload exceeds 24 MiB upload limit.";
+    showToast("Media exceeds 24 MiB upload limit.", "danger");
+    return;
+  }
+  outEl.textContent = `Uploading & processing ${filename}...`;
+  try {
+    const content_base64 = await readBlobAsBase64(blob);
+    const res = await window.secondBrain.request("POST", "/v1/ingest/media", {
+      filename,
+      content_base64,
+    });
+    if (res.ok && res.data) {
+      const d = res.data;
+      const flagSuffix =
+        Array.isArray(d.dlp_flags) && d.dlp_flags.length
+          ? ` [DLP flags: ${d.dlp_flags.join(", ")}]`
+          : "";
+      outEl.textContent = `${d.quarantined ? "Quarantined" : "Ingested"} (${
+        d.category
+      }): ${d.output_rel_path} (sha256=${shortSha(d.source_sha256)})${flagSuffix}`;
+      showToast(
+        `${d.quarantined ? "Quarantined in Inbox" : "Ingested"}: ${
+          d.output_filename
+        }`,
+        d.quarantined ? "warn" : "ok"
+      );
+      refreshHealth();
+    } else {
+      const msg = apiErrorMessage(res, "Media ingestion failed");
+      outEl.textContent = msg;
+      showToast(msg, "danger");
+    }
+  } catch (err) {
+    outEl.textContent = `Media upload error: ${err?.message || String(err)}`;
+    showToast("Media upload error", "danger");
+  }
+}
+
+document
+  .getElementById("mediaUploadSubmitBtn")
+  .addEventListener("click", async () => {
+    const inp = document.getElementById("mediaUploadFileInput");
+    const file = inp.files && inp.files[0];
+    if (!file) {
+      showToast("Choose a media file first.", "warn");
+      return;
+    }
+    await uploadMediaBlobToVault(file, file.name || "uploaded-media.bin");
+    inp.value = "";
+  });
+
+let importMediaRecorder = null;
+let importMediaStream = null;
+let importAudioChunks = [];
+
+function stopImportMediaStream() {
+  if (importMediaStream) {
+    for (const t of importMediaStream.getTracks()) t.stop();
+    importMediaStream = null;
+  }
+}
+
+document
+  .getElementById("mediaUploadRecordBtn")
+  .addEventListener("click", async () => {
+    const btn = document.getElementById("mediaUploadRecordBtn");
+    const outEl = document.getElementById("mediaUploadResult");
+    if (importMediaRecorder && importMediaRecorder.state === "recording") {
+      importMediaRecorder.stop();
+      return;
+    }
+    if (
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== "function" ||
+      typeof MediaRecorder === "undefined"
+    ) {
+      showToast("Microphone recording is unavailable in this environment.", "warn");
+      return;
+    }
+    try {
+      importMediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      importAudioChunks = [];
+      importMediaRecorder = new MediaRecorder(importMediaStream);
+      btn.textContent = "Stop Voice Memo";
+      outEl.textContent = "Recording voice memo... click Stop Voice Memo to transcribe & ingest.";
+      importMediaRecorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) importAudioChunks.push(ev.data);
+      };
+      importMediaRecorder.onstop = async () => {
+        btn.textContent = "Record Voice Memo";
+        stopImportMediaStream();
+        const blob = new Blob(importAudioChunks, { type: "audio/webm" });
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        await uploadMediaBlobToVault(blob, `voice-memo-${stamp}.webm`);
+      };
+      importMediaRecorder.start();
+    } catch (err) {
+      stopImportMediaStream();
+      btn.textContent = "Record Voice Memo";
+      outEl.textContent = `Microphone error: ${err?.message || String(err)}`;
+    }
+  });
+
+window.addEventListener("paste", async (e) => {
+  if (activeView !== "import") return;
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.kind === "file" && item.type.startsWith("image/")) {
+      const file = item.getAsFile();
+      if (file) {
+        e.preventDefault();
+        const ext = (file.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png";
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        await uploadMediaBlobToVault(file, `clipboard-screenshot-${stamp}.${ext}`);
+        return;
+      }
+    }
+  }
+});
+
+// Git Post-Commit Hook & Coding Session Distiller
+async function loadGitHookStatus() {
+  const repo = document.getElementById("gitHookRepoInput").value.trim();
+  const badge = document.getElementById("gitHookStatusBadge");
+  const outEl = document.getElementById("gitHookOutput");
+  const q = repo ? `?repo=${encodeURIComponent(repo)}` : "";
+  const res = await window.secondBrain.request("GET", `/v1/git/hook${q}`);
+  if (res.ok && res.data) {
+    const installed = Boolean(res.data.installed);
+    badge.textContent = installed ? "hook installed" : "not installed";
+    badge.className = `badge ${installed ? "ok" : "warn"}`;
+    outEl.textContent = `Repo: ${res.data.repo_root} · Hook: ${res.data.hook_path}`;
+  } else {
+    badge.textContent = "unavailable";
+    badge.className = "badge";
+    outEl.textContent = apiErrorMessage(res, "Select a valid Git repository path.");
+  }
+}
+
+document
+  .getElementById("gitHookRefreshBtn")
+  .addEventListener("click", loadGitHookStatus);
+
+document
+  .getElementById("gitHookBrowseBtn")
+  .addEventListener("click", async () => {
+    const folder = await window.secondBrain.pickFolder();
+    if (folder) {
+      document.getElementById("gitHookRepoInput").value = folder;
+      loadGitHookStatus();
+    }
+  });
+
+document
+  .getElementById("gitHookInstallBtn")
+  .addEventListener("click", async () => {
+    const repo =
+      document.getElementById("gitHookRepoInput").value.trim() || undefined;
+    const project_scope =
+      document.getElementById("gitHookProjectInput").value.trim() || undefined;
+    const res = await window.secondBrain.request("POST", "/v1/git/hook/install", {
+      repo,
+      project_scope,
+    });
+    if (res.ok && res.data) {
+      showToast(`Installed post-commit hook (${res.data.project_scope})`, "ok");
+      loadGitHookStatus();
+    } else {
+      showToast(apiErrorMessage(res, "Failed to install Git hook"), "danger");
+    }
+  });
+
+document
+  .getElementById("gitHookUninstallBtn")
+  .addEventListener("click", async () => {
+    const repo =
+      document.getElementById("gitHookRepoInput").value.trim() || undefined;
+    const res = await window.secondBrain.request(
+      "POST",
+      "/v1/git/hook/uninstall",
+      { repo }
+    );
+    if (res.ok && res.data) {
+      showToast(`Post-commit hook: ${res.data.status}`, "ok");
+      loadGitHookStatus();
+    } else {
+      showToast(apiErrorMessage(res, "Failed to remove Git hook"), "danger");
+    }
+  });
+
+document
+  .getElementById("gitDistillBtn")
+  .addEventListener("click", async () => {
+    const repo =
+      document.getElementById("gitHookRepoInput").value.trim() || undefined;
+    const project_scope =
+      document.getElementById("gitHookProjectInput").value.trim() || undefined;
+    const max_commits = Math.max(
+      1,
+      Math.min(
+        25,
+        parseInt(document.getElementById("gitDistillMaxInput").value, 10) || 5
+      )
+    );
+    const outEl = document.getElementById("gitHookOutput");
+    outEl.textContent = "Distilling recent commits with DLP screening...";
+    const res = await window.secondBrain.request("POST", "/v1/git/distill", {
+      repo,
+      project_scope,
+      max_commits,
+      stage_inbox: true,
+    });
+    if (res.ok && res.data) {
+      const d = res.data;
+      outEl.textContent = `Distilled ${d.distilled_count} commit(s) (${d.skipped_duplicate_count} already distilled) in ${d.project_scope}.`;
+      showToast(`Distilled ${d.distilled_count} commit(s)`, "ok");
+      refreshHealth();
+    } else {
+      const msg = apiErrorMessage(res, "Git distillation failed");
+      outEl.textContent = msg;
+      showToast(msg, "danger");
+    }
+  });
+
+// Watchdog Daemon & One-Shot Index/Vector Sync
+async function loadDaemonStatus() {
+  const kpis = document.getElementById("daemonStatusKpis");
+  const outEl = document.getElementById("daemonOutput");
+  const res = await window.secondBrain.request("GET", "/v1/daemon/status");
+  if (!res.ok || !res.data) {
+    outEl.textContent = apiErrorMessage(res, "Daemon status unavailable.");
+    return;
+  }
+  const d = res.data;
+  kpis.replaceChildren(
+    makeKpiCard(
+      "Lexical FTS5",
+      d.lexical_index_current ? "Current" : "Needs Sync",
+      "",
+      d.lexical_index_current ? "ok" : "warn"
+    ),
+    makeKpiCard(
+      "Dense Chroma",
+      d.dense_index_current ? "Current" : "Optional/Stale",
+      d.dense_generation_id ? shortSha(d.dense_generation_id) : "none"
+    ),
+    makeKpiCard("0-raw Queue", d.raw_queue_count ?? 0),
+    makeKpiCard("Quarantined Inbox", d.inbox_quarantine_count ?? 0)
+  );
+  const autoEnabled = Boolean(d.auto_sync && d.auto_sync.enabled);
+  outEl.textContent = `Active vault: ${d.brain_dir} · Auto-Sync: ${
+    autoEnabled ? `ON (${d.auto_sync.interval_seconds}s)` : "OFF"
+  }`;
+}
+
+document
+  .getElementById("daemonRefreshBtn")
+  .addEventListener("click", loadDaemonStatus);
+
+document
+  .getElementById("daemonSyncOnceBtn")
+  .addEventListener("click", async () => {
+    const auto_sync = Boolean(
+      document.getElementById("daemonSyncAutoCheck").checked
+    );
+    const outEl = document.getElementById("daemonOutput");
+    outEl.textContent = "Running one-shot FTS5 + Chroma vector sync & stale anchor check...";
+    const res = await window.secondBrain.request("POST", "/v1/daemon/sync-once", {
+      auto_sync,
+    });
+    if (res.ok && res.data) {
+      const ds = res.data.daemon_sync || {};
+      const stale = ds.atoms ? ds.atoms.stale_count ?? 0 : 0;
+      const vecSt =
+        ds.atoms && ds.atoms.vector_sync ? ds.atoms.vector_sync.status : "n/a";
+      outEl.textContent = `Synced notes & atoms · Vector sync: ${vecSt} · Stale source anchors: ${stale}`;
+      showToast("Completed one-shot index & vector sync", "ok");
+      loadDaemonStatus();
+      refreshHealth();
+    } else {
+      const msg = apiErrorMessage(res, "One-shot daemon sync failed");
+      outEl.textContent = msg;
+      showToast(msg, "danger");
+    }
+  });
+
+// Portable Three-Store Vault Backup & Restore (.sbvault)
+document
+  .getElementById("backupPickSaveBtn")
+  .addEventListener("click", async () => {
+    if (typeof window.secondBrain.pickSaveBackup === "function") {
+      const chosen = await window.secondBrain.pickSaveBackup();
+      if (chosen) document.getElementById("backupOutPathInput").value = chosen;
+    }
+  });
+
+document
+  .getElementById("backupPickOpenBtn")
+  .addEventListener("click", async () => {
+    if (typeof window.secondBrain.pickBackupFile === "function") {
+      const chosen = await window.secondBrain.pickBackupFile();
+      if (chosen) document.getElementById("backupVerifyPathInput").value = chosen;
+    }
+  });
+
+document
+  .getElementById("backupPickTargetBtn")
+  .addEventListener("click", async () => {
+    const chosen = await window.secondBrain.pickFolder();
+    if (chosen) {
+      document.getElementById("backupRestoreTargetInput").value = chosen;
+    }
+  });
+
+document
+  .getElementById("backupCreateBtn")
+  .addEventListener("click", async () => {
+    const output_path = document.getElementById("backupOutPathInput").value.trim();
+    const passphrase =
+      document.getElementById("backupPassphraseInput").value || undefined;
+    const unencrypted = Boolean(
+      document.getElementById("backupUnencryptedCheck").checked
+    );
+    const outEl = document.getElementById("backupOutput");
+    if (!output_path) {
+      showToast("Choose a destination .sbvault path first.", "warn");
+      return;
+    }
+    outEl.textContent = "Creating portable Three-Store .sbvault backup...";
+    const res = await window.secondBrain.request(
+      "POST",
+      "/v1/vault/backup/create",
+      {
+        output_path,
+        passphrase: unencrypted ? undefined : passphrase,
+        unencrypted,
+      }
+    );
+    if (res.ok && res.data) {
+      const d = res.data;
+      document.getElementById("backupVerifyPathInput").value = d.backup_path;
+      outEl.textContent = `Created ${
+        d.encrypted ? "AES-256-GCM encrypted" : "unencrypted"
+      } backup: ${d.backup_path} (${d.file_count} files, Merkle ${shortSha(
+        d.merkle_root
+      )})`;
+      showToast("Vault backup created", "ok");
+    } else {
+      const msg = apiErrorMessage(res, "Backup creation failed");
+      outEl.textContent = msg;
+      showToast(msg, "danger");
+    }
+  });
+
+document
+  .getElementById("backupVerifyBtn")
+  .addEventListener("click", async () => {
+    const backup_path = document
+      .getElementById("backupVerifyPathInput")
+      .value.trim();
+    const passphrase =
+      document.getElementById("backupPassphraseInput").value || undefined;
+    const outEl = document.getElementById("backupOutput");
+    if (!backup_path) {
+      showToast("Select a .sbvault archive to verify.", "warn");
+      return;
+    }
+    outEl.textContent = "Verifying .sbvault AEAD tag, SHA-256 hashes & Merkle root in memory...";
+    const res = await window.secondBrain.request(
+      "POST",
+      "/v1/vault/backup/verify",
+      { backup_path, passphrase }
+    );
+    if (res.ok && res.data) {
+      const d = res.data;
+      outEl.textContent = `VALID (${d.cipher}): ${d.file_count} files, ${d.approved_atoms} approved atoms, Merkle ${shortSha(
+        d.merkle_root
+      )}`;
+      showToast("Backup archive verified ✓", "ok");
+    } else {
+      const msg = apiErrorMessage(res, "Backup verification failed");
+      outEl.textContent = msg;
+      showToast(msg, "danger");
+    }
+  });
+
+document
+  .getElementById("backupRestoreBtn")
+  .addEventListener("click", async () => {
+    const backup_path = document
+      .getElementById("backupVerifyPathInput")
+      .value.trim();
+    const target_brain_dir = document
+      .getElementById("backupRestoreTargetInput")
+      .value.trim();
+    const passphrase =
+      document.getElementById("backupPassphraseInput").value || undefined;
+    const force = Boolean(
+      document.getElementById("backupForceRestoreCheck").checked
+    );
+    const outEl = document.getElementById("backupOutput");
+    if (!backup_path || !target_brain_dir) {
+      showToast("Provide both .sbvault archive path and target vault directory.", "warn");
+      return;
+    }
+    outEl.textContent = "Restoring Three-Store vault & rebuilding FTS5 indexes...";
+    const res = await window.secondBrain.request(
+      "POST",
+      "/v1/vault/backup/restore",
+      { backup_path, target_brain_dir, passphrase, force }
+    );
+    if (res.ok && res.data) {
+      const d = res.data;
+      outEl.textContent = `Restored ${d.restored_files} files into ${d.target_brain_dir} (${d.lexical_indexed_atoms} atoms & ${d.indexed_notes} notes indexed).`;
+      showToast("Vault restored & FTS5 rebuilt ✓", "ok");
+    } else {
+      const msg = apiErrorMessage(res, "Backup restore failed");
+      outEl.textContent = msg;
+      showToast(msg, "danger");
+    }
+  });
 
 // ─── Global Shortcuts & Init ─────────────────────────────────────────────────
 

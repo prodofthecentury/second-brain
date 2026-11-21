@@ -38,7 +38,13 @@ from config import (
     VISION_MODEL,
     is_content_markdown,
 )
-from hardware_profile import _NoRedirectHandler, detect_hardware_profile, fetch_loopback_json, loopback_ollama_base_url
+from hardware_profile import (
+    _NoRedirectHandler,
+    detect_hardware_profile,
+    fetch_loopback_json,
+    loopback_ollama_base_url,
+    resolve_active_local_generation_model,
+)
 from index_manifest import index_manifest_is_current, load_index_manifest
 from lexical_store import lexical_index_is_current
 from review_atom import approved_revision_is_current
@@ -203,6 +209,8 @@ def run_checks() -> list[tuple[str, str, str]]:
     opt_caps = []
     for mod_name, label in (
         ("chromadb", "chromadb"),
+        ("onnxruntime", "onnx"),
+        ("tokenizers", "tokenizers"),
         ("streamlit", "dashboard"),
         ("mcp", "mcp"),
         ("httpx", "scout"),
@@ -321,7 +329,8 @@ def run_checks() -> list[tuple[str, str, str]]:
         vision_names = vision_model_names(models_payload)
         checks.append(ok("ollama", f"Ollama returned {len(models_payload.get('models', []))} model(s)"))
 
-    for label, model in [("generation model", GEN_MODEL), ("embedding model", EMBED_MODEL)]:
+    active_gen_model = resolve_active_local_generation_model(fallback=GEN_MODEL)
+    for label, model in [("generation model", active_gen_model), ("embedding model", EMBED_MODEL)]:
         if model in names or model.split(":", 1)[0] in names:
             checks.append(ok(label, model))
         else:
@@ -399,6 +408,40 @@ def run_checks() -> list[tuple[str, str, str]]:
             f"installed={hw_profile.selected_installed_generation_model or 'none'})",
         )
     )
+
+    try:
+        from onnx_models import get_onnx_models_status
+
+        onnx_st = get_onnx_models_status(run_inference=False)
+        ce_info = onnx_st["slots"]["cross-encoder"]
+        nli_info = onnx_st["slots"]["nli"]
+        corrupt_slots = [
+            s for s, info in onnx_st["slots"].items() if info.get("installed") and not info.get("verified")
+        ]
+        if corrupt_slots:
+            checks.append(
+                warn(
+                    "onnx models",
+                    f"Unverified local ONNX files in {', '.join(corrupt_slots)}; run `second-brain models pull --force`",
+                )
+            )
+        elif onnx_st["all_verified"]:
+            checks.append(
+                ok(
+                    "onnx models",
+                    f"SHA-256 verified ({ce_info.get('model_id')}, {nli_info.get('model_id')})",
+                )
+            )
+        else:
+            checks.append(
+                ok(
+                    "onnx models",
+                    f"cross-encoder={ce_info['active_backend']}, nli={nli_info['active_backend']} "
+                    "(run `second-brain models pull` for neural ONNX weights)",
+                )
+            )
+    except Exception as exc:
+        checks.append(warn("onnx models", f"Could not inspect ONNX models: {exc}"))
 
     raw_count = count_files(RAW_DIR, (".md", ".txt", ".intake"))
     if os.path.exists(READING_LIST):

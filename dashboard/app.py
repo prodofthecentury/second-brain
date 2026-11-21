@@ -76,10 +76,10 @@ from scripts.answer_policy import (
     format_research_leads,
     validate_standard_answer,
 )
-from scripts.atom_mutator import apply_atom_edit, apply_atom_merge
+from scripts.atom_mutator import apply_atom_edit, apply_atom_merge, set_atom_temporal_bounds
 from scripts.audit_sources import audit_sources
 from scripts.review_atom import apply_review_transition, approved_revision_is_current, review_lock
-from scripts.memory_format import split_frontmatter
+from scripts.memory_format import evaluate_temporal_validity, split_frontmatter
 from scripts.memory_review import list_review_queue, parse_atom_record, section_text
 from scripts.review_details import atom_review_details
 from scripts.dashboard_auth import assert_loopback_address, require_dashboard_login
@@ -136,6 +136,14 @@ from scripts.ide_connector import (
     host_targets as ide_host_targets,
     status as ide_connector_status,
 )
+from scripts.chat_threads import (
+    create_chat_thread,
+    delete_chat_thread,
+    get_chat_thread,
+    list_chat_threads,
+    pin_turn_to_note,
+    resolve_followup_query,
+)
 import scripts.streaming_chat as _streaming_chat_mod
 from scripts.streaming_chat import CHAT_MODES, ChatPaths, chat_events, warmup
 from scripts.vault_ledger import (
@@ -145,7 +153,7 @@ from scripts.vault_ledger import (
     verify_merkle_proof,
     verify_vault_ledger,
 )
-from scripts.knowledge_graph import build_knowledge_graph, detect_contradictions
+from scripts.knowledge_graph import auto_link_vault_atoms, build_knowledge_graph, detect_contradictions
 from scripts.time_travel import (
     create_snapshot,
     diff_snapshots,
@@ -154,12 +162,42 @@ from scripts.time_travel import (
     verify_snapshot,
 )
 from scripts.vault_sync import (
+    configure_auto_sync as vault_configure_auto_sync,
+    get_auto_sync_status as vault_auto_sync_status,
+    get_sync_conflict_detail as vault_conflict_detail,
     init_sync as vault_init_sync,
     join_sync as vault_join_sync,
+    migrate_sync_key_to_keychain as vault_seal_keychain,
+    pull_mobile_inbox_drops as vault_pull_mobile_drops,
+    resolve_sync_conflict as vault_resolve_conflict,
+    run_auto_sync_cycle as vault_run_auto_sync,
+    sync_gc as vault_sync_gc,
     sync_pull as vault_sync_pull,
     sync_push as vault_sync_push,
     sync_status as vault_sync_status,
     sync_verify as vault_sync_verify,
+)
+from scripts.git_distiller import (
+    distill_git_commits as git_distill_commits,
+    get_git_hook_status,
+    install_git_post_commit_hook,
+    uninstall_git_post_commit_hook,
+)
+from scripts.ingest_multimodal import ingest_uploaded_media_bytes
+from scripts.vault_backup import (
+    create_vault_backup,
+    restore_vault_backup,
+    verify_vault_backup,
+)
+from scripts.inbox_drop import (
+    create_mobile_drop_pairing,
+    list_mobile_drop_pairings,
+    resolve_scoped_inbox_drop_s3_credentials,
+    revoke_mobile_drop_pairing,
+)
+from scripts.onnx_models import (
+    get_onnx_models_status,
+    pull_onnx_models,
 )
 from scripts.vault_workspaces import (
     create_vault as ws_create_vault,
@@ -171,6 +209,7 @@ from scripts.vault_workspaces import (
 )
 from scripts.web_clipper import (
     create_clipper_pairing as clipper_create_pairing,
+    create_clipper_pairing_code as clipper_create_pairing_code,
     list_clipper_pairings as clipper_list_pairings,
     revoke_clipper_pairing as clipper_revoke_pairing,
 )
@@ -817,6 +856,8 @@ def search_memory(
     allow_cross_project=False,
     enable_fitness_boost=False,
     active_context_profile=(),
+    include_expired=False,
+    as_of=None,
 ):
     consume_last_degradation_warning()
     try:
@@ -831,6 +872,8 @@ def search_memory(
                 enable_fitness_boost=enable_fitness_boost,
                 active_context_profile=tuple(active_context_profile),
                 telemetry_db_path=TELEMETRY_DB_PATH,
+                include_expired=bool(include_expired),
+                as_of=(str(as_of).strip() or None) if as_of else None,
             ),
             atoms_dir=ATOMS_DIR,
             index_path=LEXICAL_INDEX_PATH,
@@ -1259,7 +1302,86 @@ if nav_selection == "💬 Chat with Memory":
     with top_c4:
         if st.button("🧹 Clear Chat History", width="stretch"):
             st.session_state.chat_history = []
+            st.session_state.pop("active_chat_thread_id", None)
             st.rerun()
+
+    # Persistent Multi-Turn Chat Thread Bar
+    try:
+        _saved_threads_res = list_chat_threads(brain_dir=BRAIN_DIR, limit=50)
+        _saved_threads = list(_saved_threads_res.get("threads") or [])
+    except Exception:
+        _saved_threads = []
+    _thread_options = [""] + [str(t["thread_id"]) for t in _saved_threads]
+    _thread_labels = {"": "💬 Ephemeral / Auto-Create Thread"}
+    for _t in _saved_threads:
+        _thread_labels[str(_t["thread_id"])] = f"{_t.get('title') or _t['thread_id']} ({_t.get('turn_count', 0)} turns)"
+
+    th_c1, th_c2, th_c3, th_c4 = st.columns([2.4, 0.9, 1.1, 0.8])
+    with th_c1:
+        _cur_tid = str(st.session_state.get("active_chat_thread_id") or "")
+        _sel_idx = _thread_options.index(_cur_tid) if _cur_tid in _thread_options else 0
+        chosen_tid = st.selectbox(
+            "Persistent Conversation Thread",
+            options=_thread_options,
+            index=_sel_idx,
+            format_func=lambda tid: _thread_labels.get(tid, tid),
+            key="chat_thread_selector",
+        )
+        if chosen_tid != _cur_tid:
+            st.session_state["active_chat_thread_id"] = chosen_tid
+            if chosen_tid:
+                try:
+                    _tdoc = get_chat_thread(chosen_tid, brain_dir=BRAIN_DIR)
+                    st.session_state.chat_history = [
+                        {
+                            "role": str(turn["role"]),
+                            "content": str(turn["content"]),
+                            "mode": str(_tdoc.get("mode") or "stream"),
+                            "sources": list(turn.get("cited_sources") or turn.get("citations") or []),
+                        }
+                        for turn in (_tdoc.get("turns") or [])
+                    ]
+                except Exception:
+                    pass
+    with th_c2:
+        if st.button("➕ New Thread", width="stretch"):
+            try:
+                _nt = create_chat_thread(mode=selected_chat_mode, brain_dir=BRAIN_DIR)
+                st.session_state["active_chat_thread_id"] = str(_nt["thread_id"])
+                st.session_state.chat_history = []
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not create thread: {exc}")
+    with th_c3:
+        if st.button("📌 Pin Answer to Note", width="stretch"):
+            _active_tid = str(st.session_state.get("active_chat_thread_id") or "")
+            try:
+                if _active_tid:
+                    _pinned = pin_turn_to_note(_active_tid, brain_dir=BRAIN_DIR)
+                    st.success(f"Pinned answer to note `{_pinned['filename']}`.")
+                else:
+                    _last_asst = next(
+                        (m for m in reversed(st.session_state.chat_history) if m.get("role") == "assistant" and m.get("content")),
+                        None,
+                    )
+                    if not _last_asst:
+                        st.warning("Ask a question first to pin an answer.")
+                    else:
+                        _cn = create_note("Pinned Chat Synthesis", str(_last_asst["content"]), tags=["pinned-chat"], paths=_active_note_paths())
+                        st.success(f"Pinned answer to note `{_cn['filename']}`.")
+            except Exception as exc:
+                st.error(f"Pin failed: {exc}")
+    with th_c4:
+        if st.button("🗑️ Delete Thread", width="stretch"):
+            _active_tid = str(st.session_state.get("active_chat_thread_id") or "")
+            if _active_tid:
+                try:
+                    delete_chat_thread(_active_tid, brain_dir=BRAIN_DIR)
+                    st.session_state.pop("active_chat_thread_id", None)
+                    st.session_state.chat_history = []
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Delete failed: {exc}")
 
     policies_map = load_host_policies()
     enabled_host_ids = [hid for hid, r in sorted(policies_map.items()) if r.enabled]
@@ -1288,7 +1410,9 @@ if nav_selection == "💬 Chat with Memory":
             rag_follow = st.checkbox("Follow Graph Links (Graph RAG)", value=True)
             rag_cross_project = st.checkbox("Allow Cross-Project Links", value=False)
             rag_fitness_boost = st.checkbox("Fitness & Freshness Boost (Approved Only)", value=False)
+            rag_include_expired = st.checkbox("Include Expired Bi-Temporal Facts", value=False, key="chat_include_expired")
             rag_project_scope = st.text_input("Project Scope (optional, e.g. project:second_brain)", value="", key="chat_project_scope")
+            rag_as_of = st.text_input("Point-in-Time As-Of Date (optional, YYYY-MM-DD)", value="", key="chat_as_of")
         with c3:
             active_host_rule = policies_map.get(chat_host_id)
             default_host_model = active_host_rule.default_model if active_host_rule else GEN_MODEL
@@ -1455,7 +1579,14 @@ if nav_selection == "💬 Chat with Memory":
                     lexical_index_path=LEXICAL_INDEX_PATH,
                     chroma_path=CHROMA_PATH,
                     telemetry_db_path=TELEMETRY_DB_PATH,
+                    persist_threads_allowed=True,
                 )
+                prior_turns = [
+                    {"role": str(m["role"]), "content": str(m["content"])}
+                    for m in st.session_state.chat_history[:-1]
+                    if m.get("role") in {"user", "assistant"} and str(m.get("content") or "").strip()
+                ][-10:]
+                active_tid = str(st.session_state.get("active_chat_thread_id") or "").strip() or None
                 chat_sig = inspect.signature(chat_events).parameters
                 chat_kwargs: dict[str, object] = {
                     "mode": selected_chat_mode,
@@ -1472,10 +1603,20 @@ if nav_selection == "💬 Chat with Memory":
                     chat_kwargs["retrieval_mode"] = rag_retrieval_mode
                 if "host_id" in chat_sig:
                     chat_kwargs["host_id"] = chat_host_id
+                if "thread_id" in chat_sig and active_tid:
+                    chat_kwargs["thread_id"] = active_tid
+                if "history" in chat_sig and prior_turns:
+                    chat_kwargs["history"] = prior_turns
+                if "include_expired" in chat_sig and rag_include_expired:
+                    chat_kwargs["include_expired"] = True
+                if "as_of" in chat_sig and rag_as_of.strip():
+                    chat_kwargs["as_of"] = rag_as_of.strip()
 
                 for ev in chat_events(user_prompt, **chat_kwargs):
                     etype = ev.get("type")
                     if etype == "context":
+                        if ev.get("thread_id"):
+                            st.session_state["active_chat_thread_id"] = str(ev["thread_id"])
                         sources_list = list(ev.get("sources") or [])
                         retrieval_ms = ev.get("retrieval_ms")
                         if ev.get("warning"):
@@ -1554,6 +1695,10 @@ if nav_selection == "💬 Chat with Memory":
                     extra_recall_kwargs["enable_fitness_boost"] = True
                 if context_profile_tuple:
                     extra_recall_kwargs["active_context_profile"] = context_profile_tuple
+                if rag_include_expired:
+                    extra_recall_kwargs["include_expired"] = True
+                if rag_as_of.strip():
+                    extra_recall_kwargs["as_of"] = rag_as_of.strip()
                 with st.spinner(f"🧠 Retrieving verified atoms & querying `{chat_host_id}`..."):
                     direct_refs, neighbor_refs = search_memory(
                         user_prompt,
@@ -1680,6 +1825,23 @@ elif nav_selection == "🕸️ Knowledge Graph":
             kg_inc_pending = st.checkbox("Include Pending Drafts", value=False, key="kg_inc_pending")
             kg_inc_overlap = st.checkbox("Show Topic-Overlap Edges", value=True, key="kg_inc_overlap")
             kg_inc_threads = st.checkbox("Overlay Synthesis Threads (`3-threads/`)", value=True, key="kg_inc_threads")
+            if st.button("🔗 Auto-Link Graph Atoms", width="stretch", key="btn_kg_autolink"):
+                try:
+                    al_res = auto_link_vault_atoms(
+                        actor="local_dashboard_owner",
+                        project_scope=kg_project_scope.strip() or None,
+                        include_pending=kg_inc_pending,
+                        dry_run=False,
+                        brain_dir=BRAIN_DIR,
+                        atoms_dir=ATOMS_DIR,
+                    )
+                    st.session_state["_dashboard_flash_success"] = (
+                        f"Auto-linked {al_res['updated_atom_count']} atom(s) "
+                        f"(orphan approved atoms: {al_res['orphan_before']} -> {al_res['orphan_after']})."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Auto-link failed: {exc}")
 
             st.markdown("### Node & Edge Legend")
             st.markdown(
@@ -2036,6 +2198,38 @@ elif nav_selection == "🗄️ Vault Explorer":
                                     )
                             else:
                                 st.caption("No duplicate candidates above threshold for this atom.")
+
+                        with st.expander("⏳ Bi-Temporal Fact Validity (`valid_from` / `valid_until`)", expanded=False):
+                            _cur_vf = str((record or {}).get("valid_from") or "")
+                            _cur_vu = str((record or {}).get("valid_until") or "")
+                            _t_status = evaluate_temporal_validity(_cur_vf, _cur_vu).get("status", "active")
+                            st.caption(
+                                f"Current temporal status: **`{_t_status}`** "
+                                f"(`{_cur_vf or '-inf'}` -> `{_cur_vu or '+inf'}`). "
+                                "Updating validity bounds preserves current owner approval without forcing re-approval."
+                            )
+                            tv_c1, tv_c2 = st.columns(2)
+                            with tv_c1:
+                                vf_in = st.text_input("valid_from (YYYY-MM-DD or blank)", value=_cur_vf, key=f"vf-{selected_file}")
+                            with tv_c2:
+                                vu_in = st.text_input("valid_until (YYYY-MM-DD or blank)", value=_cur_vu, key=f"vu-{selected_file}")
+                            if st.button("💾 Save Validity Window (CAS)", key=f"save-val-{selected_file}"):
+                                try:
+                                    res_tv = set_atom_temporal_bounds(
+                                        atom_path=file_path,
+                                        expected_sha256=expected_hash,
+                                        valid_from=vf_in.strip() or None,
+                                        valid_until=vu_in.strip() or None,
+                                        actor="local_dashboard_owner",
+                                        brain_dir=BRAIN_DIR,
+                                        atoms_dir=ATOMS_DIR,
+                                    )
+                                    st.session_state["_dashboard_flash_success"] = (
+                                        f"Updated validity window for `{selected_file}` (`{res_tv.get('temporal_status', 'active')}`)."
+                                    )
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Validity update failed: {exc}")
 
 
 # PAGE 4: INBOX & WEB SCOUT
@@ -3491,11 +3685,19 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                     pit_snap = st.selectbox("Point-in-Time Snapshot", snap_ids, key="tt_pit_snap")
                     pit_query = st.text_input("Historical Recall Query", placeholder="What was approved at this snapshot?", key="tt_pit_q")
                     pit_proj = st.text_input("Optional Project Scope", value="", key="tt_pit_proj")
-                    pc_a, pc_b = st.columns(2)
+                    pit_as_of = st.text_input(
+                        "Optional Point-in-Time Date (`as_of`)",
+                        value="",
+                        placeholder="YYYY-MM-DD (defaults to snapshot created_at)",
+                        key="tt_pit_as_of",
+                    )
+                    pc_a, pc_b, pc_c = st.columns(3)
                     with pc_a:
                         pit_topk = st.slider("Max Results (`top_k`)", 1, 20, 5, key="tt_pit_topk")
                     with pc_b:
                         pit_prefs = st.checkbox("Include Owner Preferences", value=False, key="tt_pit_prefs")
+                    with pc_c:
+                        pit_inc_exp = st.checkbox("Include Expired Atoms", value=False, key="tt_pit_inc_exp")
                     if st.button("⏪ Recall at Snapshot", key="btn_pit_recall"):
                         try:
                             pit_res = recall_at_snapshot(
@@ -3504,11 +3706,15 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                                 project_scope=pit_proj.strip() or None,
                                 include_preferences=pit_prefs,
                                 top_k=pit_topk,
+                                as_of=pit_as_of.strip() or None,
+                                include_expired=pit_inc_exp,
                                 brain_dir=BRAIN_DIR,
                             )
                             hits = pit_res.get("results", [])
                             st.caption(
                                 f"Snapshot `{pit_res['snapshot_id']}` (`{pit_res['created_at']}`) · "
+                                f"as_of `{pit_res.get('as_of', pit_res['created_at'])}` · "
+                                f"Reranker `{pit_res.get('rerank_backend', 'none')}` · "
                                 f"Merkle `{pit_res['merkle_root'][:16]}…` · **{len(hits)} hit(s)**"
                             )
                             if not hits:
@@ -3516,8 +3722,13 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                             else:
                                 for rank, h in enumerate(hits, start=1):
                                     with st.container(border=True):
+                                        tv_badge = (
+                                            f" · validity `{h.get('temporal_status')}` (`{h.get('valid_from') or '-inf'}..{h.get('valid_until') or '+inf'}`)"
+                                            if (h.get("valid_from") or h.get("valid_until"))
+                                            else ""
+                                        )
                                         st.markdown(
-                                            f"**#{rank} `{h['filename']}`** (score `{h['score']}` · SHA-256 `{str(h.get('file_sha256', ''))[:14]}…`)"
+                                            f"**#{rank} `{h['filename']}`** (score `{h['score']}` · SHA-256 `{str(h.get('file_sha256', ''))[:14]}…`{tv_badge})"
                                         )
                                         st.code(str(h.get("claim", "")), language="text")
                                         if h.get("contexts"):
@@ -3619,6 +3830,116 @@ elif nav_selection == "⚙️ System Control":
                     except Exception as exc:
                         st.error(f"Disconnect failed: {exc}")
 
+    # Local Neural ONNX Models (Cross-Encoder & DeBERTa NLI)
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🧠 Verified Local Neural ONNX Models (Cross-Encoder Reranker & DeBERTa NLI)")
+        st.caption(
+            "SHA-256 + immutable commit-pinned int8 CPU ONNX weights for sub-25ms neural cross-encoder reranking "
+            "(`Xenova/ms-marco-MiniLM-L-6-v2`) and clause-aligned bidirectional NLI (`Xenova/nli-deberta-v3-xsmall`)."
+        )
+        try:
+            onnx_st = get_onnx_models_status()
+        except Exception as onnx_exc:
+            onnx_st = {"runtime_available": False, "all_verified": False, "slots": {}, "error": str(onnx_exc)}
+        onnx_slots = onnx_st.get("slots") or {}
+        om1, om2, om3 = st.columns(3)
+        om1.metric("ONNX Runtime", "Ready" if onnx_st.get("onnx_runtime_ready") else "Fallback Engine")
+        om2.metric(
+            "Cross-Encoder Reranker",
+            "Verified ✅" if (onnx_slots.get("cross-encoder") or {}).get("verified") else "Not Installed",
+        )
+        om3.metric(
+            "Bidirectional NLI",
+            "Verified ✅" if (onnx_slots.get("nli") or {}).get("verified") else "Not Installed",
+        )
+        ob1, ob2 = st.columns(2)
+        with ob1:
+            if st.button("⬇️ Pull & Verify Pinned ONNX Weights", key="btn_onnx_pull"):
+                try:
+                    pres = pull_onnx_models("all")
+                    st.success(f"Pulled & verified ONNX weights (`all_verified={pres.get('all_verified')}`).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"ONNX pull failed: {exc}")
+        with ob2:
+            if st.button("🧪 Verify SHA-256 & CPU Smoke Test", key="btn_onnx_verify"):
+                try:
+                    vres = get_onnx_models_status(run_inference=True)
+                    if vres.get("all_verified"):
+                        st.success("All ONNX SHA-256 digests and CPU smoke inference checks passed!")
+                    else:
+                        st.warning(f"ONNX verification incomplete: `all_verified={vres.get('all_verified')}`.")
+                except Exception as exc:
+                    st.error(f"ONNX verify failed: {exc}")
+
+    # Zero-Knowledge Mobile E2EE Inbox Drop (PWA & iOS Shortcut)
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 📱 Zero-Knowledge Mobile Inbox Drop (Static PWA & iOS Shortcut)")
+        st.caption(
+            "Forward-secret `ECDH P-256 + HKDF-SHA256 + AES-256-GCM` (`SBID1`) + revocable per-device `HMAC-SHA256`. "
+            "Mobile devices hold only the public `P-256` key and drop ciphertext into `inbox-drops/<id>.enc` -> quarantined `0-raw/inbox/`."
+        )
+        md_c1, md_c2, md_c3 = st.columns([1.4, 1.8, 1.0])
+        with md_c1:
+            md_label_in = st.text_input("Mobile Device Label", value="Mobile Quick-Capture", key="sys_md_label")
+        with md_c2:
+            md_pwa_url_in = st.text_input(
+                "Static PWA Base URL (optional)",
+                placeholder="https://pages.example/inbox-drop/",
+                key="sys_md_pwa_url",
+            )
+        with md_c3:
+            md_inc_s3 = st.checkbox("Include S3 Write Keys", value=False, key="sys_md_inc_s3")
+        mdb1, mdb2 = st.columns(2)
+        with mdb1:
+            if st.button("📲 Pair Mobile Device (SBID1)", key="btn_md_pair"):
+                try:
+                    _md_sync = vault_sync_status(brain_dir=BRAIN_DIR)
+                    if not _md_sync.get("configured") or not _md_sync.get("vault_id"):
+                        raise ValueError("Initialize E2EE vault sync below first before pairing a Mobile Inbox Drop device.")
+                    _ak, _sk = resolve_scoped_inbox_drop_s3_credentials(include_from_env=bool(md_inc_s3))
+                    mpres = create_mobile_drop_pairing(
+                        label=md_label_in.strip() or "Mobile Quick-Capture",
+                        vault_id=str(_md_sync["vault_id"]),
+                        sync_target_url=str(_md_sync.get("target") or "") if _md_sync.get("backend_type") == "http_object" else "",
+                        s3_region=str(_md_sync.get("s3_region") or "auto"),
+                        s3_access_key_id=_ak,
+                        s3_secret_access_key=_sk,
+                        pwa_base_url=md_pwa_url_in.strip() or "https://localhost/inbox-drop/",
+                        brain_dir=BRAIN_DIR,
+                    )
+                    st.success(f"Paired `{mpres['label']}` (`token_id={mpres['token_id']}`):")
+                    st.code(str(mpres.get("pwa_pairing_url") or mpres.get("pairing_fragment") or ""), language="text")
+                except Exception as exc:
+                    st.error(f"Mobile drop pairing failed: {exc}")
+        with mdb2:
+            if st.button("📥 Pull Mobile Drops into Quarantined Inbox", key="btn_md_pull"):
+                try:
+                    p_drops = vault_pull_mobile_drops(brain_dir=BRAIN_DIR)
+                    st.success(
+                        f"Pulled mobile drops: {p_drops.get('ingested_count', 0)} staged into `0-raw/inbox/`, "
+                        f"{p_drops.get('skipped_duplicate_count', 0)} duplicate(s) skipped."
+                    )
+                except Exception as exc:
+                    st.error(f"Pull mobile drops failed: {exc}")
+        try:
+            md_info = list_mobile_drop_pairings(brain_dir=BRAIN_DIR)
+            md_pairings = [p for p in (md_info.get("pairings") or []) if not p.get("revoked")]
+        except Exception:
+            md_pairings = []
+        if md_pairings:
+            st.dataframe(pd.DataFrame(md_pairings), width="stretch")
+            md_rev_id = st.selectbox("Revoke Mobile Pairing", [p["token_id"] for p in md_pairings], key="sys_md_rev_sel")
+            if st.button("🚫 Revoke Mobile Token", key="btn_md_revoke"):
+                try:
+                    revoke_mobile_drop_pairing(md_rev_id, brain_dir=BRAIN_DIR)
+                    st.success(f"Revoked mobile drop token `{md_rev_id}`.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Revoke failed: {exc}")
+
     # Zero-Knowledge E2EE Multi-Device Vault Sync
     st.divider()
     with st.container(border=True):
@@ -3632,16 +3953,18 @@ elif nav_selection == "⚙️ System Control":
         except Exception as sync_exc:
             sync_st = {"configured": False, "error": str(sync_exc), "conflict_count": 0, "conflicts": []}
 
-        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1, sm2, sm3, sm4, sm5, sm6 = st.columns(6)
         sm1.metric("Sync Status", "Configured" if sync_st.get("configured") else "Not Configured")
         sm2.metric("Local Epoch", sync_st.get("local_epoch", 0))
         sm3.metric("Remote Epoch", sync_st.get("remote_epoch", 0))
-        sm4.metric("Conflicts", sync_st.get("conflict_count", 0))
+        sm4.metric("Key Sealing", "OS Keychain/DPAPI" if sync_st.get("keychain_sealed") else str(sync_st.get("kdf_mode") or "keyfile"))
+        sm5.metric("Auto-Sync", "Enabled" if (sync_st.get("auto_sync") or {}).get("enabled") else "Off")
+        sm6.metric("Conflicts", sync_st.get("conflict_count", 0))
 
-        sc1, sc2 = st.columns(2)
+        sc1, sc2, sc3 = st.columns(3)
         with sc1:
             sync_target_in = st.text_input(
-                "Sync Target (Local Folder or https:// URL)",
+                "Sync Target (Local Folder or https:// S3/R2 URL)",
                 value=str(sync_st.get("target") or ""),
                 key="sys_sync_target",
             )
@@ -3651,9 +3974,33 @@ elif nav_selection == "⚙️ System Control":
                 index=0 if sync_st.get("backend_type", "local_folder") == "local_folder" else 1,
                 key="sys_sync_backend",
             )
+            sync_use_kc_in = st.checkbox(
+                "Seal Master Key in OS Keychain / Windows DPAPI",
+                value=True,
+                key="sys_sync_use_keychain",
+            )
         with sc2:
+            _auth_opts = ["bearer", "s3_sigv4", "none"]
+            _cur_auth = str(sync_st.get("auth_mode") or "bearer")
+            sync_auth_in = st.selectbox(
+                "HTTP Auth Mode",
+                options=_auth_opts,
+                index=_auth_opts.index(_cur_auth) if _cur_auth in _auth_opts else 0,
+                key="sys_sync_auth_mode",
+            )
+            sync_s3_region_in = st.text_input(
+                "S3 / R2 Region",
+                value=str(sync_st.get("s3_region") or "auto"),
+                key="sys_sync_s3_region",
+            )
+            sync_s3_ak_env_in = st.text_input(
+                "S3 Access Key Env Var",
+                value="AWS_ACCESS_KEY_ID",
+                key="sys_sync_s3_ak_env",
+            )
+        with sc3:
             sync_pass_in = st.text_input(
-                "Optional Passphrase (leave blank for keyfile)",
+                "Optional Passphrase (blank = 256-bit random key)",
                 type="password",
                 key="sys_sync_passphrase",
             )
@@ -3662,8 +4009,13 @@ elif nav_selection == "⚙️ System Control":
                 type="password",
                 key="sys_sync_recovery",
             )
+            sync_s3_sk_env_in = st.text_input(
+                "S3 Secret Key Env Var",
+                value="AWS_SECRET_ACCESS_KEY",
+                key="sys_sync_s3_sk_env",
+            )
 
-        sb1, sb2, sb3, sb4, sb5 = st.columns(5)
+        sb1, sb2, sb3, sb4, sb5, sb6, sb7 = st.columns(7)
         with sb1:
             if st.button("🆕 Init Sync", key="btn_sync_init"):
                 try:
@@ -3672,8 +4024,13 @@ elif nav_selection == "⚙️ System Control":
                         backend_type=sync_backend_in,
                         brain_dir=BRAIN_DIR,
                         passphrase=sync_pass_in or None,
+                        use_keychain=sync_use_kc_in,
+                        auth_mode=sync_auth_in,
+                        s3_region=sync_s3_region_in.strip() or "auto",
+                        s3_access_key_env=sync_s3_ak_env_in.strip() or None if sync_auth_in == "s3_sigv4" else None,
+                        s3_secret_key_env=sync_s3_sk_env_in.strip() or None if sync_auth_in == "s3_sigv4" else None,
                     )
-                    st.success(f"Initialized E2EE vault `{res['vault_id']}` (device `{res['device_id']}`).")
+                    st.success(f"Initialized E2EE vault `{res['vault_id']}` (device `{res['device_id']}`, mode `{res['kdf_mode']}`).")
                     if res.get("recovery_key_b64"):
                         st.code(f"Recovery Key (save offline safely): {res['recovery_key_b64']}", language="text")
                 except Exception as exc:
@@ -3687,8 +4044,13 @@ elif nav_selection == "⚙️ System Control":
                         brain_dir=BRAIN_DIR,
                         passphrase=sync_pass_in or None,
                         recovery_key_b64=sync_rec_in.strip() or None,
+                        use_keychain=sync_use_kc_in,
+                        auth_mode=sync_auth_in,
+                        s3_region=sync_s3_region_in.strip() or "auto",
+                        s3_access_key_env=sync_s3_ak_env_in.strip() or None if sync_auth_in == "s3_sigv4" else None,
+                        s3_secret_key_env=sync_s3_sk_env_in.strip() or None if sync_auth_in == "s3_sigv4" else None,
                     )
-                    st.success(f"Joined E2EE vault `{res['vault_id']}` as `{res['device_id']}`.")
+                    st.success(f"Joined E2EE vault `{res['vault_id']}` as `{res['device_id']}` (`{res['kdf_mode']}`).")
                 except Exception as exc:
                     st.error(f"Join failed: {exc}")
         with sb3:
@@ -3720,6 +4082,105 @@ elif nav_selection == "⚙️ System Control":
                         st.error(f"Verification failed: {res.get('issues')}")
                 except Exception as exc:
                     st.error(f"Verify failed: {exc}")
+        with sb6:
+            if st.button("🧹 Prune Orphans", key="btn_sync_gc"):
+                try:
+                    res = vault_sync_gc(brain_dir=BRAIN_DIR, passphrase=sync_pass_in or None)
+                    st.success(f"Pruned {res['deleted_blobs']} orphan blob(s) & {res['deleted_manifests']} old manifest(s).")
+                except Exception as exc:
+                    st.error(f"GC failed: {exc}")
+        with sb7:
+            if st.button("🔐 Seal Keychain", key="btn_sync_seal_kc"):
+                try:
+                    res = vault_seal_keychain(brain_dir=BRAIN_DIR, passphrase=sync_pass_in or None)
+                    st.success(f"Sealed master key into `{res['keychain_backend']}` (`{res['kdf_mode']}`).")
+                except Exception as exc:
+                    st.error(f"Seal keychain failed: {exc}")
+
+        ac1, ac2, ac3, ac4 = st.columns([1.2, 1.0, 1.0, 1.0])
+        with ac1:
+            auto_iv_in = st.number_input(
+                "Auto-Sync Interval (s)",
+                min_value=10,
+                max_value=86400,
+                value=int((sync_st.get("auto_sync") or {}).get("interval_seconds") or 300),
+                step=30,
+                key="sys_sync_auto_iv",
+            )
+        with ac2:
+            if st.button("▶️ Enable Auto-Sync", key="btn_sync_auto_on"):
+                try:
+                    vault_configure_auto_sync(enabled=True, interval_seconds=int(auto_iv_in), start_background=False, brain_dir=BRAIN_DIR)
+                    st.success(f"Enabled background auto-sync ({int(auto_iv_in)}s).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Auto-sync enable failed: {exc}")
+        with ac3:
+            if st.button("⏹️ Disable Auto-Sync", key="btn_sync_auto_off"):
+                try:
+                    vault_configure_auto_sync(enabled=False, interval_seconds=int(auto_iv_in), start_background=False, brain_dir=BRAIN_DIR)
+                    st.success("Disabled background auto-sync.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Auto-sync disable failed: {exc}")
+        with ac4:
+            if st.button("🔄 Run Auto-Sync Cycle", key="btn_sync_auto_once"):
+                try:
+                    cyc = vault_run_auto_sync(brain_dir=BRAIN_DIR)
+                    st.info(f"Auto-sync cycle status: `{cyc.get('status')}` (pushed={cyc.get('pushed')}).")
+                except Exception as exc:
+                    st.error(f"Auto-sync cycle failed: {exc}")
+
+        open_conflicts = list(sync_st.get("conflicts") or [])
+        if open_conflicts:
+            st.markdown("#### ⚠️ Interactive 3-Way Sync Conflict Resolver")
+            conf_options = [str(c.get("conflict_id") or c.get("rel_path")) for c in open_conflicts]
+            conf_labels = {
+                str(c.get("conflict_id") or c.get("rel_path")): f"{c.get('rel_path')} (epoch {c.get('remote_epoch')}, {c.get('conflict_kind', 'divergent_edit')})"
+                for c in open_conflicts
+            }
+            sel_conf_id = st.selectbox(
+                "Select Conflict to Inspect & Resolve",
+                options=conf_options,
+                format_func=lambda cid: conf_labels.get(cid, cid),
+                key="sys_sync_conf_select",
+            )
+            if sel_conf_id:
+                try:
+                    cdet = vault_conflict_detail(sel_conf_id, brain_dir=BRAIN_DIR)
+                    if cdet.get("base_content"):
+                        with st.expander("Inspect Common Ancestor (Base)", expanded=False):
+                            st.code(str(cdet["base_content"]), language="markdown")
+                    st.code(str(cdet.get("unified_diff") or "(no text diff)"), language="diff")
+                    manual_merge_txt = st.text_area(
+                        "Manual 3-Way Merge Editor",
+                        value=str(cdet.get("local_content") or cdet.get("remote_content") or ""),
+                        height=180,
+                        key=f"sys_sync_merge_ta_{sel_conf_id}",
+                    )
+                    rc1, rc2, rc3, rc4 = st.columns(4)
+                    for col_obj, strat_key, btn_lbl in (
+                        (rc1, "keep_local", "🏠 Keep Local"),
+                        (rc2, "accept_remote", "☁️ Accept Remote"),
+                        (rc3, "keep_both", "📑 Keep Both"),
+                        (rc4, "manual_merge", "✍️ Save Manual Merge"),
+                    ):
+                        with col_obj:
+                            if st.button(btn_lbl, key=f"btn_conf_{strat_key}_{sel_conf_id}"):
+                                r_out = vault_resolve_conflict(
+                                    sel_conf_id,
+                                    resolution=strat_key,
+                                    merged_content=manual_merge_txt if strat_key == "manual_merge" else None,
+                                    expected_local_sha256=cdet.get("current_local_sha256"),
+                                    actor="local_dashboard_owner",
+                                    brain_dir=BRAIN_DIR,
+                                )
+                                st.session_state["_dashboard_flash_success"] = (
+                                    f"Resolved `{r_out['rel_path']}` via `{strat_key}` ({r_out['remaining_conflicts']} remaining)."
+                                )
+                                st.rerun()
+                except Exception as exc:
+                    st.error(f"Conflict detail/resolve error: {exc}")
 
     # Multi-Vault Workspaces & Opt-In Federated Cross-Vault Recall
     st.divider()
@@ -3854,13 +4315,23 @@ elif nav_selection == "⚙️ System Control":
             )
         with cc2:
             clip_label_in = st.text_input("Browser Label", value="Browser Clipper", key="sys_clip_label")
-        if st.button("🔗 Pair Browser Extension & Mint Scoped Token", key="btn_clip_pair"):
-            try:
-                pres = clipper_create_pairing(clip_origin_in.strip(), label=clip_label_in.strip() or "Browser Clipper")
-                st.success(f"Paired `{pres['label']}` (`{pres['pairing_id']}`). Paste this write-only token into the extension popup:")
-                st.code(str(pres["token"]), language="text")
-            except Exception as exc:
-                st.error(f"Pairing failed: {exc}")
+        cp_b1, cp_b2 = st.columns(2)
+        with cp_b1:
+            if st.button("⚡ Generate 1-Click Pairing Code (5 min)", key="btn_clip_pair_code"):
+                try:
+                    cpres = clipper_create_pairing_code(label=clip_label_in.strip() or "Browser Clipper", ttl_seconds=300)
+                    st.success("Paste this single-use code into the Browser Clipper popup and click **Pair in 1 Click**:")
+                    st.code(str(cpres["code"]), language="text")
+                except Exception as exc:
+                    st.error(f"Pairing code generation failed: {exc}")
+        with cp_b2:
+            if st.button("🔗 Pair Browser Extension by Origin", key="btn_clip_pair"):
+                try:
+                    pres = clipper_create_pairing(clip_origin_in.strip(), label=clip_label_in.strip() or "Browser Clipper")
+                    st.success(f"Paired `{pres['label']}` (`{pres['pairing_id']}`). Paste this write-only token into the extension popup:")
+                    st.code(str(pres["token"]), language="text")
+                except Exception as exc:
+                    st.error(f"Pairing failed: {exc}")
         try:
             pairings = clipper_list_pairings()
         except Exception:
@@ -3877,6 +4348,167 @@ elif nav_selection == "⚙️ System Control":
                     st.error(f"Revoke failed: {exc}")
         else:
             st.info("No browser clipper extensions paired yet.")
+
+    # Multimodal Voice Memo & Media Upload
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🎙️ Multimodal Voice Memo, Screenshot & Media Upload (`0-raw/` + DLP Quarantine)")
+        st.caption(
+            "Ingest uploaded audio, screenshots/images (Pillow-verified), or documents (`.pdf`, `.docx`, `.epub`, `.html`, `.csv`, `.tsv`) "
+            "up to 24 MiB with automatic DLP secret redaction and `0-raw/inbox/` quarantine."
+        )
+        up_media = st.file_uploader(
+            "Select Audio, Screenshot/Image, or Document",
+            type=["png", "jpg", "jpeg", "webp", "wav", "mp3", "m4a", "webm", "ogg", "flac", "pdf", "docx", "epub", "html", "csv", "tsv"],
+            key="sys_multimodal_uploader",
+        )
+        enable_mic = st.checkbox("Enable Browser Voice Memo Recorder", value=False, key="sys_enable_voice_memo")
+        recorded_voice = None
+        if enable_mic and callable(getattr(st, "audio_input", None)):
+            recorded_voice = st.audio_input("Record Voice Memo", key="sys_voice_memo_input")
+        if st.button("📥 Ingest Media into Vault", key="btn_sys_ingest_media"):
+            chosen_obj = recorded_voice if recorded_voice is not None else up_media
+            if chosen_obj is None:
+                st.warning("Upload a media file or record a voice memo first.")
+            else:
+                try:
+                    fname_in = getattr(chosen_obj, "name", None) or "voice-memo.wav"
+                    mres = ingest_uploaded_media_bytes(chosen_obj.getvalue(), fname_in, brain_dir=BRAIN_DIR)
+                    if mres.get("quarantined"):
+                        st.warning(f"Quarantined in `{mres['output_rel_path']}` (flags: {mres.get('dlp_flags')}).")
+                    else:
+                        st.success(f"Ingested `{mres['output_rel_path']}` (`{mres['category']}`, SHA-256 `{str(mres['source_sha256'])[:16]}…`).")
+                except Exception as exc:
+                    st.error(f"Media ingestion failed: {exc}")
+
+    # Git Post-Commit Hook & Coding Session Memory Distiller
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🧬 Git Post-Commit Hook & Coding Session Memory Distiller")
+        st.caption(
+            "Non-destructively manage `.git/hooks/post-commit` and distill repository commits into `4-experiences/` "
+            "and DLP-screened `0-raw/inbox/` captures."
+        )
+        gc1, gc2, gc3 = st.columns([2, 1, 1])
+        with gc1:
+            git_repo_in = st.text_input("Git Repository Path", value=PROJECT_ROOT, key="sys_git_repo_path")
+        with gc2:
+            git_proj_in = st.text_input("Optional Project Scope", value="", placeholder="project:second_brain", key="sys_git_proj")
+        with gc3:
+            git_max_in = st.number_input("Max Commits", min_value=1, max_value=25, value=5, step=1, key="sys_git_max")
+        try:
+            hk_st = get_git_hook_status(git_repo_in.strip() or PROJECT_ROOT)
+            st.caption(
+                f"Hook status: **{'INSTALLED' if hk_st.get('installed') else 'NOT INSTALLED'}** (`{hk_st.get('hook_path')}`)"
+            )
+        except Exception as hk_exc:
+            st.caption(f"Hook status unavailable: {hk_exc}")
+        gb1, gb2, gb3 = st.columns(3)
+        with gb1:
+            if st.button("🪝 Install Post-Commit Hook", key="btn_git_hook_install"):
+                try:
+                    ires = install_git_post_commit_hook(
+                        repo_dir=git_repo_in.strip() or PROJECT_ROOT,
+                        brain_dir=BRAIN_DIR,
+                        project_scope=git_proj_in.strip() or None,
+                    )
+                    st.success(f"Installed hook at `{ires['hook_path']}` (`{ires['project_scope']}`).")
+                except Exception as exc:
+                    st.error(f"Hook install failed: {exc}")
+        with gb2:
+            if st.button("🧹 Uninstall Post-Commit Hook", key="btn_git_hook_uninstall"):
+                try:
+                    ures = uninstall_git_post_commit_hook(repo_dir=git_repo_in.strip() or PROJECT_ROOT)
+                    st.info(f"Hook status: `{ures['status']}`.")
+                except Exception as exc:
+                    st.error(f"Hook uninstall failed: {exc}")
+        with gb3:
+            if st.button("⚡ Distill Recent Commits", key="btn_git_distill"):
+                try:
+                    dres = git_distill_commits(
+                        repo_dir=git_repo_in.strip() or PROJECT_ROOT,
+                        brain_dir=BRAIN_DIR,
+                        project_scope=git_proj_in.strip() or None,
+                        max_commits=int(git_max_in),
+                        stage_inbox=True,
+                    )
+                    st.success(
+                        f"Distilled **{dres['distilled_count']}** commit(s) (`{dres['skipped_duplicate_count']}` skipped) in `{dres['project_scope']}`."
+                    )
+                except Exception as exc:
+                    st.error(f"Commit distillation failed: {exc}")
+
+    # Watchdog One-Shot Sync & Portable Three-Store Vault Backup (.sbvault)
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🛡️ Watchdog Index/Vector Sync & Portable `.sbvault` Backup / Restore")
+        st.caption(
+            "Trigger a one-shot FTS5 + incremental Chroma vector sync, or create/verify/restore AES-256-GCM encrypted "
+            "Three-Store `.sbvault` backups (excluding `.sidecar/`, `.chroma/`, and OS keys)."
+        )
+        if st.button("🔄 Run One-Shot Notes/Atoms FTS5 & Chroma Vector Sync", key="btn_sys_daemon_sync_once"):
+            try:
+                from scripts.watchdog_daemon import sync_notes_and_atoms_once
+
+                s_once = sync_notes_and_atoms_once(
+                    notes_dir=NOTES_DIR,
+                    atoms_dir=ATOMS_DIR,
+                    lexical_index_path=LEXICAL_INDEX_PATH,
+                    brain_dir=BRAIN_DIR,
+                )
+                st.success(
+                    f"Synced indexes · Vector sync: `{s_once.get('atoms', {}).get('vector_sync', {}).get('status', 'n/a')}` "
+                    f"· Stale anchors: `{s_once.get('atoms', {}).get('stale_count', 0)}`"
+                )
+            except Exception as exc:
+                st.error(f"One-shot sync failed: {exc}")
+
+        bk1, bk2 = st.columns(2)
+        with bk1:
+            bk_out = st.text_input("Create Backup Output Path (`.sbvault`)", placeholder="C:\\Backups\\vault.sbvault", key="sys_bk_out")
+            bk_pw = st.text_input("Backup Passphrase (>= 8 chars)", type="password", key="sys_bk_pw")
+            bk_unenc = st.checkbox("Unencrypted Checksummed Archive", value=False, key="sys_bk_unenc")
+            if st.button("💾 Create Portable Backup", key="btn_sys_bk_create"):
+                try:
+                    cres = create_vault_backup(
+                        bk_out.strip(),
+                        brain_dir=BRAIN_DIR,
+                        passphrase=None if bk_unenc else bk_pw,
+                        unencrypted=bk_unenc,
+                    )
+                    st.success(
+                        f"Created `{cres['backup_path']}` ({cres['file_count']} files, Merkle `{cres['merkle_root'][:16]}…`)."
+                    )
+                except Exception as exc:
+                    st.error(f"Backup create failed: {exc}")
+        with bk2:
+            bk_in = st.text_input("Existing `.sbvault` Archive Path", key="sys_bk_in")
+            bk_target = st.text_input("Restore Target Vault Directory", key="sys_bk_target")
+            bk_force = st.checkbox("Force Overwrite (creates pre-restore safety backup)", value=False, key="sys_bk_force")
+            bvb1, bvb2 = st.columns(2)
+            with bvb1:
+                if st.button("✅ Verify Archive", key="btn_sys_bk_verify"):
+                    try:
+                        vres = verify_vault_backup(bk_in.strip(), passphrase=bk_pw or None)
+                        st.success(
+                            f"VALID (`{vres['cipher']}`): {vres['file_count']} files, Merkle `{vres['merkle_root'][:16]}…`."
+                        )
+                    except Exception as exc:
+                        st.error(f"Backup verify failed: {exc}")
+            with bvb2:
+                if st.button("♻️ Restore Vault", key="btn_sys_bk_restore"):
+                    try:
+                        rres = restore_vault_backup(
+                            bk_in.strip(),
+                            bk_target.strip(),
+                            passphrase=bk_pw or None,
+                            force=bk_force,
+                        )
+                        st.success(
+                            f"Restored {rres['restored_files']} files into `{rres['target_brain_dir']}` (rebuilt FTS5 indexes)."
+                        )
+                    except Exception as exc:
+                        st.error(f"Backup restore failed: {exc}")
 
     # Briefing log
     st.divider()

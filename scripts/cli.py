@@ -151,6 +151,7 @@ def doctor() -> int:
         "dashboard": _capability("streamlit"),
         "mcp": _capability("mcp"),
         "dense_index": _capability("chromadb"),
+        "onnx_reranker_runtime": _capability("onnxruntime") and _capability("tokenizers"),
         "scout_http": _capability("httpx"),
         "extractor": _capability("trafilatura"),
         "document_pdf": _capability("pypdf"),
@@ -236,8 +237,11 @@ def doctor() -> int:
         models = sorted(item.get("name", item.get("model", "unknown")) for item in payload.get("models", []))
         print(f"Ollama service: ready ({len(models)} model(s))")
         print(f"Ollama models: {', '.join(models) if models else 'none installed'}")
+        from scripts.hardware_profile import resolve_active_local_generation_model
+
+        active_gen_model = resolve_active_local_generation_model(fallback=_config.GEN_MODEL)
         model_roots = {name.split(":", 1)[0] for name in models}
-        for label, configured in (("Generation", _config.GEN_MODEL), ("Embedding", _config.EMBED_MODEL), ("Vision", _config.VISION_MODEL)):
+        for label, configured in (("Generation", active_gen_model), ("Embedding", _config.EMBED_MODEL), ("Vision", _config.VISION_MODEL)):
             present = configured in models or configured.split(":", 1)[0] in model_roots
             print(f"{label} model {configured}: {'available' if present else 'not installed'}")
     except (OSError, urllib.error.URLError, json.JSONDecodeError):
@@ -273,6 +277,19 @@ def doctor() -> int:
             print("Dense index: unavailable (no active manifest); lexical FTS5 handles recall cleanly")
     except (OSError, ValueError, TypeError) as exc:
         print(f"Dense index: unavailable or invalid ({exc}); no dense results will be served")
+    try:
+        from scripts.onnx_models import get_onnx_models_status
+
+        onnx_st = get_onnx_models_status(run_inference=False)
+        ce_info = onnx_st["slots"]["cross-encoder"]
+        nli_info = onnx_st["slots"]["nli"]
+        print(
+            f"ONNX neural models: cross-encoder={ce_info['active_backend']} "
+            f"({'verified' if ce_info['verified'] else 'fallback'}), "
+            f"nli={nli_info['active_backend']} ({'verified' if nli_info['verified'] else 'fallback'})"
+        )
+    except Exception:
+        pass
     return 1 if (missing_dirs or not lexical_ready or not ledger_ok) else 0
 
 
@@ -443,8 +460,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("graph", "Contradiction & Drift Radar + temporal knowledge graph."),
         ("snapshot", "Time-travel vault snapshots, semantic diff, and point-in-time recall."),
         ("sync", "Zero-Knowledge E2EE multi-device vault sync (init/join/status/push/pull/verify/conflicts)."),
+        ("models", "Download, SHA-256 verify, inspect, or remove local ONNX Cross-Encoder & NLI weights."),
         ("clipper", "Pair, manage, and capture via the local-first Browser Web Clipper."),
         ("vault", "Manage isolated Multi-Vault Workspaces and opt-in cross-vault federated recall."),
+        ("backup", "Create, cryptographically verify, or restore portable Three-Store .sbvault backups."),
+        ("hook", "Install/manage git post-commit hooks and distill commits into Second Brain."),
         ("recall", "Search owner-approved memory atoms via lexical, dense, or hybrid RRF recall."),
         ("answer", "Generate a citation-validated grounded answer (standard, preference, or research)."),
         ("review", "Inspect, approve, reject, quarantine, demote, edit, or merge memory atoms."),
@@ -530,7 +550,8 @@ _PASSTHROUGH_COMMANDS = frozenset({
     "api",
     "inbox", "hosts", "cognitive", "playbooks", "playbook", "plan",
     "notes", "capture", "import", "chat", "connect", "benchmark",
-    "sota-benchmark", "ledger", "graph", "snapshot", "sync", "clipper", "vault",
+    "sota-benchmark", "ledger", "graph", "snapshot", "sync", "models", "clipper", "vault",
+    "backup", "hook",
     "recall", "answer", "review", "audit",
     "rebuild-lexical", "rebuild-vectors",
     "refinery", "editor", "scout", "ingest", "daemon", "mcp",
@@ -568,6 +589,8 @@ def _run_recall_cli(forwarded: list[str]) -> int:
     p.add_argument("--allow-cross-project", action="store_true")
     p.add_argument("--no-follow-links", action="store_true")
     p.add_argument("--include-duplicates", action="store_true")
+    p.add_argument("--include-expired", action="store_true", help="Include expired or not-yet-valid temporal atoms.")
+    p.add_argument("--as-of", default=None, help="Point-in-time ISO-8601 date/timestamp validity filter (YYYY-MM-DD).")
     p.add_argument("--json", action="store_true", help="Emit structured JSON output.")
     args = p.parse_args(forwarded)
 
@@ -581,6 +604,8 @@ def _run_recall_cli(forwarded: list[str]) -> int:
         projects=projects,
         allow_cross_project=bool(args.allow_cross_project),
         retrieval_mode=args.retrieval_mode,
+        include_expired=bool(args.include_expired),
+        as_of=args.as_of.strip() if args.as_of and args.as_of.strip() else None,
     )
     direct, neighbors = recall_mod.search_memory(
         args.query,
@@ -631,6 +656,8 @@ def _run_answer_cli(forwarded: list[str]) -> int:
     p.add_argument("-n", "--limit", type=int, default=5)
     p.add_argument("--project", default=None)
     p.add_argument("--allow-cross-project", action="store_true")
+    p.add_argument("--include-expired", action="store_true", help="Include temporally expired atoms during recall.")
+    p.add_argument("--as-of", default=None, help="Optional ISO-8601 date/timestamp point-in-time validity filter.")
     p.add_argument("--host-id", default="ollama_local")
     p.add_argument("--model-override", default=None)
     p.add_argument("--json", action="store_true")
@@ -640,6 +667,7 @@ def _run_answer_cli(forwarded: list[str]) -> int:
     chroma_path = os.path.join(vault_dir, ".chroma")
     n_res = max(1, min(int(args.limit), 15))
     projects = (args.project.strip(),) if args.project and args.project.strip() else ()
+    as_of_val = str(args.as_of).strip() if args.as_of and str(args.as_of).strip() else None
     direct, neighbors = search_memory(
         args.query,
         RecallOptions(
@@ -649,6 +677,8 @@ def _run_answer_cli(forwarded: list[str]) -> int:
             projects=projects,
             allow_cross_project=bool(args.allow_cross_project),
             retrieval_mode=args.retrieval_mode,
+            include_expired=bool(args.include_expired),
+            as_of=as_of_val,
         ),
         atoms_dir=atoms_dir,
         index_path=lexical_index_path,
@@ -779,6 +809,10 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.vault_sync import main as sync_main
 
         return sync_main(forwarded)
+    if command == "models":
+        from scripts.onnx_models import main as models_main
+
+        return models_main(forwarded)
     if command == "clipper":
         from scripts.web_clipper import main as clipper_main
 
@@ -787,6 +821,14 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.vault_workspaces import main as vault_main
 
         return vault_main(forwarded)
+    if command == "backup":
+        from scripts.vault_backup import main as backup_main
+
+        return backup_main(forwarded)
+    if command == "hook":
+        from scripts.git_distiller import main as hook_main
+
+        return hook_main(forwarded)
     if command == "recall":
         return _run_recall_cli(forwarded)
     if command == "answer":

@@ -527,7 +527,9 @@ function buildChatWebviewHtml(nonce) {
     <input id="hostId" style="width:125px;" value="ollama_local" placeholder="Host (ollama_local)" />
     <input id="modelOverride" style="width:135px;" placeholder="Model override" />
     <input id="scope" style="width:125px;" placeholder="Scope (optional)" />
+    <input id="asOf" style="width:120px;" placeholder="As-Of YYYY-MM-DD" />
     <label class="ctrl-label"><input id="incPrefs" type="checkbox" checked /> Preferences</label>
+    <label class="ctrl-label"><input id="incExpired" type="checkbox" /> Include Expired</label>
   </div>
   <div id="status" class="status">Ready — retrieved [V#]/[N#]/[P#]/[L#] sources appear immediately.</div>
   <div id="out" class="answer-box">Ask a question above to search verified atoms and working notes.</div>
@@ -547,7 +549,9 @@ function buildChatWebviewHtml(nonce) {
     const hostIdEl = document.getElementById("hostId");
     const modelOverrideEl = document.getElementById("modelOverride");
     const scopeEl = document.getElementById("scope");
+    const asOfEl = document.getElementById("asOf");
     const incPrefsEl = document.getElementById("incPrefs");
+    const incExpiredEl = document.getElementById("incExpired");
     const stopBtn = document.getElementById("stop");
     const outEl = document.getElementById("out");
     const statusEl = document.getElementById("status");
@@ -608,7 +612,9 @@ function buildChatWebviewHtml(nonce) {
         host_id: (hostIdEl.value || "").trim() || "ollama_local",
         model_override: (modelOverrideEl.value || "").trim() || undefined,
         project_scope: (scopeEl.value || "").trim() || undefined,
+        as_of: (asOfEl.value || "").trim() || undefined,
         include_preferences: Boolean(incPrefsEl.checked),
+        include_expired: Boolean(incExpiredEl.checked),
       });
     }
 

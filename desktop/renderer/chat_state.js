@@ -30,6 +30,22 @@
       if (scope) payload.project_scope = scope;
       const modelOv = String(params.model_override || "").trim();
       if (modelOv) payload.model_override = modelOv;
+      if (params.include_expired) {
+        payload.include_expired = true;
+      }
+      const asOfVal = String(params.as_of || "").trim();
+      if (asOfVal) payload.as_of = asOfVal;
+      const tid = String(params.thread_id || "").trim();
+      if (tid) payload.thread_id = tid;
+      if (Array.isArray(params.history) && params.history.length > 0) {
+        payload.history = params.history
+          .filter((h) => h && (h.role === "user" || h.role === "assistant") && String(h.content || "").trim())
+          .slice(-12)
+          .map((h) => ({
+            role: h.role,
+            content: String(h.content || "").trim().slice(0, 4000),
+          }));
+      }
       return payload;
     }
 
@@ -37,6 +53,7 @@
       let turns = [];
       let nextSeq = 1;
       let selectedTurnId = null;
+      let activeThreadId = "";
 
       function getTurnById(turnId) {
         return turns.find((t) => t.id === turnId) || null;
@@ -88,6 +105,14 @@
 
           if (eventName === "context") {
             turn.sources = Array.isArray(data.sources) ? [...data.sources] : [];
+            if (data.thread_id) {
+              activeThreadId = String(data.thread_id);
+              turn.thread_id = activeThreadId;
+            }
+            if (data.resolved_query) {
+              turn.resolved_query = String(data.resolved_query);
+              turn.query_expanded = Boolean(data.query_expanded);
+            }
             if (data.retrieval_ms !== undefined && data.retrieval_ms !== null) {
               turn.retrieval_ms = Number(data.retrieval_ms);
             }
@@ -218,6 +243,72 @@
         clearHistory() {
           turns = [];
           selectedTurnId = null;
+        },
+
+        getThreadId() {
+          return activeThreadId;
+        },
+
+        setThreadId(tid) {
+          activeThreadId = String(tid || "").trim();
+          return activeThreadId;
+        },
+
+        buildPriorHistory() {
+          const hist = [];
+          for (const t of turns) {
+            if (t.query) hist.push({ role: "user", content: t.query });
+            if (t.assistantText) hist.push({ role: "assistant", content: t.assistantText });
+          }
+          return hist.slice(-12);
+        },
+
+        loadThreadTurns(threadDoc) {
+          turns = [];
+          selectedTurnId = null;
+          activeThreadId = String(threadDoc?.thread_id || "").trim();
+          const rawTurns = Array.isArray(threadDoc?.turns) ? threadDoc.turns : [];
+          let pendingUser = null;
+          for (const item of rawTurns) {
+            if (!item || typeof item !== "object") continue;
+            if (item.role === "user") {
+              pendingUser = item;
+            } else if (item.role === "assistant") {
+              const id = `turn-${nextSeq++}`;
+              const tObj = {
+                id,
+                dbTurnId: item.turn_id ?? null,
+                thread_id: activeThreadId,
+                query: String(pendingUser?.content || "(continued turn)"),
+                mode: String(threadDoc?.mode || "stream"),
+                host_id: String(threadDoc?.host_id || "ollama_local"),
+                model_override: "",
+                retrieval_mode: "auto",
+                answer_view: "standard",
+                project_scope: String(threadDoc?.project_scope || ""),
+                include_preferences: true,
+                createdAt: item.created_at || new Date().toISOString(),
+                assistantText: String(item.content || ""),
+                sources: Array.isArray(item.cited_sources)
+                  ? [...item.cited_sources]
+                  : Array.isArray(item.citations)
+                  ? [...item.citations]
+                  : [],
+                warning: "",
+                researchLeads: null,
+                verifiedClaims: null,
+                grounding: null,
+                retrieval_ms: null,
+                total_ms: null,
+                status: "done",
+                error: "",
+              };
+              turns.push(tObj);
+              selectedTurnId = id;
+              pendingUser = null;
+            }
+          }
+          return turns.length;
         },
 
         exportMarkdown() {

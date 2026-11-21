@@ -42,6 +42,7 @@ from atom_mutator import (  # noqa: E402
     approved_revision_is_current,
     atomic_write_bytes,
     content_sha256,
+    set_atom_temporal_bounds,
 )
 import config as _config  # noqa: E402
 from config import (  # noqa: E402
@@ -55,10 +56,31 @@ from host_adapters import (  # noqa: E402
     read_bounded_security_file,
     restrict_security_file_permissions,
 )
+from git_distiller import (  # noqa: E402
+    GitDistillerError,
+    GitDistillerSecurityError,
+    distill_git_commits,
+    get_git_hook_status,
+    install_git_post_commit_hook,
+    uninstall_git_post_commit_hook,
+)
+from inbox_drop import (  # noqa: E402
+    InboxDropError,
+    InboxDropSecurityError,
+    create_mobile_drop_pairing,
+    list_mobile_drop_pairings,
+    resolve_scoped_inbox_drop_s3_credentials,
+    revoke_mobile_drop_pairing,
+)
 from lexical_store import LexicalIndexUnavailable  # noqa: E402
 from memory_format import (  # noqa: E402
     VALID_EPISTEMIC_LABELS,
     VALID_MEMORY_TYPES,
+    evaluate_temporal_validity,
+    frontmatter_has_key,
+    frontmatter_value,
+    normalize_temporal_bound_str,
+    remove_frontmatter_fields,
     render_memory_document,
     set_scalar_field,
     set_string_list_field,
@@ -84,15 +106,37 @@ from notes_store import (  # noqa: E402
     update_note,
     verify_note_excerpt,
 )
-from recall import MemoryRecallUnavailable  # noqa: E402
+from onnx_models import (  # noqa: E402
+    OnnxModelError,
+    OnnxModelSecurityError,
+    get_onnx_models_status,
+    pull_onnx_models,
+    remove_onnx_models,
+)
+from recall import MemoryRecallUnavailable, normalize_project_tag, project_tags_match  # noqa: E402
 from skill_playbooks import PlaybookValidationError  # noqa: E402
+from vault_backup import (  # noqa: E402
+    VaultBackupError,
+    VaultBackupSecurityError,
+    create_vault_backup,
+    restore_vault_backup,
+    verify_vault_backup,
+)
 from vault_sync import (  # noqa: E402
     SyncConflictError,
     SyncError,
     SyncSecurityError,
+    configure_auto_sync,
+    get_auto_sync_status,
+    get_sync_conflict_detail,
     init_sync,
     join_sync,
     list_sync_conflicts,
+    migrate_sync_key_to_keychain,
+    pull_mobile_inbox_drops,
+    resolve_sync_conflict,
+    run_auto_sync_cycle,
+    sync_gc,
     sync_pull,
     sync_push,
     sync_status,
@@ -112,8 +156,10 @@ from web_clipper import (  # noqa: E402
     ClipperError,
     ClipperSecurityError,
     create_clipper_pairing,
+    create_clipper_pairing_code,
     ingest_web_clip,
     list_clipper_pairings,
+    redeem_clipper_pairing_code,
     revoke_clipper_pairing,
 )
 
@@ -387,6 +433,17 @@ def _paths(rt) -> NotePaths:
     return NotePaths.for_brain(rt.brain_dir)
 
 
+def _tags_strictly_in_project_scope(tags: list[str] | tuple[str, ...], project: str | None) -> bool:
+    """Enforce strict normalized multi-project containment (excluding unscoped & mixed-project items)."""
+    if not project or not str(project).strip():
+        return True
+    scope_tag = normalize_project_tag(str(project))
+    if not scope_tag:
+        return True
+    proj_tags = [str(t).strip() for t in (tags or ()) if str(t).strip().lower().startswith("project:")]
+    return bool(proj_tags) and all(bool(project_tags_match((t,), (scope_tag,))) for t in proj_tags)
+
+
 def _parse_bounded_int(
     q: dict[str, list[str]],
     key: str,
@@ -398,7 +455,9 @@ def _parse_bounded_int(
     vals = q.get(key)
     if not vals or not str(vals[0]).strip():
         return default
-    raw = str(vals[0]).strip()[:9]
+    raw = str(vals[0]).strip()
+    if len(raw) > 12:
+        raise ValueError(f"Invalid integer query parameter '{key}'.")
     try:
         parsed = int(raw)
     except ValueError as exc:
@@ -461,7 +520,7 @@ def _is_preference_atom_file(path: str) -> bool:
     return is_preference_atom_content(raw_text)
 
 
-def _atom_card(path: str, rt) -> dict[str, object]:
+def _atom_card(path: str, rt, *, as_of: str | None = None) -> dict[str, object]:
     rec = parse_atom_record(path)
     raw = Path(path).read_bytes()
     raw_text = raw.decode("utf-8")
@@ -470,6 +529,9 @@ def _atom_card(path: str, rt) -> dict[str, object]:
     evidence = section_text("\n".join(parsed[1]), "Evidence") if parsed else ""
     epistemic_label = str(fm_vals.get("epistemic_label") or rec.get("epistemic_label") or "claim").strip() or "claim"
     epistemic_contract = str(fm_vals.get("epistemic_contract") or rec.get("epistemic_contract") or "").strip()
+    valid_from = str(rec.get("valid_from") or fm_vals.get("valid_from") or "").strip()
+    valid_until = str(rec.get("valid_until") or fm_vals.get("valid_until") or "").strip()
+    tv = evaluate_temporal_validity(valid_from, valid_until, as_of=as_of)
     return {
         "filename": rec["filename"],
         "claim": rec["claim"],
@@ -482,6 +544,9 @@ def _atom_card(path: str, rt) -> dict[str, object]:
         "contexts": list(rec.get("contexts") or []),
         "origin": rec["origin"],
         "sources": rec["sources"],
+        "valid_from": valid_from,
+        "valid_until": valid_until,
+        "temporal_status": str(tv["status"]),
         "sha256": content_sha256(raw),
         "verified": approved_revision_is_current(path, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir),
     }
@@ -574,6 +639,46 @@ def _replace_markdown_section(body_lines: list[str], section_name: str, new_text
     return rebuilt
 
 
+def _apply_temporal_overrides_to_frontmatter(fm: list[str], body: dict) -> list[str]:
+    if "valid_from" in body:
+        raw_vf = _str(body, "valid_from", max_len=64, required=False).strip()
+        norm_vf = normalize_temporal_bound_str(raw_vf) if raw_vf else ""
+        if norm_vf:
+            fm = set_scalar_field(fm, "valid_from", norm_vf, "last-reviewed")
+        else:
+            fm = remove_frontmatter_fields(fm, {"valid_from"})
+
+    if "valid_until" in body:
+        raw_vu = _str(body, "valid_until", max_len=64, required=False).strip()
+        norm_vu = normalize_temporal_bound_str(raw_vu) if raw_vu else ""
+        if norm_vu:
+            after_key = "valid_from" if frontmatter_has_key(fm, "valid_from") else "last-reviewed"
+            fm = set_scalar_field(fm, "valid_until", norm_vu, after_key)
+        else:
+            fm = remove_frontmatter_fields(fm, {"valid_until"})
+
+    eff_vf = frontmatter_value(fm, "valid_from")
+    eff_vu = frontmatter_value(fm, "valid_until")
+    if eff_vf or eff_vu:
+        tv = evaluate_temporal_validity(eff_vf, eff_vu)
+        if tv["status"] == "invalid_window":
+            raise ValueError("Invalid bi-temporal validity window: valid_from must be <= valid_until.")
+    return fm
+
+
+def _apply_temporal_overrides_to_markdown(raw_md: str, body: dict) -> str:
+    parsed = split_frontmatter(raw_md)
+    if parsed is None:
+        if "valid_from" in body or "valid_until" in body:
+            raise ValueError("Target atom is missing valid YAML frontmatter.")
+        return raw_md
+    fm, body_lines = list(parsed[0]), list(parsed[1])
+    fm = _apply_temporal_overrides_to_frontmatter(fm, body)
+    if "valid_from" in body or "valid_until" in body:
+        return render_memory_document(fm, body_lines)
+    return raw_md
+
+
 def _synthesize_edited_atom_markdown(atom_path: str, body: dict) -> str:
     raw_text = Path(atom_path).read_text(encoding="utf-8")
     parsed = split_frontmatter(raw_text)
@@ -596,6 +701,8 @@ def _synthesize_edited_atom_markdown(atom_path: str, body: dict) -> str:
     if "contexts" in body and body.get("contexts") is not None:
         ctxs = _str_list(body, "contexts", max_items=32, max_item_len=120)
         fm = set_string_list_field(fm, "contexts", ctxs, "tags")
+
+    fm = _apply_temporal_overrides_to_frontmatter(fm, body)
 
     if body.get("claim") is not None:
         claim_val = _str(body, "claim", max_len=8000)
@@ -635,8 +742,13 @@ def _atom_summary_from_indexed_row(filename: str, content: str, sha256: str) -> 
     with _ATOM_SUMMARY_CACHE_LOCK:
         cached = _ATOM_SUMMARY_BY_SHA.get(cache_key)
     if cached is not None:
+        tv_cached = evaluate_temporal_validity(
+            str(cached.get("valid_from") or ""),
+            str(cached.get("valid_until") or ""),
+        )
         return {
             **cached,
+            "temporal_status": str(tv_cached["status"]),
             "contexts": list(cached["contexts"]),  # type: ignore[arg-type]
             "sources": list(cached["sources"]),  # type: ignore[arg-type]
         }
@@ -661,6 +773,8 @@ def _atom_summary_from_indexed_row(filename: str, content: str, sha256: str) -> 
     effective_label = (
         "preference" if (epistemic_label_raw == "preference" or epistemic_contract) else epistemic_label_raw
     )
+    valid_from = str(fm_vals.get("valid_from") or "").strip()
+    valid_until = str(fm_vals.get("valid_until") or "").strip()
     summary: dict[str, object] = {
         "filename": filename,
         "claim": section_text(body_text, "Claim"),
@@ -673,14 +787,18 @@ def _atom_summary_from_indexed_row(filename: str, content: str, sha256: str) -> 
         "contexts": list(contexts),
         "origin": origin,
         "sources": list(sources),
+        "valid_from": valid_from,
+        "valid_until": valid_until,
         "sha256": sha256,
     }
     with _ATOM_SUMMARY_CACHE_LOCK:
         if len(_ATOM_SUMMARY_BY_SHA) >= _ATOM_SUMMARY_CACHE_MAX and cache_key not in _ATOM_SUMMARY_BY_SHA:
             _ATOM_SUMMARY_BY_SHA.pop(next(iter(_ATOM_SUMMARY_BY_SHA)), None)
         _ATOM_SUMMARY_BY_SHA[cache_key] = summary
+    tv_live = evaluate_temporal_validity(valid_from, valid_until)
     return {
         **summary,
+        "temporal_status": str(tv_live["status"]),
         "contexts": list(contexts),
         "sources": list(sources),
     }
@@ -1031,6 +1149,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     claim=body.get("claim") if isinstance(body.get("claim"), str) else None,
                     memory_type=body.get("memory_type") if isinstance(body.get("memory_type"), str) else "semantic",
                     tags=_tags(body) if "tags" in body else None,
+                    valid_from=_str(body, "valid_from", max_len=64, required=False).strip() or None,
+                    valid_until=_str(body, "valid_until", max_len=64, required=False).strip() or None,
                     paths=paths,
                 )
                 return send(201, res)
@@ -1051,8 +1171,61 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(202 if res["status"] == "quarantined" else 201, res)
 
-        # ── Streaming chat ──
+        # ── Multi-turn Chat Threads (owner-only) & Streaming Chat ──
+        if path == "/v1/chat/threads" and method == "GET":
+            if not owner_only():
+                return True
+            from chat_threads import list_chat_threads
+
+            limit = _parse_bounded_int(q, "limit", default=50, min_val=1, max_val=200)
+            offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
+            proj = ((q.get("project") or [None])[0] or None)
+            if proj and len(proj) > 120:
+                raise ValueError("Invalid project query filter.")
+            return send(200, list_chat_threads(limit=limit, offset=offset, project_scope=proj, brain_dir=rt.brain_dir))
+
+        if path == "/v1/chat/threads" and method == "POST":
+            if not owner_only():
+                return True
+            from chat_threads import create_chat_thread
+
+            created = create_chat_thread(
+                title=_str(body, "title", max_len=160, required=False),
+                project_scope=_str(body, "project_scope", max_len=120, required=False).strip() or None,
+                host_id=_str(body, "host_id", default="ollama_local", max_len=64, required=False) or "ollama_local",
+                mode=_str(body, "mode", default="verified", max_len=32, required=False) or "verified",
+                brain_dir=rt.brain_dir,
+            )
+            return send(201, created)
+
+        if path.startswith("/v1/chat/threads/"):
+            if not owner_only():
+                return True
+            from chat_threads import delete_chat_thread, get_chat_thread, pin_turn_to_note
+
+            rest = unquote(path[len("/v1/chat/threads/") :]).strip("/")
+            if rest.endswith("/pin") and method == "POST":
+                tid = rest[: -len("/pin")].strip()
+                raw_turn_id = body.get("turn_id")
+                if raw_turn_id is not None and (isinstance(raw_turn_id, bool) or not isinstance(raw_turn_id, int)):
+                    raise ValueError("'turn_id' must be an integer or null.")
+                pinned = pin_turn_to_note(
+                    tid,
+                    turn_id=raw_turn_id,
+                    title=_str(body, "title", max_len=160, required=False).strip() or None,
+                    tags=_tags(body) if "tags" in body else (),
+                    brain_dir=rt.brain_dir,
+                )
+                return send(201, pinned)
+            if method == "GET":
+                max_turns = _parse_bounded_int(q, "max_turns", default=100, min_val=1, max_val=500)
+                return send(200, get_chat_thread(rest, max_turns=max_turns, brain_dir=rt.brain_dir))
+            if method == "DELETE":
+                return send(200, delete_chat_thread(rest, brain_dir=rt.brain_dir))
+            return send(405, {"error": "Method not allowed."})
+
         if path == "/v1/chat/stream" and method == "POST":
+            from chat_threads import get_chat_thread
             from streaming_chat import ChatPaths, ChatStreamRequest, chat_events
 
             chat_payload = dict(body)
@@ -1061,6 +1234,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             ):
                 chat_payload["mode"] = "stream"
             req = ChatStreamRequest.model_validate(chat_payload)
+            if req.thread_id and not is_owner:
+                return send(
+                    403,
+                    {"error": "403 Forbidden: persistent chat threads require owner authorization."},
+                )
+            if req.thread_id and req.thread_id != "new":
+                # Validate thread existence synchronously so missing threads return HTTP 404 before opening SSE.
+                get_chat_thread(req.thread_id, max_turns=1, brain_dir=rt.brain_dir)
             stream_sem = getattr(handler.server, "_stream_slots", None)
             if stream_sem is not None and not stream_sem.acquire(blocking=False):
                 return send(429, {"error": "Too many concurrent chat streams."})
@@ -1076,6 +1257,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     http_transport=rt.http_transport,
                     skip_dns_check_for_mock_transport=rt.skip_dns_check_for_mock_transport,
                     include_quarantined_inbox=bool(is_owner),
+                    persist_threads_allowed=bool(is_owner),
                 )
                 if req.answer_view == "preference" and not is_owner:
                     return send(
@@ -1083,21 +1265,27 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         {"error": "403 Forbidden: subjective preference view requires owner authorization."},
                     )
                 inc_prefs = bool(is_owner and req.include_preferences)
+                ce_kwargs: dict[str, object] = {
+                    "mode": req.mode,
+                    "paths": cp,
+                    "project_scope": req.project_scope,
+                    "model_override": req.model_override,
+                    "include_preferences": inc_prefs,
+                    "host_id": req.host_id,
+                    "retrieval_mode": req.retrieval_mode,
+                    "allow_cross_project": req.allow_cross_project,
+                    "answer_view": req.answer_view,
+                    "allow_unverified_leads": bool(is_owner and (req.answer_view == "research" or req.mode == "research")),
+                    "include_expired": bool(req.include_expired),
+                    "as_of": req.as_of.strip() if req.as_of and req.as_of.strip() else None,
+                }
+                if req.thread_id:
+                    ce_kwargs["thread_id"] = req.thread_id
+                if req.history:
+                    ce_kwargs["history"] = [h.model_dump() for h in req.history]
                 stream_sse(
                     handler,
-                    chat_events(
-                        req.query,
-                        mode=req.mode,
-                        paths=cp,
-                        project_scope=req.project_scope,
-                        model_override=req.model_override,
-                        include_preferences=inc_prefs,
-                        host_id=req.host_id,
-                        retrieval_mode=req.retrieval_mode,
-                        allow_cross_project=req.allow_cross_project,
-                        answer_view=req.answer_view,
-                        allow_unverified_leads=bool(is_owner and (req.answer_view == "research" or req.mode == "research")),
-                    ),
+                    chat_events(req.query, **ce_kwargs),
                     on_open=lambda: _audit_fn(rt.brain_dir, path, method, 200),
                 )
                 return True
@@ -1240,6 +1428,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             proj_filter = (q.get("project") or [""])[0].strip()
             if len(proj_filter) > 120:
                 raise ValueError("Invalid project query filter.")
+            inc_exp_list = (q.get("include_expired") or ["0"])[0] in {"1", "true", "yes"}
 
             if (os.path.lexists(rt.brain_dir) and _is_reparse_or_link(rt.brain_dir)) or (
                 os.path.lexists(rt.atoms_dir) and _is_reparse_or_link(rt.atoms_dir)
@@ -1300,6 +1489,11 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         continue
                     if not is_owner and base.get("review_status") != "accepted":
                         continue
+                    if not is_owner and (
+                        base.get("temporal_status") == "invalid_window"
+                        or (base.get("temporal_status") != "active" and not inc_exp_list)
+                    ):
+                        continue
                     verified = (
                         base.get("review_status") == "accepted"
                         and approved_revision_is_current(
@@ -1341,6 +1535,10 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         if not card["verified"]:
                             continue
                         if card.get("epistemic_label") == "preference" or bool(card.get("epistemic_contract")):
+                            continue
+                        if card.get("temporal_status") == "invalid_window" or (
+                            card.get("temporal_status") != "active" and not inc_exp_list
+                        ):
                             continue
                     matching.append(card)
 
@@ -1410,6 +1608,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path.startswith("/v1/atoms/") and method == "GET":
+            inc_exp_q = (q.get("include_expired") or ["0"])[0] in {"1", "true", "yes"}
+            clean_as_of_q: str | None = None
+            as_of_q = ((q.get("as_of") or [None])[0] or None)
+            if as_of_q is not None and str(as_of_q).strip():
+                if len(str(as_of_q)) > 64:
+                    raise ValueError("Invalid as_of query filter.")
+                clean_as_of_q = str(as_of_q).strip()
+                evaluate_temporal_validity("", "", as_of=clean_as_of_q)
+
             raw_fname = unquote(path[len("/v1/atoms/"):]).strip()
             if not raw_fname or "/" in raw_fname or "\\" in raw_fname:
                 return send(404, {"error": "Atom not found."})
@@ -1435,7 +1642,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     or is_pref
                 ):
                     return send(404, {"error": "Atom not found."})
-                card = _atom_card(atom_path, rt)
+                tv_get = evaluate_temporal_validity(
+                    rec.get("valid_from"),
+                    rec.get("valid_until"),
+                    as_of=clean_as_of_q,
+                )
+                if tv_get["status"] == "invalid_window" or (not tv_get["active"] and not inc_exp_q):
+                    return send(404, {"error": "Atom not found."})
+                card = _atom_card(atom_path, rt, as_of=clean_as_of_q)
                 return send(
                     200,
                     {
@@ -1455,7 +1669,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 atoms_dir=rt.atoms_dir,
                 brain_dir=rt.brain_dir,
             )
-            card = _atom_card(atom_path, rt)
+            card = _atom_card(atom_path, rt, as_of=clean_as_of_q)
             return send(
                 200,
                 {
@@ -1488,7 +1702,10 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             has_raw_md = isinstance(body.get("edited_content"), str) or isinstance(body.get("content"), str)
             if has_raw_md:
                 md_key = "edited_content" if isinstance(body.get("edited_content"), str) else "content"
-                edited_md = _str(body, md_key, max_len=MAX_NOTE_BYTES)
+                edited_md = _apply_temporal_overrides_to_markdown(
+                    _str(body, md_key, max_len=MAX_NOTE_BYTES),
+                    body,
+                )
                 record = apply_atom_edit(
                     atom_path=atom_path,
                     expected_sha256=expected_sha,
@@ -1511,8 +1728,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     atoms_dir=rt.atoms_dir,
                 )
             else:
-                if not any(k in body for k in ("claim", "why_it_matters", "contexts", "memory_type", "epistemic_label")):
-                    raise ValueError("Atom edit requires 'edited_content'/'content' or at least one structured field ('claim', 'why_it_matters', 'contexts', 'memory_type', 'epistemic_label').")
+                if not any(k in body for k in ("claim", "why_it_matters", "contexts", "memory_type", "epistemic_label", "valid_from", "valid_until")):
+                    raise ValueError("Atom edit requires 'edited_content'/'content' or at least one structured field ('claim', 'why_it_matters', 'contexts', 'memory_type', 'epistemic_label', 'valid_from', 'valid_until').")
                 edited_md = _synthesize_edited_atom_markdown(atom_path, body)
                 record = apply_atom_edit(
                     atom_path=atom_path,
@@ -1530,6 +1747,35 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 return True
             rest = unquote(path[len("/v1/atoms/"):])
             filename, _, action = rest.rpartition("/")
+            if action == "validity":
+                norm_fname = normalize_markdown_filename(filename)
+                atom_path = safe_file_in_dir(rt.atoms_dir, norm_fname, allowed_exts={".md"}, must_exist=True)
+                if not atom_path or _is_reparse_or_link(atom_path):
+                    return send(404, {"error": "Atom not found."})
+                record = set_atom_temporal_bounds(
+                    atom_path,
+                    valid_from=_str(body, "valid_from", max_len=64, required=False).strip() or None,
+                    valid_until=_str(body, "valid_until", max_len=64, required=False).strip() or None,
+                    expected_sha256=_str(body, "expected_sha256", max_len=64),
+                    actor=_str(body, "actor", max_len=120),
+                    rationale=_str(body, "rationale", max_len=500, required=False),
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                )
+                _sync_lexical_after_atom_mutation(rt, [norm_fname])
+                card = _atom_card(atom_path, rt)
+                return send(
+                    200,
+                    {
+                        "status": "validity_updated",
+                        "valid_from": record.get("valid_from", card.get("valid_from", "")),
+                        "valid_until": record.get("valid_until", card.get("valid_until", "")),
+                        "temporal_status": record.get("temporal_status", card.get("temporal_status", "active")),
+                        "approved_current": bool(record.get("approved_current", card.get("approved_current"))),
+                        "atom": card,
+                        "decision": record,
+                    },
+                )
             if action not in {"approve", "reject", "demote", "quarantine"}:
                 return send(404, {"error": "Unknown atom action."})
             norm_fname = normalize_markdown_filename(filename)
@@ -1753,6 +1999,10 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 if body.get("default_model") is not None
                 else cur.default_model
             )
+            if cur.provider == "ollama" and cur.transport == "local" and raw_model.strip().lower() == "auto":
+                from hardware_profile import resolve_active_local_generation_model
+
+                raw_model = resolve_active_local_generation_model(fallback=_config.GEN_MODEL)
             new_model = host_adapters.validate_model_identifier(raw_model, provider=cur.provider)
             new_ep = (
                 _str(body, "endpoint_url", max_len=500).rstrip("/")
@@ -1958,7 +2208,10 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if proj and len(proj) > 120:
                 raise ValueError("Invalid project query filter.")
             inc_pending = bool(is_owner and ((q.get("include_pending") or ["1"])[0] != "0"))
-            enable_nli = bool(is_owner and ((q.get("nli") or ["0"])[0] in {"1", "true", "yes"}))
+            raw_nli_mode = str((q.get("nli_mode") or ["llm"])[0] or "llm").strip().lower()
+            if raw_nli_mode not in {"llm", "fast", "hybrid"}:
+                raise ValueError("nli_mode must be one of ('llm', 'fast', 'hybrid').")
+            enable_nli = bool(is_owner and (((q.get("nli") or ["0"])[0] in {"1", "true", "yes"}) or raw_nli_mode != "llm"))
             dc_params = inspect.signature(detect_contradictions).parameters
             dc_kwargs: dict[str, object] = {
                 "brain_dir": rt.brain_dir,
@@ -1968,6 +2221,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             }
             if "include_preferences" in dc_params:
                 dc_kwargs["include_preferences"] = bool(is_owner)
+            if "nli_mode" in dc_params and is_owner:
+                dc_kwargs["nli_mode"] = raw_nli_mode
             if "enable_nli" in dc_params:
                 dc_kwargs["enable_nli"] = enable_nli
                 dc_kwargs["policy_path"] = rt.policy_path
@@ -1988,6 +2243,16 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         and al.get("atom_b", {}).get("filename") not in pref_files
                     ]
                     orphans = [fn for fn in (radar.get("orphan_approved_atoms") or []) if fn not in pref_files]
+                    drifts = [
+                        dr
+                        for dr in (radar.get("drift_alerts") or [])
+                        if isinstance(dr, dict) and dr.get("filename") not in pref_files
+                    ]
+                    expired_list = [
+                        ex
+                        for ex in (radar.get("expired_atoms") or [])
+                        if isinstance(ex, dict) and ex.get("filename") not in pref_files
+                    ]
                     radar = {
                         **radar,
                         "alerts": alerts,
@@ -1995,6 +2260,10 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         "high_severity_count": sum(1 for al in alerts if al.get("severity") == "high"),
                         "orphan_approved_atoms": orphans,
                         "orphan_approved_count": len(orphans),
+                        "drift_alerts": drifts,
+                        "drift_count": len(drifts),
+                        "expired_atoms": expired_list,
+                        "expired_count": len(expired_list),
                     }
             return send(200, radar)
 
@@ -2113,6 +2382,68 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     }
             return send(200, res)
 
+        if path.startswith("/v1/graph/suggestions/") and method == "GET":
+            from knowledge_graph import suggest_atom_graph_links
+            from recall import project_tags_match
+
+            raw_target = unquote(path[len("/v1/graph/suggestions/") :]).strip()
+            if not raw_target or "/" in raw_target or "\\" in raw_target or len(raw_target) > 200:
+                return send(404, {"error": "Atom not found in graph."})
+            proj = ((q.get("project") or [None])[0] or None)
+            if proj and len(proj) > 120:
+                raise ValueError("Invalid project query filter.")
+            norm_t = normalize_markdown_filename(raw_target)
+            if not is_owner:
+                if _live_approved_atom_sha(norm_t, rt) is None:
+                    return send(404, {"error": "Atom not found in graph."})
+                t_path = safe_file_in_dir(rt.atoms_dir, norm_t, allowed_exts={".md"}, must_exist=True)
+                if not t_path or _is_preference_atom_file(t_path):
+                    return send(404, {"error": "Atom not found in graph."})
+                t_rec = parse_atom_record(t_path)
+                t_projs = [
+                    str(c).strip()
+                    for c in (t_rec.get("contexts") or [])
+                    if str(c).strip().lower().startswith("project:")
+                ]
+                if proj:
+                    if not t_projs or not all(project_tags_match((tp,), (proj,)) for tp in t_projs):
+                        return send(404, {"error": "Atom not found in graph."})
+                elif t_projs:
+                    return send(404, {"error": "Atom not found in graph."})
+            q_inc_pending = bool(is_owner and (q.get("include_pending") or ["0"])[0] in {"1", "true", "yes"})
+            sug = suggest_atom_graph_links(
+                raw_target,
+                project_scope=proj,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                include_pending=q_inc_pending,
+            )
+            return send(200, sug)
+
+        if path == "/v1/graph/auto-link" and method == "POST":
+            if not owner_only():
+                return True
+            from knowledge_graph import auto_link_vault_atoms
+
+            actor = _str(body, "actor", default="owner", max_len=120, required=False).strip() or "owner"
+            proj = _str(body, "project_scope", max_len=120, required=False).strip() or None
+            dry_run = bool(body.get("dry_run", False))
+            inc_pending = bool(body.get("include_pending", False))
+            raw_max = body.get("max_links_per_atom", 4)
+            if isinstance(raw_max, bool) or not isinstance(raw_max, (int, str)) or len(str(raw_max).strip()) > 12:
+                raise ValueError("'max_links_per_atom' must be an integer between 1 and 10.")
+            max_links = max(1, min(int(str(raw_max).strip()), 10))
+            res = auto_link_vault_atoms(
+                actor=actor,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                project_scope=proj,
+                include_pending=inc_pending,
+                dry_run=dry_run,
+                max_links_per_atom=max_links,
+            )
+            return send(200, res)
+
         # ── Source Anchor Audit (owner) ──
         if path == "/v1/audit/sources" and method == "GET":
             if not owner_only():
@@ -2208,7 +2539,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     live_sha = _live_approved_atom_sha(entry.get("filename"), rt)
                     if live_sha is not None and live_sha == entry.get("file_sha256"):
                         return entry
-                    return {**entry, "claim": "", "evidence": "", "redacted_revoked": True}
+                    return {
+                        **entry,
+                        "claim": "",
+                        "evidence": "",
+                        "contexts": [],
+                        "valid_from": "",
+                        "valid_until": "",
+                        "redacted_revoked": True,
+                    }
 
                 added = [
                     _redact_atom_diff_entry(a)
@@ -2238,6 +2577,9 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         "before_claim": "",
                         "old_evidence": "",
                         "before_evidence": "",
+                        "old_contexts": [],
+                        "old_valid_from": "",
+                        "old_valid_until": "",
                         "redacted_revoked": True,
                     }
                     if not new_is_live:
@@ -2245,6 +2587,9 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         redacted_m["after_claim"] = ""
                         redacted_m["new_evidence"] = ""
                         redacted_m["after_evidence"] = ""
+                        redacted_m["new_contexts"] = []
+                        redacted_m["new_valid_from"] = ""
+                        redacted_m["new_valid_until"] = ""
                     modified.append(redacted_m)
 
                 raw_pb_changes = dict(res.get("playbook_changes") or {})
@@ -2253,7 +2598,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     pb_rep = _live_active_playbook_report(item.get("filename"), rt)
                     expected_sha = item.get("new_sha256") or item.get("old_sha256")
                     if not pb_rep or pb_rep.sha256 != expected_sha:
-                        pb_added.append({**item, "steps": [], "title": "", "redacted_revoked": True})
+                        pb_added.append({**item, "steps": [], "backing_atoms": [], "title": "", "redacted_revoked": True})
                     else:
                         pb_added.append(item)
 
@@ -2262,17 +2607,24 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     pb_rep = _live_active_playbook_report(item.get("filename"), rt)
                     expected_sha = item.get("new_sha256") or item.get("old_sha256")
                     if not pb_rep or pb_rep.sha256 != expected_sha:
-                        pb_removed.append({**item, "steps": [], "title": "", "redacted_revoked": True})
+                        pb_removed.append({**item, "steps": [], "backing_atoms": [], "title": "", "redacted_revoked": True})
                     else:
                         pb_removed.append(item)
 
                 pb_modified = []
                 for item in raw_pb_changes.get("modified") or []:
                     pb_rep = _live_active_playbook_report(item.get("filename"), rt)
-                    redacted_pb = {**item, "old_steps": [], "redacted_revoked": True}
-                    if not pb_rep or pb_rep.sha256 != item.get("new_sha256"):
+                    pb_is_live = bool(pb_rep and pb_rep.sha256 == item.get("new_sha256"))
+                    redacted_pb = {
+                        **item,
+                        "old_steps": [],
+                        "old_backing_atoms": [],
+                        "title": pb_rep.title if pb_is_live else "",
+                        "redacted_revoked": True,
+                    }
+                    if not pb_is_live:
                         redacted_pb["new_steps"] = []
-                        redacted_pb["title"] = ""
+                        redacted_pb["new_backing_atoms"] = []
                     pb_modified.append(redacted_pb)
 
                 prev_summary = dict(res.get("summary") or {})
@@ -2300,10 +2652,13 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             from time_travel import recall_at_snapshot
 
             raw_limit = body.get("top_k") if "top_k" in body else body.get("limit", 5)
-            if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, str)):
+            if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, str)) or len(str(raw_limit).strip()) > 12:
                 raise ValueError("'limit' must be an integer between 1 and 25.")
-            top_k = max(1, min(int(str(raw_limit).strip()[:9]), 25))
+            top_k = max(1, min(int(str(raw_limit).strip()), 25))
             proj_scope = _str(body, "project_scope", max_len=120, required=False).strip() or None
+            as_of_str = _str(body, "as_of", max_len=64, required=False).strip() or None
+            inc_expired = bool(body.get("include_expired", False))
+            enable_rerank = bool(body.get("enable_reranker", True))
             inc_prefs = bool(is_owner and body.get("include_preferences", True))
             ras_params = inspect.signature(recall_at_snapshot).parameters
             ras_kwargs: dict[str, object] = {
@@ -2312,6 +2667,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             }
             if "include_preferences" in ras_params:
                 ras_kwargs["include_preferences"] = inc_prefs
+            if "as_of" in ras_params:
+                ras_kwargs["as_of"] = as_of_str
+            if "include_expired" in ras_params:
+                ras_kwargs["include_expired"] = inc_expired
+            if "enable_reranker" in ras_params:
+                ras_kwargs["enable_reranker"] = enable_rerank
             if "top_k" in ras_params:
                 ras_kwargs["top_k"] = top_k if is_owner else min(25, max(top_k * 3, 15))
             res = recall_at_snapshot(
@@ -2329,6 +2690,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         if proj_scope and not playbook_visible_in_scope(pb_rep, (proj_scope,)):
                             continue
                         filtered_results.append(hit)
+                        continue
+                    if not _tags_strictly_in_project_scope(list(hit.get("contexts") or []), proj_scope):
                         continue
                     live_sha = _live_approved_atom_sha(hit.get("filename"), rt)
                     if live_sha is not None and live_sha == hit.get("file_sha256"):
@@ -2496,6 +2859,111 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             items = list_sync_conflicts(brain_dir=rt.brain_dir)
             return send(200, {"count": len(items), "conflicts": items})
 
+        if path == "/v1/sync/conflicts/resolve" and method == "POST":
+            if not owner_only():
+                return True
+            cid = _str(body, "conflict_id", max_len=300, required=False).strip() or _str(body, "rel_path", max_len=300).strip()
+            resolution = _str(body, "resolution", max_len=32).strip()
+            merged_content = (
+                _str(body, "merged_content", max_len=MAX_NOTE_BYTES, required=False)
+                if "merged_content" in body and body.get("merged_content") is not None
+                else None
+            )
+            exp_sha = _str(body, "expected_local_sha256", max_len=64, required=False).strip() or None
+            actor = _str(body, "actor", default="owner", max_len=120, required=False) or "owner"
+            res = resolve_sync_conflict(
+                cid,
+                resolution=resolution,
+                merged_content=merged_content,
+                expected_local_sha256=exp_sha,
+                actor=actor,
+                brain_dir=rt.brain_dir,
+            )
+            return send(200, res)
+
+        if path.startswith("/v1/sync/conflicts/") and method == "GET":
+            if not owner_only():
+                return True
+            cid = unquote(path[len("/v1/sync/conflicts/") :]).strip()
+            return send(200, get_sync_conflict_detail(cid, brain_dir=rt.brain_dir))
+
+        if path == "/v1/sync/auto" and method == "GET":
+            if not owner_only():
+                return True
+            return send(
+                200,
+                get_auto_sync_status(
+                    brain_dir=rt.brain_dir,
+                    state_dir=getattr(rt, "sync_state_dir", None),
+                ),
+            )
+
+        if path == "/v1/sync/auto" and method == "POST":
+            if not owner_only():
+                return True
+            if bool(body.get("run_once", False)):
+                return send(
+                    200,
+                    run_auto_sync_cycle(
+                        brain_dir=rt.brain_dir,
+                        state_dir=getattr(rt, "sync_state_dir", None),
+                        http_transport=getattr(rt, "http_transport", None),
+                        skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+                    ),
+                )
+            enabled = bool(body.get("enabled", False))
+            raw_iv = body.get("interval_seconds", 300)
+            if isinstance(raw_iv, bool) or not isinstance(raw_iv, (int, str)):
+                raise ValueError("'interval_seconds' must be an integer.")
+            iv = max(5, min(int(str(raw_iv).strip()[:8]), 86400))
+            start_bg = bool(body.get("start_background", True))
+            return send(
+                200,
+                configure_auto_sync(
+                    enabled=enabled,
+                    interval_seconds=iv,
+                    start_background=start_bg,
+                    brain_dir=rt.brain_dir,
+                    state_dir=getattr(rt, "sync_state_dir", None),
+                    http_transport=getattr(rt, "http_transport", None),
+                    skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+                ),
+            )
+
+        if path == "/v1/sync/gc" and method == "POST":
+            if not owner_only():
+                return True
+            passphrase = body.get("passphrase")
+            if passphrase is not None and not isinstance(passphrase, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(passphrase, str) and not passphrase:
+                passphrase = None
+            dry_run = bool(body.get("dry_run", False))
+            res = sync_gc(
+                brain_dir=rt.brain_dir,
+                passphrase=passphrase,
+                dry_run=dry_run,
+                state_dir=getattr(rt, "sync_state_dir", None),
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(200, res)
+
+        if path == "/v1/sync/seal-keychain" and method == "POST":
+            if not owner_only():
+                return True
+            passphrase = body.get("passphrase")
+            if passphrase is not None and not isinstance(passphrase, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(passphrase, str) and not passphrase:
+                passphrase = None
+            res = migrate_sync_key_to_keychain(
+                brain_dir=rt.brain_dir,
+                passphrase=passphrase,
+                state_dir=getattr(rt, "sync_state_dir", None),
+            )
+            return send(200, res)
+
         if path == "/v1/sync/init" and method == "POST":
             if not owner_only():
                 return True
@@ -2507,14 +2975,28 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 raise ValueError("'passphrase' must be a string.")
             if isinstance(passphrase, str) and not passphrase:
                 passphrase = None
+            kdf_mode = _str(body, "kdf_mode", max_len=32, required=False).strip() or None
+            use_keychain = bool(body.get("use_keychain", False))
+            auth_mode = _str(body, "auth_mode", default="bearer", max_len=32, required=False).strip() or "bearer"
             bearer_token_env = _str(body, "bearer_token_env", max_len=80, required=False).strip() or None
+            s3_region = _str(body, "s3_region", default="auto", max_len=64, required=False).strip() or "auto"
+            s3_access_key_env = _str(body, "s3_access_key_env", max_len=80, required=False).strip() or None
+            s3_secret_key_env = _str(body, "s3_secret_key_env", max_len=80, required=False).strip() or None
+            s3_session_token_env = _str(body, "s3_session_token_env", max_len=80, required=False).strip() or None
             res = init_sync(
                 target,
                 backend_type=backend_type,
                 brain_dir=rt.brain_dir,
                 device_name=device_name,
                 passphrase=passphrase,
+                kdf_mode=kdf_mode,
+                use_keychain=use_keychain,
                 bearer_token_env=bearer_token_env,
+                auth_mode=auth_mode,
+                s3_region=s3_region,
+                s3_access_key_env=s3_access_key_env,
+                s3_secret_key_env=s3_secret_key_env,
+                s3_session_token_env=s3_session_token_env,
                 state_dir=getattr(rt, "sync_state_dir", None),
                 http_transport=getattr(rt, "http_transport", None),
                 skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
@@ -2533,7 +3015,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if isinstance(passphrase, str) and not passphrase:
                 passphrase = None
             recovery_key_b64 = _str(body, "recovery_key_b64", max_len=256, required=False).strip() or None
+            kdf_mode = _str(body, "kdf_mode", max_len=32, required=False).strip() or None
+            use_keychain = bool(body.get("use_keychain", False))
+            auth_mode = _str(body, "auth_mode", default="bearer", max_len=32, required=False).strip() or "bearer"
             bearer_token_env = _str(body, "bearer_token_env", max_len=80, required=False).strip() or None
+            s3_region = _str(body, "s3_region", default="auto", max_len=64, required=False).strip() or "auto"
+            s3_access_key_env = _str(body, "s3_access_key_env", max_len=80, required=False).strip() or None
+            s3_secret_key_env = _str(body, "s3_secret_key_env", max_len=80, required=False).strip() or None
+            s3_session_token_env = _str(body, "s3_session_token_env", max_len=80, required=False).strip() or None
             res = join_sync(
                 target,
                 backend_type=backend_type,
@@ -2541,7 +3030,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 device_name=device_name,
                 passphrase=passphrase,
                 recovery_key_b64=recovery_key_b64,
+                kdf_mode=kdf_mode,
+                use_keychain=use_keychain,
                 bearer_token_env=bearer_token_env,
+                auth_mode=auth_mode,
+                s3_region=s3_region,
+                s3_access_key_env=s3_access_key_env,
+                s3_secret_key_env=s3_secret_key_env,
+                s3_session_token_env=s3_session_token_env,
                 state_dir=getattr(rt, "sync_state_dir", None),
                 http_transport=getattr(rt, "http_transport", None),
                 skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
@@ -2601,6 +3097,85 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(200, res)
 
+        # ── Zero-Knowledge Mobile Inbox Drop (owner-only) ──
+        _drop_state_dir = getattr(rt, "sync_state_dir", None) or getattr(rt, "security_dir", None)
+        if path == "/v1/sync/inbox-drop/pairings" and method == "GET":
+            if not owner_only():
+                return True
+            sync_st = sync_status(
+                brain_dir=rt.brain_dir,
+                state_dir=_drop_state_dir,
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            vid = str(sync_st.get("vault_id") or "") or None
+            return send(
+                200,
+                list_mobile_drop_pairings(
+                    vault_id=vid,
+                    brain_dir=rt.brain_dir,
+                    state_dir=_drop_state_dir,
+                ),
+            )
+
+        if path == "/v1/sync/inbox-drop/pair" and method == "POST":
+            if not owner_only():
+                return True
+            sync_st = sync_status(
+                brain_dir=rt.brain_dir,
+                state_dir=_drop_state_dir,
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            if not sync_st.get("configured") or not sync_st.get("vault_id"):
+                raise InboxDropError("Initialize E2EE vault sync first before creating a Mobile Inbox Drop pairing.")
+            label = (
+                _str(body, "label", max_len=80, required=False).strip()
+                or _str(body, "device_label", max_len=80, required=False).strip()
+                or "Mobile Quick-Capture"
+            )
+            pwa_url = _str(body, "pwa_base_url", default="https://localhost/inbox-drop/", max_len=300, required=False) or "https://localhost/inbox-drop/"
+            ak_id, sk_id = resolve_scoped_inbox_drop_s3_credentials(
+                s3_access_key_id=_str(body, "s3_access_key_id", max_len=160, required=False).strip(),
+                s3_secret_access_key=_str(body, "s3_secret_access_key", max_len=160, required=False).strip(),
+                include_from_env=bool(body.get("include_s3_credentials")),
+            )
+            res = create_mobile_drop_pairing(
+                label=label,
+                vault_id=str(sync_st["vault_id"]),
+                sync_target_url=str(sync_st.get("target") or "") if sync_st.get("backend_type") == "http_object" else "",
+                s3_region=str(sync_st.get("s3_region") or "auto"),
+                s3_access_key_id=ak_id,
+                s3_secret_access_key=sk_id,
+                pwa_base_url=pwa_url,
+                brain_dir=rt.brain_dir,
+                state_dir=_drop_state_dir,
+            )
+            res["device_label"] = res.get("label", label)
+            return send(201, res)
+
+        if path == "/v1/sync/inbox-drop/pull" and method == "POST":
+            if not owner_only():
+                return True
+            res = pull_mobile_inbox_drops(
+                brain_dir=rt.brain_dir,
+                state_dir=_drop_state_dir,
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(200, res)
+
+        if path.startswith("/v1/sync/inbox-drop/") and method == "DELETE":
+            if not owner_only():
+                return True
+            tid = unquote(path[len("/v1/sync/inbox-drop/") :]).strip()
+            res = revoke_mobile_drop_pairing(
+                tid,
+                brain_dir=rt.brain_dir,
+                state_dir=_drop_state_dir,
+            )
+            return send(200, res)
+
         # ── Local-First Browser Web Clipper (scoped token or owner-only on /ping,/status,/clip; owner-only on pairings) ──
         sec_dir = getattr(rt, "security_dir", None)
         if path in {"/v1/clipper/ping", "/v1/clipper/status", "/v1/clipper/clip"}:
@@ -2618,7 +3193,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 {
                     "ok": True,
                     "service": "second-brain-clipper",
-                    "version": "0.3.0",
+                    "version": "1.0.0",
                     "active_vault": os.path.basename(os.path.abspath(rt.brain_dir)),
                 },
             )
@@ -2662,6 +3237,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 title=_str(body, "title", max_len=240, required=False),
                 selected_quote=_str(body, "selected_quote", max_len=32_000, required=False),
                 page_text=_str(body, "page_text", max_len=200_000, required=False),
+                raw_html=_str(body, "raw_html", max_len=500_000, required=False),
                 tags=tags_val,
                 destination=_str(body, "destination", default="note", max_len=16, required=False) or "note",
                 capture_source=src_label,
@@ -2674,6 +3250,38 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 return True
             items = list_clipper_pairings(security_dir=sec_dir)
             return send(200, {"count": len(items), "pairings": items, "items": items})
+
+        if path == "/v1/clipper/pair-code" and method == "POST":
+            if not owner_only():
+                return True
+            label = _str(body, "label", default="Browser Clipper", max_len=80, required=False) or "Browser Clipper"
+            raw_ttl = body.get("ttl_seconds", 300)
+            if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, (int, str)):
+                raise ClipperError("'ttl_seconds' must be an integer between 30 and 900.")
+            ttl = max(30, min(int(str(raw_ttl).strip()[:6]), 900))
+            res = create_clipper_pairing_code(label=label, ttl_seconds=ttl, security_dir=sec_dir)
+            return send(201, res)
+
+        if path == "/v1/clipper/redeem" and method == "POST":
+            client_ip = handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1"
+            code = _str(body, "code", max_len=32)
+            origin = _str(body, "origin", max_len=200)
+            hdr_origin = (handler.headers.get("Origin") or "").strip().lower().rstrip("/")
+            bound_port = handler.server.server_address[1]
+            label = _str(body, "label", default="", max_len=80, required=False).strip() or None
+            try:
+                if hdr_origin and hdr_origin != f"http://127.0.0.1:{bound_port}":
+                    if hdr_origin != origin.strip().lower().rstrip("/"):
+                        raise ClipperSecurityError("Extension Origin header does not match requested pairing origin.")
+                res = redeem_clipper_pairing_code(code, origin, label=label, security_dir=sec_dir)
+            except ClipperSecurityError as exc:
+                rec_redeem_fn = getattr(_api_mod, "_record_clipper_redeem_failure", None)
+                if callable(rec_redeem_fn):
+                    fail_code = rec_redeem_fn(client_ip, hdr_origin)
+                    if fail_code == 429:
+                        return send(429, {"error": "Too Many Requests: pairing code attempt limit exceeded."})
+                return send(403, {"error": str(exc)})
+            return send(201, res)
 
         if path == "/v1/clipper/pair" and method == "POST":
             if not owner_only():
@@ -2744,11 +3352,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 raise VaultWorkspaceError("'limit' must be an integer between 1 and 25.")
             lim = max(1, min(int(str(raw_lim).strip()[:6]), 25))
             proj = _str(body, "project_scope", max_len=120, required=False).strip() or None
+            ret_mode = _str(body, "retrieval_mode", default="lexical", max_len=16, required=False).strip() or "lexical"
             res = federated_recall(
                 q_str,
                 vault_ids=vids_arg,
                 project_scope=proj,
+                retrieval_mode=ret_mode,
                 limit=lim,
+                include_expired=bool(body.get("include_expired", False)),
+                as_of=_str(body, "as_of", max_len=64, required=False).strip() or None,
                 security_dir=sec_dir,
                 current_brain_dir=rt.brain_dir,
             )
@@ -2778,6 +3390,239 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             res = remove_vault(vid, security_dir=sec_dir, current_brain_dir=rt.brain_dir)
             return send(200, res)
 
+        # ── SHA-256-Pinned Verified Local ONNX Weights Manager (owner-only) ──
+        if path == "/v1/models/onnx" and method == "GET":
+            if not owner_only():
+                return True
+            return send(200, get_onnx_models_status(state_dir=sec_dir, run_inference=False))
+
+        if path == "/v1/models/onnx/verify" and method == "POST":
+            if not owner_only():
+                return True
+            return send(200, get_onnx_models_status(state_dir=sec_dir, run_inference=True))
+
+        if path == "/v1/models/onnx/pull" and method == "POST":
+            if not owner_only():
+                return True
+            target = (
+                _str(body, "target", max_len=32, required=False).strip()
+                or _str(body, "slot", max_len=32, required=False).strip()
+                or "all"
+            )
+            preset = _str(body, "preset", default="default", max_len=32, required=False) or "default"
+            force = bool(body.get("force", False))
+            res = pull_onnx_models(
+                target,
+                preset=preset,
+                force=force,
+                state_dir=sec_dir,
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(200, res)
+
+        if path.startswith("/v1/models/onnx/") and method == "DELETE":
+            if not owner_only():
+                return True
+            slot_target = unquote(path[len("/v1/models/onnx/") :]).strip()
+            res = remove_onnx_models(slot_target, state_dir=sec_dir)
+            return send(200, res)
+
+        # ── Multimodal Media Upload (Audio, Screenshots/Images, Documents — owner-only) ──
+        if path == "/v1/ingest/media" and method == "POST":
+            if not owner_only():
+                return True
+            import base64 as _b64
+            from ingest_multimodal import MAX_API_MEDIA_UPLOAD_BYTES, ingest_uploaded_media_bytes
+
+            fname = _str(body, "filename", max_len=255, required=True).strip()
+            raw_media = body.get("_raw_media_bytes")
+            if isinstance(raw_media, (bytes, bytearray)):
+                media_bytes = bytes(raw_media)
+            else:
+                b64_raw = body.get("content_base64")
+                if not isinstance(b64_raw, str) or not b64_raw.strip():
+                    raise ValueError("'content_base64' (or binary body) is required for /v1/ingest/media.")
+                # Strip optional data URL prefix (e.g. data:image/png;base64,...)
+                clean_b64 = b64_raw.strip()
+                if clean_b64.startswith("data:") and "," in clean_b64[:128]:
+                    clean_b64 = clean_b64.split(",", 1)[1].strip()
+                try:
+                    media_bytes = _b64.b64decode(clean_b64, validate=True)
+                except Exception as exc:
+                    raise ValueError(f"Invalid base64 media payload: {exc}") from exc
+            if len(media_bytes) > MAX_API_MEDIA_UPLOAD_BYTES:
+                return send(
+                    413,
+                    {"error": f"Payload Too Large: uploaded media ({len(media_bytes)} bytes) exceeds {MAX_API_MEDIA_UPLOAD_BYTES} bytes."},
+                )
+            res = ingest_uploaded_media_bytes(media_bytes, fname, brain_dir=rt.brain_dir)
+            return send(201, res)
+
+        # ── Git Post-Commit Hook & Coding Session Distiller (owner-only) ──
+        if path == "/v1/git/hook" and method == "GET":
+            if not owner_only():
+                return True
+            default_repo = str(Path(__file__).resolve().parent.parent)
+            repo_q = ((q.get("repo") or [""])[0] or "").strip()[:1000] or default_repo
+            return send(200, get_git_hook_status(repo_q))
+
+        if path == "/v1/git/hook/install" and method == "POST":
+            if not owner_only():
+                return True
+            default_repo = str(Path(__file__).resolve().parent.parent)
+            repo_p = _str(body, "repo", default=default_repo, max_len=1000, required=False).strip() or default_repo
+            proj_p = _str(body, "project_scope", max_len=120, required=False).strip() or None
+            return send(
+                200,
+                install_git_post_commit_hook(repo_dir=repo_p, brain_dir=rt.brain_dir, project_scope=proj_p),
+            )
+
+        if path == "/v1/git/hook/uninstall" and method == "POST":
+            if not owner_only():
+                return True
+            default_repo = str(Path(__file__).resolve().parent.parent)
+            repo_p = _str(body, "repo", default=default_repo, max_len=1000, required=False).strip() or default_repo
+            return send(200, uninstall_git_post_commit_hook(repo_dir=repo_p))
+
+        if path == "/v1/git/distill" and method == "POST":
+            if not owner_only():
+                return True
+            default_repo = str(Path(__file__).resolve().parent.parent)
+            repo_p = _str(body, "repo", default=default_repo, max_len=1000, required=False).strip() or default_repo
+            proj_p = _str(body, "project_scope", max_len=120, required=False).strip() or None
+            commit_p = _str(body, "commit_sha", max_len=64, required=False).strip() or None
+            raw_mc = body.get("max_commits", 5)
+            if isinstance(raw_mc, bool) or not isinstance(raw_mc, (int, str)):
+                raise ValueError("'max_commits' must be an integer.")
+            mc_val = max(1, min(int(str(raw_mc).strip()[:4]), 25))
+            stage_ib = bool(body.get("stage_inbox", True))
+            force_d = bool(body.get("force", False))
+            return send(
+                200,
+                distill_git_commits(
+                    repo_dir=repo_p,
+                    brain_dir=rt.brain_dir,
+                    project_scope=proj_p,
+                    max_commits=mc_val,
+                    commit_sha=commit_p,
+                    stage_inbox=stage_ib,
+                    force=force_d,
+                ),
+            )
+
+        # ── Watchdog Daemon Status & One-Shot Sync/Index Pass (owner-only) ──
+        if path in {"/v1/daemon/status", "/v1/system"} and method == "GET":
+            if not owner_only():
+                return True
+            from index_manifest import index_manifest_is_current, load_index_manifest
+            from lexical_store import lexical_index_is_current
+
+            lex_ok = lexical_index_is_current(rt.atoms_dir, rt.lexical_index_path)
+            manifest = load_index_manifest(rt.chroma_path) if os.path.isdir(rt.chroma_path) else None
+            dense_ok = bool(manifest and index_manifest_is_current(manifest, rt.atoms_dir))
+            raw_dir = Path(rt.brain_dir) / "0-raw"
+            inbox_dir = raw_dir / "inbox"
+            raw_q_cnt = (
+                sum(1 for f in os.listdir(raw_dir) if is_content_markdown(f))
+                if (raw_dir.is_dir() and not _is_reparse_or_link(str(raw_dir)))
+                else 0
+            )
+            inbox_q_cnt = (
+                sum(1 for f in os.listdir(inbox_dir) if is_content_markdown(f))
+                if (inbox_dir.is_dir() and not _is_reparse_or_link(str(inbox_dir)))
+                else 0
+            )
+            stale_summary: dict[str, object] | None = None
+            for stale_name in ("stale-anchors.json", "stale-source-anchors.json"):
+                stale_file = Path(rt.brain_dir) / ".sidecar" / stale_name
+                if stale_file.is_file() and not _is_reparse_or_link(str(stale_file)):
+                    try:
+                        stale_summary = json.loads(stale_file.read_text(encoding="utf-8"))
+                        break
+                    except Exception:
+                        stale_summary = None
+            auto_st = get_auto_sync_status(
+                brain_dir=rt.brain_dir,
+                state_dir=getattr(rt, "sync_state_dir", None),
+            )
+            return send(
+                200,
+                {
+                    "status": "ok",
+                    "brain_dir": rt.brain_dir,
+                    "lexical_index_current": lex_ok,
+                    "dense_index_current": dense_ok,
+                    "dense_generation_id": manifest.get("generation_id") if isinstance(manifest, dict) else None,
+                    "raw_queue_count": raw_q_cnt,
+                    "inbox_quarantine_count": inbox_q_cnt,
+                    "auto_sync": auto_st,
+                    "stale_anchor_report": stale_summary,
+                },
+            )
+
+        if path == "/v1/daemon/sync-once" and method == "POST":
+            if not owner_only():
+                return True
+            from watchdog_daemon import sync_notes_and_atoms_once
+
+            notes_d = os.path.join(rt.brain_dir, "notes")
+            sync_res = sync_notes_and_atoms_once(
+                notes_dir=notes_d,
+                atoms_dir=rt.atoms_dir,
+                lexical_index_path=rt.lexical_index_path,
+                brain_dir=rt.brain_dir,
+            )
+            auto_cycle = None
+            if bool(body.get("auto_sync", False)):
+                auto_cycle = run_auto_sync_cycle(
+                    brain_dir=rt.brain_dir,
+                    state_dir=getattr(rt, "sync_state_dir", None),
+                    http_transport=getattr(rt, "http_transport", None),
+                    skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+                )
+            return send(200, {"status": "synced", "daemon_sync": sync_res, "auto_sync_cycle": auto_cycle})
+
+        # ── Portable Three-Store .sbvault Backup & Disaster-Recovery Restore (owner-only) ──
+        if path == "/v1/vault/backup/create" and method == "POST":
+            if not owner_only():
+                return True
+            out_p = _str(body, "output_path", max_len=1000, required=True).strip()
+            pw = body.get("passphrase")
+            if pw is not None and not isinstance(pw, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(pw, str) and not pw:
+                pw = None
+            unenc = bool(body.get("unencrypted", False))
+            return send(
+                201,
+                create_vault_backup(out_p, brain_dir=rt.brain_dir, passphrase=pw, unencrypted=unenc),
+            )
+
+        if path == "/v1/vault/backup/verify" and method == "POST":
+            if not owner_only():
+                return True
+            b_p = _str(body, "backup_path", max_len=1000, required=True).strip()
+            pw = body.get("passphrase")
+            if pw is not None and not isinstance(pw, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(pw, str) and not pw:
+                pw = None
+            return send(200, verify_vault_backup(b_p, passphrase=pw))
+
+        if path == "/v1/vault/backup/restore" and method == "POST":
+            if not owner_only():
+                return True
+            b_p = _str(body, "backup_path", max_len=1000, required=True).strip()
+            t_p = _str(body, "target_brain_dir", max_len=1000, required=True).strip()
+            pw = body.get("passphrase")
+            if pw is not None and not isinstance(pw, str):
+                raise ValueError("'passphrase' must be a string.")
+            if isinstance(pw, str) and not pw:
+                pw = None
+            force_r = bool(body.get("force", False))
+            return send(200, restore_vault_backup(b_p, t_p, passphrase=pw, force=force_r))
+
     except (MemoryRecallUnavailable, LexicalIndexUnavailable) as exc:
         return send(
             503,
@@ -2798,13 +3643,36 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         PlaybookValidationError,
         ReviewTransitionError,
         SyncError,
+        InboxDropError,
         ClipperError,
         VaultWorkspaceError,
+        OnnxModelError,
+        GitDistillerError,
+        VaultBackupError,
         ValueError,
         NotADirectoryError,
     ) as exc:
+        if isinstance(
+            exc,
+            (
+                OnnxModelSecurityError,
+                InboxDropSecurityError,
+                GitDistillerSecurityError,
+                VaultBackupSecurityError,
+            ),
+        ):
+            return send(403, {"error": str(exc)})
         return send(422, {"error": str(exc)})
-    except (HostConsentError, SyncSecurityError, ClipperSecurityError, VaultWorkspaceSecurityError) as exc:
+    except (
+        HostConsentError,
+        SyncSecurityError,
+        InboxDropSecurityError,
+        ClipperSecurityError,
+        VaultWorkspaceSecurityError,
+        OnnxModelSecurityError,
+        GitDistillerSecurityError,
+        VaultBackupSecurityError,
+    ) as exc:
         return send(403, {"error": str(exc)})
     except PermissionError as exc:
         return send(403, {"error": str(exc)})

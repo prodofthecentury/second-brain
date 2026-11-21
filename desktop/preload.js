@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld("secondBrain", {
   cancelChat: () => ipcRenderer.invoke("chat:abort"),
   pickFolder: () => ipcRenderer.invoke("dialog:pick-folder"),
   pickFile: () => ipcRenderer.invoke("dialog:pick-file"),
+  pickSaveBackup: () => ipcRenderer.invoke("dialog:pick-save-backup"),
+  pickBackupFile: () => ipcRenderer.invoke("dialog:pick-backup-file"),
   openExternal: (url) => ipcRenderer.invoke("shell:open-external", { url }),
   switchVault: () => ipcRenderer.invoke("vault:switch"),
   chooseVault: () => ipcRenderer.invoke("vault:switch"),

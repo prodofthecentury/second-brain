@@ -9,8 +9,8 @@ The `second-brain` MCP server exposes 17 audited, scope-enforced tools across ve
 
 | Tool | Tier | Parameters | Use for |
 | --- | --- | --- | --- |
-| `search_memory` | **Verified** (`brain/2-atoms/`) | `query` (required), `n_results` (1–10, default 5), `project` (optional `project:<id>`) | Owner-approved claims anchored by SHA-256 to source evidence; cite as `[verified: <atom>]` |
-| `get_atom` | **Verified** (`brain/2-atoms/`) | `atom_id` (filename, e.g. `2026-0619-sodium-ion.md`) | Read full verified atom body, frontmatter, and byte-offset provenance |
+| `search_memory` | **Verified** (`brain/2-atoms/`) | `query` (required), `n_results` (1–10, default 5), `project` (optional `project:<id>`), `as_of` (optional ISO-8601 date), `include_expired` (optional bool) | Owner-approved claims anchored by SHA-256 to source evidence (filters expired bi-temporal facts by default); cite as `[verified: <atom>]` |
+| `get_atom` | **Verified** (`brain/2-atoms/`) | `atom_id` (filename, e.g. `2026-0619-sodium-ion.md`), `project` (optional `project:<id>`), `as_of` (optional ISO-8601 date), `include_expired` (optional bool) | Read full verified atom body, frontmatter, bi-temporal validity window, and byte-offset provenance |
 | `search_notes` | **Working Notes** (`brain/notes/`) | `query` (required), `limit` (1–20, default 6), `project` (optional strict `project:<id>` filter) | Search the owner's unverified notes & drafts; attribute as "your notes say…" with `[note: <note>]` |
 | `get_note` | **Working Notes** (`brain/notes/`) | `filename` (from `search_notes`) | Read the full Markdown body of a working note |
 | `list_playbooks` | **Verified Playbooks** (`brain/5-playbooks/`) | `project` (optional `project:<id>`) | List owner-promoted active Skill Playbooks verified against live backing procedural atoms |
@@ -19,7 +19,7 @@ The `second-brain` MCP server exposes 17 audited, scope-enforced tools across ve
 | `list_contradictions` | **Knowledge Graph** | `project` (optional `project:<id>`) | Surface polarity, antonym, unit-normalized numeric, `contested_by`, and source-drift alerts over approved atoms |
 | `graph_neighbors` | **Knowledge Graph** | `atom_id` (required), `project` (optional `project:<id>`) | Inspect scoped 1-hop verified graph neighbors and contradictions involving an approved atom |
 | `list_snapshots` | **Time-Travel** | _(none)_ | List content-free immutable vault snapshot headers (`snapshot_id`, `created_at`, `merkle_root`, counts) |
-| `recall_at_snapshot` | **Time-Travel** | `query` (required), `snapshot_id` (required), `project` (optional), `top_k` (1–25, default 5) | Run point-in-time BM25 recall at `snapshot_id` with live revocation filtering |
+| `recall_at_snapshot` | **Time-Travel** | `query` (required), `snapshot_id` (required), `project` (optional), `top_k` (1–25, default 5), `as_of` (optional ISO-8601 date override), `include_expired` (optional bool) | Run point-in-time BM25 + Cross-Encoder recall at `snapshot_id` with bi-temporal validity and live revocation filtering |
 | `verify_ledger` | **Cryptographic Ledger** | _(none)_ | Verify the append-only `vault-ledger.jsonl` hash chain against the live vault Merkle root |
 | `prove_leaf` | **Cryptographic Ledger** | `leaf_id` (required), `kind` (`auto` \| `atom` \| `playbook`), `project` (optional) | Export a portable SHA-256 Merkle inclusion proof for a verified atom or active playbook |
 | `remember` | **Write (Note)** | `content` (max 16,000 chars), `title` (optional), `tags` (optional string array, e.g. `["project:second_brain"]`) | Save a concise durable fact, decision, or preference as a working note (risky/secret input is auto-quarantined to `0-raw/inbox/`) |

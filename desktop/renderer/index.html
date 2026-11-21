@@ -88,8 +88,10 @@
                   <option value="episodic">Episodic Event</option>
                   <option value="self">Preference / Self</option>
                 </select>
-                <input type="text" id="verifyClaimInput" placeholder="Optional distilled claim override..." style="flex:1; min-width:170px;" />
-                <input type="text" id="verifyActorInput" value="desktop_owner" placeholder="Actor" style="width:125px;" />
+                <input type="text" id="verifyClaimInput" placeholder="Optional distilled claim override..." style="flex:1; min-width:150px;" />
+                <input type="text" id="verifyValidFromInput" placeholder="valid_from (YYYY-MM-DD)" style="width:140px;" />
+                <input type="text" id="verifyValidUntilInput" placeholder="valid_until (YYYY-MM-DD)" style="width:140px;" />
+                <input type="text" id="verifyActorInput" value="desktop_owner" placeholder="Actor" style="width:115px;" />
                 <button class="btn good" id="verifyExcerptBtn" type="button">Verify Selection as Atom</button>
               </div>
               <div class="editor-split" id="editorSplitWrap">
@@ -141,6 +143,20 @@
             <input type="checkbox" id="chatIncludePrefsCheck" checked />
             Prefs
           </label>
+          <label class="inline-check" title="Include expired bi-temporal facts">
+            <input type="checkbox" id="chatIncludeExpiredCheck" />
+            Expired
+          </label>
+          <input type="text" id="chatAsOfInput" placeholder="as_of YYYY-MM-DD" style="width:130px;" />
+        </div>
+        <div class="toolbar">
+          <span class="field-label">Thread:</span>
+          <select id="chatThreadSelect" aria-label="Chat Thread" style="min-width:220px;">
+            <option value="">(New / Unsaved Session)</option>
+          </select>
+          <button class="btn sm primary" id="chatNewThreadBtn" type="button">+ New Thread</button>
+          <button class="btn sm good" id="chatPinTurnBtn" type="button">Pin Answer to Note</button>
+          <button class="btn sm danger" id="chatDeleteThreadBtn" type="button">Delete Thread</button>
         </div>
         <div class="status-banner" id="chatBanner">Multi-turn grounded chat: sub-20ms retrieval cards appear immediately before LLM tokens stream. Click any [V#]/[N#]/[P#]/[L#] badge to jump to its source card.</div>
         <div class="chat-layout">
@@ -253,6 +269,18 @@
           <div class="status-banner" id="importFileResult">Select a local document to extract and import into your notes vault.</div>
         </div>
 
+        <!-- MULTIMODAL MEDIA UPLOAD, SCREENSHOT PASTE & VOICE MEMO -->
+        <div class="card" id="mediaIngestCard">
+          <strong>2b. Multimodal Media Upload, Screenshot Paste &amp; Voice Memo (0-raw/ + DLP Quarantine)</strong>
+          <div class="note-item-meta">Upload audio (.wav, .mp3, .m4a, .webm, .ogg, .flac), screenshots/images (.png, .jpg, .webp), or documents up to 24 MiB, record a voice memo, or press Ctrl+V on this tab to paste a clipboard screenshot.</div>
+          <div class="toolbar" style="margin-top:6px;">
+            <input type="file" id="mediaUploadFileInput" accept="image/*,audio/*,.pdf,.docx,.epub,.html,.csv,.tsv" style="flex:1;" />
+            <button class="btn" id="mediaUploadRecordBtn" type="button">Record Voice Memo</button>
+            <button class="btn primary" id="mediaUploadSubmitBtn" type="button">Ingest Selected Media</button>
+          </div>
+          <div class="status-banner" id="mediaUploadResult">Choose a media file, record a voice memo, or paste a clipboard image (Ctrl+V).</div>
+        </div>
+
         <!-- WEB SCOUT QUEUE & TRIGGER -->
         <div class="card">
           <div class="toolbar">
@@ -292,6 +320,28 @@
         </div>
         <div class="status-banner" id="ideBanner">One-click connect merges trusted-stdio MCP credentials (and Antigravity plugin rules/skills where supported) while backing up your existing host config.</div>
         <div class="cards-grid" id="ideGrid"></div>
+
+        <div class="card" id="ideGitDistillerCard" style="margin-top:12px;">
+          <div class="toolbar">
+            <strong>Git Post-Commit Hook &amp; Coding Session Memory Distiller</strong>
+            <span class="badge" id="gitHookStatusBadge">checking...</span>
+            <button class="btn sm" id="gitHookRefreshBtn" type="button" style="margin-left:auto;">Refresh Hook</button>
+          </div>
+          <div class="note-item-meta">Automatically distill repository commits into episodic Experience Records (4-experiences/) and DLP-screened candidate captures (0-raw/inbox/) without blocking git commit.</div>
+          <div class="toolbar" style="margin-top:8px;">
+            <input type="text" id="gitHookRepoInput" placeholder="Git repository path (blank = current project root)..." style="flex:1; min-width:220px;" />
+            <button class="btn sm" id="gitHookBrowseBtn" type="button">Browse Repo...</button>
+            <input type="text" id="gitHookProjectInput" placeholder="Scope (e.g. project:second_brain)" style="width:200px;" />
+          </div>
+          <div class="toolbar" style="margin-top:6px;">
+            <button class="btn sm good" id="gitHookInstallBtn" type="button">Install Post-Commit Hook</button>
+            <button class="btn sm" id="gitHookUninstallBtn" type="button">Uninstall Hook</button>
+            <span class="field-label" style="margin-left:8px;">Recent Commits (1-25):</span>
+            <input type="text" id="gitDistillMaxInput" value="5" style="width:60px;" />
+            <button class="btn sm primary" id="gitDistillBtn" type="button">Distill Recent Commits</button>
+          </div>
+          <div class="status-banner" id="gitHookOutput">Select a Git repository to inspect hook status or distill recent commits.</div>
+        </div>
       </section>
 
       <!-- TAB 6: SYSTEM VIEW -->
@@ -317,6 +367,18 @@
           <div class="status-banner">Loading hardware profile...</div>
         </div>
 
+        <div class="card" id="systemOnnxCard">
+          <div class="toolbar">
+            <strong>Verified Local Neural ONNX Models (Cross-Encoder Reranker &amp; DeBERTa NLI)</strong>
+            <button class="btn sm" id="onnxRefreshBtn" type="button" style="margin-left:auto;">Refresh Status</button>
+            <button class="btn sm primary" id="onnxPullBtn" type="button">Pull Verified Weights</button>
+            <button class="btn sm good" id="onnxVerifyBtn" type="button">Verify Smoke Test</button>
+          </div>
+          <div class="note-item-meta">SHA-256 + immutable commit-pinned int8 CPU ONNX weights for local sub-25ms neural cross-encoder reranking and clause-aligned bidirectional NLI contradiction checking.</div>
+          <div class="kpi-grid" id="onnxStatusKpis"></div>
+          <div class="status-banner" id="onnxOutput">Checking local ONNX weights...</div>
+        </div>
+
         <div class="card">
           <strong>Host Sharing &amp; Outbound Redaction Policies</strong>
           <div class="note-item-meta">Control which local or remote model hosts are enabled, allowed project scopes, PII redaction, and preference sharing.</div>
@@ -335,37 +397,79 @@
             <button class="btn sm primary" id="syncPushBtn" type="button">Push Encrypted</button>
             <button class="btn sm good" id="syncPullBtn" type="button">Pull &amp; Merge</button>
             <button class="btn sm" id="syncVerifyBtn" type="button">Verify Remote</button>
+            <button class="btn sm" id="syncGcBtn" type="button">Prune Orphans</button>
           </div>
-          <div class="note-item-meta">AES-256-GCM + HKDF-SHA256 + Ed25519 signed heads. Syncs ONLY durable Markdown &amp; append-only logs; never uploads plaintext paths, .sidecar/, or secrets.</div>
+          <div class="note-item-meta">AES-256-GCM + HKDF-SHA256 + Ed25519 signed heads. Supports S3/R2/B2 SigV4, OS Keychain / Windows DPAPI sealing, background Auto-Sync, and interactive 3-way conflict merge.</div>
           <div class="kpi-grid" id="syncStatusKpis"></div>
           <div class="form-grid" style="margin-top:8px;">
             <div class="field-col">
-              <span class="field-label">Sync Target (Local Folder or https:// Object Store)</span>
+              <span class="field-label">Sync Target (Local Folder or https:// S3/R2/Object Store)</span>
               <input type="text" id="syncTargetInput" placeholder="e.g. C:\Users\you\OneDrive\SecondBrainSync or https://..." />
             </div>
             <div class="field-col">
               <span class="field-label">Backend</span>
               <select id="syncBackendSelect" aria-label="Sync Backend">
                 <option value="local_folder">local_folder (OneDrive / iCloud / Syncthing / NAS)</option>
-                <option value="http_object">http_object (DNS-Pinned HTTPS Object Store)</option>
+                <option value="http_object">http_object (DNS-Pinned HTTPS / S3 / R2 / B2)</option>
               </select>
+            </div>
+            <div class="field-col">
+              <span class="field-label">HTTP Auth Mode</span>
+              <select id="syncAuthModeSelect" aria-label="HTTP Auth Mode">
+                <option value="bearer">Bearer Token (env var)</option>
+                <option value="s3_sigv4">AWS S3 / Cloudflare R2 / B2 SigV4</option>
+                <option value="none">None (loopback / presigned)</option>
+              </select>
+            </div>
+            <div class="field-col">
+              <span class="field-label">S3 / R2 Region &amp; Key Env Vars</span>
+              <div class="toolbar" style="margin:0; gap:4px;">
+                <input type="text" id="syncS3RegionInput" value="auto" placeholder="auto / us-east-1" style="width:90px;" />
+                <input type="text" id="syncS3AccessEnvInput" value="AWS_ACCESS_KEY_ID" placeholder="AWS_ACCESS_KEY_ID" style="flex:1;" />
+                <input type="text" id="syncS3SecretEnvInput" value="AWS_SECRET_ACCESS_KEY" placeholder="AWS_SECRET_ACCESS_KEY" style="flex:1;" />
+              </div>
             </div>
             <div class="field-col">
               <span class="field-label">Device Name (optional)</span>
               <input type="text" id="syncDeviceNameInput" placeholder="e.g. workstation-win" />
             </div>
             <div class="field-col">
-              <span class="field-label">Optional Passphrase (blank = 256-bit keyfile)</span>
+              <span class="field-label">Optional Passphrase (blank = 256-bit random key)</span>
               <input type="password" id="syncPassphraseInput" placeholder="Optional E2EE passphrase..." autocomplete="off" />
             </div>
           </div>
           <div class="toolbar" style="margin-top:6px;">
-            <input type="password" id="syncRecoveryKeyInput" placeholder="Recovery Key (base64, required only to Join a keyfile vault)" style="flex:1; min-width:240px;" autocomplete="off" />
+            <label class="inline-check"><input type="checkbox" id="syncUseKeychainCheck" checked /> Seal Key in OS Keychain / DPAPI</label>
+            <input type="password" id="syncRecoveryKeyInput" placeholder="Recovery Key (base64, required only to Join a keyfile/keychain vault)" style="flex:1; min-width:200px;" autocomplete="off" />
             <button class="btn" id="syncInitBtn" type="button">Init New Sync Target</button>
             <button class="btn" id="syncJoinBtn" type="button">Join Existing Target</button>
           </div>
+          <div class="toolbar" style="margin-top:6px;">
+            <button class="btn sm" id="syncSealKeychainBtn" type="button">Migrate Key to Keychain/DPAPI</button>
+            <span class="field-label">Auto-Sync Interval (s):</span>
+            <input type="text" id="syncAutoIntervalInput" value="300" style="width:70px;" />
+            <button class="btn sm good" id="syncAutoEnableBtn" type="button">Enable Auto-Sync</button>
+            <button class="btn sm" id="syncAutoDisableBtn" type="button">Disable Auto-Sync</button>
+            <button class="btn sm" id="syncAutoRunOnceBtn" type="button">Sync Cycle Now</button>
+          </div>
           <div class="status-banner" id="syncOutput">Checking E2EE sync status...</div>
           <div id="syncConflictsList"></div>
+          <div class="sub-panel" id="systemInboxDropPanel" style="margin-top:10px;">
+            <div class="toolbar">
+              <strong>Zero-Knowledge Mobile Inbox Drop (Static PWA &amp; iOS Shortcut)</strong>
+              <button class="btn sm" id="inboxDropRefreshBtn" type="button" style="margin-left:auto;">Refresh Pairings</button>
+              <button class="btn sm good" id="inboxDropPullBtn" type="button">Pull Mobile Drops Now</button>
+            </div>
+            <div class="note-item-meta">Forward-secret ECDH P-256 + HKDF-SHA256 + AES-256-GCM (SBID1) + revocable per-device HMAC-SHA256. Mobile devices hold only the public P-256 key and drop ciphertext into inbox-drops/*.enc -> quarantined 0-raw/inbox/.</div>
+            <div class="toolbar" style="margin-top:6px;">
+              <input type="text" id="inboxDropDeviceLabelInput" value="Mobile Quick-Capture" placeholder="Device label (e.g. iPhone Safari PWA)" style="width:210px;" />
+              <input type="text" id="inboxDropPwaUrlInput" placeholder="Static PWA base URL (optional, e.g. https://pages.example/inbox-drop/)" style="flex:1; min-width:200px;" />
+              <label class="inline-check"><input type="checkbox" id="inboxDropIncludeS3Check" /> Include S3 Write Keys in #pair</label>
+              <button class="btn sm primary" id="inboxDropPairBtn" type="button">Pair Mobile Device</button>
+            </div>
+            <div class="status-banner" id="inboxDropOutput">Configure E2EE Sync above, then pair a mobile PWA or iOS Shortcut.</div>
+            <div id="inboxDropPairingsWrap"></div>
+          </div>
         </div>
 
         <div class="card" id="systemWorkspacesCard">
@@ -416,10 +520,47 @@
             </div>
           </div>
           <div class="toolbar" style="margin-top:6px;">
-            <button class="btn primary sm" id="clipperPairBtn" type="button">Pair Extension &amp; Mint Token</button>
+            <button class="btn good sm" id="clipperPairCodeBtn" type="button">Generate 1-Click Pairing Code</button>
+            <button class="btn primary sm" id="clipperPairBtn" type="button">Pair by Origin &amp; Mint Token</button>
           </div>
           <div class="status-banner" id="clipperOutput">Paste your extension origin from the Clipper popup and click Pair.</div>
           <div id="clipperPairingsWrap"></div>
+        </div>
+
+        <div class="card" id="systemDaemonCard">
+          <div class="toolbar">
+            <strong>Watchdog Daemon, Incremental Vector Sync &amp; Stale Anchor Monitor</strong>
+            <button class="btn sm" id="daemonRefreshBtn" type="button" style="margin-left:auto;">Refresh Daemon</button>
+            <label class="inline-check"><input type="checkbox" id="daemonSyncAutoCheck" /> Include E2EE Auto-Sync Cycle</label>
+            <button class="btn sm primary" id="daemonSyncOnceBtn" type="button">Run One-Shot Index &amp; Vector Sync</button>
+          </div>
+          <div class="note-item-meta">Synchronizes FTS5 notes/atoms indexes, upserts changed Chroma vectors in O(|changed|), audits stale source anchors, and optionally runs an E2EE Auto-Sync cycle.</div>
+          <div class="kpi-grid" id="daemonStatusKpis"></div>
+          <div class="status-banner" id="daemonOutput">Checking daemon &amp; index sync health...</div>
+        </div>
+
+        <div class="card" id="systemBackupCard">
+          <div class="toolbar">
+            <strong>Portable Three-Store Vault Backup &amp; Disaster-Recovery Restore (.sbvault)</strong>
+          </div>
+          <div class="note-item-meta">Creates an AES-256-GCM (scrypt + HKDF-SHA256) encrypted or checksummed .sbvault archive of all durable Markdown &amp; source evidence (excluding .sidecar/, .chroma/, and OS keys), with in-memory Merkle verification and automatic FTS5 index rebuild on restore.</div>
+          <div class="toolbar" style="margin-top:8px;">
+            <input type="text" id="backupOutPathInput" placeholder="Destination .sbvault path (outside live vault)..." style="flex:1; min-width:220px;" />
+            <button class="btn sm" id="backupPickSaveBtn" type="button">Save As...</button>
+            <input type="password" id="backupPassphraseInput" placeholder="Backup passphrase (>= 8 chars)" style="width:210px;" autocomplete="off" />
+            <label class="inline-check"><input type="checkbox" id="backupUnencryptedCheck" /> Unencrypted</label>
+            <button class="btn sm primary" id="backupCreateBtn" type="button">Create Backup</button>
+          </div>
+          <div class="toolbar" style="margin-top:6px;">
+            <input type="text" id="backupVerifyPathInput" placeholder="Existing .sbvault archive to verify or restore..." style="flex:1; min-width:200px;" />
+            <button class="btn sm" id="backupPickOpenBtn" type="button">Browse .sbvault...</button>
+            <input type="text" id="backupRestoreTargetInput" placeholder="Restore target vault folder..." style="flex:1; min-width:190px;" />
+            <button class="btn sm" id="backupPickTargetBtn" type="button">Target Folder...</button>
+            <label class="inline-check"><input type="checkbox" id="backupForceRestoreCheck" /> Force Overwrite</label>
+            <button class="btn sm good" id="backupVerifyBtn" type="button">Verify Archive</button>
+            <button class="btn sm" id="backupRestoreBtn" type="button">Restore Vault</button>
+          </div>
+          <div class="status-banner" id="backupOutput">Choose a destination path and passphrase to create or verify a portable .sbvault backup.</div>
         </div>
 
         <div class="card">
@@ -686,8 +827,10 @@
 
           <div class="toolbar">
             <span class="field-label">Point-in-Time Recall:</span>
-            <input type="text" id="snapshotQueryInput" placeholder="BM25 query at selected From Snapshot..." style="flex:1; min-width:200px;" />
-            <input type="text" id="snapshotRecallScopeInput" placeholder="project_scope (optional)" style="width:165px;" />
+            <input type="text" id="snapshotQueryInput" placeholder="BM25 + Cross-Encoder query at selected Snapshot..." style="flex:1; min-width:190px;" />
+            <input type="text" id="snapshotRecallScopeInput" placeholder="project_scope (optional)" style="width:155px;" />
+            <input type="text" id="snapshotAsOfInput" placeholder="as_of YYYY-MM-DD (optional)" style="width:165px;" />
+            <label class="inline-check"><input type="checkbox" id="snapshotIncludeExpiredCheck" /> Include Expired</label>
             <button class="btn primary" id="recallSnapshotBtn" type="button">Recall at Snapshot</button>
           </div>
           <div id="snapshotOutput" class="sub-panel">Select or create a snapshot above to inspect semantic diffs or run point-in-time recall.</div>
@@ -719,6 +862,7 @@
           <button class="btn sm" id="graphZoomInBtn" type="button" title="Zoom In">+</button>
           <button class="btn sm" id="graphZoomOutBtn" type="button" title="Zoom Out">−</button>
           <button class="btn sm" id="graphResetViewBtn" type="button">Reset View</button>
+          <button class="btn good sm" id="graphAutoLinkBtn" type="button">Auto-Link Graph</button>
           <button class="btn primary" id="refreshGraphBtn" type="button">Reload Graph</button>
         </div>
         <div class="status-banner" id="graphBanner">Interactive 2D Knowledge Graph — drag to pan, scroll to zoom, and click any node to inspect its neighborhood and provenance.</div>

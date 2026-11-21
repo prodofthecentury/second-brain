@@ -555,8 +555,18 @@ class VaultTreeProvider {
             a.filename,
             vscode.TreeItemCollapsibleState.None
           );
-          item.description = a.review_status || "pending";
-          item.tooltip = a.claim || a.filename;
+          const tsTag =
+            a.temporal_status === "expired"
+              ? " [EXPIRED]"
+              : a.temporal_status === "not_yet_valid"
+              ? " [FUTURE]"
+              : "";
+          item.description = `${a.review_status || "pending"}${tsTag}`;
+          item.tooltip =
+            (a.claim || a.filename) +
+            (a.valid_from || a.valid_until
+              ? `\nValidity: ${a.valid_from || "-inf"} -> ${a.valid_until || "+inf"} (${a.temporal_status || "active"})`
+              : "");
           item.contextValue = "secondBrain.pendingAtom";
           item.iconPath = new vscode.ThemeIcon("eye");
           item.sbData = {
@@ -586,8 +596,18 @@ class VaultTreeProvider {
             a.filename,
             vscode.TreeItemCollapsibleState.None
           );
-          item.description = a.review_status || a.status || "";
-          item.tooltip = a.claim || a.filename;
+          const tsTag =
+            a.temporal_status === "expired"
+              ? " [EXPIRED]"
+              : a.temporal_status === "not_yet_valid"
+              ? " [FUTURE]"
+              : "";
+          item.description = `${a.review_status || a.status || ""}${tsTag}`;
+          item.tooltip =
+            (a.claim || a.filename) +
+            (a.valid_from || a.valid_until
+              ? `\nValidity: ${a.valid_from || "-inf"} -> ${a.valid_until || "+inf"} (${a.temporal_status || "active"})`
+              : "");
           item.contextValue = "secondBrain.verifiedAtom";
           item.iconPath = new vscode.ThemeIcon("shield");
           item.sbData = {
@@ -710,7 +730,11 @@ class VaultTreeProvider {
               `[DRIFT] ${dr.filename || dr.atom_id || "Atom"}`,
               vscode.TreeItemCollapsibleState.None
             );
-            item.description = "source anchor drift";
+            item.description =
+              dr.reason ||
+              (Array.isArray(dr.drift_reasons) && dr.drift_reasons.length
+                ? dr.drift_reasons.join(", ")
+                : "source anchor drift");
             item.iconPath = new vscode.ThemeIcon("error");
             item.command = {
               command: "secondBrain.openTreeItem",
@@ -812,6 +836,8 @@ function activate(context) {
   let chatPanel = null;
   let activeChatStream = null;
   let lastChatSourcesByCitation = Object.create(null);
+  let activeChatThreadId = "";
+  let chatTurnHistory = [];
 
   function abortActiveChatStream() {
     if (!activeChatStream) return false;
@@ -2246,6 +2272,11 @@ function activate(context) {
           msg.include_preferences === undefined
             ? true
             : Boolean(msg.include_preferences);
+        const includeExpired = Boolean(msg.include_expired);
+        const asOf =
+          typeof msg.as_of === "string" && msg.as_of.trim()
+            ? msg.as_of.trim().slice(0, 64)
+            : "";
 
         const port = getPort();
         const token = readBearerToken();
@@ -2257,9 +2288,20 @@ function activate(context) {
           answer_view: answerView,
           host_id: hostId,
           include_preferences: includePreferences,
+          include_expired: includeExpired,
         };
+        if (asOf) reqPayloadObj.as_of = asOf;
         if (projectScope) reqPayloadObj.project_scope = projectScope;
         if (modelOverride) reqPayloadObj.model_override = modelOverride;
+        const explicitTid =
+          typeof msg.thread_id === "string" && msg.thread_id.trim()
+            ? msg.thread_id.trim()
+            : activeChatThreadId;
+        if (explicitTid) reqPayloadObj.thread_id = explicitTid;
+        if (chatTurnHistory.length > 0) {
+          reqPayloadObj.history = chatTurnHistory.slice(-10);
+        }
+        let streamedAssistantBuf = "";
 
         const body = JSON.stringify(reqPayloadObj);
         const streamHeaders = {
@@ -2329,6 +2371,9 @@ function activate(context) {
                       : String(data.type || "message");
 
                   if (eventType === "context") {
+                    if (data.thread_id) {
+                      activeChatThreadId = String(data.thread_id);
+                    }
                     const sources = Array.isArray(data.sources)
                       ? data.sources
                       : [
@@ -2381,18 +2426,22 @@ function activate(context) {
                       leads,
                     });
                   } else if (eventType === "token") {
+                    const tokPiece = String(data.text ?? data.token ?? "");
+                    streamedAssistantBuf += tokPiece;
                     panel.webview.postMessage({
                       type: "append",
-                      text: data.text ?? data.token ?? "",
+                      text: tokPiece,
                     });
                   } else if (eventType === "verified_answer") {
                     if (!data.answerable) {
+                      const abstText =
+                        data.reason ||
+                        data.text ||
+                        "Abstained: no verified claims answer this question.";
+                      streamedAssistantBuf = String(abstText);
                       panel.webview.postMessage({
                         type: "markdown",
-                        text:
-                          data.reason ||
-                          data.text ||
-                          "Abstained: no verified claims answer this question.",
+                        text: abstText,
                       });
                     } else {
                       const formattedClaims = (data.claims || [])
@@ -2408,9 +2457,11 @@ function activate(context) {
                           return `${idx + 1}. ${c.text}${cites ? "\n" + cites : ""}`;
                         })
                         .join("\n\n");
+                      const verText = formattedClaims || data.text || "";
+                      streamedAssistantBuf = String(verText);
                       panel.webview.postMessage({
                         type: "markdown",
-                        text: formattedClaims || data.text || "",
+                        text: verText,
                       });
                     }
                   } else if (eventType === "grounding") {
@@ -2419,9 +2470,11 @@ function activate(context) {
                       grounding: data,
                     });
                   } else if (eventType === "abstain") {
+                    const abstMsg = `**Abstained:** ${data.reason || data.text || ""}`;
+                    streamedAssistantBuf = abstMsg;
                     panel.webview.postMessage({
                       type: "markdown",
-                      text: `**Abstained:** ${data.reason || data.text || ""}`,
+                      text: abstMsg,
                     });
                   } else if (eventType === "error") {
                     panel.webview.postMessage({
@@ -2431,6 +2484,16 @@ function activate(context) {
                   } else if (eventType === "done") {
                     if (activeChatStream === streamHandle) {
                       activeChatStream = null;
+                    }
+                    chatTurnHistory.push({ role: "user", content: query });
+                    if (streamedAssistantBuf.trim()) {
+                      chatTurnHistory.push({
+                        role: "assistant",
+                        content: streamedAssistantBuf.trim().slice(0, 4000),
+                      });
+                    }
+                    if (chatTurnHistory.length > 20) {
+                      chatTurnHistory = chatTurnHistory.slice(-20);
                     }
                     const ms = data.total_ms ?? data.elapsed_ms;
                     if (ms !== undefined) {
@@ -2806,22 +2869,52 @@ function activate(context) {
         if (!action) {
           const pick = await vscode.window.showQuickPick(
             [
-              { label: "Status", action: "status", description: "Inspect E2EE sync epochs & open conflicts" },
+              { label: "Status", action: "status", description: "Inspect E2EE sync epochs, keychain & open conflicts" },
               { label: "Push Encrypted", action: "push", description: "Encrypt durable vault files & push signed head" },
               { label: "Pull & Merge", action: "pull", description: "Verify signatures, 3-way merge, rebuild indexes" },
               { label: "Verify Remote", action: "verify", description: "Full cryptographic audit of remote encrypted blobs" },
+              { label: "Prune Orphan Blobs (GC)", action: "gc", description: "Delete unreferenced remote ciphertext blobs" },
+              { label: "Seal Master Key in Keychain/DPAPI", action: "seal-keychain", description: "Move master key out of JSON into OS Keychain / DPAPI" },
+              { label: "Toggle Background Auto-Sync", action: "auto", description: "Enable or disable background pull+push scheduler" },
+              { label: "Resolve Conflicts (3-Way)", action: "resolve", description: "Inspect unified diff & resolve quarantined sync conflicts" },
             ],
             { placeHolder: "Zero-Knowledge E2EE Multi-Device Vault Sync" }
           );
           if (!pick) return;
           action = pick.action;
         }
+        if (action === "resolve") {
+          await vscode.commands.executeCommand("secondBrain.resolveSyncConflicts");
+          return;
+        }
         let res;
         if (action === "status") {
           res = await apiRequest("GET", "/v1/sync/status", null, { useOwnerToken: true });
-        } else if (action === "push" || action === "pull" || action === "verify") {
+        } else if (action === "auto") {
+          const curAuto = await apiRequest("GET", "/v1/sync/auto", null, { useOwnerToken: true });
+          const nextEnabled = !(curAuto.ok && curAuto.data?.enabled);
+          res = await apiRequest(
+            "POST",
+            "/v1/sync/auto",
+            { enabled: nextEnabled, interval_seconds: Number(opts.interval_seconds) || 300 },
+            { useOwnerToken: true }
+          );
+          if (res.ok) {
+            vscode.window.showInformationMessage(
+              `Background E2EE Auto-Sync ${res.data?.enabled ? "enabled" : "disabled"} (${res.data?.interval_seconds || 300}s).`
+            );
+            return;
+          }
+        } else if (
+          action === "push" ||
+          action === "pull" ||
+          action === "verify" ||
+          action === "gc" ||
+          action === "seal-keychain"
+        ) {
           const payload = opts.passphrase ? { passphrase: String(opts.passphrase) } : {};
           if (action === "pull") payload.trust_new_peers = opts.trust_new_peers !== false;
+          if (action === "gc" && opts.dry_run) payload.dry_run = true;
           res = await apiRequest("POST", `/v1/sync/${action}`, payload, {
             useOwnerToken: true,
           });
@@ -2978,6 +3071,19 @@ function activate(context) {
           limit: Number(target.limit) || 8,
         };
         if (scope.trim()) recallPayload.project_scope = scope.trim();
+        if (target.as_of !== undefined && String(target.as_of).trim()) {
+          recallPayload.as_of = String(target.as_of).trim();
+        } else if (target.query === undefined) {
+          const asOfInput = await vscode.window.showInputBox({
+            prompt: "Optional as_of ISO-8601 date override (blank = snapshot timestamp)",
+            placeHolder: "YYYY-MM-DD",
+          });
+          if (asOfInput === undefined) return;
+          if (asOfInput.trim()) recallPayload.as_of = asOfInput.trim();
+        }
+        if (target.include_expired !== undefined) {
+          recallPayload.include_expired = Boolean(target.include_expired);
+        }
 
         const recallRes = await apiRequest(
           "POST",
@@ -3389,16 +3495,79 @@ function activate(context) {
       }
     }),
 
-    vscode.commands.registerCommand("secondBrain.pairClipper", async () => {
-      const origin = await vscode.window.showInputBox({
-        prompt: "Browser extension origin (copy from Second Brain Clipper popup -> Pair)",
-        placeHolder: "chrome-extension://<32-char-id> or moz-extension://<uuid>",
-      });
+    vscode.commands.registerCommand("secondBrain.pairClipper", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      let mode = opts.origin ? "origin" : opts.mode || "";
+      if (!mode) {
+        const modePick = await vscode.window.showQuickPick(
+          [
+            {
+              label: "Generate 1-Click Pairing Code (Recommended)",
+              mode: "code",
+              description: "Mint a 5-minute single-use SBC-XXXX-XXXX-XXXX code & copy to clipboard",
+            },
+            {
+              label: "Pair by Browser Extension Origin",
+              mode: "origin",
+              description: "Paste chrome-extension:// or moz-extension:// origin manually",
+            },
+          ],
+          { placeHolder: "Pair Second Brain Browser Web Clipper" }
+        );
+        if (!modePick) return;
+        mode = modePick.mode;
+      }
+
+      if (mode === "code") {
+        const label =
+          opts.label !== undefined
+            ? String(opts.label)
+            : await vscode.window.showInputBox({
+                prompt: "Browser label",
+                value: "Browser Clipper",
+              });
+        if (label === undefined) return;
+        try {
+          const res = await apiRequest(
+            "POST",
+            "/v1/clipper/pair-code",
+            { label: label.trim() || "Browser Clipper", ttl_seconds: 300 },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(
+              `Pairing code generation failed: ${res.data?.error || res.status}`
+            );
+            return;
+          }
+          const code = String(res.data?.code || "");
+          if (code && vscode.env && vscode.env.clipboard) {
+            await vscode.env.clipboard.writeText(code);
+          }
+          vscode.window.showInformationMessage(
+            `1-Click Clipper Pairing Code copied to clipboard: ${code} (valid 5 min). Paste into the extension popup.`
+          );
+        } catch (err) {
+          vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+        }
+        return;
+      }
+
+      const origin =
+        opts.origin !== undefined
+          ? String(opts.origin)
+          : await vscode.window.showInputBox({
+              prompt: "Browser extension origin (copy from Second Brain Clipper popup -> Pair)",
+              placeHolder: "chrome-extension://<32-char-id> or moz-extension://<uuid>",
+            });
       if (!origin || !origin.trim()) return;
-      const label = await vscode.window.showInputBox({
-        prompt: "Browser label",
-        value: "Browser Clipper",
-      });
+      const label =
+        opts.label !== undefined
+          ? String(opts.label)
+          : await vscode.window.showInputBox({
+              prompt: "Browser label",
+              value: "Browser Clipper",
+            });
       if (label === undefined) return;
       try {
         const res = await apiRequest(
@@ -3420,6 +3589,849 @@ function activate(context) {
         vscode.window.showInformationMessage(
           `Paired '${res.data?.label}' (${res.data?.pairing_id}). Scoped clipper_* token copied to clipboard.`
         );
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.newChatThread", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      try {
+        const res = await apiRequest(
+          "POST",
+          "/v1/chat/threads",
+          {
+            title: String(opts.title || ""),
+            project_scope: opts.project_scope || undefined,
+            host_id: String(opts.host_id || "ollama_local"),
+            mode: String(opts.mode || "stream"),
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Create chat thread failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        activeChatThreadId = String(res.data?.thread_id || "");
+        chatTurnHistory = [];
+        vscode.window.showInformationMessage(
+          `Started persistent Second Brain chat thread '${activeChatThreadId}'.`
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.pinChatTurn", async () => {
+      try {
+        if (activeChatThreadId) {
+          const res = await apiRequest(
+            "POST",
+            `/v1/chat/threads/${encodeURIComponent(activeChatThreadId)}/pin`,
+            {},
+            { useOwnerToken: true }
+          );
+          if (res.ok) {
+            vscode.window.showInformationMessage(
+              `Pinned latest chat answer to Working Note: ${res.data?.filename || "saved"}`
+            );
+            treeProvider.refresh();
+            return;
+          }
+        }
+        const lastAssistant = [...chatTurnHistory]
+          .reverse()
+          .find((t) => t.role === "assistant" && t.content);
+        if (!lastAssistant) {
+          vscode.window.showInformationMessage(
+            "Ask a question in Second Brain Chat first to pin an answer."
+          );
+          return;
+        }
+        const nRes = await apiRequest(
+          "POST",
+          "/v1/notes",
+          {
+            title: "Pinned Chat Synthesis",
+            body: lastAssistant.content,
+            tags: ["pinned-chat"],
+          },
+          { useOwnerToken: true }
+        );
+        if (!nRes.ok) {
+          vscode.window.showErrorMessage(
+            `Pin chat turn failed: ${nRes.data?.error || nRes.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Pinned chat answer to Working Note: ${nRes.data?.filename || "saved"}`
+        );
+        treeProvider.refresh();
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.autoLinkGraph", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      try {
+        const res = await apiRequest(
+          "POST",
+          "/v1/graph/auto-link",
+          {
+            actor: "vscode_owner",
+            project_scope: opts.project_scope || undefined,
+            include_pending: Boolean(opts.include_pending),
+            dry_run: Boolean(opts.dry_run),
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Graph auto-link failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Auto-linked ${res.data?.updated_atom_count ?? 0} atom(s) (orphans ${res.data?.orphan_before ?? "?"} -> ${res.data?.orphan_after ?? "?"}).`
+        );
+        treeProvider.refresh();
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.resolveSyncConflicts", async () => {
+      try {
+        const listRes = await apiRequest("GET", "/v1/sync/conflicts", null, {
+          useOwnerToken: true,
+        });
+        if (!listRes.ok) {
+          vscode.window.showErrorMessage(
+            `Could not read sync conflicts: ${listRes.data?.error || listRes.status}`
+          );
+          return;
+        }
+        const conflicts = listRes.data?.conflicts || [];
+        if (!conflicts.length) {
+          vscode.window.showInformationMessage("0 unresolved E2EE sync conflicts.");
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          conflicts.map((c) => ({
+            label: c.rel_path,
+            description: `epoch ${c.remote_epoch ?? "?"} · ${c.conflict_kind || "divergent_edit"}`,
+            detail: `conflict_id: ${c.conflict_id}`,
+            conflict: c,
+          })),
+          { placeHolder: "Select a sync conflict to inspect & resolve (3-way)" }
+        );
+        if (!picked) return;
+        const cid = picked.conflict.conflict_id || picked.conflict.rel_path;
+        const detRes = await apiRequest(
+          "GET",
+          `/v1/sync/conflicts/${encodeURIComponent(cid)}`,
+          null,
+          { useOwnerToken: true }
+        );
+        if (detRes.ok && detRes.data) {
+          const md = [
+            `# 3-Way Sync Conflict: \`${detRes.data.rel_path}\``,
+            "",
+            `- **Conflict ID**: \`${detRes.data.conflict_id}\``,
+            `- **Local SHA-256**: \`${detRes.data.current_local_sha256 || "missing"}\``,
+            `- **Remote SHA-256**: \`${detRes.data.remote_sha256 || "deleted"}\``,
+            "",
+            "## Unified Diff (Local vs Remote)",
+            "```diff",
+            detRes.data.unified_diff || "(no text diff)",
+            "```",
+          ].join("\n");
+          await openMarkdownPreview(md);
+        }
+        const stratPick = await vscode.window.showQuickPick(
+          [
+            { label: "Keep Local", strategy: "keep_local" },
+            { label: "Accept Remote", strategy: "accept_remote" },
+            { label: "Keep Both (save peer copy)", strategy: "keep_both" },
+          ],
+          { placeHolder: `Choose resolution strategy for ${picked.label}` }
+        );
+        if (!stratPick) return;
+        const res = await apiRequest(
+          "POST",
+          "/v1/sync/conflicts/resolve",
+          {
+            conflict_id: cid,
+            resolution: stratPick.strategy,
+            expected_local_sha256: detRes.data?.current_local_sha256 || undefined,
+            actor: "vscode_owner",
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Conflict resolution failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Resolved '${picked.label}' via ${stratPick.strategy} (${res.data?.remaining_conflicts ?? 0} remaining).`
+        );
+        treeProvider.refresh();
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.manageOnnxModels", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      let action = opts.action || "";
+      if (!action) {
+        const pick = await vscode.window.showQuickPick(
+          [
+            {
+              label: "Status — Inspect Local Neural ONNX Weights",
+              action: "status",
+            },
+            {
+              label: "Pull — Download & SHA-256 Verify Pinned ONNX Weights",
+              action: "pull",
+            },
+            {
+              label: "Verify — Run SHA-256 & CPU Smoke Inference Check",
+              action: "verify",
+            },
+          ],
+          { placeHolder: "Second Brain Local Neural ONNX Models (Cross-Encoder & DeBERTa NLI)" }
+        );
+        if (!pick) return;
+        action = pick.action;
+      }
+      try {
+        if (action === "status") {
+          const res = await apiRequest("GET", "/v1/models/onnx", null, {
+            useOwnerToken: true,
+          });
+          if (!res.ok) {
+            vscode.window.showErrorMessage(
+              `ONNX status failed: ${res.data?.error || res.status}`
+            );
+            return;
+          }
+          await openMarkdownPreview(
+            [
+              "# Second Brain — Local Neural ONNX Models",
+              "",
+              `- **Runtime Available:** \`${Boolean(
+                res.data?.onnx_runtime_ready ?? res.data?.runtime_available
+              )}\``,
+              `- **All Verified:** \`${Boolean(res.data?.all_verified)}\``,
+              `- **Models Root:** \`${res.data?.models_root || ""}\``,
+              "",
+              "```json",
+              JSON.stringify(res.data?.slots || {}, null, 2),
+              "```",
+            ].join("\n")
+          );
+          return;
+        }
+        const endpoint =
+          action === "pull" ? "/v1/models/onnx/pull" : "/v1/models/onnx/verify";
+        const body =
+          action === "pull"
+            ? { slot: opts.slot || "all", force: Boolean(opts.force) }
+            : { slot: opts.slot || "all", smoke_test: opts.smoke_test !== false };
+        const res = await apiRequest("POST", endpoint, body, {
+          useOwnerToken: true,
+        });
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `ONNX ${action} failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `ONNX ${action} complete: all_verified=${Boolean(res.data?.all_verified)}.`
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.setAtomValidity", async (arg) => {
+      const target = extractTargetData(arg);
+      let filename = target.filename || "";
+      let expectedSha = target.sha256 || target.atom?.sha256 || "";
+      let curFrom = target.atom?.valid_from || "";
+      let curUntil = target.atom?.valid_until || "";
+
+      try {
+        if (!filename) {
+          const listRes = await apiRequest("GET", "/v1/atoms?limit=200", null, {
+            useOwnerToken: true,
+          });
+          const items = listRes.data?.items || [];
+          if (!items.length) {
+            vscode.window.showInformationMessage("No atoms found in vault.");
+            return;
+          }
+          const picked = await vscode.window.showQuickPick(
+            items.map((a) => ({
+              label: a.filename,
+              description: `${a.review_status || ""}${
+                a.temporal_status && a.temporal_status !== "active"
+                  ? " [" + a.temporal_status + "]"
+                  : ""
+              }`,
+              detail: a.claim || "",
+              atom: a,
+            })),
+            { placeHolder: "Select atom to set bi-temporal validity window" }
+          );
+          if (!picked) return;
+          filename = picked.atom.filename;
+          expectedSha = picked.atom.sha256 || "";
+          curFrom = picked.atom.valid_from || "";
+          curUntil = picked.atom.valid_until || "";
+        }
+
+        if (!expectedSha) {
+          const getRes = await apiRequest(
+            "GET",
+            `/v1/atoms/${encodeURIComponent(filename)}`,
+            null,
+            { useOwnerToken: true }
+          );
+          if (getRes.ok && getRes.data) {
+            const doc = getRes.data.atom || getRes.data;
+            expectedSha = doc.sha256 || "";
+            curFrom = doc.valid_from || curFrom;
+            curUntil = doc.valid_until || curUntil;
+          }
+        }
+
+        const validFrom =
+          target.valid_from !== undefined
+            ? String(target.valid_from || "")
+            : await vscode.window.showInputBox({
+                prompt: `valid_from for ${filename} (YYYY-MM-DD or ISO-8601, blank to clear)`,
+                value: curFrom,
+                placeHolder: "e.g. 2026-01-01",
+              });
+        if (validFrom === undefined) return;
+
+        const validUntil =
+          target.valid_until !== undefined
+            ? String(target.valid_until || "")
+            : await vscode.window.showInputBox({
+                prompt: `valid_until for ${filename} (YYYY-MM-DD or ISO-8601, blank to clear)`,
+                value: curUntil,
+                placeHolder: "e.g. 2026-12-31",
+              });
+        if (validUntil === undefined) return;
+
+        const res = await apiRequest(
+          "POST",
+          `/v1/atoms/${encodeURIComponent(filename)}/validity`,
+          {
+            expected_sha256: expectedSha,
+            valid_from: validFrom.trim() || null,
+            valid_until: validUntil.trim() || null,
+            actor: "vscode_owner",
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Set validity failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Updated ${filename} validity (${res.data?.valid_from || "-inf"} -> ${
+            res.data?.valid_until || "+inf"
+          }, status=${res.data?.temporal_status || "active"}).`
+        );
+        treeProvider.refresh();
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.mobileInboxDrop", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      let action = opts.action || "";
+      if (!action) {
+        const pick = await vscode.window.showQuickPick(
+          [
+            {
+              label: "Pair Mobile PWA / iOS Shortcut (SBID1 E2EE)",
+              action: "pair",
+            },
+            {
+              label: "Pull & Decrypt Mobile Inbox Drops into Quarantined Inbox",
+              action: "pull",
+            },
+            {
+              label: "List / Revoke Paired Mobile Devices",
+              action: "revoke",
+            },
+          ],
+          { placeHolder: "Second Brain Zero-Knowledge Mobile Inbox Drop" }
+        );
+        if (!pick) return;
+        action = pick.action;
+      }
+      try {
+        if (action === "pair") {
+          const label =
+            opts.device_label !== undefined
+              ? String(opts.device_label)
+              : await vscode.window.showInputBox({
+                  prompt: "Mobile device label",
+                  value: "Mobile Quick-Capture",
+                });
+          if (label === undefined) return;
+          const pwaUrl =
+            opts.pwa_base_url !== undefined
+              ? String(opts.pwa_base_url)
+              : await vscode.window.showInputBox({
+                  prompt: "Optional static PWA base URL (blank for #pair=... fragment only)",
+                  placeHolder: "https://pages.example/inbox-drop/",
+                });
+          if (pwaUrl === undefined) return;
+          const res = await apiRequest(
+            "POST",
+            "/v1/sync/inbox-drop/pair",
+            {
+              device_label: label.trim() || "Mobile Quick-Capture",
+              pwa_base_url: pwaUrl.trim(),
+              include_s3_credentials: Boolean(opts.include_s3_credentials),
+            },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(
+              `Mobile drop pairing failed: ${res.data?.error || res.status}`
+            );
+            return;
+          }
+          const shareLink = String(
+            res.data?.pwa_pairing_url || res.data?.pairing_fragment || ""
+          );
+          if (shareLink && vscode.env && vscode.env.clipboard) {
+            await vscode.env.clipboard.writeText(shareLink);
+          }
+          vscode.window.showInformationMessage(
+            `Paired '${res.data?.device_label}' (token_id=${res.data?.token_id}). Pairing link copied to clipboard.`
+          );
+          return;
+        }
+        if (action === "pull") {
+          const res = await apiRequest(
+            "POST",
+            "/v1/sync/inbox-drop/pull",
+            { delete_consumed: opts.delete_consumed !== false },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(
+              `Pull mobile drops failed: ${res.data?.error || res.status}`
+            );
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Mobile Inbox Drops pulled: ${res.data?.ingested_count ?? 0} staged into 0-raw/inbox/, ${
+              res.data?.skipped_duplicate_count ?? 0
+            } duplicate(s) skipped.`
+          );
+          treeProvider.refresh();
+          return;
+        }
+        const listRes = await apiRequest(
+          "GET",
+          "/v1/sync/inbox-drop/pairings",
+          null,
+          { useOwnerToken: true }
+        );
+        if (!listRes.ok) {
+          vscode.window.showErrorMessage(
+            `List mobile pairings failed: ${listRes.data?.error || listRes.status}`
+          );
+          return;
+        }
+        const active = (listRes.data?.pairings || []).filter((p) => !p.revoked);
+        if (!active.length) {
+          vscode.window.showInformationMessage("No active mobile drop pairings.");
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          active.map((p) => ({
+            label: p.label || p.device_label || p.token_id,
+            description: `token_id: ${p.token_id}`,
+            detail: `Created ${p.created_at || ""}`,
+            tokenId: p.token_id,
+          })),
+          { placeHolder: "Select mobile drop pairing to revoke" }
+        );
+        if (!picked) return;
+        const revRes = await apiRequest(
+          "DELETE",
+          `/v1/sync/inbox-drop/${encodeURIComponent(picked.tokenId)}`,
+          {},
+          { useOwnerToken: true }
+        );
+        if (!revRes.ok) {
+          vscode.window.showErrorMessage(
+            `Revoke failed: ${revRes.data?.error || revRes.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Revoked mobile drop token '${picked.tokenId}'.`
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.ingestMedia", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      let filePath = opts.filePath ? String(opts.filePath) : "";
+      if (!filePath) {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectMany: false,
+          openLabel: "Ingest Media into Second Brain",
+          filters: {
+            "Supported Media & Documents": [
+              "png",
+              "jpg",
+              "jpeg",
+              "webp",
+              "wav",
+              "mp3",
+              "m4a",
+              "webm",
+              "ogg",
+              "flac",
+              "pdf",
+              "docx",
+              "epub",
+              "html",
+              "csv",
+              "tsv",
+            ],
+          },
+        });
+        if (!picked || !picked.length) return;
+        filePath = picked[0].fsPath;
+      }
+      try {
+        const st = fs.statSync(filePath);
+        if (st.size === 0 || st.size > 24 * 1024 * 1024) {
+          vscode.window.showErrorMessage(
+            "Media file must be non-empty and at most 24 MiB."
+          );
+          return;
+        }
+        const rawBytes = fs.readFileSync(filePath);
+        const res = await apiRequest(
+          "POST",
+          "/v1/ingest/media",
+          {
+            filename: path.basename(filePath),
+            content_base64: rawBytes.toString("base64"),
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Media ingestion failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        const d = res.data || {};
+        vscode.window.showInformationMessage(
+          `${d.quarantined ? "Quarantined in Inbox" : "Ingested"} (${
+            d.category || "media"
+          }): ${d.output_rel_path || d.output_filename}`
+        );
+        treeProvider.refresh();
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain media ingest error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.installGitHook", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      const wsDefault =
+        vscode.workspace.workspaceFolders &&
+        vscode.workspace.workspaceFolders.length
+          ? vscode.workspace.workspaceFolders[0].uri.fsPath
+          : "";
+      const repo =
+        opts.repo !== undefined
+          ? String(opts.repo)
+          : await vscode.window.showInputBox({
+              prompt: "Git repository path for Second Brain post-commit hook",
+              value: wsDefault,
+            });
+      if (!repo || !repo.trim()) return;
+      try {
+        const res = await apiRequest(
+          "POST",
+          "/v1/git/hook/install",
+          {
+            repo: repo.trim(),
+            project_scope: opts.project_scope || undefined,
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Install Git hook failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Installed Second Brain post-commit hook (${res.data?.project_scope || "repo"}).`
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.uninstallGitHook", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      const wsDefault =
+        vscode.workspace.workspaceFolders &&
+        vscode.workspace.workspaceFolders.length
+          ? vscode.workspace.workspaceFolders[0].uri.fsPath
+          : "";
+      const repo =
+        opts.repo !== undefined
+          ? String(opts.repo)
+          : await vscode.window.showInputBox({
+              prompt: "Git repository path to remove Second Brain post-commit hook",
+              value: wsDefault,
+            });
+      if (!repo || !repo.trim()) return;
+      try {
+        const res = await apiRequest(
+          "POST",
+          "/v1/git/hook/uninstall",
+          { repo: repo.trim() },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Uninstall Git hook failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Second Brain post-commit hook: ${res.data?.status || "removed"}.`
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.distillGitCommits", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      const wsDefault =
+        vscode.workspace.workspaceFolders &&
+        vscode.workspace.workspaceFolders.length
+          ? vscode.workspace.workspaceFolders[0].uri.fsPath
+          : "";
+      const repo =
+        opts.repo !== undefined
+          ? String(opts.repo)
+          : await vscode.window.showInputBox({
+              prompt: "Git repository path to distill recent commits into memory",
+              value: wsDefault,
+            });
+      if (!repo || !repo.trim()) return;
+      const maxCommits = Number(opts.max_commits) || 5;
+      try {
+        const res = await apiRequest(
+          "POST",
+          "/v1/git/distill",
+          {
+            repo: repo.trim(),
+            project_scope: opts.project_scope || undefined,
+            max_commits: maxCommits,
+            stage_inbox: opts.stage_inbox !== false,
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Distill Git commits failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+        const d = res.data || {};
+        vscode.window.showInformationMessage(
+          `Distilled ${d.distilled_count ?? 0} commit(s) into ${d.project_scope || "vault"}.`
+        );
+        treeProvider.refresh();
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.backupVault", async (arg) => {
+      const opts = arg && typeof arg === "object" ? arg : {};
+      let action = opts.action || "";
+      if (!action) {
+        const picked = await vscode.window.showQuickPick(
+          [
+            {
+              label: "Create Encrypted .sbvault Backup",
+              action: "create",
+              description: "AES-256-GCM + Merkle-verified Three-Store archive",
+            },
+            {
+              label: "Verify .sbvault Backup Archive",
+              action: "verify",
+              description: "In-memory AEAD, SHA-256 & Merkle root check",
+            },
+            {
+              label: "Restore .sbvault Archive to Folder",
+              action: "restore",
+              description: "Extract verified durable vault & rebuild FTS5 indexes",
+            },
+          ],
+          { placeHolder: "Portable Second Brain Vault Backup & Restore" }
+        );
+        if (!picked) return;
+        action = picked.action;
+      }
+
+      try {
+        if (action === "create") {
+          const outputPath =
+            opts.output_path ||
+            (await vscode.window.showInputBox({
+              prompt: "Destination .sbvault path (must be outside live vault)",
+              placeHolder: "C:\\Backups\\second-brain.sbvault",
+            }));
+          if (!outputPath || !outputPath.trim()) return;
+          const passphrase =
+            opts.passphrase !== undefined
+              ? opts.passphrase
+              : await vscode.window.showInputBox({
+                  prompt: "Backup passphrase (at least 8 characters)",
+                  password: true,
+                });
+          if (!passphrase && !opts.unencrypted) return;
+          const res = await apiRequest(
+            "POST",
+            "/v1/vault/backup/create",
+            {
+              output_path: outputPath.trim(),
+              passphrase: opts.unencrypted ? undefined : passphrase,
+              unencrypted: Boolean(opts.unencrypted),
+            },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(
+              `Backup creation failed: ${res.data?.error || res.status}`
+            );
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Created backup: ${res.data?.backup_path} (${res.data?.file_count ?? 0} files).`
+          );
+          return;
+        }
+
+        if (action === "verify") {
+          const backupPath =
+            opts.backup_path ||
+            (await vscode.window.showInputBox({
+              prompt: "Path to .sbvault archive to verify",
+            }));
+          if (!backupPath || !backupPath.trim()) return;
+          const passphrase =
+            opts.passphrase !== undefined
+              ? opts.passphrase
+              : await vscode.window.showInputBox({
+                  prompt: "Backup passphrase (leave blank if unencrypted)",
+                  password: true,
+                });
+          if (passphrase === undefined) return;
+          const res = await apiRequest(
+            "POST",
+            "/v1/vault/backup/verify",
+            {
+              backup_path: backupPath.trim(),
+              passphrase: passphrase || undefined,
+            },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(
+              `Backup verification failed: ${res.data?.error || res.status}`
+            );
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Backup VALID (${res.data?.cipher}): ${res.data?.file_count ?? 0} files, Merkle ${String(
+              res.data?.merkle_root || ""
+            ).slice(0, 16)}…`
+          );
+          return;
+        }
+
+        if (action === "restore") {
+          const backupPath =
+            opts.backup_path ||
+            (await vscode.window.showInputBox({
+              prompt: "Path to .sbvault archive to restore",
+            }));
+          if (!backupPath || !backupPath.trim()) return;
+          const targetDir =
+            opts.target_brain_dir ||
+            (await vscode.window.showInputBox({
+              prompt: "Destination vault folder to restore into",
+            }));
+          if (!targetDir || !targetDir.trim()) return;
+          const passphrase =
+            opts.passphrase !== undefined
+              ? opts.passphrase
+              : await vscode.window.showInputBox({
+                  prompt: "Backup passphrase (leave blank if unencrypted)",
+                  password: true,
+                });
+          if (passphrase === undefined) return;
+          const res = await apiRequest(
+            "POST",
+            "/v1/vault/backup/restore",
+            {
+              backup_path: backupPath.trim(),
+              target_brain_dir: targetDir.trim(),
+              passphrase: passphrase || undefined,
+              force: Boolean(opts.force),
+            },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(
+              `Backup restore failed: ${res.data?.error || res.status}`
+            );
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Restored ${res.data?.restored_files ?? 0} files into ${res.data?.target_brain_dir}.`
+          );
+        }
       } catch (err) {
         vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
       }

@@ -1460,10 +1460,12 @@ ipcMain.handle("api:request", async (event, payload = {}) => {
   if (isFromCapture) {
     if (
       safeMethod !== "POST" ||
-      (apiPath !== "/v1/notes" && apiPath !== "/v1/inbox")
+      (apiPath !== "/v1/notes" &&
+        apiPath !== "/v1/inbox" &&
+        apiPath !== "/v1/ingest/media")
     ) {
       throw new Error(
-        "403 Forbidden: Quick Capture window may only invoke POST /v1/notes or POST /v1/inbox."
+        "403 Forbidden: Quick Capture window may only invoke POST /v1/notes, POST /v1/inbox, or POST /v1/ingest/media."
       );
     }
   }
@@ -1500,6 +1502,27 @@ const handlePickFolderIpc = async (event) => {
 };
 ipcMain.handle("dialog:pick-folder", handlePickFolderIpc);
 ipcMain.handle("dialog:pickFolder", handlePickFolderIpc);
+
+ipcMain.handle("dialog:pick-save-backup", async (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  const stamp = new Date().toISOString().slice(0, 10);
+  const res = await dialog.showSaveDialog(mainWindow || undefined, {
+    title: "Save Portable Second Brain Backup (.sbvault)",
+    defaultPath: `second-brain-backup-${stamp}.sbvault`,
+    filters: [{ name: "Second Brain Vault Backup", extensions: ["sbvault"] }],
+  });
+  return res.canceled ? null : res.filePath;
+});
+
+ipcMain.handle("dialog:pick-backup-file", async (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  const res = await dialog.showOpenDialog(mainWindow || undefined, {
+    title: "Select Second Brain Backup Archive (.sbvault)",
+    properties: ["openFile"],
+    filters: [{ name: "Second Brain Vault Backup", extensions: ["sbvault"] }],
+  });
+  return res.canceled ? null : res.filePaths[0];
+});
 
 ipcMain.handle("dialog:pick-file", async (event) => {
   assertTrustedRenderer(event, { allowCapture: false });

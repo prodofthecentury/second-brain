@@ -2,7 +2,7 @@
   "name": "second-brain-vscode",
   "displayName": "Second Brain — Local AI Memory",
   "description": "Zero-friction notes, SHA-256 verified atoms, Merkle inclusion proofs, contradiction radar, instant recall, and streaming chat inside VS Code, Cursor, and Windsurf.",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "publisher": "second-brain",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -196,7 +196,55 @@
       },
       {
         "command": "secondBrain.pairClipper",
-        "title": "Second Brain: Pair Browser Web Clipper"
+        "title": "Second Brain: Pair Browser Web Clipper (1-Click Code or Origin)"
+      },
+      {
+        "command": "secondBrain.newChatThread",
+        "title": "Second Brain: New Multi-Turn Chat Thread"
+      },
+      {
+        "command": "secondBrain.pinChatTurn",
+        "title": "Second Brain: Pin Last Chat Answer to Working Note"
+      },
+      {
+        "command": "secondBrain.autoLinkGraph",
+        "title": "Second Brain: Auto-Link Knowledge Graph Atoms"
+      },
+      {
+        "command": "secondBrain.resolveSyncConflicts",
+        "title": "Second Brain: Resolve E2EE Sync Conflicts (3-Way)"
+      },
+      {
+        "command": "secondBrain.manageOnnxModels",
+        "title": "Second Brain: Manage Local ONNX Models (Status / Pull / Verify)"
+      },
+      {
+        "command": "secondBrain.setAtomValidity",
+        "title": "Second Brain: Set Atom Bi-Temporal Validity (valid_from / valid_until)"
+      },
+      {
+        "command": "secondBrain.mobileInboxDrop",
+        "title": "Second Brain: Mobile E2EE Inbox Drop (Pair PWA / Pull Drops / Revoke)"
+      },
+      {
+        "command": "secondBrain.ingestMedia",
+        "title": "Second Brain: Ingest Media (Audio / Screenshot / Document)"
+      },
+      {
+        "command": "secondBrain.installGitHook",
+        "title": "Second Brain: Install Git Post-Commit Hook"
+      },
+      {
+        "command": "secondBrain.uninstallGitHook",
+        "title": "Second Brain: Uninstall Git Post-Commit Hook"
+      },
+      {
+        "command": "secondBrain.distillGitCommits",
+        "title": "Second Brain: Distill Recent Git Commits to Memory"
+      },
+      {
+        "command": "secondBrain.backupVault",
+        "title": "Second Brain: Portable Vault Backup & Restore (.sbvault)"
       },
       {
         "command": "secondBrain.refreshVault",
@@ -289,6 +337,11 @@
           "group": "1_governance@2"
         },
         {
+          "command": "secondBrain.setAtomValidity",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.pendingAtom",
+          "group": "1_governance@3"
+        },
+        {
           "command": "secondBrain.proveAtom",
           "when": "view == secondBrain.vaultView && viewItem == secondBrain.verifiedAtom",
           "group": "1_governance@1"
@@ -307,6 +360,11 @@
           "command": "secondBrain.mergeAtoms",
           "when": "view == secondBrain.vaultView && viewItem == secondBrain.verifiedAtom",
           "group": "1_governance@4"
+        },
+        {
+          "command": "secondBrain.setAtomValidity",
+          "when": "view == secondBrain.vaultView && viewItem == secondBrain.verifiedAtom",
+          "group": "1_governance@5"
         },
         {
           "command": "secondBrain.proveAtom",

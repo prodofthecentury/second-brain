@@ -358,7 +358,7 @@ def _host_companion_layout(host_id: str, target: HostTarget, resolved_home: Path
         plugin_dir = target.config_path.parent
         plugin_json = _load_template_text(
             ("plugins", "antigravity", "second-brain", "plugin.json"),
-            json.dumps({"name": "second-brain", "version": "0.3.0"}, indent=2) + "\n",
+            json.dumps({"name": "second-brain", "version": "1.0.0"}, indent=2) + "\n",
         )
         readme_md = _load_template_text(
             ("plugins", "antigravity", "second-brain", "README.md"),

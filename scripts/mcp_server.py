@@ -43,6 +43,7 @@ from collections.abc import Mapping
 from contextlib import closing
 import datetime
 import glob
+import hashlib
 import hmac
 import inspect
 import json
@@ -85,7 +86,7 @@ from config import (
     vault_paths_for,
 )
 from host_adapters import read_bounded_security_file, restrict_security_file_permissions
-from memory_format import split_frontmatter
+from memory_format import evaluate_temporal_validity, split_frontmatter
 from memory_review import parse_atom_record, parse_frontmatter_values
 from recall import (
     MemoryRecallUnavailable,
@@ -455,13 +456,21 @@ def _is_preference_atom_text(raw_text: str) -> bool:
     return epistemic_label == "preference" or bool(fm_vals.get("epistemic_contract"))
 
 
-def semantic_search(query: str, n_results: int = 5, project: str | None = None) -> list[dict]:
+def semantic_search(
+    query: str,
+    n_results: int = 5,
+    project: str | None = None,
+    *,
+    include_expired: bool = False,
+    as_of: str | None = None,
+) -> list[dict]:
     query = str(query or "")[:4096]
     try:
         n_results = max(1, min(int(n_results), 10))
     except (TypeError, ValueError):
         n_results = 5
     projects = (str(project).strip(),) if project and str(project).strip() else ()
+    clean_as_of = str(as_of).strip() if as_of and str(as_of).strip() else None
     vdirs = _resolve_vault_dirs()
     direct, neighbors = search_memory(
         query,
@@ -470,6 +479,8 @@ def semantic_search(query: str, n_results: int = 5, project: str | None = None) 
             follow_links=True,
             include_statuses={"accepted"},
             projects=projects,
+            include_expired=bool(include_expired),
+            as_of=clean_as_of,
         ),
         atoms_dir=vdirs["atoms_dir"],
         index_path=vdirs["lexical_index_path"],
@@ -519,6 +530,8 @@ def _load_verified_non_preference_atom(
     *,
     vdirs: dict[str, str],
     project: str | None = None,
+    include_expired: bool = False,
+    as_of: str | None = None,
 ) -> tuple[str, str, dict[str, Any]] | None:
     """Validate safe basename, current CAS approval, non-superseded, non-preference, and project scope."""
     cleaned = str(raw_atom_id or "").strip()
@@ -558,6 +571,13 @@ def _load_verified_non_preference_atom(
         return None
     contexts = list(record.get("contexts") or [])
     if not _tags_strictly_in_project_scope(contexts, project):
+        return None
+    tv = evaluate_temporal_validity(
+        record.get("valid_from"),
+        record.get("valid_until"),
+        as_of=str(as_of).strip() if as_of and str(as_of).strip() else None,
+    )
+    if tv["status"] == "invalid_window" or (not tv["active"] and not include_expired):
         return None
     return atom_id, path, record
 
@@ -644,9 +664,11 @@ ALL_TOOLS = (
         inputSchema={
             "type": "object",
             "properties": {
-                "query":     {"type": "string", "description": "Natural language search query."},
-                "n_results": {"type": "integer", "description": "Number of results (default 5)."},
-                "project":   {"type": "string", "description": "Optional project scope tag (e.g. project:second_brain)."},
+                "query":           {"type": "string", "description": "Natural language search query."},
+                "n_results":       {"type": "integer", "description": "Number of results (default 5)."},
+                "project":         {"type": "string", "description": "Optional project scope tag (e.g. project:second_brain)."},
+                "as_of":           {"type": "string", "description": "Optional ISO-8601 date/timestamp (YYYY-MM-DD) for bi-temporal point-in-time validity."},
+                "include_expired": {"type": "boolean", "description": "Include expired or not-yet-valid temporal atoms (default false)."},
             },
             "required": ["query"],
         },
@@ -657,7 +679,10 @@ ALL_TOOLS = (
         inputSchema={
             "type": "object",
             "properties": {
-                "atom_id": {"type": "string", "description": "Atom filename (e.g. 2026-0619-sodium-ion.md)"},
+                "atom_id":         {"type": "string", "description": "Atom filename (e.g. 2026-0619-sodium-ion.md)"},
+                "project":         {"type": "string", "description": "Optional project:<id> scope filter."},
+                "as_of":           {"type": "string", "description": "Optional ISO-8601 date/timestamp (YYYY-MM-DD) for bi-temporal validity."},
+                "include_expired": {"type": "boolean", "description": "Allow reading expired/not-yet-valid temporal atoms (default false)."},
             },
             "required": ["atom_id"],
         },
@@ -788,9 +813,11 @@ ALL_TOOLS = (
             "type": "object",
             "properties": {
                 "query":       {"type": "string", "description": "Search query against the snapshot."},
-                "snapshot_id": {"type": "string", "description": "Snapshot ID from list_snapshots."},
-                "project":     {"type": "string", "description": "Optional project:<id> scope filter."},
-                "top_k":       {"type": "integer", "description": "Max results (default 5, max 25)."},
+                "snapshot_id":     {"type": "string", "description": "Snapshot ID from list_snapshots."},
+                "project":         {"type": "string", "description": "Optional project:<id> scope filter."},
+                "top_k":           {"type": "integer", "description": "Max results (default 5, max 25)."},
+                "as_of":           {"type": "string", "description": "Optional ISO-8601 date/timestamp override (defaults to snapshot created_at)."},
+                "include_expired": {"type": "boolean", "description": "Include atoms expired or not yet valid at snapshot/as_of time (default false)."},
             },
             "required": ["query", "snapshot_id"],
         },
@@ -913,9 +940,17 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
             )
         n       = arguments.get("n_results", 5)
         project = arguments.get("project")
+        inc_exp = bool(arguments.get("include_expired", False))
+        as_of_arg = str(arguments.get("as_of") or "").strip() or None
         try:
-            results = semantic_search(query, n_results=n, project=project)
-        except MemoryRecallUnavailable as exc:
+            results = semantic_search(
+                query,
+                n_results=n,
+                project=project,
+                include_expired=inc_exp,
+                as_of=as_of_arg,
+            )
+        except (MemoryRecallUnavailable, ValueError) as exc:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Memory recall unavailable: {exc}")], isError=True)
         if not results:
             text = "No relevant memories found for this query."
@@ -940,11 +975,16 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         raw_exists = safe_file_in_dir(vdirs["atoms_dir"], atom_id, allowed_exts={".md"})
         if not raw_exists:
             return types.CallToolResult(content=[types.TextContent(type="text", text=f"Atom '{atom_id}' not found or invalid.")])
-        loaded = _load_verified_non_preference_atom(
-            atom_id,
-            vdirs=vdirs,
-            project=str(arguments.get("project") or "").strip() or None,
-        )
+        try:
+            loaded = _load_verified_non_preference_atom(
+                atom_id,
+                vdirs=vdirs,
+                project=str(arguments.get("project") or "").strip() or None,
+                include_expired=bool(arguments.get("include_expired", False)),
+                as_of=str(arguments.get("as_of") or "").strip() or None,
+            )
+        except ValueError as exc:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
         if loaded is None:
             return types.CallToolResult(content=[types.TextContent(type="text", text=UNAVAILABLE_ATOM_MESSAGE)])
         content = read_file_safe(loaded[1])
@@ -1417,6 +1457,10 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
             "top_k": 25,
             "brain_dir": vdirs["brain_dir"],
         }
+        if "as_of" in rs_params:
+            rs_kwargs["as_of"] = str(arguments.get("as_of") or "").strip()[:64] or None
+        if "include_expired" in rs_params:
+            rs_kwargs["include_expired"] = bool(arguments.get("include_expired", False))
         if "atoms_dir" in rs_params:
             rs_kwargs["atoms_dir"] = vdirs["atoms_dir"]
         if "playbooks_dir" in rs_params:
@@ -1427,7 +1471,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         except (FileNotFoundError, PermissionError, ValueError) as exc:
             return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
 
-        # Mandatory post-snapshot live revocation & scope guard:
+        # Mandatory post-snapshot live revocation & scope guard (include_expired=True because snapshot already enforced temporal validity as of snapshot/as_of):
         filtered_hits: list[dict[str, Any]] = []
         for hit in raw_recall.get("results", []):
             hit_kind = str(hit.get("kind") or "")
@@ -1437,7 +1481,14 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
             if hit_kind == "atom":
                 if not _tags_strictly_in_project_scope(list(hit.get("contexts") or []), project):
                     continue
-                if _load_verified_non_preference_atom(fname, vdirs=vdirs, project=project) is None:
+                loaded = _load_verified_non_preference_atom(fname, vdirs=vdirs, project=project, include_expired=True)
+                if loaded is None:
+                    continue
+                try:
+                    live_atom_sha = hashlib.sha256(Path(loaded[1]).read_bytes()).hexdigest()
+                except OSError:
+                    continue
+                if live_atom_sha != str(hit.get("file_sha256") or ""):
                     continue
                 filtered_hits.append(hit)
             elif hit_kind == "playbook":
@@ -1458,6 +1509,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                     telemetry_db_path=vdirs["telemetry_db_path"],
                 )
                 if not (pb_rep.valid and pb_rep.status == "active"):
+                    continue
+                if pb_rep.sha256 != str(hit.get("file_sha256") or ""):
                     continue
                 if project and not playbook_visible_in_scope(pb_rep, (project,)):
                     continue
@@ -1810,7 +1863,7 @@ async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) ->
 app = (
     Server(
         "second-brain",
-        version="0.3.0",
+        version="1.0.0",
         on_list_tools=handle_list_tools,
         on_call_tool=handle_call_tool,
         on_list_resources=handle_list_resources,

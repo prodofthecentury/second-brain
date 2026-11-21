@@ -135,6 +135,7 @@ function formatRadarMarkdown(data) {
     "",
     `- **Contradiction Alerts:** ${data?.contradiction_count ?? alerts.length} (${data?.high_severity_count ?? 0} high severity)`,
     `- **Source Anchor Drift Alerts:** ${data?.drift_count ?? drift.length}`,
+    `- **Expired Bi-Temporal Atoms:** ${data?.expired_count ?? (data?.expired_atoms || []).length}`,
     `- **Orphan Approved Atoms:** ${data?.orphan_approved_count ?? orphans.length}`,
     ...(data?.nli_status
       ? [
@@ -238,6 +239,11 @@ function formatSnapshotDiffMarkdown(d) {
       `  - **Before:** ${m.old_claim || m.before_claim || ""}`,
       `  - **After:** ${m.new_claim || m.after_claim || ""}`
     );
+    if (m.old_valid_from || m.new_valid_from || m.old_valid_until || m.new_valid_until) {
+      lines.push(
+        `  - **Validity:** \`${m.old_valid_from || "-inf"}..${m.old_valid_until || "+inf"}\` -> \`${m.new_valid_from || "-inf"}..${m.new_valid_until || "+inf"}\``
+      );
+    }
   }
   lines.push("");
 
@@ -262,19 +268,28 @@ function formatSnapshotRecallMarkdown(data, query, snapshotId) {
     "",
     `- **Query:** ${query}`,
     `- **Snapshot Merkle Root:** \`${data?.merkle_root || ""}\``,
-    `- **Matches Returned:** ${results.length}`,
-    "",
   ];
+  if (data?.as_of) {
+    lines.push(`- **Effective as_of:** \`${data.as_of}\``);
+  }
+  if (data?.rerank_backend) {
+    lines.push(`- **Reranker:** \`${data.rerank_backend}\``);
+  }
+  lines.push(`- **Matches Returned:** ${results.length}`, "");
   if (!results.length) {
     lines.push("_No matching atoms recorded in this historical snapshot._", "");
   } else {
     results.forEach((r, idx) => {
       lines.push(
         `## ${idx + 1}. \`${r.filename || r.atom_id || "Atom"}\`${r.score !== undefined ? ` _(score: ${r.score})_` : ""}`,
-        `- **SHA-256:** \`${r.file_sha256 || r.sha256 || ""}\``,
-        `- **Claim:** ${r.claim || ""}`,
-        ""
+        `- **SHA-256:** \`${r.file_sha256 || r.sha256 || ""}\``
       );
+      if (r.valid_from || r.valid_until || (r.temporal_status && r.temporal_status !== "unbounded")) {
+        lines.push(
+          `- **Validity:** \`${r.valid_from || "-inf"}..${r.valid_until || "+inf"}\` (\`${r.temporal_status || "active"}\`)`
+        );
+      }
+      lines.push(`- **Claim:** ${r.claim || ""}`, "");
       if (r.evidence) {
         lines.push(`> ${String(r.evidence).replace(/\r?\n/g, "\n> ")}`, "");
       }
@@ -353,6 +368,13 @@ function formatAtomProofMarkdown(ref, itemMeta, proof) {
     `- **Kind:** \`${isPlaybook ? "playbook" : itemMeta?.memory_type || "semantic"}\``,
     `- **File SHA-256:** \`${proof?.file_sha256 || itemMeta?.sha256 || ""}\``,
   ];
+  if (itemMeta?.valid_from || itemMeta?.valid_until) {
+    lines.push(
+      `- **Validity Window:** \`${itemMeta.valid_from || "-inf"}\` -> \`${
+        itemMeta.valid_until || "+inf"
+      }\` (\`${itemMeta.temporal_status || "active"}\`)`
+    );
+  }
   if (Array.isArray(itemMeta?.sources) && itemMeta.sources.length) {
     lines.push(`- **Sources:** ${itemMeta.sources.map((s) => `\`${s}\``).join(", ")}`);
   }

@@ -1,6 +1,6 @@
 {
   "name": "second-brain-desktop",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "description": "Second Brain — Local-first verifiable AI memory desktop app",
   "main": "main.js",
   "scripts": {
@@ -78,6 +78,10 @@
       {
         "from": "../plugins",
         "to": "backend/plugins"
+      },
+      {
+        "from": "../mobile",
+        "to": "backend/mobile"
       },
       {
         "from": "../setup.ps1",

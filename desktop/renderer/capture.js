@@ -9,8 +9,16 @@ const cancelBtn = document.getElementById("qcCancel");
 const closeTopBtn = document.getElementById("qcCloseTop");
 const statusEl = document.getElementById("qcStatus");
 const shortcutHintEl = document.getElementById("qcShortcutHint");
+const mediaFileInputEl = document.getElementById("qcMediaFileInput");
+const attachMediaBtn = document.getElementById("qcAttachMediaBtn");
+const recordAudioBtn = document.getElementById("qcRecordAudioBtn");
+const mediaBadgeEl = document.getElementById("qcMediaBadge");
 
 let isSaving = false;
+let pendingMedia = null; // { filename, content_base64, byteLength }
+let activeRecorder = null;
+let activeStream = null;
+let audioChunks = [];
 
 function applyPlatformLabels(platform) {
   if (platform !== "darwin") return;
@@ -19,7 +27,7 @@ function applyPlatformLabels(platform) {
   }
   if (bodyEl) {
     bodyEl.placeholder =
-      "Capture a thought, snippet, or decision... (⌘+Enter to save)";
+      "Capture a thought, snippet, decision, or paste a screenshot (⌘+V)... (⌘+Enter to save)";
   }
 }
 
@@ -41,6 +49,50 @@ function showStatus(msg, kind = "info") {
       : "status-banner banner-ok no-drag";
 }
 
+function updateMediaBadge() {
+  if (!mediaBadgeEl) return;
+  if (!pendingMedia) {
+    mediaBadgeEl.style.display = "none";
+    mediaBadgeEl.textContent = "";
+    return;
+  }
+  mediaBadgeEl.style.display = "block";
+  const kb = Math.max(1, Math.round((pendingMedia.byteLength || 0) / 1024));
+  mediaBadgeEl.textContent = `Staged media: ${pendingMedia.filename} (${kb} KB) — click Save to ingest into 0-raw/.`;
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const str = String(reader.result || "");
+      const idx = str.indexOf(",");
+      resolve(idx >= 0 ? str.slice(idx + 1) : str);
+    };
+    reader.onerror = () => reject(new Error("Failed to read media bytes."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function stageBlobForCapture(blob, fallbackName) {
+  if (!blob || blob.size === 0) {
+    showStatus("Selected media is empty.", "warn");
+    return;
+  }
+  if (blob.size > 24 * 1024 * 1024) {
+    showStatus("Media exceeds 24 MiB upload limit.", "error");
+    return;
+  }
+  const content_base64 = await blobToBase64(blob);
+  pendingMedia = {
+    filename: fallbackName,
+    content_base64,
+    byteLength: blob.size,
+  };
+  updateMediaBadge();
+  syncDestinationUi();
+}
+
 function parseTagsInput(raw) {
   const tags = String(raw || "")
     .split(",")
@@ -51,16 +103,93 @@ function parseTagsInput(raw) {
 
 function syncDestinationUi() {
   if (!saveBtn) return;
+  if (isSaving) {
+    saveBtn.textContent = "Saving...";
+    return;
+  }
+  if (pendingMedia) {
+    saveBtn.textContent = "Ingest Media";
+    return;
+  }
   const isInbox = destEl && destEl.value === "inbox";
-  saveBtn.textContent = isSaving
-    ? "Saving..."
-    : isInbox
-    ? "Queue in Inbox"
-    : "Save Note";
+  saveBtn.textContent = isInbox ? "Queue in Inbox" : "Save Note";
 }
 
 if (destEl) {
   destEl.addEventListener("change", syncDestinationUi);
+}
+
+if (attachMediaBtn && mediaFileInputEl) {
+  attachMediaBtn.addEventListener("click", () => mediaFileInputEl.click());
+  mediaFileInputEl.addEventListener("change", async () => {
+    const f = mediaFileInputEl.files && mediaFileInputEl.files[0];
+    if (f) {
+      await stageBlobForCapture(f, f.name || "capture.bin");
+    }
+    mediaFileInputEl.value = "";
+  });
+}
+
+window.addEventListener("paste", async (e) => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.kind === "file" && item.type.startsWith("image/")) {
+      const file = item.getAsFile();
+      if (file) {
+        e.preventDefault();
+        const ext = (file.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "") || "png";
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        await stageBlobForCapture(file, `screenshot-${stamp}.${ext}`);
+        return;
+      }
+    }
+  }
+});
+
+function stopVoiceStream() {
+  if (activeStream) {
+    for (const track of activeStream.getTracks()) {
+      track.stop();
+    }
+    activeStream = null;
+  }
+}
+
+if (recordAudioBtn) {
+  recordAudioBtn.addEventListener("click", async () => {
+    if (activeRecorder && activeRecorder.state === "recording") {
+      activeRecorder.stop();
+      return;
+    }
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function" || typeof MediaRecorder === "undefined") {
+      showStatus("Microphone recording is unavailable on this host.", "warn");
+      return;
+    }
+    try {
+      activeStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunks = [];
+      activeRecorder = new MediaRecorder(activeStream);
+      recordAudioBtn.textContent = "Stop Recording";
+      showStatus("Recording voice memo... click Stop Recording when finished.", "info");
+      activeRecorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) audioChunks.push(ev.data);
+      };
+      activeRecorder.onstop = async () => {
+        recordAudioBtn.textContent = "Record Voice";
+        stopVoiceStream();
+        const blob = new Blob(audioChunks, { type: "audio/webm" });
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        showStatus("");
+        await stageBlobForCapture(blob, `voice-memo-${stamp}.webm`);
+      };
+      activeRecorder.start();
+    } catch (err) {
+      stopVoiceStream();
+      recordAudioBtn.textContent = "Record Voice";
+      showStatus(`Microphone unavailable: ${err?.message || String(err)}`, "error");
+    }
+  });
 }
 
 function applyBackendStatus(st) {
@@ -107,8 +236,8 @@ if (window.secondBrain && typeof window.secondBrain.onCaptureFocus === "function
 async function save() {
   if (isSaving) return;
   const body = (bodyEl ? bodyEl.value : "").trim();
-  if (!body) {
-    showStatus("Enter note content before saving.", "warn");
+  if (!body && !pendingMedia) {
+    showStatus("Enter note content or attach/paste media before saving.", "warn");
     if (bodyEl) bodyEl.focus();
     return;
   }
@@ -125,30 +254,49 @@ async function save() {
   showStatus("");
 
   try {
-    let res;
-    if (dest === "inbox") {
-      const headerLines = [];
-      if (rawTitle) headerLines.push(`# ${rawTitle}`);
-      if (tags.length) headerLines.push(`Tags: ${tags.join(", ")}`);
-      const content = headerLines.length
-        ? `${headerLines.join("\n")}\n\n${body}`
-        : body;
-      res = await window.secondBrain.request("POST", "/v1/inbox", {
-        content,
-        source: "desktop_quick_capture",
+    let res = null;
+    if (pendingMedia) {
+      res = await window.secondBrain.request("POST", "/v1/ingest/media", {
+        filename: pendingMedia.filename,
+        content_base64: pendingMedia.content_base64,
       });
-    } else {
-      res = await window.secondBrain.request("POST", "/v1/notes", {
-        title,
-        body,
-        tags,
-      });
+      if (!res || !res.ok) {
+        const errMsg =
+          res?.data?.error ||
+          res?.error ||
+          `Media ingestion failed (HTTP ${res?.status || "unavailable"})`;
+        showStatus(errMsg, "error");
+        return;
+      }
+    }
+
+    if (body) {
+      if (dest === "inbox") {
+        const headerLines = [];
+        if (rawTitle) headerLines.push(`# ${rawTitle}`);
+        if (tags.length) headerLines.push(`Tags: ${tags.join(", ")}`);
+        const content = headerLines.length
+          ? `${headerLines.join("\n")}\n\n${body}`
+          : body;
+        res = await window.secondBrain.request("POST", "/v1/inbox", {
+          content,
+          source: "desktop_quick_capture",
+        });
+      } else {
+        res = await window.secondBrain.request("POST", "/v1/notes", {
+          title,
+          body,
+          tags,
+        });
+      }
     }
 
     if (res && res.ok) {
       if (titleEl) titleEl.value = "";
       if (bodyEl) bodyEl.value = "";
       if (tagsEl) tagsEl.value = "";
+      pendingMedia = null;
+      updateMediaBadge();
       showStatus("");
       await window.secondBrain.notifyMainRefresh();
       await window.secondBrain.closeCapture();
@@ -172,6 +320,10 @@ async function save() {
 }
 
 function requestClose() {
+  stopVoiceStream();
+  pendingMedia = null;
+  updateMediaBadge();
+  syncDestinationUi();
   if (!isSaving && window.secondBrain) {
     window.secondBrain.closeCapture();
   }
