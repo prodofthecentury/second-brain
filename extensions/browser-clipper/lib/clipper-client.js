@@ -60,16 +60,17 @@ function parseTagsInput(rawTags) {
     .slice(0, 32);
 }
 
-function buildClipPayload({ url, title, selectedQuote, pageText, tags, destination }) {
+function buildClipPayload({ url, title, selectedQuote, pageText, rawHtml, tags, destination }) {
   const cleanUrl = validateClipUrl(url);
   const cleanTitle = String(title || "").replace(/\s+/g, " ").trim().slice(0, 240);
   const cleanQuote = String(selectedQuote || "").trim().slice(0, MAX_QUOTE_CHARS);
   const cleanBody = String(pageText || "").trim().slice(0, MAX_PAGE_TEXT_CHARS);
-  if (!cleanQuote && !cleanBody) {
+  const cleanHtml = String(rawHtml || "").trim().slice(0, 500000);
+  if (!cleanQuote && !cleanBody && !cleanHtml) {
     throw new Error("Nothing selected or extracted from the page to clip.");
   }
   const dest = destination === "inbox" ? "inbox" : "note";
-  return {
+  const payload = {
     url: cleanUrl,
     title: cleanTitle,
     selected_quote: cleanQuote,
@@ -77,6 +78,50 @@ function buildClipPayload({ url, title, selectedQuote, pageText, tags, destinati
     tags: parseTagsInput(tags),
     destination: dest,
   };
+  if (cleanHtml) {
+    payload.raw_html = cleanHtml;
+  }
+  return payload;
+}
+
+function validatePairingCode(rawCode) {
+  const cleaned = String(rawCode || "").trim().toUpperCase();
+  if (!/^SBC-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(cleaned)) {
+    throw new Error("Enter a valid 1-click pairing code (format: SBC-XXXX-XXXX-XXXX).");
+  }
+  return cleaned;
+}
+
+async function redeemPairingCode({ port, code, origin, label, fetchImpl }) {
+  const fn = fetchImpl || globalThis.fetch;
+  if (typeof fn !== "function") {
+    throw new Error("fetch API is unavailable in this environment.");
+  }
+  const baseUrl = buildLoopbackBaseUrl(port);
+  const safeCode = validatePairingCode(code);
+  const cleanOrigin = String(origin || "").trim().toLowerCase().replace(/\/+$/, "");
+  if (!cleanOrigin) {
+    throw new Error("Browser extension origin is unavailable.");
+  }
+  const resp = await fn(`${baseUrl}/v1/clipper/redeem`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code: safeCode,
+      origin: cleanOrigin,
+      label: String(label || "Browser Clipper").trim().slice(0, 80) || "Browser Clipper",
+    }),
+  });
+  let data = {};
+  try {
+    data = await resp.json();
+  } catch {
+    data = { error: `HTTP ${resp.status}` };
+  }
+  if (!resp.ok) {
+    throw new Error(data.error || `Pairing code redemption failed (HTTP ${resp.status})`);
+  }
+  return data;
 }
 
 async function clipperRequest({ port, token, method, path, body, fetchImpl }) {
@@ -126,10 +171,12 @@ const exported = {
   normalizeLoopbackPort,
   buildLoopbackBaseUrl,
   validateClipperToken,
+  validatePairingCode,
   validateClipUrl,
   parseTagsInput,
   buildClipPayload,
   clipperRequest,
+  redeemPairingCode,
   testClipperConnection,
   sendWebClip,
 };

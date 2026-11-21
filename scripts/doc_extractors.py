@@ -17,13 +17,17 @@ sources directly; callers archive them separately with SHA-256 lineage.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import csv
 from dataclasses import dataclass, field
 import io
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from typing import Any
 import xml.etree.ElementTree as ET
 import zipfile
@@ -40,7 +44,9 @@ MAX_ZIP_RATIO = 200
 MAX_PDF_PAGES = 2000
 MAX_TABLE_ROWS = 20000
 MAX_EXTRACTED_CHARS = 8_000_000
+MAX_OCR_IMAGE_PIXELS = 25_000_000
 EXTRACTION_BODY_MARKER = "<!-- extraction_body -->"
+_TABLE_BLOCK_SENTINEL = "\x00__SB_MD_TABLE__\x00"
 
 _WS_RE = re.compile(r"[ \t\u00a0\u2000-\u200b\u3000]+")
 _HEADING_NAME_RE = re.compile(
@@ -152,8 +158,8 @@ def _open_safe_zip(path: str) -> zipfile.ZipFile:
 
 
 def _safe_xml(data: bytes) -> ET.Element:
-    head = data[:4096].upper()
-    if b"<!DOCTYPE" in head or b"<!ENTITY" in data.upper():
+    upper_data = data.upper()
+    if b"<!DOCTYPE" in upper_data or b"<!ENTITY" in upper_data:
         raise DocumentExtractionError("XML DOCTYPE/ENTITY declarations are not allowed in document containers.")
     try:
         return ET.fromstring(data)
@@ -215,7 +221,374 @@ def _detect_running_lines(pages: list[list[str]]) -> set[str]:
     return {key for key, count in counts.items() if count >= threshold}
 
 
-def extract_pdf(path: str) -> DocumentExtraction:
+def _collect_pdf_positioned_fragments(page) -> list[tuple[float, float, float, str]]:
+    """Extract (x, y, font_size, cleaned_text) fragments from a pypdf PageObject."""
+    fragments: list[tuple[float, float, float, str]] = []
+
+    def _visitor(text: str, cm: Any, tm: Any, _font_dict: Any, font_size: Any) -> None:
+        cleaned = _clean_line(text)
+        if not cleaned:
+            return
+        try:
+            x = float(cm[0]) * float(tm[4]) + float(cm[2]) * float(tm[5]) + float(cm[4])
+            y = float(cm[1]) * float(tm[4]) + float(cm[3]) * float(tm[5]) + float(cm[5])
+            fsize = float(font_size or 11.0) if font_size else 11.0
+        except Exception:
+            x, y, fsize = 72.0, 0.0, 11.0
+        fragments.append((x, y, max(6.0, min(fsize, 72.0)), cleaned))
+
+    page.extract_text(visitor_text=_visitor)
+    return fragments
+
+
+_LAYOUT_CELL_RE = re.compile(r"\S+(?: {1,2}\S+)*")
+
+
+def _extract_pdf_layout_rows(
+    page,
+    page_width: float,
+) -> list[tuple[float, list[tuple[float, float, str]]]]:
+    """Extract top-to-bottom rows of ``(x_start, x_end, cell_text)`` using pypdf's layout engine."""
+    layout_text = ""
+    try:
+        layout_text = page.extract_text(extraction_mode="layout") or ""
+    except Exception:
+        layout_text = ""
+
+    raw_lines = [
+        ln.rstrip()
+        for ln in layout_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if ln.strip()
+    ]
+    if raw_lines:
+        max_cols = max(max((len(ln) for ln in raw_lines), default=80), 40)
+        pt_per_col = page_width / float(max_cols)
+        rows: list[tuple[float, list[tuple[float, float, str]]]] = []
+        total = len(raw_lines)
+        for idx, ln in enumerate(raw_lines):
+            ry = float(total - idx) * 14.0
+            cells: list[tuple[float, float, str]] = []
+            for m in _LAYOUT_CELL_RE.finditer(ln):
+                cleaned = _clean_line(m.group(0))
+                if cleaned:
+                    cells.append((m.start() * pt_per_col, m.end() * pt_per_col, cleaned))
+            if cells:
+                rows.append((ry, cells))
+        if rows:
+            return rows
+
+    try:
+        fragments = _collect_pdf_positioned_fragments(page)
+    except Exception:
+        fragments = []
+    return _group_fragments_into_rows(fragments)
+
+
+def _group_fragments_into_rows(
+    fragments: list[tuple[float, float, float, str]],
+    *,
+    y_tol: float = 3.5,
+    cell_gap_pt: float = 26.0,
+) -> list[tuple[float, list[tuple[float, float, str]]]]:
+    """Group positioned fragments into top-to-bottom rows of (x_start, x_end, cell_text) cells."""
+    if not fragments:
+        return []
+    # Sort descending by y, then ascending by x
+    ordered = sorted(fragments, key=lambda item: (-round(item[1] / y_tol), item[0]))
+    y_bands: list[list[tuple[float, float, float, str]]] = []
+    for frag in ordered:
+        if not y_bands or abs(frag[1] - y_bands[-1][0][1]) > y_tol:
+            y_bands.append([frag])
+        else:
+            y_bands[-1].append(frag)
+
+    rows: list[tuple[float, list[tuple[float, float, str]]]] = []
+    for band in y_bands:
+        band.sort(key=lambda f: f[0])
+        row_y = sum(f[1] for f in band) / len(band)
+        cells: list[tuple[float, float, str]] = []
+        for x, _y, fsize, txt in band:
+            est_w = max(4.0, len(txt) * fsize * 0.48)
+            x_end = x + est_w
+            if not cells:
+                cells.append((x, x_end, txt))
+            else:
+                prev_x, prev_end, prev_txt = cells[-1]
+                if (x - prev_end) < cell_gap_pt:
+                    merged_txt = f"{prev_txt} {txt}".strip()
+                    cells[-1] = (prev_x, max(prev_end, x_end), merged_txt)
+                else:
+                    cells.append((x, x_end, txt))
+        if cells:
+            rows.append((row_y, cells))
+    rows.sort(key=lambda r: -r[0])
+    return rows
+
+
+def _format_markdown_pipe_table(table_rows: list[list[str]]) -> str:
+    col_count = max((len(r) for r in table_rows), default=0)
+    if col_count < 2:
+        return "\n".join(" ".join(r) for r in table_rows)
+
+    def _fmt_row(cells: list[str]) -> str:
+        padded = [(_neutralize(c).replace("|", "\\|").strip()) for c in cells[:col_count]]
+        while len(padded) < col_count:
+            padded.append("")
+        return "| " + " | ".join(padded) + " |"
+
+    header = _fmt_row(table_rows[0])
+    sep = "| " + " | ".join(["---"] * col_count) + " |"
+    body = [_fmt_row(r) for r in table_rows[1:]]
+    return "\n".join([header, sep, *body])
+
+
+def _reconstruct_pdf_page_lines(
+    page,
+) -> tuple[list[str], bool]:
+    """Reconstruct reading-order lines and Markdown pipe tables from a PDF page.
+
+    Returns ``(ordered_lines_or_table_sentinels, used_advanced_layout)``.
+    """
+    try:
+        page_width = float(page.mediabox.width)
+    except Exception:
+        page_width = 612.0
+    if page_width <= 0:
+        page_width = 612.0
+
+    rows = _extract_pdf_layout_rows(page, page_width)
+    if not rows:
+        raw = page.extract_text() or ""
+        return [_clean_line(ln) for ln in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")], False
+
+    midpoint = page_width * 0.50
+
+    # Check for 2-column academic prose layout:
+    # Distinct left-column cells (ending near or before midpoint) and right-column cells (starting near/after midpoint),
+    # where cells carry prose phrases rather than short tabular values.
+    two_col_rows = [
+        r for r in rows
+        if len(r[1]) == 2
+        and r[1][0][0] < (midpoint - 16.0)
+        and r[1][0][1] <= (midpoint + 30.0)
+        and r[1][1][0] >= (midpoint - 12.0)
+    ]
+    all_two_col_lengths = [
+        len(cell[2])
+        for _ry, cells in two_col_rows
+        for cell in cells
+    ]
+    avg_two_col_len = (sum(all_two_col_lengths) / len(all_two_col_lengths)) if all_two_col_lengths else 0.0
+    right_only_rows = [
+        r for r in rows
+        if len(r[1]) == 1 and r[1][0][0] >= (midpoint - 12.0) and len(r[1][0][2]) >= 18
+    ]
+    is_two_column = (len(two_col_rows) >= 3 and avg_two_col_len >= 22.0) or (
+        (len(two_col_rows) + len(right_only_rows)) >= 4 and avg_two_col_len >= 20.0
+    )
+
+    if is_two_column:
+        first_col_y = max(
+            [r[0] for r in two_col_rows] + [r[0] for r in right_only_rows],
+            default=rows[0][0],
+        )
+        last_col_y = min(
+            [r[0] for r in two_col_rows] + [r[0] for r in right_only_rows],
+            default=rows[-1][0],
+        )
+        top_full: list[tuple[float, str]] = []
+        left_col: list[tuple[float, str]] = []
+        right_col: list[tuple[float, str]] = []
+        bottom_full: list[tuple[float, str]] = []
+
+        for ry, cells in rows:
+            if len(cells) == 1:
+                cx, cend, ctxt = cells[0]
+                if cx < (midpoint - 12.0) and cend > (midpoint + 36.0):
+                    if ry >= first_col_y - 2.0:
+                        top_full.append((ry, ctxt))
+                    elif ry <= last_col_y + 2.0:
+                        bottom_full.append((ry, ctxt))
+                    else:
+                        left_col.append((ry, ctxt))
+                elif cx >= (midpoint - 12.0):
+                    right_col.append((ry, ctxt))
+                elif ry > first_col_y + 4.0:
+                    top_full.append((ry, ctxt))
+                elif ry < last_col_y - 4.0:
+                    bottom_full.append((ry, ctxt))
+                else:
+                    left_col.append((ry, ctxt))
+            else:
+                for cx, _cend, ctxt in cells:
+                    if cx < (midpoint - 12.0):
+                        left_col.append((ry, ctxt))
+                    else:
+                        right_col.append((ry, ctxt))
+
+        top_full.sort(key=lambda item: -item[0])
+        left_col.sort(key=lambda item: -item[0])
+        right_col.sort(key=lambda item: -item[0])
+        bottom_full.sort(key=lambda item: -item[0])
+
+        ordered_lines: list[str] = [txt for _, txt in top_full]
+        if left_col:
+            if ordered_lines:
+                ordered_lines.append("")
+            ordered_lines.extend(txt for _, txt in left_col)
+        if right_col:
+            if ordered_lines:
+                ordered_lines.append("")
+            ordered_lines.extend(txt for _, txt in right_col)
+        if bottom_full:
+            if ordered_lines:
+                ordered_lines.append("")
+            ordered_lines.extend(txt for _, txt in bottom_full)
+        return ordered_lines, True
+
+    # Single-column page: check for aligned multi-column tabular grids (>= 2 consecutive rows, >= 2 columns)
+    out_lines: list[str] = []
+    used_table = False
+    idx = 0
+    while idx < len(rows):
+        _ry, cells = rows[idx]
+        if 2 <= len(cells) <= 10 and all(len(c[2]) <= 64 for c in cells):
+            anchor_xs = [c[0] for c in cells]
+            table_group: list[list[str]] = [[c[2] for c in cells]]
+            j = idx + 1
+            while j < len(rows):
+                _nry, ncells = rows[j]
+                if len(ncells) != len(anchor_xs) or any(len(c[2]) > 64 for c in ncells):
+                    break
+                if all(abs(ncells[col_i][0] - anchor_xs[col_i]) <= 38.0 for col_i in range(len(anchor_xs))):
+                    table_group.append([c[2] for c in ncells])
+                    j += 1
+                else:
+                    break
+            if len(table_group) >= 2:
+                used_table = True
+                out_lines.append("")
+                out_lines.append(_TABLE_BLOCK_SENTINEL + _format_markdown_pipe_table(table_group))
+                out_lines.append("")
+                idx = j
+                continue
+        out_lines.append(" ".join(c[2] for c in cells))
+        idx += 1
+
+    if not used_table:
+        # Preserve pypdf's native line spacing on plain single-column pages for exact backwards compatibility
+        raw = page.extract_text() or ""
+        plain_lines = [_clean_line(ln) for ln in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+        if any(plain_lines):
+            return plain_lines, False
+    return out_lines, used_table
+
+
+def _sanitize_pdf_image_to_png(raw_bytes: bytes) -> bytes | None:
+    """Validate embedded PDF image bytes via Pillow (blocking decompression bombs) and return clean PNG."""
+    if not raw_bytes or len(raw_bytes) > 20 * 1024 * 1024:
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            w, h = img.size
+            if w <= 0 or h <= 0 or (w * h) > MAX_OCR_IMAGE_PIXELS:
+                return None
+            rgb = img.convert("RGB")
+            buf = io.BytesIO()
+            rgb.save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _run_local_ocr_on_png(
+    png_bytes: bytes,
+    page_number: int,
+    *,
+    ocr_fn: Callable[[bytes, int], str] | None = None,
+    allow_vision_ocr: bool = False,
+) -> tuple[str, str | None]:
+    """Run local-only OCR on a sanitized PNG image. Returns (extracted_text, engine_label)."""
+    if ocr_fn is not None:
+        try:
+            raw_ocr = ocr_fn(png_bytes, page_number)  # type: ignore[misc]
+        except TypeError:
+            raw_ocr = ocr_fn(png_bytes)  # type: ignore[call-arg]
+        txt = str(raw_ocr or "").strip()
+        return (txt, "custom-ocr") if txt else ("", None)
+
+    env_tess = (os.environ.get("BRAIN_TESSERACT_CMD") or "").strip()
+    tess_bin = env_tess if env_tess else shutil.which("tesseract")
+    if tess_bin and os.path.isfile(tess_bin) and not _is_reparse_or_link(tess_bin):
+        fd, tmp_png = tempfile.mkstemp(prefix=".sb-pdf-ocr-", suffix=".png")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(png_bytes)
+            proc = subprocess.run(
+                [tess_bin, tmp_png, "stdout", "--psm", "6"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20.0,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout and proc.stdout.strip():
+                return proc.stdout.strip(), "tesseract-local"
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(tmp_png):
+                try:
+                    os.remove(tmp_png)
+                except OSError:
+                    pass
+
+    use_vision = allow_vision_ocr or (os.environ.get("BRAIN_PDF_VISION_OCR") or "").strip() == "1"
+    if use_vision:
+        try:
+            import base64
+            from config import VISION_MODEL
+            from host_adapters import validate_model_identifier
+            import ollama
+            from ollama_utils import _resolve_local_ollama_rule_and_url
+
+            _eff_rule, base_url = _resolve_local_ollama_rule_and_url()
+            safe_vision_model = validate_model_identifier(VISION_MODEL, provider="ollama")
+            b64_img = base64.b64encode(png_bytes).decode("ascii")
+            client = ollama.Client(host=base_url, timeout=30.0, follow_redirects=False, trust_env=False)
+            resp = client.chat(
+                model=safe_vision_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Transcribe all visible text on this scanned document page verbatim. Output only the transcribed text.",
+                        "images": [b64_img],
+                    }
+                ],
+                options={"temperature": 0.0, "num_predict": 1024},
+            )
+            txt = str((resp.get("message") or {}).get("content") or "").strip()
+            if txt:
+                return txt, f"ollama-vision:{safe_vision_model}"
+        except Exception:
+            pass
+
+    return "", None
+
+
+MAX_OCR_IMAGES_PER_PDF = 32
+
+
+def extract_pdf(
+    path: str,
+    *,
+    enable_ocr: bool = True,
+    allow_vision_ocr: bool = False,
+    ocr_fn: Callable[[bytes, int], str] | None = None,
+) -> DocumentExtraction:
     try:
         from pypdf import PdfReader
         from pypdf.errors import PdfReadError
@@ -242,15 +615,65 @@ def extract_pdf(path: str) -> DocumentExtraction:
     outline_titles = _pdf_outline_titles(reader)
     raw_pages: list[list[str]] = []
     warnings: list[str] = []
+    any_layout_upgraded = False
+    ocr_engines_used: list[str] = []
+    ocr_images_processed = 0
+    ocr_budget_warned = False
+
     for index, page in enumerate(page_objs, start=1):
         try:
-            text = page.extract_text() or ""
+            lines, used_adv = _reconstruct_pdf_page_lines(page)
+            if used_adv:
+                any_layout_upgraded = True
         except Exception as exc:
             warnings.append(f"page {index}: text extraction failed ({type(exc).__name__})")
-            text = ""
-        raw_pages.append([_clean_line(ln) for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")])
+            lines = []
 
-    running = _detect_running_lines(raw_pages)
+        printable_chars = sum(
+            len(ln.replace(_TABLE_BLOCK_SENTINEL, "").strip())
+            for ln in lines
+            if ln and ln.strip()
+        )
+        if enable_ocr and printable_chars < 20:
+            try:
+                page_images = list(getattr(page, "images", ()) or ())
+            except Exception:
+                page_images = []
+            ocr_lines: list[str] = []
+            for img_obj in page_images[:4]:
+                if ocr_images_processed >= MAX_OCR_IMAGES_PER_PDF:
+                    if not ocr_budget_warned:
+                        warnings.append(f"OCR image budget ({MAX_OCR_IMAGES_PER_PDF} images per PDF) reached; remaining sparse pages skipped.")
+                        ocr_budget_warned = True
+                    break
+                img_bytes = getattr(img_obj, "data", None)
+                if not isinstance(img_bytes, (bytes, bytearray)):
+                    continue
+                clean_png = _sanitize_pdf_image_to_png(bytes(img_bytes))
+                if clean_png is None:
+                    continue
+                ocr_images_processed += 1
+                ocr_txt, eng = _run_local_ocr_on_png(
+                    clean_png,
+                    index,
+                    ocr_fn=ocr_fn,
+                    allow_vision_ocr=allow_vision_ocr,
+                )
+                if ocr_txt:
+                    if eng and eng not in ocr_engines_used:
+                        ocr_engines_used.append(eng)
+                    for raw_ln in ocr_txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                        cl = _clean_line(raw_ln)
+                        if cl:
+                            ocr_lines.append(cl)
+            if ocr_lines:
+                lines = [ln for ln in lines if ln] + ocr_lines
+
+        raw_pages.append(lines)
+
+    running = _detect_running_lines(
+        [[ln for ln in p if not ln.startswith(_TABLE_BLOCK_SENTINEL)] for p in raw_pages]
+    )
     title = ""
     try:
         meta_title = (reader.metadata or {}).get("/Title") if reader.metadata else None
@@ -265,18 +688,22 @@ def extract_pdf(path: str) -> DocumentExtraction:
 
         def flush() -> None:
             if paragraph:
-                parts.append(" ".join(paragraph))
+                parts.append(_neutralize(" ".join(paragraph)))
                 paragraph.clear()
 
         for line in lines:
             if not line:
                 flush()
                 continue
+            if line.startswith(_TABLE_BLOCK_SENTINEL):
+                flush()
+                parts.append(line[len(_TABLE_BLOCK_SENTINEL) :])
+                continue
             if re.sub(r"\d+", "#", line) in running:
                 continue
             if _looks_like_heading(line, outline_titles):
                 flush()
-                parts.append(f"### {line}")
+                parts.append(f"### {_neutralize(line)}")
                 if not title and index == 1 and not _HEADING_NAME_RE.match(line):
                     title = line
                 continue
@@ -284,7 +711,7 @@ def extract_pdf(path: str) -> DocumentExtraction:
             if line.endswith((".", "?", "!", ":")) and len(" ".join(paragraph)) > 400:
                 flush()
         flush()
-        body = "\n\n".join(_neutralize(p) for p in parts) if parts else "_(no extractable text on this page)_"
+        body = "\n\n".join(parts) if parts else "_(no extractable text on this page)_"
         page_blocks.append(f"## [page {index}]\n\n{body}")
 
     header = f"# {_neutralize(title)}\n\n" if title else ""
@@ -315,15 +742,38 @@ def extract_pdf(path: str) -> DocumentExtraction:
         version = getattr(pypdf, "__version__", "unknown")
     except Exception:  # pragma: no cover
         version = "unknown"
+
+    if ocr_engines_used:
+        extractor_name = "pypdf-layout+ocr"
+        model_label = f"pypdf {version} + {', '.join(ocr_engines_used)}"
+        model_digest = "local-ocr"
+        limitations_note = (
+            "Coordinate-aware PDF layout/table reconstruction with Pillow-sanitized local OCR fallback on sparse pages. "
+            "Verify OCR quotes against the archived PDF."
+        )
+    elif any_layout_upgraded:
+        extractor_name = "pypdf-layout"
+        model_label = f"pypdf {version}"
+        model_digest = "deterministic-no-model"
+        limitations_note = (
+            "Deterministic coordinate-aware PDF multi-column & Markdown pipe-table extraction. "
+            "Verify quotes against the archived PDF."
+        )
+    else:
+        extractor_name = "pypdf-text"
+        model_label = f"pypdf {version}"
+        model_digest = "deterministic-no-model"
+        limitations_note = (
+            "Deterministic PDF text-layer extraction; multi-column layout, tables, and sparse-page local OCR "
+            "activate automatically when detected. Verify quotes against the archived PDF."
+        )
+
     return DocumentExtraction(
         markdown=markdown,
-        extractor="pypdf-text",
-        model=f"pypdf {version}",
-        model_digest="deterministic-no-model",
-        limitations=(
-            "Deterministic PDF text-layer extraction; scanned images are not OCRed, multi-column layout, "
-            "tables, equations, and ligatures may be reordered or merged. Verify quotes against the archived PDF."
-        ),
+        extractor=extractor_name,
+        model=model_label,
+        model_digest=model_digest,
+        limitations=limitations_note,
         title=title,
         page_count=len(page_objs),
         section_count=sum(block.count("\n### ") for block in page_blocks),

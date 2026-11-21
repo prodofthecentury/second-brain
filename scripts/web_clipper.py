@@ -50,8 +50,12 @@ MAX_CLIP_TITLE_CHARS = 240
 MAX_CLIP_URL_CHARS = 2048
 MAX_CLIP_QUOTE_CHARS = 32_000
 MAX_CLIP_PAGE_TEXT_CHARS = 200_000
+MAX_CLIP_RAW_HTML_CHARS = 500_000
 MAX_PAIRINGS_FILE_BYTES = 262_144
 MAX_ACTIVE_PAIRINGS = 64
+MAX_PENDING_PAIRING_CODES = 8
+PAIRING_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+_PAIRING_CODE_RE = re.compile(r"^SBC-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 
 _CHROME_EXT_ORIGIN_RE = re.compile(r"^chrome-extension://[a-p]{32}$")
 _MOZ_EXT_ORIGIN_RE = re.compile(
@@ -77,6 +81,12 @@ def _now_iso() -> str:
 def _clipper_pairings_path(security_dir: str | Path | None = None) -> Path:
     base = Path(security_dir).expanduser().resolve() if security_dir is not None else security_state_dir()
     return base / CLIPPER_PAIRINGS_FILENAME
+
+
+def is_valid_extension_origin(origin: str) -> bool:
+    """Return True iff origin is a syntactically valid Chrome/Edge or Firefox extension origin."""
+    cleaned = str(origin or "").strip().lower().rstrip("/")
+    return bool(_CHROME_EXT_ORIGIN_RE.fullmatch(cleaned) or _MOZ_EXT_ORIGIN_RE.fullmatch(cleaned))
 
 
 def validate_extension_origin(origin: str) -> str:
@@ -195,7 +205,8 @@ def create_clipper_pairing(
             "scopes": ["clipper:write", "clipper:status"],
         }
         pairings.append(record)
-        _save_pairings_unlocked(path, {"schema_version": 1, "pairings": pairings})
+        pending_codes = [c for c in data.get("pending_codes", []) if isinstance(c, dict)]
+        _save_pairings_unlocked(path, {"schema_version": 1, "pairings": pairings, "pending_codes": pending_codes})
 
     return {
         "pairing_id": pairing_id,
@@ -207,6 +218,102 @@ def create_clipper_pairing(
         "scopes": list(record["scopes"]),
         "allowed_endpoints": ["/v1/clipper/ping", "/v1/clipper/status", "/v1/clipper/clip"],
     }
+
+
+def _prune_expired_codes(codes: list[dict[str, object]], now_epoch: float) -> list[dict[str, object]]:
+    kept: list[dict[str, object]] = []
+    for item in codes:
+        if not isinstance(item, dict):
+            continue
+        try:
+            exp = float(item.get("expires_epoch") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if exp > now_epoch and len(str(item.get("code_sha256") or "")) == 64:
+            kept.append(item)
+    return kept
+
+
+def create_clipper_pairing_code(
+    *,
+    label: str = "Browser Clipper",
+    ttl_seconds: int = 300,
+    security_dir: str | Path | None = None,
+) -> dict[str, object]:
+    """Mint a short-lived, single-use 60-bit 1-click pairing code (SBC-XXXX-XXXX-XXXX) for the owner."""
+    clean_label = re.sub(r"\s+", " ", str(label or "Browser Clipper")).strip()[:80] or "Browser Clipper"
+    ttl = max(30, min(int(ttl_seconds), 900))
+    groups = ["".join(secrets.choice(PAIRING_CODE_ALPHABET) for _ in range(4)) for _ in range(3)]
+    raw_code = f"SBC-{groups[0]}-{groups[1]}-{groups[2]}"
+    code_sha = _sha256_str(raw_code)
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    now_epoch = now_dt.timestamp()
+    exp_epoch = round(now_epoch + ttl, 3)
+    expires_at = datetime.datetime.fromtimestamp(exp_epoch, tz=datetime.timezone.utc).isoformat(timespec="seconds")
+
+    path = _clipper_pairings_path(security_dir)
+    with _CLIPPER_LOCK:
+        data = _load_pairings_unlocked(path)
+        pairings = [p for p in data.get("pairings", []) if isinstance(p, dict)]
+        pending = _prune_expired_codes(list(data.get("pending_codes", []) or []), now_epoch)
+        if len(pending) >= MAX_PENDING_PAIRING_CODES:
+            pending = pending[-(MAX_PENDING_PAIRING_CODES - 1) :]
+        pending.append(
+            {
+                "code_sha256": code_sha,
+                "label": clean_label,
+                "created_at": now_dt.isoformat(timespec="seconds"),
+                "expires_at": expires_at,
+                "expires_epoch": exp_epoch,
+            }
+        )
+        _save_pairings_unlocked(path, {"schema_version": 1, "pairings": pairings, "pending_codes": pending})
+
+    return {
+        "code": raw_code,
+        "label": clean_label,
+        "ttl_seconds": ttl,
+        "expires_at": expires_at,
+    }
+
+
+def redeem_clipper_pairing_code(
+    code: str,
+    origin: str,
+    *,
+    label: str | None = None,
+    security_dir: str | Path | None = None,
+) -> dict[str, object]:
+    """Consume a valid single-use pairing code and register the browser extension origin."""
+    norm_origin = validate_extension_origin(origin)
+    norm_code = str(code or "").strip().upper()
+    if not _PAIRING_CODE_RE.fullmatch(norm_code):
+        raise ClipperSecurityError("Invalid or expired 1-click pairing code.")
+    supplied_sha = _sha256_str(norm_code)
+    now_epoch = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+    path = _clipper_pairings_path(security_dir)
+    matched_label: str | None = None
+    with _CLIPPER_LOCK:
+        data = _load_pairings_unlocked(path)
+        pairings = [p for p in data.get("pairings", []) if isinstance(p, dict)]
+        active_codes = _prune_expired_codes(list(data.get("pending_codes", []) or []), now_epoch)
+        remaining_codes: list[dict[str, object]] = []
+        matched = False
+        for entry in active_codes:
+            expected_sha = str(entry.get("code_sha256") or "")
+            if not matched and len(expected_sha) == 64 and hmac.compare_digest(supplied_sha, expected_sha):
+                matched = True
+                matched_label = str(entry.get("label") or "Browser Clipper")
+            else:
+                remaining_codes.append(entry)
+        # Always persist pruned/consumed state so expired or redeemed codes cannot be replayed.
+        _save_pairings_unlocked(path, {"schema_version": 1, "pairings": pairings, "pending_codes": remaining_codes})
+        if not matched:
+            raise ClipperSecurityError("Invalid or expired 1-click pairing code.")
+
+    effective_label = re.sub(r"\s+", " ", str(label or matched_label or "Browser Clipper")).strip()[:80] or "Browser Clipper"
+    return create_clipper_pairing(norm_origin, label=effective_label, security_dir=security_dir)
 
 
 def list_clipper_pairings(*, security_dir: str | Path | None = None) -> list[dict[str, object]]:
@@ -243,7 +350,8 @@ def revoke_clipper_pairing(pairing_id: str, *, security_dir: str | Path | None =
         remaining = [p for p in pairings if str(p.get("pairing_id") or "") != pid]
         if len(remaining) == len(pairings):
             raise FileNotFoundError(f"Clipper pairing not found: {pid}")
-        _save_pairings_unlocked(path, {"schema_version": 1, "pairings": remaining})
+        pending_codes = [c for c in data.get("pending_codes", []) if isinstance(c, dict)]
+        _save_pairings_unlocked(path, {"schema_version": 1, "pairings": remaining, "pending_codes": pending_codes})
     return {"status": "revoked", "pairing_id": pid}
 
 
@@ -343,12 +451,46 @@ def _write_exclusive_snapshot(directory: Path, stem: str, payload: bytes) -> str
         return name
 
 
+def extract_clean_markdown_from_html(raw_html: str, *, source_url: str = "") -> str:
+    """Extract clean article Markdown locally from raw HTML with zero network requests."""
+    markup = str(raw_html or "").strip()
+    if not markup:
+        return ""
+    if len(markup) > MAX_CLIP_RAW_HTML_CHARS:
+        raise ClipperError(f"Raw HTML exceeds maximum allowed length ({MAX_CLIP_RAW_HTML_CHARS} chars).")
+    try:
+        import trafilatura
+
+        extracted = trafilatura.extract(
+            markup,
+            url=source_url or None,
+            output_format="markdown",
+            include_links=True,
+            include_tables=True,
+            no_fallback=False,
+        )
+        if isinstance(extracted, str) and extracted.strip():
+            return extracted.replace("\r\n", "\n").strip()[:MAX_CLIP_PAGE_TEXT_CHARS]
+    except Exception:
+        pass
+    try:
+        from doc_extractors import _html_to_blocks
+
+        _title, blocks = _html_to_blocks(markup, heading_offset=1)
+        if blocks:
+            return "\n\n".join(blocks).strip()[:MAX_CLIP_PAGE_TEXT_CHARS]
+    except Exception:
+        pass
+    return ""
+
+
 def ingest_web_clip(
     *,
     url: str,
     title: str,
     selected_quote: str = "",
     page_text: str = "",
+    raw_html: str = "",
     tags: list[str] | tuple[str, ...] | str = (),
     destination: str = "note",
     capture_source: str = "browser-clipper",
@@ -359,6 +501,8 @@ def ingest_web_clip(
     clean_title = re.sub(r"\s+", " ", str(title or "")).strip()[:MAX_CLIP_TITLE_CHARS] or host
     clean_quote = str(selected_quote or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     clean_page = str(page_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if raw_html and str(raw_html).strip() and not clean_page:
+        clean_page = extract_clean_markdown_from_html(raw_html, source_url=clean_url)
     if len(clean_quote) > MAX_CLIP_QUOTE_CHARS:
         raise ClipperError(f"Selected quote exceeds maximum allowed length ({MAX_CLIP_QUOTE_CHARS} chars).")
     if len(clean_page) > MAX_CLIP_PAGE_TEXT_CHARS:
@@ -543,6 +687,17 @@ def main(argv: list[str] | None = None) -> int:
     p_pair.add_argument("--label", default="Browser Clipper", help="Human-friendly browser label.")
     p_pair.add_argument("--json", action="store_true", help="Output JSON.")
 
+    p_pcode = sub.add_parser("pair-code", help="Generate a short-lived 1-click pairing code for the browser extension.")
+    p_pcode.add_argument("--label", default="Browser Clipper", help="Human-friendly browser label.")
+    p_pcode.add_argument("--ttl", type=int, default=300, help="Expiration window in seconds (30..900).")
+    p_pcode.add_argument("--json", action="store_true", help="Output JSON.")
+
+    p_redeem = sub.add_parser("redeem", help="Redeem a 1-click pairing code for an extension origin.")
+    p_redeem.add_argument("--code", required=True, help="Pairing code (SBC-XXXX-XXXX-XXXX).")
+    p_redeem.add_argument("--origin", required=True, help="Extension origin.")
+    p_redeem.add_argument("--label", default=None, help="Optional browser label override.")
+    p_redeem.add_argument("--json", action="store_true", help="Output JSON.")
+
     p_list = sub.add_parser("list", help="List paired browser clipper extensions.")
     p_list.add_argument("--json", action="store_true", help="Output JSON.")
 
@@ -555,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
     p_clip.add_argument("--title", default="", help="Page title.")
     p_clip.add_argument("--quote", default="", help="Highlighted verbatim quote.")
     p_clip.add_argument("--body", default="", help="Cleaned page text.")
+    p_clip.add_argument("--html", default="", help="Optional raw HTML to convert via local Readability/trafilatura.")
     p_clip.add_argument("--tags", default="", help="Comma-separated tags.")
     p_clip.add_argument("--destination", choices=["note", "inbox"], default="note")
     p_clip.add_argument("--json", action="store_true", help="Output JSON.")
@@ -569,6 +725,17 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Paired browser clipper '{res['label']}' ({res['pairing_id']})")
                 print(f"  Origin: {res['origin']}")
                 print(f"  Scoped Token (save in extension popup once): {res['token']}")
+            return 0
+        if args.cmd == "pair-code":
+            res = create_clipper_pairing_code(label=args.label, ttl_seconds=args.ttl)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(f"1-Click Pairing Code: {res['code']}  (expires at {res['expires_at']})")
+            return 0
+        if args.cmd == "redeem":
+            res = redeem_clipper_pairing_code(args.code, args.origin, label=args.label)
+            print(json.dumps(res, indent=2) if args.json else f"Paired '{res['label']}' ({res['pairing_id']})")
             return 0
         if args.cmd == "list":
             items = list_clipper_pairings()
@@ -590,6 +757,7 @@ def main(argv: list[str] | None = None) -> int:
                 title=args.title,
                 selected_quote=args.quote,
                 page_text=args.body,
+                raw_html=args.html,
                 tags=args.tags,
                 destination=args.destination,
             )

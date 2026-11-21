@@ -3,6 +3,9 @@
 if (typeof SecondBrainClipper === "undefined" && typeof importScripts === "function") {
   importScripts("lib/clipper-client.js");
 }
+if (typeof SecondBrainReadability === "undefined" && typeof importScripts === "function") {
+  importScripts("lib/readability-markdown.js");
+}
 
 const STORAGE_KEY_PORT = "secondBrainPort";
 const STORAGE_KEY_TOKEN = "secondBrainClipperToken";
@@ -51,11 +54,16 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   let pageText = "";
   try {
     if (chrome.scripting && tab.id) {
+      const extractorFn =
+        globalThis.SecondBrainReadability && globalThis.SecondBrainReadability.extractActiveTabContent
+          ? globalThis.SecondBrainReadability.extractActiveTabContent
+          : () => ({ pageText: document.body ? String(document.body.innerText || "").slice(0, 50000) : "" });
       const injected = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: () => (document.body ? String(document.body.innerText || "").slice(0, 50000) : ""),
+        func: extractorFn,
       });
-      pageText = (injected && injected[0] && injected[0].result) || "";
+      const resData = injected && injected[0] && injected[0].result;
+      pageText = typeof resData === "string" ? resData : (resData && resData.pageText) || "";
     }
   } catch {
     pageText = "";

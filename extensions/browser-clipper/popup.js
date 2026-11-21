@@ -29,12 +29,16 @@ async function loadActiveTabInfo() {
     $("titleInput").value = tab.title || "";
     $("urlInput").value = tab.url || "";
     if (chrome.scripting && tab.id && tab.url && /^https?:\/\//i.test(tab.url)) {
+      const extractorFn =
+        globalThis.SecondBrainReadability && globalThis.SecondBrainReadability.extractActiveTabContent
+          ? globalThis.SecondBrainReadability.extractActiveTabContent
+          : () => ({
+              selection: String(window.getSelection ? window.getSelection() : "").trim(),
+              pageText: document.body ? String(document.body.innerText || "").slice(0, 80000) : "",
+            });
       const injected = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: () => ({
-          selection: String(window.getSelection ? window.getSelection() : "").trim(),
-          pageText: document.body ? String(document.body.innerText || "").slice(0, 80000) : "",
-        }),
+        func: extractorFn,
       });
       const data = injected && injected[0] && injected[0].result;
       if (data) {
@@ -107,6 +111,37 @@ async function initPopup() {
       $("settingsHint").textContent = err && err.message ? err.message : "Invalid settings.";
     }
   });
+
+  if ($("oneClickPairBtn")) {
+    $("oneClickPairBtn").addEventListener("click", async () => {
+      const pairBtn = $("oneClickPairBtn");
+      pairBtn.disabled = true;
+      try {
+        const safePort = globalThis.SecondBrainClipper.normalizeLoopbackPort($("portInput").value);
+        const code = $("pairCodeInput").value;
+        const redeemed = await globalThis.SecondBrainClipper.redeemPairingCode({
+          port: safePort,
+          code,
+          origin: $("originOutput").value,
+        });
+        const mintedToken = String(redeemed.token || "");
+        $("tokenInput").value = mintedToken;
+        $("pairCodeInput").value = "";
+        await chrome.storage.local.set({ [STORAGE_KEY_PORT]: safePort, [STORAGE_KEY_TOKEN]: mintedToken });
+        const ok = await checkConnection(safePort, mintedToken);
+        $("settingsHint").textContent = ok
+          ? `1-click paired (${redeemed.pairing_id || "active"})!`
+          : "Paired, verifying connection…";
+        if (ok) {
+          $("settingsPanel").classList.add("hidden");
+        }
+      } catch (err) {
+        $("settingsHint").textContent = err && err.message ? err.message : "1-click pairing failed.";
+      } finally {
+        pairBtn.disabled = false;
+      }
+    });
+  }
 
   $("clipBtn").addEventListener("click", async () => {
     const btn = $("clipBtn");

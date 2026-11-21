@@ -70,6 +70,106 @@ def write_text_pdf(path: str | Path, pages: list[list[str]], *, title: str = "")
     return target
 
 
+def build_positioned_pdf(
+    pages: list[list[tuple[float, float, str]]],
+    *,
+    title: str = "",
+) -> bytes:
+    """Build a valid PDF with explicit (x, y, text) positioned fragments (e.g. 2-column or tabular grids)."""
+    objects: list[bytes] = []
+
+    def add(obj: bytes) -> int:
+        objects.append(obj)
+        return len(objects)
+
+    catalog_id = add(b"")
+    pages_id = add(b"")
+    font_id = add(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+    page_ids: list[int] = []
+    for frags in pages:
+        ops = ["BT", "/F1 10 Tf"]
+        for x, y, txt in frags:
+            ops.append(f"1 0 0 1 {x:.1f} {y:.1f} Tm ({_pdf_escape(txt)}) Tj")
+        ops.append("ET")
+        stream = "\n".join(ops).encode("latin-1", errors="replace")
+        content_id = add(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream")
+        page_id = add(
+            b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>"
+            % (pages_id, font_id, content_id)
+        )
+        page_ids.append(page_id)
+    kids = " ".join(f"{pid} 0 R" for pid in page_ids).encode()
+    objects[pages_id - 1] = b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % len(page_ids)
+    objects[catalog_id - 1] = b"<< /Type /Catalog /Pages %d 0 R >>" % pages_id
+    info_id = None
+    if title:
+        info_id = add(b"<< /Title (" + _pdf_escape(title).encode("latin-1", errors="replace") + b") >>")
+
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for index, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % index + body + b"\nendobj\n"
+    xref_pos = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1)
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    trailer = b"<< /Size %d /Root %d 0 R" % (len(objects) + 1, catalog_id)
+    if info_id:
+        trailer += b" /Info %d 0 R" % info_id
+    trailer += b" >>"
+    out += b"trailer\n" + trailer + b"\nstartxref\n%d\n%%%%EOF\n" % xref_pos
+    return bytes(out)
+
+
+def build_scanned_image_pdf(width: int = 120, height: int = 40, *, title: str = "Scanned Document") -> bytes:
+    """Build a valid single-page scanned PDF containing an embedded RGB XObject image and zero text layer."""
+    import zlib
+
+    raw_rgb = bytes([245, 245, 245] * (width * height))
+    compressed = zlib.compress(raw_rgb)
+    objects: list[bytes] = []
+
+    def add(obj: bytes) -> int:
+        objects.append(obj)
+        return len(objects)
+
+    catalog_id = add(b"")
+    pages_id = add(b"")
+    img_id = add(
+        (
+            f"<< /Type /XObject /Subtype /Image /Width {width} /Height {height} "
+            f"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {len(compressed)} >>\nstream\n"
+        ).encode("ascii")
+        + compressed
+        + b"\nendstream"
+    )
+    content_stream = b"q 400 0 0 120 72 600 cm /Im1 Do Q"
+    content_id = add(b"<< /Length %d >>\nstream\n" % len(content_stream) + content_stream + b"\nendstream")
+    page_id = add(
+        b"<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im1 %d 0 R >> >> /Contents %d 0 R >>"
+        % (pages_id, img_id, content_id)
+    )
+    objects[pages_id - 1] = b"<< /Type /Pages /Kids [%d 0 R] /Count 1 >>" % page_id
+    objects[catalog_id - 1] = b"<< /Type /Catalog /Pages %d 0 R >>" % pages_id
+    info_id = add(b"<< /Title (" + _pdf_escape(title).encode("latin-1", errors="replace") + b") >>")
+
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for index, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % index + body + b"\nendobj\n"
+    xref_pos = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1)
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    trailer = b"<< /Size %d /Root %d 0 R /Info %d 0 R >>" % (len(objects) + 1, catalog_id, info_id)
+    out += b"trailer\n" + trailer + b"\nstartxref\n%d\n%%%%EOF\n" % xref_pos
+    return bytes(out)
+
+
 def write_docx(path: str | Path, paragraphs: list[tuple[str, str]], table: list[list[str]] | None = None) -> Path:
     """Write a minimal DOCX. ``paragraphs`` is a list of (style, text); style '' for body text."""
     ns = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'

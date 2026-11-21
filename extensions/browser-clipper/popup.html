@@ -20,7 +20,14 @@
 
     <section class="panel hidden" id="settingsPanel">
       <div class="field-group">
-        <label for="originOutput">Extension Origin (paste into Desktop/CLI Pair)</label>
+        <label for="pairCodeInput">1-Click Pairing Code (from Desktop / Dashboard / CLI)</label>
+        <div class="row">
+          <input type="text" id="pairCodeInput" placeholder="SBC-XXXX-XXXX-XXXX" autocomplete="off" />
+          <button type="button" class="btn primary sm" id="oneClickPairBtn">1-Click Pair</button>
+        </div>
+      </div>
+      <div class="field-group">
+        <label for="originOutput">Extension Origin (or manual pair)</label>
         <div class="row">
           <input type="text" id="originOutput" readonly />
           <button type="button" class="btn sm" id="copyOriginBtn">Copy</button>
@@ -37,7 +44,7 @@
         </div>
       </div>
       <div class="row">
-        <button type="button" class="btn primary sm" id="saveSettingsBtn">Save &amp; Test</button>
+        <button type="button" class="btn sm" id="saveSettingsBtn">Save &amp; Test</button>
         <span class="hint" id="settingsHint">Strict 127.0.0.1 loopback only.</span>
       </div>
     </section>
@@ -79,6 +86,7 @@
     </section>
   </div>
   <script src="lib/clipper-client.js"></script>
+  <script src="lib/readability-markdown.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -45,8 +45,12 @@ import re
 import shutil
 import sys
 import threading
+import types
 
-import ollama
+try:
+    import ollama
+except ImportError:  # Clean minimal wheel without optional [online] extra
+    ollama = types.SimpleNamespace(chat=None, embed=None, Client=None)  # type: ignore[assignment]
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from atom_mutator import atomic_write_bytes
@@ -71,7 +75,12 @@ from config import (
 )
 from doc_extractors import EXTRACTION_BODY_MARKER, MAX_DOC_BINARY_BYTES, extract_document
 from hardware_profile import fetch_loopback_json
-from host_adapters import HostConsentError, OutboundSecretBlockedError, _redact_outbound_with_map
+from host_adapters import (
+    HostConsentError,
+    OutboundSecretBlockedError,
+    _redact_outbound_with_map,
+    inspect_and_redact_outbound,
+)
 from inbox_workflow import scan_inbox_payload_risks
 from ollama_utils import _is_monkeypatched_ollama_fn, _resolve_local_ollama_rule_and_url
 from review_atom import review_lock
@@ -79,8 +88,10 @@ from stable_file import wait_for_stable_file
 
 MAX_AUDIO_BYTES = 200 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_API_MEDIA_UPLOAD_BYTES = 24 * 1024 * 1024
 MAX_IMAGE_SIDE_PX = 2048
 MAX_IMAGE_PIXELS = 64_000_000
+_THREAD_VAULT_CONTEXT = threading.local()
 SOURCE_BINARY_TOKEN = "{{SECOND_BRAIN_SOURCE_BINARY}}"
 PILLOW_REQUIRED_MESSAGE = (
     "Pillow (PIL) is required to validate and sanitize images before vision ingestion; refusing to send "
@@ -159,20 +170,29 @@ def _sanitize_stem(raw_stem: str) -> str:
     return cleaned
 
 
+def _effective_raw_dir() -> str:
+    return str(getattr(_THREAD_VAULT_CONTEXT, "raw_dir", None) or RAW_DIR)
+
+
+def _effective_inbox_dir() -> str:
+    return str(getattr(_THREAD_VAULT_CONTEXT, "inbox_dir", None) or INBOX_DIR)
+
+
 def _is_direct_raw_child(filepath: str) -> bool:
     try:
         parent = os.path.realpath(os.path.dirname(os.path.abspath(filepath)))
-        raw_real = os.path.realpath(os.path.abspath(RAW_DIR))
+        raw_real = os.path.realpath(os.path.abspath(_effective_raw_dir()))
         return os.path.normcase(parent) == os.path.normcase(raw_real)
     except OSError:
         return False
 
 
 def _validate_media_source(filepath: str, *, max_bytes: int) -> int:
+    eff_raw = _effective_raw_dir()
     if os.path.lexists(filepath) and _is_reparse_or_link(filepath):
         raise PermissionError(f"Refusing to ingest symlink or reparse point media file: {filepath}")
-    if os.path.lexists(RAW_DIR) and _is_reparse_or_link(RAW_DIR):
-        raise PermissionError(f"Refusing to write captures under symlinked 0-raw directory: {RAW_DIR}")
+    if os.path.lexists(eff_raw) and _is_reparse_or_link(eff_raw):
+        raise PermissionError(f"Refusing to write captures under symlinked 0-raw directory: {eff_raw}")
     if not os.path.isfile(filepath):
         raise FileNotFoundError(f"Media file not found: {filepath}")
     size = os.path.getsize(filepath)
@@ -184,11 +204,11 @@ def _validate_media_source(filepath: str, *, max_bytes: int) -> int:
 
 
 def unique_archive_path(filename: str) -> str:
-    # Resolve from this module's RAW_DIR (not config's import-time value) so patched/isolated vaults
-    # can never archive into the live vault.
+    # Resolve from effective thread/module RAW_DIR so isolated/concurrent vaults never cross-archive.
     import datetime as _dt
 
-    destination_dir = os.path.join(RAW_DIR, "archive", _dt.datetime.now().strftime("%Y-%m"))
+    eff_raw = _effective_raw_dir()
+    destination_dir = os.path.join(eff_raw, "archive", _dt.datetime.now().strftime("%Y-%m"))
     os.makedirs(destination_dir, exist_ok=True)
     if _is_reparse_or_link(destination_dir) or _is_reparse_or_link(os.path.dirname(destination_dir)):
         raise PermissionError(f"Refusing to archive into symlinked directory: {destination_dir}")
@@ -202,11 +222,13 @@ def unique_archive_path(filename: str) -> str:
 
 
 def _resolve_multimodal_inbox_dir() -> str:
-    raw_abs = os.path.abspath(RAW_DIR)
-    inbox_abs = os.path.abspath(INBOX_DIR)
+    eff_raw = _effective_raw_dir()
+    eff_inbox = _effective_inbox_dir()
+    raw_abs = os.path.abspath(eff_raw)
+    inbox_abs = os.path.abspath(eff_inbox)
     if os.path.normcase(os.path.dirname(inbox_abs)) == os.path.normcase(raw_abs):
-        return INBOX_DIR
-    return os.path.join(RAW_DIR, "inbox")
+        return eff_inbox
+    return os.path.join(eff_raw, "inbox")
 
 
 def _copy_source_binary(filepath: str, archived_path: str, expected_source_sha256: str) -> None:
@@ -242,15 +264,17 @@ def save_capture_and_archive(
     ARCHIVE_MANIFEST entry: moved when it lives directly in 0-raw/, copied (verified by SHA-256)
     when it is an external path so the caller's file is never touched.
     """
-    ensure_dirs()
-    os.makedirs(RAW_DIR, exist_ok=True)
-    brain_root_dir = os.path.dirname(os.path.abspath(RAW_DIR))
-    sidecar_dir = os.path.join(brain_root_dir, ".sidecar")
+    eff_raw = _effective_raw_dir()
+    if getattr(_THREAD_VAULT_CONTEXT, "raw_dir", None) is None:
+        ensure_dirs()
+    os.makedirs(eff_raw, exist_ok=True)
+    brain_root_dir = os.path.dirname(os.path.abspath(eff_raw))
+    sidecar_dir = str(getattr(_THREAD_VAULT_CONTEXT, "sidecar_dir", None) or os.path.join(brain_root_dir, ".sidecar"))
     os.makedirs(sidecar_dir, exist_ok=True)
     lock_path = os.path.join(sidecar_dir, "writer.lock")
     with review_lock(lock_path):
-        if _is_reparse_or_link(RAW_DIR):
-            raise PermissionError(f"Refusing to write into symlinked 0-raw directory: {RAW_DIR}")
+        if _is_reparse_or_link(eff_raw):
+            raise PermissionError(f"Refusing to write into symlinked 0-raw directory: {eff_raw}")
         if not os.path.isfile(filepath) or _is_reparse_or_link(filepath) or file_sha256(filepath) != expected_source_sha256:
             raise RuntimeError("The source capture changed or was already processed during multimodal extraction.")
 
@@ -259,9 +283,18 @@ def save_capture_and_archive(
         archived_rel = os.path.relpath(archived_path, brain_root_dir).replace("\\", "/")
 
         normalized_content = content.replace("\r\n", "\n").replace(SOURCE_BINARY_TOKEN, archived_rel)
-        risk_flags = scan_inbox_payload_risks(normalized_content)
+        dlp_rep = inspect_and_redact_outbound(normalized_content, redact_pii=False, fail_on_secret_detection=False)
+        dlp_flags = tuple(f"dlp_secret:{h}" for h in dlp_rep.secret_hits)
+        if dlp_flags:
+            normalized_content = dlp_rep.sanitized_text
+            setattr(_THREAD_VAULT_CONTEXT, "last_dlp_flags", list(dlp_flags))
+        else:
+            setattr(_THREAD_VAULT_CONTEXT, "last_dlp_flags", [])
+
+        base_risk_flags = scan_inbox_payload_risks(normalized_content)
         if allow_large:
-            risk_flags = tuple(flag for flag in risk_flags if flag != "oversized_payload")
+            base_risk_flags = tuple(flag for flag in base_risk_flags if flag != "oversized_payload")
+        risk_flags = tuple(dict.fromkeys([*base_risk_flags, *dlp_flags]))
         if risk_flags:
             target_dir = _resolve_multimodal_inbox_dir()
             os.makedirs(target_dir, exist_ok=True)
@@ -273,7 +306,7 @@ def save_capture_and_archive(
             normalized_content = f"<!-- second_brain_origin: untrusted_inbox -->\n{risk_note}\n" + stripped.lstrip("\ufeff")
             capture_origin_label = "untrusted_inbox"
         else:
-            target_dir = RAW_DIR
+            target_dir = eff_raw
             capture_origin_label = "user_local"
 
         stem, extension = os.path.splitext(output_name)
@@ -572,6 +605,10 @@ Output plain text only."""
     if _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
         response = ollama.chat(model=model_name, messages=messages)
     else:
+        if getattr(ollama, "Client", None) is None:
+            raise RuntimeError(
+                "Python 'ollama' package is not installed; install 'second-brain[online]' for local vision extraction."
+            )
         client = ollama.Client(
             host=base_url,
             timeout=120.0,
@@ -686,6 +723,116 @@ def process_document(filepath: str) -> str | None:
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 
 SUPPORTED_INGEST_EXTS = AUDIO_EXTS | IMAGE_EXTS | DOC_EXTS
+
+
+def ingest_uploaded_media_bytes(
+    raw_bytes: bytes,
+    filename: str,
+    *,
+    brain_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """Safely stage and ingest uploaded audio, image/screenshot, or document bytes into `0-raw/`."""
+    if not isinstance(raw_bytes, (bytes, bytearray)) or len(raw_bytes) == 0:
+        raise ValueError("Uploaded media payload is empty.")
+    if len(raw_bytes) > MAX_API_MEDIA_UPLOAD_BYTES:
+        raise ValueError(
+            f"Uploaded media payload ({len(raw_bytes)} bytes) exceeds {MAX_API_MEDIA_UPLOAD_BYTES} bytes limit."
+        )
+    base_name = os.path.basename(str(filename or "").strip().replace("\\", "/"))
+    raw_stem, ext = os.path.splitext(base_name)
+    ext = ext.lower()
+    if ext not in SUPPORTED_INGEST_EXTS:
+        raise ValueError(
+            f"Unsupported media extension {ext!r}; supported: {sorted(SUPPORTED_INGEST_EXTS)}"
+        )
+    safe_stem = _sanitize_stem(raw_stem)
+    media_category = (
+        "audio" if ext in AUDIO_EXTS else ("image" if ext in IMAGE_EXTS else "document")
+    )
+
+    resolved_brain = os.path.abspath(str(brain_dir)) if brain_dir is not None else os.path.dirname(os.path.abspath(RAW_DIR))
+    target_raw = os.path.join(resolved_brain, "0-raw")
+    target_inbox = os.path.join(target_raw, "inbox")
+    target_archive = os.path.join(target_raw, "archive")
+    target_sidecar = os.path.join(resolved_brain, ".sidecar")
+
+    for check_p in (resolved_brain, target_raw, target_inbox, target_archive, target_sidecar):
+        if os.path.lexists(check_p) and _is_reparse_or_link(check_p):
+            raise PermissionError(f"Refusing to ingest media under symlinked directory: {check_p}")
+    for mk_p in (target_raw, target_inbox, target_archive, target_sidecar):
+        os.makedirs(mk_p, exist_ok=True)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    staged_path = ""
+    for attempt in range(64):
+        cand_name = (
+            f"{safe_stem}{ext}"
+            if attempt == 0
+            else f"{safe_stem}-{attempt + 1}{ext}"
+        )
+        cand_path = os.path.join(target_raw, cand_name)
+        if os.path.lexists(cand_path):
+            continue
+        try:
+            fd = os.open(cand_path, flags, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(bytes(raw_bytes))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except Exception:
+                if os.path.exists(cand_path):
+                    try:
+                        os.unlink(cand_path)
+                    except OSError:
+                        pass
+                raise
+            staged_path = cand_path
+            break
+        except FileExistsError:
+            continue
+    if not staged_path:
+        raise RuntimeError("Could not allocate an exclusive staging filename in 0-raw/.")
+
+    source_sha = hashlib.sha256(bytes(raw_bytes)).hexdigest()
+    prev_ctx = (
+        getattr(_THREAD_VAULT_CONTEXT, "raw_dir", None),
+        getattr(_THREAD_VAULT_CONTEXT, "inbox_dir", None),
+        getattr(_THREAD_VAULT_CONTEXT, "sidecar_dir", None),
+    )
+    _THREAD_VAULT_CONTEXT.raw_dir = target_raw
+    _THREAD_VAULT_CONTEXT.inbox_dir = target_inbox
+    _THREAD_VAULT_CONTEXT.sidecar_dir = target_sidecar
+    _THREAD_VAULT_CONTEXT.last_dlp_flags = []
+    try:
+        saved_rel = process_file(staged_path)
+        dlp_hits = list(getattr(_THREAD_VAULT_CONTEXT, "last_dlp_flags", []) or [])
+    except PermissionError:
+        raise
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise ValueError(f"Media ingestion failed or deferred: {exc}") from exc
+    finally:
+        _THREAD_VAULT_CONTEXT.raw_dir, _THREAD_VAULT_CONTEXT.inbox_dir, _THREAD_VAULT_CONTEXT.sidecar_dir = prev_ctx
+        if os.path.exists(staged_path):
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+
+    if not saved_rel:
+        raise ValueError(f"No text or transcript could be extracted from {os.path.basename(staged_path)}.")
+
+    quarantined = saved_rel.startswith("inbox/")
+    return {
+        "status": "quarantined" if quarantined else "ingested",
+        "category": media_category,
+        "source_filename": os.path.basename(staged_path),
+        "source_sha256": source_sha,
+        "output_rel_path": f"0-raw/{saved_rel}",
+        "output_filename": os.path.basename(saved_rel),
+        "quarantined": quarantined,
+        "dlp_flags": dlp_hits,
+    }
 
 
 def process_file(filepath: str) -> str | None:

@@ -55,6 +55,7 @@ from config import (  # noqa: E402
 )
 from evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
 from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
+from memory_format import evaluate_temporal_validity, normalize_temporal_bound_str  # noqa: E402
 from lexical_store import (  # noqa: E402
     LexicalIndexUnavailable,
     lexical_index_is_current,
@@ -561,6 +562,8 @@ def verify_note_excerpt(
     claim: str | None = None,
     memory_type: str = "semantic",
     tags=(),
+    valid_from: str | None = None,
+    valid_until: str | None = None,
     paths: NotePaths = DEFAULT_PATHS,
 ) -> dict[str, object]:
     """One-click owner promotion of a note excerpt into a source-anchored, approved atom.
@@ -574,6 +577,15 @@ def verify_note_excerpt(
         raise NoteError("Verification requires an explicit human owner actor.")
     if memory_type not in {"semantic", "episodic", "procedural", "self"}:
         raise NoteError(f"Unsupported memory_type: {memory_type!r}")
+    try:
+        norm_vf = normalize_temporal_bound_str(valid_from) if valid_from else ""
+        norm_vu = normalize_temporal_bound_str(valid_until) if valid_until else ""
+    except ValueError as exc:
+        raise NoteError(f"Invalid temporal validity bound: {exc}") from exc
+    if norm_vf or norm_vu:
+        tv = evaluate_temporal_validity(norm_vf, norm_vu)
+        if tv["status"] == "invalid_window":
+            raise NoteError(f"Invalid temporal validity window: valid_from ({norm_vf}) > valid_until ({norm_vu}).")
     raw_excerpt = re.sub(r"\s+", " ", str(excerpt or "")).strip()
     md_stripped_excerpt = re.sub(r"^(?:>+\s*|#{1,6}\s+)+", "", raw_excerpt).strip()
     candidates: list[str] = []
@@ -624,7 +636,46 @@ def verify_note_excerpt(
         all_note_tags = _clean_tags((*parent_rec.tags, *(tags or ())))
         derived_contexts = _extract_derived_contexts(all_note_tags)
 
+        auto_linked_filenames: list[str] = []
+        auto_linked_stems: list[str] = []
+        dup_candidates: list[dict[str, object]] = []
+        contra_alerts: list[dict[str, object]] = []
+        try:
+            from knowledge_graph import suggest_atom_graph_links_for_claim
+
+            graph_sug = suggest_atom_graph_links_for_claim(
+                flat_claim,
+                contexts=derived_contexts,
+                brain_dir=paths.brain_dir,
+                atoms_dir=paths.atoms_dir,
+                include_pending=False,
+                top_k=4,
+            )
+            for rel_item in graph_sug.get("related_links") or []:
+                r_stem = str(rel_item.get("stem") or "").strip()
+                r_fn = str(rel_item.get("filename") or "").strip()
+                if r_stem and r_stem != stem and r_stem not in auto_linked_stems:
+                    auto_linked_stems.append(r_stem)
+                    if r_fn:
+                        auto_linked_filenames.append(r_fn)
+            dup_candidates = list(graph_sug.get("duplicate_candidates") or [])
+            contra_alerts = list(graph_sug.get("contradiction_alerts") or [])
+        except Exception:
+            pass
+
+        merged_frontmatter_links = [stem, *auto_linked_stems]
+        related_wikilinks_suffix = (
+            " Related atoms: " + ", ".join(f"[[{s}]]" for s in auto_linked_stems) + "."
+            if auto_linked_stems
+            else ""
+        )
+
         def _build_note_atom_text(excerpt_val: str) -> str:
+            temporal_lines = ""
+            if norm_vf:
+                temporal_lines += f"valid_from: {norm_vf}\n"
+            if norm_vu:
+                temporal_lines += f"valid_until: {norm_vu}\n"
             return (
                 "---\n"
                 f"id: note-{stem}-{hashlib.sha256(excerpt_val.encode('utf-8')).hexdigest()[:8]}\n"
@@ -633,11 +684,12 @@ def verify_note_excerpt(
                 "certainty: established\n"
                 f"created: {today}\n"
                 f"last-reviewed: {today}\n"
+                f"{temporal_lines}"
                 "importance: 0.70\n"
                 "confidence: 0.90\n"
                 "sources:\n"
                 f"  - {rel_source}\n"
-                f"links: [{json.dumps(stem)}]\n"
+                f"links: {json.dumps(merged_frontmatter_links)}\n"
                 f"tags: {json.dumps(list(all_note_tags))}\n"
                 f"contexts: {json.dumps(derived_contexts)}\n"
                 "supersedes: []\n"
@@ -651,7 +703,7 @@ def verify_note_excerpt(
                 "---\n\n"
                 f"## Claim\n{flat_claim}\n\n"
                 f"## Evidence\n{excerpt_val}\n\n"
-                f"## Why It Matters\nVerified by the owner from note [[{stem}]].\n"
+                f"## Why It Matters\nVerified by the owner from note [[{stem}]].{related_wikilinks_suffix}\n"
             )
 
         atom_text = ""
@@ -698,6 +750,11 @@ def verify_note_excerpt(
         "evidence_source": rel_source,
         "claim": flat_claim,
         "memory_type": memory_type,
+        "valid_from": norm_vf,
+        "valid_until": norm_vu,
+        "auto_linked_atoms": auto_linked_filenames,
+        "duplicate_candidates": dup_candidates,
+        "contradiction_alerts": contra_alerts,
     }
 
 
@@ -1006,6 +1063,8 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--expected-sha256", dest="expected_sha256", default=None, help="Optional CAS SHA-256 of the note.")
     v.add_argument("--claim", default=None)
     v.add_argument("--memory-type", "--type", dest="memory_type", default="semantic", choices=["semantic", "episodic", "procedural", "self"])
+    v.add_argument("--valid-from", default=None, help="Optional ISO-8601 start date/timestamp (YYYY-MM-DD).")
+    v.add_argument("--valid-until", default=None, help="Optional ISO-8601 expiry date/timestamp (YYYY-MM-DD).")
     v.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Tag or comma-separated tags (repeatable).")
     v.add_argument("--json", action="store_true", help="Emit JSON output.")
     t = sub.add_parser("tasks", help="Extract structured action items from working notes and raw captures.")
@@ -1071,6 +1130,8 @@ def main(argv: list[str] | None = None) -> int:
                 claim=args.claim,
                 memory_type=args.memory_type,
                 tags=_split_cli_tags(args.tags),
+                valid_from=args.valid_from,
+                valid_until=args.valid_until,
                 expected_note_sha256=expected_sha,
                 paths=cli_paths,
             ),

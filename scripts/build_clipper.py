@@ -22,12 +22,13 @@ INCLUDE_FILES = (
     "popup.js",
     "README.md",
     "lib/clipper-client.js",
+    "lib/readability-markdown.js",
 )
 
 
 def build_clipper_zip(out_dir: str | Path | None = None) -> Path:
     manifest = json.loads((CLIPPER_DIR / "manifest.json").read_text(encoding="utf-8"))
-    version = str(manifest.get("version") or "0.3.0")
+    version = str(manifest.get("version") or "1.0.0")
     dest_dir = Path(out_dir).expanduser().resolve() if out_dir else (REPO_ROOT / "dist")
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive_path = dest_dir / f"second-brain-clipper-{version}.zip"
