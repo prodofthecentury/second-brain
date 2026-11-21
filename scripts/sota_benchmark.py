@@ -887,6 +887,215 @@ class _Mem0StyleFlatMemoryStore:
         return [item[1] for item in scored[:top_k]]
 
 
+class _RankBm25LiveIndex:
+    """Live third-party rank-bm25 (BM25Okapi) baseline without CAS/anchor trust gating."""
+
+    def __init__(self, atoms_dir: Path) -> None:
+        from rank_bm25 import BM25Okapi
+
+        self._docs: list[dict[str, Any]] = []
+        tokenized_corpus: list[list[str]] = []
+        for p in sorted(atoms_dir.glob("*.md")):
+            txt = p.read_text(encoding="utf-8")
+            claim = txt.split("## Claim", 1)[1].split("##", 1)[0].strip() if "## Claim" in txt else ""
+            tags = tuple(
+                line.strip()[2:].strip().lower()
+                for line in txt.splitlines()
+                if line.strip().startswith("- project:")
+            )
+            toks = [_light_stem(t) for t in _TOKEN_RE.findall(txt.lower()) if t not in QUERY_STOP_WORDS]
+            tokenized_corpus.append(toks if toks else ["_empty_"])
+            self._docs.append({"filename": p.name, "tags": tags, "claim": claim})
+        self._bm25 = BM25Okapi(tokenized_corpus)
+
+    def search(self, query: str, *, project_scope: str | None = None, top_k: int = 5) -> list[dict[str, str]]:
+        q_toks = [_light_stem(t) for t in _TOKEN_RE.findall((query or "").lower()) if t not in QUERY_STOP_WORDS]
+        if not q_toks or not self._docs:
+            return []
+        scores = self._bm25.get_scores(q_toks)
+        ranked: list[tuple[float, dict[str, str]]] = []
+        for idx, sc in enumerate(scores):
+            val = float(sc)
+            if val <= 0.0:
+                continue
+            doc = self._docs[idx]
+            if project_scope and not bool(project_tags_match(doc["tags"], (project_scope,))):
+                continue
+            ranked.append(
+                (
+                    val,
+                    {
+                        "filename": doc["filename"],
+                        "contexts": ",".join(doc["tags"]),
+                        "claim": doc["claim"],
+                    },
+                )
+            )
+        ranked.sort(key=lambda item: (-item[0], item[1]["filename"]))
+        return [item[1] for item in ranked[:top_k]]
+
+
+class _FaissHnswLiveIndex:
+    """Live third-party FAISS C++ IndexHNSWFlat inner-product/cosine baseline without CAS/anchor trust gating."""
+
+    def __init__(self, atoms_dir: Path, embed_fn) -> None:
+        import faiss
+        import numpy as np
+
+        self._np = np
+        self._embed_fn = embed_fn
+        self._docs: list[dict[str, Any]] = []
+        rows: list[list[float]] = []
+        for p in sorted(atoms_dir.glob("*.md")):
+            txt = p.read_text(encoding="utf-8")
+            claim = txt.split("## Claim", 1)[1].split("##", 1)[0].strip() if "## Claim" in txt else ""
+            tags = tuple(
+                line.strip()[2:].strip().lower()
+                for line in txt.splitlines()
+                if line.strip().startswith("- project:")
+            )
+            rows.append(self._embed_fn(txt))
+            self._docs.append({"filename": p.name, "tags": tags, "claim": claim})
+
+        dim = len(rows[0]) if rows else _DENSE_DIM
+        self._index = faiss.IndexHNSWFlat(dim, 16, faiss.METRIC_INNER_PRODUCT)
+        self._index.hnsw.efConstruction = 64
+        self._index.hnsw.efSearch = 32
+        if rows:
+            mat = np.asarray(rows, dtype=np.float32)
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms[norms == 0.0] = 1.0
+            mat = mat / norms
+            self._index.add(mat)
+
+    def search(self, query: str, *, project_scope: str | None = None, top_k: int = 5) -> list[dict[str, str]]:
+        if not self._docs:
+            return []
+        np = self._np
+        q_arr = np.asarray([self._embed_fn(query)], dtype=np.float32)
+        q_norm = float(np.linalg.norm(q_arr))
+        if q_norm > 0.0:
+            q_arr = q_arr / q_norm
+        k_fetch = min(len(self._docs), max(top_k * 4, 20))
+        scores, indices = self._index.search(q_arr, k_fetch)
+        out: list[dict[str, str]] = []
+        for sc, idx in zip(scores[0], indices[0]):
+            if int(idx) < 0 or float(sc) <= 0.05:
+                continue
+            doc = self._docs[int(idx)]
+            if project_scope and not bool(project_tags_match(doc["tags"], (project_scope,))):
+                continue
+            out.append(
+                {
+                    "filename": doc["filename"],
+                    "contexts": ",".join(doc["tags"]),
+                    "claim": doc["claim"],
+                }
+            )
+            if len(out) >= top_k:
+                break
+        return out
+
+
+class _Mem0LiveMemoryStore:
+    """Live third-party Mem0 OSS (mem0ai v2.x) memory engine backed by local Ollama + ChromaDB."""
+
+    def __init__(self, events: list[dict[str, Any]], store_dir: Path, *, llm_model: str | None = None) -> None:
+        os.environ["MEM0_TELEMETRY"] = "false"
+        os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+        from hardware_profile import resolve_active_local_generation_model
+        from mem0 import Memory
+
+        base_url = ollama_utils.ollama_base_url()
+        chosen_llm = llm_model or resolve_active_local_generation_model(fallback=GEN_MODEL)
+        sample_vec = ollama_utils.embed_text("mem0 dimension probe", model=EMBED_MODEL)
+        emb_dims = len(sample_vec)
+        cfg = {
+            "vector_store": {
+                "provider": "chroma",
+                "config": {
+                    "collection_name": "mem0_live_bench",
+                    "path": str(store_dir),
+                },
+            },
+            "embedder": {
+                "provider": "ollama",
+                "config": {
+                    "model": EMBED_MODEL,
+                    "ollama_base_url": base_url,
+                    "embedding_dims": emb_dims,
+                },
+            },
+            "llm": {
+                "provider": "ollama",
+                "config": {
+                    "model": chosen_llm,
+                    "ollama_base_url": base_url,
+                },
+            },
+            "version": "v1.1",
+        }
+        self._memory = Memory.from_config(cfg)
+        active_id_by_entity: dict[str, str] = {}
+        for ev in events:
+            ekey = str(ev["entity_key"])
+            prev_id = active_id_by_entity.get(ekey)
+            if prev_id:
+                try:
+                    self._memory.delete(prev_id)
+                except Exception:
+                    pass
+            res = self._memory.add(
+                str(ev["claim"]),
+                user_id="owner",
+                metadata={
+                    "filename": str(ev["filename"]),
+                    "contexts": ",".join(ev["contexts"]),
+                    "entity_key": ekey,
+                },
+                infer=False,
+            )
+            results_list = res.get("results", []) if isinstance(res, dict) else []
+            if results_list and isinstance(results_list[0], dict) and results_list[0].get("id"):
+                active_id_by_entity[ekey] = str(results_list[0]["id"])
+
+    def search(self, query: str, *, top_k: int = 5) -> list[dict[str, str]]:
+        res = self._memory.search(query, filters={"user_id": "owner"}, limit=top_k)
+        items = res.get("results", []) if isinstance(res, dict) else (res if isinstance(res, list) else [])
+        out: list[dict[str, str]] = []
+        for item in items[:top_k]:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata") or {}
+            out.append(
+                {
+                    "filename": str(meta.get("filename") or ""),
+                    "contexts": str(meta.get("contexts") or ""),
+                    "claim": str(item.get("memory") or ""),
+                }
+            )
+        return out
+
+    def close(self) -> None:
+        vs = getattr(self._memory, "vector_store", None)
+        client = getattr(vs, "client", None)
+        if client is not None:
+            _close_chroma_client(client)
+        self._memory = None
+
+
+def _detect_third_party_versions() -> dict[str, str]:
+    import importlib.metadata
+
+    found: dict[str, str] = {}
+    for pkg in ("mem0ai", "faiss-cpu", "rank-bm25", "chromadb", "onnxruntime"):
+        try:
+            found[pkg] = importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return found
+
+
 def _fuse_untrusted_rrf(
     bm25_hits: list[dict[str, str]],
     dense_hits: list[dict[str, str]],
@@ -1106,6 +1315,7 @@ def run_sota_benchmark(
     include_llm: bool = False,
     llm_model: str | None = None,
     include_dense_ollama: bool = False,
+    live_third_party: bool = False,
 ) -> dict[str, Any]:
     hw = detect_hardware_profile()
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp, ExitStack() as stack:
@@ -1113,6 +1323,7 @@ def run_sota_benchmark(
         atoms_dir = brain / "2-atoms"
         chroma_dir = brain / ".chroma"
         naive_chroma_dir = Path(tmp) / "naive_chroma"
+        mem0_live_dir = Path(tmp) / "mem0_live_chroma"
         lexical_db = str(brain / ".sidecar" / "lexical.sqlite3")
 
         queries, corpus_meta = _seed_corpus(brain, atoms)
@@ -1121,8 +1332,25 @@ def run_sota_benchmark(
 
         # Prevent rebuild_vectors from calling config.ensure_dirs() on the live vault.
         stack.enter_context(patch.object(_rv_mod, "ensure_dirs", lambda: None))
+        build_vec_cache: dict[str, list[float]] = {}
+        use_build_cache = True
+
         if include_dense_ollama:
-            embed_fn = lambda txt: ollama_utils.embed_text(txt, model=EMBED_MODEL)
+            def _live_embed_fn(txt: str) -> list[float]:
+                if use_build_cache:
+                    key = hashlib.sha256(str(txt).encode("utf-8")).hexdigest()
+                    cached = build_vec_cache.get(key)
+                    if cached is not None:
+                        return cached
+                    vec = ollama_utils.embed_text(txt, model=EMBED_MODEL)
+                    build_vec_cache[key] = vec
+                    return vec
+                return ollama_utils.embed_text(txt, model=EMBED_MODEL)
+
+            embed_fn = _live_embed_fn
+            stack.enter_context(
+                patch.object(_rv_mod, "embed_text", side_effect=lambda txt, model=None: _live_embed_fn(txt))
+            )
         else:
             embed_fn = _deterministic_dense_embed
             stack.enter_context(
@@ -1150,8 +1378,19 @@ def run_sota_benchmark(
         chroma_untrusted = _ChromaHnswUntrustedIndex(atoms_dir, naive_chroma_dir, embed_fn)
         mem0_store = _Mem0StyleFlatMemoryStore(mem0_events, embed_fn)
 
+        rank_bm25_live: _RankBm25LiveIndex | None = None
+        faiss_hnsw_live: _FaissHnswLiveIndex | None = None
+        mem0_live_store: _Mem0LiveMemoryStore | None = None
+        if live_third_party:
+            rank_bm25_live = _RankBm25LiveIndex(atoms_dir)
+            faiss_hnsw_live = _FaissHnswLiveIndex(atoms_dir, embed_fn)
+            mem0_live_store = _Mem0LiveMemoryStore(mem0_events, mem0_live_dir, llm_model=llm_model)
+
+        use_build_cache = False
+        build_vec_cache.clear()
+
         try:
-            systems = (
+            base_systems = [
                 "second_brain_verified",
                 "second_brain_hybrid_rrf",
                 "naive_bm25_rag_no_trust_gate",
@@ -1161,7 +1400,16 @@ def run_sota_benchmark(
                 "mem0_style_flat_overwrite_memory",
                 "unscoped_flat_memory",
                 "ungrounded_synthesis",
-            )
+            ]
+            if live_third_party:
+                base_systems.extend(
+                    [
+                        "rank_bm25_okapi_live",
+                        "faiss_hnsw_live",
+                        "mem0_live_v2",
+                    ]
+                )
+            systems = tuple(base_systems)
             stats: dict[str, dict[str, Any]] = {
                 s: {
                     "pos_total": 0,
@@ -1452,6 +1700,32 @@ def run_sota_benchmark(
                 u_ms = (time.perf_counter() - t0) * 1000.0
                 _record_untrusted_baseline(stats["unscoped_flat_memory"], u_hits, q, u_ms)
 
+                if live_third_party:
+                    assert rank_bm25_live is not None
+                    assert faiss_hnsw_live is not None
+                    assert mem0_live_store is not None
+
+                    t0 = time.perf_counter()
+                    rb_hits = rank_bm25_live.search(q["query"], project_scope=q["project_scope"], top_k=5)
+                    rb_ms = (time.perf_counter() - t0) * 1000.0
+                    _record_untrusted_baseline(stats["rank_bm25_okapi_live"], rb_hits, q, rb_ms)
+
+                    t0 = time.perf_counter()
+                    fa_hits = faiss_hnsw_live.search(q["query"], project_scope=q["project_scope"], top_k=5)
+                    fa_ms = (time.perf_counter() - t0) * 1000.0
+                    _record_untrusted_baseline(stats["faiss_hnsw_live"], fa_hits, q, fa_ms)
+
+                    t0 = time.perf_counter()
+                    ml_hits = mem0_live_store.search(q["query"], top_k=5)
+                    ml_ms = (time.perf_counter() - t0) * 1000.0
+                    _record_untrusted_baseline(
+                        stats["mem0_live_v2"],
+                        ml_hits,
+                        q,
+                        ml_ms,
+                        has_source_citations=False,
+                    )
+
                 # 9. Ungrounded Synthesis Baseline (multi-hit unverified synthesis; no abstention gate)
                 t0 = time.perf_counter()
                 g_hits = _fts_search(naive_conn, q["query"], project_scope=q["project_scope"], top_k=5)
@@ -1530,6 +1804,8 @@ def run_sota_benchmark(
         finally:
             naive_conn.close()
             chroma_untrusted.close()
+            if mem0_live_store is not None:
+                mem0_live_store.close()
             sb_chroma_collection.close()
             gc.collect()
 
@@ -1572,6 +1848,8 @@ def run_sota_benchmark(
             "embedding_backend": (
                 f"ollama:{EMBED_MODEL}" if include_dense_ollama else f"deterministic_feature_hash_{_DENSE_DIM}d_chroma_hnsw"
             ),
+            "live_third_party_enabled": bool(live_third_party),
+            "third_party_versions": _detect_third_party_versions(),
             "hardware_profile": asdict(hw),
             "systems": summary,
             "llm_evaluation": llm_eval,
@@ -1587,13 +1865,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-llm", action="store_true", help="Run end-to-end local Ollama LLM answer generation evaluation.")
     parser.add_argument("--llm-model", default=None, help="Preferred local Ollama generation model for --include-llm.")
     parser.add_argument("--real-embeddings", action="store_true", help="Use live Ollama nomic-embed-text embeddings instead of deterministic dense vectors.")
+    parser.add_argument("--live-third-party", action="store_true", help="Benchmark live third-party packages (mem0ai, faiss-cpu, rank-bm25) alongside core baselines.")
     args = parser.parse_args(argv)
 
+    use_real_embeddings = bool(args.real_embeddings or args.live_third_party)
     result = run_sota_benchmark(
         atoms=max(80, args.atoms),
         include_llm=bool(args.include_llm),
         llm_model=args.llm_model,
-        include_dense_ollama=bool(args.real_embeddings),
+        include_dense_ollama=use_real_embeddings,
+        live_third_party=bool(args.live_third_party),
     )
     output_target = args.output or args.json_output
     if output_target:

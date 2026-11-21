@@ -299,6 +299,7 @@ def _write_mutation(
     evidence_anchor: dict | None = None,
     dense_refresh_required: bool = False,
     dense_model: str | None = None,
+    extra_record_fields: dict | None = None,
 ) -> dict:
     before_hash = content_sha256(original)
     after_hash = content_sha256(updated)
@@ -363,6 +364,8 @@ def _write_mutation(
             record["dense_index_error"] = dense_error
         if evidence_anchor:
             record.update(evidence_anchor)
+        if extra_record_fields:
+            record.update(extra_record_fields)
         append_decision_record(record, decision_log_path)
     except Exception:
         atomic_write_bytes(atom_path, original)
@@ -678,6 +681,9 @@ def set_atom_temporal_bounds(
             for key in ANCHOR_FIELDS:
                 updated_fm = set_scalar_field(updated_fm, key, str(evidence_anchor[key]), "citation_integrity")
             recorded_action = "approve"
+        else:
+            updated_fm = set_scalar_field(updated_fm, "review_status", "pending", "contexts")
+            updated_fm = set_scalar_field(updated_fm, "claim_state", "candidate", "review_status")
 
         updated_bytes = render_memory_document(updated_fm, body).encode("utf-8")
 
@@ -695,6 +701,7 @@ def set_atom_temporal_bounds(
             and index_manifest_is_current(active_dense_manifest, atoms_dir)
         )
 
+        clean_rationale = str(rationale or "").strip()[:500]
         res = _write_mutation(
             atom_path=atom_path,
             original=original,
@@ -707,6 +714,11 @@ def set_atom_temporal_bounds(
             evidence_anchor=evidence_anchor,
             dense_refresh_required=dense_refresh_required,
             dense_model=active_dense_manifest.get("embedding_model") if dense_refresh_required else None,
+            extra_record_fields={
+                "valid_from": norm_vf,
+                "valid_until": norm_vu,
+                "rationale": clean_rationale,
+            },
         )
         tv_now = evaluate_temporal_validity(norm_vf, norm_vu)
         return {
@@ -715,7 +727,7 @@ def set_atom_temporal_bounds(
             "valid_from": norm_vf,
             "valid_until": norm_vu,
             "temporal_status": tv_now["status"],
-            "rationale": str(rationale or "").strip()[:500],
+            "rationale": clean_rationale,
         }
 
 

@@ -1,0 +1,169 @@
+{
+  "generated_at": "2026-11-21T22:02:07+00:00",
+  "benchmark_type": "live_curated_vault_third_party_comparison",
+  "dataset_id": "second-brain-retrieval-curated-90",
+  "dataset_version": "3.0.0",
+  "dataset_sha256": "b51661c99cb72129f06080afebbc758063fece1de0466188979cc8c93b629404",
+  "vault_total_atoms": 78,
+  "vault_owner_approved_atoms": 75,
+  "vault_unapproved_candidate_atoms": [
+    "code-reviews-as-mentorship.md",
+    "continuous-integration-deployment.md",
+    "sodium-ion-battery-cost-record.md"
+  ],
+  "query_counts": {
+    "total": 90,
+    "answerable": 25,
+    "preference": 15,
+    "exploratory": 25,
+    "unanswerable": 25
+  },
+  "embedding_model": "nomic-embed-text",
+  "embedding_dimensions": 768,
+  "rerank_backend": "onnx_cross_encoder",
+  "package_versions": {
+    "mem0ai": "2.2.1",
+    "faiss-cpu": "1.16.0",
+    "rank-bm25": "0.2.2",
+    "chromadb": "1.5.9",
+    "onnxruntime": "1.31.1",
+    "ollama": "0.6.3"
+  },
+  "setup_timing_ms": {
+    "vault_78_atom_ollama_embed_ms": 15198.4,
+    "mem0_live_index_setup_ms": 9346.53
+  },
+  "hardware_profile": {
+    "os_name": "Windows",
+    "os_release": "10",
+    "architecture": "AMD64",
+    "cpu_threads": 8,
+    "total_ram_gib": 15.91,
+    "available_ram_gib": 5.61,
+    "cpp_runtime_ready": true,
+    "cpp_runtime_detail": "MSVC C++ runtime (vcruntime140.dll) present",
+    "gpu_backend": "cpu",
+    "gpu_name": "CPU inference mode (no CUDA/Metal accelerator)",
+    "vram_gib": 0.0,
+    "ollama_reachable": true,
+    "installed_ollama_models": [
+      "llama3.2:3b",
+      "llava:latest",
+      "nomic-embed-text:latest",
+      "qwen2.5-coder:7b",
+      "qwen3.6:latest"
+    ],
+    "tier_id": "tier_2_cpu_balanced",
+    "tier_label": "Tier 2 \u2014 Balanced CPU 7B Intelligence",
+    "recommended_generation_model": "qwen2.5-coder:7b",
+    "selected_installed_generation_model": "qwen2.5-coder:7b",
+    "recommended_embedding_model": "nomic-embed-text",
+    "recommended_retrieval_mode": "lexical",
+    "retrieval_p95_slo_ms": 15.0,
+    "answer_p95_slo_ms": 35000.0,
+    "rationale": "CPU host with 15.9 GiB RAM comfortably fits quantized 7B/8B models (94%+ benchmarked positive coverage on qwen2.5-coder:7b / qwen3); lexical FTS5 stays default for sub-10ms recall, with RRF opt-in. Oversized model(s) skipped for auto-default to prevent swap thrashing: qwen3.6:latest (override via BRAIN_GEN_MODEL).",
+    "oversized_installed_models": [
+      "qwen3.6:latest"
+    ]
+  },
+  "systems": {
+    "second_brain_verified": {
+      "answerable_expected_recall_at_5_pct": 100.0,
+      "answerable_mrr_at_5": 0.98,
+      "answerable_ndcg_at_5": 0.9852,
+      "candidate_mean_recall_at_5_pct": 88.5,
+      "candidate_mean_mrr_at_5": 0.9436,
+      "candidate_mean_ndcg_at_5": 0.8783,
+      "trap_false_positive_rate_pct": 0.0,
+      "abstention_accuracy_pct": 100.0,
+      "unapproved_candidate_leak_queries": 0,
+      "cross_project_leak_pct": 0.0,
+      "latency_p50_ms": 7.63,
+      "latency_p95_ms": 56.658
+    },
+    "second_brain_hybrid_rrf": {
+      "answerable_expected_recall_at_5_pct": 100.0,
+      "answerable_mrr_at_5": 1.0,
+      "answerable_ndcg_at_5": 1.0,
+      "candidate_mean_recall_at_5_pct": 72.1,
+      "candidate_mean_mrr_at_5": 0.8538,
+      "candidate_mean_ndcg_at_5": 0.7428,
+      "trap_false_positive_rate_pct": 0.0,
+      "abstention_accuracy_pct": 100.0,
+      "unapproved_candidate_leak_queries": 0,
+      "cross_project_leak_pct": 0.0,
+      "latency_p50_ms": 118.788,
+      "latency_p95_ms": 142.48
+    },
+    "mem0_live_v2": {
+      "answerable_expected_recall_at_5_pct": 96.0,
+      "answerable_mrr_at_5": 0.96,
+      "answerable_ndcg_at_5": 0.96,
+      "candidate_mean_recall_at_5_pct": 89.0,
+      "candidate_mean_mrr_at_5": 0.9308,
+      "candidate_mean_ndcg_at_5": 0.8764,
+      "trap_false_positive_rate_pct": 100.0,
+      "abstention_accuracy_pct": 0.0,
+      "unapproved_candidate_leak_queries": 7,
+      "cross_project_leak_pct": 100.0,
+      "latency_p50_ms": 82.33,
+      "latency_p95_ms": 104.624
+    },
+    "faiss_hnsw_live": {
+      "answerable_expected_recall_at_5_pct": 100.0,
+      "answerable_mrr_at_5": 0.96,
+      "answerable_ndcg_at_5": 0.9705,
+      "candidate_mean_recall_at_5_pct": 92.1,
+      "candidate_mean_mrr_at_5": 0.9423,
+      "candidate_mean_ndcg_at_5": 0.8957,
+      "trap_false_positive_rate_pct": 100.0,
+      "abstention_accuracy_pct": 0.0,
+      "unapproved_candidate_leak_queries": 9,
+      "cross_project_leak_pct": 100.0,
+      "latency_p50_ms": 94.113,
+      "latency_p95_ms": 113.524
+    },
+    "chromadb_hnsw_live": {
+      "answerable_expected_recall_at_5_pct": 100.0,
+      "answerable_mrr_at_5": 1.0,
+      "answerable_ndcg_at_5": 1.0,
+      "candidate_mean_recall_at_5_pct": 92.1,
+      "candidate_mean_mrr_at_5": 0.9423,
+      "candidate_mean_ndcg_at_5": 0.8982,
+      "trap_false_positive_rate_pct": 100.0,
+      "abstention_accuracy_pct": 0.0,
+      "unapproved_candidate_leak_queries": 8,
+      "cross_project_leak_pct": 100.0,
+      "latency_p50_ms": 100.19,
+      "latency_p95_ms": 127.402
+    },
+    "rank_bm25_okapi_live": {
+      "answerable_expected_recall_at_5_pct": 100.0,
+      "answerable_mrr_at_5": 0.9733,
+      "answerable_ndcg_at_5": 0.98,
+      "candidate_mean_recall_at_5_pct": 91.9,
+      "candidate_mean_mrr_at_5": 0.9026,
+      "candidate_mean_ndcg_at_5": 0.8835,
+      "trap_false_positive_rate_pct": 92.0,
+      "abstention_accuracy_pct": 8.0,
+      "unapproved_candidate_leak_queries": 9,
+      "cross_project_leak_pct": 100.0,
+      "latency_p50_ms": 0.561,
+      "latency_p95_ms": 0.876
+    },
+    "sqlite_fts5_untrusted_live": {
+      "answerable_expected_recall_at_5_pct": 100.0,
+      "answerable_mrr_at_5": 0.9533,
+      "answerable_ndcg_at_5": 0.9652,
+      "candidate_mean_recall_at_5_pct": 91.8,
+      "candidate_mean_mrr_at_5": 0.9167,
+      "candidate_mean_ndcg_at_5": 0.89,
+      "trap_false_positive_rate_pct": 92.0,
+      "abstention_accuracy_pct": 8.0,
+      "unapproved_candidate_leak_queries": 10,
+      "cross_project_leak_pct": 100.0,
+      "latency_p50_ms": 0.621,
+      "latency_p95_ms": 1.034
+    }
+  }
+}

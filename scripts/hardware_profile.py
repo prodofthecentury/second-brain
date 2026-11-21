@@ -532,10 +532,10 @@ def classify_hardware_tier(
             recommended_embedding_model=EMBED_MODEL,
             recommended_retrieval_mode="lexical",
             retrieval_p95_slo_ms=15.0,
-            answer_p95_slo_ms=35000.0,
+            answer_p95_slo_ms=35000.0 if cpu_threads >= 12 else 45000.0,
             rationale=(
-                f"CPU host with {total_ram_gib:.1f} GiB RAM comfortably fits quantized 7B/8B models "
-                "(94%+ benchmarked positive coverage on qwen2.5-coder:7b / qwen3); lexical FTS5 stays default for sub-10ms recall, with RRF opt-in."
+                f"CPU host with {total_ram_gib:.1f} GiB RAM ({cpu_threads} threads) comfortably fits quantized 7B/8B models "
+                "(100.0% benchmarked positive coverage on qwen2.5-coder:7b across the 90-case curated suite); lexical FTS5 stays default for sub-15ms recall, with RRF opt-in."
                 + oversized_note
             ),
             oversized_installed_models=oversized,

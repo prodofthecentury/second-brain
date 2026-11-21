@@ -311,7 +311,10 @@ def chat_loop(argv: list[str] | None = None):
                 for chunk in response_stream:
                     content = chunk["message"]["content"]
                     full_response += content
-                rehydrated_draft = _rehydrate_draft_claims(full_response, pii_placeholder_map)
+                from hardware_profile import strip_reasoning_think_blocks
+
+                cleaned_response = strip_reasoning_think_blocks(full_response) or "{}"
+                rehydrated_draft = _rehydrate_draft_claims(cleaned_response, pii_placeholder_map)
                 answer = validate_standard_answer(
                     rehydrated_draft,
                     scoped_atoms,

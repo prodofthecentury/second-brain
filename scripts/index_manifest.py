@@ -31,17 +31,14 @@ _STAT_HASH_CACHE: dict[str, tuple[int, int, int, str]] = {}
 _MAX_STAT_CACHE_ENTRIES = 50_000
 # abs_dir -> (stat signature tuple, revisions list) — whole-directory memo for large vaults
 _DIR_MEMO: dict[str, tuple[tuple, list[dict[str, str]]]] = {}
-# abs_dir -> (dir_mtime_ns, expires_monotonic, revisions list) — sub-second burst memo for >64-atom vaults
-_DIR_BURST_MEMO: dict[str, tuple[int, float, list[dict[str, str]]]] = {}
-# id(revisions) -> (revisions, fingerprint)
-_FP_MEMO: dict[int, tuple[list[dict[str, str]], str]] = {}
+# id(revisions) -> (revisions, fingerprint, filename_to_sha_map)
+_FP_MEMO: dict[int, tuple[list[dict[str, str]], str, dict[str, str]]] = {}
 
 
 def invalidate_atom_revision_cache(path: str | None = None) -> None:
     """Clear cached stat->sha256 entries (all or one specific file)."""
     with _STAT_HASH_LOCK:
         _DIR_MEMO.clear()
-        _DIR_BURST_MEMO.clear()
         if path is None:
             _STAT_HASH_CACHE.clear()
             _FP_MEMO.clear()
@@ -61,7 +58,6 @@ def record_known_atom_hash(path: str, content_sha256: str) -> None:
         return
     with _STAT_HASH_LOCK:
         _DIR_MEMO.pop(parent_dir, None)
-        _DIR_BURST_MEMO.pop(parent_dir, None)
         if len(_STAT_HASH_CACHE) >= _MAX_STAT_CACHE_ENTRIES:
             _STAT_HASH_CACHE.clear()
         _STAT_HASH_CACHE[cache_key] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, content_sha256)
@@ -108,13 +104,10 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
     if os.name != "nt" and _is_reparse_or_link(abs_dir):
         return []
 
-    dir_key_fast = os.path.normcase(abs_dir)
-    now_mono = time.monotonic()
-    with _STAT_HASH_LOCK:
-        burst = _DIR_BURST_MEMO.get(dir_key_fast)
-    if burst is not None and burst[0] == dir_st.st_mtime_ns and now_mono < burst[1]:
-        return burst[2]
-
+    is_nt = os.name == "nt"
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    s_isreg = stat.S_ISREG
+    s_islnk = stat.S_ISLNK
     entry_rows: list[tuple[str, str, tuple[int, int, int]]] = []
     try:
         with os.scandir(abs_dir) as it:
@@ -123,7 +116,13 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
                 if not name.endswith(".md") or name == "README.md":
                     continue
                 st = entry.stat(follow_symlinks=False)
-                if not stat.S_ISREG(st.st_mode) or _entry_is_reparse_or_link(entry, st):
+                mode = st.st_mode
+                if not s_isreg(mode) or s_islnk(mode):
+                    continue
+                if is_nt:
+                    if st.st_file_attributes & reparse_flag:
+                        continue
+                elif _entry_is_reparse_or_link(entry, st):
                     continue
                 entry_rows.append((name, entry.path, (st.st_mtime_ns, st.st_ctime_ns, st.st_size)))
     except OSError as exc:
@@ -139,8 +138,6 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
         with _STAT_HASH_LOCK:
             memo = _DIR_MEMO.get(dir_key)
         if memo is not None and memo[0] == sigs:
-            with _STAT_HASH_LOCK:
-                _DIR_BURST_MEMO[dir_key] = (dir_st.st_mtime_ns, time.monotonic() + 10.0, memo[1])
             return memo[1]
 
     for filename, abs_path, sig in entry_rows:
@@ -173,9 +170,7 @@ def atom_revisions(atoms_dir: str) -> list[dict[str, str]]:
         with _STAT_HASH_LOCK:
             if len(_DIR_MEMO) > 64:
                 _DIR_MEMO.clear()
-                _DIR_BURST_MEMO.clear()
             _DIR_MEMO[dir_key] = (sigs, revisions)
-            _DIR_BURST_MEMO[dir_key] = (dir_st.st_mtime_ns, time.monotonic() + 10.0, revisions)
     return revisions
 
 
@@ -187,12 +182,21 @@ def revisions_fingerprint(revisions: list[dict[str, str]]) -> str:
     encoded = json.dumps(revisions, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
     if len(revisions) > LARGE_VAULT_STAT_CACHE_THRESHOLD:
+        rev_map = {item["filename"]: item["content_sha256"] for item in revisions}
         with _STAT_HASH_LOCK:
             if len(_FP_MEMO) > 64:
                 _FP_MEMO.clear()
             # Holding a strong ref keeps id() stable; memoized lists are treated as immutable.
-            _FP_MEMO[id(revisions)] = (revisions, digest)
+            _FP_MEMO[id(revisions)] = (revisions, digest, rev_map)
     return digest
+
+
+def revisions_sha_map(revisions: list[dict[str, str]]) -> dict[str, str]:
+    with _STAT_HASH_LOCK:
+        memo = _FP_MEMO.get(id(revisions))
+    if memo is not None and memo[0] is revisions:
+        return memo[2]
+    return {item["filename"]: item["content_sha256"] for item in revisions}
 
 
 def build_index_manifest(

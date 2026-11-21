@@ -942,7 +942,14 @@ def _invoke_provider_draft(
                         },
                     },
                 }
-                resp = client.post(f"{rule.endpoint_url}/chat/completions", headers=headers, json=body)
+                target_base = (
+                    rule.endpoint_url.replace("://localhost:", "://127.0.0.1:").replace("://localhost/", "://127.0.0.1/")
+                    if rule.transport == "local"
+                    else rule.endpoint_url
+                )
+                if rule.transport == "local" and target_base.endswith("://localhost"):
+                    target_base = target_base[: -len("localhost")] + "127.0.0.1"
+                resp = client.post(f"{target_base}/chat/completions", headers=headers, json=body)
                 if 300 <= resp.status_code < 400:
                     raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
                 resp.raise_for_status()
@@ -1145,9 +1152,16 @@ def invoke_provider_stream(
                     "stream": True,
                     "messages": messages,
                 }
+                target_base = (
+                    rule.endpoint_url.replace("://localhost:", "://127.0.0.1:").replace("://localhost/", "://127.0.0.1/")
+                    if rule.transport == "local"
+                    else rule.endpoint_url
+                )
+                if rule.transport == "local" and target_base.endswith("://localhost"):
+                    target_base = target_base[: -len("localhost")] + "127.0.0.1"
                 with client.stream(
                     "POST",
-                    f"{rule.endpoint_url}/chat/completions",
+                    f"{target_base}/chat/completions",
                     headers=headers,
                     json=body,
                 ) as resp:

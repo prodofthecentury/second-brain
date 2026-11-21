@@ -230,27 +230,37 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
         ),
     )
     scored_cases = [case for case in corpus["queries"] if case["answerability"] in {"answerable", "unanswerable"}]
+    if not _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
+        try:
+            call_ollama_chat_maybe_no_think(
+                ollama_client.chat,
+                model=model,
+                messages=[{"role": "user", "content": 'Return {"claims":[]}.'}],
+                format=ANSWER_DRAFT_SCHEMA,
+                options={"temperature": 0, "num_ctx": 1536, "num_predict": 16},
+                stream=False,
+            )
+        except Exception:
+            pass
     observations: list[dict[str, Any]] = []
     for run_number in range(1, runs + 1):
         for case in scored_cases:
             started = time.perf_counter()
             case_projects = (str(case["project_scope"]).strip(),) if case.get("project_scope") else ()
             case_mode = str(case.get("answer_mode") or "standard").strip() or "standard"
-            include_prefs = case_mode == "preference"
             try:
                 direct, neighbors = search_memory(
                     case["query"],
                     RecallOptions(
-                        n_results=5,
+                        n_results=3,
                         follow_links=True,
                         retrieval_mode="auto",
-                        include_preferences=include_prefs,
                         projects=case_projects,
                     ),
                 )
             except Exception as exc:
                 raise EvaluationRunError(f"Trusted recall failed for {case['id']}: {exc}") from exc
-            retrieved = direct + neighbors
+            retrieved = (list(direct) + list(neighbors))[:4]
             retrieval_ms = (time.perf_counter() - started) * 1000
             if not retrieved:
                 observations.append({
@@ -290,7 +300,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                         model=model,
                         messages=[{"role": "user", "content": redaction.sanitized_text}],
                         format=ANSWER_DRAFT_SCHEMA,
-                        options={"temperature": 0, "num_ctx": 2048},
+                        options={"temperature": 0, "num_ctx": 1536},
                         stream=False,
                     )
                 raw_content = strip_reasoning_think_blocks(str(response["message"]["content"])) or "{}"

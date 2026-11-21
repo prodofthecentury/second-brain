@@ -36,7 +36,7 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "evaluation_dataset",
-        "Curated 30-case dataset schema, splits & SHA-256 revision binding (scripts/evaluation_dataset.py)",
+        "Curated 90-case dataset schema, splits & SHA-256 revision binding (scripts/evaluation_dataset.py)",
         (str(SCRIPTS_DIR / "evaluation_dataset.py"),),
     ),
     (
@@ -101,8 +101,23 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "v100_final_completion_tests",
-        "v1.0.0 production completion suite: multimodal /v1/ingest/media & DLP quarantine, Git post-commit distiller, bi-temporal Cross-Encoder snapshot recall, daemon vector/auto-sync, portable .sbvault backup/restore & WinGet/Homebrew/PWA manifests (scripts/v100_final_completion_tests.py)",
+        "v1.0.0 production completion suite: multimodal /v1/ingest/media & DLP quarantine, Git post-commit distiller, bi-temporal Cross-Encoder snapshot recall, daemon vector/auto-sync, portable .sbvault backup/restore, bidirectional SBID1/SBMR1 mobile recall & WinGet/Homebrew/PWA manifests (scripts/v100_final_completion_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "v100_final_completion_tests.py")),
+    ),
+    (
+        "creative_media_tests",
+        "Creative media provenance, Pillow sanitization, CAS asset binding & security boundary suite (scripts/creative_media_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "creative_media_tests.py")),
+    ),
+    (
+        "stage4_executable_skills_tests",
+        "Stage 4 owner-promoted Executable Skills, closed-action sandbox, kill-switch, rollback & hash-chained audit suite (scripts/stage4_executable_skills_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "stage4_executable_skills_tests.py")),
+    ),
+    (
+        "mobile_vault_client_tests",
+        "Cross-runtime Python <-> Node WebCrypto on-device Mobile Vault Client E2EE sync, epistemic recall & offline drop suite (scripts/mobile_vault_client_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "mobile_vault_client_tests.py")),
     ),
     (
         "desktop_ui_tests",

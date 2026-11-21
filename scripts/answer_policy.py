@@ -578,9 +578,9 @@ def build_grounding_prompt(
             if claim:
                 allowed_claims.append(claim)
             compact_body = (
-                f"## Claim\n{claim}\n\n## Evidence\n{evidence_sec[:800]}"
+                f"## Claim\n{claim}\n\n## Evidence\n{evidence_sec[:240]}"
                 if (claim or evidence_sec)
-                else body_text[:1200]
+                else body_text[:480]
             )
             atoms.append(
                 f'<retrieved_atom id="{filename}">\n'

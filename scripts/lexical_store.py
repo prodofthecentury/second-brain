@@ -23,10 +23,17 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import _is_reparse_or_link, safe_file_in_dir
-from index_manifest import LARGE_VAULT_STAT_CACHE_THRESHOLD, atom_revisions, record_known_atom_hash, revisions_fingerprint
+from index_manifest import (
+    LARGE_VAULT_STAT_CACHE_THRESHOLD,
+    atom_revisions,
+    record_known_atom_hash,
+    revisions_fingerprint,
+    revisions_sha_map,
+)
 
 
 LEXICAL_SCHEMA_VERSION = 1
@@ -270,12 +277,15 @@ def _read_metadata(connection: sqlite3.Connection) -> dict[str, object] | None:
 _MEM_FTS_LOCK = threading.Lock()
 # (thread_id, norm_abs_index_path) -> (mtime_ns, ctime_ns, size, in_memory_conn, metadata_dict)
 _MEM_FTS_MIRRORS: dict[tuple[int, str], tuple[int, int, int, sqlite3.Connection, dict[str, object] | None]] = {}
+# (norm_abs_atoms_dir, norm_abs_index_path) -> (dir_mtime_ns, idx_mtime_ns, expires_mono, verified_sha_map)
+_VERIFIED_SCAN_MEMO: dict[tuple[str, str], tuple[int, int, float, dict[str, str]]] = {}
 
 
 def _evict_mem_fts_mirror(index_path: str | None = None) -> None:
     target_norm = os.path.normcase(os.path.abspath(index_path)) if index_path else None
     to_close: list[sqlite3.Connection] = []
     with _MEM_FTS_LOCK:
+        _VERIFIED_SCAN_MEMO.clear()
         for key in list(_MEM_FTS_MIRRORS):
             if target_norm is None or key[1] == target_norm:
                 entry = _MEM_FTS_MIRRORS.pop(key, None)
@@ -626,20 +636,51 @@ def _search_lexical_index_verified(
         limit = 5
 
     verified_map: dict[str, str] | None = None
+    abs_atoms_dir = os.path.abspath(atoms_dir) if atoms_dir is not None else ""
     connection, pre_meta, should_close = _get_query_connection(index_path)
     try:
         if atoms_dir is not None:
             metadata = pre_meta if pre_meta is not None else _read_metadata(connection)
             if not isinstance(metadata, dict) or metadata.get("schema_version") != LEXICAL_SCHEMA_VERSION:
                 raise LexicalIndexUnavailable("Lexical recall index is stale; rebuild it before serving memory.")
-            revisions = atom_revisions(atoms_dir)
-            if not (
-                metadata.get("atom_count") == len(revisions)
-                and metadata.get("indexed_count") == len(revisions)
-                and metadata.get("atom_revisions_sha256") == revisions_fingerprint(revisions)
+            memo_key = (os.path.normcase(abs_atoms_dir), os.path.normcase(os.path.abspath(index_path)))
+            try:
+                dir_mtime_ns = os.lstat(abs_atoms_dir).st_mtime_ns
+                idx_mtime_ns = os.stat(index_path).st_mtime_ns
+            except OSError:
+                dir_mtime_ns = -1
+                idx_mtime_ns = -1
+            now_mono = time.monotonic()
+            with _MEM_FTS_LOCK:
+                scan_memo = _VERIFIED_SCAN_MEMO.get(memo_key)
+            if (
+                scan_memo is not None
+                and dir_mtime_ns >= 0
+                and scan_memo[0] == dir_mtime_ns
+                and scan_memo[1] == idx_mtime_ns
+                and now_mono < scan_memo[2]
+                and metadata.get("atom_count") == len(scan_memo[3])
             ):
-                raise LexicalIndexUnavailable("Lexical recall index is stale; rebuild it before serving memory.")
-            verified_map = {item["filename"]: item["content_sha256"] for item in revisions}
+                verified_map = scan_memo[3]
+            else:
+                revisions = atom_revisions(atoms_dir)
+                if not (
+                    metadata.get("atom_count") == len(revisions)
+                    and metadata.get("indexed_count") == len(revisions)
+                    and metadata.get("atom_revisions_sha256") == revisions_fingerprint(revisions)
+                ):
+                    raise LexicalIndexUnavailable("Lexical recall index is stale; rebuild it before serving memory.")
+                verified_map = revisions_sha_map(revisions)
+                if len(revisions) > LARGE_VAULT_STAT_CACHE_THRESHOLD and dir_mtime_ns >= 0:
+                    with _MEM_FTS_LOCK:
+                        if len(_VERIFIED_SCAN_MEMO) >= 16:
+                            _VERIFIED_SCAN_MEMO.clear()
+                        _VERIFIED_SCAN_MEMO[memo_key] = (
+                            dir_mtime_ns,
+                            idx_mtime_ns,
+                            time.monotonic() + 5.0,
+                            verified_map,
+                        )
         if not expression:
             return [], verified_map
         rows = connection.execute(
