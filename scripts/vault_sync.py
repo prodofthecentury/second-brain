@@ -35,6 +35,7 @@ import argparse
 import base64
 from dataclasses import dataclass
 import datetime
+import difflib
 import hashlib
 import hmac
 import json
@@ -45,8 +46,11 @@ import secrets
 import socket
 import sys
 import tempfile
+import threading
+import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlparse
+import xml.etree.ElementTree as ET
 
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
@@ -58,11 +62,13 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import (  # noqa: E402
+    approved_revision_is_current,
     atomic_write_bytes,
     content_sha256,
     invalidate_decision_log_cache,
     review_lock,
 )
+from index_manifest import invalidate_atom_revision_cache, load_index_manifest  # noqa: E402
 from config import (  # noqa: E402
     BRAIN_DIR,
     _WINDOWS_RESERVED_STEMS,
@@ -78,7 +84,14 @@ from host_adapters import (  # noqa: E402
     restrict_security_file_permissions,
     validate_endpoint_network_boundary,
 )
+from keychain_store import (  # noqa: E402
+    KeychainError,
+    keychain_backend_name,
+    load_secret,
+    store_secret,
+)
 from lexical_store import rebuild_lexical_index  # noqa: E402
+from memory_format import normalize_memory_document, render_memory_document, set_scalar_field, split_frontmatter  # noqa: E402
 from notes_store import NotePaths, ensure_notes_index  # noqa: E402
 
 
@@ -89,7 +102,10 @@ KEY_BYTES = 32
 MAX_SYNC_FILE_BYTES = 50_000_000
 MAX_SYNC_MANIFEST_BYTES = 16_000_000
 MAX_SYNC_HEADER_BYTES = 65_536
+MAX_SYNC_BASE_CACHE_BYTES = 524_288
+MAX_S3_LIST_XML_BYTES = 4_000_000
 MAX_TRUSTED_PEERS = 32
+_KEYCHAIN_SERVICE = "second-brain.vault-sync"
 _SCRYPT_N = 2**15
 _SCRYPT_R = 8
 _SCRYPT_P = 1
@@ -98,6 +114,7 @@ _SCRYPT_MAXMEM = 64 * 1024 * 1024
 _HEX_ID_RE = re.compile(r"^(?:[0-9a-f]{2}){8,32}$")
 _DEVICE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{4,64}$")
 _ENV_VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+_S3_REGION_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 _ALLOWED_TOP_FILES = frozenset({"house-rules.md"})
 _ALLOWED_ROOT_DIRS = frozenset(
@@ -403,6 +420,12 @@ class SyncBackend:
     def put_object(self, key: str, data: bytes) -> None:
         raise NotImplementedError
 
+    def delete_object(self, key: str) -> bool:
+        raise NotImplementedError
+
+    def list_objects(self, prefix: str = "") -> list[str]:
+        raise NotImplementedError
+
     def exists(self, key: str) -> bool:
         return self.get_object(key, max_bytes=16) is not None
 
@@ -413,9 +436,173 @@ def _validate_backend_key(key: str) -> str:
     parts = key.split("/")
     if any(seg in {"", ".", ".."} for seg in parts):
         raise SyncSecurityError(f"Unsafe sync object key traversal: {key!r}")
-    if parts[0] not in {"vault-header.json", "head.json", "manifests", "objects"}:
+    if parts[0] not in {"vault-header.json", "head.json", "manifests", "objects", "inbox-drops"}:
         raise SyncSecurityError(f"Disallowed sync object namespace: {key!r}")
+    if parts[0] == "inbox-drops":
+        if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{32}\.enc", parts[1]):
+            raise SyncSecurityError(f"Invalid inbox-drop object key format: {key!r}")
     return key
+
+
+def _hmac_sha256_bytes(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def sign_s3_sigv4_headers(
+    method: str,
+    url: str,
+    payload: bytes = b"",
+    *,
+    access_key: str,
+    secret_key: str,
+    region: str = "auto",
+    service: str = "s3",
+    session_token: str | None = None,
+    amz_date: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Compute RFC-compliant AWS SigV4 (`AWS4-HMAC-SHA256`) headers for S3 / R2 / B2 / MinIO."""
+    if not access_key or not secret_key:
+        raise SyncSecurityError("S3 SigV4 access_key and secret_key must be non-empty.")
+    if not _S3_REGION_RE.fullmatch(region):
+        raise SyncSecurityError(f"Invalid S3 region identifier: {region!r}")
+    parsed = urlparse(url)
+    if not parsed.hostname or parsed.scheme not in {"https", "http"}:
+        raise SyncSecurityError(f"Invalid S3 request URL: {url!r}")
+
+    now_amz = amz_date or datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if len(now_amz) < 16 or not now_amz.endswith("Z"):
+        raise SyncSecurityError(f"Invalid x-amz-date format: {now_amz!r}")
+    date_stamp = now_amz[:8]
+
+    if (parsed.scheme == "https" and parsed.port == 443) or (parsed.scheme == "http" and parsed.port == 80):
+        host_header = parsed.hostname
+    else:
+        host_header = parsed.netloc
+
+    raw_path = parsed.path or "/"
+    encoded_segments = [quote(unquote(seg), safe="-_.~") for seg in raw_path.split("/")]
+    canonical_uri = "/".join(encoded_segments) or "/"
+    if not canonical_uri.startswith("/"):
+        canonical_uri = "/" + canonical_uri
+
+    query_pairs: list[tuple[str, str]] = []
+    if parsed.query:
+        for raw_part in parsed.query.split("&"):
+            if not raw_part:
+                continue
+            if "=" in raw_part:
+                qk, qv = raw_part.split("=", 1)
+                query_pairs.append((unquote(qk), unquote(qv)))
+            else:
+                query_pairs.append((unquote(raw_part), ""))
+    encoded_query = sorted((quote(k, safe="-_.~"), quote(v, safe="-_.~")) for k, v in query_pairs)
+    canonical_querystring = "&".join(f"{k}={v}" for k, v in encoded_query)
+
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    signable: dict[str, str] = {
+        "host": host_header,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": now_amz,
+    }
+    if session_token:
+        signable["x-amz-security-token"] = session_token.strip()
+
+    out_headers: dict[str, str] = {
+        "User-Agent": "SecondBrain-Sync/1.0",
+        "Host": host_header,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": now_amz,
+    }
+    if session_token:
+        out_headers["x-amz-security-token"] = session_token.strip()
+    if extra_headers:
+        for hk, hv in extra_headers.items():
+            out_headers[hk] = hv
+            hk_low = hk.strip().lower()
+            if hk_low.startswith("x-amz-") or hk_low == "content-md5":
+                signable[hk_low] = str(hv)
+
+    sorted_keys = sorted(signable.keys())
+    canonical_headers = "".join(f"{k}:{' '.join(signable[k].strip().split())}\n" for k in sorted_keys)
+    signed_headers = ";".join(sorted_keys)
+
+    canonical_request = "\n".join(
+        [
+            method.upper(),
+            canonical_uri,
+            canonical_querystring,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            now_amz,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ]
+    )
+    k_date = _hmac_sha256_bytes(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    k_region = _hmac_sha256_bytes(k_date, region)
+    k_service = _hmac_sha256_bytes(k_region, service)
+    k_signing = _hmac_sha256_bytes(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    out_headers["Authorization"] = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return out_headers
+
+
+def _parse_s3_list_objects_xml(
+    xml_bytes: bytes,
+    *,
+    key_strip_prefix: str = "",
+) -> tuple[list[str], str | None]:
+    """Safely parse S3 ListObjectsV2 XML, rejecting DTD/XXE declarations fail-closed."""
+    if len(xml_bytes) > MAX_S3_LIST_XML_BYTES:
+        raise SyncSecurityError("S3 ListObjectsV2 XML response exceeds maximum size.")
+    upper_all = xml_bytes.upper()
+    if b"<!DOCTYPE" in upper_all or b"<!ENTITY" in upper_all:
+        raise SyncSecurityError("Rejected S3 XML response containing DTD/ENTITY declarations.")
+    try:
+        root = ET.fromstring(xml_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ET.ParseError) as exc:
+        raise SyncSecurityError(f"Malformed S3 ListObjectsV2 XML response: {exc}") from exc
+
+    def _local_tag(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+    keys: list[str] = []
+    is_truncated = False
+    next_token: str | None = None
+    norm_strip = key_strip_prefix.strip("/")
+    prefix_with_slash = f"{norm_strip}/" if norm_strip else ""
+
+    for child in root:
+        ctag = _local_tag(child.tag)
+        if ctag == "IsTruncated" and (child.text or "").strip().lower() == "true":
+            is_truncated = True
+        elif ctag == "NextContinuationToken" and (child.text or "").strip():
+            next_token = (child.text or "").strip()
+        elif ctag == "Contents":
+            for sub in child:
+                if _local_tag(sub.tag) == "Key" and (sub.text or "").strip():
+                    raw_k = (sub.text or "").strip().lstrip("/")
+                    if prefix_with_slash:
+                        if not raw_k.startswith(prefix_with_slash):
+                            continue
+                        raw_k = raw_k[len(prefix_with_slash) :]
+                    try:
+                        keys.append(_validate_backend_key(raw_k))
+                    except SyncSecurityError:
+                        continue
+    return keys, (next_token if is_truncated else None)
 
 
 class LocalFolderSyncBackend(SyncBackend):
@@ -455,9 +642,50 @@ class LocalFolderSyncBackend(SyncBackend):
         _assert_no_symlink_chain(dest, stop_at=self.root)
         atomic_write_bytes(str(dest), data)
 
+    def delete_object(self, key: str) -> bool:
+        dest = self._resolve(key)
+        if not dest.exists():
+            return False
+        if not dest.is_file() or _is_reparse_or_link(str(dest)):
+            raise SyncSecurityError(f"Refusing to delete non-regular sync object: {key}")
+        dest.unlink()
+        return True
+
+    def list_objects(self, prefix: str = "") -> list[str]:
+        clean_pref = prefix.strip().strip("/")
+        if clean_pref and clean_pref.split("/")[0] not in {"vault-header.json", "head.json", "manifests", "objects", "inbox-drops"}:
+            raise SyncSecurityError(f"Disallowed sync list prefix: {prefix!r}")
+        if not self.root.is_dir():
+            return []
+        _assert_no_symlink_chain(self.root)
+        namespaces = [clean_pref.split("/")[0]] if clean_pref else ["manifests", "objects"]
+        found: list[str] = []
+        for ns in namespaces:
+            target = self.root / ns
+            if not target.exists() or _is_reparse_or_link(str(target)):
+                continue
+            if target.is_file():
+                rel = target.relative_to(self.root).as_posix()
+                if not clean_pref or rel == clean_pref or rel.startswith(clean_pref + "/"):
+                    found.append(_validate_backend_key(rel))
+                continue
+            for dirpath, dirnames, filenames in os.walk(str(target), followlinks=False):
+                dirnames[:] = [d for d in sorted(dirnames) if not _is_reparse_or_link(os.path.join(dirpath, d))]
+                for fn in sorted(filenames):
+                    full = os.path.join(dirpath, fn)
+                    if _is_reparse_or_link(full) or not os.path.isfile(full):
+                        continue
+                    rel = Path(full).relative_to(self.root).as_posix()
+                    if not clean_pref or rel == clean_pref or rel.startswith(clean_pref + "/"):
+                        try:
+                            found.append(_validate_backend_key(rel))
+                        except SyncSecurityError:
+                            continue
+        return sorted(set(found))
+
 
 class HttpObjectSyncBackend(SyncBackend):
-    """DNS-pinned HTTPS object-store backend (S3 presigned/gateway, R2, WebDAV, or custom HTTPS endpoint)."""
+    """DNS-pinned HTTPS object-store backend (AWS S3 / Cloudflare R2 / Backblaze B2 SigV4, Bearer, or HTTPS)."""
 
     backend_type = "http_object"
 
@@ -466,6 +694,11 @@ class HttpObjectSyncBackend(SyncBackend):
         endpoint_url: str,
         *,
         bearer_token_env: str | None = None,
+        auth_mode: str = "bearer",
+        s3_region: str = "auto",
+        s3_access_key_env: str | None = None,
+        s3_secret_key_env: str | None = None,
+        s3_session_token_env: str | None = None,
         http_transport: httpx.BaseTransport | None = None,
         skip_dns_check_for_mock_transport: bool = False,
         timeout_s: float = 30.0,
@@ -476,12 +709,40 @@ class HttpObjectSyncBackend(SyncBackend):
             raise SyncSecurityError(f"Invalid HTTP sync endpoint URL: {endpoint_url!r}")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise SyncSecurityError("Sync endpoint URL must not embed credentials, query strings, or fragments.")
+
+        norm_auth = (auth_mode or "bearer").strip().lower()
+        if norm_auth not in {"bearer", "s3_sigv4", "none"}:
+            raise SyncSecurityError(f"Unsupported HTTP sync auth_mode: {auth_mode!r}")
+        self.auth_mode = norm_auth
+
         if bearer_token_env is not None and bearer_token_env.strip():
             if not _ENV_VAR_RE.fullmatch(bearer_token_env.strip()):
                 raise SyncSecurityError("bearer_token_env must be an uppercase environment variable name.")
             self.bearer_token_env: str | None = bearer_token_env.strip()
         else:
             self.bearer_token_env = None
+
+        norm_region = (s3_region or "auto").strip()
+        if not _S3_REGION_RE.fullmatch(norm_region):
+            raise SyncSecurityError(f"Invalid s3_region: {s3_region!r}")
+        self.s3_region = norm_region
+
+        def _clean_env_name(raw_name: str | None, default_name: str | None) -> str | None:
+            cand = (raw_name or "").strip() or default_name
+            if cand is None:
+                return None
+            if not _ENV_VAR_RE.fullmatch(cand):
+                raise SyncSecurityError(f"Invalid credential environment variable name: {cand!r}")
+            return cand
+
+        if self.auth_mode == "s3_sigv4":
+            self.s3_access_key_env = _clean_env_name(s3_access_key_env, "AWS_ACCESS_KEY_ID")
+            self.s3_secret_key_env = _clean_env_name(s3_secret_key_env, "AWS_SECRET_ACCESS_KEY")
+            self.s3_session_token_env = _clean_env_name(s3_session_token_env, None)
+        else:
+            self.s3_access_key_env = _clean_env_name(s3_access_key_env, None)
+            self.s3_secret_key_env = _clean_env_name(s3_secret_key_env, None)
+            self.s3_session_token_env = _clean_env_name(s3_session_token_env, None)
 
         transport_kind = "local" if (parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1"}) else "online"
         if parsed.scheme == "http" and transport_kind != "local":
@@ -493,7 +754,7 @@ class HttpObjectSyncBackend(SyncBackend):
             transport=transport_kind,
             endpoint_url=raw_ep,
             default_model="sync-object-store",
-            api_key_env=self.bearer_token_env,
+            api_key_env=self.bearer_token_env or self.s3_access_key_env,
             enabled=True,
             owner_consent_recorded=True,
         )
@@ -505,15 +766,49 @@ class HttpObjectSyncBackend(SyncBackend):
         self.http_transport = http_transport
         self.timeout_s = timeout_s
 
-    def _headers(self) -> dict[str, str]:
+    def _request_headers(
+        self,
+        method: str,
+        url: str,
+        payload: bytes = b"",
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        if self.auth_mode == "s3_sigv4":
+            ak_env = self.s3_access_key_env or "AWS_ACCESS_KEY_ID"
+            sk_env = self.s3_secret_key_env or "AWS_SECRET_ACCESS_KEY"
+            access_key = (os.environ.get(ak_env) or "").strip()
+            secret_key = (os.environ.get(sk_env) or "").strip()
+            if not access_key or not secret_key:
+                raise SyncSecurityError(
+                    f"Required S3 SigV4 environment variables ('{ak_env}', '{sk_env}') are not set."
+                )
+            session_tok = (
+                (os.environ.get(self.s3_session_token_env) or "").strip() or None
+                if self.s3_session_token_env
+                else None
+            )
+            return sign_s3_sigv4_headers(
+                method,
+                url,
+                payload,
+                access_key=access_key,
+                secret_key=secret_key,
+                region=self.s3_region,
+                session_token=session_tok,
+                extra_headers=extra_headers,
+            )
+
         hdrs: dict[str, str] = {"User-Agent": "SecondBrain-Sync/1.0"}
-        if self.bearer_token_env:
+        if self.auth_mode == "bearer" and self.bearer_token_env:
             tok = (os.environ.get(self.bearer_token_env) or "").strip()
             if not tok:
                 raise SyncSecurityError(
                     f"Required sync auth environment variable '{self.bearer_token_env}' is not set."
                 )
             hdrs["Authorization"] = f"Bearer {tok}"
+        if extra_headers:
+            hdrs.update(extra_headers)
         return hdrs
 
     def _open_client(self) -> tuple[httpx.Client, PinnedHTTPTransport | None]:
@@ -553,8 +848,8 @@ class HttpObjectSyncBackend(SyncBackend):
         client, pinned = self._open_client()
         try:
             with client:
-                hdrs = self._headers()
-                head_resp = client.request("HEAD", url, headers=hdrs)
+                head_hdrs = self._request_headers("HEAD", url)
+                head_resp = client.request("HEAD", url, headers=head_hdrs)
                 if 300 <= head_resp.status_code < 400:
                     raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
                 if head_resp.status_code == 200:
@@ -563,7 +858,8 @@ class HttpObjectSyncBackend(SyncBackend):
                     return False
                 if head_resp.status_code not in {405, 501}:
                     head_resp.raise_for_status()
-                with client.stream("GET", url, headers=hdrs) as get_resp:
+                get_hdrs = self._request_headers("GET", url)
+                with client.stream("GET", url, headers=get_hdrs) as get_resp:
                     if 300 <= get_resp.status_code < 400:
                         raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
                     if get_resp.status_code == 404:
@@ -579,7 +875,7 @@ class HttpObjectSyncBackend(SyncBackend):
         client, pinned = self._open_client()
         try:
             with client:
-                with client.stream("GET", url, headers=self._headers()) as resp:
+                with client.stream("GET", url, headers=self._request_headers("GET", url)) as resp:
                     if 300 <= resp.status_code < 400:
                         raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
                     if resp.status_code == 404:
@@ -609,7 +905,12 @@ class HttpObjectSyncBackend(SyncBackend):
         client, pinned = self._open_client()
         try:
             with client:
-                hdrs = {**self._headers(), "Content-Type": "application/octet-stream"}
+                hdrs = self._request_headers(
+                    "PUT",
+                    url,
+                    data,
+                    extra_headers={"Content-Type": "application/octet-stream"},
+                )
                 resp = client.put(url, headers=hdrs, content=data)
                 if 300 <= resp.status_code < 400:
                     raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
@@ -617,6 +918,119 @@ class HttpObjectSyncBackend(SyncBackend):
         finally:
             if pinned is not None:
                 pinned.close()
+
+    def delete_object(self, key: str) -> bool:
+        url = self._url_for(key)
+        client, pinned = self._open_client()
+        try:
+            with client:
+                hdrs = self._request_headers("DELETE", url)
+                resp = client.delete(url, headers=hdrs)
+                if 300 <= resp.status_code < 400:
+                    raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
+                if resp.status_code == 404:
+                    return False
+                resp.raise_for_status()
+                return True
+        finally:
+            if pinned is not None:
+                pinned.close()
+
+    @staticmethod
+    def _is_virtual_hosted_s3_hostname(hostname: str) -> bool:
+        host = (hostname or "").strip().lower().rstrip(".")
+        if not host:
+            return False
+        # Virtual-hosted S3: <bucket>.s3.<region>.amazonaws.com, <bucket>.s3-<region>.amazonaws.com, <bucket>.s3.amazonaws.com
+        if ".s3." in host or ".s3-" in host or ".s3-accelerate" in host:
+            return True
+        # Virtual-hosted Backblaze B2: <bucket>.s3.<region>.backblazeb2.com (covered by .s3.)
+        # Virtual-hosted DigitalOcean Spaces: <bucket>.<region>.digitaloceanspaces.com (4 labels)
+        if host.endswith(".digitaloceanspaces.com") and host.count(".") >= 3:
+            return True
+        # Virtual-hosted Cloudflare R2 custom/r2.dev domain: <pub>.r2.dev
+        if host.endswith(".r2.dev"):
+            return True
+        return False
+
+    def list_objects(self, prefix: str = "") -> list[str]:
+        clean_pref = prefix.strip().strip("/")
+        if clean_pref and clean_pref.split("/")[0] not in {"vault-header.json", "head.json", "manifests", "objects", "inbox-drops"}:
+            raise SyncSecurityError(f"Disallowed sync list prefix: {prefix!r}")
+        parsed_ep = urlparse(self.endpoint_url)
+        path_segments = [s for s in (parsed_ep.path or "").split("/") if s]
+        is_vhost = self._is_virtual_hosted_s3_hostname(parsed_ep.hostname or "")
+
+        if is_vhost:
+            bucket_url = f"{parsed_ep.scheme}://{parsed_ep.netloc}"
+            sub_prefix = "/".join(path_segments)
+            if sub_prefix:
+                full_prefix = f"{sub_prefix}/{clean_pref}/" if clean_pref in {"manifests", "objects", "inbox-drops"} else (f"{sub_prefix}/{clean_pref}" if clean_pref else f"{sub_prefix}/")
+            else:
+                full_prefix = f"{clean_pref}/" if clean_pref in {"manifests", "objects", "inbox-drops"} else clean_pref
+        elif len(path_segments) >= 2:
+            # Path-style S3 URLs like https://acct.r2.cloudflarestorage.com/my-bucket/subprefix
+            bucket_url = f"{parsed_ep.scheme}://{parsed_ep.netloc}/{path_segments[0]}"
+            sub_prefix = "/".join(path_segments[1:])
+            full_prefix = f"{sub_prefix}/{clean_pref}/" if clean_pref in {"manifests", "objects", "inbox-drops"} else (f"{sub_prefix}/{clean_pref}" if clean_pref else f"{sub_prefix}/")
+        else:
+            bucket_url = self.endpoint_url
+            sub_prefix = ""
+            full_prefix = f"{clean_pref}/" if clean_pref in {"manifests", "objects", "inbox-drops"} else clean_pref
+
+        collected: list[str] = []
+        continuation_token: str | None = None
+        client, pinned = self._open_client()
+        try:
+            with client:
+                for _page in range(200):
+                    q_items = [("list-type", "2")]
+                    if full_prefix:
+                        q_items.append(("prefix", full_prefix))
+                    if continuation_token:
+                        q_items.append(("continuation-token", continuation_token))
+                    qs = "&".join(f"{quote(k, safe='-_.~')}={quote(v, safe='-_.~')}" for k, v in sorted(q_items))
+                    list_url = f"{bucket_url}?{qs}"
+                    hdrs = self._request_headers("GET", list_url)
+                    chunks: list[bytes] = []
+                    total_bytes = 0
+                    with client.stream("GET", list_url, headers=hdrs) as resp:
+                        if 300 <= resp.status_code < 400:
+                            raise SyncSecurityError("HTTP redirects are forbidden on sync object endpoints.")
+                        resp.raise_for_status()
+                        ctype = (resp.headers.get("Content-Type") or "").lower()
+                        for chunk in resp.iter_bytes():
+                            total_bytes += len(chunk)
+                            if total_bytes > MAX_S3_LIST_XML_BYTES:
+                                raise SyncSecurityError("Sync list_objects response exceeded maximum byte limit.")
+                            chunks.append(chunk)
+                    raw_body = b"".join(chunks)
+                    if "json" in ctype:
+                        doc = json.loads(raw_body.decode("utf-8"))
+                        raw_items = doc.get("keys") or doc.get("objects") or []
+                        for item in raw_items:
+                            rk = str(item.get("key") if isinstance(item, dict) else item).lstrip("/")
+                            if sub_prefix:
+                                if not rk.startswith(sub_prefix + "/"):
+                                    continue
+                                rk = rk[len(sub_prefix) + 1 :]
+                            try:
+                                collected.append(_validate_backend_key(rk))
+                            except SyncSecurityError:
+                                continue
+                        continuation_token = None
+                    else:
+                        page_keys, continuation_token = _parse_s3_list_objects_xml(
+                            raw_body,
+                            key_strip_prefix=sub_prefix,
+                        )
+                        collected.extend(page_keys)
+                    if not continuation_token:
+                        break
+        finally:
+            if pinned is not None:
+                pinned.close()
+        return sorted(set(collected))
 
 
 def _backend_from_config(
@@ -632,6 +1046,11 @@ def _backend_from_config(
         return HttpObjectSyncBackend(
             str(cfg["target"]),
             bearer_token_env=cfg.get("bearer_token_env"),
+            auth_mode=str(cfg.get("auth_mode") or "bearer"),
+            s3_region=str(cfg.get("s3_region") or "auto"),
+            s3_access_key_env=cfg.get("s3_access_key_env"),
+            s3_secret_key_env=cfg.get("s3_secret_key_env"),
+            s3_session_token_env=cfg.get("s3_session_token_env"),
             http_transport=http_transport,
             skip_dns_check_for_mock_transport=skip_dns_check_for_mock_transport,
         )
@@ -816,9 +1235,64 @@ def _save_local_sync_state(brain_dir: str | Path, state: dict[str, Any]) -> None
     atomic_write_bytes(str(sp), (json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
-def _resolve_master_key(cfg: dict[str, Any], *, passphrase: str | None = None) -> bytes:
+def _seal_key_into_keychain(
+    vault_id: str,
+    device_id: str,
+    master_key: bytes,
+    *,
+    state_dir: Path | None = None,
+) -> dict[str, str]:
+    account = f"vault-{vault_id}-{device_id}"
+    try:
+        return store_secret(_KEYCHAIN_SERVICE, account, master_key, state_dir=state_dir)
+    except KeychainError as exc:
+        raise SyncSecurityError(f"Failed to seal master key into OS Keychain / DPAPI: {exc}") from exc
+
+
+def _resolve_master_key(
+    cfg: dict[str, Any],
+    *,
+    passphrase: str | None = None,
+    state_dir: Path | None = None,
+) -> bytes:
     kdf_mode = str(cfg.get("kdf_mode") or "keyfile")
+    kc_account = str(cfg.get("keychain_account") or "").strip()
+    kc_service = str(cfg.get("keychain_service") or _KEYCHAIN_SERVICE).strip()
+    kc_backend = str(cfg.get("keychain_backend") or "").strip() or None
+
+    if kdf_mode == "os_keychain":
+        if not kc_account:
+            raise SyncSecurityError("Sync config missing keychain_account for os_keychain mode.")
+        try:
+            key = load_secret(kc_service, kc_account, state_dir=state_dir, backend=kc_backend)
+        except KeychainError as exc:
+            raise SyncSecurityError(f"OS Keychain / DPAPI unseal failed: {exc}") from exc
+        if key is None or len(key) != KEY_BYTES:
+            raise SyncSecurityError("Master key missing or corrupted in OS Keychain / DPAPI store.")
+        return key
+
+    if kdf_mode == "passphrase":
+        if passphrase:
+            salt = base64.b64decode(str(cfg["kdf_salt_b64"]))
+            return derive_master_key_from_passphrase(passphrase, salt)
+        if kc_account:
+            try:
+                key = load_secret(kc_service, kc_account, state_dir=state_dir, backend=kc_backend)
+            except KeychainError as exc:
+                raise SyncSecurityError(f"OS Keychain / DPAPI unseal failed: {exc}") from exc
+            if key is not None and len(key) == KEY_BYTES:
+                return key
+        raise SyncSecurityError("Passphrase is required to unlock this E2EE sync vault.")
+
     if kdf_mode == "keyfile":
+        if kc_account and not cfg.get("master_key_b64"):
+            try:
+                key = load_secret(kc_service, kc_account, state_dir=state_dir, backend=kc_backend)
+            except KeychainError as exc:
+                raise SyncSecurityError(f"OS Keychain / DPAPI unseal failed: {exc}") from exc
+            if key is None or len(key) != KEY_BYTES:
+                raise SyncSecurityError("Master key missing or corrupted in OS Keychain / DPAPI store.")
+            return key
         key_b64 = str(cfg.get("master_key_b64") or "")
         if not key_b64:
             raise SyncSecurityError("Sync config missing master_key_b64.")
@@ -826,12 +1300,100 @@ def _resolve_master_key(cfg: dict[str, Any], *, passphrase: str | None = None) -
         if len(key) != KEY_BYTES:
             raise SyncSecurityError("Invalid master key length.")
         return key
-    if kdf_mode == "passphrase":
-        if not passphrase:
-            raise SyncSecurityError("Passphrase is required to unlock this E2EE sync vault.")
-        salt = base64.b64decode(str(cfg["kdf_salt_b64"]))
-        return derive_master_key_from_passphrase(passphrase, salt)
+
     raise SyncSecurityError(f"Unsupported sync kdf_mode: {kdf_mode!r}")
+
+
+def _sync_base_cache_dir(active_brain: Path) -> Path:
+    return active_brain / ".sidecar" / "sync-base"
+
+
+def _cache_sync_base_blob(active_brain: Path, sha256_hex: str, raw_bytes: bytes) -> None:
+    if not _HEX_ID_RE.fullmatch(sha256_hex) or len(raw_bytes) > MAX_SYNC_BASE_CACHE_BYTES:
+        return
+    base_dir = _sync_base_cache_dir(active_brain)
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+        if _is_reparse_or_link(str(base_dir)):
+            return
+        dest = base_dir / f"{sha256_hex}.blob"
+        if not dest.exists():
+            atomic_write_bytes(str(dest), raw_bytes)
+    except OSError:
+        pass
+
+
+def _load_sync_base_text(active_brain: Path, sha256_hex: str | None) -> str | None:
+    if not sha256_hex or not _HEX_ID_RE.fullmatch(str(sha256_hex)):
+        return None
+    dest = _sync_base_cache_dir(active_brain) / f"{sha256_hex}.blob"
+    if not dest.is_file() or _is_reparse_or_link(str(dest)):
+        return None
+    try:
+        raw = dest.read_bytes()
+        if content_sha256(raw) != sha256_hex:
+            return None
+        return raw.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _prune_sync_base_cache(active_brain: Path, keep_shas: set[str]) -> None:
+    base_dir = _sync_base_cache_dir(active_brain)
+    if not base_dir.is_dir() or _is_reparse_or_link(str(base_dir)):
+        return
+    try:
+        for fn in os.listdir(base_dir):
+            if not fn.endswith(".blob"):
+                continue
+            stem = fn[:-5]
+            if stem not in keep_shas:
+                fp = base_dir / fn
+                if fp.is_file() and not _is_reparse_or_link(str(fp)):
+                    fp.unlink()
+    except OSError:
+        pass
+
+
+def _sync_dense_vectors_incremental(
+    active_brain: Path,
+    changed_atoms: list[str],
+    deleted_atoms: list[str],
+) -> bool:
+    atoms_dir = active_brain / "2-atoms"
+    for fname in (*changed_atoms, *deleted_atoms):
+        invalidate_atom_revision_cache(str(atoms_dir / fname))
+    if not changed_atoms and not deleted_atoms:
+        return False
+    chroma_dir = active_brain / ".chroma"
+    try:
+        manifest = load_index_manifest(str(chroma_dir))
+        if not manifest or manifest.get("distance_metric") != "cosine":
+            return False
+        import rebuild_vectors as _rv_mod
+
+        inc_fn = getattr(_rv_mod, "upsert_changed_vectors", None)
+        if callable(inc_fn):
+            res = inc_fn(
+                atoms_dir=str(atoms_dir),
+                store_path=str(chroma_dir),
+                model=str(manifest.get("embedding_model") or "").strip() or None,
+                changed_filenames=changed_atoms,
+                deleted_filenames=deleted_atoms,
+                _writer_lock_held=True,
+            )
+            return bool(res.get("committed", True))
+    except Exception:
+        return False
+    return False
+
+
+def _conflict_entry_id(entry: dict[str, Any]) -> str:
+    existing = str(entry.get("conflict_id") or "").strip()
+    if existing:
+        return existing
+    seed = f"{entry.get('rel_path', '')}:{entry.get('remote_epoch', 0)}:{entry.get('remote_sha256', '')}:{entry.get('local_sha256', '')}"
+    return "conf_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
 
 
 # ─── Public High-Level Sync API ──────────────────────────────────────────────
@@ -843,7 +1405,14 @@ def init_sync(
     brain_dir: str | Path | None = None,
     device_name: str | None = None,
     passphrase: str | None = None,
+    kdf_mode: str | None = None,
+    use_keychain: bool = False,
     bearer_token_env: str | None = None,
+    auth_mode: str = "bearer",
+    s3_region: str = "auto",
+    s3_access_key_env: str | None = None,
+    s3_secret_key_env: str | None = None,
+    s3_session_token_env: str | None = None,
     state_dir: Path | None = None,
     http_transport: httpx.BaseTransport | None = None,
     skip_dns_check_for_mock_transport: bool = False,
@@ -855,20 +1424,38 @@ def init_sync(
     device_id = f"{host_slug}-{secrets.token_hex(4)}"
     priv_b64, pub_b64 = _generate_device_keypair()
 
+    req_kdf = (kdf_mode or "").strip().lower() or None
+    if req_kdf not in {None, "keyfile", "passphrase", "os_keychain"}:
+        raise ValueError(f"Unsupported kdf_mode: {kdf_mode!r}")
+    seal_in_kc = bool(use_keychain or req_kdf == "os_keychain")
+
+    kc_meta: dict[str, str] | None = None
     if passphrase is not None:
         salt = os.urandom(32)
         master_key = derive_master_key_from_passphrase(passphrase, salt)
-        kdf_mode = "passphrase"
+        local_kdf_mode = "passphrase"
+        header_kdf_mode = "passphrase"
         salt_b64 = base64.b64encode(salt).decode("ascii")
         stored_key_b64 = None
         recovery_key_b64 = None
+        if seal_in_kc:
+            kc_meta = _seal_key_into_keychain(vault_id, device_id, master_key, state_dir=state_dir)
     else:
+        if req_kdf == "passphrase":
+            raise ValueError("Passphrase must be supplied when kdf_mode='passphrase'.")
         master_key = os.urandom(KEY_BYTES)
-        kdf_mode = "keyfile"
+        header_kdf_mode = "keyfile"
         salt_b64 = None
-        stored_key_b64 = base64.b64encode(master_key).decode("ascii")
-        recovery_key_b64 = stored_key_b64
+        recovery_key_b64 = base64.b64encode(master_key).decode("ascii")
+        if seal_in_kc:
+            local_kdf_mode = "os_keychain"
+            stored_key_b64 = None
+            kc_meta = _seal_key_into_keychain(vault_id, device_id, master_key, state_dir=state_dir)
+        else:
+            local_kdf_mode = "keyfile"
+            stored_key_b64 = recovery_key_b64
 
+    norm_auth = (auth_mode or "bearer").strip().lower()
     cfg: dict[str, Any] = {
         "schema_version": SYNC_SCHEMA_VERSION,
         "vault_id": vault_id,
@@ -877,11 +1464,21 @@ def init_sync(
         "device_pubkey_b64": pub_b64,
         "backend_type": backend_type,
         "target": str(Path(os.path.abspath(os.path.expanduser(target))) if backend_type == "local_folder" else target.strip().rstrip("/")),
+        "auth_mode": norm_auth,
         "bearer_token_env": bearer_token_env,
-        "kdf_mode": kdf_mode,
+        "s3_region": (s3_region or "auto").strip(),
+        "s3_access_key_env": s3_access_key_env,
+        "s3_secret_key_env": s3_secret_key_env,
+        "s3_session_token_env": s3_session_token_env,
+        "kdf_mode": local_kdf_mode,
         "kdf_salt_b64": salt_b64,
         "master_key_b64": stored_key_b64,
+        "keychain_service": kc_meta["service"] if kc_meta else None,
+        "keychain_account": kc_meta["account"] if kc_meta else None,
+        "keychain_backend": kc_meta["backend"] if kc_meta else None,
         "trusted_peers": {device_id: pub_b64},
+        "auto_sync_enabled": False,
+        "auto_sync_interval_seconds": 300,
         "created_at": _utc_now_iso(),
     }
     backend = _backend_from_config(
@@ -903,9 +1500,9 @@ def init_sync(
     header_doc = {
         "schema_version": SYNC_SCHEMA_VERSION,
         "vault_id": vault_id,
-        "kdf_mode": kdf_mode,
+        "kdf_mode": header_kdf_mode,
         "kdf_salt_b64": salt_b64,
-        "scrypt_params": {"n": _SCRYPT_N, "r": _SCRYPT_R, "p": _SCRYPT_P} if kdf_mode == "passphrase" else None,
+        "scrypt_params": {"n": _SCRYPT_N, "r": _SCRYPT_R, "p": _SCRYPT_P} if header_kdf_mode == "passphrase" else None,
         "key_check_b64": base64.b64encode(key_check).decode("ascii"),
         "created_at": cfg["created_at"],
     }
@@ -921,8 +1518,11 @@ def init_sync(
         "device_id": device_id,
         "device_pubkey_b64": pub_b64,
         "backend_type": backend_type,
+        "auth_mode": norm_auth,
         "target": cfg["target"],
-        "kdf_mode": kdf_mode,
+        "kdf_mode": local_kdf_mode,
+        "keychain_sealed": bool(kc_meta),
+        "keychain_backend": kc_meta["backend"] if kc_meta else None,
         "recovery_key_b64": recovery_key_b64,
     }
 
@@ -935,7 +1535,14 @@ def join_sync(
     device_name: str | None = None,
     passphrase: str | None = None,
     recovery_key_b64: str | None = None,
+    kdf_mode: str | None = None,
+    use_keychain: bool = False,
     bearer_token_env: str | None = None,
+    auth_mode: str = "bearer",
+    s3_region: str = "auto",
+    s3_access_key_env: str | None = None,
+    s3_secret_key_env: str | None = None,
+    s3_session_token_env: str | None = None,
     state_dir: Path | None = None,
     http_transport: httpx.BaseTransport | None = None,
     skip_dns_check_for_mock_transport: bool = False,
@@ -943,7 +1550,17 @@ def join_sync(
     """Pair a device to an existing E2EE sync target, verifying master key ownership first."""
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
     norm_target = str(Path(os.path.abspath(os.path.expanduser(target))) if backend_type == "local_folder" else target.strip().rstrip("/"))
-    probe_cfg = {"backend_type": backend_type, "target": norm_target, "bearer_token_env": bearer_token_env}
+    norm_auth = (auth_mode or "bearer").strip().lower()
+    probe_cfg = {
+        "backend_type": backend_type,
+        "target": norm_target,
+        "auth_mode": norm_auth,
+        "bearer_token_env": bearer_token_env,
+        "s3_region": (s3_region or "auto").strip(),
+        "s3_access_key_env": s3_access_key_env,
+        "s3_secret_key_env": s3_secret_key_env,
+        "s3_session_token_env": s3_session_token_env,
+    }
     backend = _backend_from_config(
         probe_cfg,
         http_transport=http_transport,
@@ -956,22 +1573,20 @@ def join_sync(
     vault_id = str(hdr.get("vault_id") or "")
     if not _HEX_ID_RE.fullmatch(vault_id):
         raise SyncSecurityError("Malformed vault_id in remote vault-header.json.")
-    kdf_mode = str(hdr.get("kdf_mode") or "")
+    remote_kdf_mode = str(hdr.get("kdf_mode") or "")
     salt_b64 = hdr.get("kdf_salt_b64")
-    if kdf_mode == "passphrase":
+    if remote_kdf_mode == "passphrase":
         if not passphrase or not salt_b64:
             raise SyncSecurityError("Passphrase is required to join passphrase-encrypted sync target.")
         master_key = derive_master_key_from_passphrase(passphrase, base64.b64decode(str(salt_b64)))
-        stored_key_b64 = None
-    elif kdf_mode == "keyfile":
+    elif remote_kdf_mode in {"keyfile", "os_keychain"}:
         if not recovery_key_b64:
             raise SyncSecurityError("recovery_key_b64 is required to join keyfile-encrypted sync target.")
         master_key = base64.b64decode(recovery_key_b64.strip())
         if len(master_key) != KEY_BYTES:
             raise SyncSecurityError("Invalid recovery key length (expected 32 bytes).")
-        stored_key_b64 = base64.b64encode(master_key).decode("ascii")
     else:
-        raise SyncSecurityError(f"Unsupported remote kdf_mode: {kdf_mode!r}")
+        raise SyncSecurityError(f"Unsupported remote kdf_mode: {remote_kdf_mode!r}")
 
     # Verify master key decrypts the remote key_check envelope cleanly!
     kc_env = base64.b64decode(str(hdr.get("key_check_b64") or ""))
@@ -983,6 +1598,23 @@ def join_sync(
     device_id = f"{host_slug}-{secrets.token_hex(4)}"
     priv_b64, pub_b64 = _generate_device_keypair()
     trusted_peers: dict[str, str] = {device_id: pub_b64}
+
+    req_kdf = (kdf_mode or "").strip().lower() or None
+    seal_in_kc = bool(use_keychain or req_kdf == "os_keychain")
+    kc_meta: dict[str, str] | None = None
+    if remote_kdf_mode == "passphrase":
+        local_kdf_mode = "passphrase"
+        stored_key_b64 = None
+        if seal_in_kc:
+            kc_meta = _seal_key_into_keychain(vault_id, device_id, master_key, state_dir=state_dir)
+    else:
+        if seal_in_kc:
+            local_kdf_mode = "os_keychain"
+            stored_key_b64 = None
+            kc_meta = _seal_key_into_keychain(vault_id, device_id, master_key, state_dir=state_dir)
+        else:
+            local_kdf_mode = "keyfile"
+            stored_key_b64 = base64.b64encode(master_key).decode("ascii")
 
     # If a valid signed + master-key-authenticated remote head already exists, pin its device pubkey
     raw_head = backend.get_object("head.json", max_bytes=MAX_SYNC_HEADER_BYTES)
@@ -1014,11 +1646,21 @@ def join_sync(
         "device_pubkey_b64": pub_b64,
         "backend_type": backend_type,
         "target": norm_target,
+        "auth_mode": norm_auth,
         "bearer_token_env": bearer_token_env,
-        "kdf_mode": kdf_mode,
+        "s3_region": (s3_region or "auto").strip(),
+        "s3_access_key_env": s3_access_key_env,
+        "s3_secret_key_env": s3_secret_key_env,
+        "s3_session_token_env": s3_session_token_env,
+        "kdf_mode": local_kdf_mode,
         "kdf_salt_b64": salt_b64,
         "master_key_b64": stored_key_b64,
+        "keychain_service": kc_meta["service"] if kc_meta else None,
+        "keychain_account": kc_meta["account"] if kc_meta else None,
+        "keychain_backend": kc_meta["backend"] if kc_meta else None,
         "trusted_peers": trusted_peers,
+        "auto_sync_enabled": False,
+        "auto_sync_interval_seconds": 300,
         "created_at": _utc_now_iso(),
     }
     _atomic_write_restricted_json(sync_config_path(active_brain, state_dir=state_dir), cfg)
@@ -1032,8 +1674,45 @@ def join_sync(
         "device_id": device_id,
         "device_pubkey_b64": pub_b64,
         "backend_type": backend_type,
+        "auth_mode": norm_auth,
         "target": norm_target,
+        "kdf_mode": local_kdf_mode,
+        "keychain_sealed": bool(kc_meta),
+        "keychain_backend": kc_meta["backend"] if kc_meta else None,
         "trusted_peer_count": len(trusted_peers),
+    }
+
+
+def migrate_sync_key_to_keychain(
+    *,
+    brain_dir: str | Path | None = None,
+    passphrase: str | None = None,
+    state_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Seal an existing vault's master key into the OS Keychain / DPAPI and scrub plaintext JSON key material."""
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    cfg_path = sync_config_path(active_brain, state_dir=state_dir)
+    cfg = _load_sync_config(active_brain, state_dir=state_dir)
+    master_key = _resolve_master_key(cfg, passphrase=passphrase, state_dir=state_dir)
+    kc_meta = _seal_key_into_keychain(
+        str(cfg["vault_id"]),
+        str(cfg["device_id"]),
+        master_key,
+        state_dir=state_dir,
+    )
+    if str(cfg.get("kdf_mode")) == "keyfile":
+        cfg["kdf_mode"] = "os_keychain"
+    cfg["master_key_b64"] = None
+    cfg["keychain_service"] = kc_meta["service"]
+    cfg["keychain_account"] = kc_meta["account"]
+    cfg["keychain_backend"] = kc_meta["backend"]
+    _atomic_write_restricted_json(cfg_path, cfg)
+    return {
+        "status": "migrated",
+        "vault_id": cfg["vault_id"],
+        "kdf_mode": cfg["kdf_mode"],
+        "keychain_sealed": kc_meta["backend"] != "posix_restricted_keyfile",
+        "keychain_backend": kc_meta["backend"],
     }
 
 
@@ -1053,6 +1732,8 @@ def sync_status(
             "brain_dir": str(active_brain),
             "conflicts": [],
             "conflict_count": 0,
+            "keychain_available_backend": keychain_backend_name(state_dir=state_dir),
+            "auto_sync": get_auto_sync_status(brain_dir=active_brain, state_dir=state_dir),
         }
     cfg = _load_sync_config(active_brain, state_dir=state_dir)
     local_state = _load_local_sync_state(active_brain)
@@ -1082,14 +1763,18 @@ def sync_status(
         remote_reachable = False
         remote_error = str(exc)
 
-    conflicts = list(local_state.get("conflicts") or [])
+    conflicts = [{**c, "conflict_id": _conflict_entry_id(c)} for c in (local_state.get("conflicts") or [])]
     return {
         "configured": True,
         "vault_id": cfg["vault_id"],
         "device_id": cfg["device_id"],
         "backend_type": cfg["backend_type"],
+        "auth_mode": str(cfg.get("auth_mode") or "bearer"),
+        "s3_region": cfg.get("s3_region"),
         "target": cfg["target"],
         "kdf_mode": cfg["kdf_mode"],
+        "keychain_sealed": bool(cfg.get("keychain_account")),
+        "keychain_backend": cfg.get("keychain_backend") or keychain_backend_name(state_dir=state_dir),
         "local_epoch": int(local_state.get("last_seen_epoch", 0)),
         "remote_epoch": remote_epoch,
         "remote_device_id": remote_device_id,
@@ -1101,6 +1786,7 @@ def sync_status(
         "trusted_peer_count": len(cfg.get("trusted_peers") or {}),
         "conflicts": conflicts,
         "conflict_count": len(conflicts),
+        "auto_sync": get_auto_sync_status(brain_dir=active_brain, state_dir=state_dir),
     }
 
 
@@ -1164,9 +1850,8 @@ def sync_push(
 ) -> dict[str, Any]:
     """Encrypt durable vault files (deduplicated via blind blob IDs) and push a signed manifest."""
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
-    cfg_path = sync_config_path(active_brain, state_dir=state_dir)
     cfg = _load_sync_config(active_brain, state_dir=state_dir)
-    master_key = _resolve_master_key(cfg, passphrase=passphrase)
+    master_key = _resolve_master_key(cfg, passphrase=passphrase, state_dir=state_dir)
     backend = _backend_from_config(
         cfg,
         http_transport=http_transport,
@@ -1199,10 +1884,16 @@ def sync_push(
 
         for rel_path, meta in sorted(inventory.items()):
             plain_sha = str(meta["sha256"])
+            raw_bytes: bytes | None = None
             blob_id = compute_blind_blob_id(master_key, vault_id, plain_sha)
             obj_key = f"objects/{blob_id[:2]}/{blob_id}.enc"
             if backend.exists(obj_key):
                 reused_blobs += 1
+                if int(meta["size"]) <= MAX_SYNC_BASE_CACHE_BYTES:
+                    try:
+                        raw_bytes = (active_brain / rel_path).read_bytes()
+                    except OSError:
+                        raw_bytes = None
             else:
                 raw_bytes = (active_brain / rel_path).read_bytes()
                 if content_sha256(raw_bytes) != plain_sha:
@@ -1218,6 +1909,8 @@ def sync_push(
                 )
                 backend.put_object(obj_key, ct)
                 uploaded_blobs += 1
+            if raw_bytes is not None:
+                _cache_sync_base_blob(active_brain, plain_sha, raw_bytes)
             manifest_files[rel_path] = {
                 "blob_id": blob_id,
                 "sha256": plain_sha,
@@ -1270,6 +1963,10 @@ def sync_push(
         local_state["last_manifest_id"] = manifest_id
         local_state["files"] = {rel: entry["sha256"] for rel, entry in manifest_files.items()}
         _save_local_sync_state(active_brain, local_state)
+        keep_shas = set(local_state["files"].values()) | {
+            str(c.get("base_sha256")) for c in (local_state.get("conflicts") or []) if c.get("base_sha256")
+        }
+        _prune_sync_base_cache(active_brain, keep_shas)
 
         return {
             "status": "pushed",
@@ -1296,7 +1993,7 @@ def sync_pull(
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
     cfg_path = sync_config_path(active_brain, state_dir=state_dir)
     cfg = _load_sync_config(active_brain, state_dir=state_dir)
-    master_key = _resolve_master_key(cfg, passphrase=passphrase)
+    master_key = _resolve_master_key(cfg, passphrase=passphrase, state_dir=state_dir)
     backend = _backend_from_config(
         cfg,
         http_transport=http_transport,
@@ -1304,6 +2001,9 @@ def sync_pull(
     )
     lock_path = active_brain / ".sidecar" / "writer.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    changed_atoms: list[str] = []
+    deleted_atoms: list[str] = []
 
     with review_lock(str(lock_path)):
         local_state = _load_local_sync_state(active_brain)
@@ -1315,6 +2015,14 @@ def sync_pull(
             trust_new_peers=trust_new_peers,
         )
         if remote_head is None:
+            from inbox_drop import pull_inbox_drops_from_backend
+
+            drops_res = pull_inbox_drops_from_backend(
+                backend,
+                brain_dir=active_brain,
+                state_dir=state_dir,
+                _writer_lock_held=True,
+            )
             return {
                 "status": "empty_remote",
                 "epoch": int(local_state.get("last_seen_epoch", 0)),
@@ -1323,6 +2031,8 @@ def sync_pull(
                 "deleted": 0,
                 "merged_jsonl": 0,
                 "conflicts": [],
+                "inbox_drops_ingested": int(drops_res.get("ingested_count", 0)),
+                "inbox_drops": drops_res,
             }
 
         vault_id = str(cfg["vault_id"])
@@ -1374,6 +2084,11 @@ def sync_pull(
 
             local_meta = local_inventory.get(clean_rel)
             if local_meta is not None and local_meta["sha256"] == remote_sha:
+                if int(local_meta.get("size", 0)) <= MAX_SYNC_BASE_CACHE_BYTES:
+                    try:
+                        _cache_sync_base_blob(active_brain, remote_sha, (active_brain / clean_rel).read_bytes())
+                    except OSError:
+                        pass
                 continue  # Already identical locally
 
             obj_key = f"objects/{blob_id[:2]}/{blob_id}.enc"
@@ -1400,18 +2115,27 @@ def sync_pull(
         new_conflicts: list[dict[str, Any]] = []
         new_base_files = dict(base_files)
 
+        def _is_top_atom_rel(rp: str) -> str | None:
+            if rp.startswith("2-atoms/") and rp.count("/") == 1 and rp.endswith(".md"):
+                return rp.split("/", 1)[1]
+            return None
+
         for clean_rel, (remote_bytes, remote_sha) in sorted(decrypted_incoming.items()):
             dest = active_brain.joinpath(*clean_rel.split("/"))
             _assert_no_symlink_chain(dest, stop_at=active_brain)
             local_meta = local_inventory.get(clean_rel)
             base_sha = base_files.get(clean_rel)
+            atom_fname = _is_top_atom_rel(clean_rel)
 
             if local_meta is None:
                 # New remote file
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_bytes(str(dest), remote_bytes)
+                _cache_sync_base_blob(active_brain, remote_sha, remote_bytes)
                 new_base_files[clean_rel] = remote_sha
                 added += 1
+                if atom_fname:
+                    changed_atoms.append(atom_fname)
                 if clean_rel == "0-raw/archive/decision-record.jsonl":
                     decision_log_touched = True
                 continue
@@ -1421,8 +2145,11 @@ def sync_pull(
                 # Clean fast-forward: local unchanged since last sync
                 _backup_before_sync_overwrite(active_brain, clean_rel, dest.read_bytes())
                 atomic_write_bytes(str(dest), remote_bytes)
+                _cache_sync_base_blob(active_brain, remote_sha, remote_bytes)
                 new_base_files[clean_rel] = remote_sha
                 updated += 1
+                if atom_fname:
+                    changed_atoms.append(atom_fname)
                 if clean_rel == "0-raw/archive/decision-record.jsonl":
                     decision_log_touched = True
                 continue
@@ -1435,7 +2162,9 @@ def sync_pull(
             if clean_rel in _APPEND_ONLY_JSONL_PATHS:
                 merged = _merge_append_only_jsonl(dest.read_bytes(), remote_bytes)
                 atomic_write_bytes(str(dest), merged)
-                new_base_files[clean_rel] = content_sha256(merged)
+                merged_sha = content_sha256(merged)
+                _cache_sync_base_blob(active_brain, merged_sha, merged)
+                new_base_files[clean_rel] = merged_sha
                 merged_jsonl += 1
                 if clean_rel == "0-raw/archive/decision-record.jsonl":
                     decision_log_touched = True
@@ -1447,17 +2176,19 @@ def sync_pull(
                     remote_device_id=str(remote_head["device_id"]),
                     remote_epoch=int(remote_head["epoch"]),
                 )
-                new_conflicts.append(
-                    {
-                        "rel_path": clean_rel,
-                        "conflict_copy": conflict_rel,
-                        "local_sha256": local_sha,
-                        "remote_sha256": remote_sha,
-                        "remote_device_id": str(remote_head["device_id"]),
-                        "remote_epoch": int(remote_head["epoch"]),
-                        "recorded_at": _utc_now_iso(),
-                    }
-                )
+                c_entry: dict[str, Any] = {
+                    "rel_path": clean_rel,
+                    "conflict_copy": conflict_rel,
+                    "conflict_kind": "divergent_edit",
+                    "base_sha256": base_sha,
+                    "local_sha256": local_sha,
+                    "remote_sha256": remote_sha,
+                    "remote_device_id": str(remote_head["device_id"]),
+                    "remote_epoch": int(remote_head["epoch"]),
+                    "recorded_at": _utc_now_iso(),
+                }
+                c_entry["conflict_id"] = _conflict_entry_id(c_entry)
+                new_conflicts.append(c_entry)
 
         # Propagate remote file deletions (paths in base_files omitted from remote_files)
         for prev_rel, base_sha in sorted(base_files.items()):
@@ -1477,21 +2208,25 @@ def sync_pull(
                     dest.unlink()
                 new_base_files.pop(clean_rel, None)
                 deleted += 1
+                atom_fname = _is_top_atom_rel(clean_rel)
+                if atom_fname:
+                    deleted_atoms.append(atom_fname)
             else:
                 # Modify/delete divergence: preserve local modified file on disk & record conflict!
                 new_base_files.pop(clean_rel, None)
-                new_conflicts.append(
-                    {
-                        "rel_path": clean_rel,
-                        "conflict_copy": None,
-                        "conflict_kind": "modify_delete",
-                        "local_sha256": local_sha,
-                        "remote_sha256": None,
-                        "remote_device_id": str(remote_head["device_id"]),
-                        "remote_epoch": int(remote_head["epoch"]),
-                        "recorded_at": _utc_now_iso(),
-                    }
-                )
+                md_entry: dict[str, Any] = {
+                    "rel_path": clean_rel,
+                    "conflict_copy": None,
+                    "conflict_kind": "modify_delete",
+                    "base_sha256": base_sha,
+                    "local_sha256": local_sha,
+                    "remote_sha256": None,
+                    "remote_device_id": str(remote_head["device_id"]),
+                    "remote_epoch": int(remote_head["epoch"]),
+                    "recorded_at": _utc_now_iso(),
+                }
+                md_entry["conflict_id"] = _conflict_entry_id(md_entry)
+                new_conflicts.append(md_entry)
 
         # Record unchanged files that match remote in cursor
         for clean_rel, entry in remote_files.items():
@@ -1506,16 +2241,33 @@ def sync_pull(
         local_state["conflicts"] = existing_conflicts
         _save_local_sync_state(active_brain, local_state)
 
+        keep_shas = set(new_base_files.values()) | {
+            str(c.get("base_sha256")) for c in existing_conflicts if c.get("base_sha256")
+        }
+        _prune_sync_base_cache(active_brain, keep_shas)
+
         if decision_log_touched:
             invalidate_decision_log_cache()
 
+        from inbox_drop import pull_inbox_drops_from_backend
+
+        drops_res = pull_inbox_drops_from_backend(
+            backend,
+            brain_dir=active_brain,
+            state_dir=state_dir,
+            _writer_lock_held=True,
+        )
+
         indexes_rebuilt = False
+        vectors_updated = False
         if added > 0 or updated > 0 or deleted > 0 or merged_jsonl > 0:
             atoms_dir = active_brain / "2-atoms"
             lex_path = active_brain / ".sidecar" / "lexical.sqlite3"
             atoms_dir.mkdir(parents=True, exist_ok=True)
             rebuild_lexical_index(str(atoms_dir), str(lex_path))
             indexes_rebuilt = True
+            if changed_atoms or deleted_atoms:
+                vectors_updated = _sync_dense_vectors_incremental(active_brain, changed_atoms, deleted_atoms)
 
     if indexes_rebuilt or deleted > 0:
         try:
@@ -1536,7 +2288,35 @@ def sync_pull(
         "conflict_count": len(new_conflicts),
         "conflicts": new_conflicts,
         "indexes_rebuilt": indexes_rebuilt,
+        "vectors_updated": vectors_updated,
+        "inbox_drops_ingested": int(drops_res.get("ingested_count", 0)),
+        "inbox_drops": drops_res,
     }
+
+
+def pull_mobile_inbox_drops(
+    *,
+    brain_dir: str | Path | None = None,
+    state_dir: Path | None = None,
+    http_transport: httpx.BaseTransport | None = None,
+    skip_dns_check_for_mock_transport: bool = False,
+) -> dict[str, Any]:
+    """Standalone pull of E2EE mobile `inbox-drops/*.enc` into quarantined `0-raw/inbox/`."""
+    from inbox_drop import pull_inbox_drops_from_backend
+
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    cfg = _load_sync_config(active_brain, state_dir=state_dir)
+    backend = _backend_from_config(
+        cfg,
+        http_transport=http_transport,
+        skip_dns_check_for_mock_transport=skip_dns_check_for_mock_transport,
+    )
+    return pull_inbox_drops_from_backend(
+        backend,
+        brain_dir=active_brain,
+        state_dir=state_dir,
+        _writer_lock_held=False,
+    )
 
 
 def sync_verify(
@@ -1550,7 +2330,7 @@ def sync_verify(
     """Read-only full cryptographic audit of remote vault-header, head signature, manifest, and every blob."""
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
     cfg = _load_sync_config(active_brain, state_dir=state_dir)
-    master_key = _resolve_master_key(cfg, passphrase=passphrase)
+    master_key = _resolve_master_key(cfg, passphrase=passphrase, state_dir=state_dir)
     backend = _backend_from_config(
         cfg,
         http_transport=http_transport,
@@ -1652,10 +2432,700 @@ def sync_verify(
     }
 
 
+def sync_gc(
+    *,
+    brain_dir: str | Path | None = None,
+    passphrase: str | None = None,
+    dry_run: bool = False,
+    keep_parent_manifest: bool = True,
+    state_dir: Path | None = None,
+    http_transport: httpx.BaseTransport | None = None,
+    skip_dns_check_for_mock_transport: bool = False,
+) -> dict[str, Any]:
+    """Garbage-collect unreferenced encrypted blobs and superseded manifests after verifying signed head."""
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    cfg = _load_sync_config(active_brain, state_dir=state_dir)
+    master_key = _resolve_master_key(cfg, passphrase=passphrase, state_dir=state_dir)
+    backend = _backend_from_config(
+        cfg,
+        http_transport=http_transport,
+        skip_dns_check_for_mock_transport=skip_dns_check_for_mock_transport,
+    )
+    vault_id = str(cfg["vault_id"])
+    lock_path = active_brain / ".sidecar" / "writer.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with review_lock(str(lock_path)):
+        local_state = _load_local_sync_state(active_brain)
+        head, _ = _verify_and_read_remote_head(
+            backend,
+            cfg,
+            master_key=master_key,
+            local_state=local_state,
+            trust_new_peers=True,
+        )
+        if head is None:
+            return {
+                "status": "empty_remote",
+                "dry_run": bool(dry_run),
+                "kept_manifests": 0,
+                "kept_blobs": 0,
+                "deleted_manifests": 0,
+                "deleted_blobs": 0,
+                "deleted_keys": [],
+            }
+
+        head_mid = str(head["manifest_id"])
+        if not _HEX_ID_RE.fullmatch(head_mid):
+            raise SyncSecurityError(f"Malformed manifest_id in remote head: {head_mid!r}")
+        head_mct = backend.get_object(f"manifests/{head_mid}.enc", max_bytes=MAX_SYNC_MANIFEST_BYTES)
+        if head_mct is None or content_sha256(head_mct) != str(head["manifest_ciphertext_sha256"]):
+            raise SyncSecurityError("Active remote manifest missing or failed hash check; aborting GC fail-closed.")
+        head_mplain = decrypt_object(master_key, vault_id=vault_id, kind="manifest", object_id=head_mid, envelope=head_mct)
+        head_mdoc = json.loads(head_mplain.decode("utf-8"))
+        if (
+            not isinstance(head_mdoc, dict)
+            or str(head_mdoc.get("vault_id") or "") != vault_id
+            or int(head_mdoc.get("epoch", -1)) != int(head["epoch"])
+            or not isinstance(head_mdoc.get("files"), dict)
+        ):
+            raise SyncSecurityError("Decrypted active manifest failed vault_id/epoch/files validation during GC.")
+
+        kept_manifest_keys: set[str] = {f"manifests/{head_mid}.enc"}
+        kept_blob_keys: set[str] = set()
+        for entry in head_mdoc["files"].values():
+            bid = str(entry.get("blob_id") or "") if isinstance(entry, dict) else ""
+            if _HEX_ID_RE.fullmatch(bid):
+                kept_blob_keys.add(f"objects/{bid[:2]}/{bid}.enc")
+
+        parent_mid = str(head.get("parent_manifest_id") or "").strip()
+        if keep_parent_manifest and parent_mid and _HEX_ID_RE.fullmatch(parent_mid):
+            pm_key = f"manifests/{parent_mid}.enc"
+            pm_ct = backend.get_object(pm_key, max_bytes=MAX_SYNC_MANIFEST_BYTES)
+            if pm_ct is not None:
+                try:
+                    pm_plain = decrypt_object(master_key, vault_id=vault_id, kind="manifest", object_id=parent_mid, envelope=pm_ct)
+                    pm_doc = json.loads(pm_plain.decode("utf-8"))
+                    if (
+                        isinstance(pm_doc, dict)
+                        and str(pm_doc.get("vault_id") or "") == vault_id
+                        and isinstance(pm_doc.get("files"), dict)
+                    ):
+                        kept_manifest_keys.add(pm_key)
+                        for entry in pm_doc["files"].values():
+                            bid = str(entry.get("blob_id") or "") if isinstance(entry, dict) else ""
+                            if _HEX_ID_RE.fullmatch(bid):
+                                kept_blob_keys.add(f"objects/{bid[:2]}/{bid}.enc")
+                except Exception:
+                    pass
+
+        remote_manifests = backend.list_objects("manifests")
+        remote_objects = backend.list_objects("objects")
+        orphan_manifests = sorted(k for k in remote_manifests if k not in kept_manifest_keys)
+        orphan_blobs = sorted(k for k in remote_objects if k not in kept_blob_keys)
+        deleted_keys: list[str] = []
+
+        if not dry_run:
+            for k in (*orphan_blobs, *orphan_manifests):
+                if backend.delete_object(k):
+                    deleted_keys.append(k)
+        else:
+            deleted_keys = [*orphan_blobs, *orphan_manifests]
+
+        return {
+            "status": "dry_run" if dry_run else "pruned",
+            "dry_run": bool(dry_run),
+            "epoch": int(head["epoch"]),
+            "kept_manifests": len(kept_manifest_keys),
+            "kept_blobs": len(kept_blob_keys),
+            "deleted_manifests": len(orphan_manifests),
+            "deleted_blobs": len(orphan_blobs),
+            "deleted_keys": deleted_keys,
+        }
+
+
+# ─── Interactive 3-Way Conflict Inspection & Resolution ──────────────────────
+
 def list_sync_conflicts(*, brain_dir: str | Path | None = None) -> list[dict[str, Any]]:
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
     state = _load_local_sync_state(active_brain)
-    return list(state.get("conflicts") or [])
+    return [{**c, "conflict_id": _conflict_entry_id(c)} for c in (state.get("conflicts") or [])]
+
+
+def _resolve_conflict_quarantine_path(active_brain: Path, conflict_copy: str | None) -> Path | None:
+    if not conflict_copy:
+        return None
+    clean = conflict_copy.strip().replace("\\", "/")
+    if not clean.startswith("0-raw/sync-conflicts/") or ".." in clean.split("/"):
+        raise SyncSecurityError(f"Invalid conflict quarantine path: {conflict_copy!r}")
+    dest = active_brain.joinpath(*clean.split("/"))
+    _assert_no_symlink_chain(dest, stop_at=active_brain)
+    return dest
+
+
+def get_sync_conflict_detail(
+    conflict_id_or_rel_path: str,
+    *,
+    brain_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return local, remote, and 3-way base text plus unified diff for an unresolved sync conflict."""
+    needle = (conflict_id_or_rel_path or "").strip()
+    if not needle:
+        raise ValueError("conflict_id or rel_path is required.")
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    conflicts = list_sync_conflicts(brain_dir=active_brain)
+    matched = next(
+        (c for c in conflicts if c["conflict_id"] == needle or c.get("rel_path") == needle),
+        None,
+    )
+    if matched is None:
+        raise FileNotFoundError(f"Sync conflict not found: {needle}")
+
+    clean_rel = validate_sync_rel_path(str(matched["rel_path"]))
+    local_file = active_brain.joinpath(*clean_rel.split("/"))
+    _assert_no_symlink_chain(local_file, stop_at=active_brain)
+
+    local_content = ""
+    current_local_sha256: str | None = None
+    if local_file.is_file():
+        lbytes = local_file.read_bytes()
+        current_local_sha256 = content_sha256(lbytes)
+        local_content = lbytes.decode("utf-8", errors="replace")
+
+    remote_content: str | None = None
+    q_path = _resolve_conflict_quarantine_path(active_brain, matched.get("conflict_copy"))
+    if q_path is not None and q_path.is_file():
+        rbytes = q_path.read_bytes()
+        remote_content = rbytes.decode("utf-8", errors="replace")
+
+    base_content = _load_sync_base_text(active_brain, matched.get("base_sha256"))
+    diff_lines = list(
+        difflib.unified_diff(
+            local_content.splitlines(),
+            (remote_content or "").splitlines(),
+            fromfile=f"local/{clean_rel}",
+            tofile=f"remote/{clean_rel}" if remote_content is not None else "(deleted on remote)",
+            lineterm="",
+        )
+    )
+    return {
+        **matched,
+        "rel_path": clean_rel,
+        "current_local_sha256": current_local_sha256,
+        "base_content": base_content,
+        "local_content": local_content,
+        "remote_content": remote_content,
+        "unified_diff": "\n".join(diff_lines),
+        "is_canonical_atom": clean_rel.startswith("2-atoms/") and clean_rel.count("/") == 1 and clean_rel.endswith(".md"),
+    }
+
+
+def _demote_unapproved_canonical_merge(
+    active_brain: Path,
+    clean_rel: str,
+    candidate_bytes: bytes,
+    *,
+    force_demote: bool = False,
+) -> tuple[bytes, bool]:
+    """Ensure manual_merge or peer-duplicate canonical files never claim accepted status without owner approval."""
+    if clean_rel.startswith("2-atoms/") and clean_rel.count("/") == 1 and clean_rel.endswith(".md"):
+        atoms_root = str(active_brain / "2-atoms")
+        dest_path = str(active_brain / clean_rel)
+        if not force_demote and approved_revision_is_current(
+            dest_path,
+            brain_dir=str(active_brain),
+            atoms_dir=atoms_root,
+            known_atom_bytes=candidate_bytes,
+            known_atom_sha256=content_sha256(candidate_bytes),
+            canonical_atoms_root=atoms_root,
+        ):
+            return candidate_bytes, False
+        text = candidate_bytes.decode("utf-8", errors="replace")
+        parsed = split_frontmatter(text)
+        if parsed is not None:
+            fm_lines, body_lines = parsed
+            updated_fm = set_scalar_field(fm_lines, "claim_state", "candidate", "citation_integrity")
+            updated_fm = set_scalar_field(updated_fm, "review_status", "pending", "epistemic_label")
+            return render_memory_document(updated_fm, body_lines).encode("utf-8"), True
+        normalized = normalize_memory_document(text, source_filename=Path(clean_rel).name, origin="user_local")
+        return normalized.encode("utf-8"), True
+    if clean_rel.startswith("5-playbooks/") and clean_rel.count("/") == 1 and clean_rel.endswith(".md"):
+        text = candidate_bytes.decode("utf-8", errors="replace")
+        parsed = split_frontmatter(text)
+        if parsed is not None:
+            fm_lines, body_lines = parsed
+            updated_fm = set_scalar_field(fm_lines, "status", "draft", "type")
+            return render_memory_document(updated_fm, body_lines).encode("utf-8"), True
+        rebuilt_pb = f"---\ntype: playbook\nstatus: draft\n---\n\n{text.strip()}\n"
+        return rebuilt_pb.encode("utf-8"), True
+    return candidate_bytes, False
+
+
+def resolve_sync_conflict(
+    conflict_id_or_rel_path: str,
+    *,
+    resolution: str,
+    merged_content: str | None = None,
+    expected_local_sha256: str | None = None,
+    actor: str = "owner",
+    brain_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Resolve a quarantined sync conflict atomically with CAS, .history/ backup, and canonical trust guards."""
+    needle = (conflict_id_or_rel_path or "").strip()
+    if not needle:
+        raise ValueError("conflict_id or rel_path is required.")
+    strat = (resolution or "").strip().lower()
+    if strat not in {"keep_local", "accept_remote", "keep_both", "manual_merge"}:
+        raise ValueError("resolution must be one of: keep_local, accept_remote, keep_both, manual_merge.")
+    if strat == "manual_merge":
+        if not isinstance(merged_content, str) or not merged_content.strip():
+            raise ValueError("'merged_content' is required when resolution='manual_merge'.")
+        if len(merged_content.encode("utf-8")) > MAX_SYNC_FILE_BYTES:
+            raise ValueError("merged_content exceeds maximum sync file size.")
+
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    lock_path = active_brain / ".sidecar" / "writer.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    changed_atoms: list[str] = []
+    deleted_atoms: list[str] = []
+    sibling_rel: str | None = None
+    demoted_to_pending = False
+
+    with review_lock(str(lock_path)):
+        local_state = _load_local_sync_state(active_brain)
+        raw_conflicts = list(local_state.get("conflicts") or [])
+        idx = next(
+            (
+                i
+                for i, c in enumerate(raw_conflicts)
+                if _conflict_entry_id(c) == needle or str(c.get("rel_path") or "") == needle
+            ),
+            None,
+        )
+        if idx is None:
+            raise FileNotFoundError(f"Sync conflict not found: {needle}")
+
+        entry = raw_conflicts[idx]
+        cid = _conflict_entry_id(entry)
+        clean_rel = validate_sync_rel_path(str(entry["rel_path"]))
+        dest = active_brain.joinpath(*clean_rel.split("/"))
+        _assert_no_symlink_chain(dest, stop_at=active_brain)
+
+        existing_local_bytes = dest.read_bytes() if dest.is_file() else None
+        if expected_local_sha256:
+            actual_sha = content_sha256(existing_local_bytes) if existing_local_bytes is not None else ""
+            if actual_sha != expected_local_sha256.strip().lower():
+                raise SyncConflictError(
+                    f"CAS mismatch on '{clean_rel}': local file changed since conflict was inspected."
+                )
+
+        q_path = _resolve_conflict_quarantine_path(active_brain, entry.get("conflict_copy"))
+        remote_sha = entry.get("remote_sha256")
+        remote_bytes: bytes | None = None
+        if q_path is not None and q_path.is_file():
+            remote_bytes = q_path.read_bytes()
+            if remote_sha and content_sha256(remote_bytes) != str(remote_sha):
+                raise SyncSecurityError(f"Quarantined conflict copy hash mismatch for '{clean_rel}'.")
+
+        is_top_atom = clean_rel.startswith("2-atoms/") and clean_rel.count("/") == 1 and clean_rel.endswith(".md")
+        atom_fname = clean_rel.split("/", 1)[1] if is_top_atom else None
+
+        if strat == "keep_local":
+            if existing_local_bytes is None:
+                raise SyncError(f"Local file '{clean_rel}' no longer exists; cannot keep_local.")
+            if atom_fname:
+                changed_atoms.append(atom_fname)
+
+        elif strat == "accept_remote":
+            if entry.get("conflict_kind") == "modify_delete" or remote_sha is None:
+                if existing_local_bytes is not None:
+                    _backup_before_sync_overwrite(active_brain, clean_rel, existing_local_bytes)
+                    dest.unlink()
+                if atom_fname:
+                    deleted_atoms.append(atom_fname)
+            else:
+                if remote_bytes is None:
+                    raise SyncError(f"Quarantined remote copy missing for '{clean_rel}'.")
+                safe_remote_bytes, rem_demoted = _demote_unapproved_canonical_merge(
+                    active_brain,
+                    clean_rel,
+                    remote_bytes,
+                    force_demote=False,
+                )
+                demoted_to_pending = demoted_to_pending or rem_demoted
+                if existing_local_bytes is not None:
+                    _backup_before_sync_overwrite(active_brain, clean_rel, existing_local_bytes)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_bytes(str(dest), safe_remote_bytes)
+                if atom_fname:
+                    changed_atoms.append(atom_fname)
+
+        elif strat == "keep_both":
+            if existing_local_bytes is None:
+                raise SyncError(f"Local file '{clean_rel}' no longer exists; cannot keep_both.")
+            if remote_bytes is None or entry.get("conflict_kind") == "modify_delete":
+                raise SyncError(f"Remote copy does not exist for '{clean_rel}'; use keep_local or accept_remote.")
+            dev_slug = re.sub(r"[^a-zA-Z0-9_-]+", "", str(entry.get("remote_device_id") or "peer"))[:16] or "peer"
+            p_obj = Path(clean_rel)
+            cand_stem = f"{p_obj.stem}-peer-{dev_slug}"
+            sib_path = dest.parent / f"{cand_stem}{p_obj.suffix}"
+            suffix_n = 2
+            while sib_path.exists():
+                sib_path = dest.parent / f"{cand_stem}-{suffix_n}{p_obj.suffix}"
+                suffix_n += 1
+            sibling_rel = validate_sync_rel_path(sib_path.relative_to(active_brain).as_posix())
+            safe_peer_bytes, peer_demoted = _demote_unapproved_canonical_merge(
+                active_brain,
+                sibling_rel,
+                remote_bytes,
+                force_demote=True,
+            )
+            demoted_to_pending = demoted_to_pending or peer_demoted
+            atomic_write_bytes(str(sib_path), safe_peer_bytes)
+            if sibling_rel.startswith("2-atoms/") and sibling_rel.count("/") == 1 and sibling_rel.endswith(".md"):
+                changed_atoms.append(sibling_rel.split("/", 1)[1])
+
+        elif strat == "manual_merge":
+            assert merged_content is not None
+            norm_text = merged_content.replace("\r\n", "\n")
+            if not norm_text.endswith("\n"):
+                norm_text += "\n"
+            merged_bytes, was_demoted = _demote_unapproved_canonical_merge(
+                active_brain,
+                clean_rel,
+                norm_text.encode("utf-8"),
+                force_demote=False,
+            )
+            demoted_to_pending = was_demoted
+            if existing_local_bytes is not None:
+                _backup_before_sync_overwrite(active_brain, clean_rel, existing_local_bytes)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(str(dest), merged_bytes)
+            if atom_fname:
+                changed_atoms.append(atom_fname)
+
+        # Advance base cursor for clean_rel to remote_sha (so remote epoch is acknowledged without re-conflicting)
+        files_map = dict(local_state.get("files") or {})
+        if remote_sha and isinstance(remote_sha, str):
+            files_map[clean_rel] = remote_sha
+            if remote_bytes is not None:
+                _cache_sync_base_blob(active_brain, remote_sha, remote_bytes)
+        else:
+            files_map.pop(clean_rel, None)
+
+        raw_conflicts.pop(idx)
+        local_state["files"] = files_map
+        local_state["conflicts"] = raw_conflicts
+        _save_local_sync_state(active_brain, local_state)
+
+        if q_path is not None and q_path.is_file():
+            still_used = any(c.get("conflict_copy") == entry.get("conflict_copy") for c in raw_conflicts)
+            if not still_used:
+                try:
+                    q_path.unlink()
+                except OSError:
+                    pass
+
+        if clean_rel == "0-raw/archive/decision-record.jsonl":
+            invalidate_decision_log_cache()
+        atoms_dir = active_brain / "2-atoms"
+        lex_path = active_brain / ".sidecar" / "lexical.sqlite3"
+        atoms_dir.mkdir(parents=True, exist_ok=True)
+        rebuild_lexical_index(str(atoms_dir), str(lex_path))
+        if changed_atoms or deleted_atoms:
+            _sync_dense_vectors_incremental(active_brain, changed_atoms, deleted_atoms)
+
+    try:
+        ensure_notes_index(NotePaths.for_brain(active_brain))
+    except Exception:
+        pass
+
+    final_sha = content_sha256(dest.read_bytes()) if dest.is_file() else None
+    return {
+        "status": "resolved",
+        "conflict_id": cid,
+        "rel_path": clean_rel,
+        "resolution": strat,
+        "actor": (actor or "owner").strip()[:120] or "owner",
+        "resolved_sha256": final_sha,
+        "sibling_rel_path": sibling_rel,
+        "demoted_unapproved_canonical": demoted_to_pending,
+        "remaining_conflicts": len(raw_conflicts),
+    }
+
+
+# ─── Background Auto-Sync Scheduler ──────────────────────────────────────────
+
+class AutoSyncScheduler:
+    """Thread-safe background pull+push sync loop with conflict pause and exponential backoff."""
+
+    def __init__(
+        self,
+        brain_dir: str | Path,
+        *,
+        interval_seconds: int = 300,
+        state_dir: Path | None = None,
+        http_transport: httpx.BaseTransport | None = None,
+        skip_dns_check_for_mock_transport: bool = False,
+    ) -> None:
+        self.brain_dir = Path(brain_dir).resolve()
+        self.interval_seconds = max(5, min(int(interval_seconds), 86400))
+        self.state_dir = state_dir
+        self.http_transport = http_transport
+        self.skip_dns_check_for_mock_transport = skip_dns_check_for_mock_transport
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self.last_run_at: str | None = None
+        self.last_status: str = "idle"
+        self.last_error: str | None = None
+        self.consecutive_failures: int = 0
+        self.cycles_completed: int = 0
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._wake_event.clear()
+            t = threading.Thread(
+                target=self._loop,
+                name=f"sb-autosync-{_vault_key_slug(self.brain_dir)[:8]}",
+                daemon=True,
+            )
+            self._thread = t
+            t.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        with self._lock:
+            t = self._thread
+            self._thread = None
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=timeout)
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
+
+    def run_once(self) -> dict[str, Any]:
+        res = run_auto_sync_cycle(
+            brain_dir=self.brain_dir,
+            state_dir=self.state_dir,
+            http_transport=self.http_transport,
+            skip_dns_check_for_mock_transport=self.skip_dns_check_for_mock_transport,
+        )
+        with self._lock:
+            self.last_run_at = _utc_now_iso()
+            self.last_status = str(res.get("status") or "unknown")
+            self.last_error = str(res["error"]) if res.get("error") else None
+            if res.get("status") == "error":
+                self.consecutive_failures += 1
+            else:
+                self.consecutive_failures = 0
+            self.cycles_completed += 1
+        return res
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            self.run_once()
+            with self._lock:
+                fails = self.consecutive_failures
+                base_iv = self.interval_seconds
+            wait_s = min(3600.0, float(base_iv) * (2 ** min(fails, 5)))
+            self._wake_event.wait(timeout=wait_s)
+            self._wake_event.clear()
+
+
+_AUTO_SYNC_REGISTRY_LOCK = threading.Lock()
+_AUTO_SYNC_SCHEDULERS: dict[str, AutoSyncScheduler] = {}
+
+
+def run_auto_sync_cycle(
+    *,
+    brain_dir: str | Path | None = None,
+    state_dir: Path | None = None,
+    http_transport: httpx.BaseTransport | None = None,
+    skip_dns_check_for_mock_transport: bool = False,
+) -> dict[str, Any]:
+    """Execute one non-interactive pull -> conditional push cycle, pausing cleanly on conflicts or locked keys."""
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    cfg_path = sync_config_path(active_brain, state_dir=state_dir)
+    if not cfg_path.exists():
+        return {"status": "not_configured", "pushed": False, "pulled": False}
+
+    open_conflicts = list_sync_conflicts(brain_dir=active_brain)
+    if open_conflicts:
+        return {
+            "status": "paused_conflicts",
+            "conflict_count": len(open_conflicts),
+            "pushed": False,
+            "pulled": False,
+        }
+
+    try:
+        cfg = _load_sync_config(active_brain, state_dir=state_dir)
+        _resolve_master_key(cfg, passphrase=None, state_dir=state_dir)
+    except SyncSecurityError as exc:
+        return {
+            "status": "paused_locked",
+            "error": str(exc),
+            "pushed": False,
+            "pulled": False,
+        }
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "pushed": False, "pulled": False}
+
+    try:
+        pull_res = sync_pull(
+            brain_dir=active_brain,
+            passphrase=None,
+            trust_new_peers=True,
+            state_dir=state_dir,
+            http_transport=http_transport,
+            skip_dns_check_for_mock_transport=skip_dns_check_for_mock_transport,
+        )
+        if int(pull_res.get("conflict_count") or 0) > 0:
+            return {
+                "status": "paused_conflicts",
+                "conflict_count": int(pull_res["conflict_count"]),
+                "pulled": True,
+                "pushed": False,
+                "pull": pull_res,
+            }
+
+        local_state = _load_local_sync_state(active_brain)
+        current_files = scan_durable_vault_files(active_brain)
+        base_files = dict(local_state.get("files") or {})
+        has_local_changes = (
+            any(base_files.get(p) != info["sha256"] for p, info in current_files.items())
+            or any(p not in current_files for p in base_files)
+            or (int(local_state.get("last_seen_epoch", 0)) == 0 and len(current_files) > 0)
+        )
+        push_res: dict[str, Any] | None = None
+        if has_local_changes:
+            push_res = sync_push(
+                brain_dir=active_brain,
+                passphrase=None,
+                state_dir=state_dir,
+                http_transport=http_transport,
+                skip_dns_check_for_mock_transport=skip_dns_check_for_mock_transport,
+            )
+        local_state = _load_local_sync_state(active_brain)
+        local_state["last_auto_sync_at"] = _utc_now_iso()
+        local_state["last_auto_sync_status"] = "synced"
+        _save_local_sync_state(active_brain, local_state)
+        return {
+            "status": "synced",
+            "pulled": True,
+            "pushed": push_res is not None,
+            "pull": pull_res,
+            "push": push_res,
+        }
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "pulled": False, "pushed": False}
+
+
+def configure_auto_sync(
+    *,
+    enabled: bool,
+    interval_seconds: int = 300,
+    start_background: bool = True,
+    brain_dir: str | Path | None = None,
+    state_dir: Path | None = None,
+    http_transport: httpx.BaseTransport | None = None,
+    skip_dns_check_for_mock_transport: bool = False,
+) -> dict[str, Any]:
+    """Enable or disable background auto-sync for the active vault."""
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    cfg_path = sync_config_path(active_brain, state_dir=state_dir)
+    cfg = _load_sync_config(active_brain, state_dir=state_dir)
+    iv = max(5, min(int(interval_seconds), 86400))
+    cfg["auto_sync_enabled"] = bool(enabled)
+    cfg["auto_sync_interval_seconds"] = iv
+    _atomic_write_restricted_json(cfg_path, cfg)
+
+    slug = _vault_key_slug(active_brain)
+    with _AUTO_SYNC_REGISTRY_LOCK:
+        existing = _AUTO_SYNC_SCHEDULERS.get(slug)
+        if not enabled:
+            if existing is not None:
+                existing.stop()
+                _AUTO_SYNC_SCHEDULERS.pop(slug, None)
+        else:
+            if existing is not None:
+                existing.interval_seconds = iv
+                existing.state_dir = state_dir
+                existing.http_transport = http_transport
+                existing.skip_dns_check_for_mock_transport = skip_dns_check_for_mock_transport
+                sched = existing
+            else:
+                sched = AutoSyncScheduler(
+                    active_brain,
+                    interval_seconds=iv,
+                    state_dir=state_dir,
+                    http_transport=http_transport,
+                    skip_dns_check_for_mock_transport=skip_dns_check_for_mock_transport,
+                )
+                _AUTO_SYNC_SCHEDULERS[slug] = sched
+            if start_background:
+                sched.start()
+    return get_auto_sync_status(brain_dir=active_brain, state_dir=state_dir)
+
+
+def get_auto_sync_status(
+    *,
+    brain_dir: str | Path | None = None,
+    state_dir: Path | None = None,
+) -> dict[str, Any]:
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    cfg_path = sync_config_path(active_brain, state_dir=state_dir)
+    enabled = False
+    interval_seconds = 300
+    if cfg_path.exists():
+        try:
+            cfg = _load_sync_config(active_brain, state_dir=state_dir)
+            enabled = bool(cfg.get("auto_sync_enabled", False))
+            interval_seconds = int(cfg.get("auto_sync_interval_seconds") or 300)
+        except Exception:
+            pass
+    local_state = _load_local_sync_state(active_brain)
+    slug = _vault_key_slug(active_brain)
+    with _AUTO_SYNC_REGISTRY_LOCK:
+        sched = _AUTO_SYNC_SCHEDULERS.get(slug)
+    return {
+        "enabled": enabled,
+        "running": sched.is_running() if sched is not None else False,
+        "interval_seconds": interval_seconds,
+        "last_run_at": (sched.last_run_at if sched and sched.last_run_at else local_state.get("last_auto_sync_at")),
+        "last_status": (sched.last_status if sched and sched.cycles_completed else local_state.get("last_auto_sync_status") or "idle"),
+        "last_error": sched.last_error if sched else None,
+        "consecutive_failures": sched.consecutive_failures if sched else 0,
+        "cycles_completed": sched.cycles_completed if sched else 0,
+    }
+
+
+def stop_auto_sync_scheduler(brain_dir: str | Path) -> bool:
+    """Stop and unregister the background AutoSyncScheduler for one specific vault, if running."""
+    active_brain = Path(brain_dir).resolve()
+    slug = _vault_key_slug(active_brain)
+    with _AUTO_SYNC_REGISTRY_LOCK:
+        sched = _AUTO_SYNC_SCHEDULERS.pop(slug, None)
+    if sched is not None:
+        sched.stop()
+        return True
+    return False
+
+
+def stop_all_auto_sync_schedulers() -> None:
+    with _AUTO_SYNC_REGISTRY_LOCK:
+        scheds = list(_AUTO_SYNC_SCHEDULERS.values())
+        _AUTO_SYNC_SCHEDULERS.clear()
+    for s in scheds:
+        s.stop()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1663,23 +3133,37 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_init = sub.add_parser("init", help="Initialize an encrypted sync target and local device identity")
-    p_init.add_argument("target", help="Local sync folder (OneDrive/Syncthing/NAS/USB) or https:// object store URL")
+    p_init.add_argument("target", help="Local sync folder (OneDrive/Syncthing/NAS/USB) or https:// S3/R2/object store URL")
     p_init.add_argument("--backend", choices=("local_folder", "http_object"), default="local_folder")
     p_init.add_argument("--device-name", default=None)
-    p_init.add_argument("--passphrase-env", default=None, help="Env var holding optional passphrase (defaults to 256-bit keyfile)")
+    p_init.add_argument("--kdf-mode", choices=("keyfile", "passphrase", "os_keychain"), default=None)
+    p_init.add_argument("--use-keychain", action="store_true", help="Seal master key in OS Keychain / Windows DPAPI")
+    p_init.add_argument("--passphrase-env", default=None, help="Env var holding optional passphrase")
+    p_init.add_argument("--auth-mode", choices=("bearer", "s3_sigv4", "none"), default="bearer")
     p_init.add_argument("--bearer-token-env", default=None, help="Env var holding Bearer token for http_object backend")
+    p_init.add_argument("--s3-region", default="auto", help="S3/R2 region (e.g. 'auto', 'us-east-1')")
+    p_init.add_argument("--s3-access-key-env", default=None, help="Env var holding S3 Access Key ID")
+    p_init.add_argument("--s3-secret-key-env", default=None, help="Env var holding S3 Secret Access Key")
+    p_init.add_argument("--s3-session-token-env", default=None, help="Optional env var holding STS Session Token")
     p_init.add_argument("--json", action="store_true")
 
     p_join = sub.add_parser("join", help="Pair this device to an existing encrypted sync target")
-    p_join.add_argument("target", help="Local sync folder or https:// object store URL")
+    p_join.add_argument("target", help="Local sync folder or https:// S3/R2/object store URL")
     p_join.add_argument("--backend", choices=("local_folder", "http_object"), default="local_folder")
     p_join.add_argument("--device-name", default=None)
+    p_join.add_argument("--kdf-mode", choices=("keyfile", "passphrase", "os_keychain"), default=None)
+    p_join.add_argument("--use-keychain", action="store_true", help="Seal master key in OS Keychain / Windows DPAPI")
     p_join.add_argument("--recovery-key-env", default=None, help="Env var holding base64 256-bit recovery key")
     p_join.add_argument("--passphrase-env", default=None, help="Env var holding vault passphrase")
+    p_join.add_argument("--auth-mode", choices=("bearer", "s3_sigv4", "none"), default="bearer")
     p_join.add_argument("--bearer-token-env", default=None)
+    p_join.add_argument("--s3-region", default="auto")
+    p_join.add_argument("--s3-access-key-env", default=None)
+    p_join.add_argument("--s3-secret-key-env", default=None)
+    p_join.add_argument("--s3-session-token-env", default=None)
     p_join.add_argument("--json", action="store_true")
 
-    p_status = sub.add_parser("status", help="Show E2EE sync status, epochs, and pending conflicts")
+    p_status = sub.add_parser("status", help="Show E2EE sync status, epochs, keychain, auto-sync, and pending conflicts")
     p_status.add_argument("--json", action="store_true")
 
     p_push = sub.add_parser("push", help="Encrypt changed durable vault files and push signed manifest")
@@ -1695,8 +3179,61 @@ def main(argv: list[str] | None = None) -> int:
     p_ver.add_argument("--passphrase-env", default=None)
     p_ver.add_argument("--json", action="store_true")
 
+    p_gc = sub.add_parser("gc", help="Prune unreferenced encrypted blobs and superseded manifests")
+    p_gc.add_argument("--passphrase-env", default=None)
+    p_gc.add_argument("--dry-run", action="store_true")
+    p_gc.add_argument("--json", action="store_true")
+
+    p_kc = sub.add_parser("seal-keychain", help="Migrate existing master key into OS Keychain / Windows DPAPI")
+    p_kc.add_argument("--passphrase-env", default=None)
+    p_kc.add_argument("--json", action="store_true")
+
+    p_auto = sub.add_parser("auto", help="Configure or inspect background auto-sync")
+    p_auto.add_argument("--enable", action="store_true", help="Enable background auto-sync")
+    p_auto.add_argument("--disable", action="store_true", help="Disable background auto-sync")
+    p_auto.add_argument("--run-once", action="store_true", help="Run a single auto-sync cycle immediately")
+    p_auto.add_argument("--interval", type=int, default=300, help="Sync interval in seconds (default 300)")
+    p_auto.add_argument("--json", action="store_true")
+
     p_conf = sub.add_parser("conflicts", help="List quarantined sync conflicts awaiting owner resolution")
     p_conf.add_argument("--json", action="store_true")
+
+    p_cdet = sub.add_parser("conflict-detail", help="Inspect 3-way diff for a specific sync conflict")
+    p_cdet.add_argument("conflict", help="conflict_id or relative vault path")
+    p_cdet.add_argument("--json", action="store_true")
+
+    p_res = sub.add_parser("resolve", help="Resolve a sync conflict (keep_local, accept_remote, keep_both, manual_merge)")
+    p_res.add_argument("conflict", help="conflict_id or relative vault path")
+    p_res.add_argument(
+        "--strategy",
+        choices=("keep_local", "accept_remote", "keep_both", "manual_merge"),
+        required=True,
+    )
+    p_res.add_argument("--merged-file", default=None, help="Path to merged file when --strategy=manual_merge")
+    p_res.add_argument("--expected-sha256", default=None, help="Optional CAS local file SHA-256")
+    p_res.add_argument("--actor", default="owner")
+    p_res.add_argument("--json", action="store_true")
+
+    p_dpair = sub.add_parser("drop-pair", help="Create a forward-secret E2EE Mobile Inbox Drop pairing (PWA + iOS Shortcut)")
+    p_dpair.add_argument("--label", default="Mobile Quick-Capture")
+    p_dpair.add_argument("--s3-access-key-env", default=None, help="Optional env var with write-scoped S3 Access Key ID")
+    p_dpair.add_argument("--s3-secret-key-env", default=None, help="Optional env var with write-scoped S3 Secret Access Key")
+    p_dpair.add_argument("--pwa-url", default="https://localhost/inbox-drop/")
+    p_dpair.add_argument("--json", action="store_true")
+
+    p_dlist = sub.add_parser("drop-list", help="List configured Mobile Inbox Drop pairings")
+    p_dlist.add_argument("--json", action="store_true")
+
+    p_drev = sub.add_parser("drop-revoke", help="Revoke a Mobile Inbox Drop pairing token_id")
+    p_drev.add_argument("token_id", help="16-char hex token_id")
+    p_drev.add_argument("--json", action="store_true")
+
+    p_dpull = sub.add_parser("pull-drops", help="Pull and decrypt E2EE mobile inbox-drops/*.enc into 0-raw/inbox/")
+    p_dpull.add_argument("--json", action="store_true")
+
+    p_dpwa = sub.add_parser("export-pwa", help="Export the static zero-dependency Mobile Inbox Drop PWA bundle")
+    p_dpwa.add_argument("dest_dir", help="Destination directory for static PWA files")
+    p_dpwa.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
     brain_dir = resolve_active_brain_dir()
@@ -1709,9 +3246,16 @@ def main(argv: list[str] | None = None) -> int:
             brain_dir=brain_dir,
             device_name=args.device_name,
             passphrase=passphrase,
+            kdf_mode=args.kdf_mode,
+            use_keychain=bool(args.use_keychain),
             bearer_token_env=args.bearer_token_env,
+            auth_mode=args.auth_mode,
+            s3_region=args.s3_region,
+            s3_access_key_env=args.s3_access_key_env,
+            s3_secret_key_env=args.s3_secret_key_env,
+            s3_session_token_env=args.s3_session_token_env,
         )
-        print(json.dumps(res, indent=2) if args.json else f"Initialized E2EE sync vault={res['vault_id']} device={res['device_id']} target={res['target']}")
+        print(json.dumps(res, indent=2) if args.json else f"Initialized E2EE sync vault={res['vault_id']} device={res['device_id']} target={res['target']} kdf={res['kdf_mode']}")
         return 0
     if args.cmd == "join":
         rec_key = os.environ.get(args.recovery_key_env) if args.recovery_key_env else None
@@ -1722,9 +3266,16 @@ def main(argv: list[str] | None = None) -> int:
             device_name=args.device_name,
             passphrase=passphrase,
             recovery_key_b64=rec_key,
+            kdf_mode=args.kdf_mode,
+            use_keychain=bool(args.use_keychain),
             bearer_token_env=args.bearer_token_env,
+            auth_mode=args.auth_mode,
+            s3_region=args.s3_region,
+            s3_access_key_env=args.s3_access_key_env,
+            s3_secret_key_env=args.s3_secret_key_env,
+            s3_session_token_env=args.s3_session_token_env,
         )
-        print(json.dumps(res, indent=2) if args.json else f"Joined E2EE sync vault={res['vault_id']} device={res['device_id']}")
+        print(json.dumps(res, indent=2) if args.json else f"Joined E2EE sync vault={res['vault_id']} device={res['device_id']} kdf={res['kdf_mode']}")
         return 0
     if args.cmd == "status":
         res = sync_status(brain_dir=brain_dir)
@@ -1742,9 +3293,88 @@ def main(argv: list[str] | None = None) -> int:
         res = sync_verify(brain_dir=brain_dir, passphrase=passphrase)
         print(json.dumps(res, indent=2) if args.json else f"valid={res['valid']} verified_blobs={res['verified_blobs']} issues={len(res['issues'])}")
         return 0 if res["valid"] else 1
+    if args.cmd == "gc":
+        res = sync_gc(brain_dir=brain_dir, passphrase=passphrase, dry_run=bool(args.dry_run))
+        print(json.dumps(res, indent=2) if args.json else f"status={res['status']} deleted_blobs={res['deleted_blobs']} deleted_manifests={res['deleted_manifests']}")
+        return 0
+    if args.cmd == "seal-keychain":
+        res = migrate_sync_key_to_keychain(brain_dir=brain_dir, passphrase=passphrase)
+        print(json.dumps(res, indent=2) if args.json else f"Sealed sync master key in {res['keychain_backend']} (kdf_mode={res['kdf_mode']})")
+        return 0
+    if args.cmd == "auto":
+        if args.run_once:
+            res = run_auto_sync_cycle(brain_dir=brain_dir)
+        elif args.enable:
+            res = configure_auto_sync(enabled=True, interval_seconds=args.interval, start_background=False, brain_dir=brain_dir)
+        elif args.disable:
+            res = configure_auto_sync(enabled=False, interval_seconds=args.interval, start_background=False, brain_dir=brain_dir)
+        else:
+            res = get_auto_sync_status(brain_dir=brain_dir)
+        print(json.dumps(res, indent=2) if args.json else f"auto_sync={res}")
+        return 0
     if args.cmd == "conflicts":
         items = list_sync_conflicts(brain_dir=brain_dir)
         print(json.dumps({"count": len(items), "conflicts": items}, indent=2) if args.json else f"conflicts={len(items)}")
+        return 0
+    if args.cmd == "conflict-detail":
+        det = get_sync_conflict_detail(args.conflict, brain_dir=brain_dir)
+        print(json.dumps(det, indent=2) if args.json else (det["unified_diff"] or "(no text diff)"))
+        return 0
+    if args.cmd == "resolve":
+        merged_txt = Path(args.merged_file).read_text(encoding="utf-8") if args.merged_file else None
+        res = resolve_sync_conflict(
+            args.conflict,
+            resolution=args.strategy,
+            merged_content=merged_txt,
+            expected_local_sha256=args.expected_sha256,
+            actor=args.actor,
+            brain_dir=brain_dir,
+        )
+        print(json.dumps(res, indent=2) if args.json else f"Resolved {res['rel_path']} ({res['resolution']}) remaining={res['remaining_conflicts']}")
+        return 0
+    if args.cmd == "drop-pair":
+        from inbox_drop import create_mobile_drop_pairing
+
+        cfg = _load_sync_config(Path(brain_dir).resolve())
+        ak = os.environ.get(args.s3_access_key_env, "") if args.s3_access_key_env else ""
+        sk = os.environ.get(args.s3_secret_key_env, "") if args.s3_secret_key_env else ""
+        res = create_mobile_drop_pairing(
+            label=args.label,
+            vault_id=str(cfg["vault_id"]),
+            sync_target_url=str(cfg.get("target") or "") if cfg.get("backend_type") == "http_object" else "",
+            s3_region=str(cfg.get("s3_region") or "auto"),
+            s3_access_key_id=ak,
+            s3_secret_access_key=sk,
+            pwa_base_url=args.pwa_url,
+            brain_dir=brain_dir,
+        )
+        print(json.dumps(res, indent=2) if args.json else f"Paired mobile drop token_id={res['token_id']} pwa_url={res['pwa_pairing_url']}")
+        return 0
+    if args.cmd == "drop-list":
+        from inbox_drop import list_mobile_drop_pairings
+
+        vid = None
+        cfg_p = sync_config_path(Path(brain_dir).resolve())
+        if cfg_p.exists():
+            vid = str(_load_sync_config(Path(brain_dir).resolve()).get("vault_id") or "") or None
+        res = list_mobile_drop_pairings(vault_id=vid, brain_dir=brain_dir)
+        print(json.dumps(res, indent=2) if args.json else f"active_pairings={res['count']} key_id={res.get('key_id')}")
+        return 0
+    if args.cmd == "drop-revoke":
+        from inbox_drop import revoke_mobile_drop_pairing
+
+        res = revoke_mobile_drop_pairing(args.token_id, brain_dir=brain_dir)
+        print(json.dumps(res, indent=2) if args.json else f"Revoked mobile drop pairing {res['token_id']}")
+        return 0
+    if args.cmd == "pull-drops":
+        res = pull_mobile_inbox_drops(brain_dir=brain_dir)
+        print(json.dumps(res, indent=2) if args.json else f"Ingested {res['ingested_count']} mobile inbox drop(s)")
+        return 0
+    if args.cmd == "export-pwa":
+        from inbox_drop import export_static_pwa_bundle
+
+        res = export_static_pwa_bundle(args.dest_dir)
+        print(json.dumps(res, indent=2) if args.json else f"Exported static PWA ({len(res['files'])} files) to {res['destination']}")
         return 0
     return 1
 

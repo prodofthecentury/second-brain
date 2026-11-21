@@ -38,8 +38,12 @@ import sys
 import threading
 import time
 
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
+try:
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:  # Clean minimal wheel without optional [watchdog] extra
+    FileSystemEventHandler = object  # type: ignore[assignment,misc]
+    Observer = None  # type: ignore[assignment,misc]
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from atom_mutator import atomic_write_bytes, review_lock
@@ -450,9 +454,12 @@ def sync_atoms_and_detect_stale_anchors(
     brain_dir: str | None = None,
     atoms_dir: str | None = None,
     lexical_index_path: str | None = None,
+    chroma_path: str | None = None,
+    sync_vectors: bool = True,
 ) -> dict[str, object]:
-    """Incrementally sync lexical.sqlite3 FTS5 and run read-only stale-anchor detection on 2-atoms/."""
+    """Incrementally sync lexical.sqlite3 FTS5, O(1) Chroma vectors (when active), and stale-anchor detection on 2-atoms/."""
     from audit_sources import audit_sources
+    from index_manifest import index_manifest_is_current, load_index_manifest
     from lexical_store import sync_lexical_index
 
     resolved_atoms = os.path.abspath(
@@ -465,9 +472,41 @@ def sync_atoms_and_detect_stale_anchors(
     if _is_reparse_or_link(resolved_atoms) or _is_reparse_or_link(sidecar):
         raise PermissionError("Refusing to sync symlinked 2-atoms or .sidecar directory.")
     resolved_lex = os.path.abspath(lexical_index_path or os.path.join(sidecar, "lexical.sqlite3"))
+    resolved_chroma = os.path.abspath(chroma_path or os.path.join(resolved_brain, ".chroma"))
     lock_file = os.path.join(sidecar, "writer.lock")
+    vector_sync: dict[str, object] = {"status": "not_active"}
     with review_lock(lock_file):
         lex_stats = sync_lexical_index(resolved_atoms, resolved_lex)
+        if (
+            sync_vectors
+            and os.path.isdir(resolved_chroma)
+            and not _is_reparse_or_link(resolved_chroma)
+        ):
+            manifest = load_index_manifest(resolved_chroma)
+            if isinstance(manifest, dict) and manifest.get("embedding_model") and isinstance(manifest.get("embedding_dimensions"), int):
+                if index_manifest_is_current(manifest, resolved_atoms):
+                    vector_sync = {"status": "already_current", "generation_id": manifest.get("generation_id")}
+                else:
+                    try:
+                        import rebuild_vectors as _rv_mod
+
+                        vec_res = _rv_mod.upsert_changed_vectors(
+                            atoms_dir=resolved_atoms,
+                            store_path=resolved_chroma,
+                            collection_name="atoms",
+                            model=str(manifest["embedding_model"]),
+                            pre_verified_current=False,
+                            _writer_lock_held=True,
+                        )
+                        vector_sync = {
+                            "status": "synced",
+                            "embedded": vec_res.get("embedded", 0),
+                            "deleted": vec_res.get("deleted", 0),
+                            "generation_id": vec_res.get("generation_id"),
+                        }
+                    except Exception as exc:
+                        log.warning(f"Incremental Chroma vector sync skipped/degraded: {exc}")
+                        vector_sync = {"status": "degraded", "reason": str(exc)[:300]}
 
     reports = audit_sources(atoms_dir=resolved_atoms, brain_dir=resolved_brain, demote_stale=False)
     stale = [
@@ -498,7 +537,13 @@ def sync_atoms_and_detect_stale_anchors(
                 sort_keys=True,
             ).encode("utf-8"),
         )
-    return {"lexical_sync": lex_stats, "total_atoms": len(reports), "stale_count": len(stale), "stale_atoms": stale}
+    return {
+        "lexical_sync": lex_stats,
+        "vector_sync": vector_sync,
+        "total_atoms": len(reports),
+        "stale_count": len(stale),
+        "stale_atoms": stale,
+    }
 
 
 def sync_notes_and_atoms_once(
@@ -612,7 +657,7 @@ class InboxHandler(FileSystemEventHandler):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def run_daemon(*, once: bool = False) -> int:
+def run_daemon(*, once: bool = False, auto_sync: bool = False, sync_interval: int = 300) -> int:
     ensure_dirs()
     for watched in (RAW_DIR, NOTES_DIR, ATOMS_DIR):
         if os.path.lexists(watched) and _is_reparse_or_link(watched):
@@ -637,7 +682,29 @@ def run_daemon(*, once: bool = False) -> int:
             atoms_dir=ATOMS_DIR,
             lexical_index_path=LEXICAL_INDEX_PATH,
         )
+        if auto_sync:
+            from vault_sync import run_auto_sync_cycle
+
+            run_auto_sync_cycle(brain_dir=BRAIN_DIR)
         return 0
+
+    if Observer is None:
+        raise RuntimeError(
+            "Continuous filesystem watching requires 'watchdog'; install 'second-brain[watchdog]' (or run with '--once')."
+        )
+
+    sync_sched = None
+    try:
+        from vault_sync import AutoSyncScheduler, get_auto_sync_status
+
+        auto_st = get_auto_sync_status(brain_dir=BRAIN_DIR)
+        if auto_sync or bool(auto_st.get("enabled")):
+            iv = int(sync_interval or auto_st.get("interval_seconds") or 300)
+            sync_sched = AutoSyncScheduler(BRAIN_DIR, interval_seconds=iv)
+            sync_sched.start()
+            log.info(f"  Background E2EE auto-sync active (interval={iv}s)")
+    except Exception as exc:
+        log.warning(f"  Auto-sync scheduler not started: {exc}")
 
     profile = get_daemon_hardware_profile()
     log.info("=" * 50)
@@ -675,6 +742,8 @@ def run_daemon(*, once: bool = False) -> int:
     except KeyboardInterrupt:
         log.info("Shutting down watchdog...")
     finally:
+        if sync_sched is not None:
+            sync_sched.stop(timeout=5.0)
         notes_handler.stop()
         atoms_handler.stop()
         observer.stop()
@@ -691,8 +760,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Sync notes/atoms FTS + stale anchors and process unhandled 0-raw/ files once, then exit cleanly.",
     )
+    parser.add_argument(
+        "--auto-sync",
+        action="store_true",
+        help="Run background E2EE vault auto-sync loop alongside file watching.",
+    )
+    parser.add_argument(
+        "--sync-interval",
+        type=int,
+        default=300,
+        help="Background E2EE auto-sync interval in seconds (default 300).",
+    )
     args = parser.parse_args(argv)
-    return run_daemon(once=args.once)
+    return run_daemon(once=args.once, auto_sync=args.auto_sync, sync_interval=args.sync_interval)
 
 
 if __name__ == "__main__":

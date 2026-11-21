@@ -12,4 +12,4 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 echo "Starting Second Brain Watchdog Daemon..."
-exec uv run --locked python scripts/watchdog_daemon.py
+exec uv run --locked python scripts/watchdog_daemon.py "$@"

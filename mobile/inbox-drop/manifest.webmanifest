@@ -1,0 +1,19 @@
+{
+  "name": "Second Brain — E2EE Mobile Inbox Drop",
+  "short_name": "SB Drop",
+  "description": "Zero-knowledge client-side E2EE quick-capture into your Second Brain S3/R2 inbox.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0b0f19",
+  "theme_color": "#0b0f19",
+  "share_target": {
+    "action": "./index.html",
+    "method": "GET",
+    "enctype": "application/x-www-form-urlencoded",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url"
+    }
+  }
+}

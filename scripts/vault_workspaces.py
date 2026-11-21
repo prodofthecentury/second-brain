@@ -48,10 +48,11 @@ from config import (  # noqa: E402
     vault_paths_for,
 )
 from host_adapters import restrict_security_file_permissions  # noqa: E402
+from cross_encoder import score_query_atom_pairs  # noqa: E402
 from lexical_store import lexical_index_is_current, rebuild_lexical_index  # noqa: E402
 from memory_format import split_frontmatter  # noqa: E402
 from memory_review import parse_frontmatter_values  # noqa: E402
-from recall import RecallOptions, search_lexical_memory  # noqa: E402
+from recall import RecallOptions, search_memory  # noqa: E402
 
 
 VAULTS_REGISTRY_FILENAME = "vaults.json"
@@ -558,7 +559,10 @@ def federated_recall(
     *,
     vault_ids: list[str] | tuple[str, ...] | None = None,
     project_scope: str | None = None,
+    retrieval_mode: str = "lexical",
     limit: int = 5,
+    include_expired: bool = False,
+    as_of: str | None = None,
     security_dir: str | Path | None = None,
     current_brain_dir: str | None = None,
 ) -> dict[str, object]:
@@ -570,6 +574,9 @@ def federated_recall(
     clean_query = str(query or "").strip()
     if not clean_query or len(clean_query) > 2000:
         raise VaultWorkspaceError("Query must be 1..2000 characters.")
+    clean_mode = str(retrieval_mode or "lexical").strip().lower()
+    if clean_mode not in {"lexical", "rrf", "dense", "auto"}:
+        raise VaultWorkspaceError("retrieval_mode must be one of ('lexical', 'rrf', 'dense', 'auto').")
     top_k = max(1, min(int(limit), 25))
     projects = (str(project_scope).strip(),) if project_scope and str(project_scope).strip() else ()
 
@@ -618,16 +625,21 @@ def federated_recall(
                 with review_lock(os.path.join(vp["sidecar_dir"], "writer.lock")):
                     if not lexical_index_is_current(vp["atoms_dir"], vp["lexical_index_path"]):
                         rebuild_lexical_index(vp["atoms_dir"], vp["lexical_index_path"])
-            direct, _ = search_lexical_memory(
+            direct, _ = search_memory(
                 clean_query,
                 RecallOptions(
                     n_results=top_k,
                     follow_links=False,
                     include_statuses={"accepted"},
                     projects=projects,
+                    retrieval_mode=clean_mode,
+                    enable_reranker=True,
+                    include_expired=bool(include_expired),
+                    as_of=as_of,
                 ),
                 atoms_dir=vp["atoms_dir"],
                 index_path=vp["lexical_index_path"],
+                chroma_path=vp["chroma_path"],
             )
         except Exception:
             continue
@@ -641,9 +653,25 @@ def federated_recall(
             item["vault_label"] = vlabel
             merged.append(item)
 
-    merged.sort(key=lambda r: (-float(r.get("score") or 0.0), str(r.get("vault_id") or ""), str(r.get("filename") or "")))
+    if len(merged) > 1:
+        ce_scores, _ = score_query_atom_pairs(clean_query, [str(r.get("content") or "") for r in merged])
+        for item, ce in zip(merged, ce_scores):
+            base_s = float(item.get("score") or 0.0)
+            # Normalize RRF vs [0,1] scores onto comparable cross-vault ranking scale
+            norm_base = min(1.0, base_s * 20.0) if str(item.get("source")) == "rrf_hybrid" else base_s
+            item["cross_vault_score"] = round(0.75 * norm_base + 0.25 * ce, 6)
+        merged.sort(
+            key=lambda r: (
+                -float(r.get("cross_vault_score", r.get("score") or 0.0)),
+                str(r.get("vault_id") or ""),
+                str(r.get("filename") or ""),
+            )
+        )
+    else:
+        merged.sort(key=lambda r: (-float(r.get("score") or 0.0), str(r.get("vault_id") or ""), str(r.get("filename") or "")))
     return {
         "query": clean_query,
+        "retrieval_mode": clean_mode,
         "searched_vaults": searched_ids,
         "skipped_non_opted_in": skipped_non_opted,
         "count": len(merged[:top_k]),
