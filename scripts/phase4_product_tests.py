@@ -104,6 +104,24 @@ class ScaleEngineTests(IsolatedVaultCase):
         self.assertNotEqual(before["a0005.md"], after["a0005.md"])
         self.assertEqual(after["a0005.md"], hashlib.sha256(target.read_bytes()).hexdigest())
 
+    def test_verified_scan_memo_detects_out_of_band_in_place_edit(self) -> None:
+        """A same-size in-place overwrite (no rename, dir mtime unchanged) must never be served from memo."""
+        from lexical_store import _search_lexical_index_verified, rebuild_lexical_index
+
+        d = self._write_atoms(80)
+        idx = str(self.root / "memo-idx.sqlite3")
+        rebuild_lexical_index(str(d), idx)
+        _, first_map = _search_lexical_index_verified("alpha 5 bravo", idx, 5, atoms_dir=str(d))
+        target = d / "a0005.md"
+        with open(target, "r+b") as fh:
+            data = fh.read()
+            fh.seek(0)
+            fh.write(data.replace(b"alpha 5 bravo", b"omega 5 bravo"))
+        with self.assertRaises(Exception):
+            # The index is now stale versus disk; verification must fail closed rather than reuse the memo.
+            _search_lexical_index_verified("bravo", idx, 20, atoms_dir=str(d))
+        self.assertIsNotNone(first_map)
+
     def test_incremental_upsert_delete_and_sync_keep_index_exact(self) -> None:
         from lexical_store import (
             lexical_index_is_current,
