@@ -55,16 +55,29 @@ def validate_dataset(
     for field in ("dataset_id", "dataset_version"):
         if not isinstance(dataset.get(field), str) or not dataset[field].strip():
             errors.append(f"{field} must be a non-empty string.")
-    if dataset.get("status") != "owner_approved":
-        errors.append("status must be owner_approved.")
+    status = dataset.get("status")
+    if status not in {"owner_approved", "pending_owner_review"}:
+        errors.append("status must be owner_approved or pending_owner_review.")
     if not isinstance(dataset.get("purpose"), str) or not dataset["purpose"].strip():
         errors.append("purpose must be a non-empty string.")
-    approval = dataset.get("owner_approval")
-    if not isinstance(approval, dict) or not all(
-        isinstance(approval.get(field), str) and approval[field].strip()
-        for field in ("actor", "date", "scope")
-    ):
-        errors.append("owner_approval must include actor, date, and scope.")
+    if status == "owner_approved":
+        approval = dataset.get("owner_approval")
+        if not isinstance(approval, dict) or not all(
+            isinstance(approval.get(field), str) and approval[field].strip()
+            for field in ("actor", "date", "scope")
+        ):
+            errors.append("owner_approval must include actor, date, and scope.")
+    elif status == "pending_owner_review":
+        # Agent-drafted labels are never presented as owner decisions; they stay provisional
+        # until the owner reviews them and records an explicit owner_approval block.
+        if dataset.get("owner_approval"):
+            errors.append("pending_owner_review datasets must not carry an owner_approval block.")
+        draft = dataset.get("draft_provenance")
+        if not isinstance(draft, dict) or not all(
+            isinstance(draft.get(field), str) and draft[field].strip()
+            for field in ("drafted_by", "date", "scope")
+        ):
+            errors.append("draft_provenance must include drafted_by, date, and scope.")
 
     queries = dataset.get("queries")
     if not isinstance(queries, list) or not queries:

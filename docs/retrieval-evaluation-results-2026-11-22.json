@@ -1,8 +1,8 @@
 {
-  "evaluation_status": "owner_approved",
+  "evaluation_status": "pending_owner_review",
   "dataset_id": "second-brain-retrieval-curated-90",
   "dataset_version": "3.0.0",
-  "dataset_sha256": "b51661c99cb72129f06080afebbc758063fece1de0466188979cc8c93b629404",
+  "dataset_sha256": "7fea1225d45aa1e5d24b21a8a3e6b6435ef4d54fbadd032c95ef419927defcef",
   "index_generation": "cc1fd9f4128448099cf55c06b2b16d48",
   "embedding_model": "nomic-embed-text",
   "embedding_dimensions": 768,
@@ -14,25 +14,25 @@
   "unanswerable_query_count": 25,
   "candidate_lexical_mean_recall_at_k": 0.9153846153846154,
   "candidate_dense_mean_recall_at_k": 0.8166666666666667,
-  "candidate_rrf_hybrid_mean_recall_at_k": 0.9192307692307692,
+  "candidate_rrf_hybrid_mean_recall_at_k": 0.9115384615384615,
   "candidate_lexical_mean_mrr": 0.9282051282051282,
   "candidate_dense_mean_mrr": 0.8525641025641025,
   "candidate_rrf_hybrid_mean_mrr": 0.9346153846153846,
   "candidate_lexical_mean_ndcg_at_k": 0.8933702513663069,
   "candidate_dense_mean_ndcg_at_k": 0.7999358631497759,
-  "candidate_rrf_hybrid_mean_ndcg_at_k": 0.8979278874977946,
+  "candidate_rrf_hybrid_mean_ndcg_at_k": 0.8942786919167286,
   "answerable_lexical_expected_atom_recall_at_k": 1.0,
   "answerable_dense_expected_atom_recall_at_k": 0.96,
   "answerable_rrf_hybrid_expected_atom_recall_at_k": 1.0,
   "trusted_answerable_lexical_expected_atom_recall": 1.0,
   "trusted_answerable_dense_expected_atom_recall": 1.0,
   "trusted_answerable_rrf_hybrid_expected_atom_recall": 1.0,
-  "lexical_median_latency_ms": 0.8814999964670278,
-  "lexical_p95_latency_ms": 1.644,
-  "dense_median_latency_ms": 103.89145000226563,
-  "dense_p95_latency_ms": 159.902,
-  "rrf_hybrid_median_latency_ms": 104.86474999925122,
-  "rrf_hybrid_p95_latency_ms": 160.661,
+  "lexical_median_latency_ms": 2.317349993973039,
+  "lexical_p95_latency_ms": 4.121,
+  "dense_median_latency_ms": 103.08839999925112,
+  "dense_p95_latency_ms": 131.462,
+  "rrf_hybrid_median_latency_ms": 106.01360000146087,
+  "rrf_hybrid_p95_latency_ms": 134.377,
   "by_split": {
     "regression": {
       "scored_query_count": 22,
@@ -44,7 +44,7 @@
       "scored_query_count": 21,
       "lexical_recall_at_k": 0.881,
       "dense_recall_at_k": 0.8214,
-      "rrf_hybrid_recall_at_k": 0.9087
+      "rrf_hybrid_recall_at_k": 0.8849
     },
     "holdout": {
       "scored_query_count": 22,
@@ -70,7 +70,7 @@
       "count": 25,
       "lexical_recall_at_k": 0.86,
       "dense_recall_at_k": 0.7433,
-      "rrf_hybrid_recall_at_k": 0.85
+      "rrf_hybrid_recall_at_k": 0.83
     }
   },
   "trusted_trap_false_positives": 0,
@@ -104,7 +104,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 3.054,
+        "latency_ms": 5.469,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -119,7 +119,7 @@
         "recall_at_k": 0.5,
         "mrr": 1.0,
         "ndcg_at_k": 0.6131471927654584,
-        "latency_ms": 215.997,
+        "latency_ms": 3389.282,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -134,7 +134,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 219.079,
+        "latency_ms": 3394.779,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -170,7 +170,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.559,
+        "latency_ms": 0.867,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -185,7 +185,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 105.034,
+        "latency_ms": 88.955,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -200,7 +200,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 105.629,
+        "latency_ms": 89.863,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -238,7 +238,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.268,
+        "latency_ms": 1.052,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -253,7 +253,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 163.014,
+        "latency_ms": 97.097,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -268,7 +268,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 164.329,
+        "latency_ms": 98.205,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -306,7 +306,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.706,
+        "latency_ms": 2.783,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -321,7 +321,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 90.68,
+        "latency_ms": 112.786,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -336,7 +336,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 91.419,
+        "latency_ms": 115.614,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -375,7 +375,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.596,
+        "latency_ms": 1.154,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -390,7 +390,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9197207891481876,
-        "latency_ms": 97.983,
+        "latency_ms": 99.352,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -405,7 +405,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 98.603,
+        "latency_ms": 100.548,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -443,7 +443,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.036,
+        "latency_ms": 1.561,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -458,7 +458,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 95.707,
+        "latency_ms": 88.862,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -473,7 +473,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 96.791,
+        "latency_ms": 90.462,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -510,7 +510,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.582,
+        "latency_ms": 1.39,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -525,7 +525,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9197207891481876,
-        "latency_ms": 105.925,
+        "latency_ms": 84.776,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -540,7 +540,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 106.543,
+        "latency_ms": 86.201,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -578,7 +578,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.195,
+        "latency_ms": 1.779,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -593,7 +593,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 103.983,
+        "latency_ms": 88.391,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -608,7 +608,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 105.231,
+        "latency_ms": 90.216,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -646,7 +646,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.662,
+        "latency_ms": 2.165,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -661,7 +661,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 96.317,
+        "latency_ms": 92.543,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -676,7 +676,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 97.031,
+        "latency_ms": 94.761,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -714,7 +714,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.793,
+        "latency_ms": 3.204,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -729,7 +729,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 123.746,
+        "latency_ms": 101.322,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -744,7 +744,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 124.588,
+        "latency_ms": 104.566,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -783,7 +783,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9197207891481876,
-        "latency_ms": 1.8,
+        "latency_ms": 3.828,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -798,7 +798,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9197207891481876,
-        "latency_ms": 109.654,
+        "latency_ms": 119.005,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -813,7 +813,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.8772153153380493,
-        "latency_ms": 111.508,
+        "latency_ms": 122.884,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -851,7 +851,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.69,
+        "latency_ms": 2.401,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -866,7 +866,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 95.944,
+        "latency_ms": 106.451,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -881,7 +881,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 96.678,
+        "latency_ms": 108.894,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -919,7 +919,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.867,
+        "latency_ms": 3.859,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -934,7 +934,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 103.527,
+        "latency_ms": 102.673,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -949,7 +949,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 104.455,
+        "latency_ms": 106.561,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -988,7 +988,7 @@
         "recall_at_k": 0.5,
         "mrr": 0.5,
         "ndcg_at_k": 0.38685280723454163,
-        "latency_ms": 0.864,
+        "latency_ms": 4.271,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1003,7 +1003,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 106.259,
+        "latency_ms": 108.251,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1018,7 +1018,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.8772153153380493,
-        "latency_ms": 107.177,
+        "latency_ms": 112.571,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1057,7 +1057,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9197207891481876,
-        "latency_ms": 0.767,
+        "latency_ms": 2.973,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1072,7 +1072,7 @@
         "recall_at_k": 0.5,
         "mrr": 1.0,
         "ndcg_at_k": 0.6131471927654584,
-        "latency_ms": 99.208,
+        "latency_ms": 102.91,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1087,7 +1087,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.8772153153380493,
-        "latency_ms": 100.018,
+        "latency_ms": 105.928,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1125,7 +1125,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.168,
+        "latency_ms": 3.27,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1140,7 +1140,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 160.904,
+        "latency_ms": 108.717,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1155,7 +1155,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 162.121,
+        "latency_ms": 112.033,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1195,7 +1195,7 @@
         "recall_at_k": 1.0,
         "mrr": 0.5,
         "ndcg_at_k": 0.6934264036172708,
-        "latency_ms": 1.549,
+        "latency_ms": 2.714,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1210,7 +1210,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 128.125,
+        "latency_ms": 112.765,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1225,7 +1225,7 @@
         "recall_at_k": 1.0,
         "mrr": 0.5,
         "ndcg_at_k": 0.6934264036172708,
-        "latency_ms": 129.701,
+        "latency_ms": 115.522,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1265,7 +1265,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.676,
+        "latency_ms": 1.98,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1280,7 +1280,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 99.07,
+        "latency_ms": 106.599,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1295,7 +1295,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 99.794,
+        "latency_ms": 108.621,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1333,7 +1333,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.15,
+        "latency_ms": 2.359,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1348,7 +1348,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 114.758,
+        "latency_ms": 122.557,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1363,7 +1363,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 115.947,
+        "latency_ms": 124.953,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1401,7 +1401,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.66,
+        "latency_ms": 1.968,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1416,7 +1416,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 99.337,
+        "latency_ms": 107.576,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1431,7 +1431,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 100.053,
+        "latency_ms": 109.589,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1469,7 +1469,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.718,
+        "latency_ms": 2.572,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1484,7 +1484,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 117.978,
+        "latency_ms": 119.254,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1499,7 +1499,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 118.722,
+        "latency_ms": 121.87,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1537,7 +1537,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.556,
+        "latency_ms": 3.639,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1552,7 +1552,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 119.607,
+        "latency_ms": 96.681,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1567,7 +1567,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 121.206,
+        "latency_ms": 100.37,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1605,7 +1605,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.233,
+        "latency_ms": 2.312,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1620,7 +1620,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 136.589,
+        "latency_ms": 126.226,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1635,7 +1635,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 137.866,
+        "latency_ms": 128.581,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1673,7 +1673,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.694,
+        "latency_ms": 1.877,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1688,7 +1688,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 107.347,
+        "latency_ms": 116.864,
         "expected_atom_recall_at_k": 0.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1697,13 +1697,13 @@
           "note-8-no-autonomous-deletion-or-contradiction-adjudi.md",
           "note-autonomous-deletion-merge-or-conflict-adjudicati.md",
           "note-human-review-entailment-epistemic-labels-promoti.md",
-          "controlled-refinery-change-validation.md",
-          "note-maintain-a-strict-hierarchical-uses-depends-upon-2.md"
+          "note-self-modifying-code-or-autonomous-skill-executio.md",
+          "controlled-refinery-change-validation.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 108.08,
+        "latency_ms": 118.77,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1741,7 +1741,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.716,
+        "latency_ms": 3.783,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1751,12 +1751,12 @@
           "ollama-refinery-entrypoint.md",
           "continuous-integration-deployment.md",
           "cognitive-core-single-file-mode.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-public-dns-results-the-owner-approved-structured.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 115.897,
+        "latency_ms": 100.463,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1771,7 +1771,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 117.666,
+        "latency_ms": 104.276,
         "expected_atom_recall_at_k": 1.0,
         "trusted_expected_atom_recall": 1.0
       },
@@ -1800,7 +1800,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.159,
+        "latency_ms": 2.292,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1815,7 +1815,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 107.94,
+        "latency_ms": 103.748,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1830,7 +1830,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 109.166,
+        "latency_ms": 106.066,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1859,7 +1859,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.655,
+        "latency_ms": 2.365,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1874,7 +1874,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 103.8,
+        "latency_ms": 81.951,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1889,7 +1889,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 104.498,
+        "latency_ms": 84.342,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1918,7 +1918,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.573,
+        "latency_ms": 1.752,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1933,7 +1933,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 79.279,
+        "latency_ms": 78.961,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1948,7 +1948,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 79.893,
+        "latency_ms": 80.749,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1975,7 +1975,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.612,
+        "latency_ms": 1.286,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -1990,7 +1990,7 @@
         "recall_at_k": 1.0,
         "mrr": 0.5,
         "ndcg_at_k": 0.6309297535714575,
-        "latency_ms": 102.966,
+        "latency_ms": 96.339,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2005,7 +2005,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 103.612,
+        "latency_ms": 97.663,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2033,7 +2033,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.861,
+        "latency_ms": 0.89,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2048,7 +2048,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 84.428,
+        "latency_ms": 87.051,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2063,7 +2063,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 85.327,
+        "latency_ms": 87.966,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2093,7 +2093,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.644,
+        "latency_ms": 3.881,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2108,7 +2108,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 117.464,
+        "latency_ms": 116.184,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2123,7 +2123,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 119.162,
+        "latency_ms": 120.116,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2153,7 +2153,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.8503449055347546,
-        "latency_ms": 1.225,
+        "latency_ms": 2.275,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2168,7 +2168,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 112.474,
+        "latency_ms": 104.265,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2183,7 +2183,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 113.739,
+        "latency_ms": 106.592,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2212,7 +2212,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.64,
+        "latency_ms": 2.311,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2227,7 +2227,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 82.127,
+        "latency_ms": 96.763,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2242,7 +2242,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 82.813,
+        "latency_ms": 99.117,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2271,7 +2271,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.278,
+        "latency_ms": 2.427,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2286,7 +2286,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 95.514,
+        "latency_ms": 88.788,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2301,7 +2301,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 96.834,
+        "latency_ms": 91.257,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2331,7 +2331,7 @@
         "recall_at_k": 1.0,
         "mrr": 0.5,
         "ndcg_at_k": 0.6934264036172708,
-        "latency_ms": 1.291,
+        "latency_ms": 2.25,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2346,7 +2346,7 @@
         "recall_at_k": 0.5,
         "mrr": 0.3333333333333333,
         "ndcg_at_k": 0.3065735963827292,
-        "latency_ms": 99.79,
+        "latency_ms": 97.433,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2361,7 +2361,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9197207891481876,
-        "latency_ms": 101.134,
+        "latency_ms": 99.735,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2391,7 +2391,7 @@
         "recall_at_k": 1.0,
         "mrr": 0.5,
         "ndcg_at_k": 0.6509209298071326,
-        "latency_ms": 0.678,
+        "latency_ms": 2.4,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2406,7 +2406,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 99.386,
+        "latency_ms": 98.051,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2421,7 +2421,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9197207891481876,
-        "latency_ms": 100.109,
+        "latency_ms": 100.496,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2451,7 +2451,7 @@
         "recall_at_k": 0.5,
         "mrr": 1.0,
         "ndcg_at_k": 0.6131471927654584,
-        "latency_ms": 1.728,
+        "latency_ms": 2.309,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2466,7 +2466,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 101.652,
+        "latency_ms": 131.149,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2481,7 +2481,7 @@
         "recall_at_k": 0.5,
         "mrr": 1.0,
         "ndcg_at_k": 0.6131471927654584,
-        "latency_ms": 103.435,
+        "latency_ms": 133.489,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2510,7 +2510,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 1.366,
+        "latency_ms": 3.319,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2525,7 +2525,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 149.715,
+        "latency_ms": 107.729,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2540,7 +2540,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 151.127,
+        "latency_ms": 111.091,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2569,7 +2569,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.199,
+        "latency_ms": 2.069,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2584,7 +2584,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 143.4,
+        "latency_ms": 97.584,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2599,7 +2599,7 @@
         "recall_at_k": 1.0,
         "mrr": 0.5,
         "ndcg_at_k": 0.6309297535714575,
-        "latency_ms": 144.652,
+        "latency_ms": 99.693,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2628,7 +2628,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.412,
+        "latency_ms": 3.622,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2643,7 +2643,7 @@
         "recall_at_k": 1.0,
         "mrr": 0.25,
         "ndcg_at_k": 0.43067655807339306,
-        "latency_ms": 119.293,
+        "latency_ms": 90.719,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2658,7 +2658,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 120.759,
+        "latency_ms": 94.372,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2688,7 +2688,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.255,
+        "latency_ms": 3.052,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2703,7 +2703,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 101.252,
+        "latency_ms": 109.159,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2718,7 +2718,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 102.558,
+        "latency_ms": 112.238,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2748,7 +2748,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.674,
+        "latency_ms": 1.525,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2763,7 +2763,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 86.094,
+        "latency_ms": 92.048,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2778,7 +2778,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 86.813,
+        "latency_ms": 93.609,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2809,7 +2809,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.083,
+        "latency_ms": 3.571,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2824,7 +2824,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 100.312,
+        "latency_ms": 100.215,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2839,7 +2839,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 101.426,
+        "latency_ms": 103.838,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2870,7 +2870,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.718,
+        "latency_ms": 3.427,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2885,7 +2885,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 84.584,
+        "latency_ms": 98.862,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2900,7 +2900,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 85.361,
+        "latency_ms": 102.331,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2931,7 +2931,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9674679834891693,
-        "latency_ms": 0.644,
+        "latency_ms": 1.595,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2946,7 +2946,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 94.309,
+        "latency_ms": 87.569,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2961,7 +2961,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 94.983,
+        "latency_ms": 89.203,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -2992,7 +2992,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 1.0,
         "ndcg_at_k": 0.6713860725233041,
-        "latency_ms": 0.781,
+        "latency_ms": 2.229,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3007,7 +3007,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 1.0,
         "ndcg_at_k": 0.7653606369886217,
-        "latency_ms": 121.825,
+        "latency_ms": 98.642,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3022,7 +3022,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 1.0,
         "ndcg_at_k": 0.7653606369886217,
-        "latency_ms": 122.659,
+        "latency_ms": 100.92,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3053,7 +3053,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 1.0,
         "ndcg_at_k": 0.7653606369886217,
-        "latency_ms": 0.956,
+        "latency_ms": 2.795,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3068,7 +3068,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 1.0,
         "ndcg_at_k": 0.7653606369886217,
-        "latency_ms": 126.712,
+        "latency_ms": 120.55,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3083,7 +3083,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 1.0,
         "ndcg_at_k": 0.7653606369886217,
-        "latency_ms": 127.72,
+        "latency_ms": 123.39,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3113,7 +3113,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.271,
+        "latency_ms": 2.854,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3128,7 +3128,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 107.519,
+        "latency_ms": 108.621,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3143,7 +3143,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 108.819,
+        "latency_ms": 111.53,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3174,7 +3174,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9674679834891693,
-        "latency_ms": 0.883,
+        "latency_ms": 4.351,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3189,7 +3189,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9469024295259745,
-        "latency_ms": 104.6,
+        "latency_ms": 153.01,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3198,13 +3198,13 @@
           "note-4-final-correction-direct-human-edits-are-canoni.md",
           "note-7-every-edit-can-invalidate-trust-changing-an-at.md",
           "note-4-citation-integrity-add-byte-offset-quote-valid.md",
-          "note-2-scripts-ollama-refinery-py-embed-existing-atom.md",
-          "note-delete-and-rebuild-disposable-fts5-or-chroma-sea.md"
+          "note-delete-and-rebuild-disposable-fts5-or-chroma-sea.md",
+          "note-2-scripts-ollama-refinery-py-embed-existing-atom.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 105.514,
+        "latency_ms": 157.411,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3235,7 +3235,7 @@
         "recall_at_k": 0.3333333333333333,
         "mrr": 1.0,
         "ndcg_at_k": 0.46927872602275644,
-        "latency_ms": 0.827,
+        "latency_ms": 4.121,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3250,7 +3250,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 1.0,
         "ndcg_at_k": 0.6713860725233041,
-        "latency_ms": 130.247,
+        "latency_ms": 143.112,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3265,7 +3265,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 1.0,
         "ndcg_at_k": 0.7039180890341347,
-        "latency_ms": 131.144,
+        "latency_ms": 147.286,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3296,7 +3296,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.8529278650606567,
-        "latency_ms": 0.8,
+        "latency_ms": 2.286,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3311,7 +3311,7 @@
         "recall_at_k": 0.3333333333333333,
         "mrr": 1.0,
         "ndcg_at_k": 0.46927872602275644,
-        "latency_ms": 98.148,
+        "latency_ms": 118.676,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3326,7 +3326,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9674679834891693,
-        "latency_ms": 99.0,
+        "latency_ms": 121.015,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3358,7 +3358,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.855,
+        "latency_ms": 3.497,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3373,7 +3373,7 @@
         "recall_at_k": 0.75,
         "mrr": 1.0,
         "ndcg_at_k": 0.8318724637288826,
-        "latency_ms": 106.816,
+        "latency_ms": 124.512,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3383,12 +3383,12 @@
           "note-5-external-input-remains-externally-sourced-web.md",
           "note-no-scout-mcp-content-leaves-quarantine-without-a.md",
           "note-network-allow-deny-policy-mcp-connection-to-a-no.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-current-runtime-follow-up-2026-10-27-native-chro.md"
         ],
         "recall_at_k": 0.75,
         "mrr": 1.0,
         "ndcg_at_k": 0.8318724637288826,
-        "latency_ms": 107.723,
+        "latency_ms": 128.039,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3419,7 +3419,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9469024295259745,
-        "latency_ms": 0.646,
+        "latency_ms": 1.657,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3434,7 +3434,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 0.5,
         "ndcg_at_k": 0.5307212739772434,
-        "latency_ms": 97.339,
+        "latency_ms": 127.24,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3449,7 +3449,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.8854598815714874,
-        "latency_ms": 98.025,
+        "latency_ms": 128.938,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3480,7 +3480,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9674679834891693,
-        "latency_ms": 0.817,
+        "latency_ms": 3.232,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3495,7 +3495,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.8854598815714874,
-        "latency_ms": 112.315,
+        "latency_ms": 119.481,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3510,7 +3510,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9060254355346823,
-        "latency_ms": 113.165,
+        "latency_ms": 122.743,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3541,7 +3541,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 0.3333333333333333,
         "ndcg_at_k": 0.41618115554873086,
-        "latency_ms": 1.046,
+        "latency_ms": 2.65,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3556,7 +3556,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 108.762,
+        "latency_ms": 103.267,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3571,7 +3571,7 @@
         "recall_at_k": 0.3333333333333333,
         "mrr": 0.25,
         "ndcg_at_k": 0.20210734650054757,
-        "latency_ms": 109.861,
+        "latency_ms": 105.961,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3599,7 +3599,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.912,
+        "latency_ms": 1.577,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3614,7 +3614,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 96.093,
+        "latency_ms": 117.829,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3629,7 +3629,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 97.106,
+        "latency_ms": 119.446,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3658,7 +3658,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.622,
+        "latency_ms": 4.806,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3673,7 +3673,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 84.153,
+        "latency_ms": 113.064,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3688,7 +3688,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 85.829,
+        "latency_ms": 117.934,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3718,7 +3718,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.461,
+        "latency_ms": 3.675,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3733,7 +3733,7 @@
         "recall_at_k": 0.5,
         "mrr": 1.0,
         "ndcg_at_k": 0.6131471927654584,
-        "latency_ms": 95.717,
+        "latency_ms": 93.135,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3748,7 +3748,7 @@
         "recall_at_k": 0.5,
         "mrr": 1.0,
         "ndcg_at_k": 0.6131471927654584,
-        "latency_ms": 97.247,
+        "latency_ms": 96.84,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3779,7 +3779,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 0.633,
+        "latency_ms": 2.209,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3794,7 +3794,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 95.473,
+        "latency_ms": 91.633,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3809,7 +3809,7 @@
         "recall_at_k": 0.0,
         "mrr": 0.0,
         "ndcg_at_k": 0.0,
-        "latency_ms": 96.152,
+        "latency_ms": 93.917,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3840,7 +3840,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.629,
+        "latency_ms": 3.954,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3855,7 +3855,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9469024295259745,
-        "latency_ms": 102.343,
+        "latency_ms": 94.039,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3870,7 +3870,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 0.9674679834891693,
-        "latency_ms": 104.003,
+        "latency_ms": 98.051,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3901,7 +3901,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 1.0,
         "ndcg_at_k": 0.7039180890341347,
-        "latency_ms": 0.767,
+        "latency_ms": 2.866,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3916,7 +3916,7 @@
         "recall_at_k": 0.3333333333333333,
         "mrr": 0.5,
         "ndcg_at_k": 0.2960819109658652,
-        "latency_ms": 100.417,
+        "latency_ms": 131.462,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3931,7 +3931,7 @@
         "recall_at_k": 0.6666666666666666,
         "mrr": 0.5,
         "ndcg_at_k": 0.49818925746641285,
-        "latency_ms": 101.229,
+        "latency_ms": 134.377,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3961,7 +3961,7 @@
         "recall_at_k": 0.5,
         "mrr": 1.0,
         "ndcg_at_k": 0.6131471927654584,
-        "latency_ms": 0.994,
+        "latency_ms": 2.981,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3976,7 +3976,7 @@
         "recall_at_k": 0.5,
         "mrr": 1.0,
         "ndcg_at_k": 0.6131471927654584,
-        "latency_ms": 117.508,
+        "latency_ms": 119.452,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -3986,12 +3986,12 @@
           "owner-product-target.md",
           "note-7-safe-automation-quarantine-scout-mcp-input-sco.md",
           "note-no-scout-mcp-content-leaves-quarantine-without-a.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-public-dns-results-the-owner-approved-structured.md"
         ],
-        "recall_at_k": 1.0,
+        "recall_at_k": 0.5,
         "mrr": 1.0,
-        "ndcg_at_k": 0.8503449055347546,
-        "latency_ms": 118.547,
+        "ndcg_at_k": 0.6131471927654584,
+        "latency_ms": 122.476,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4020,7 +4020,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.842,
+        "latency_ms": 2.301,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4030,12 +4030,12 @@
           "note-claude-found-the-central-contradiction-the-proje.md",
           "note-public-dns-results-the-owner-approved-structured.md",
           "note-real-time-llm-extraction-3d-graph-first-workflow.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-the-current-14-atom-cosine-generation-after-inst.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 97.463,
+        "latency_ms": 90.791,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4044,13 +4044,13 @@
           "note-graph-features-are-narrow-initially-lifecycle-pr.md",
           "note-real-time-llm-extraction-3d-graph-first-workflow.md",
           "note-2-immutable-evidence-create-non-destructive-mani.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
-          "note-explicitly-absent-until-a-future-capability-prof.md"
+          "note-explicitly-absent-until-a-future-capability-prof.md",
+          "code-reviews-as-mentorship.md"
         ],
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 98.336,
+        "latency_ms": 93.148,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4080,7 +4080,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 0.787,
+        "latency_ms": 3.54,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4095,7 +4095,7 @@
         "recall_at_k": 0.5,
         "mrr": 0.3333333333333333,
         "ndcg_at_k": 0.3065735963827292,
-        "latency_ms": 94.405,
+        "latency_ms": 112.425,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4110,7 +4110,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 95.248,
+        "latency_ms": 116.014,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4140,7 +4140,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 1.08,
+        "latency_ms": 2.103,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4155,7 +4155,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 131.863,
+        "latency_ms": 99.464,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4170,7 +4170,7 @@
         "recall_at_k": 1.0,
         "mrr": 1.0,
         "ndcg_at_k": 1.0,
-        "latency_ms": 133.0,
+        "latency_ms": 101.617,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4193,7 +4193,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.697,
+        "latency_ms": 0.619,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4208,7 +4208,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 104.651,
+        "latency_ms": 82.535,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4223,7 +4223,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 105.377,
+        "latency_ms": 83.188,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4248,7 +4248,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 1.071,
+        "latency_ms": 0.838,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4263,7 +4263,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 127.974,
+        "latency_ms": 93.589,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4278,7 +4278,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 129.078,
+        "latency_ms": 94.463,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4303,7 +4303,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.573,
+        "latency_ms": 1.314,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4318,7 +4318,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 97.041,
+        "latency_ms": 111.39,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4333,7 +4333,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 97.638,
+        "latency_ms": 112.743,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4359,7 +4359,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.723,
+        "latency_ms": 1.783,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4368,13 +4368,13 @@
           "note-the-current-14-atom-cosine-generation-after-inst.md",
           "owner-product-target.md",
           "note-2-scripts-ollama-refinery-py-embed-existing-atom.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
-          "note-claude-found-the-central-contradiction-the-proje.md"
+          "note-claude-found-the-central-contradiction-the-proje.md",
+          "note-current-runtime-follow-up-2026-10-27-native-chro.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 107.473,
+        "latency_ms": 98.301,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4389,7 +4389,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 108.22,
+        "latency_ms": 100.123,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4416,7 +4416,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.88,
+        "latency_ms": 3.791,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4431,7 +4431,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 102.45,
+        "latency_ms": 104.27,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4446,7 +4446,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 103.383,
+        "latency_ms": 108.112,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4473,7 +4473,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 1.077,
+        "latency_ms": 4.0,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4488,7 +4488,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 95.137,
+        "latency_ms": 94.118,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4503,7 +4503,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 96.239,
+        "latency_ms": 98.164,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4526,7 +4526,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.544,
+        "latency_ms": 1.301,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4535,13 +4535,13 @@
           "owner-product-target.md",
           "note-public-dns-results-the-owner-approved-structured.md",
           "note-the-current-14-atom-cosine-generation-after-inst.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
-          "note-3-adversarial-correction-reduce-this-to-three-st.md"
+          "note-3-adversarial-correction-reduce-this-to-three-st.md",
+          "note-current-runtime-follow-up-2026-10-27-native-chro.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 97.25,
+        "latency_ms": 95.998,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4551,12 +4551,12 @@
           "owner-product-target.md",
           "note-public-dns-results-the-owner-approved-structured.md",
           "note-the-current-14-atom-cosine-generation-after-inst.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-3-adversarial-correction-reduce-this-to-three-st.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 97.841,
+        "latency_ms": 97.32,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4581,7 +4581,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.624,
+        "latency_ms": 1.448,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4596,7 +4596,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 93.854,
+        "latency_ms": 95.412,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4611,7 +4611,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 94.514,
+        "latency_ms": 96.888,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4638,7 +4638,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.731,
+        "latency_ms": 3.746,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4653,22 +4653,22 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 90.219,
+        "latency_ms": 98.769,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
       "rrf_hybrid": {
         "ranked": [
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
           "sodium-ion-battery-cost-record.md",
           "note-the-exact-review-prompts-are-stored-under-tasks.md",
           "structured-logging.md",
-          "note-public-dns-results-the-owner-approved-structured.md"
+          "note-public-dns-results-the-owner-approved-structured.md",
+          "note-the-system-must-remain-useful-when-no-generation.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 91.024,
+        "latency_ms": 102.571,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4695,7 +4695,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.91,
+        "latency_ms": 2.287,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4710,7 +4710,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 93.441,
+        "latency_ms": 92.199,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4725,7 +4725,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 94.406,
+        "latency_ms": 94.538,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4752,7 +4752,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 1.08,
+        "latency_ms": 2.322,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4767,7 +4767,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 96.082,
+        "latency_ms": 101.961,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4776,13 +4776,13 @@
           "owner-product-target.md",
           "ollama-refinery-entrypoint.md",
           "cognitive-core-single-file-mode.md",
-          "controlled-refinery-change-validation.md",
-          "cognitive-core-validation-operational-stats.md"
+          "note-claude-found-the-central-contradiction-the-proje.md",
+          "controlled-refinery-change-validation.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 97.238,
+        "latency_ms": 104.327,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4809,7 +4809,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.627,
+        "latency_ms": 1.743,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4824,7 +4824,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 98.229,
+        "latency_ms": 100.24,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4839,7 +4839,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 98.896,
+        "latency_ms": 102.02,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4866,7 +4866,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.963,
+        "latency_ms": 3.677,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4881,7 +4881,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 123.348,
+        "latency_ms": 137.107,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4891,12 +4891,12 @@
           "note-public-dns-results-the-owner-approved-structured.md",
           "owner-product-target.md",
           "note-the-exact-review-prompts-are-stored-under-tasks.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-status-proposed-requires-owner-approval-before-i.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 124.367,
+        "latency_ms": 140.836,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4923,7 +4923,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.916,
+        "latency_ms": 3.691,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4938,22 +4938,22 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 119.166,
+        "latency_ms": 114.442,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
       "rrf_hybrid": {
         "ranked": [
           "owner-product-target.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
           "note-the-exact-review-prompts-are-stored-under-tasks.md",
           "note-a-claim-that-the-system-has-perfect-memory-or-th.md",
-          "structured-logging.md"
+          "structured-logging.md",
+          "note-public-dns-results-the-owner-approved-structured.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 120.114,
+        "latency_ms": 118.186,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -4980,37 +4980,37 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 1.411,
+        "latency_ms": 2.403,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
       "dense": {
         "ranked": [
           "note-the-current-14-atom-cosine-generation-after-inst.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
           "note-current-runtime-follow-up-2026-10-27-native-chro.md",
           "note-the-exact-review-prompts-are-stored-under-tasks.md",
-          "note-public-dns-results-the-owner-approved-structured.md"
+          "note-public-dns-results-the-owner-approved-structured.md",
+          "note-claude-found-the-central-contradiction-the-proje.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 113.213,
+        "latency_ms": 113.899,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
       "rrf_hybrid": {
         "ranked": [
           "note-the-exact-review-prompts-are-stored-under-tasks.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
           "owner-product-target.md",
           "note-the-current-corpus-is-small-13-atoms-23-raw-capt.md",
-          "note-network-allow-deny-policy-mcp-connection-to-a-no.md"
+          "note-network-allow-deny-policy-mcp-connection-to-a-no.md",
+          "note-keep-a-data-structure-its-internal-linkings-acce.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 114.679,
+        "latency_ms": 116.345,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5037,7 +5037,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 1.038,
+        "latency_ms": 2.202,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5046,13 +5046,13 @@
           "owner-product-target.md",
           "continuous-integration-deployment.md",
           "note-the-current-14-atom-cosine-generation-after-inst.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
-          "note-2-scripts-ollama-refinery-py-embed-existing-atom.md"
+          "note-2-scripts-ollama-refinery-py-embed-existing-atom.md",
+          "note-network-allow-deny-policy-mcp-connection-to-a-no.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 106.172,
+        "latency_ms": 103.989,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5067,7 +5067,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 107.247,
+        "latency_ms": 106.228,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5093,7 +5093,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.722,
+        "latency_ms": 1.582,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5103,12 +5103,12 @@
           "note-current-runtime-follow-up-2026-10-27-native-chro.md",
           "note-2-scripts-ollama-refinery-py-embed-existing-atom.md",
           "owner-product-target.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-claude-found-the-central-contradiction-the-proje.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 159.902,
+        "latency_ms": 106.55,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5123,7 +5123,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 160.661,
+        "latency_ms": 108.169,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5150,7 +5150,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 1.178,
+        "latency_ms": 2.882,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5165,7 +5165,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 163.36,
+        "latency_ms": 101.667,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5180,7 +5180,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 164.59,
+        "latency_ms": 104.597,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5207,7 +5207,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.941,
+        "latency_ms": 1.821,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5216,13 +5216,13 @@
           "note-current-runtime-follow-up-2026-10-27-native-chro.md",
           "owner-product-target.md",
           "note-the-current-14-atom-cosine-generation-after-inst.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
-          "note-public-dns-results-the-owner-approved-structured.md"
+          "note-public-dns-results-the-owner-approved-structured.md",
+          "note-network-allow-deny-policy-mcp-connection-to-a-no.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 94.061,
+        "latency_ms": 94.167,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5237,7 +5237,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 95.046,
+        "latency_ms": 96.011,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5258,7 +5258,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.456,
+        "latency_ms": 2.751,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5268,12 +5268,12 @@
           "note-public-dns-results-the-owner-approved-structured.md",
           "note-current-runtime-follow-up-2026-10-27-native-chro.md",
           "owner-product-target.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-claude-found-the-central-contradiction-the-proje.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 87.053,
+        "latency_ms": 94.986,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5283,12 +5283,12 @@
           "note-public-dns-results-the-owner-approved-structured.md",
           "note-current-runtime-follow-up-2026-10-27-native-chro.md",
           "owner-product-target.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-claude-found-the-central-contradiction-the-proje.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 87.545,
+        "latency_ms": 97.769,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5311,7 +5311,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 1.348,
+        "latency_ms": 0.817,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5319,14 +5319,14 @@
         "ranked": [
           "note-the-current-14-atom-cosine-generation-after-inst.md",
           "note-current-runtime-follow-up-2026-10-27-native-chro.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
           "note-public-dns-results-the-owner-approved-structured.md",
-          "owner-product-target.md"
+          "owner-product-target.md",
+          "note-2-scripts-ollama-refinery-py-embed-existing-atom.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 129.663,
+        "latency_ms": 115.713,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5335,13 +5335,13 @@
           "note-lexical-fts5-is-first-it-is-cheap-and-model-free.md",
           "note-the-current-14-atom-cosine-generation-after-inst.md",
           "note-current-runtime-follow-up-2026-10-27-native-chro.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md",
-          "note-public-dns-results-the-owner-approved-structured.md"
+          "note-public-dns-results-the-owner-approved-structured.md",
+          "owner-product-target.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 131.046,
+        "latency_ms": 116.566,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5362,7 +5362,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.814,
+        "latency_ms": 0.898,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5372,12 +5372,12 @@
           "owner-product-target.md",
           "note-the-current-corpus-is-small-13-atoms-23-raw-capt.md",
           "note-each-slice-must-leave-the-system-functional-and.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-3-model-free-lexical-retrieval-add-fts5-behind-t.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 114.998,
+        "latency_ms": 129.426,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5387,12 +5387,12 @@
           "owner-product-target.md",
           "note-the-current-corpus-is-small-13-atoms-23-raw-capt.md",
           "note-each-slice-must-leave-the-system-functional-and.md",
-          "note-microsoft-visual-c-v14-x64-runtime-scout-pins-co.md"
+          "note-3-model-free-lexical-retrieval-add-fts5-behind-t.md"
         ],
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 115.849,
+        "latency_ms": 130.364,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5419,7 +5419,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 0.729,
+        "latency_ms": 1.811,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5434,7 +5434,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 91.481,
+        "latency_ms": 123.715,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5449,7 +5449,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 92.248,
+        "latency_ms": 125.573,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5472,7 +5472,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 1.013,
+        "latency_ms": 1.191,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5487,7 +5487,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 104.994,
+        "latency_ms": 115.765,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5502,7 +5502,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 106.044,
+        "latency_ms": 116.992,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5526,7 +5526,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 1.17,
+        "latency_ms": 1.41,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5541,7 +5541,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 117.213,
+        "latency_ms": 118.974,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },
@@ -5556,7 +5556,7 @@
         "recall_at_k": null,
         "mrr": null,
         "ndcg_at_k": null,
-        "latency_ms": 118.424,
+        "latency_ms": 120.419,
         "expected_atom_recall_at_k": null,
         "trusted_expected_atom_recall": null
       },

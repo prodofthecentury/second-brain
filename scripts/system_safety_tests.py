@@ -56,6 +56,24 @@ class EvaluationDatasetTests(unittest.TestCase):
             validated = validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
         self.assertEqual(validated["dataset_version"], "1.0.0")
 
+    def test_agent_drafted_dataset_stays_pending_and_cannot_claim_owner_approval(self):
+        from evaluation_dataset import EvaluationDatasetError, validate_dataset
+
+        with tempfile.TemporaryDirectory() as directory:
+            atoms_dir = Path(directory)
+            dataset = self._dataset(atoms_dir)
+            dataset["status"] = "pending_owner_review"
+            dataset["draft_provenance"] = {"drafted_by": "agent", "date": "2026-11-22", "scope": "draft labels"}
+            # An agent draft may not also carry a (fabricated) owner_approval block.
+            with self.assertRaises(EvaluationDatasetError):
+                validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+            dataset.pop("owner_approval")
+            validated = validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+            self.assertEqual(validated["status"], "pending_owner_review")
+            dataset.pop("draft_provenance")
+            with self.assertRaises(EvaluationDatasetError):
+                validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=lambda _path: True)
+
     def test_dataset_rejects_an_atom_revision_hash_that_does_not_match_current_file(self):
         from evaluation_dataset import EvaluationDatasetError, validate_dataset
 

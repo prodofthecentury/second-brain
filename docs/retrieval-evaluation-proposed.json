@@ -2,13 +2,13 @@
   "schema_version": 2,
   "dataset_id": "second-brain-retrieval-curated-90",
   "dataset_version": "3.0.0",
-  "status": "owner_approved",
-  "owner_approval": {
-    "actor": "camer",
+  "status": "pending_owner_review",
+  "draft_provenance": {
+    "drafted_by": "agent (Antigravity coding session)",
     "date": "2026-11-22",
-    "scope": "Expanded 90-case human-curated evaluation suite across the 78-atom vault: 25 Standard Factual Positives (bound to post-linking SHA-256 revisions), 15 Owner Preference Queries, 25 Multi-Atom & Pending Exploratory Queries, and 25 Adversarial/Unapproved/Cross-Project/Secret Trap Queries partitioned across regression (30), development (30), and holdout (30) splits."
+    "scope": "Agent-drafted expansion of the owner-approved 30-case set (v2.1.0) to 90 cases over the 78-atom vault: 25 factual positives bound to current SHA-256 revisions of already owner-approved atoms, 15 preference, 25 exploratory, and 25 trap queries split 30/30/30. Labels, expected claims, and trap rationales are provisional until the owner reviews them; the original 30 cases were owner-approved on 2026-11-08."
   },
-  "purpose": "Human-curated retrieval, provenance, scope-containment, and grounded answerability benchmark across software architecture, modular design, observability, resilience, hardware tiering, epistemic governance, and adversarial traps.",
+  "purpose": "Agent-drafted (pending owner review) retrieval, provenance, scope-containment, and grounded answerability benchmark across software architecture, modular design, observability, resilience, hardware tiering, epistemic governance, and adversarial traps.",
   "queries": [
     {
       "id": "pos_logging_traceability_01",
