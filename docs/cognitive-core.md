@@ -2,13 +2,14 @@
 
 ## Status
 
-**Implemented (Phases 2 & 3A).** This note originally specified the Cognitive
-Core architecture layer on top of Second Brain. All six Cognitive Core
+**Implemented (Phases 2, 3A & Stage 4 Executable Skills).** This note originally specified the Cognitive
+Core architecture layer on top of Second Brain. All Cognitive Core
 milestones—including Layers 4–5 (fitness-aware ranking, owner-gated Skill
-Playbooks in `brain/5-playbooks/`, and the grounded Executive Planner in
-`scripts/executive_planner.py`)—are now implemented, security-audited, and
-verified. See `docs/phase2-architecture-and-sweep-2026-11-15.md` and
-`docs/phase3a-and-phase4-architecture-2026-11-15.md` for current architecture
+Playbooks in `brain/5-playbooks/`, Stage 4 Sandboxed Executable Skills in
+`brain/6-skills/` via `scripts/executable_skills.py`, and the grounded Executive
+Planner in `scripts/executive_planner.py`)—are now implemented, security-audited,
+and verified. See `docs/phase2-architecture-and-sweep-2026-11-15.md` and
+`docs/phase3a-and-phase4-architecture-2026-11-15.md` for architecture
 details and security invariants.
 
 ## Purpose
@@ -145,9 +146,13 @@ Procedural memories should mature through explicit stages:
 Procedural Memory -> Verified Procedure -> Skill Candidate -> Executable Skill
 ```
 
-Promotion should depend on repeated successful use, low correction rate, clear
-inputs, clear outputs, and human-readable recovery steps. Executable skills are
-not part of the current slice.
+Promotion depends on repeated successful use, low correction rate, clear
+inputs, clear outputs, and human-readable recovery steps. Stage 4 Executable
+Skills (`brain/6-skills/`, `scripts/executable_skills.py`, `second-brain skills`,
+`/v1/skills/*`) promote active verified Playbooks via owner CAS into a
+closed-catalog network-jailed sandbox runtime with 25ms live kill-switch
+polling (`skill-kill-switch.json`), automatic workspace snapshot rollback on
+failure, and a hash-chained audit trail (`brain/0-raw/archive/skill-executions.jsonl`).
 
 ## Guardrails (Still In Force)
 
@@ -166,3 +171,4 @@ not part of the current slice.
 4. Experience and reflection records — **Complete** (`brain/4-experiences/`, `POST /v1/cognitive/experiences`).
 5. Procedure verification and skill-candidate tracking — **Complete** (owner-gated Skill Playbooks in `brain/5-playbooks/`, `scripts/skill_playbooks.py`, `second-brain playbooks`, `GET /v1/playbooks`).
 6. Executive planner using mature skills and memory, not raw notes — **Complete** (`scripts/executive_planner.py`, `second-brain plan`, `POST /v1/plan`).
+7. Stage 4 Executable Skills & Sandboxed Runtime — **Complete** (`brain/6-skills/`, `scripts/executable_skills.py`, `second-brain skills`, `/v1/skills/*`, verified by `scripts/stage4_executable_skills_tests.py`).

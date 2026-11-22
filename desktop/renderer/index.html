@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; img-src 'self' data:; media-src 'self' data: blob:; object-src 'none'; base-uri 'none'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
   <title>Second Brain</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
@@ -281,6 +281,47 @@
           <div class="status-banner" id="mediaUploadResult">Choose a media file, record a voice memo, or paste a clipboard image (Ctrl+V).</div>
         </div>
 
+        <!-- LOCAL CREATIVE MEDIA STUDIO (OFFLINE IMAGE & VIDEO GENERATION) -->
+        <div class="card" id="creativeStudioCard">
+          <div class="toolbar">
+            <strong>2c. Local Creative Media Studio — Offline Image &amp; Video Generation (sources/generated/)</strong>
+            <span class="badge" id="creativeHardwareBadge">checking tier...</span>
+            <button class="btn sm" id="creativeRefreshBtn" type="button" style="margin-left:auto;">Refresh Gallery</button>
+          </div>
+          <div class="note-item-meta">100% offline image (.png / .webp) and video (.mp4 / .gif) synthesis gated by hardware capability profile and outbound DLP secret/policy controls. Optional vault grounding attaches [verified: &lt;atom&gt;] provenance without fabricating canonical approvals.</div>
+          <div class="toolbar" style="margin-top:6px;">
+            <input type="text" id="creativePromptInput" placeholder="Describe the diagram, concept card, architectural blueprint, or animated storyboard to generate locally..." style="flex:1; min-width:220px;" />
+            <input type="text" id="creativeTitleInput" placeholder="Optional title..." style="width:170px;" />
+          </div>
+          <div class="toolbar" style="margin-top:6px;">
+            <span class="field-label">Style:</span>
+            <select id="creativeStyleSelect" aria-label="Creative Media Style">
+              <option value="concept_card">concept_card</option>
+              <option value="blueprint">blueprint</option>
+              <option value="knowledge_poster">knowledge_poster</option>
+              <option value="geometric_art">geometric_art</option>
+              <option value="storyboard">storyboard</option>
+            </select>
+            <span class="field-label">Backend:</span>
+            <select id="creativeBackendSelect" aria-label="Creative Media Backend">
+              <option value="auto">auto (Local GPU or Procedural)</option>
+              <option value="builtin_procedural_local">builtin_procedural_local (Offline CPU/GPU)</option>
+              <option value="sd_webui_local">sd_webui_local (127.0.0.1:7860)</option>
+              <option value="comfyui_local">comfyui_local (127.0.0.1:8188)</option>
+              <option value="diffusers_local">diffusers_local (Offline Cache)</option>
+            </select>
+            <input type="text" id="creativeScopeInput" placeholder="project_scope (optional)" style="width:155px;" />
+            <label class="inline-check"><input type="checkbox" id="creativeGroundVaultCheck" checked /> Ground in Verified Vault</label>
+            <label class="inline-check"><input type="checkbox" id="creativeAttachNoteCheck" /> Attach Working Note</label>
+            <button class="btn primary sm" id="creativeGenImageBtn" type="button">Generate Image (.png)</button>
+            <button class="btn good sm" id="creativeGenVideoBtn" type="button">Generate Video (.mp4)</button>
+            <button class="btn sm" id="creativeGenGifBtn" type="button">Generate Animated (.gif)</button>
+          </div>
+          <div class="status-banner" id="creativeStudioOutput">Enter a prompt above to generate an offline image or video.</div>
+          <div id="creativePreviewWrap" class="sub-panel" style="display:none; margin-top:6px;"></div>
+          <div id="creativeGalleryWrap" class="cards-grid" style="margin-top:6px;"></div>
+        </div>
+
         <!-- WEB SCOUT QUEUE & TRIGGER -->
         <div class="card">
           <div class="toolbar">
@@ -469,6 +510,23 @@
             </div>
             <div class="status-banner" id="inboxDropOutput">Configure E2EE Sync above, then pair a mobile PWA or iOS Shortcut.</div>
             <div id="inboxDropPairingsWrap"></div>
+          </div>
+          <div class="sub-panel" id="systemMobileVaultPanel" style="margin-top:10px;">
+            <div class="toolbar">
+              <strong>Full On-Device Mobile Vault Client (iOS / Android Offline E2EE App)</strong>
+              <button class="btn sm" id="mobileVaultRefreshBtn" type="button" style="margin-left:auto;">Refresh Clients</button>
+              <button class="btn sm good" id="mobileVaultExportBtn" type="button">Export iOS/Android App Bundle (.zip)</button>
+            </div>
+            <div class="note-item-meta">Full offline mobile vault client (mobile/vault-client/ Capacitor iOS/Android + Offline PWA) supporting local E2EE sync pull (SBSY1 + Ed25519 + scrypt), .sbvault import, encrypted IndexedDB device storage, byte-offset verified search, Merkle proofs, and offline grounded chat.</div>
+            <div class="toolbar" style="margin-top:6px;">
+              <input type="text" id="mobileVaultLabelInput" value="iOS / Android Vault App" placeholder="Device label (e.g. iPhone 16 Pro)" style="width:200px;" />
+              <input type="text" id="mobileVaultBaseUrlInput" value="https://localhost/vault-client/" placeholder="App base URL" style="flex:1; min-width:190px;" />
+              <label class="inline-check"><input type="checkbox" id="mobileVaultIncludeKeyCheck" /> Include Recovery Key in #vaultpair</label>
+              <label class="inline-check"><input type="checkbox" id="mobileVaultIncludeDropCheck" checked /> Bundle SBID1 Drop Token</label>
+              <button class="btn sm primary" id="mobileVaultPairBtn" type="button">Pair Mobile Vault App</button>
+            </div>
+            <div class="status-banner" id="mobileVaultOutput">Pair an iOS / Android mobile vault client or export the standalone offline app bundle.</div>
+            <div id="mobileVaultPairingsWrap"></div>
           </div>
         </div>
 
@@ -731,6 +789,49 @@
             <label class="inline-check"><input type="checkbox" id="pbAllowMultiProjCheck" /> Multi-Project</label>
             <button class="btn good" id="promotePlaybookBtn" type="button">Promote Playbook</button>
           </div>
+        </div>
+
+        <!-- STAGE 4 EXECUTABLE SKILLS (SANDBOXED RUNTIME, KILL-SWITCH & AUDIT TRAIL) -->
+        <div class="card" id="executableSkillsCard" style="margin-top:12px;">
+          <div class="toolbar">
+            <strong>Stage 4 Executable Skills — Sandboxed Runtime, Kill-Switch &amp; Hash-Chained Audit Trail (6-skills/)</strong>
+            <span class="badge" id="skillKillSwitchBadge">checking...</span>
+            <button class="btn sm danger" id="skillEngageGlobalKillBtn" type="button" style="margin-left:auto;">Engage Global Kill-Switch</button>
+            <button class="btn sm good" id="skillReleaseGlobalKillBtn" type="button">Release Kill-Switch</button>
+            <button class="btn sm" id="refreshSkillsBtn" type="button">Refresh Skills</button>
+          </div>
+          <div class="note-item-meta">Promotes verified active Skill Playbooks into cryptographically pinned Executable Skills executed inside an isolated, network-jailed sandbox with live 25ms kill-switch polling, automatic rollback on failure, and a hash-chained audit trail (skill-executions.jsonl).</div>
+          <div class="form-grid" style="margin-top:8px;">
+            <div class="field-col">
+              <span class="field-label">Executable Skill ID (slug) *</span>
+              <input type="text" id="skillIdInput" placeholder="e.g. run-lexical-audit-skill" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Backing Active Playbook *</span>
+              <select id="skillPlaybookSelect" aria-label="Backing Active Playbook"></select>
+            </div>
+            <div class="field-col">
+              <span class="field-label">Timeout Seconds (1-120)</span>
+              <input type="text" id="skillTimeoutInput" value="15" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Promotion Rationale *</span>
+              <input type="text" id="skillRationaleInput" placeholder="Owner verification rationale..." />
+            </div>
+          </div>
+          <div class="field-col" style="margin-top:6px;">
+            <span class="field-label">Sandboxed Step Actions JSON * (1:1 with Playbook steps: vault_recall | vault_audit | workspace_write | workspace_assert | sandbox_python)</span>
+            <textarea id="skillActionsJsonInput" rows="3" placeholder='[{"action_type":"vault_audit","audit_kind":"sources","output_file":"audit.json"}]'></textarea>
+          </div>
+          <div class="toolbar" style="margin-top:6px;">
+            <input type="text" id="skillActorInput" value="desktop_owner" placeholder="Human owner actor" style="width:150px;" />
+            <label class="inline-check"><input type="checkbox" id="skillAllowEarlyCheck" checked /> Early Owner Override</label>
+            <button class="btn sm" id="skillPrefillAuditActionsBtn" type="button">Pre-fill Safe Audit Step Actions</button>
+            <button class="btn good sm" id="promoteExecutableSkillBtn" type="button" style="margin-left:auto;">Promote to Executable Skill</button>
+          </div>
+          <div class="status-banner" id="executableSkillsOutput">Select an active Playbook above to promote or execute a Stage 4 Executable Skill in the sandbox.</div>
+          <div class="cards-grid" id="executableSkillsGrid" style="margin-top:8px;"></div>
+          <div id="skillExecutionsWrap" class="sub-panel" style="margin-top:8px;">No sandboxed skill executions recorded yet.</div>
         </div>
       </section>
 

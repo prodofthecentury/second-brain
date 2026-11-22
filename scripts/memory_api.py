@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from typing import Annotated
-from urllib.parse import parse_qs, quote as url_quote, urlparse
+from urllib.parse import parse_qs, quote, quote as url_quote, urlparse
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator

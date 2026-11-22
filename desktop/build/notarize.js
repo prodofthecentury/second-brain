@@ -105,7 +105,7 @@ exports.default = async function notarizeApp(context) {
         "--apple-id",
         appleId,
         "--password",
-        applePassword,
+        "@env:APPLE_APP_SPECIFIC_PASSWORD",
         "--team-id",
         appleTeamId
       );

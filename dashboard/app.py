@@ -213,6 +213,30 @@ from scripts.web_clipper import (
     list_clipper_pairings as clipper_list_pairings,
     revoke_clipper_pairing as clipper_revoke_pairing,
 )
+from scripts.executable_skills import (
+    execute_promoted_skill,
+    get_skill_kill_switch_status,
+    inspect_executable_skill_candidates,
+    list_executable_skills,
+    list_skill_executions,
+    promote_playbook_to_executable_skill,
+    revoke_executable_skill,
+    set_skill_kill_switch,
+    verify_skill_execution_audit_chain,
+)
+from scripts.mobile_vault_client import (
+    create_mobile_vault_pairing,
+    export_mobile_vault_client_bundle,
+    list_mobile_vault_pairings,
+    revoke_mobile_vault_pairing,
+)
+from scripts.creative_media import (
+    generate_local_image,
+    generate_local_video,
+    get_creative_media_status,
+    get_generated_media_file,
+    list_generated_media,
+)
 
 # Resolve active vault directories dynamically so env overrides (BRAIN_VAULT_DIR) or persisted vault paths stay isolated per run.
 _env_vault_override = (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
@@ -4509,6 +4533,150 @@ elif nav_selection == "⚙️ System Control":
                         )
                     except Exception as exc:
                         st.error(f"Backup restore failed: {exc}")
+
+    # Stage 4 Executable Skills (Sandboxed Runtime, Kill-Switch & Hash-Chained Audit Trail)
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### ⚙️ Stage 4 Executable Skills — Sandboxed Runtime, Kill-Switch & Audit Trail (`6-skills/`)")
+        st.caption(
+            "Promote verified active Skill Playbooks into cryptographically pinned Executable Skills that run inside an isolated, "
+            "network-jailed sandbox with live 25ms kill-switch polling, automatic workspace rollback, and hash-chained audit logging (`skill-executions.jsonl`)."
+        )
+        try:
+            ks_st = get_skill_kill_switch_status(brain_dir=BRAIN_DIR)
+            sk_list = list_executable_skills(
+                brain_dir=BRAIN_DIR,
+                atoms_dir=ATOMS_DIR,
+                playbooks_dir=PLAYBOOKS_DIR,
+                telemetry_db_path=TELEMETRY_DB_PATH,
+                active_only=False,
+            )
+            ex_chain = verify_skill_execution_audit_chain(brain_dir=BRAIN_DIR)
+            st.caption(
+                f"Kill-Switch: **{'ENGAGED (ALL SKILLS HALTED)' if ks_st.get('global_engaged') else 'ARMED (READY)'}** · "
+                f"Registered Executable Skills: **{len(sk_list)}** · "
+                f"Audit Chain: **{'VALID' if ex_chain.get('chain_valid') else 'INVALID'}** (`{ex_chain.get('entry_count', 0)}` executions)"
+            )
+        except Exception as sk_exc:
+            st.caption(f"Executable Skills status unavailable: {sk_exc}")
+
+        ks_c1, ks_c2 = st.columns(2)
+        with ks_c1:
+            if st.button("🛑 Engage Global Kill-Switch", key="btn_sys_skill_kill_engage"):
+                try:
+                    set_skill_kill_switch(
+                        engaged=True,
+                        scope="global",
+                        actor="dashboard_owner",
+                        reason="Engaged from Streamlit Dashboard",
+                        brain_dir=BRAIN_DIR,
+                    )
+                    st.warning("Global Executable Skill Kill-Switch ENGAGED.")
+                except Exception as exc:
+                    st.error(f"Kill-switch failed: {exc}")
+        with ks_c2:
+            if st.button("✅ Release Global Kill-Switch", key="btn_sys_skill_kill_release"):
+                try:
+                    set_skill_kill_switch(
+                        engaged=False,
+                        scope="global",
+                        actor="dashboard_owner",
+                        reason="Released from Streamlit Dashboard",
+                        brain_dir=BRAIN_DIR,
+                    )
+                    st.success("Global Executable Skill Kill-Switch released.")
+                except Exception as exc:
+                    st.error(f"Kill-switch release failed: {exc}")
+
+    # Full On-Device Mobile Vault Client (iOS / Android Offline E2EE App)
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 📱 Full On-Device Mobile Vault Client (iOS / Android Offline E2EE App)")
+        st.caption(
+            "Pair the offline-capable iOS / Android Mobile Vault Client (`mobile/vault-client/` Capacitor & Offline PWA) for "
+            "client-side E2EE vault pull (`SBSY1` + `Ed25519` + `scrypt`), `.sbvault` import, byte-offset verified search, and grounded chat."
+        )
+        mv_c1, mv_c2 = st.columns(2)
+        with mv_c1:
+            mv_label = st.text_input("Mobile Device Label", value="iOS / Android Vault App", key="sys_mv_label")
+            mv_inc_key = st.checkbox("Include Recovery Key in `#vaultpair=` URI", value=False, key="sys_mv_inc_key")
+            if st.button("📲 Pair Mobile Vault Client", key="btn_sys_mv_pair"):
+                try:
+                    mres = create_mobile_vault_pairing(
+                        brain_dir=BRAIN_DIR,
+                        label=mv_label.strip() or "Mobile Vault App",
+                        include_recovery_key=mv_inc_key,
+                    )
+                    st.success(f"Paired Mobile Vault Client `{mres['pairing_id']}`.")
+                    st.code(str(mres.get("pairing_url") or mres.get("pairing_fragment") or ""), language="text")
+                except Exception as exc:
+                    st.error(f"Mobile pairing failed: {exc}")
+        with mv_c2:
+            if st.button("📦 Export Standalone iOS/Android App Bundle (`.zip`)", key="btn_sys_mv_export"):
+                try:
+                    eres = export_mobile_vault_client_bundle(os.path.join(PROJECT_ROOT, "dist"))
+                    st.success(f"Exported `{eres['zip_path']}` (`{eres['size_bytes']}` bytes, SHA-256 `{eres['sha256'][:16]}…`).")
+                except Exception as exc:
+                    st.error(f"Bundle export failed: {exc}")
+
+    # Local Creative Media Generation Studio (Offline Image & Video)
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🎨 Local Creative Media Generation Studio — Offline Image & Video (`sources/generated/`)")
+        st.caption(
+            "100% offline image (`.png` / `.webp`) and video (`.mp4` / `.gif`) synthesis gated by hardware capability profile and outbound DLP secret controls."
+        )
+        cm_prompt = st.text_input(
+            "Creative Media Prompt",
+            placeholder="Describe the diagram, concept card, architectural blueprint, or animated storyboard...",
+            key="sys_cm_prompt",
+        )
+        cm1, cm2, cm3 = st.columns(3)
+        with cm1:
+            cm_style = st.selectbox(
+                "Visual Style",
+                ["concept_card", "blueprint", "knowledge_poster", "geometric_art", "storyboard"],
+                key="sys_cm_style",
+            )
+        with cm2:
+            cm_backend = st.selectbox(
+                "Local Adapter Backend",
+                ["auto", "builtin_procedural_local", "sd_webui_local", "comfyui_local", "diffusers_local"],
+                key="sys_cm_backend",
+            )
+        with cm3:
+            cm_ground = st.checkbox("Ground in Verified Vault Claims", value=True, key="sys_cm_ground")
+        cmb1, cmb2 = st.columns(2)
+        with cmb1:
+            if st.button("🖼️ Generate Offline Image (`.png`)", key="btn_sys_cm_img"):
+                try:
+                    img_art = generate_local_image(
+                        cm_prompt.strip(),
+                        brain_dir=BRAIN_DIR,
+                        backend=cm_backend,
+                        style=cm_style,
+                        output_format="png",
+                        ground_in_vault=cm_ground,
+                    )
+                    st.success(f"Generated `{img_art.filename}` via `{img_art.backend_used}` (`{img_art.width}x{img_art.height}`).")
+                    st.image(img_art.file_path, caption=img_art.filename)
+                except Exception as exc:
+                    st.error(f"Offline image generation failed: {exc}")
+        with cmb2:
+            if st.button("🎬 Generate Offline Video (`.mp4`)", key="btn_sys_cm_vid"):
+                try:
+                    vid_art = generate_local_video(
+                        cm_prompt.strip(),
+                        brain_dir=BRAIN_DIR,
+                        backend=cm_backend if cm_backend != "sd_webui_local" else "auto",
+                        style=cm_style,
+                        output_format="mp4",
+                        ground_in_vault=cm_ground,
+                    )
+                    st.success(f"Generated `{vid_art.filename}` via `{vid_art.backend_used}` (`{vid_art.frames}` frames @ `{vid_art.fps}` fps).")
+                    st.video(vid_art.file_path)
+                except Exception as exc:
+                    st.error(f"Offline video generation failed: {exc}")
 
     # Briefing log
     st.divider()

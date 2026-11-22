@@ -27,14 +27,16 @@ second_brain/
 │   ├── 3-threads/          generated, non-overwriting synthesis files
 │   ├── 4-experiences/      create-only task experience episodes (Cognitive Core)
 │   ├── 5-playbooks/        owner-gated CAS Skill Playbooks and .history/ revisions
+│   ├── 6-skills/           owner-promoted Stage 4 Sandboxed Executable Skills and .history/ revisions
 │   ├── notes/              zero-friction working notes (separate from verified atoms)
-│   ├── sources/            external source pages and captured evidence
+│   ├── sources/            external source pages, captured evidence, and generated/ local creative media
 │   ├── .sidecar/           strictly disposable rebuildable FTS5/notes/telemetry SQLite DBs & runtime locks
 │   └── .chroma/            optional rebuildable dense index
-├── scripts/                ingestion, review, retrieval, planning, product API, and health tools
+├── scripts/                ingestion, review, retrieval, planning, executable skills, creative media, product API, and health tools
 ├── dashboard/              local Streamlit application
 ├── desktop/                Electron desktop companion (tray, capture & local API UI)
-├── extensions/             VS Code / Cursor / Windsurf editor extension
+├── extensions/             VS Code / Cursor / Windsurf editor extension & Browser Web Clipper MV3
+├── mobile/                 Full On-Device Mobile Vault Client (vault-client/ iOS/Android Capacitor + Offline PWA) & Inbox Drop PWA (inbox-drop/)
 ├── plugins/                Antigravity and Claude Code MCP/skill plugin bundles
 └── docs/                   architecture notes and operator runbooks/templates (docs/runbooks/)
 ```
@@ -126,7 +128,15 @@ uv run --locked second-brain audit
 uv run --locked second-brain inbox list
 uv run --locked second-brain cognitive fitness
 uv run --locked second-brain playbooks list
+uv run --locked second-brain skills candidates
+uv run --locked second-brain skills list
 uv run --locked second-brain plan --goal "<task goal>"
+uv run --locked second-brain mobile status
+uv run --locked second-brain mobile export-app --out-dir dist
+uv run --locked second-brain media status
+uv run --locked second-brain media image "<prompt>" --style blueprint
+uv run --locked second-brain media video "<prompt>" --format mp4
+uv run --locked second-brain release check-credentials
 
 # Cryptographic Merkle ledger, Contradiction Radar, Time-Travel snapshots, E2EE Sync & benchmarks
 uv run --locked second-brain ledger verify

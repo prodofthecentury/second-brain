@@ -1713,6 +1713,183 @@
     };
   }
 
+  function latestSkillDecisions(filesMap) {
+    const rawBytes = getFileBytes(filesMap, "0-raw/archive/skill-decisions.jsonl");
+    if (!rawBytes) {
+      return { ok: true, map: {}, globalKillEngaged: false, killedSkills: {} };
+    }
+    let text;
+    try {
+      text = utf8DecodeStrict(rawBytes);
+    } catch (_err) {
+      return { ok: false, map: {}, globalKillEngaged: false, killedSkills: {} };
+    }
+    const map = {};
+    let globalKillEngaged = false;
+    const killedSkills = {};
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+      const s = lines[i].trim();
+      if (!s) continue;
+      let rec;
+      try {
+        rec = JSON.parse(s);
+      } catch (_err) {
+        return { ok: false, map: {}, globalKillEngaged: false, killedSkills: {} };
+      }
+      if (!rec || typeof rec !== "object" || Array.isArray(rec)) {
+        return { ok: false, map: {}, globalKillEngaged: false, killedSkills: {} };
+      }
+      const act = String(rec.action || "");
+      if (act === "engage_kill_switch") {
+        const sc = String(rec.scope || "").toLowerCase();
+        if (sc === "global") globalKillEngaged = true;
+        else if (sc) killedSkills[sc] = true;
+      } else if (act === "release_kill_switch") {
+        const sc = String(rec.scope || "").toLowerCase();
+        if (sc === "global") globalKillEngaged = false;
+        else if (sc) delete killedSkills[sc];
+      } else if (
+        typeof rec.filename === "string" &&
+        (act === "promote_executable_skill" ||
+          act === "revoke_executable_skill" ||
+          act === "auto_rollback_executable_skill")
+      ) {
+        map[rec.filename] = rec;
+      }
+    }
+    return { ok: true, map: map, globalKillEngaged: globalKillEngaged, killedSkills: killedSkills };
+  }
+
+  const REQUIRED_SKILL_SECTIONS = [
+    "Backing Playbook & Governance",
+    "Input Schema",
+    "Ordered Sandboxed Steps",
+    "Expected Outputs & Verification",
+    "Failure Modes & Rollback",
+  ];
+
+  function verifyExecutableSkillIntegrityOffline(filename, filesMap, sharedCaches) {
+    const fname = String(filename || "").split("/").pop();
+    const fallbackId = fname.replace(/\.md$/i, "");
+    if (!isContentMarkdownFilename(fname)) {
+      return { valid: false, status: "invalid", reason: "unsafe_skill_filename", filename: fname };
+    }
+    const rawBytes = getFileBytes(filesMap, "6-skills/" + fname);
+    if (!rawBytes) {
+      return { valid: false, status: "invalid", reason: "missing_skill_file", filename: fname };
+    }
+    let rawText;
+    try {
+      rawText = utf8DecodeStrict(rawBytes);
+    } catch (_err) {
+      return { valid: false, status: "invalid", reason: "unreadable_skill_file", filename: fname };
+    }
+    const sha = sha256HexSync(rawBytes);
+    const parsed = splitFrontmatter(rawText);
+    if (!parsed) {
+      return { valid: false, status: "invalid", reason: "missing_frontmatter", filename: fname, sha256: sha };
+    }
+    const fmMap = parseFrontmatterValues(parsed.frontmatter);
+    if (String(fmMap.type || "").trim() !== "executable_skill") {
+      return { valid: false, status: "invalid", reason: "invalid_document_type", filename: fname, sha256: sha };
+    }
+    const skId = String(fmMap.skill_id || fallbackId).trim();
+    const status = String(fmMap.skill_status || "invalid").trim();
+    const pbId = String(fmMap.playbook_id || "").trim();
+    const pbSha = String(fmMap.playbook_sha256 || "").trim().toLowerCase();
+    const stepsShaExpected = String(fmMap.step_actions_sha256 || "").trim().toLowerCase();
+    const body = parsed.body.join("\n");
+
+    for (let s = 0; s < REQUIRED_SKILL_SECTIONS.length; s += 1) {
+      if (!rawSectionBlock(body, REQUIRED_SKILL_SECTIONS[s]).trim()) {
+        return {
+          valid: false,
+          status: status,
+          reason: "missing_required_section:" + REQUIRED_SKILL_SECTIONS[s],
+          skill_id: skId,
+          filename: fname,
+          sha256: sha,
+        };
+      }
+    }
+    if (skId !== fallbackId) {
+      return { valid: false, status: "invalid", reason: "skill_id_filename_mismatch", skill_id: fallbackId, filename: fname, sha256: sha };
+    }
+    const skDec = (sharedCaches && sharedCaches.skDecisions) || latestSkillDecisions(filesMap);
+    if (!skDec.ok) {
+      return { valid: false, status: "invalid", reason: "skill_decision_log_unreadable", skill_id: skId, filename: fname, sha256: sha };
+    }
+    if (skDec.globalKillEngaged || skDec.killedSkills[skId.toLowerCase()]) {
+      return { valid: false, status: "killed", reason: "kill_switch_engaged", skill_id: skId, filename: fname, sha256: sha };
+    }
+    if (status !== "active") {
+      return { valid: false, status: status, reason: "skill_not_active:" + status, skill_id: skId, filename: fname, sha256: sha };
+    }
+    const latestDec = skDec.map[fname];
+    if (!latestDec || latestDec.action !== "promote_executable_skill" || String(latestDec.new_sha256 || "") !== sha) {
+      return { valid: false, status: "invalid", reason: "skill_revision_not_owner_promoted", skill_id: skId, filename: fname, sha256: sha };
+    }
+
+    let atomHashes = fmMap.backing_atom_sha256s;
+    if (typeof atomHashes === "string" && atomHashes.trim().startsWith("{")) {
+      try {
+        atomHashes = JSON.parse(atomHashes);
+      } catch (_err) {
+        atomHashes = null;
+      }
+    }
+    const backingList = parseScalarList(fmMap.backing_atoms);
+    if (!pbId || !/^[0-9a-f]{64}$/.test(pbSha) || backingList.length === 0 || !atomHashes || typeof atomHashes !== "object") {
+      return { valid: false, status: "invalid", reason: "missing_playbook_or_atom_anchors", skill_id: skId, filename: fname, sha256: sha };
+    }
+
+    const pbRep = verifyPlaybookIntegrityOffline(pbId + ".md", filesMap, sharedCaches);
+    if (!pbRep.valid || pbRep.status !== "active") {
+      return { valid: false, status: "stale", reason: "backing_playbook_invalid", skill_id: skId, filename: fname, sha256: sha };
+    }
+    if (pbRep.sha256 !== pbSha) {
+      return { valid: false, status: "stale", reason: "stale_backing_playbook_sha256", skill_id: skId, filename: fname, sha256: sha };
+    }
+
+    for (let i = 0; i < backingList.length; i += 1) {
+      const atomName = String(backingList[i]);
+      const atomBytes = getFileBytes(filesMap, "2-atoms/" + atomName);
+      if (!atomBytes || sha256HexSync(atomBytes) !== String(atomHashes[atomName] || "")) {
+        return { valid: false, status: "stale", reason: "stale_backing_atom_sha256:" + atomName, skill_id: skId, filename: fname, sha256: sha };
+      }
+    }
+
+    const stepsSec = rawSectionBlock(body, "Ordered Sandboxed Steps");
+    const fencedMatch = /```json\s*([\s\S]*?)```/i.exec(stepsSec);
+    if (!fencedMatch) {
+      return { valid: false, status: "invalid", reason: "missing_step_actions_json_block", skill_id: skId, filename: fname, sha256: sha };
+    }
+    let parsedSteps;
+    try {
+      parsedSteps = JSON.parse(fencedMatch[1]);
+    } catch (_err) {
+      return { valid: false, status: "invalid", reason: "invalid_step_actions_json", skill_id: skId, filename: fname, sha256: sha };
+    }
+    if (!Array.isArray(parsedSteps) || parsedSteps.length !== pbRep.steps.length) {
+      return { valid: false, status: "invalid", reason: "step_count_mismatch", skill_id: skId, filename: fname, sha256: sha };
+    }
+    const computedStepsSha = sha256HexSync(utf8Bytes(canonicalJson(parsedSteps)));
+    if (!/^[0-9a-f]{64}$/.test(stepsShaExpected) || computedStepsSha !== stepsShaExpected) {
+      return { valid: false, status: "invalid", reason: "step_actions_sha256_mismatch", skill_id: skId, filename: fname, sha256: sha };
+    }
+
+    return {
+      valid: true,
+      skill_id: skId,
+      filename: fname,
+      status: "active",
+      sha256: sha,
+      playbook_id: pbId,
+      playbook_sha256: pbSha,
+    };
+  }
+
   function leafDigest(relPath, fileSha256) {
     return sha256HexSync(utf8Bytes("leaf:" + relPath + ":" + fileSha256));
   }
@@ -1749,6 +1926,7 @@
   function computeVaultMerkleOffline(filesMap) {
     const decisionRes = parseLatestDecisionRecords(filesMap);
     const pbDecisions = latestPlaybookDecisions(filesMap);
+    const skDecisions = latestSkillDecisions(filesMap);
     const allPaths = listFilePaths(filesMap);
     const leaves = [];
 
@@ -1784,6 +1962,24 @@
             file_sha256: fhash,
             leaf_sha256: leafDigest(rel, fhash),
           });
+        } else if (rel.startsWith("6-skills/")) {
+          const fname = rel.slice("6-skills/".length);
+          if (!isContentMarkdownFilename(fname)) continue;
+          const skRep = verifyExecutableSkillIntegrityOffline(fname, filesMap, {
+            decisionMap: decisionRes.map,
+            pbDecisions: pbDecisions,
+            skDecisions: skDecisions,
+          });
+          if (!skRep.valid || skRep.status !== "active") continue;
+          const rawBytes = getFileBytes(filesMap, rel);
+          const fhash = sha256HexSync(rawBytes);
+          if (skRep.sha256 !== fhash) continue;
+          leaves.push({
+            rel_path: rel,
+            kind: "skill",
+            file_sha256: fhash,
+            leaf_sha256: leafDigest(rel, fhash),
+          });
         }
       }
     }
@@ -1797,6 +1993,7 @@
       leaf_count: leaves.length,
       approved_atoms: leaves.filter(function (l) { return l.kind === "atom"; }).length,
       accepted_playbooks: leaves.filter(function (l) { return l.kind === "playbook"; }).length,
+      active_skills: leaves.filter(function (l) { return l.kind === "skill"; }).length,
       leaves: leaves,
       levels: levels,
     };
@@ -1885,6 +2082,7 @@
       leaf_count: merkle.leaf_count,
       approved_atoms: merkle.approved_atoms,
       accepted_playbooks: merkle.accepted_playbooks,
+      active_skills: merkle.active_skills,
       synced_with_head: syncedWithHead,
       matches_latest_checkpoint: syncedWithHead,
     };
@@ -1899,6 +2097,8 @@
     }
     if (rawTarget.startsWith("playbook:")) {
       rawTarget = "5-playbooks/" + rawTarget.slice("playbook:".length);
+    } else if (rawTarget.startsWith("skill:")) {
+      rawTarget = "6-skills/" + rawTarget.slice("skill:".length);
     }
     if (
       rawTarget.indexOf("\x00") !== -1 ||
@@ -1924,26 +2124,39 @@
 
     let targetRel = null;
     if (parts.length === 2 && parts[0] === "2-atoms") {
-      if (cleanKind === "playbook") throw new Error("Leaf prefix conflicts with kind='playbook'.");
+      if (cleanKind === "playbook" || cleanKind === "skill") {
+        throw new Error("Leaf prefix conflicts with kind='" + cleanKind + "'.");
+      }
       targetRel = "2-atoms/" + normalizeMd(parts[1]);
     } else if (parts.length === 2 && (parts[0] === "5-playbooks" || parts[0] === "playbooks")) {
-      if (cleanKind === "atom") throw new Error("Leaf prefix conflicts with kind='atom'.");
+      if (cleanKind === "atom" || cleanKind === "skill") {
+        throw new Error("Leaf prefix conflicts with kind='" + cleanKind + "'.");
+      }
       targetRel = "5-playbooks/" + normalizeMd(parts[1]);
+    } else if (parts.length === 2 && (parts[0] === "6-skills" || parts[0] === "skills")) {
+      if (cleanKind === "atom" || cleanKind === "playbook") {
+        throw new Error("Leaf prefix conflicts with kind='" + cleanKind + "'.");
+      }
+      targetRel = "6-skills/" + normalizeMd(parts[1]);
     } else if (parts.length === 1) {
       const mdName = normalizeMd(parts[0]);
       if (cleanKind === "atom") {
         targetRel = "2-atoms/" + mdName;
       } else if (cleanKind === "playbook") {
         targetRel = "5-playbooks/" + mdName;
+      } else if (cleanKind === "skill") {
+        targetRel = "6-skills/" + mdName;
       } else {
         const atomRel = "2-atoms/" + mdName;
         const pbRel = "5-playbooks/" + mdName;
-        const hasAtom = merkle.leaves.some(function (l) { return l.rel_path === atomRel; });
-        const hasPb = merkle.leaves.some(function (l) { return l.rel_path === pbRel; });
-        if (hasAtom && hasPb) {
+        const skRel = "6-skills/" + mdName;
+        const matched = [atomRel, pbRel, skRel].filter(function (cand) {
+          return merkle.leaves.some(function (l) { return l.rel_path === cand; });
+        });
+        if (matched.length > 1) {
           throw new Error("Ambiguous leaf target '" + target + "'; specify kind.");
         }
-        targetRel = hasPb ? pbRel : atomRel;
+        targetRel = matched.length === 1 ? matched[0] : atomRel;
       }
     } else {
       throw new Error("Unsupported leaf directory prefix in " + JSON.stringify(target));
@@ -2708,6 +2921,7 @@
     searchVerifiedVault: searchVerifiedVault,
     searchWorkingNotes: searchWorkingNotes,
     verifyPlaybookIntegrityOffline: verifyPlaybookIntegrityOffline,
+    verifyExecutableSkillIntegrityOffline: verifyExecutableSkillIntegrityOffline,
     computeVaultMerkleOffline: computeVaultMerkleOffline,
     verifyVaultLedgerOffline: verifyVaultLedgerOffline,
     proveLeafOffline: proveLeafOffline,

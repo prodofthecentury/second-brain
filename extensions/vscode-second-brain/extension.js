@@ -4435,6 +4435,311 @@ function activate(context) {
       } catch (err) {
         vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
       }
+    }),
+
+    // ── Stage 4 Executable Skills (Promote / Execute in Sandbox / Kill-Switch / Audit) ──
+    vscode.commands.registerCommand(
+      "secondBrain.manageExecutableSkills",
+      async (arg) => {
+        try {
+          const opts = arg && typeof arg === "object" ? arg : {};
+          const action =
+            opts.action ||
+            (
+              await vscode.window.showQuickPick(
+                [
+                  { label: "list", description: "List Stage 4 Executable Skills & Kill-Switch Status" },
+                  { label: "promote", description: "Promote Verified Playbook to Executable Skill" },
+                  { label: "execute", description: "Execute Promoted Skill in Isolated Sandbox" },
+                  { label: "dry_run", description: "Dry-Run Skill Verification without Subprocess" },
+                  { label: "kill_switch", description: "Engage or Release Global / Per-Skill Kill-Switch" },
+                  { label: "audit", description: "Verify Hash-Chained Execution Audit Trail" },
+                ],
+                { placeHolder: "Select Stage 4 Executable Skill action" }
+              )
+            )?.label;
+          if (!action) return;
+
+          if (action === "list") {
+            const res = await apiRequest("GET", "/v1/skills?include_inactive=1", null, {
+              useOwnerToken: true,
+            });
+            if (!res.ok) {
+              vscode.window.showErrorMessage(`Skills query failed: ${res.data?.error || res.status}`);
+              return;
+            }
+            const ks = res.data?.kill_switch?.global_engaged ? "KILL-SWITCH ENGAGED" : "ARMED";
+            vscode.window.showInformationMessage(
+              `Executable Skills: ${res.data?.count ?? 0} (${ks})`
+            );
+            return res.data;
+          }
+
+          if (action === "promote") {
+            const skillId =
+              opts.skill_id ||
+              (await vscode.window.showInputBox({ prompt: "Executable Skill ID (slug)" }));
+            if (!skillId) return;
+            const playbookId =
+              opts.playbook_id ||
+              (await vscode.window.showInputBox({ prompt: "Backing Active Playbook ID" }));
+            if (!playbookId) return;
+            const expectedSha =
+              opts.expected_playbook_sha256 ||
+              (await vscode.window.showInputBox({ prompt: "Expected Playbook SHA-256" }));
+            if (!expectedSha) return;
+            const stepActions = opts.step_actions || [
+              { action_type: "vault_audit", audit_kind: "sources", output_file: "audit.json" },
+            ];
+            const res = await apiRequest(
+              "POST",
+              "/v1/skills/promote",
+              {
+                skill_id: skillId.trim(),
+                playbook_id: playbookId.trim(),
+                expected_playbook_sha256: expectedSha.trim(),
+                step_actions: stepActions,
+                actor: opts.actor || "vscode_owner",
+                rationale: opts.rationale || "Promoted from VS Code",
+                allow_early_owner_override:
+                  opts.allow_early_owner_override !== undefined
+                    ? Boolean(opts.allow_early_owner_override)
+                    : true,
+              },
+              { useOwnerToken: true }
+            );
+            if (!res.ok) {
+              vscode.window.showErrorMessage(`Skill promotion failed: ${res.data?.error || res.status}`);
+              return;
+            }
+            vscode.window.showInformationMessage(`Promoted Executable Skill: ${res.data?.skill_id}`);
+            return res.data;
+          }
+
+          if (action === "execute" || action === "dry_run") {
+            const skillId =
+              opts.skill_id ||
+              (await vscode.window.showInputBox({ prompt: "Executable Skill ID to run" }));
+            if (!skillId) return;
+            const res = await apiRequest(
+              "POST",
+              `/v1/skills/${encodeURIComponent(skillId.trim())}/execute`,
+              {
+                actor: opts.actor || "vscode_owner",
+                dry_run: action === "dry_run" || Boolean(opts.dry_run),
+                inputs: opts.inputs || {},
+              },
+              { useOwnerToken: true }
+            );
+            if (!res.ok) {
+              vscode.window.showErrorMessage(`Skill execution failed: ${res.data?.error || res.status}`);
+              return;
+            }
+            vscode.window.showInformationMessage(
+              `Skill ${skillId}: ${res.data?.status} (audit ${String(res.data?.execution_sha256 || "").slice(0, 12)})`
+            );
+            return res.data;
+          }
+
+          if (action === "kill_switch") {
+            const engaged =
+              opts.engaged !== undefined
+                ? Boolean(opts.engaged)
+                : (
+                    await vscode.window.showQuickPick(["engage", "release"], {
+                      placeHolder: "Engage or release Executable Skill Kill-Switch?",
+                    })
+                  ) === "engage";
+            const res = await apiRequest(
+              "POST",
+              "/v1/skills/kill-switch",
+              {
+                engaged,
+                scope: opts.scope || "global",
+                actor: opts.actor || "vscode_owner",
+                reason: opts.reason || "VS Code owner kill-switch toggle",
+              },
+              { useOwnerToken: true }
+            );
+            if (!res.ok) {
+              vscode.window.showErrorMessage(`Kill-switch update failed: ${res.data?.error || res.status}`);
+              return;
+            }
+            vscode.window.showInformationMessage(
+              `Skill Kill-Switch (${opts.scope || "global"}): engaged=${engaged}`
+            );
+            return res.data;
+          }
+
+          if (action === "audit") {
+            const res = await apiRequest("GET", "/v1/skills/executions?limit=25", null, {
+              useOwnerToken: true,
+            });
+            if (!res.ok) {
+              vscode.window.showErrorMessage(`Audit check failed: ${res.data?.error || res.status}`);
+              return;
+            }
+            const chain = res.data?.audit_chain || {};
+            vscode.window.showInformationMessage(
+              `Skill Audit Chain: ${chain.chain_valid ? "VALID" : "INVALID"} (${chain.entry_count ?? 0} entries)`
+            );
+            return res.data;
+          }
+        } catch (err) {
+          vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+        }
+      }
+    ),
+
+    // ── Full On-Device Mobile Vault Client (iOS / Android) ──
+    vscode.commands.registerCommand("secondBrain.mobileVaultClient", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        const action =
+          opts.action ||
+          (
+            await vscode.window.showQuickPick(
+              [
+                { label: "pair", description: "Pair iOS / Android Mobile Vault Client (#vaultpair=)" },
+                { label: "export", description: "Export Standalone Offline Mobile Vault App Bundle (.zip)" },
+                { label: "status", description: "List Paired Mobile Vault Clients" },
+              ],
+              { placeHolder: "Select Mobile Vault Client action" }
+            )
+          )?.label;
+        if (!action) return;
+
+        if (action === "pair") {
+          const label =
+            opts.label ||
+            (await vscode.window.showInputBox({
+              prompt: "Mobile device label",
+              value: "iOS / Android Vault App",
+            }));
+          if (!label) return;
+          const res = await apiRequest(
+            "POST",
+            "/v1/mobile/pair",
+            {
+              label: label.trim(),
+              include_recovery_key: Boolean(opts.include_recovery_key),
+              include_inbox_drop_pairing:
+                opts.include_inbox_drop_pairing !== undefined
+                  ? Boolean(opts.include_inbox_drop_pairing)
+                  : true,
+            },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Mobile pairing failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          vscode.window.showInformationMessage(`Paired Mobile Vault Client: ${res.data?.pairing_id}`);
+          return res.data;
+        }
+
+        if (action === "export") {
+          const res = await apiRequest(
+            "POST",
+            "/v1/mobile/export",
+            { out_dir: opts.out_dir || "" },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Mobile bundle export failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          vscode.window.showInformationMessage(`Exported Mobile Vault Client: ${res.data?.zip_path}`);
+          return res.data;
+        }
+
+        if (action === "status") {
+          const res = await apiRequest("GET", "/v1/mobile/status", null, { useOwnerToken: true });
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Mobile status failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Paired Mobile Vault Clients: ${(res.data?.pairings || []).length}`
+          );
+          return res.data;
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    // ── Local Creative Media Studio (Offline Image & Video Generation) ──
+    vscode.commands.registerCommand("secondBrain.generateCreativeImage", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        const prompt =
+          opts.prompt ||
+          (await vscode.window.showInputBox({
+            prompt: "Offline Image Generation Prompt (local-only, DLP-gated)",
+          }));
+        if (!prompt || !prompt.trim()) return;
+        const res = await apiRequest(
+          "POST",
+          "/v1/media/image",
+          {
+            prompt: prompt.trim(),
+            style: opts.style || "concept_card",
+            backend: opts.backend || "auto",
+            output_format: opts.output_format || "png",
+            ground_in_vault: Boolean(opts.ground_in_vault),
+            project_scope: opts.project_scope || undefined,
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(`Image generation failed: ${res.data?.error || res.status}`);
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Generated offline image: ${res.data?.filename} (${res.data?.backend_used})`
+        );
+        return res.data;
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("secondBrain.generateCreativeVideo", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        const prompt =
+          opts.prompt ||
+          (await vscode.window.showInputBox({
+            prompt: "Offline Video Generation Prompt (.mp4 / .gif, local-only, DLP-gated)",
+          }));
+        if (!prompt || !prompt.trim()) return;
+        const res = await apiRequest(
+          "POST",
+          "/v1/media/video",
+          {
+            prompt: prompt.trim(),
+            style: opts.style || "concept_card",
+            backend: opts.backend || "auto",
+            output_format: opts.output_format || "mp4",
+            frames: opts.frames || 16,
+            fps: opts.fps || 12,
+            ground_in_vault: Boolean(opts.ground_in_vault),
+            project_scope: opts.project_scope || undefined,
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(`Video generation failed: ${res.data?.error || res.status}`);
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Generated offline video: ${res.data?.filename} (${res.data?.backend_used})`
+        );
+        return res.data;
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
     })
   );
 }

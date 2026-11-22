@@ -116,6 +116,8 @@
     "0-raw/archive/mcp-audit.jsonl",
     "0-raw/archive/atom-feedback.jsonl",
     "0-raw/archive/playbook-decisions.jsonl",
+    "0-raw/archive/skill-decisions.jsonl",
+    "0-raw/archive/skill-executions.jsonl",
   ]);
 
   class SyncError extends Error {
@@ -1735,11 +1737,12 @@
       throw new SyncSecurityError("Malformed JSON in remote head.json.");
     }
 
+    const defaultPinMode = Object.keys(trustedPeers).length > 0 ? "strict" : "tofu";
     const headVerified = await verifyRemoteSyncHead(head, masterKey, {
       vaultId: vaultId,
       trustedPeers: trustedPeers,
       lastEpoch: lastEpoch,
-      pinMode: cfg.pinMode || "tofu",
+      pinMode: cfg.pinMode || defaultPinMode,
       trustNewPeers: cfg.trustNewPeers,
       forcePureJsEd25519: cfg.forcePureJsEd25519,
     });

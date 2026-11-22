@@ -559,7 +559,10 @@ function switchView(name) {
   });
   if (name === "chat") loadChatHosts();
   if (name === "review") loadReviewQueue();
-  if (name === "import") loadScoutQueue();
+  if (name === "import") {
+    loadScoutQueue();
+    loadCreativeMediaStudio();
+  }
   if (name === "ide") {
     loadIdeStatus();
     loadGitHookStatus();
@@ -567,8 +570,12 @@ function switchView(name) {
   if (name === "system") {
     loadSystemView();
     loadDaemonStatus();
+    loadMobileVaultClient();
   }
-  if (name === "planner") loadPlannerView();
+  if (name === "planner") {
+    loadPlannerView();
+    loadExecutableSkills();
+  }
   if (name === "proof") loadProofView();
   if (name === "graph") loadGraphView();
   if (name === "vault") loadVaultBrowser({ append: false });
@@ -7101,6 +7108,7 @@ document
     }
   });
 
+
 // Watchdog Daemon & One-Shot Index/Vector Sync
 async function loadDaemonStatus() {
   const kpis = document.getElementById("daemonStatusKpis");
@@ -7162,6 +7170,7 @@ document
       showToast(msg, "danger");
     }
   });
+
 
 // Portable Three-Store Vault Backup & Restore (.sbvault)
 document
@@ -7231,6 +7240,7 @@ document
     }
   });
 
+
 document
   .getElementById("backupVerifyBtn")
   .addEventListener("click", async () => {
@@ -7262,6 +7272,7 @@ document
       showToast(msg, "danger");
     }
   });
+
 
 document
   .getElementById("backupRestoreBtn")
@@ -7298,6 +7309,416 @@ document
       showToast(msg, "danger");
     }
   });
+
+// ─── Stage 4 Executable Skills, Mobile Vault Client & Creative Media Studio ─
+
+async function loadCreativeMediaStudio() {
+  const badge = document.getElementById("creativeHardwareBadge");
+  const galleryWrap = document.getElementById("creativeGalleryWrap");
+  if (!badge || !galleryWrap) return;
+
+  const [stRes, galRes] = await Promise.all([
+    window.secondBrain.request("GET", "/v1/media/status"),
+    window.secondBrain.request("GET", "/v1/media/gallery?limit=12"),
+  ]);
+
+  if (stRes.ok && stRes.data) {
+    const st = stRes.data;
+    badge.textContent = `${st.tier_id || "tier_0"} · max ${st.max_width || 768}x${st.max_height || 768}`;
+    badge.className = st.neural_generation_eligible ? "badge ok" : "badge";
+  }
+
+  galleryWrap.replaceChildren();
+  const items = (galRes.ok && Array.isArray(galRes.data?.items)) ? galRes.data.items : [];
+  for (const item of items) {
+    const card = el("div", "card");
+    const hdr = el("div", "toolbar");
+    hdr.appendChild(el("strong", "", item.title || item.filename || item.media_id));
+    hdr.appendChild(el("span", "badge mono", item.media_type || "media"));
+    card.appendChild(hdr);
+    card.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        `${item.backend_used || "local"} · ${item.width || "?"}x${item.height || "?"} · SHA ${shortSha(item.sha256)}`
+      )
+    );
+    const prevBtn = el("button", "btn sm", "Preview Asset");
+    prevBtn.type = "button";
+    prevBtn.addEventListener("click", () => previewCreativeAsset(item.media_id));
+    card.appendChild(prevBtn);
+    galleryWrap.appendChild(card);
+  }
+}
+
+async function previewCreativeAsset(mediaId) {
+  const wrap = document.getElementById("creativePreviewWrap");
+  if (!wrap || !mediaId) return;
+  wrap.style.display = "block";
+  wrap.replaceChildren(el("div", "note-item-meta", `Loading ${mediaId}...`));
+  const res = await window.secondBrain.request(
+    "GET",
+    `/v1/media/file/${encodeURIComponent(mediaId)}?encoding=base64`
+  );
+  if (!res.ok || !res.data?.data_uri) {
+    wrap.replaceChildren(el("div", "note-item-meta", apiErrorMessage(res, "Preview failed")));
+    return;
+  }
+  wrap.replaceChildren();
+  const d = res.data;
+  wrap.appendChild(
+    el("div", "note-item-meta", `${d.filename} (${d.mime_type}, ${d.size_bytes} bytes, SHA-256 ${shortSha(d.sha256)})`)
+  );
+  if (String(d.mime_type || "").startsWith("video/")) {
+    const vid = document.createElement("video");
+    vid.controls = true;
+    vid.autoplay = false;
+    vid.loop = true;
+    vid.src = d.data_uri;
+    vid.style.maxWidth = "100%";
+    vid.style.maxHeight = "320px";
+    vid.style.marginTop = "6px";
+    wrap.appendChild(vid);
+  } else {
+    const img = document.createElement("img");
+    img.src = d.data_uri;
+    img.alt = d.filename || d.media_id;
+    img.style.maxWidth = "100%";
+    img.style.maxHeight = "320px";
+    img.style.marginTop = "6px";
+    wrap.appendChild(img);
+  }
+}
+
+async function triggerCreativeMediaGen(kind, outputFormat) {
+  const promptEl = document.getElementById("creativePromptInput");
+  const outEl = document.getElementById("creativeStudioOutput");
+  if (!promptEl || !outEl) return;
+  const prompt = promptEl.value.trim();
+  if (!prompt) {
+    showToast("Enter a creative generation prompt first.", "warn");
+    return;
+  }
+  const payload = {
+    prompt,
+    title: (document.getElementById("creativeTitleInput")?.value || "").trim(),
+    style: document.getElementById("creativeStyleSelect")?.value || "concept_card",
+    backend: document.getElementById("creativeBackendSelect")?.value || "auto",
+    output_format: outputFormat,
+    project_scope: (document.getElementById("creativeScopeInput")?.value || "").trim() || undefined,
+    ground_in_vault: Boolean(document.getElementById("creativeGroundVaultCheck")?.checked),
+    attach_to_note: Boolean(document.getElementById("creativeAttachNoteCheck")?.checked),
+  };
+  outEl.textContent = `Synthesizing offline ${kind} (${outputFormat}) via ${payload.backend}...`;
+  const endpoint = kind === "video" ? "/v1/media/video" : "/v1/media/image";
+  const res = await window.secondBrain.request("POST", endpoint, payload);
+  if (res.ok && res.data) {
+    const d = res.data;
+    outEl.textContent = `Generated ${d.filename} (${d.backend_used}, ${d.width}x${d.height}, SHA ${shortSha(d.sha256)}, grounded=${(d.referenced_atoms || []).length} atoms).`;
+    showToast(`Generated ${d.filename}`, "ok");
+    await previewCreativeAsset(d.media_id);
+    await loadCreativeMediaStudio();
+  } else {
+    const msg = apiErrorMessage(res, "Creative media generation failed");
+    outEl.textContent = msg;
+    showToast(msg, "danger");
+  }
+}
+
+document.getElementById("creativeRefreshBtn")?.addEventListener("click", loadCreativeMediaStudio);
+document.getElementById("creativeGenImageBtn")?.addEventListener("click", () => triggerCreativeMediaGen("image", "png"));
+document.getElementById("creativeGenVideoBtn")?.addEventListener("click", () => triggerCreativeMediaGen("video", "mp4"));
+document.getElementById("creativeGenGifBtn")?.addEventListener("click", () => triggerCreativeMediaGen("video", "gif"));
+
+async function loadMobileVaultClient() {
+  const wrap = document.getElementById("mobileVaultPairingsWrap");
+  if (!wrap) return;
+  const res = await window.secondBrain.request("GET", "/v1/mobile/status");
+  if (!res.ok || !res.data) return;
+  wrap.replaceChildren();
+  const pairings = Array.isArray(res.data.pairings) ? res.data.pairings : [];
+  for (const p of pairings) {
+    const row = el("div", "toolbar");
+    row.appendChild(el("span", "badge mono", p.pairing_id || ""));
+    row.appendChild(el("strong", "", p.label || "Mobile Client"));
+    row.appendChild(el("span", "note-item-meta", `${p.status || "active"} · ${p.created_at || ""}`));
+    if (p.status === "active") {
+      const revBtn = el("button", "btn sm danger", "Revoke");
+      revBtn.type = "button";
+      revBtn.style.marginLeft = "auto";
+      revBtn.addEventListener("click", async () => {
+        const r = await window.secondBrain.request("POST", "/v1/mobile/revoke", {
+          pairing_id: p.pairing_id,
+        });
+        if (r.ok) {
+          showToast(`Revoked mobile client ${p.pairing_id}`, "ok");
+          loadMobileVaultClient();
+        } else {
+          showToast(apiErrorMessage(r, "Revoke failed"), "danger");
+        }
+      });
+      row.appendChild(revBtn);
+    }
+    wrap.appendChild(row);
+  }
+}
+
+document.getElementById("mobileVaultRefreshBtn")?.addEventListener("click", loadMobileVaultClient);
+document.getElementById("mobileVaultPairBtn")?.addEventListener("click", async () => {
+  const outEl = document.getElementById("mobileVaultOutput");
+  if (!outEl) return;
+  const payload = {
+    label: (document.getElementById("mobileVaultLabelInput")?.value || "Mobile Vault App").trim(),
+    pwa_base_url: (document.getElementById("mobileVaultBaseUrlInput")?.value || "https://localhost/vault-client/").trim(),
+    include_recovery_key: Boolean(document.getElementById("mobileVaultIncludeKeyCheck")?.checked),
+    include_inbox_drop_pairing: Boolean(document.getElementById("mobileVaultIncludeDropCheck")?.checked),
+  };
+  const res = await window.secondBrain.request("POST", "/v1/mobile/pair", payload);
+  if (res.ok && res.data) {
+    outEl.textContent = `Paired ${res.data.pairing_id}: ${res.data.pairing_url || res.data.pairing_fragment}`;
+    showToast("Mobile Vault Client paired ✓", "ok");
+    loadMobileVaultClient();
+  } else {
+    const msg = apiErrorMessage(res, "Mobile Vault Client pairing failed");
+    outEl.textContent = msg;
+    showToast(msg, "danger");
+  }
+});
+
+document.getElementById("mobileVaultExportBtn")?.addEventListener("click", async () => {
+  const outEl = document.getElementById("mobileVaultOutput");
+  if (!outEl) return;
+  outEl.textContent = "Exporting offline iOS / Android Mobile Vault Client bundle...";
+  const res = await window.secondBrain.request("POST", "/v1/mobile/export", {});
+  if (res.ok && res.data) {
+    outEl.textContent = `Exported ${res.data.zip_path} (${res.data.size_bytes} bytes, SHA-256 ${shortSha(res.data.sha256)})`;
+    showToast("Exported Mobile Vault Client bundle ✓", "ok");
+  } else {
+    const msg = apiErrorMessage(res, "Export failed");
+    outEl.textContent = msg;
+    showToast(msg, "danger");
+  }
+});
+
+async function loadExecutableSkills() {
+  const badge = document.getElementById("skillKillSwitchBadge");
+  const pbSelect = document.getElementById("skillPlaybookSelect");
+  const grid = document.getElementById("executableSkillsGrid");
+  const execWrap = document.getElementById("skillExecutionsWrap");
+  if (!badge || !grid) return;
+
+  const [skRes, candRes, exRes] = await Promise.all([
+    window.secondBrain.request("GET", "/v1/skills?include_inactive=1"),
+    window.secondBrain.request("GET", "/v1/skills/candidates"),
+    window.secondBrain.request("GET", "/v1/skills/executions?limit=10"),
+  ]);
+
+  if (skRes.ok && skRes.data) {
+    const ks = skRes.data.kill_switch || {};
+    const globalKilled = Boolean(ks.global_engaged);
+    badge.textContent = globalKilled ? "KILL-SWITCH ENGAGED" : "SANDBOX ARMED";
+    badge.className = globalKilled ? "badge danger" : "badge ok";
+  }
+
+  if (pbSelect && candRes.ok && Array.isArray(candRes.data?.candidates)) {
+    pbSelect.replaceChildren();
+    for (const c of candRes.data.candidates) {
+      const opt = el("option", "", `${c.playbook_id} (${c.title || c.playbook_id}) [${shortSha(c.playbook_sha256)}]`);
+      opt.value = c.playbook_id;
+      opt.dataset.sha256 = c.playbook_sha256 || "";
+      opt.dataset.stepsCount = String((c.steps || []).length || 1);
+      pbSelect.appendChild(opt);
+    }
+  }
+
+  grid.replaceChildren();
+  const skills = (skRes.ok && Array.isArray(skRes.data?.skills)) ? skRes.data.skills : [];
+  for (const sk of skills) {
+    const card = el("div", "card");
+    const hdr = el("div", "toolbar");
+    hdr.appendChild(el("strong", "", sk.title || sk.skill_id));
+    hdr.appendChild(el("span", `badge ${sk.valid ? "ok" : "warn"}`, sk.status || "unknown"));
+    card.appendChild(hdr);
+    card.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        `ID: ${sk.skill_id} · Playbook: ${sk.playbook_id} · Steps: ${(sk.steps || []).length} · SHA ${shortSha(sk.sha256)}`
+      )
+    );
+    const bar = el("div", "toolbar");
+    const dryBtn = el("button", "btn sm", "Dry Run");
+    dryBtn.type = "button";
+    dryBtn.addEventListener("click", () => executeSkillAction(sk.skill_id, true));
+    const runBtn = el("button", "btn sm primary", "Execute in Sandbox");
+    runBtn.type = "button";
+    runBtn.addEventListener("click", () => executeSkillAction(sk.skill_id, false));
+    bar.appendChild(dryBtn);
+    bar.appendChild(runBtn);
+    if (sk.status === "active") {
+      const revBtn = el("button", "btn sm danger", "Revoke");
+      revBtn.type = "button";
+      revBtn.addEventListener("click", async () => {
+        const actor = (document.getElementById("skillActorInput")?.value || "desktop_owner").trim();
+        const r = await window.secondBrain.request(
+          "POST",
+          `/v1/skills/${encodeURIComponent(sk.skill_id)}/revoke`,
+          {
+            expected_skill_sha256: sk.sha256,
+            actor,
+            reason: "Revoked by owner from Desktop UI",
+          }
+        );
+        if (r.ok) {
+          showToast(`Revoked skill ${sk.skill_id}`, "ok");
+          loadExecutableSkills();
+        } else {
+          showToast(apiErrorMessage(r, "Revoke failed"), "danger");
+        }
+      });
+      bar.appendChild(revBtn);
+    }
+    card.appendChild(bar);
+    grid.appendChild(card);
+  }
+
+  if (execWrap && exRes.ok && exRes.data) {
+    const chain = exRes.data.audit_chain || {};
+    const execs = Array.isArray(exRes.data.executions) ? exRes.data.executions : [];
+    execWrap.replaceChildren();
+    execWrap.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        `Audit Chain: ${chain.chain_valid ? "VALID" : "INVALID"} (${chain.entry_count ?? 0} hash-chained execution records)`
+      )
+    );
+    for (const ex of execs.slice(0, 6)) {
+      execWrap.appendChild(
+        el(
+          "div",
+          "note-item-meta",
+          `[${ex.status}] ${ex.skill_id} · actor=${ex.actor} · rollback=${Boolean(ex.rollback_executed)} · sha=${shortSha(ex.execution_sha256)}`
+        )
+      );
+    }
+  }
+}
+
+async function executeSkillAction(skillId, dryRun) {
+  const outEl = document.getElementById("executableSkillsOutput");
+  const actor = (document.getElementById("skillActorInput")?.value || "desktop_owner").trim();
+  if (outEl) {
+    outEl.textContent = `${dryRun ? "Dry-running" : "Executing"} ${skillId} inside isolated sandbox...`;
+  }
+  const res = await window.secondBrain.request(
+    "POST",
+    `/v1/skills/${encodeURIComponent(skillId)}/execute`,
+    { actor, dry_run: Boolean(dryRun), inputs: {} }
+  );
+  if (res.ok && res.data) {
+    const d = res.data;
+    if (outEl) {
+      outEl.textContent = `Execution ${d.execution_id || ""}: status=${d.status} (${d.duration_ms ?? 0} ms, audit=${shortSha(d.execution_sha256)})`;
+    }
+    showToast(`Skill ${skillId}: ${d.status}`, d.status === "completed" || d.status === "dry_run_verified" ? "ok" : "warn");
+    loadExecutableSkills();
+  } else {
+    const msg = apiErrorMessage(res, "Skill execution denied");
+    if (outEl) outEl.textContent = msg;
+    showToast(msg, "danger");
+    loadExecutableSkills();
+  }
+}
+
+document.getElementById("refreshSkillsBtn")?.addEventListener("click", loadExecutableSkills);
+document.getElementById("skillPrefillAuditActionsBtn")?.addEventListener("click", () => {
+  const pbSelect = document.getElementById("skillPlaybookSelect");
+  const opt = pbSelect?.selectedOptions?.[0];
+  const count = Math.max(1, Number(opt?.dataset?.stepsCount || 1));
+  const actions = [];
+  for (let i = 0; i < count; i += 1) {
+    actions.push({
+      action_type: "vault_audit",
+      audit_kind: "sources",
+      output_file: `step_${i + 1}_audit.json`,
+    });
+  }
+  const area = document.getElementById("skillActionsJsonInput");
+  if (area) area.value = JSON.stringify(actions, null, 2);
+});
+
+document.getElementById("promoteExecutableSkillBtn")?.addEventListener("click", async () => {
+  const outEl = document.getElementById("executableSkillsOutput");
+  const pbSelect = document.getElementById("skillPlaybookSelect");
+  const opt = pbSelect?.selectedOptions?.[0];
+  const skillId = (document.getElementById("skillIdInput")?.value || "").trim();
+  const playbookId = pbSelect?.value || "";
+  const expectedSha = opt?.dataset?.sha256 || "";
+  const rawActions = (document.getElementById("skillActionsJsonInput")?.value || "").trim();
+  if (!skillId || !playbookId || !rawActions) {
+    showToast("Provide Skill ID, Backing Playbook, and Step Actions JSON.", "warn");
+    return;
+  }
+  let parsedActions;
+  try {
+    parsedActions = JSON.parse(rawActions);
+  } catch (err) {
+    showToast(`Invalid Step Actions JSON: ${err.message}`, "danger");
+    return;
+  }
+  const res = await window.secondBrain.request("POST", "/v1/skills/promote", {
+    skill_id: skillId,
+    playbook_id: playbookId,
+    expected_playbook_sha256: expectedSha,
+    step_actions: parsedActions,
+    timeout_seconds: Number(document.getElementById("skillTimeoutInput")?.value || 15),
+    actor: (document.getElementById("skillActorInput")?.value || "desktop_owner").trim(),
+    rationale: (document.getElementById("skillRationaleInput")?.value || "Owner Desktop promotion").trim(),
+    allow_early_owner_override: Boolean(document.getElementById("skillAllowEarlyCheck")?.checked),
+  });
+  if (res.ok && res.data) {
+    if (outEl) outEl.textContent = `Promoted Executable Skill ${res.data.skill_id} (SHA ${shortSha(res.data.sha256)})`;
+    showToast(`Promoted ${res.data.skill_id} ✓`, "ok");
+    loadExecutableSkills();
+  } else {
+    const msg = apiErrorMessage(res, "Skill promotion failed");
+    if (outEl) outEl.textContent = msg;
+    showToast(msg, "danger");
+  }
+});
+
+document.getElementById("skillEngageGlobalKillBtn")?.addEventListener("click", async () => {
+  const actor = (document.getElementById("skillActorInput")?.value || "desktop_owner").trim();
+  const res = await window.secondBrain.request("POST", "/v1/skills/kill-switch", {
+    engaged: true,
+    scope: "global",
+    actor,
+    reason: "Emergency global kill-switch engaged from Desktop UI",
+  });
+  if (res.ok) {
+    showToast("Global Executable Skill Kill-Switch ENGAGED", "warn");
+    loadExecutableSkills();
+  } else {
+    showToast(apiErrorMessage(res, "Kill-switch update failed"), "danger");
+  }
+});
+
+document.getElementById("skillReleaseGlobalKillBtn")?.addEventListener("click", async () => {
+  const actor = (document.getElementById("skillActorInput")?.value || "desktop_owner").trim();
+  const res = await window.secondBrain.request("POST", "/v1/skills/kill-switch", {
+    engaged: false,
+    scope: "global",
+    actor,
+    reason: "Global kill-switch released by owner",
+  });
+  if (res.ok) {
+    showToast("Global Kill-Switch released ✓", "ok");
+    loadExecutableSkills();
+  } else {
+    showToast(apiErrorMessage(res, "Kill-switch release failed"), "danger");
+  }
+});
 
 // ─── Global Shortcuts & Init ─────────────────────────────────────────────────
 

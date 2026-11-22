@@ -2314,176 +2314,311 @@ def _append_skill_execution_record(brain_dir: str, payload_without_chain: dict[s
 
 
 _SANDBOX_SITECUSTOMIZE_SOURCE = '''"""Second Brain Stage 4 Executable Skill runtime sandbox guard (`_guard/sitecustomize.py`)."""
-import builtins as _builtins
-import io as _io
-import os as _os
-import pathlib as _pathlib
-import socket as _socket
-import sys as _sys
-
-_NET_ERR = "Network access is disabled inside Second Brain Executable Skill sandbox"
-_FS_ERR = "Filesystem writes outside SB_SANDBOX_WORKSPACE are disabled inside Second Brain sandbox"
-_CHDIR_ERR = "os.chdir outside SB_SANDBOX_WORKSPACE is disabled inside Second Brain sandbox"
-
-_WORKSPACE_RAW = _os.environ.get("SB_SANDBOX_WORKSPACE") or ""
-_WORKSPACE_REAL = _os.path.realpath(_WORKSPACE_RAW) if _WORKSPACE_RAW else ""
-_NORM_WS = _os.path.normcase(_WORKSPACE_REAL)
-
-_FORBIDDEN_MODULES = frozenset({
-    "ctypes", "_ctypes", "winreg", "pty", "webbrowser", "httpx", "requests",
-    "http", "ftplib", "smtplib", "telnetlib", "xmlrpc", "multiprocessing",
-    "subprocess", "pickle", "shelve", "asyncio",
-})
-_FORBIDDEN_EXACT_OR_PREFIX = (
-    "urllib.request",
-    "urllib.response",
-    "urllib.robotparser",
-)
 
 
-class _BlockedModuleFinder:
-    def find_spec(self, fullname, path=None, target=None):
-        root = fullname.split(".", 1)[0]
-        if root in _FORBIDDEN_MODULES or any(
-            fullname == p or fullname.startswith(p + ".") for p in _FORBIDDEN_EXACT_OR_PREFIX
-        ):
-            raise ImportError(f"Module {fullname!r} is blocked inside Second Brain Executable Skill sandbox")
-        return None
+def _install_sandbox_guard() -> None:
+    import builtins as _builtins
+    import io as _io
+    import os as _os
+    import socket as _socket
+    import sys as _sys
 
+    _NET_ERR = "Network access is disabled inside Second Brain Executable Skill sandbox"
+    _FS_ERR = "Filesystem access outside SB_SANDBOX_WORKSPACE is disabled inside Second Brain sandbox"
+    _CHDIR_ERR = "os.chdir outside SB_SANDBOX_WORKSPACE is disabled inside Second Brain sandbox"
 
-def _deny_network(*_args, **_kwargs):
-    raise PermissionError(_NET_ERR)
+    _WORKSPACE_RAW = _os.environ.get("SB_SANDBOX_WORKSPACE") or ""
+    _WORKSPACE_REAL = _os.path.realpath(_WORKSPACE_RAW) if _WORKSPACE_RAW else ""
+    _NORM_WS = _os.path.normcase(_WORKSPACE_REAL) if _WORKSPACE_REAL else ""
 
+    _INPUTS_RAW = _os.environ.get("SB_SANDBOX_INPUTS") or ""
+    _INPUTS_REAL = _os.path.realpath(_INPUTS_RAW) if _INPUTS_RAW else ""
+    _NORM_INPUTS = _os.path.normcase(_INPUTS_REAL) if _INPUTS_REAL else ""
 
-_socket.socket.connect = _deny_network
-_socket.socket.connect_ex = _deny_network
-_socket.socket.bind = _deny_network
-_socket.socket.sendto = _deny_network
-_socket.create_connection = _deny_network
-if hasattr(_socket, "create_server"):
-    _socket.create_server = _deny_network
-_socket.getaddrinfo = _deny_network
+    _GUARD_DIR_REAL = _os.path.dirname(_INPUTS_REAL) if _INPUTS_REAL else ""
+    _NORM_GUARD_DIR = _os.path.normcase(_GUARD_DIR_REAL) if _GUARD_DIR_REAL else ""
 
-_orig_open = _builtins.open
-_orig_io_open = _io.open
-_orig_os_open = _os.open
-_orig_chdir = _os.chdir
-_orig_remove = _os.remove
-_orig_unlink = _os.unlink
-_orig_mkdir = _os.mkdir
-_orig_makedirs = _os.makedirs
-_orig_rmdir = _os.rmdir
-_orig_rename = _os.rename
-_orig_replace = _os.replace
+    _STDLIB_NORM_ROOTS = []
+    for _cand in (
+        getattr(_sys, "prefix", ""),
+        getattr(_sys, "base_prefix", ""),
+        getattr(_sys, "exec_prefix", ""),
+        getattr(_sys, "base_exec_prefix", ""),
+    ):
+        if not _cand or not isinstance(_cand, str):
+            continue
+        try:
+            _rp = _os.path.realpath(_cand)
+            _np = _os.path.normcase(_rp)
+        except Exception:
+            continue
+        if not _np or _np == _NORM_GUARD_DIR:
+            continue
+        if _NORM_WS:
+            try:
+                if _os.path.normcase(_os.path.commonpath([_rp, _WORKSPACE_REAL])) == _np:
+                    continue
+            except Exception:
+                pass
+        if _np not in _STDLIB_NORM_ROOTS:
+            _STDLIB_NORM_ROOTS.append(_np)
 
+    _FORBIDDEN_MODULES = frozenset({
+        "ctypes", "_ctypes", "winreg", "pty", "webbrowser", "httpx", "requests",
+        "http", "ftplib", "smtplib", "telnetlib", "xmlrpc", "multiprocessing",
+        "subprocess", "pickle", "shelve", "asyncio", "gc", "inspect",
+    })
+    _FORBIDDEN_EXACT_OR_PREFIX = (
+        "urllib.request",
+        "urllib.response",
+        "urllib.robotparser",
+    )
 
-def _is_inside_workspace(target) -> bool:
-    if not _NORM_WS or isinstance(target, int):
+    class _BlockedModuleFinder:
+        def find_spec(self, fullname, path=None, target=None):
+            root = fullname.split(".", 1)[0]
+            if root in _FORBIDDEN_MODULES or any(
+                fullname == p or fullname.startswith(p + ".") for p in _FORBIDDEN_EXACT_OR_PREFIX
+            ):
+                raise ImportError(f"Module {fullname!r} is blocked inside Second Brain Executable Skill sandbox")
+            return None
+
+    def _deny_network(*_args, **_kwargs):
+        raise PermissionError(_NET_ERR)
+
+    _socket.socket.connect = _deny_network
+    _socket.socket.connect_ex = _deny_network
+    _socket.socket.bind = _deny_network
+    _socket.socket.sendto = _deny_network
+    _socket.create_connection = _deny_network
+    if hasattr(_socket, "create_server"):
+        _socket.create_server = _deny_network
+    _socket.getaddrinfo = _deny_network
+
+    _orig_open = _builtins.open
+    _orig_io_open = _io.open
+    _orig_fileio = _io.FileIO
+    _orig_os_open = _os.open
+    _orig_chdir = _os.chdir
+    _orig_remove = _os.remove
+    _orig_unlink = _os.unlink
+    _orig_mkdir = _os.mkdir
+    _orig_makedirs = _os.makedirs
+    _orig_rmdir = _os.rmdir
+    _orig_rename = _os.rename
+    _orig_replace = _os.replace
+    _orig_truncate = getattr(_os, "truncate", None)
+    _orig_chmod = getattr(_os, "chmod", None)
+    _orig_utime = getattr(_os, "utime", None)
+
+    def _is_inside_workspace(target) -> bool:
+        if not _NORM_WS or isinstance(target, int):
+            return False
+        try:
+            p = _os.fsdecode(target)
+        except Exception:
+            return False
+        if not p or "\\x00" in p:
+            return False
+        try:
+            abs_p = _os.path.abspath(p)
+            real_p = _os.path.realpath(abs_p)
+            return (
+                _os.path.normcase(_os.path.commonpath([_WORKSPACE_REAL, abs_p])) == _NORM_WS
+                and _os.path.normcase(_os.path.commonpath([_WORKSPACE_REAL, real_p])) == _NORM_WS
+            )
+        except Exception:
+            return False
+
+    def _is_allowed_read(target) -> bool:
+        if isinstance(target, int):
+            return False
+        if _is_inside_workspace(target):
+            return True
+        try:
+            p = _os.fsdecode(target)
+        except Exception:
+            return False
+        if not p or "\\x00" in p:
+            return False
+        if p in ("/dev/null", "/dev/urandom", "/dev/random", "NUL", "nul"):
+            return True
+        try:
+            abs_p = _os.path.abspath(p)
+            real_p = _os.path.realpath(abs_p)
+            norm_abs = _os.path.normcase(abs_p)
+            norm_real = _os.path.normcase(real_p)
+        except Exception:
+            return False
+        if _NORM_INPUTS and norm_abs == _NORM_INPUTS and norm_real == _NORM_INPUTS:
+            return True
+        for _root in _STDLIB_NORM_ROOTS:
+            try:
+                if _os.path.normcase(_os.path.commonpath([_root, norm_real])) == _root:
+                    return True
+            except Exception:
+                continue
         return False
-    try:
-        p = _os.fsdecode(target)
-    except Exception:
-        return False
-    if not p or "\\x00" in p:
-        return False
-    try:
-        abs_p = _os.path.abspath(p)
-        real_p = _os.path.realpath(abs_p)
-        return (
-            _os.path.normcase(_os.path.commonpath([_WORKSPACE_REAL, abs_p])) == _NORM_WS
-            and _os.path.normcase(_os.path.commonpath([_WORKSPACE_REAL, real_p])) == _NORM_WS
-        )
-    except Exception:
-        return False
 
+    def _guarded_open(file, mode="r", *args, **kwargs):
+        mode_str = str(mode or "r")
+        if any(flag in mode_str for flag in ("w", "a", "x", "+")):
+            if not _is_inside_workspace(file):
+                raise PermissionError(f"{_FS_ERR}: {file!r}")
+        else:
+            if not _is_allowed_read(file):
+                raise PermissionError(f"{_FS_ERR}: {file!r}")
+        return _orig_open(file, mode, *args, **kwargs)
 
-def _guarded_open(file, mode="r", *args, **kwargs):
-    mode_str = str(mode or "r")
-    if any(flag in mode_str for flag in ("w", "a", "x", "+")):
-        if not _is_inside_workspace(file):
-            raise PermissionError(f"{_FS_ERR}: {file!r}")
-    return _orig_open(file, mode, *args, **kwargs)
+    def _guarded_io_open(file, mode="r", *args, **kwargs):
+        mode_str = str(mode or "r")
+        if any(flag in mode_str for flag in ("w", "a", "x", "+")):
+            if not _is_inside_workspace(file):
+                raise PermissionError(f"{_FS_ERR}: {file!r}")
+        else:
+            if not _is_allowed_read(file):
+                raise PermissionError(f"{_FS_ERR}: {file!r}")
+        return _orig_io_open(file, mode, *args, **kwargs)
 
+    class _GuardedFileIO(_orig_fileio):
+        def __init__(self, file, mode="r", closefd=True, opener=None):
+            mode_str = str(mode or "r")
+            if opener is not None:
+                raise PermissionError(f"{_FS_ERR}: custom FileIO opener forbidden")
+            if any(flag in mode_str for flag in ("w", "a", "x", "+")):
+                if not _is_inside_workspace(file):
+                    raise PermissionError(f"{_FS_ERR}: {file!r}")
+            else:
+                if not _is_allowed_read(file):
+                    raise PermissionError(f"{_FS_ERR}: {file!r}")
+            super().__init__(file, mode, closefd=closefd, opener=opener)
 
-def _guarded_io_open(file, mode="r", *args, **kwargs):
-    mode_str = str(mode or "r")
-    if any(flag in mode_str for flag in ("w", "a", "x", "+")):
-        if not _is_inside_workspace(file):
-            raise PermissionError(f"{_FS_ERR}: {file!r}")
-    return _orig_io_open(file, mode, *args, **kwargs)
+    _WRITE_FLAGS = (
+        getattr(_os, "O_WRONLY", 1)
+        | getattr(_os, "O_RDWR", 2)
+        | getattr(_os, "O_CREAT", 0)
+        | getattr(_os, "O_TRUNC", 0)
+        | getattr(_os, "O_APPEND", 0)
+    )
 
-
-_WRITE_FLAGS = (
-    getattr(_os, "O_WRONLY", 1)
-    | getattr(_os, "O_RDWR", 2)
-    | getattr(_os, "O_CREAT", 0)
-    | getattr(_os, "O_TRUNC", 0)
-    | getattr(_os, "O_APPEND", 0)
-)
-
-
-def _guarded_os_open(path, flags, mode=0o777, *, dir_fd=None):
-    if dir_fd is not None:
-        raise PermissionError(f"{_FS_ERR}: dir_fd forbidden")
-    if flags & _WRITE_FLAGS:
-        if not _is_inside_workspace(path):
-            raise PermissionError(f"{_FS_ERR}: {path!r}")
-    return _orig_os_open(path, flags, mode)
-
-
-def _guarded_chdir(path):
-    if not _is_inside_workspace(path):
-        raise PermissionError(f"{_CHDIR_ERR}: {path!r}")
-    return _orig_chdir(path)
-
-
-def _wrap_single_path(fn):
-    def _wrapped(path, *args, **kwargs):
-        if "dir_fd" in kwargs and kwargs["dir_fd"] is not None:
+    def _guarded_os_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None:
             raise PermissionError(f"{_FS_ERR}: dir_fd forbidden")
+        if flags & _WRITE_FLAGS:
+            if not _is_inside_workspace(path):
+                raise PermissionError(f"{_FS_ERR}: {path!r}")
+        else:
+            if not _is_allowed_read(path):
+                raise PermissionError(f"{_FS_ERR}: {path!r}")
+        return _orig_os_open(path, flags, mode)
+
+    def _guarded_chdir(path):
         if not _is_inside_workspace(path):
-            raise PermissionError(f"{_FS_ERR}: {path!r}")
-        return fn(path, *args, **kwargs)
-    return _wrapped
+            raise PermissionError(f"{_CHDIR_ERR}: {path!r}")
+        return _orig_chdir(path)
+
+    def _wrap_single_path(fn):
+        def _wrapped(path, *args, **kwargs):
+            if "dir_fd" in kwargs and kwargs["dir_fd"] is not None:
+                raise PermissionError(f"{_FS_ERR}: dir_fd forbidden")
+            if not _is_inside_workspace(path):
+                raise PermissionError(f"{_FS_ERR}: {path!r}")
+            return fn(path, *args, **kwargs)
+        return _wrapped
+
+    def _wrap_two_paths(fn):
+        def _wrapped(src, dst, *args, **kwargs):
+            if "src_dir_fd" in kwargs and kwargs["src_dir_fd"] is not None:
+                raise PermissionError(f"{_FS_ERR}: dir_fd forbidden")
+            if "dst_dir_fd" in kwargs and kwargs["dst_dir_fd"] is not None:
+                raise PermissionError(f"{_FS_ERR}: dir_fd forbidden")
+            if not _is_inside_workspace(src) or not _is_inside_workspace(dst):
+                raise PermissionError(f"{_FS_ERR}: {src!r} -> {dst!r}")
+            return fn(src, dst, *args, **kwargs)
+        return _wrapped
+
+    def _deny_link(*_args, **_kwargs):
+        raise PermissionError("Creating symlinks or hardlinks is disabled inside Second Brain sandbox")
+
+    def _audit_hook(event, args):
+        if event.startswith("socket.") or event == "urllib.Request":
+            raise PermissionError(_NET_ERR)
+        if event in (
+            "subprocess.Popen", "os.system", "os.exec", "os.spawn",
+            "os.fork", "os.posix_spawn", "ctypes.dlopen", "ctypes.dlsym",
+        ):
+            raise PermissionError(f"Blocked runtime event {event!r} inside Second Brain sandbox")
+        if event in ("os.symlink", "os.link"):
+            raise PermissionError("Creating symlinks or hardlinks is disabled inside Second Brain sandbox")
+        if event == "os.chdir":
+            p = args[0] if args else None
+            if not _is_inside_workspace(p):
+                raise PermissionError(f"{_CHDIR_ERR}: {p!r}")
+        elif event in ("os.remove", "os.rmdir", "os.mkdir", "os.truncate", "os.chmod", "os.utime"):
+            p = args[0] if args else None
+            if not _is_inside_workspace(p):
+                raise PermissionError(f"{_FS_ERR}: {p!r}")
+        elif event == "os.rename":
+            src = args[0] if len(args) > 0 else None
+            dst = args[1] if len(args) > 1 else None
+            if not _is_inside_workspace(src) or not _is_inside_workspace(dst):
+                raise PermissionError(f"{_FS_ERR}: {src!r} -> {dst!r}")
+        elif event in ("os.listdir", "os.scandir"):
+            p = args[0] if args and args[0] is not None else "."
+            if not _is_allowed_read(p):
+                raise PermissionError(f"{_FS_ERR}: {p!r}")
+        elif event == "open":
+            p = args[0] if len(args) > 0 else None
+            m = str(args[1] or "") if len(args) > 1 else ""
+            fl = int(args[2] or 0) if len(args) > 2 and isinstance(args[2], int) else 0
+            is_write = any(c in m for c in ("w", "a", "x", "+")) or bool(fl & _WRITE_FLAGS)
+            if is_write:
+                if not _is_inside_workspace(p):
+                    raise PermissionError(f"{_FS_ERR}: {p!r}")
+            else:
+                if not _is_allowed_read(p):
+                    raise PermissionError(f"{_FS_ERR}: {p!r}")
+
+    _builtins.open = _guarded_open
+    _io.open = _guarded_io_open
+    _io.FileIO = _GuardedFileIO
+    if "_io" in _sys.modules:
+        setattr(_sys.modules["_io"], "open", _guarded_io_open)
+        setattr(_sys.modules["_io"], "FileIO", _GuardedFileIO)
+    _os.open = _guarded_os_open
+    _os.chdir = _guarded_chdir
+    _os.remove = _wrap_single_path(_orig_remove)
+    _os.unlink = _wrap_single_path(_orig_unlink)
+    _os.mkdir = _wrap_single_path(_orig_mkdir)
+    _os.makedirs = _wrap_single_path(_orig_makedirs)
+    _os.rmdir = _wrap_single_path(_orig_rmdir)
+    _os.rename = _wrap_two_paths(_orig_rename)
+    _os.replace = _wrap_two_paths(_orig_replace)
+    if _orig_truncate is not None:
+        _os.truncate = _wrap_single_path(_orig_truncate)
+    if _orig_chmod is not None:
+        _os.chmod = _wrap_single_path(_orig_chmod)
+    if _orig_utime is not None:
+        _os.utime = _wrap_single_path(_orig_utime)
+    _os.symlink = _deny_link
+    _os.link = _deny_link
+    if "pathlib" in _sys.modules:
+        _pl = _sys.modules["pathlib"]
+        _acc = getattr(_pl, "_normal_accessor", None)
+        if _acc is not None:
+            for _attr in ("open", "mkdir", "unlink", "rmdir", "rename", "replace", "symlink", "chmod", "utime"):
+                if hasattr(_os, _attr):
+                    setattr(_acc, _attr, getattr(_os, _attr))
+    _sys.meta_path.insert(0, _BlockedModuleFinder())
+    if hasattr(_sys, "addaudithook"):
+        _sys.addaudithook(_audit_hook)
 
 
-def _wrap_two_paths(fn):
-    def _wrapped(src, dst, *args, **kwargs):
-        if not _is_inside_workspace(src) or not _is_inside_workspace(dst):
-            raise PermissionError(f"{_FS_ERR}: {src!r} -> {dst!r}")
-        return fn(src, dst, *args, **kwargs)
-    return _wrapped
-
-
-def _deny_link(*_args, **_kwargs):
-    raise PermissionError("Creating symlinks or hardlinks is disabled inside Second Brain sandbox")
-
-
-_builtins.open = _guarded_open
-_io.open = _guarded_io_open
-_os.open = _guarded_os_open
-_os.chdir = _guarded_chdir
-_os.remove = _wrap_single_path(_orig_remove)
-_os.unlink = _wrap_single_path(_orig_unlink)
-_os.mkdir = _wrap_single_path(_orig_mkdir)
-_os.makedirs = _wrap_single_path(_orig_makedirs)
-_os.rmdir = _wrap_single_path(_orig_rmdir)
-_os.rename = _wrap_two_paths(_orig_rename)
-_os.replace = _wrap_two_paths(_orig_replace)
-_os.symlink = _deny_link
-_os.link = _deny_link
-if "pathlib" in _sys.modules:
-    _pl = _sys.modules["pathlib"]
-    _acc = getattr(_pl, "_normal_accessor", None)
-    if _acc is not None:
-        for _attr in ("open", "mkdir", "unlink", "rmdir", "rename", "replace", "symlink"):
-            if hasattr(_os, _attr):
-                setattr(_acc, _attr, getattr(_os, _attr))
-_sys.meta_path.insert(0, _BlockedModuleFinder())
+_install_sandbox_guard()
+del _install_sandbox_guard
 '''
 
 _SANDBOX_RUNNER_SOURCE = '''"""Bootstrap loader for `python -I -B`: activates `_guard/sitecustomize.py` before user script."""
-import importlib.util as _ilu
 import os as _os
 import sys as _sys
 
@@ -2496,10 +2631,15 @@ _target_script = _sys.argv[1]
 with open(_target_script, "rb") as _sfh:
     _script_bytes = _sfh.read()
 
-_spec = _ilu.spec_from_file_location("sitecustomize", _sc_path)
-_sc_mod = _ilu.module_from_spec(_spec)
-_sys.modules["sitecustomize"] = _sc_mod
-exec(compile(_sc_bytes, _sc_path, "exec"), _sc_mod.__dict__)
+_sc_code = compile(_sc_bytes, _sc_path, "exec")
+_script_code = compile(_script_bytes, _target_script, "exec")
+del _sc_bytes, _script_bytes, _fh, _sfh, _sc_path, _guard_dir
+
+_sc_ns = {"__name__": "sitecustomize", "__builtins__": __builtins__}
+exec(_sc_code, _sc_ns)
+_sc_ns.clear()
+del _sc_ns, _sc_code
+_sys.modules.pop("sitecustomize", None)
 
 _sys.argv = [_target_script]
 _main_globals = {
@@ -2509,7 +2649,8 @@ _main_globals = {
     "__package__": None,
     "__builtins__": __builtins__,
 }
-exec(compile(_script_bytes, _target_script, "exec"), _main_globals)
+del _target_script, _os, _sys
+exec(_script_code, _main_globals)
 '''
 
 

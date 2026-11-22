@@ -247,6 +247,22 @@
         "title": "Second Brain: Portable Vault Backup & Restore (.sbvault)"
       },
       {
+        "command": "secondBrain.manageExecutableSkills",
+        "title": "Second Brain: Stage 4 Executable Skills (Promote / Execute in Sandbox / Kill-Switch / Audit)"
+      },
+      {
+        "command": "secondBrain.mobileVaultClient",
+        "title": "Second Brain: Full Mobile Vault Client (Pair iOS/Android App / Export Bundle / Revoke)"
+      },
+      {
+        "command": "secondBrain.generateCreativeImage",
+        "title": "Second Brain: Generate Local Offline Image (Creative Media Studio)"
+      },
+      {
+        "command": "secondBrain.generateCreativeVideo",
+        "title": "Second Brain: Generate Local Offline Video (Creative Media Studio)"
+      },
+      {
         "command": "secondBrain.refreshVault",
         "title": "Second Brain: Refresh Vault",
         "icon": "$(refresh)"

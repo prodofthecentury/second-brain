@@ -484,7 +484,7 @@ class MobileVaultClientEndToEndTests(unittest.TestCase):
         )
 
         # 9. Active promoted Playbook backed by alpha-deploy-mtls.md
-        promote_skill_playbook(
+        pb_promoted = promote_skill_playbook(
             playbook_id="alpha-release-gate",
             title="Alpha Signed Release Gate",
             backing_atoms=[("alpha-deploy-mtls.md", alpha_approved["content_sha256_after"])],
@@ -500,6 +500,25 @@ class MobileVaultClientEndToEndTests(unittest.TestCase):
             atoms_dir=str(atoms_dir),
             playbooks_dir=str(playbooks_dir),
             telemetry_db_path=str(brain_dir / ".sidecar" / "telemetry.sqlite3"),
+        )
+
+        # 9b. Active promoted Stage 4 Executable Skill in 6-skills/ backed by alpha-release-gate
+        from executable_skills import promote_playbook_to_executable_skill
+
+        promote_playbook_to_executable_skill(
+            skill_id="alpha-release-skill",
+            playbook_id="alpha-release-gate",
+            expected_playbook_sha256=str(pb_promoted["sha256"]),
+            step_actions=[{"action_type": "vault_audit", "audit_kind": "sources", "output_file": "sources.json"}],
+            actor="cameron",
+            rationale="Core mobile audit test executable skill.",
+            allow_early_owner_override=True,
+            brain_dir=str(brain_dir),
+            atoms_dir=str(atoms_dir),
+            playbooks_dir=str(playbooks_dir),
+            skills_dir=str(brain_dir / "6-skills"),
+            telemetry_db_path=str(brain_dir / ".sidecar" / "telemetry.sqlite3"),
+            security_dir=self.tmp / "sec_skills",
         )
 
         # 10. Commit tamper-evident Merkle checkpoint in 0-raw/archive/vault-ledger.jsonl
@@ -792,8 +811,10 @@ class MobileVaultClientEndToEndTests(unittest.TestCase):
           const ledgerAudit = Epistemic.verifyVaultLedgerOffline(files);
           const atomProof = Epistemic.proveLeafOffline(files, "2-atoms/alpha-deploy-mtls.md");
           const pbProof = Epistemic.proveLeafOffline(files, "5-playbooks/alpha-release-gate.md");
+          const skProof = Epistemic.proveLeafOffline(files, "6-skills/alpha-release-skill.md");
           const atomProofValidJs = Epistemic.verifyMerkleProofOffline(atomProof);
           const pbProofValidJs = Epistemic.verifyMerkleProofOffline(pbProof);
+          const skProofValidJs = Epistemic.verifyMerkleProofOffline(skProof);
 
           process.stdout.write(JSON.stringify({
             wrongPinRejected,
@@ -817,8 +838,10 @@ class MobileVaultClientEndToEndTests(unittest.TestCase):
             ledgerAudit,
             atomProof,
             pbProof,
+            skProof,
             atomProofValidJs,
             pbProofValidJs,
+            skProofValidJs,
           }));
         })();
         """
@@ -894,8 +917,11 @@ class MobileVaultClientEndToEndTests(unittest.TestCase):
         self.assertEqual(off["ledgerAudit"]["head_entry_sha256"], py_ledger["head_entry_sha256"])
         self.assertTrue(off["atomProofValidJs"])
         self.assertTrue(off["pbProofValidJs"])
+        self.assertTrue(off["skProofValidJs"])
+        self.assertEqual(off["ledgerAudit"]["active_skills"], 1)
         self.assertTrue(verify_merkle_proof(off["atomProof"]))
         self.assertTrue(verify_merkle_proof(off["pbProof"]))
+        self.assertTrue(verify_merkle_proof(off["skProof"]))
 
     def test_keyfile_mode_and_adversarial_sync_attacks_fail_closed(self) -> None:
         brain_dir = self.tmp / "vault_keyfile"

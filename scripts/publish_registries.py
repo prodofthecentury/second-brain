@@ -239,6 +239,9 @@ def publish_homebrew_tap_via_github_api(
     transport: httpx.BaseTransport | None = None,
 ) -> dict[str, Any]:
     """Commit Casks/second-brain.rb (and optional Formula/README) directly to a live GitHub Homebrew Tap."""
+    clean_tap_repo = str(tap_repo or "").strip()
+    if not re.fullmatch(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", clean_tap_repo) or ".." in clean_tap_repo:
+        raise RegistryPublishError(f"Invalid Homebrew Tap repository slug: {tap_repo!r}")
     resolved_token = (token or os.environ.get("HOMEBREW_TAP_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
     if not resolved_token:
         raise RegistryPublishError("Missing HOMEBREW_TAP_TOKEN or GITHUB_TOKEN for Homebrew Tap publish.")
@@ -260,7 +263,7 @@ def publish_homebrew_tap_via_github_api(
     updated: list[str] = []
     with httpx.Client(timeout=30.0, follow_redirects=False, trust_env=False, transport=transport) as client:
         for repo_rel, content_bytes in files_to_push:
-            api_url = f"https://api.github.com/repos/{tap_repo}/contents/{repo_rel}"
+            api_url = f"https://api.github.com/repos/{clean_tap_repo}/contents/{repo_rel}"
             existing_sha: str | None = None
             get_resp = client.get(api_url, headers=headers)
             if get_resp.status_code == 200:

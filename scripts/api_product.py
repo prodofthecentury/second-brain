@@ -3909,6 +3909,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, st.as_dict())
 
         if path == "/v1/media/gallery" and method == "GET":
+            if not owner_only():
+                return True
             from creative_media import list_generated_media
 
             mtype = ((q.get("media_type") or [None])[0] or None)
@@ -3920,6 +3922,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, {"count": len(items), "items": items})
 
         if path.startswith("/v1/media/file/") and method == "GET":
+            if not owner_only():
+                return True
             import base64
             from creative_media import get_generated_media_file
 

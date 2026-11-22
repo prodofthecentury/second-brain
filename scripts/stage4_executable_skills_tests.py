@@ -1416,6 +1416,232 @@ class AssertionOpsAuditKindsDlpOutputAndCliTests(Stage4IsolatedTestCase):
             self.assertEqual(rc_audit, 0)
             self.assertTrue(json.loads(buf_audit.getvalue())["valid"])
 
+    def test_7_fullstack_api_sdk_cli_merkle_and_ui_parity(self) -> None:
+        """Verify end-to-end Loopback HTTP API, MemoryApiClient SDK, Merkle proofs, CLI, and 3-surface UI parity."""
+        import threading
+        import httpx
+        from cognitive_core import compute_memory_fitness_report
+        from host_adapters import restrict_security_file_permissions
+        from memory_api import MemoryApiClient, MemoryApiRuntimeConfig, create_memory_api_server
+        from vault_ledger import prove_leaf_membership, verify_merkle_proof
+        from vault_sync import LocalFolderSyncBackend, init_sync
+
+        brain = self.root_tmp / "brain_api"
+        _, _, pb_res = _seed_mature_playbook(
+            brain,
+            playbook_id="api-audit-pb",
+            atom_filename="api-proc.md",
+            steps=["Run source anchor audit across approved atoms."],
+            contexts=("project:alpha",),
+            citations=4,
+            successful_episodes=1,
+        )
+
+        # Initialize local E2EE sync target so Mobile Vault Client pairing works over API
+        sync_target = self.root_tmp / "sync_target"
+        init_sync(
+            str(sync_target),
+            brain_dir=brain,
+            passphrase="correct-horse-battery-staple",
+            state_dir=self.sec_dir,
+            use_keychain=False,
+        )
+
+        agent_tok = "agent_tok_stage4_0123456789abcdef0123456789abcdef"
+        owner_tok = "owner_tok_stage4_fedcba9876543210fedcba9876543210"
+        tok_file = self.sec_dir / "api-token"
+        own_file = self.sec_dir / "owner-token"
+        tok_file.write_text(agent_tok + "\n", encoding="utf-8")
+        own_file.write_text(owner_tok + "\n", encoding="utf-8")
+        restrict_security_file_permissions(tok_file)
+        restrict_security_file_permissions(own_file)
+
+        rt = MemoryApiRuntimeConfig(
+            brain_dir=str(brain),
+            token_path=tok_file,
+            owner_token_path=own_file,
+            security_dir=self.sec_dir,
+        )
+        rt.sync_state_dir = self.sec_dir  # type: ignore[attr-defined]
+        server = create_memory_api_server("127.0.0.1", 0, rt)
+        port = int(server.server_address[1])
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            owner_client = MemoryApiClient("127.0.0.1", port, token=agent_tok, owner_token=owner_tok)
+            agent_client = MemoryApiClient("127.0.0.1", port, token=agent_tok)
+
+            # 1. Stage 4 Executable Skills over SDK & HTTP API
+            cands = owner_client.list_skill_candidates()
+            self.assertGreaterEqual(cands["count"], 1)
+
+            # Agent-only client cannot promote skills (403)
+            with self.assertRaises(httpx.HTTPStatusError) as cm_403:
+                agent_client.promote_skill(
+                    skill_id="api-skill",
+                    playbook_id="api-audit-pb",
+                    expected_playbook_sha256=str(pb_res["sha256"]),
+                    step_actions=[{"action_type": "vault_audit", "audit_kind": "sources", "output_file": "a.json"}],
+                    actor="api-owner",
+                )
+            self.assertEqual(cm_403.exception.response.status_code, 403)
+
+            promoted = owner_client.promote_skill(
+                skill_id="api-skill",
+                playbook_id="api-audit-pb",
+                expected_playbook_sha256=str(pb_res["sha256"]),
+                step_actions=[{"action_type": "vault_audit", "audit_kind": "sources", "output_file": "a.json"}],
+                actor="api-owner",
+                rationale="API promotion test",
+                allow_early_owner_override=True,
+            )
+            self.assertEqual(promoted["status"], "active")
+
+            # Verify Cognitive Core fitness report advances maturity_stage to "executable_skill"
+            fit = compute_memory_fitness_report(
+                atoms_dir=str(brain / "2-atoms"),
+                brain_dir=str(brain),
+                db_path=str(brain / ".sidecar" / "telemetry.sqlite3"),
+            )
+            stages_by_atom = {item["atom_id"]: item["maturity_stage"] for item in fit["procedure_maturity"]}
+            self.assertEqual(stages_by_atom.get("api-proc.md"), "executable_skill")
+
+            # Verify Merkle inclusion proof for 6-skills/api-skill.md
+            sk_proof = prove_leaf_membership("6-skills/api-skill.md", brain_dir=str(brain), atoms_dir=str(brain / "2-atoms"))
+            self.assertEqual(sk_proof["kind"], "skill")
+            self.assertTrue(verify_merkle_proof(sk_proof))
+
+            dry_res = owner_client.execute_skill("api-skill", actor="api-owner", dry_run=True)
+            self.assertEqual(dry_res["status"], "dry_run_verified")
+            live_res = owner_client.execute_skill("api-skill", actor="api-owner", dry_run=False)
+            self.assertEqual(live_res["status"], "completed")
+
+            exec_hist = owner_client.list_skill_executions(skill_id="api-skill")
+            self.assertGreaterEqual(exec_hist["count"], 2)
+            self.assertTrue(exec_hist["audit_chain"]["chain_valid"])
+
+            # Engage and release kill-switch via API
+            owner_client.set_skill_kill_switch(engaged=True, actor="api-owner", reason="maintenance")
+            with self.assertRaises(httpx.HTTPStatusError) as cm_killed:
+                owner_client.execute_skill("api-skill", actor="api-owner")
+            self.assertEqual(cm_killed.exception.response.status_code, 403)
+            owner_client.set_skill_kill_switch(engaged=False, actor="api-owner", reason="done")
+
+            # 2. Mobile Vault Client over SDK & HTTP API
+            mob_pair = owner_client.mobile_pair(label="Test iPhone")
+            self.assertIn("#vaultpair=", str(mob_pair.get("pairing_url") or mob_pair.get("pairing_fragment")))
+            mob_st = owner_client.mobile_status()
+            self.assertEqual(len(mob_st["pairings"]), 1)
+            mob_exp = owner_client.mobile_export(str(self.root_tmp / "dist_mob"))
+            self.assertTrue(Path(str(mob_exp["zip_path"])).is_file())
+            owner_client.mobile_revoke(str(mob_pair["pairing_id"]))
+
+            # 3. Local Creative Media Generation over SDK & HTTP API
+            m_st = owner_client.media_status()
+            self.assertTrue(m_st["backends"]["builtin_procedural_local"]["ready"])
+            img_res = owner_client.generate_image(
+                "Deterministic Second Brain architecture diagram",
+                style="blueprint",
+                width=384,
+                height=256,
+                ground_in_vault=True,
+                project_scope="project:alpha",
+            )
+            self.assertEqual(img_res["media_type"], "image")
+            vid_res = owner_client.generate_video(
+                "Animated Merkle proof flow",
+                style="concept_card",
+                output_format="mp4",
+                width=320,
+                height=240,
+                frames=8,
+                fps=8,
+            )
+            self.assertEqual(vid_res["media_type"], "video")
+            gal = owner_client.media_gallery()
+            self.assertEqual(gal["count"], 2)
+            b64_file = owner_client.media_file_base64(str(vid_res["media_id"]))
+            self.assertTrue(str(b64_file["data_uri"]).startswith("data:video/mp4;base64,"))
+
+            # Non-owner (agent-only) token is rejected (403) on /v1/media/gallery and /v1/media/file/<id>
+            with self.assertRaises(httpx.HTTPStatusError) as cm_gal_403:
+                agent_client.media_gallery()
+            self.assertEqual(cm_gal_403.exception.response.status_code, 403)
+            with self.assertRaises(httpx.HTTPStatusError) as cm_file_403:
+                agent_client.media_file_base64(str(vid_res["media_id"]))
+            self.assertEqual(cm_file_403.exception.response.status_code, 403)
+
+            # DLP blocks secret in creative media prompt over API (403)
+            with self.assertRaises(httpx.HTTPStatusError) as cm_dlp:
+                owner_client.generate_image("Render key sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdefgh")
+            self.assertEqual(cm_dlp.exception.response.status_code, 403)
+
+            # Verify sandbox closure & C audit-hook isolation (sitecustomize not in sys.modules,
+            # FileIO and outside-workspace reads blocked even via closure introspection)
+            escape_probe_path = self.root_tmp / "outside_secret_probe.txt"
+            escape_probe_path.write_text("TOP_SECRET_OUTSIDE_SANDBOX", encoding="utf-8")
+            escape_skill = owner_client.promote_skill(
+                skill_id="escape-guard-skill",
+                playbook_id="api-audit-pb",
+                expected_playbook_sha256=str(pb_res["sha256"]),
+                step_actions=[
+                    {
+                        "action_type": "sandbox_python",
+                        "output_file": "guard_check.json",
+                        "script_body": (
+                            "import io, json, os, sys\n"
+                            "assert 'sitecustomize' not in sys.modules, 'sitecustomize leaked in sys.modules'\n"
+                            f"outside = {str(escape_probe_path)!r}\n"
+                            "blocked_read = False\n"
+                            "try:\n"
+                            "    open(outside, 'r').read()\n"
+                            "except PermissionError:\n"
+                            "    blocked_read = True\n"
+                            "assert blocked_read, 'outside-workspace read was not blocked'\n"
+                            "blocked_fileio = False\n"
+                            "try:\n"
+                            "    io.FileIO(outside, 'w')\n"
+                            "except PermissionError:\n"
+                            "    blocked_fileio = True\n"
+                            "assert blocked_fileio, 'io.FileIO outside-workspace write was not blocked'\n"
+                            "with open('guard_check.json', 'w', encoding='utf-8') as f:\n"
+                            "    json.dump({'isolated': True}, f)\n"
+                        ),
+                    }
+                ],
+                actor="api-owner",
+                rationale="Verify sandbox closure & audit-hook hardening",
+                allow_early_owner_override=True,
+            )
+            self.assertEqual(escape_skill["status"], "active")
+            guard_exec = owner_client.execute_skill("escape-guard-skill", actor="api-owner", dry_run=False)
+            self.assertEqual(guard_exec["status"], "completed")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # 4. Verify 3-surface UI parity (Electron Desktop, VS Code Extension, Streamlit Dashboard)
+        repo_root = Path(__file__).resolve().parents[1]
+        desktop_html = (repo_root / "desktop" / "renderer" / "index.html").read_text(encoding="utf-8")
+        for dom_id in ("creativeStudioCard", "systemMobileVaultPanel", "executableSkillsCard"):
+            self.assertIn(dom_id, desktop_html)
+        vscode_pkg = json.loads((repo_root / "extensions" / "vscode-second-brain" / "package.json").read_text(encoding="utf-8"))
+        vscode_cmds = {c["command"] for c in vscode_pkg["contributes"]["commands"]}
+        for cmd_name in (
+            "secondBrain.manageExecutableSkills",
+            "secondBrain.mobileVaultClient",
+            "secondBrain.generateCreativeImage",
+            "secondBrain.generateCreativeVideo",
+        ):
+            self.assertIn(cmd_name, vscode_cmds)
+        dash_src = (repo_root / "dashboard" / "app.py").read_text(encoding="utf-8")
+        for heading in (
+            "Stage 4 Executable Skills",
+            "Full On-Device Mobile Vault Client",
+            "Local Creative Media Generation Studio",
+        ):
+            self.assertIn(heading, dash_src)
+
 
 if __name__ == "__main__":
     unittest.main()

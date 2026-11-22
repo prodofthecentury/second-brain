@@ -2294,14 +2294,20 @@ def _submit_and_collect_comfy_outputs(
         fetched: list[tuple[str, bytes]] = []
         for desc in asset_descriptors[: HARD_MAX_FRAMES + 2]:
             fname = desc["filename"]
-            if ".." in fname or "/" in fname or "\\" in fname:
+            subf = desc["subfolder"]
+            ftype = desc["type"]
+            if ".." in fname or "/" in fname or "\\" in fname or ":" in fname:
                 raise CreativeMediaSecurityError(f"ComfyUI returned unsafe output filename: {fname!r}")
+            if ".." in subf or ":" in subf or subf.startswith(("/", "\\")):
+                raise CreativeMediaSecurityError(f"ComfyUI returned unsafe output subfolder: {subf!r}")
+            if ftype not in {"output", "temp"}:
+                raise CreativeMediaSecurityError(f"ComfyUI returned unsafe output type: {ftype!r}")
             view_resp = client.get(
                 f"{endpoint_url}/view",
                 params={
                     "filename": fname,
-                    "subfolder": desc["subfolder"],
-                    "type": desc["type"],
+                    "subfolder": subf,
+                    "type": ftype,
                 },
             )
             fetched.append((fname.lower(), _check_loopback_response(view_resp)))
@@ -2461,8 +2467,10 @@ def _generate_via_diffusers_local(
         raise CreativeMediaError(
             "diffusers_local requires a locally cached model path or repo ID via model_name or BRAIN_DIFFUSERS_MODEL."
         )
-    if model_id.lower().startswith(("http://", "https://", "ftp://")):
+    if model_id.lower().startswith(("http://", "https://", "ftp://", "file://")):
         raise CreativeMediaSecurityError("diffusers_local forbids remote HTTP/HTTPS model URLs.")
+    if model_id.startswith(("\\\\", "//")) or ".." in model_id or not _SAFE_CHECKPOINT_RE.fullmatch(model_id):
+        raise CreativeMediaSecurityError(f"diffusers_local rejected unsafe or UNC model identifier: {model_id!r}")
 
     try:
         import torch  # type: ignore[import-not-found]

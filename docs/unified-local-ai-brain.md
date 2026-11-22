@@ -25,8 +25,7 @@ researching, deciding, and creating.
 - `brain/.chroma/` and any JSON vector fallback are rebuildable recall layers.
 - Raw captures and scraped sources must remain auditable after ingestion.
 - AI-generated memories start as tentative until reviewed.
-- Creative image and video generation are optional modules activated only when
-  local tools/models are installed.
+- Creative image and video generation are optional modules (`scripts/creative_media.py`, `second-brain media`, `/v1/media/*`) gated by hardware capability profile (`scripts/hardware_profile.py`) and outbound DLP policy controls, with zero cloud dependency (`builtin_procedural_local` Pillow + pure-Python ISO-BMFF `.mp4` / `.gif` synthesis out of the box, plus loopback-only `sd_webui_local`, `comfyui_local`, and offline `diffusers_local` adapters).
 
 ## Tech Stack
 
