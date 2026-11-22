@@ -7,7 +7,7 @@
 - [answer-evaluation-results-2026-11-22.json](answer-evaluation-results-2026-11-22.json) — Live CPU `qwen2.5-coder:7b` grounded answer & trap-abstention evaluation
 - [live-third-party-benchmark-2026-11-22.json](live-third-party-benchmark-2026-11-22.json) — Live head-to-head comparison vs `mem0ai 2.2.1`, `faiss-cpu 1.16.0`, `chromadb 1.5.9`, `rank-bm25 0.2.2`, and `SQLite FTS5` on the real 78-atom vault
 - [sota-live-benchmark-results-2026-11-22.json](sota-live-benchmark-results-2026-11-22.json) — 120-atom multimodal PDF + 2-hop wikilink + bi-temporal/CAS/drift adversarial benchmark with live Ollama 768d embeddings, live third-party engines, and live `qwen2.5-coder:7b` generation
-- [sota-benchmark-results-2026-11-21.json](sota-benchmark-results-2026-11-21.json) — 300-atom ONNX Cross-Encoder & cryptographic validation scale latency benchmark (`13.645 ms` total P95 `< 15.0 ms` SLO)
+- [sota-benchmark-results-2026-11-21.json](sota-benchmark-results-2026-11-21.json) — 300-atom ONNX Cross-Encoder & cryptographic validation scale latency benchmark (`14.7–15.7 ms` P95 across 3 runs (median `15.18 ms`; Tier-0 `15.0 ms` target not reliably met))
 
 ---
 
@@ -33,8 +33,8 @@ All benchmarks were executed locally on the reference Windows workstation (`seco
 
 ## 2. Methodology
 
-### 2.1 Expanded 90-Case Human-Curated Vault Corpus (`v3.0.0`)
-The evaluation suite ([retrieval-evaluation-proposed.json](retrieval-evaluation-proposed.json)) was expanded **3x** from the prior 30-case set to **90 human-curated queries** over the live **78-atom vault** (`75` owner-approved canonical atoms linked across `141` `[[wikilink]]` edges with `0` orphans, plus `3` intentionally unapproved `pending` candidate atoms: `sodium-ion-battery-cost-record.md`, `code-reviews-as-mentorship.md`, and `continuous-integration-deployment.md`):
+### 2.1 Expanded 90-Case Agent-Drafted (Pending Owner Review) Vault Corpus (`v3.0.0`)
+The evaluation suite ([retrieval-evaluation-proposed.json](retrieval-evaluation-proposed.json)) was expanded **3x** from the prior 30-case set to **90 agent-drafted queries (pending owner review)** over the live **78-atom vault** (`75` owner-approved canonical atoms linked across `141` `[[wikilink]]` edges with `0` orphans, plus `3` intentionally unapproved `pending` candidate atoms: `sodium-ion-battery-cost-record.md`, `code-reviews-as-mentorship.md`, and `continuous-integration-deployment.md`):
 
 - **`25` Answerable Standard Factual Queries (`pos_01`–`pos_25`):** Cover observability, failure resilience, TDD, Three-Store Markdown durability, Refinery single-file validation, FTS5/Chroma index recovery, Parnas information hiding & hierarchical `uses` ordering, GGUF 23 GB hardware gating, sticky external provenance, human-only governance, and `project:second-brain` scoped product targets. Every positive case is cryptographically bound to the exact post-linking SHA-256 revision of its supporting approved atom(s) via `scripts/evaluation_dataset.py`.
 - **`15` Owner Preference Queries (`pref_26`–`pref_40`):** Evaluate architectural philosophy and subjective engineering preferences (`answer_mode: "preference"`), isolated from `standard` factual answers.
@@ -70,7 +70,7 @@ Two complementary live third-party benchmarks were executed:
 - **Unexpected Displayed Claims:** **`0`** (`0.0%`)
 - **Trap Claim Leakage:** **`0 / 25`** (`0.0%`, **`100.0%` trap abstention rate**)
 - **Validated Claim Citation Rate:** **`100.0%`** (`25 / 25` claims verified against live source SHA-256 & UTF-8 byte offsets)
-- **End-to-End CPU Latency (`qwen2.5-coder:7b` on 8-thread Skylake CPU):** **`25.23 s` P50 / `38.86 s` P95** (`<= 45.0 s` Tier-2 8-thread CPU SLO; single-hop regression subset measured `13.26 s` P50 / `21.37 s` P95).
+- **End-to-End CPU Latency (`qwen2.5-coder:7b` on 8-thread Skylake CPU):** **`23.63 s` P50 / `36.45 s` P95** (`<= 45.0 s` Tier-2 8-thread CPU SLO; single-hop regression subset measured `13.26 s` P50 / `21.37 s` P95).
 
 ---
 
@@ -113,14 +113,14 @@ Two complementary live third-party benchmarks were executed:
 Eliminating redundant Windows `CreateFileW` (`os.path.isjunction`) kernel handles in `config.py:_is_reparse_or_link` and `atom_mutator.py:_lstat_regular_non_reparse` (relying on `os.lstat().st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT`) and deduplicating source reads in `answer_policy.py` brought **300-atom ONNX Cross-Encoder (`ms-marco-MiniLM-L-6-v2`) + cryptographic CAS/byte-anchor validation** strictly inside the `15.0 ms` Tier-0 target:
 - **Retrieval P50 / P95:** `2.350 ms` / `9.201 ms`
 - **Cryptographic Validation P50 / P95:** `0.214 ms` / `3.606 ms`
-- **Combined Total P50 / P95 / P99:** **`2.563 ms` / `13.645 ms` / `14.244 ms` (`< 15.0 ms` SLO even at P99)** with `100.0%` recall, `100.0%` citation grounding, and `0.0%` trap/cross-project leakage across `211` queries over `300` atoms.
+- **Combined Total P95 (3 independent runs, after the trust-safe memo fix):** `15.179 ms`, `14.714 ms`, `15.692 ms` (median `15.18 ms`; P50 `3.7–4.3 ms`; P99 `15.6–16.9 ms`) with `100.0%` recall, `100.0%` citation grounding, and `0.0%` trap/cross-project leakage across `211` queries over `300` atoms. **The Tier-0 `15.0 ms` P95 target is at the edge and not reliably met.** An earlier single run reported `13.645 ms`, but it came from a build whose 5-second verified-scan memo could serve an out-of-band in-place edit as trusted (NTFS doesn't bump the directory mtime on in-place writes). That memo now re-stats every served candidate, and `ScaleEngineTests.test_verified_scan_memo_detects_out_of_band_in_place_edit` locks this in.
 
 ---
 
 ## 4. Reproducibility Commands
 
 ```powershell
-# 1. Validate 90-case human-curated dataset against live vault SHA-256 revisions
+# 1. Validate 90-case agent-drafted (pending owner review) dataset against live vault SHA-256 revisions
 uv run --locked python scripts/evaluation_dataset.py
 
 # 2. Run 90-case lexical, dense (768d nomic-embed-text), and RRF hybrid evaluation
