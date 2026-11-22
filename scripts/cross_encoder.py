@@ -53,6 +53,7 @@ _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{1,63}")
 
 _ONNX_CACHE_LOCK = threading.Lock()
 _CACHED_ONNX_ENCODERS: dict[tuple[str, int], tuple[float, float, "OnnxCrossEncoder"]] = {}
+_DEFAULT_RESOLVED_DIR: tuple[str, int, int, int, int, int, int] | None = None
 _VERIFIED_DIR_CACHE: dict[tuple[Any, ...], bool] = {}
 _ONNX_PAIR_SCORE_MEMO: dict[tuple[str, int, str, str], float] = {}
 
@@ -382,15 +383,49 @@ def get_onnx_cross_encoder(
     max_length: int = 128,
 ) -> OnnxCrossEncoder | None:
     """Load and cache the ONNX cross-encoder when a validated local model directory is present."""
+    global _DEFAULT_RESOLVED_DIR
+    eff_max_len = max(8, min(int(max_length), 512))
+    is_default_lookup = explicit_dir is None and not (os.environ.get("BRAIN_CROSS_ENCODER_DIR") or "").strip()
+
+    if is_default_lookup:
+        with _ONNX_CACHE_LOCK:
+            fast_dir = _DEFAULT_RESOLVED_DIR
+        if fast_dir is not None:
+            dir_str, exp_m_ns, exp_m_sz, exp_t_ns, exp_t_sz, exp_man_ns, exp_man_sz = fast_dir
+            try:
+                if not _is_reparse_or_link(dir_str):
+                    mst = os.lstat(os.path.join(dir_str, "model.onnx"))
+                    tst = os.lstat(os.path.join(dir_str, "tokenizer.json"))
+                    man_p = os.path.join(dir_str, "onnx-manifest.json")
+                    if os.path.lexists(man_p):
+                        man_st = os.lstat(man_p)
+                        man_sig = (man_st.st_mtime_ns, man_st.st_size)
+                    else:
+                        man_sig = (0, 0)
+                    if (
+                        mst.st_mtime_ns == exp_m_ns
+                        and mst.st_size == exp_m_sz
+                        and tst.st_mtime_ns == exp_t_ns
+                        and tst.st_size == exp_t_sz
+                        and man_sig == (exp_man_ns, exp_man_sz)
+                    ):
+                        with _ONNX_CACHE_LOCK:
+                            cached_fast = _CACHED_ONNX_ENCODERS.get((dir_str, eff_max_len))
+                        if cached_fast is not None:
+                            return cached_fast[2]
+            except OSError:
+                pass
+
     resolved = resolve_cross_encoder_dir(explicit_dir)
     if resolved is None:
         return None
     try:
-        m_mtime = (resolved / "model.onnx").stat().st_mtime
-        t_mtime = (resolved / "tokenizer.json").stat().st_mtime
+        mst_full = os.lstat(str(resolved / "model.onnx"))
+        tst_full = os.lstat(str(resolved / "tokenizer.json"))
+        m_mtime = mst_full.st_mtime
+        t_mtime = tst_full.st_mtime
     except OSError:
         return None
-    eff_max_len = max(8, min(int(max_length), 512))
     cache_key = (str(resolved), eff_max_len)
     with _ONNX_CACHE_LOCK:
         cached = _CACHED_ONNX_ENCODERS.get(cache_key)
@@ -400,17 +435,38 @@ def get_onnx_cross_encoder(
         encoder = OnnxCrossEncoder(resolved, max_length=eff_max_len)
     except Exception:
         return None
+    man_file = resolved / "onnx-manifest.json"
+    try:
+        if os.path.lexists(str(man_file)):
+            man_st2 = os.lstat(str(man_file))
+            man_ns, man_sz = man_st2.st_mtime_ns, man_st2.st_size
+        else:
+            man_ns, man_sz = 0, 0
+    except OSError:
+        man_ns, man_sz = -1, -1
     with _ONNX_CACHE_LOCK:
         if len(_CACHED_ONNX_ENCODERS) >= 8:
             _CACHED_ONNX_ENCODERS.clear()
         _CACHED_ONNX_ENCODERS[cache_key] = (m_mtime, t_mtime, encoder)
+        if is_default_lookup and man_ns >= 0:
+            _DEFAULT_RESOLVED_DIR = (
+                str(resolved),
+                mst_full.st_mtime_ns,
+                mst_full.st_size,
+                tst_full.st_mtime_ns,
+                tst_full.st_size,
+                man_ns,
+                man_sz,
+            )
     return encoder
 
 
 def clear_cross_encoder_cache() -> None:
     """Clear in-memory ONNX session and parsed document interaction caches."""
+    global _DEFAULT_RESOLVED_DIR
     with _ONNX_CACHE_LOCK:
         _CACHED_ONNX_ENCODERS.clear()
+        _DEFAULT_RESOLVED_DIR = None
         _VERIFIED_DIR_CACHE.clear()
         _ONNX_PAIR_SCORE_MEMO.clear()
     with _DOC_INTERACTION_LOCK:
