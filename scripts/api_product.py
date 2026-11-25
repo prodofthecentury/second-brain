@@ -393,6 +393,23 @@ def owner_authorized(header_value: str | None, token_path: Path | None = None) -
     return verify_owner_token(header_value, get_owner_token(token_path), record_failure=False)
 
 
+def owner_bearer_attestation(handler, rt, actor: str) -> dict[str, str]:
+    """Bind an owner-token proof to an actor. The raw token is checked and then dropped from the audit log."""
+    raw = handler.headers.get(OWNER_HEADER)
+    supplied = raw.strip() if isinstance(raw, str) else ""
+    expected = getattr(rt, "owner_token", None)
+    if not expected:
+        expected = get_owner_token(getattr(rt, "owner_token_path", None)) or ""
+    token_path = getattr(rt, "owner_token_path", None)
+    return {
+        "method": "owner_bearer_token",
+        "actor": str(actor or "").strip(),
+        "token": supplied,
+        "expected_token": str(expected),
+        "token_path": str(token_path) if token_path else "",
+    }
+
+
 def evaluate_request_owner_auth(
     handler,
     rt,
@@ -1976,13 +1993,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             atom_path = safe_file_in_dir(rt.atoms_dir, norm_fname, allowed_exts={".md"}, must_exist=True)
             if not atom_path or _is_reparse_or_link(atom_path):
                 return send(404, {"error": "Atom not found."})
+            actor = _str(body, "actor", max_len=120)
             record = apply_review_transition(
                 action=action,
                 atom_path=atom_path,
                 expected_sha256=_str(body, "expected_sha256", max_len=64),
-                actor=_str(body, "actor", max_len=120),
+                actor=actor,
                 brain_dir=rt.brain_dir,
                 atoms_dir=rt.atoms_dir,
+                attestation=owner_bearer_attestation(handler, rt, actor),
             )
             _sync_lexical_after_atom_mutation(rt, [norm_fname])
             return send(200, {"status": action, "atom": _atom_card(atom_path, rt), "decision": record})
@@ -2011,6 +2030,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             fname = _str(body, "filename", max_len=200)
             sha = _str(body, "expected_sha256", max_len=64)
             actor = _str(body, "actor", max_len=120)
+            attestation = owner_bearer_attestation(handler, rt, actor)
             if path.endswith("promote"):
                 res = promote_inbox_item(
                     fname,
@@ -2020,6 +2040,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     inbox_dir=rt.inbox_dir,
                     raw_dir=os.path.dirname(rt.inbox_dir),
                     brain_dir=rt.brain_dir,
+                    attestation=attestation,
                 )
                 if isinstance(res.get("atom_filename"), str):
                     _sync_lexical_after_atom_mutation(rt, [res["atom_filename"]])
@@ -2031,8 +2052,61 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     inbox_dir=rt.inbox_dir,
                     raw_dir=os.path.dirname(rt.inbox_dir),
                     brain_dir=rt.brain_dir,
+                    attestation=attestation,
                 )
             return send(200, res)
+
+        if path == "/v1/sources/queue" and method == "GET":
+            if not owner_only():
+                return True
+            from source_review import list_source_queue
+
+            items = list_source_queue(rt.brain_dir)
+            return send(200, {"total": len(items), "items": items})
+
+        if path == "/v1/sources/approve" and method == "POST":
+            if not owner_only():
+                return True
+            from source_review import approve_sources
+
+            actor = _str(body, "actor", max_len=120)
+            selected = body.get("items")
+            if not isinstance(selected, list) or not selected:
+                filename = _str(body, "filename", max_len=200)
+                selected = [{"filename": filename, "expected_sha256": _str(body, "expected_sha256", max_len=64)}]
+            decisions = approve_sources(
+                selected,
+                actor=actor,
+                attestation=owner_bearer_attestation(handler, rt, actor),
+                acknowledge_risks=bool(body.get("acknowledge_risks")),
+                brain_dir=rt.brain_dir,
+            )
+            return send(200, {"approved": decisions})
+
+        if path == "/v1/sources/approve-clean" and method == "POST":
+            if not owner_only():
+                return True
+            from source_review import approve_clean_sources
+
+            actor = _str(body, "actor", max_len=120)
+            result = approve_clean_sources(
+                actor=actor,
+                attestation=owner_bearer_attestation(handler, rt, actor),
+                brain_dir=rt.brain_dir,
+            )
+            return send(200, result)
+
+        if path == "/v1/sources/search" and method == "POST":
+            if not owner_only():
+                return True
+            from source_review import search_approved_sources
+
+            hits = search_approved_sources(
+                _str(body, "query", max_len=500),
+                limit=int(body.get("limit") or 8),
+                brain_dir=rt.brain_dir,
+            )
+            return send(200, {"hits": hits, "citable_claim": False})
 
         if path.startswith("/v1/inbox/") and method == "GET":
             if not owner_only():

@@ -451,6 +451,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     for name, help_text in (
         ("api", "Run or configure the loopback 127.0.0.1 HTTP JSON Memory API."),
         ("inbox", "Inspect, promote, or reject quarantined 0-raw/inbox captures."),
+        ("owner", "Enroll an owner approval key and issue a short-lived approval grant."),
+        ("sources", "Review captured sources and search the ones you have approved."),
         ("hosts", "Inspect and configure per-host AI sharing consent policies."),
         ("cognitive", "Generate memory fitness reports, record feedback, and log experiences."),
         ("playbooks", "Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks."),
@@ -573,7 +575,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
 _PASSTHROUGH_COMMANDS = frozenset({
     "api",
-    "inbox", "hosts", "cognitive", "playbooks", "playbook", "skills", "plan",
+    "inbox", "owner", "sources", "hosts", "cognitive", "playbooks", "playbook", "skills", "plan",
     "notes", "tasks", "capture", "import", "chat", "connect", "benchmark",
     "sota-benchmark", "live-benchmark", "third-party-benchmark", "ledger", "graph", "snapshot", "sync", "mobile", "media", "release",
     "models", "voice", "screen", "external", "proxy", "tunnel", "jarvis", "packs", "runtime", "clipper", "vault",
@@ -755,6 +757,14 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.inbox_workflow import main as inbox_main
 
         return inbox_main(forwarded)
+    if command == "owner":
+        from scripts.owner_attestation import main as owner_main
+
+        return owner_main(forwarded)
+    if command == "sources":
+        from scripts.source_review import main as sources_main
+
+        return sources_main(forwarded)
     if command == "hosts":
         from scripts.host_adapters import main as hosts_main
 

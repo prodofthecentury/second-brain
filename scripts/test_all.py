@@ -125,6 +125,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "bugfix_1a_regression_tests.py")),
     ),
     (
+        "honesty_regression_tests",
+        "POSIX directory permissions, owner-grant approvals, captured-source search, and MCP tool-count docs (scripts/honesty_regression_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "honesty_regression_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),
@@ -141,7 +146,7 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "parity_1c_tests",
-        "1C cross-layer parity: bi-temporal graph API/SDK, 27-tool MCP + ONNX NLI, CLI commands & PWA/clipper manifests/icons (scripts/parity_1c_tests.py)",
+        "1C cross-layer parity: bi-temporal graph API/SDK, 35-tool MCP + ONNX NLI, CLI commands & PWA/clipper manifests/icons (scripts/parity_1c_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "parity_1c_tests.py")),
     ),
     (

@@ -397,6 +397,25 @@ def _write_mutation(
     return record
 
 
+def _recorded_attestation(actor: str, attestation: dict | None) -> tuple[str, dict | None]:
+    """Reject synthetic seed actors. Verify a credential when the caller presents one."""
+    from owner_attestation import OwnerAttestationError, _clean_actor, require_attestation
+
+    try:
+        clean = _clean_actor(actor)
+        if attestation is None:
+            return clean, None
+        recorded = require_attestation(
+            attestation,
+            actor=clean,
+            state_dir=attestation.get("state_dir"),
+            auth_path=attestation.get("auth_path"),
+        )
+        return clean, recorded
+    except OwnerAttestationError as exc:
+        raise ReviewTransitionError(str(exc)) from exc
+
+
 def apply_atom_mutation(
     *,
     action: str,
@@ -409,6 +428,7 @@ def apply_atom_mutation(
     brain_dir: str | None = None,
     atoms_dir: str | None = None,
     reviewed_on: str | None = None,
+    attestation: dict | None = None,
 ) -> dict:
     """Compare, mutate, reindex, and attest one atom revision as one serialized operation."""
     from config import resolve_module_atoms_and_brain
@@ -428,8 +448,7 @@ def apply_atom_mutation(
     )
     history_dir = os.path.abspath(history_dir or os.path.join(atoms_dir, ".history"))
 
-    if not actor or not actor.strip():
-        raise ReviewTransitionError("An explicit owner actor is required for atom mutations.")
+    actor, recorded_attestation = _recorded_attestation(actor, attestation)
     if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
         raise ReviewConflictError("An exact 64-character expected SHA-256 is required for atom mutations.")
     if action not in {*TRANSITIONS, "edit"}:
@@ -576,6 +595,7 @@ def apply_atom_mutation(
             evidence_anchor=evidence_anchor,
             dense_refresh_required=dense_refresh_required,
             dense_model=active_dense_manifest.get("embedding_model") if dense_refresh_required else None,
+            extra_record_fields={"attestation": recorded_attestation} if recorded_attestation else None,
         )
 
 
@@ -633,6 +653,7 @@ def set_atom_temporal_bounds(
     history_dir: str | None = None,
     brain_dir: str | None = None,
     atoms_dir: str | None = None,
+    attestation: dict | None = None,
 ) -> dict:
     """Set or clear optional ``valid_from`` / ``valid_until`` bounds on an atom under ``writer.lock``.
 
@@ -654,9 +675,9 @@ def set_atom_temporal_bounds(
     )
     history_dir = os.path.abspath(history_dir or os.path.join(atoms_dir, ".history"))
 
-    clean_actor = str(actor or "").strip()[:120]
+    clean_actor, recorded_attestation = _recorded_attestation(actor, attestation)
     actor_tokens = {tok for tok in __import__("re").split(r"[^a-z0-9]+", clean_actor.casefold()) if tok}
-    if not clean_actor or bool(actor_tokens & _DISALLOWED_TEMPORAL_ACTORS):
+    if bool(actor_tokens & _DISALLOWED_TEMPORAL_ACTORS):
         raise ReviewTransitionError("Setting temporal validity bounds requires an explicit human owner actor.")
     if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
         raise ReviewConflictError("An exact 64-character expected SHA-256 is required.")
@@ -764,6 +785,7 @@ def set_atom_temporal_bounds(
                 "valid_from": norm_vf,
                 "valid_until": norm_vu,
                 "rationale": clean_rationale,
+                **({"attestation": recorded_attestation} if recorded_attestation else {}),
             },
         )
         tv_now = evaluate_temporal_validity(norm_vf, norm_vu)
@@ -949,6 +971,7 @@ def apply_atom_merge(
     actor: str, rationale: str, decision_log_path: str | None = None,
     history_dir: str | None = None, brain_dir: str | None = None,
     atoms_dir: str | None = None, reviewed_on: str | None = None,
+    attestation: dict | None = None,
 ) -> list[dict]:
     """Owner-directed two-atom supersession with CAS, rollback, and paired audit."""
     from config import resolve_module_atoms_and_brain
@@ -968,8 +991,7 @@ def apply_atom_merge(
     history_dir = os.path.abspath(history_dir or os.path.join(atoms_dir, ".history"))
     if survivor_path == superseded_path:
         raise ReviewTransitionError("An atom cannot supersede itself.")
-    if not actor or not actor.strip():
-        raise ReviewTransitionError("An explicit owner actor is required for atom merges.")
+    actor, recorded_attestation = _recorded_attestation(actor, attestation)
     if not isinstance(rationale, str) or not rationale.strip():
         raise ReviewTransitionError("A non-empty owner rationale is required for atom merges.")
     for value, label in ((survivor_expected_sha256, "survivor"), (superseded_expected_sha256, "superseded")):
@@ -1136,6 +1158,7 @@ def apply_atom_merge(
                     "action": "merge",
                     "actor": actor.strip(),
                     "rationale": rationale.strip(),
+                    **({"attestation": recorded_attestation} if recorded_attestation else {}),
                     "atom_filename": Path(path).name,
                     "peer_filename": Path(peer_paths[index]).name,
                     "relationship": "survivor" if index == 0 else "superseded",

@@ -89,7 +89,15 @@ def parse_args(argv=None):
 
 
 def main(argv=None) -> int:
-    args = parse_args(argv)
+    from owner_attestation import OwnerAttestationError, attestation_from_grant, split_grant_args
+
+    cleaned, grant = split_grant_args(argv)
+    args = parse_args(cleaned)
+    try:
+        attestation = attestation_from_grant(grant)
+    except OwnerAttestationError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     try:
         if args.command == "merge":
             survivor_path = safe_file_in_dir(ATOMS_DIR, args.survivor, allowed_exts={".md"})
@@ -104,6 +112,7 @@ def main(argv=None) -> int:
                 superseded_expected_sha256=args.superseded_sha256,
                 actor=args.actor,
                 rationale=args.rationale,
+                attestation=attestation,
             )
         elif args.command == "edit":
             atom_path = safe_file_in_dir(ATOMS_DIR, args.atom, allowed_exts={".md"})
@@ -120,6 +129,7 @@ def main(argv=None) -> int:
                 edited_content=edited_content,
                 expected_sha256=args.expected_sha256,
                 actor=args.actor,
+                attestation=attestation,
             )
         elif args.command == "set-validity":
             atom_path = safe_file_in_dir(ATOMS_DIR, args.atom, allowed_exts={".md"})
@@ -133,6 +143,7 @@ def main(argv=None) -> int:
                 expected_sha256=args.expected_sha256,
                 actor=args.actor,
                 rationale=args.rationale,
+                attestation=attestation,
             )
         else:
             atom_path = safe_file_in_dir(ATOMS_DIR, args.atom, allowed_exts={".md"})
@@ -144,6 +155,7 @@ def main(argv=None) -> int:
                 action=args.action,
                 expected_sha256=args.expected_sha256,
                 actor=args.actor,
+                attestation=attestation,
             )
     except (ReviewConflictError, ReviewTransitionError, OSError) as exc:
         print(f"Error: {exc}")

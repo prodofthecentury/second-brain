@@ -87,6 +87,7 @@ from scripts.review_details import atom_review_details
 from scripts.dashboard_auth import assert_loopback_address, require_dashboard_login
 from scripts.hardware_profile import detect_hardware_profile
 from scripts.inbox_workflow import inspect_inbox_item, list_inbox_items, promote_inbox_item, reject_inbox_item
+from scripts.source_review import approve_clean_sources, list_source_queue, search_approved_sources
 import scripts.host_adapters as _host_adapters_mod
 from scripts.host_adapters import (
     BUILTIN_HOST_IDS,
@@ -2600,6 +2601,13 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                                 inbox_dir=INBOX_DIR,
                                 raw_dir=RAW_DIR,
                                 brain_dir=BRAIN_DIR,
+                                attestation={
+                                    "method": "dashboard_password_session",
+                                    "actor": actor_name,
+                                    "credential_fingerprint": str(
+                                        st.session_state.get("_brain_dashboard_auth_fingerprint") or ""
+                                    ),
+                                },
                             )
                             st.session_state["_dashboard_flash_success"] = (
                                 f"Promoted to `0-raw/{dec['promoted_filename']}` (SHA-256 `{dec['promoted_sha256']}`)."
@@ -2617,11 +2625,75 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                                 inbox_dir=INBOX_DIR,
                                 raw_dir=RAW_DIR,
                                 brain_dir=BRAIN_DIR,
+                                attestation={
+                                    "method": "dashboard_password_session",
+                                    "actor": actor_name,
+                                    "credential_fingerprint": str(
+                                        st.session_state.get("_brain_dashboard_auth_fingerprint") or ""
+                                    ),
+                                },
                             )
                             st.session_state["_dashboard_flash_success"] = f"Rejected and archived `{selected_q}`."
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Rejection failed: {exc}")
+
+        st.divider()
+        st.subheader("Captured articles in sources/")
+        st.caption(
+            "Scout saves articles under sources/ and leaves them unsearchable until you approve the current bytes. "
+            "Approval makes the text searchable. It does not create a citable memory atom."
+        )
+        source_items = list_source_queue(BRAIN_DIR)
+        pending_sources = [item for item in source_items if not item["approved"]]
+        if not source_items:
+            st.info("No captured source articles yet.")
+        else:
+            st.write(
+                f"{sum(1 for item in source_items if item['approved'])} approved, "
+                f"{len(pending_sources)} waiting."
+            )
+            source_actor = st.text_input("Owner actor for source approval", value="owner", key="source_actor_input")
+            if pending_sources:
+                preview = pending_sources[0]
+                st.code(
+                    f"{preview['filename']}\nsha256={preview['sha256']}\nrisks={', '.join(preview['risk_flags']) or 'none'}",
+                    language="text",
+                )
+            source_query = st.text_input("Search approved sources", key="source_search_query")
+            if source_query.strip():
+                try:
+                    hits = search_approved_sources(source_query, brain_dir=BRAIN_DIR, limit=5)
+                except Exception as exc:
+                    st.error(str(exc))
+                    hits = []
+                if not hits:
+                    st.info("No approved source matched. Pending articles stay out of search.")
+                for hit in hits:
+                    st.markdown(f"**{hit['filename']}** — {hit['epistemic_label']}")
+                    st.text(hit["snippet"][:400])
+            if st.button("Approve all clean sources", key="btn_approve_clean_sources"):
+                try:
+                    result = approve_clean_sources(
+                        actor=source_actor,
+                        attestation={
+                            "method": "dashboard_password_session",
+                            "actor": source_actor,
+                            "credential_fingerprint": str(
+                                st.session_state.get("_brain_dashboard_auth_fingerprint") or ""
+                            ),
+                        },
+                        brain_dir=BRAIN_DIR,
+                    )
+                    approved_n = len(result.get("approved") or [])
+                    skipped = result.get("skipped_risky") or []
+                    st.session_state["_dashboard_flash_success"] = (
+                        f"Approved {approved_n} clean source(s). "
+                        f"Left {len(skipped)} risky file(s) in the queue."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Source approval blocked: {exc}")
 
     with tab_hosts:
         st.subheader("Hardware Capability Profile")
