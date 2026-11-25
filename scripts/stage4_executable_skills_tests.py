@@ -192,7 +192,9 @@ class Stage4IsolatedTestCase(unittest.TestCase):
         super().setUp()
         self._stack = ExitStack()
         self.addCleanup(self._stack.close)
-        self.root_tmp = Path(self._stack.enter_context(tempfile.TemporaryDirectory()))
+        self.root_tmp = Path(
+            self._stack.enter_context(tempfile.TemporaryDirectory(ignore_cleanup_errors=True))
+        )
         self.sec_dir = self.root_tmp / "security"
         self.sec_dir.mkdir(parents=True, exist_ok=True)
         self._stack.enter_context(
