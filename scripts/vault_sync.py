@@ -179,9 +179,24 @@ def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
+def _vault_identity_paths(brain_dir: str | Path) -> tuple[str, str]:
+    """Return (resolved, absolute) spellings of a vault path.
+
+    macOS ``/var`` and Windows 8.3 short names are the same directory as the
+    resolved path. The sync config filename is a hash of that spelling, so both
+    callers must hash the same bytes.
+    """
+    raw = os.path.normcase(os.path.abspath(os.path.expanduser(str(brain_dir))))
+    try:
+        resolved = os.path.normcase(str(Path(brain_dir).expanduser().resolve()))
+    except OSError:
+        resolved = raw
+    return resolved, raw
+
+
 def _vault_key_slug(brain_dir: str | Path) -> str:
-    norm = os.path.normcase(os.path.abspath(str(brain_dir)))
-    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+    resolved, _raw = _vault_identity_paths(brain_dir)
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
 
 
 def sync_key_dir(state_dir: Path | None = None) -> Path:
@@ -190,7 +205,15 @@ def sync_key_dir(state_dir: Path | None = None) -> Path:
 
 
 def sync_config_path(brain_dir: str | Path, *, state_dir: Path | None = None) -> Path:
-    return sync_key_dir(state_dir) / f"vault-{_vault_key_slug(brain_dir)}.json"
+    base = sync_key_dir(state_dir)
+    resolved, raw = _vault_identity_paths(brain_dir)
+    primary = base / f"vault-{hashlib.sha256(resolved.encode('utf-8')).hexdigest()[:16]}.json"
+    if raw == resolved or primary.exists():
+        return primary
+    legacy = base / f"vault-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}.json"
+    if legacy.exists():
+        return legacy
+    return primary
 
 
 def sync_state_path(brain_dir: str | Path) -> Path:

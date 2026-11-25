@@ -21,6 +21,21 @@ if __name__ in ("config", "scripts.config"):
     sys.modules.setdefault("config", sys.modules[__name__])
     sys.modules.setdefault("scripts.config", sys.modules[__name__])
 
+
+def configure_utf8_stdio() -> None:
+    """Let status lines that contain ✓ print on a Windows cp1252 console."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+configure_utf8_stdio()
+
 SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR     = os.path.dirname(SCRIPTS_DIR)
 

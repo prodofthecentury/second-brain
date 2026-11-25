@@ -430,6 +430,9 @@ def transcribe_audio(filepath: str) -> str:
 
 
 def process_audio(filepath: str) -> str | None:
+    from config import configure_utf8_stdio
+
+    configure_utf8_stdio()
     _validate_media_source(filepath, max_bytes=MAX_AUDIO_BYTES)
     filename = os.path.basename(filepath)
     stem = _sanitize_stem(os.path.splitext(filename)[0])
@@ -712,6 +715,9 @@ def extract_document_markdown(
 
 
 def process_document(filepath: str) -> str | None:
+    from config import configure_utf8_stdio
+
+    configure_utf8_stdio()
     _validate_media_source(filepath, max_bytes=MAX_DOC_BINARY_BYTES)
     filename = os.path.basename(filepath)
     ext = os.path.splitext(filename)[1].lower()
@@ -1088,6 +1094,9 @@ def _apply_env_vault_override() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from config import configure_utf8_stdio
+
+    configure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Multimodal and document file ingestion.")
     parser.add_argument("--file", action="append", default=[], help="Process a single file (repeatable).")
     parser.add_argument("paths", nargs="*", help="Optional file(s) or folder(s) to ingest into 0-raw/.")
