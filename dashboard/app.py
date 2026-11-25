@@ -55,6 +55,7 @@ from scripts.config import (
     TELEMETRY_DB_PATH as _DEFAULT_TELEMETRY_DB_PATH,
     GEN_MODEL,
     _WINDOWS_RESERVED_STEMS,
+    _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     read_house_rules,
     today,
@@ -5651,7 +5652,9 @@ elif nav_selection == "⚙️ System Control":
         )
         _gate_path_obj = Path(gate_dataset_file)
         _gate_ancestors_safe = gate_dataset_file.lower().endswith(".json") and not any(
-            os.path.lexists(str(_anc)) and _is_reparse_or_link(str(_anc))
+            os.path.lexists(str(_anc))
+            and _is_reparse_or_link(str(_anc))
+            and not _is_immutable_darwin_root_symlink(_anc)
             for _anc in (_gate_path_obj, *_gate_path_obj.parents)
         )
         if os.path.isfile(gate_dataset_file) and _gate_ancestors_safe:

@@ -41,6 +41,7 @@ from atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
 from config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
+    _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     is_content_markdown,
     resolve_module_atoms_and_brain,
@@ -109,7 +110,11 @@ def _assert_safe_regular_path(path: Path, label: str) -> Path:
     abs_path = Path(os.path.abspath(str(path)))
     cur = abs_path
     while True:
-        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+        if (
+            os.path.lexists(str(cur))
+            and _is_reparse_or_link(str(cur))
+            and not _is_immutable_darwin_root_symlink(cur)
+        ):
             raise PermissionError(f"Refusing {label} through symlink or reparse point: {cur}")
         if cur.parent == cur:
             break

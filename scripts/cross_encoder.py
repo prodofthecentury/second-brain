@@ -95,7 +95,7 @@ def _ancestors_reparse_free(cand: Path) -> bool:
             continue
         except OSError:
             return False
-        if _stat_is_reparse(ast):
+        if _stat_is_reparse(ast) and not _is_immutable_darwin_root_symlink(ancestor):
             return False
     return True
 
