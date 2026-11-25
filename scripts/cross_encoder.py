@@ -572,7 +572,7 @@ def _min_span_density(q_stem_set: set[str], doc_stems: Sequence[str]) -> float:
 class InteractionCrossEncoder:
     """Fast (< 1 ms) deterministic token-interaction Cross-Encoder for Markdown memory atoms."""
 
-    backend_name = "cross_encoder"
+    backend_name = "interaction_cross_encoder"
 
     def score_pairs(self, query: str, contents: Sequence[str]) -> list[float]:
         if not contents:

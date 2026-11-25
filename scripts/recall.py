@@ -832,11 +832,14 @@ def candidate_has_semantic_corroboration(
     if not query_terms or distance is None:
         return False
     sim = cosine_distance_to_similarity(distance)
+    required = min(2, len(query_terms))
     literal_hits = len(query_terms.intersection(corroborating_terms))
     stem_hits = sum(1 for qt in query_terms if len(porter_stem(qt)) >= 4 and porter_stem(qt) in corroborating_stems)
-    if (literal_hits >= 1 or stem_hits >= 1) and sim >= 0.86:
+    if literal_hits >= required and sim >= 0.86:
         return True
-    return sim >= 0.90
+    if stem_hits >= required and sim >= 0.86:
+        return True
+    return False
 
 
 def wikilinks(content: str) -> list[str]:
