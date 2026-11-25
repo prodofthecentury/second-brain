@@ -82,14 +82,22 @@ def _is_immutable_darwin_root_symlink(path: Path | str) -> bool:
     expected = _DARWIN_SYSTEM_SYMLINKS.get(raw) or _DARWIN_SYSTEM_SYMLINKS.get(str(path).rstrip("/"))
     if not expected:
         return False
+    probe = raw if os.path.lexists(raw) else str(path)
     try:
-        link = os.readlink(raw if os.path.lexists(raw) else str(path))
+        link = os.readlink(probe)
     except OSError:
         link = ""
     if link and _darwin_symlink_target_matches(link, expected):
         return True
     try:
-        return _darwin_symlink_target_matches(os.path.realpath(raw), expected)
+        if _darwin_symlink_target_matches(os.path.realpath(probe), expected):
+            return True
+    except OSError:
+        pass
+    # GitHub's macOS image firmlinks /var in a way readlink/realpath do not spell
+    # as private/var. These three roots are SIP-owned; a normal user cannot retarget them.
+    try:
+        return stat.S_ISLNK(os.lstat(probe).st_mode)
     except OSError:
         return False
 
