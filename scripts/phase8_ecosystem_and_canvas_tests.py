@@ -360,8 +360,16 @@ class Phase8EcosystemAndCanvasTests(unittest.TestCase):
             brain = _seed_vault(tpath)
             sec_dir = tpath / "sec"
             sec_dir.mkdir()
-            with self.assertRaises(te.TtsUnavailableError):
-                te.synthesize_wav_bytes("Hello world", state_dir=sec_dir)
+            spoken = None
+            try:
+                spoken = te.synthesize_wav_bytes("Hello world", state_dir=sec_dir)
+            except te.TtsUnavailableError:
+                spoken = None
+            if spoken is None:
+                self.assertIsNone(shutil.which("espeak-ng") or shutil.which("espeak"))
+            else:
+                self.assertTrue(spoken["wav_bytes"].startswith(b"RIFF"))
+                self.assertTrue(str(spoken["model_id"]).startswith("espeak"))
 
             _write_approved_atom(brain, "loopback-audio.md", claim="Kokoro synthesizes 24 kHz WAV strictly on local CPU.")
             from scripts.lexical_store import rebuild_lexical_index
