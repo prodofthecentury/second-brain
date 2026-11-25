@@ -415,13 +415,13 @@ class McpExpanded27ToolsAndNliTests(unittest.TestCase):
                 mg_r = json.loads((await _call("list_generated_media", {"project": "project:alpha"})).content[0].text)
                 self.assertGreaterEqual(len(mg_r.get("items") or []), 1)
 
-                gh_r = json.loads((await _call("git_hook_status", {"repo": str(ROOT)})).content[0].text)
-                self.assertIn("installed", gh_r)
-
                 # Init temp git repo with 1 commit -> test distill_git_commits writes only 4-experiences/ + 0-raw/inbox/
                 repo_dir = root / "sample_repo"
                 repo_dir.mkdir(parents=True, exist_ok=True)
                 subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+                gh_r = json.loads((await _call("git_hook_status", {"repo": str(repo_dir)})).content[0].text)
+                self.assertIn("installed", gh_r)
+                self.assertFalse(gh_r["installed"])
                 subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True, capture_output=True)
                 subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(repo_dir), check=True, capture_output=True)
                 (repo_dir / "README.md").write_text("Parity commit.\n", encoding="utf-8")

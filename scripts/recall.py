@@ -967,9 +967,10 @@ def candidate_has_semantic_corroboration(
     sim = cosine_distance_to_similarity(distance)
     literal_hits = len(query_terms.intersection(corroborating_terms))
     stem_hits = sum(1 for qt in query_terms if len(porter_stem(qt)) >= 4 and porter_stem(qt) in corroborating_stems)
-    if (literal_hits >= 1 or stem_hits >= 1) and sim >= 0.86:
-        return True
-    return sim >= 0.90
+    required = min(2, len(query_terms))
+    # Stems can stand in for a missing literal, but one shared word is not enough
+    # when the query has two or more meaningful terms. Vector score alone never is.
+    return (literal_hits + stem_hits) >= required and sim >= 0.86
 
 
 def wikilinks(content: str) -> list[str]:

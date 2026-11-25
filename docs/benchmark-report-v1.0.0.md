@@ -1,7 +1,7 @@
 # Second Brain `v1.0.0` — Empirical Benchmark & Live Third-Party Comparison Report
 
 **Published:** 2026-11-22  
-**Dataset:** `second-brain-retrieval-curated-90` (`v3.0.0`, SHA-256 `7fea1225d45aa1e5d24b21a8a3e6b6435ef4d54fbadd032c95ef419927defcef`, [retrieval-evaluation-proposed.json](retrieval-evaluation-proposed.json))  
+**Dataset:** `second-brain-retrieval-curated-90` (`v3.0.0`, SHA-256 `dbf9f8bcd325f2df3860c948c73c36fcbcbda6f7f495d269c52de6fc5d7c843e`, [retrieval-evaluation-proposed.json](retrieval-evaluation-proposed.json))  
 **Raw Result Artifacts:**
 - [retrieval-evaluation-results-2026-11-22.json](retrieval-evaluation-results-2026-11-22.json) — 90-case curated lexical / dense / RRF hybrid retrieval & trust-gate audit
 - [answer-evaluation-results-2026-11-22.json](answer-evaluation-results-2026-11-22.json) — Live CPU `qwen2.5-coder:7b` grounded answer & trap-abstention evaluation

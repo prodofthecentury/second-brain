@@ -25,6 +25,40 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import httpx
 import yaml
 
+_DMG_NOTARIZE_BEHAVIOR_SCRIPT = r"""
+const hookMod = require("./desktop/build/afterAllArtifactBuild.js");
+const calls = [];
+const fakeExec = (cmd, args) => { calls.push([cmd, args]); };
+const env = {
+  SIMULATED_PLATFORM: "darwin",
+  CSC_NAME: "Developer ID Application: Example",
+  APPLE_ID: "dev@example.com",
+  APPLE_APP_SPECIFIC_PASSWORD: "app-specific",
+  APPLE_TEAM_ID: "TEAMID1234",
+};
+(async () => {
+  const skipped = await hookMod.default(
+    { artifactPaths: ["dist/Second-Brain-1.0.0-universal.dmg"] },
+    {},
+    fakeExec
+  );
+  if (!skipped || calls.length !== 0) process.exit(2);
+  calls.length = 0;
+  const res = await hookMod.default(
+    { artifactPaths: ["dist/Second-Brain-1.0.0-universal.dmg"] },
+    env,
+    fakeExec
+  );
+  if (!res || res.length !== 1 || calls.length !== 4) process.exit(3);
+  const submit = calls[0];
+  if (submit[0] !== "xcrun" || submit[1][0] !== "notarytool" || submit[1][1] !== "submit") process.exit(4);
+  if (submit[1][2] !== "dist/Second-Brain-1.0.0-universal.dmg" || !submit[1].includes("--apple-id")) process.exit(5);
+  if (calls[1][1][0] !== "stapler" || calls[1][1][1] !== "staple") process.exit(6);
+  if (calls[3][0] !== "spctl") process.exit(7);
+  console.log(calls.map((c) => [c[0], ...c[1]].join(" ")).join("\n"));
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -277,32 +311,20 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
 
         hook_path = REPO_ROOT / "desktop" / "build" / "afterAllArtifactBuild.js"
         self.assertTrue(hook_path.is_file())
-        hook_src = hook_path.read_text(encoding="utf-8")
-        self.assertIn("notarytool", hook_src)
-        self.assertIn("stapler", hook_src)
-        self.assertIn("spctl", hook_src)
-        self.assertIn(".dmg", hook_src)
 
         node_bin = shutil.which("node")
         if node_bin:
             proc = subprocess.run(
-                [
-                    node_bin,
-                    "-e",
-                    (
-                        "const hook = require('./desktop/build/afterAllArtifactBuild.js').default;"
-                        "(async () => {"
-                        "  const res = await hook({ artifactPaths: ['dist/Second-Brain-1.0.0-universal.dmg'], configuration: {} });"
-                        "  if (!res || res.length !== 1) process.exit(2);"
-                        "})().catch((e) => { console.error(e); process.exit(1); });"
-                    ),
-                ],
+                [node_bin, "-e", _DMG_NOTARIZE_BEHAVIOR_SCRIPT],
                 cwd=str(REPO_ROOT),
                 capture_output=True,
                 text=True,
                 check=False,
             )
             self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+            self.assertIn("notarytool", proc.stdout)
+            self.assertIn("stapler", proc.stdout)
+            self.assertIn("spctl", proc.stdout)
 
     def test_homebrew_cask_bundle_id_and_macos_only_manifest_decoupling(self) -> None:
         from build_distribution_manifests import build_package_manager_manifests

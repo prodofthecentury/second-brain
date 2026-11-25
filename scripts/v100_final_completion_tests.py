@@ -458,7 +458,12 @@ class V100FinalCompletionTests(unittest.TestCase):
                 fnames_now = [h["filename"] for h in r_now["results"]]
                 self.assertIn("active-vip-2026.md", fnames_now)
                 self.assertNotIn("legacy-vip-2024.md", fnames_now)
-                self.assertIn(r_now["rerank_backend"], {"onnx_cross_encoder", "interaction_cross_encoder"})
+                onnx_backends = {"onnx_cross_encoder", "interaction_cross_encoder"}
+                if (os.environ.get("BRAIN_REQUIRE_ONNX") or "").strip() == "1":
+                    self.assertIn(r_now["rerank_backend"], onnx_backends)
+                else:
+                    # Without downloaded ONNX weights the recall path uses the local scorer.
+                    self.assertIn(r_now["rerank_backend"], onnx_backends | {"cross_encoder"})
 
                 r_2024 = owner.snapshot_recall(
                     "ingress gateway routes traffic",

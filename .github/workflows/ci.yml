@@ -100,6 +100,10 @@ jobs:
         run: |
           export BRAIN_VAULT_DIR="${RUNNER_TEMP}/sb-ci-vault"
           uv run --frozen second-brain install
+          # Ollama, ONNX weights, faster-whisper, PyAV, and Pillow are optional.
+          # live_runtime_integration_tests skips those cases when the dependency is
+          # absent. Set BRAIN_REQUIRE_OLLAMA=1 (or BRAIN_REQUIRE_ONNX / WHISPER / PYAV / PILLOW)
+          # only on a runner that actually has them.
           # --exclude skips only the separately-orchestrated GUI/VSIX/wheel steps below so all suites
           # (including doctor, goal4_sync_and_ui_tests, bugfix_1a_regression_tests, parity_1c_tests,
           # phase6_release_and_stores_tests, and scale_benchmark_1500) run automatically.

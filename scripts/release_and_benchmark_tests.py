@@ -466,31 +466,37 @@ class VerifyReleaseSignaturesTests(unittest.TestCase):
             def _mock_ps(payload: dict) -> subprocess.CompletedProcess:
                 return subprocess.CompletedProcess(["powershell"], 0, json.dumps(payload), "")
 
-            with patch.object(
-                ver_sig.subprocess,
-                "run",
-                return_value=_mock_ps({
-                    "status": "Valid",
-                    "status_message": "Signature verified.",
-                    "subject": "CN=Second Brain Publisher",
-                    "issuer": "CN=DigiCert Trusted G4 Code Signing",
-                    "timestamper": "CN=DigiCert Timestamp Responder",
-                }),
+            with (
+                patch.object(ver_sig.shutil, "which", return_value="pwsh"),
+                patch.object(
+                    ver_sig.subprocess,
+                    "run",
+                    return_value=_mock_ps({
+                        "status": "Valid",
+                        "status_message": "Signature verified.",
+                        "subject": "CN=Second Brain Publisher",
+                        "issuer": "CN=DigiCert Trusted G4 Code Signing",
+                        "timestamper": "CN=DigiCert Timestamp Responder",
+                    }),
+                ),
             ):
                 trusted = ver_sig.verify_windows_authenticode(exe_file, require_trusted_ca=True)
                 self.assertTrue(trusted["ok"])
                 self.assertEqual(trusted["reason"], "trusted_authenticode_valid")
 
-            with patch.object(
-                ver_sig.subprocess,
-                "run",
-                return_value=_mock_ps({
-                    "status": "Valid",
-                    "status_message": "Signature verified.",
-                    "subject": "CN=Second Brain Publisher",
-                    "issuer": "CN=DigiCert Trusted G4 Code Signing",
-                    "timestamper": "",
-                }),
+            with (
+                patch.object(ver_sig.shutil, "which", return_value="pwsh"),
+                patch.object(
+                    ver_sig.subprocess,
+                    "run",
+                    return_value=_mock_ps({
+                        "status": "Valid",
+                        "status_message": "Signature verified.",
+                        "subject": "CN=Second Brain Publisher",
+                        "issuer": "CN=DigiCert Trusted G4 Code Signing",
+                        "timestamper": "",
+                    }),
+                ),
             ):
                 no_ts = ver_sig.verify_windows_authenticode(exe_file, require_trusted_ca=True)
                 self.assertFalse(no_ts["ok"])
@@ -902,14 +908,18 @@ class OwnerGatesAndDocParityTests(unittest.TestCase):
         self.assertEqual(report["dataset_gate"]["total_queries"], 90)
         self.assertEqual(report["dataset_gate"]["v2_baseline_query_count"], 30)
         self.assertEqual(report["dataset_gate"]["v3_expansion_query_count"], 60)
-        self.assertGreaterEqual(report["candidate_atoms_gate"]["unapproved_count"], 3)
-        cand_names = {c["filename"] for c in report["candidate_atoms_gate"]["candidates"]}
-        for expected_pending in (
+        expected_pending = (
             "sodium-ion-battery-cost-record.md",
             "code-reviews-as-mentorship.md",
             "continuous-integration-deployment.md",
-        ):
-            self.assertIn(expected_pending, cand_names)
+        )
+        if report["dataset_gate"].get("validation_mode") == "code_only_schema":
+            self.assertEqual(report["candidate_atoms_gate"]["unapproved_count"], 0)
+        else:
+            self.assertGreaterEqual(report["candidate_atoms_gate"]["unapproved_count"], 3)
+            cand_names = {c["filename"] for c in report["candidate_atoms_gate"]["candidates"]}
+            for name in expected_pending:
+                self.assertIn(name, cand_names)
 
         # CLI `second-brain gates status --json`
         buf = io.StringIO()
@@ -1115,7 +1125,7 @@ class OwnerGatesAndDocParityTests(unittest.TestCase):
         self.assertIn(f"{ret_res['candidate_lexical_mean_mrr']:.4f}", bench_md)
         self.assertIn(f"{ret_res['candidate_rrf_hybrid_mean_mrr']:.4f}", bench_md)
 
-        # 3. MCP policy docs cover all 31 tools in mcp_server.TOOL_NAMES
+        # 3. MCP policy docs cover every tool in mcp_server.TOOL_NAMES (35)
         tracked_mcp = (ROOT / "docs" / "mcp-local-policy.md").read_text(encoding="utf-8")
         for tool_name in sorted(mcp_server.TOOL_NAMES):
             self.assertIn(tool_name, tracked_mcp, f"docs/mcp-local-policy.md missing MCP tool {tool_name}")

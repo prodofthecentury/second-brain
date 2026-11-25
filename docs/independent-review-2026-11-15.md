@@ -1,3 +1,5 @@
+> **Not an independent review.** This note was written by the same automated process that produced the code. It is a self-check, not an external audit.
+
 # Independent Adversarial Architecture & Security Audit — Reconciliation Report (2026-11-15)
 
 **Auditor Session:** Isolated Read-Only `research` Subagent (`2a4e3faa-6244-4b81-8c9d-2b6e8a184782`)  

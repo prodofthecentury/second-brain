@@ -1200,7 +1200,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
             )
             self.assertEqual(probe.stdout.strip(), "1.0.0")
 
-        # 4. Exact parameter parity between SKILL.md and scripts/mcp_server.py inputSchema across all 27 tools
+        # 4. Exact parameter parity between SKILL.md and scripts/mcp_server.py inputSchema across every TOOL_NAMES entry
         mcp_src = (REPO_ROOT / "scripts" / "mcp_server.py").read_text(encoding="utf-8")
         mcp_tree = ast.parse(mcp_src)
         mcp_schemas: dict[str, set[str]] = {}

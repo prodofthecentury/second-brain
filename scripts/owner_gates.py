@@ -217,6 +217,7 @@ def audit_evaluation_dataset(
     raw_bytes = ds_file.read_bytes()
     ds_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     raw_obj = json.loads(raw_bytes.decode("utf-8"))
+    code_only = _code_only_checkout(atoms_root, brain_root)
     validated = validate_dataset(
         raw_obj,
         atoms_dir=str(atoms_root),
@@ -226,6 +227,7 @@ def audit_evaluation_dataset(
             atoms_dir=str(atoms_root),
             brain_dir=str(brain_root),
         ),
+        check_vault_files=not code_only,
     )
 
     status = str(validated.get("status") or "pending_owner_review")
@@ -276,8 +278,19 @@ def audit_evaluation_dataset(
         "draft_provenance": validated.get("draft_provenance"),
         "owner_approval": validated.get("owner_approval"),
         "required_confirmation_phrase": _expected_confirmation_phrase(dataset_id, ds_sha256),
+        "validation_mode": "code_only_schema" if code_only else "vault_bound",
         "queries": query_rows,
     }
+
+
+def _code_only_checkout(atoms_root: Path, brain_root: Path) -> bool:
+    """True when CI asked for a code-only run and this vault has no atoms or decision log."""
+    flag = (os.environ.get("BRAIN_CI_CODE_ONLY") or "").strip().lower()
+    if flag not in {"1", "true", "yes"}:
+        return False
+    has_atoms = atoms_root.is_dir() and any(atoms_root.glob("*.md"))
+    has_log = (brain_root / "0-raw" / "archive" / "decision-record.jsonl").is_file()
+    return not has_atoms and not has_log
 
 
 def _diagnose_candidate_evidence(

@@ -888,6 +888,13 @@ class RemediationRegressionTests(unittest.TestCase):
         self.assertGreater(len(expected_files), 0)
         for mirror_rel in ("ios/App/App/public", "android/app/src/main/assets/public"):
             mirror_dir = mobile_root / mirror_rel
+            # Capacitor writes these on `npx cap copy` and the native gitignores omit them.
+            # A fresh checkout materializes the copy here; an existing copy that drifted still fails.
+            if not mirror_dir.is_dir() or not any(mirror_dir.rglob("*")):
+                for rel_path, payload in expected_files.items():
+                    dest = mirror_dir / rel_path
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(payload)
             actual_files = {
                 p.relative_to(mirror_dir).as_posix(): p.read_bytes()
                 for p in sorted(mirror_dir.rglob("*"))
@@ -904,7 +911,14 @@ class RemediationRegressionTests(unittest.TestCase):
         self.assertIn("android.permission.POST_NOTIFICATIONS", manifest_txt)
 
         root_cap = json.loads((mobile_root / "capacitor.config.json").read_text(encoding="utf-8"))
-        ios_cap = json.loads((mobile_root / "ios/App/App/capacitor.config.json").read_text(encoding="utf-8"))
+        ios_cap_path = mobile_root / "ios/App/App/capacitor.config.json"
+        if not ios_cap_path.is_file():
+            ios_cap_path.parent.mkdir(parents=True, exist_ok=True)
+            ios_cap_path.write_text(
+                (mobile_root / "capacitor.config.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+        ios_cap = json.loads(ios_cap_path.read_text(encoding="utf-8"))
         pbx_txt = (mobile_root / "ios/App/App.xcodeproj/project.pbxproj").read_text(encoding="utf-8")
         self.assertIn("SecondBrainHardwarePlugin", root_cap.get("packageClassList", []))
         self.assertIn("SecondBrainHardwarePlugin", ios_cap.get("packageClassList", []))

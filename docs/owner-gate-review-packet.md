@@ -10,7 +10,7 @@
 |---|---|---|---|
 | Track 3 SLO #1 | Tier-2 8-thread CPU answer P95 SLO (`35.0 s` -> `45.0 s` in `scripts/hardware_profile.py`) | Measured `23.627 s` P50 / `36.454 s` P95 / `36.886 s` max idle (`100%` quality gate); **pending owner sign-off** | `uv run --locked second-brain gates approve-slo --actor <owner>` (phrase: `APPROVE SLO 35000->45000 1d6b80db2d4e`) |
 | Track 3 SLO #2 | 300-atom ONNX Cross-Encoder + crypto validation P95 variance vs `15.0 ms` | P50 `3.691–5.167 ms`, 5-run P95 `20.238 / 22.039 / 24.224 / 31.634 / 29.064 ms` (median `24.224 ms`, `100%` recall, `0%` trap leak); **pending owner acceptance of Windows NTFS `lstat` tail** | Signed off together via `uv run --locked second-brain gates approve-slo --actor <owner>` |
-| Track 4 Dataset | `second-brain-retrieval-curated-90` (`v3.0.0`) `60` agent-drafted expansion queries (`30` `v2.1.0` baseline already approved) | `pending_owner_review` · SHA-256 `7fea1225d45aa1e5d24b21a8a3e6b6435ef4d54fbadd032c95ef419927defcef` | `uv run --locked second-brain gates approve-dataset --actor <owner>` (phrase: `APPROVE second-brain-retrieval-curated-90 7fea1225d45a`) |
+| Track 4 Dataset | `second-brain-retrieval-curated-90` (`v3.0.0`) `60` agent-drafted expansion queries (`30` `v2.1.0` baseline already approved) | `pending_owner_review` · SHA-256 `dbf9f8bcd325f2df3860c948c73c36fcbcbda6f7f495d269c52de6fc5d7c843e` | `uv run --locked second-brain gates approve-dataset --actor <owner>` (phrase: `APPROVE second-brain-retrieval-curated-90 dbf9f8bcd325`) |
 | 1F Candidate Atoms | `3` unapproved 1F fixture atoms (+ `23` live refined candidate atoms) | `pending` / `missing` primary source anchors (`sodium-ion-battery-cost-record.md`, `code-reviews-as-mentorship.md`, `continuous-integration-deployment.md`) | Option A: Keep pending as adversarial trap fixtures (recommended). Option B: Provide primary source & approve via CAS. |
 
 ---
@@ -49,7 +49,7 @@ uv run --locked second-brain gates approve-slo --actor <owner>
 ## 2. Track 4 — Curated Benchmark Dataset `v3.0.0` (`60` Pending Queries)
 
 - **Dataset File:** `docs/retrieval-evaluation-proposed.json` (`id=second-brain-retrieval-curated-90`, `version=3.0.0`, `status=pending_owner_review`)
-- **Exact File SHA-256:** `7fea1225d45aa1e5d24b21a8a3e6b6435ef4d54fbadd032c95ef419927defcef`
+- **Exact File SHA-256:** `dbf9f8bcd325f2df3860c948c73c36fcbcbda6f7f495d269c52de6fc5d7c843e`
 - **Baseline Cohort (`v2.1.0`, Owner-Approved 2026-11-08):** `30` queries (always already owner-approved; IDs: `pos_logging_traceability_01..pos_outage_design_tenet_10`, `pref_host_offline_target_26..pref_deployment_cadence_30`, `multi_observability_pipeline_41..multi_resilience_and_observability_45`, `trap_favorite_battery_66..trap_unapproved_ci_deployment_75`).
 - **Pending Cohort (`v3.0.0`, Agent-Drafted Expansion):** `60` queries across splits `{'development': 20, 'holdout': 19, 'regression': 21}` and answerability `{'answerable': 15, 'exploratory': 20, 'preference': 10, 'unanswerable': 15}`.
 
@@ -57,7 +57,7 @@ uv run --locked second-brain gates approve-slo --actor <owner>
 
 ```powershell
 uv run --locked second-brain gates approve-dataset --actor <owner>
-# When prompted at the interactive human TTY, type: APPROVE second-brain-retrieval-curated-90 7fea1225d45a
+# When prompted at the interactive human TTY, type: APPROVE second-brain-retrieval-curated-90 dbf9f8bcd325
 ```
 
 ### 2.2 Complete 60-Query Pending Expansion Table (`v3.0.0`)
