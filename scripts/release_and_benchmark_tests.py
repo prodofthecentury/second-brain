@@ -1118,7 +1118,8 @@ class OwnerGatesAndDocParityTests(unittest.TestCase):
             self.assertEqual(cm.exception.code, 0, f"`second-brain {' '.join(tokens)} --help` exited {cm.exception.code}")
 
         # 2. Benchmark report SHA-256 & retrieval metrics match JSON artifacts verbatim
-        ds_sha = hashlib.sha256((ROOT / "docs" / "retrieval-evaluation-proposed.json").read_bytes()).hexdigest()
+        dataset_bytes = (ROOT / "docs" / "retrieval-evaluation-proposed.json").read_bytes().replace(b"\r\n", b"\n")
+        ds_sha = hashlib.sha256(dataset_bytes).hexdigest()
         bench_md = (ROOT / "docs" / "benchmark-report-v1.0.0.md").read_text(encoding="utf-8")
         self.assertIn(ds_sha, bench_md)
         ret_res = json.loads((ROOT / "docs" / "retrieval-evaluation-results-2026-11-22.json").read_text(encoding="utf-8"))

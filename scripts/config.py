@@ -71,12 +71,15 @@ def _is_immutable_darwin_root_symlink(path: Path | str) -> bool:
     """Return True only for macOS SIP-protected root compatibility symlinks (/var, /tmp, /etc)."""
     if sys.platform != "darwin":
         return False
-    raw = str(path)
+    raw = os.path.abspath(os.fspath(path)).rstrip("/") or "/"
     expected = _DARWIN_SYSTEM_SYMLINKS.get(raw)
     if not expected:
         return False
     try:
-        return os.readlink(raw).lstrip("/") == expected
+        if not stat.S_ISLNK(os.lstat(raw).st_mode):
+            return False
+        # realpath follows the symlink. /var must land on /private/var, not an arbitrary target.
+        return os.path.realpath(raw).rstrip("/") == "/" + expected
     except OSError:
         return False
 
