@@ -146,6 +146,25 @@ MAX_VERIFIED = 6
 MAX_NOTES = 4
 NOTE_EXCERPT_CHARS = 700
 KEEP_ALIVE = "30m"
+
+
+def _ollama_keep_alive() -> str:
+    from scripts.ollama_endpoint import ollama_keep_alive
+
+    return ollama_keep_alive()
+
+
+def _ollama_client_host(rule) -> str:
+    """Use BRAIN_OLLAMA_HOST when it is set; otherwise keep the policy endpoint."""
+    from scripts.host_adapters import HostConsentError
+    from scripts.ollama_endpoint import ollama_host_warning, resolved_ollama_base_url
+
+    base, source = resolved_ollama_base_url()
+    if source == "BRAIN_OLLAMA_HOST":
+        if not base:
+            raise HostConsentError(ollama_host_warning() or "BRAIN_OLLAMA_HOST was refused")
+        return base
+    return str(rule.endpoint_url)
 CITATION_RE = re.compile(r"\[([VNP])(\d+)\]")
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Za-z0-9\"'(\[])")
 _STREAM_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n")
@@ -405,7 +424,7 @@ def default_stream_fn(endpoint: str) -> StreamFn:
             model=model,
             messages=[{"role": "user", "content": prompt}],
             stream=True,
-            keep_alive=KEEP_ALIVE,
+            keep_alive=_ollama_keep_alive(),
             options={"temperature": 0.2, "num_predict": 512},
         )
         for part in stream_iter:
@@ -427,7 +446,7 @@ def default_json_fn(endpoint: str) -> JsonFn:
             model=model,
             messages=[{"role": "user", "content": prompt}],
             format=schema,
-            keep_alive=KEEP_ALIVE,
+            keep_alive=_ollama_keep_alive(),
             options={"temperature": 0, "num_predict": 64},
         )
         return strip_reasoning_think_blocks(str(resp["message"]["content"])) or "{}"
@@ -437,7 +456,7 @@ def default_json_fn(endpoint: str) -> JsonFn:
 
 def _provider_json_fn(rule: HostSharingRule, *, http_transport: Any = None, pinned_target: Any = None) -> JsonFn:
     if rule.provider == "ollama" and http_transport is None:
-        return default_json_fn(rule.endpoint_url)
+        return default_json_fn(_ollama_client_host(rule))
 
     def _json(prompt: str, model: str, schema: dict) -> str:
         return _invoke_provider_draft(
@@ -455,7 +474,7 @@ def _provider_json_fn(rule: HostSharingRule, *, http_transport: Any = None, pinn
 
 def _provider_stream_fn(rule: HostSharingRule, *, http_transport: Any = None, pinned_target: Any = None) -> StreamFn:
     if rule.provider == "ollama" and http_transport is None:
-        return default_stream_fn(rule.endpoint_url)
+        return default_stream_fn(_ollama_client_host(rule))
 
     def _stream(prompt: str, model: str) -> Iterator[str]:
         yield from invoke_provider_stream(
@@ -477,8 +496,8 @@ def warmup(policy_path: Path | None = None) -> dict[str, object]:
     import ollama
 
     t0 = time.perf_counter()
-    ollama.Client(host=rule.endpoint_url, timeout=120.0, follow_redirects=False, trust_env=False).generate(
-        model=model, prompt="", keep_alive=KEEP_ALIVE
+    ollama.Client(host=_ollama_client_host(rule), timeout=120.0, follow_redirects=False, trust_env=False).generate(
+        model=model, prompt="", keep_alive=_ollama_keep_alive()
     )
     return {"model": model, "warmup_ms": round((time.perf_counter() - t0) * 1000, 1)}
 

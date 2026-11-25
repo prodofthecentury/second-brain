@@ -9,7 +9,9 @@ import hashlib
 import inspect
 import math
 import os
+import sqlite3
 import sys
+import threading
 import types
 
 try:
@@ -68,6 +70,33 @@ def _resolve_local_ollama_rule_and_url() -> tuple[HostSharingRule, str]:
     rule = policies.get("ollama_local")
     if rule is None or not rule.enabled:
         raise HostConsentError("Local Ollama host 'ollama_local' is disabled by host sharing policy.")
+
+    remote = (os.environ.get("BRAIN_OLLAMA_HOST") or "").strip()
+    if remote:
+        from scripts.ollama_endpoint import private_or_loopback_ollama_url
+
+        base = private_or_loopback_ollama_url(remote)
+        if not base:
+            raise HostConsentError(
+                "BRAIN_OLLAMA_HOST must be an http:// loopback or private LAN address. "
+                "Public hosts, link-local addresses, and credentialed URLs are refused. "
+                f"Got {remote!r}."
+            )
+        effective_rule = HostSharingRule(
+            host_id=rule.host_id,
+            provider="ollama",
+            transport="local",
+            endpoint_url=base,
+            default_model=rule.default_model,
+            api_key_env=rule.api_key_env,
+            enabled=rule.enabled,
+            allowed_projects=rule.allowed_projects,
+            allow_unscoped_atoms=rule.allow_unscoped_atoms,
+            allow_preference_atoms=rule.allow_preference_atoms,
+            redact_pii=rule.redact_pii,
+            fail_on_secret_detection=rule.fail_on_secret_detection,
+        )
+        return effective_rule, base
 
     env_host = (os.environ.get("OLLAMA_HOST") or "").strip()
     raw_endpoint = (env_host or rule.endpoint_url or "http://127.0.0.1:11434").strip().rstrip("/")
@@ -351,6 +380,107 @@ def chat_with_fallback(messages: list[dict], model: str | None = None, **kwargs)
     raise RuntimeError("All generation models failed: " + " | ".join(errors))
 
 
+_EMBED_CACHE_LOCK = threading.Lock()
+
+
+def _embed_cache_path():
+    if (os.environ.get("BRAIN_EMBED_CACHE") or "1").strip().lower() in {"0", "false", "off", "no"}:
+        return None
+    override = (os.environ.get("BRAIN_EMBED_CACHE_PATH") or "").strip()
+    if override:
+        from pathlib import Path
+
+        return Path(override).expanduser()
+    from scripts.config import security_state_dir
+
+    return security_state_dir() / "embed-cache.sqlite3"
+
+
+def _embed_cache_connect():
+    path = _embed_cache_path()
+    if path is None:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=2.0)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS embeddings (
+            model TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            vector TEXT NOT NULL,
+            PRIMARY KEY (model, content_sha256)
+        )
+        """
+    )
+    return conn
+
+
+def _embed_cache_get(model_name: str, digest: str) -> list[float] | None:
+    try:
+        with _EMBED_CACHE_LOCK:
+            conn = _embed_cache_connect()
+            if conn is None:
+                return None
+            try:
+                row = conn.execute(
+                    "SELECT vector FROM embeddings WHERE model = ? AND content_sha256 = ?",
+                    (model_name, digest),
+                ).fetchone()
+            finally:
+                conn.close()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    import json
+
+    try:
+        parsed = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, list) or not parsed:
+        return None
+    if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in parsed):
+        return None
+    return [float(value) for value in parsed]
+
+
+def _embed_cache_put(model_name: str, digest: str, embedding: list[float]) -> None:
+    import json
+
+    try:
+        with _EMBED_CACHE_LOCK:
+            conn = _embed_cache_connect()
+            if conn is None:
+                return
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO embeddings (model, content_sha256, vector) VALUES (?, ?, ?)",
+                    (model_name, digest, json.dumps(embedding)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        return
+
+
+def _call_with_keep_alive(fn, kwargs: dict):
+    from scripts.ollama_endpoint import ollama_keep_alive
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return fn(**kwargs)
+    accepts = "keep_alive" in params or any(
+        item.kind == inspect.Parameter.VAR_KEYWORD for item in params.values()
+    )
+    if accepts:
+        kwargs = dict(kwargs)
+        kwargs["keep_alive"] = ollama_keep_alive()
+    return fn(**kwargs)
+
+
 def embed_text(text: str, model: str | None = None) -> list[float]:
     """Return one validated embedding or fail without substituting a fake vector."""
     model_name = model or EMBED_MODEL
@@ -364,21 +494,33 @@ def embed_text(text: str, model: str | None = None) -> list[float]:
         )
         outbound_text = report.sanitized_text
 
+    digest = hashlib.sha256(outbound_text.encode("utf-8")).hexdigest()
+    cached = _embed_cache_get(model_name, digest)
+    if cached is not None:
+        return cached
+
     try:
         if _is_monkeypatched_ollama_fn(ollama.embed, _DEFAULT_OLLAMA_EMBED):
-            response = ollama.embed(model=model_name, input=outbound_text)
+            response = _call_with_keep_alive(
+                ollama.embed, {"model": model_name, "input": outbound_text}
+            )
         else:
             if getattr(ollama, "Client", None) is None:
                 raise EmbeddingUnavailableError(
                     "Python 'ollama' package is not installed; install 'second-brain[dense]' for dense embeddings."
                 )
+            from scripts.ollama_endpoint import ollama_timeout_seconds
+
             client = ollama.Client(
                 host=base_url,
-                timeout=60.0,
+                timeout=min(60.0, ollama_timeout_seconds()),
                 follow_redirects=False,
                 trust_env=False,
             )
-            response = client.embed(model=model_name, input=outbound_text)
+            response = _call_with_keep_alive(
+                client.embed,
+                {"model": model_name, "input": outbound_text},
+            )
         embeddings = response["embeddings"]
         embedding = embeddings[0]
     except (HostConsentError, OutboundSecretBlockedError, PermissionError):
@@ -396,7 +538,9 @@ def embed_text(text: str, model: str | None = None) -> list[float]:
         raise EmbeddingUnavailableError(
             f"Embedding model {model_name!r} returned an invalid embedding response."
         )
-    return [float(value) for value in embedding]
+    result = [float(value) for value in embedding]
+    _embed_cache_put(model_name, digest, result)
+    return result
 
 
 def embedding_metadata(

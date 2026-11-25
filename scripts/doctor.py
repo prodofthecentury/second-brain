@@ -348,20 +348,43 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     else:
         checks.append(warn("approved memories", "No atom has current verifiable owner approval; recall will return no memories"))
 
-    ollama_base = loopback_ollama_base_url()
-    models_payload = fetch_json(f"{ollama_base}/api/tags") if ollama_base else None
-    if ollama_base is None:
-        checks.append(warn("ollama", "OLLAMA_HOST is not bound to http://127.0.0.1; remote Ollama probe refused for safety"))
-        names = set()
-        vision_names = set()
-    elif models_payload is None:
-        checks.append(warn("ollama", "Ollama is not reachable; local lexical recall remains available, generation and dense indexing are unavailable"))
-        names = set()
-        vision_names = set()
+    from scripts.ollama_endpoint import fetch_ollama_tags, ollama_host_warning, resolved_ollama_base_url
+
+    resolved_base, ollama_source = resolved_ollama_base_url()
+    host_warning = ollama_host_warning()
+    if ollama_source == "BRAIN_OLLAMA_HOST":
+        if host_warning and resolved_base:
+            checks.append(warn("ollama host", host_warning))
+        if resolved_base is None:
+            checks.append(warn("ollama", host_warning or "BRAIN_OLLAMA_HOST is not loopback or a private LAN address"))
+            names = set()
+            vision_names = set()
+            models_payload = None
+        else:
+            models_payload = fetch_ollama_tags(resolved_base, timeout=3.0)
+            if models_payload is None:
+                checks.append(warn("ollama", f"Ollama at {resolved_base} did not answer within 3 seconds"))
+                names = set()
+                vision_names = set()
+            else:
+                names = model_names(models_payload)
+                vision_names = vision_model_names(models_payload)
+                checks.append(ok("ollama", f"Ollama at {resolved_base} returned {len(models_payload.get('models', []))} model(s)"))
     else:
-        names = model_names(models_payload)
-        vision_names = vision_model_names(models_payload)
-        checks.append(ok("ollama", f"Ollama returned {len(models_payload.get('models', []))} model(s)"))
+        ollama_base = loopback_ollama_base_url()
+        models_payload = fetch_json(f"{ollama_base}/api/tags") if ollama_base else None
+        if ollama_base is None:
+            checks.append(warn("ollama", "OLLAMA_HOST is not bound to http://127.0.0.1; remote Ollama probe refused for safety"))
+            names = set()
+            vision_names = set()
+        elif models_payload is None:
+            checks.append(warn("ollama", "Ollama is not reachable; local lexical recall remains available, generation and dense indexing are unavailable"))
+            names = set()
+            vision_names = set()
+        else:
+            names = model_names(models_payload)
+            vision_names = vision_model_names(models_payload)
+            checks.append(ok("ollama", f"Ollama returned {len(models_payload.get('models', []))} model(s)"))
 
     active_gen_model = resolve_active_local_generation_model(fallback=GEN_MODEL)
     for label, model in [("generation model", active_gen_model), ("embedding model", EMBED_MODEL)]:

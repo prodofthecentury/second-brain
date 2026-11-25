@@ -47,6 +47,7 @@ from scripts.host_adapters import (
 )
 from scripts.index_manifest import load_index_manifest
 from scripts.lexical_store import lexical_index_is_current
+from scripts.ollama_endpoint import ollama_keep_alive
 from scripts.ollama_utils import _DEFAULT_OLLAMA_CHAT, _is_monkeypatched_ollama_fn, _resolve_local_ollama_rule_and_url, ollama_base_url
 from scripts.recall import RecallOptions, search_memory
 
@@ -255,7 +256,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                 messages=[{"role": "user", "content": 'Return {"claims":[]}.'}],
                 format=ANSWER_DRAFT_SCHEMA,
                 options=cpu_eval_options,
-                keep_alive="10m",
+                keep_alive=ollama_keep_alive(),
                 stream=False,
             )
         except Exception:
@@ -319,7 +320,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                         messages=[{"role": "user", "content": redaction.sanitized_text}],
                         format=ANSWER_DRAFT_SCHEMA,
                         options=cpu_eval_options,
-                        keep_alive="10m",
+                        keep_alive=ollama_keep_alive(),
                         stream=False,
                     )
                 raw_content = strip_reasoning_think_blocks(str(response["message"]["content"])) or "{}"

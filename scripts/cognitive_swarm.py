@@ -527,7 +527,17 @@ def run_ollama_cited_debate(
             "rounds": [],
             "model": model or "",
         }
-    host = (base_url or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
+    if base_url:
+        host = str(base_url).rstrip("/")
+    elif (os.environ.get("BRAIN_OLLAMA_HOST") or "").strip():
+        from scripts.ollama_endpoint import ollama_host_warning, resolved_ollama_base_url
+
+        resolved, _source = resolved_ollama_base_url()
+        if not resolved:
+            raise SwarmRuntimeError(ollama_host_warning() or "BRAIN_OLLAMA_HOST was refused")
+        host = resolved
+    else:
+        host = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
     chosen = (model or os.environ.get("BRAIN_OLLAMA_DEBATE_MODEL") or "qwen2.5:0.5b").strip()
     timeout = max(5.0, min(180.0, float(timeout_seconds)))
     catalog = ""
