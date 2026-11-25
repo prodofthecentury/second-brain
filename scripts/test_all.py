@@ -161,6 +161,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "honesty_regression_tests.py")),
     ),
     (
+        "advanced_module_behavior_tests",
+        "Behaviour checks for optional advanced modules (orchestrator, proofs, sandbox, tunnel, LoRA, world model, TTS, video, screen, curiosity, skill packs)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "advanced_module_behavior_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),
