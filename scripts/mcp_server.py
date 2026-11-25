@@ -76,6 +76,7 @@ from config import (
     RAW_DIR,
     THREADS_DIR,
     _is_reparse_or_link,
+    is_untrusted_reparse_or_link,
     is_content_markdown,
     normalize_markdown_filename,
     now_slug,
@@ -244,7 +245,7 @@ def _effective_mcp_paths() -> tuple[str, str, str, str]:
 def _assert_no_symlink_ancestors(target: Path) -> None:
     cur = Path(os.path.abspath(str(target)))
     while True:
-        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+        if is_untrusted_reparse_or_link(str(cur)):
             raise PermissionError(f"Refusing to access MCP security path through a symlink or reparse point: {cur}")
         parent = cur.parent
         if parent == cur:

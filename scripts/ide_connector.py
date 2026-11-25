@@ -37,7 +37,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import _is_reparse_or_link  # noqa: E402
+from config import _is_reparse_or_link, is_untrusted_reparse_or_link  # noqa: E402
 from host_adapters import restrict_security_file_permissions  # noqa: E402
 
 SERVER_KEY = "second-brain"
@@ -174,7 +174,7 @@ def _assert_no_symlink_chain(path: Path, *, stop_at: Path | None = None) -> None
     stop_norm = os.path.normcase(os.path.abspath(str(stop_at))) if stop_at is not None else None
     cur = Path(os.path.abspath(str(path)))
     while True:
-        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+        if is_untrusted_reparse_or_link(str(cur)):
             raise PermissionError(f"Refusing to access host path through symlink or junction: {cur}")
         if stop_norm is not None and os.path.normcase(str(cur)) == stop_norm:
             break

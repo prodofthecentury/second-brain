@@ -47,7 +47,7 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import atomic_write_bytes, invalidate_decision_log_cache, review_lock  # noqa: E402
-from config import _is_reparse_or_link, resolve_active_brain_dir  # noqa: E402
+from config import _is_reparse_or_link, is_untrusted_reparse_or_link, resolve_active_brain_dir  # noqa: E402
 from host_adapters import restrict_security_file_permissions  # noqa: E402
 from index_manifest import invalidate_atom_revision_cache  # noqa: E402
 from lexical_store import rebuild_lexical_index  # noqa: E402
@@ -122,7 +122,7 @@ class VaultBackupSecurityError(PermissionError):
 def _assert_no_symlink_ancestors(path: Path, *, stop_at: Path | None = None) -> None:
     stop_res = stop_at.resolve() if (stop_at is not None and stop_at.exists()) else None
     for cur in (path, *path.parents):
-        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+        if is_untrusted_reparse_or_link(str(cur)):
             raise VaultBackupSecurityError(f"Refusing to access backup/vault path via symlink or reparse point: {cur}")
         if stop_res is not None and cur == stop_res:
             break

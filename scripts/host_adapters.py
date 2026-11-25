@@ -270,7 +270,8 @@ def restrict_security_file_permissions(path: Path | str) -> None:
             if not parent_is_link and parent.exists():
                 os.chmod(parent, 0o700)
             if path.exists():
-                os.chmod(path, 0o600)
+                # A directory without the owner execute bit cannot hold a lock file.
+                os.chmod(path, 0o700 if path.is_dir() else 0o600)
             return
         icacls_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
         if not os.path.exists(icacls_exe):

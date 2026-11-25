@@ -49,7 +49,7 @@ from filelock import FileLock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import content_sha256, review_lock  # noqa: E402
-from config import _is_reparse_or_link, resolve_active_brain_dir, safe_file_in_dir, security_state_dir  # noqa: E402
+from config import _is_reparse_or_link, is_untrusted_reparse_or_link, resolve_active_brain_dir, safe_file_in_dir, security_state_dir  # noqa: E402
 from host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions  # noqa: E402
 from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
 from memory_format import normalize_temporal_bound_str  # noqa: E402
@@ -102,7 +102,7 @@ def _b64url_decode(raw: str) -> bytes:
 def _assert_no_symlinks(path: Path, *, stop_at: Path | None = None) -> None:
     stop_resolved = stop_at.resolve() if stop_at is not None and stop_at.exists() else None
     for cur in (path, *path.parents):
-        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+        if is_untrusted_reparse_or_link(str(cur)):
             raise InboxDropSecurityError(f"Refusing to access inbox-drop state via symlink/reparse point: {cur}")
         if stop_resolved is not None and cur == stop_resolved:
             break

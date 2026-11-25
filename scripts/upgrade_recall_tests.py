@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 import sys
 import tempfile
@@ -303,6 +304,63 @@ class UpgradeRecallTests(unittest.TestCase):
         self.assertEqual(summary["trap_leakage"], 0)
         self.assertEqual(summary["model_ms_p50"], 10.0)
         self.assertEqual(summary["json_fn_runs"], 1)
+
+
+class SecurityPathTests(unittest.TestCase):
+    def test_restricted_directory_keeps_execute_and_accepts_a_lock_file(self) -> None:
+        from host_adapters import restrict_security_file_permissions
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sec"
+            models = root / "models"
+            models.mkdir(parents=True)
+            token = root / "mcp-token"
+            token.write_text("token", encoding="utf-8")
+            restrict_security_file_permissions(root)
+            restrict_security_file_permissions(models)
+            restrict_security_file_permissions(token)
+            lock = models / ".models.lock"
+            lock.write_text("ok", encoding="utf-8")
+            self.assertTrue(lock.is_file())
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(models.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(token.stat().st_mode), 0o600)
+
+    def test_planted_symlink_stays_blocked_and_os_alias_does_not(self) -> None:
+        import mcp_server
+        from config import is_untrusted_reparse_or_link
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real"
+            real.mkdir()
+            planted = root / "planted"
+            planted.symlink_to(real, target_is_directory=True)
+            with self.assertRaises(PermissionError):
+                mcp_server._assert_no_symlink_ancestors(planted / "mcp-token")
+            plain = root / "plain"
+            plain.mkdir()
+            mcp_server._assert_no_symlink_ancestors(plain / "mcp-token")
+
+        with (
+            patch("config.sys.platform", "darwin"),
+            patch("config._is_reparse_or_link", return_value=True),
+            patch("config.os.path.realpath", return_value="/private/var"),
+        ):
+            self.assertFalse(is_untrusted_reparse_or_link("/var"))
+        with (
+            patch("config.sys.platform", "darwin"),
+            patch("config._is_reparse_or_link", return_value=True),
+            patch("config.os.path.realpath", return_value="/tmp/elsewhere"),
+        ):
+            self.assertTrue(is_untrusted_reparse_or_link("/var"))
+        with (
+            patch("config.sys.platform", "darwin"),
+            patch("config._is_reparse_or_link", return_value=True),
+            patch("config.os.path.realpath", return_value="/private/var/folders/xx"),
+        ):
+            self.assertTrue(is_untrusted_reparse_or_link("/var/folders/xx"))
 
 
 if __name__ == "__main__":
