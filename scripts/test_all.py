@@ -172,6 +172,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "real_runtime_tests.py")),
     ),
     (
+        "speed_restore_tests",
+        "Embedding cache, job queue, personal eval, remote Ollama host policy, and one-command restore",
+        ("-m", "unittest", str(SCRIPTS_DIR / "speed_restore_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),

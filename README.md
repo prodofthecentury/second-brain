@@ -38,6 +38,39 @@ This repository does not ship a personal daily-use vault. `brain/` is gitignored
 | cloudflared and tailscale | The advanced workflow runs `--version`. It does not open an authenticated tunnel. That needs owner credentials. |
 | Code sandbox, ledger, creative media | Already covered by the main suite. A GPU diffusion backend is not installed. |
 
+## Speed, retrieval, remote models, and backups
+
+Chat tokens already stream from `POST /v1/chat/stream`. The Streamlit dashboard paints each token into the reply, and the Electron app does the same through `window.secondBrain.streamChat` (`desktop/renderer/chat_send.js`). MCP tools still return one JSON result. The protocol used here has no token stream, so `search_memory` and `run_debate` are unchanged.
+
+`BRAIN_OLLAMA_KEEP_ALIVE` (or `OLLAMA_KEEP_ALIVE`) is sent on Ollama chat and embed calls. The default is `30m`. Values that are not `-1` or a number plus `s`, `m`, or `h` fall back to `30m`. `BRAIN_OLLAMA_TIMEOUT` defaults to 120 seconds and is capped at 600. Doctor's reachability probe uses 3 seconds.
+
+`OLLAMA_HOST` is still loopback only. A laptop can use Ollama on another machine by setting `BRAIN_OLLAMA_HOST` to an `http://` address on loopback or a private LAN range (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, or a private IPv6 address). Link-local addresses, including `169.254.169.254`, and public hosts are refused. Doctor prints a warning when the host is a private LAN address, because vault text is sent to that other machine. `BRAIN_GEN_MODEL=hermes3:8b` selects that model with no code change. Pull it on the machine that runs Ollama (`ollama pull hermes3:8b`). Chat, grounded answers, and the dashboard use that setting. MCP does not call the generator itself.
+
+Embeddings are cached in SQLite by the model name and the SHA-256 of the text actually sent (after any redaction). Set `BRAIN_EMBED_CACHE=0` to turn the cache off, or `BRAIN_EMBED_CACHE_PATH` to move the file. A second embed of the same text does not call Ollama. This environment has no Ollama daemon, so the measured numbers below are local stand-ins, not model latency.
+
+`second-brain capture --background` and `second-brain ingest --background` enqueue work and return. `second-brain jobs work` runs the queue. The database is `jobs.sqlite3` under the security-state directory (`BRAIN_JOB_QUEUE` overrides it). A job left in `running` is marked retry when the worker starts again. `second-brain jobs status` prints the counts. The dashboard System Control page shows the same counts. `GET /v1/jobs` requires the owner token.
+
+`second-brain jobs work` also writes today's vault backup unless `BRAIN_AUTO_BACKUP=0`. `second-brain backup auto` does that without draining the queue. Set `BRAIN_BACKUP_PASSPHRASE` to at least 8 characters or the automatic archive is unencrypted. There is no operating-system timer; the backup runs when you run the worker or `backup auto`. `second-brain restore ARCHIVE --target DIR --unencrypted` (or a passphrase) and `--force` when the target is not empty. `second-brain backup create|verify|restore` is unchanged.
+
+Hybrid retrieval still uses reciprocal rank fusion. `BRAIN_RRF_LEXICAL_WEIGHT` and `BRAIN_RRF_DENSE_WEIGHT` default to `1`, which is the previous equal blend. The reranker is the in-process interaction cross-encoder. If ONNX weights are present, doctor reports that backend; otherwise it reports the interaction fallback. Recall still requires the same literal overlap as before.
+
+`second-brain eval PATH` scores a personal set and prints recall@k and MRR. The file format is in `docs/personal-eval.example.json`. `second-brain eval-retrieval` and `second-brain eval-answers` are still there. A personal set is not the 90-query code-only dataset.
+
+The dashboard graph drawing lives in `dashboard/graph_view.py` and is bound before the sidebar runs. The product route function lives in `scripts/api_dispatch.py` and is rebound onto `api_product` so existing patches see the same function body. SSE writing lives in `scripts/api_sse.py`. Desktop chat send lives in `desktop/renderer/chat_send.js`, loaded immediately after `app.js`.
+
+Local measurements from one Linux agent machine, three runs, no Ollama process:
+
+| What | Result |
+| --- | --- |
+| 200 short texts hashed twice by a local stand-in | 0.733–0.753 ms. This is not a model call. |
+| Same 200 texts inserted in the embedding cache and read back | 159.9–181.8 ms. |
+| Second pass, cache hit only | 14.2–14.4 ms. |
+| Same text embedded twice through `embed_text` with a fake embedder | 1 model call, not 2. |
+| Enqueue 50 capture jobs | 39.3–46.1 ms. |
+| Claim those 50 jobs | 27.8–42.8 ms. |
+
+A before/after of a real Ollama embed was not measured here.
+
 ## Install
 
 Python 3.11, 3.12, or 3.13. From a source checkout, `./setup.sh` on Linux/macOS or `setup.ps1` on Windows installs `uv` when it can, syncs the lockfile, creates an empty vault, and builds the model-free SQLite index. Neither script installs Ollama. Pass `--pull-models` / `-PullModels` only when Ollama is already running. `./setup.sh --no-launch` and `setup.ps1 -NoLaunch` stop before opening the dashboard.
@@ -93,7 +126,7 @@ second_brain/
 └── docs/                   architecture notes and operator runbooks/templates (docs/runbooks/)
 ```
 
-The root project directory is the Git boundary, and the live `brain/` vault is excluded from the code baseline because it contains owner-specific captures and memories. Back it up separately using `second-brain backup` or an owner-controlled method. Both `master` and `release-code-only` are 100% code-only across their entire commit history (the legacy 18-file initial vault commit was scrubbed from root history).
+The root project directory is the Git boundary, and the live `brain/` vault is excluded from the code baseline because it contains owner-specific captures and memories. Back it up with `second-brain backup` or `second-brain backup auto`, and put it back with `second-brain restore`. Both `master` and `release-code-only` are 100% code-only across their entire commit history (the legacy 18-file initial vault commit was scrubbed from root history).
 
 ## Start with the model-free baseline
 
