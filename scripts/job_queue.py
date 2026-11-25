@@ -15,8 +15,9 @@ import os
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from scripts.config import security_state_dir
 
@@ -28,27 +29,32 @@ def queue_path() -> Path:
     return security_state_dir() / "jobs.sqlite3"
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
     path = queue_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS jobs (
-            id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            error TEXT NOT NULL DEFAULT ''
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT ''
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    return conn
+        conn.commit()
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def enqueue(kind: str, payload: dict[str, Any]) -> str:
