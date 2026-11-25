@@ -104,6 +104,49 @@ class OwnerGrantTests(unittest.TestCase):
                 os.environ["BRAIN_OWNER_GRANT"] = previous
         self.assertEqual(code, 1)
 
+    def test_library_approval_is_labeled_unattested(self) -> None:
+        from atom_mutator import apply_review_transition, content_sha256
+
+        with tempfile.TemporaryDirectory(prefix="sb-unattested-") as temp:
+            brain = Path(temp) / "brain"
+            atoms = brain / "2-atoms"
+            raw = brain / "0-raw"
+            atoms.mkdir(parents=True)
+            raw.mkdir()
+            (raw / "src-note.md").write_text("Primary record: The folder stays writable.\n", encoding="utf-8")
+            atom = atoms / "note.md"
+            atom.write_text(
+                "---\n"
+                "id: note\n"
+                "type: atom\n"
+                "memory_type: semantic\n"
+                "epistemic_label: claim\n"
+                "sources:\n"
+                "  - 0-raw/src-note.md\n"
+                "review_status: pending\n"
+                "claim_state: candidate\n"
+                "citation_integrity: missing\n"
+                "---\n\n"
+                "## Claim\n"
+                "The folder stays writable.\n\n"
+                "## Evidence\n"
+                "The folder stays writable.\n",
+                encoding="utf-8",
+            )
+            decision = apply_review_transition(
+                action="reject",
+                atom_path=str(atom),
+                expected_sha256=content_sha256(atom.read_bytes()),
+                actor="owner",
+                brain_dir=str(brain),
+                atoms_dir=str(atoms),
+            )
+            recorded = decision["attestation"]
+            self.assertEqual(recorded["method"], "unattested_library_call")
+            self.assertEqual(recorded["human_approval"], "false")
+            self.assertEqual(recorded["actor"], "owner")
+            self.assertIn("review_status: rejected", atom.read_text(encoding="utf-8"))
+
 
 class SourceReviewTests(unittest.TestCase):
     def test_unapproved_sources_stay_unsearchable_until_owner_grant(self) -> None:

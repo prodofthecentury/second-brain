@@ -12,7 +12,9 @@ The checkout keeps the full surface: the `second-brain` CLI, a loopback HTTP API
 
 Captured web articles land in `sources/` and are not searchable until you approve the current file bytes (`second-brain sources`, the dashboard quarantine tab, or `POST /v1/sources/approve`). Approval makes the text searchable as an approved source capture. It does not create a citable atom. A later refinery run can draft atoms; those still need their own approval.
 
-Approvals made from the CLI require a short-lived owner grant (`second-brain owner enroll`, then `second-brain owner grant`). Passing `--actor owner` alone is rejected. The HTTP API records the fingerprint of the owner token that authorized the call. The dashboard records the unlocked password session. In-process test helpers can still pass an actor string; that path is not a human approval.
+Approvals made from the CLI require a short-lived owner grant (`second-brain owner enroll`, then `second-brain owner grant`). Passing `--actor owner` alone is rejected. The HTTP API records the fingerprint of the owner token that authorized the call. The dashboard records the unlocked password session. A library call that passes only an actor string still changes the file, and the decision log records `method: unattested_library_call` and `human_approval: false`. That record is not an owner approval.
+
+This repository does not ship a personal daily-use vault. `brain/` is gitignored owner data. The tests build temporary vaults. Creative media, formal checks, and the other optional commands stay in the tree; they are extra surfaces on capture, approval, search, and MCP, and they are not deleted to make the core look smaller.
 
 ## Install
 

@@ -397,21 +397,20 @@ def _write_mutation(
     return record
 
 
-def _recorded_attestation(actor: str, attestation: dict | None) -> tuple[str, dict | None]:
+def _recorded_attestation(actor: str, attestation: dict | None) -> tuple[str, dict]:
     """Reject synthetic seed actors. Verify a credential when the caller presents one."""
-    from owner_attestation import OwnerAttestationError, _clean_actor, require_attestation
+    from owner_attestation import OwnerAttestationError, require_attestation, unattested_library_attestation
 
     try:
-        clean = _clean_actor(actor)
         if attestation is None:
-            return clean, None
+            return unattested_library_attestation(actor)
         recorded = require_attestation(
             attestation,
-            actor=clean,
+            actor=actor,
             state_dir=attestation.get("state_dir"),
             auth_path=attestation.get("auth_path"),
         )
-        return clean, recorded
+        return recorded["actor"], recorded
     except OwnerAttestationError as exc:
         raise ReviewTransitionError(str(exc)) from exc
 
@@ -595,7 +594,7 @@ def apply_atom_mutation(
             evidence_anchor=evidence_anchor,
             dense_refresh_required=dense_refresh_required,
             dense_model=active_dense_manifest.get("embedding_model") if dense_refresh_required else None,
-            extra_record_fields={"attestation": recorded_attestation} if recorded_attestation else None,
+            extra_record_fields={"attestation": recorded_attestation},
         )
 
 
@@ -785,7 +784,7 @@ def set_atom_temporal_bounds(
                 "valid_from": norm_vf,
                 "valid_until": norm_vu,
                 "rationale": clean_rationale,
-                **({"attestation": recorded_attestation} if recorded_attestation else {}),
+                "attestation": recorded_attestation,
             },
         )
         tv_now = evaluate_temporal_validity(norm_vf, norm_vu)
@@ -1158,7 +1157,7 @@ def apply_atom_merge(
                     "action": "merge",
                     "actor": actor.strip(),
                     "rationale": rationale.strip(),
-                    **({"attestation": recorded_attestation} if recorded_attestation else {}),
+                    "attestation": recorded_attestation,
                     "atom_filename": Path(path).name,
                     "peer_filename": Path(peer_paths[index]).name,
                     "relationship": "survivor" if index == 0 else "superseded",

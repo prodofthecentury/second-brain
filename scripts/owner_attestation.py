@@ -15,8 +15,9 @@ Two other credentials are accepted when the caller already proved them:
 * ``dashboard_password_session`` — the dashboard re-checks the unlocked
   password-verifier fingerprint stored in the Streamlit session.
 
-In-process library calls that omit an attestation still record only the actor
-string. Those calls are for tests and internal tools. The CLI does not.
+In-process library calls that omit an attestation are stored as
+``unattested_library_call`` with ``human_approval`` false. They still apply
+the file change. The CLI, HTTP API, and dashboard do not use that path.
 """
 
 from __future__ import annotations
@@ -252,6 +253,20 @@ def _clean_actor(actor: str) -> str:
             "Enroll a person with `second-brain owner enroll`."
         )
     return clean
+
+
+def unattested_library_attestation(actor: str) -> tuple[str, dict[str, str]]:
+    """Record a library call that did not present an owner credential.
+
+    The actor string is kept for the test or tool that made the change. The
+    method says it was not a human approval.
+    """
+    clean = _clean_actor(actor)
+    return clean, {
+        "method": "unattested_library_call",
+        "actor": clean,
+        "human_approval": "false",
+    }
 
 
 def public_attestation(attestation: dict | None) -> dict[str, str] | None:

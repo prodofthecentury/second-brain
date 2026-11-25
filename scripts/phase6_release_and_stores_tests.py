@@ -298,13 +298,72 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
         self.assertIn("manifest_ed25519_configured", readiness)
 
     def test_sign_release_ps1_and_outer_dmg_after_all_artifact_build_hook(self) -> None:
+        from signing_plan import SigningPlanError, plan_authenticode
+
+        azure = plan_authenticode(
+            file_path="Second Brain.exe",
+            azure_endpoint="https://eus.codesigning.azure.net",
+            azure_account="second-brain",
+            azure_profile="release",
+            dlib_path=r"C:\Azure.CodeSigning.Dlib.dll",
+        )
+        self.assertEqual(azure["backend"], "azure_dlib")
+        argv = list(azure["argv"])
+        self.assertEqual(argv[:6], ["signtool", "sign", "/v", "/fd", "SHA256", "/tr"])
+        self.assertEqual(argv[6], "https://timestamp.acs.microsoft.com")
+        self.assertIn("/dlib", argv)
+        self.assertIn("/dmdf", argv)
+        self.assertEqual(azure["timestamp_urls"], [
+            "https://timestamp.acs.microsoft.com",
+            "https://timestamp.digicert.com",
+        ])
+        hsm = plan_authenticode(
+            file_path="setup.exe",
+            csp_name="SafeNet Smart Card Key Storage Provider",
+            key_container="second-brain",
+            cert_file="cert.cer",
+        )
+        self.assertEqual(hsm["backend"], "hsm_csp")
+        self.assertIn("/csp", hsm["argv"])
+        skipped = plan_authenticode(file_path="setup.exe")
+        self.assertEqual(skipped["backend"], "skip")
+        self.assertEqual(skipped["argv"], [])
+        dev = plan_authenticode(file_path="setup.exe", self_signed=True)
+        self.assertEqual(dev["timestamp_urls"], [])
+        with self.assertRaises(SigningPlanError):
+            plan_authenticode(file_path="setup.exe", self_signed=True, require_trusted=True)
+        with self.assertRaises(SigningPlanError):
+            plan_authenticode(file_path="setup.exe", require_trusted=True)
+
         ps_src = (REPO_ROOT / "scripts" / "sign_release.ps1").read_text(encoding="utf-8")
-        self.assertIn("https://timestamp.acs.microsoft.com", ps_src)
-        self.assertIn("https://timestamp.digicert.com", ps_src)
+        for url in azure["timestamp_urls"]:
+            self.assertIn(url, ps_src)
         self.assertNotIn('"http://timestamp.acs.microsoft.com"', ps_src)
         self.assertIn("Azure.CodeSigning.Dlib.dll", ps_src)
-        self.assertIn("/dlib", ps_src)
-        self.assertIn("/dmdf", ps_src)
+
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if pwsh:
+            with tempfile.TemporaryDirectory(prefix="sb_sign_") as td:
+                dist = Path(td)
+                (dist / "notes.txt").write_text("not a binary\n", encoding="utf-8")
+                proc = subprocess.run(
+                    [
+                        pwsh,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-File",
+                        str(REPO_ROOT / "scripts" / "sign_release.ps1"),
+                        "-DistDir",
+                        str(dist),
+                        "-SkipManifest",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=60,
+                )
+                self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+                self.assertIn("skipping Authenticode", proc.stdout)
 
         desktop_pkg = json.loads((REPO_ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(desktop_pkg["build"].get("afterAllArtifactBuild"), "./build/afterAllArtifactBuild.js")

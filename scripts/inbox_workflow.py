@@ -490,15 +490,12 @@ def _append_inbox_decision(record: dict[str, object], *, brain_dir: str) -> None
         restrict_security_file_permissions(audit_path)
 
 
-def _require_inbox_actor(actor: str, attestation: dict | None) -> tuple[str, dict | None]:
-    from owner_attestation import OwnerAttestationError, require_attestation
+def _require_inbox_actor(actor: str, attestation: dict | None) -> tuple[str, dict]:
+    from owner_attestation import OwnerAttestationError, require_attestation, unattested_library_attestation
 
     try:
         if attestation is None:
-            clean = str(actor or "").strip()
-            if not clean:
-                raise OwnerAttestationError("Actor identity is required.")
-            return clean, None
+            return unattested_library_attestation(actor)
         recorded = require_attestation(
             attestation,
             actor=actor,
@@ -606,7 +603,7 @@ def promote_inbox_item(
                 "origin": origin,
                 "risk_flags": list(risks),
                 "acknowledged_risks": bool(acknowledge_risks),
-                **({"attestation": recorded_attestation} if recorded_attestation else {}),
+                "attestation": recorded_attestation,
             }
             _append_inbox_decision(decision, brain_dir=resolved_brain)
             return decision
@@ -673,7 +670,7 @@ def promote_inbox_item(
             "origin": origin,
             "risk_flags": list(risks),
             "acknowledged_risks": bool(acknowledge_risks),
-            **({"attestation": recorded_attestation} if recorded_attestation else {}),
+            "attestation": recorded_attestation,
         }
         _append_inbox_decision(decision, brain_dir=resolved_brain)
         return decision
@@ -745,7 +742,7 @@ def reject_inbox_item(
             "inbox_sha256": current_sha,
             "archived_to": os.path.relpath(archived_rejected, inbox_dir).replace("\\", "/"),
             "rationale": str(rationale or "").strip()[:500],
-            **({"attestation": recorded_attestation} if recorded_attestation else {}),
+            "attestation": recorded_attestation,
         }
         _append_inbox_decision(decision, brain_dir=resolved_brain)
         return decision
