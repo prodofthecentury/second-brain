@@ -43,6 +43,7 @@ ALLOWED_INBOX_ORIGINS = frozenset({
     "web_remote",
     "imported_unknown",
     "untrusted_inbox",
+    "miss_inbox",
 })
 
 _FORGED_TRUST_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (

@@ -1222,7 +1222,18 @@ class V040SotaUpgradesTests(unittest.TestCase):
                     skip_dns_check_for_mock_transport=True,
                 )
                 mig_res = migrate_sync_key_to_keychain(brain_dir=vault_b, state_dir=sec_b)
-                self.assertTrue(mig_res["keychain_sealed"])
+                # An isolated state_dir never writes the login keychain. Linux and macOS
+                # then seal into the restricted keyfile and report keychain_sealed False.
+                # Windows DPAPI still reports True. Either way the JSON master key is gone.
+                backend = str(mig_res["keychain_backend"])
+                self.assertIn(
+                    backend,
+                    {"windows_dpapi", "macos_keychain", "linux_secret_service", "posix_restricted_keyfile"},
+                )
+                if backend == "posix_restricted_keyfile":
+                    self.assertFalse(mig_res["keychain_sealed"])
+                else:
+                    self.assertTrue(mig_res["keychain_sealed"])
                 self.assertIsNone(json.loads(sync_config_path(vault_b, state_dir=sec_b).read_text(encoding="utf-8"))["master_key_b64"])
 
                 with (

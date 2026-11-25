@@ -183,6 +183,37 @@ def consume_last_degradation_warning() -> str | None:
     return warning
 
 
+_LAST_RETRIEVAL_FALLBACK: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "last_retrieval_fallback", default=None
+)
+
+
+def consume_last_retrieval_fallback() -> str | None:
+    """Return and clear whether the latest auto search used dense after a lexical miss."""
+    kind = _LAST_RETRIEVAL_FALLBACK.get()
+    _LAST_RETRIEVAL_FALLBACK.set(None)
+    return kind
+
+
+def _filter_dense_fallback(query: str, results: list[RecallResult]) -> list[RecallResult]:
+    """Keep accepted dense hits that clear the existing semantic corroboration gate."""
+    kept: list[RecallResult] = []
+    for item in results:
+        if str(item.review_status or "") != "accepted":
+            continue
+        try:
+            similarity = float(item.similarity)
+        except (TypeError, ValueError):
+            similarity = 0.0
+        if not math.isfinite(similarity):
+            similarity = 0.0
+        similarity = max(0.0, min(1.0, similarity))
+        distance = (1.0 - similarity) * 2.0
+        if candidate_has_semantic_corroboration(query, item.content, distance=distance):
+            kept.append(item)
+    return kept
+
+
 def normalize_project_tag(tag: str) -> str:
     cleaned = str(tag or "").strip().lower().replace("-", "_")
     if not cleaned:
@@ -1456,6 +1487,7 @@ def search_memory(
 ) -> tuple[list[RecallResult], list[RecallResult]]:
     """Retrieve memories using configured mode ('auto', 'rrf', 'lexical', or 'dense')."""
     options = options or RecallOptions()
+    _LAST_RETRIEVAL_FALLBACK.set(None)
     if options.retrieval_mode == "rrf":
         return search_hybrid_rrf_memory(
             query, options, atoms_dir=atoms_dir, index_path=index_path, chroma_path=chroma_path
@@ -1474,15 +1506,27 @@ def search_memory(
     if options.retrieval_mode == "lexical":
         return search_lexical_memory(query, options, atoms_dir=atoms_dir, index_path=index_path)
 
-    # auto mode: use lexical candidate retrieval + neural cross-encoder rerank if sidecar exists, else dense
+    # auto mode: lexical plus ONNX rerank when the sidecar exists. Dense runs only
+    # after that path returns no trusted hit, and only through the existing gate.
     if os.path.exists(index_path):
-        return search_lexical_memory(
+        direct, neighbors = search_lexical_memory(
             query,
             options,
             atoms_dir=atoms_dir,
             index_path=index_path,
             _allow_neural_rerank=True,
         )
+        if direct or neighbors or not os.path.isdir(chroma_path):
+            return direct, neighbors
+        try:
+            dense_direct, dense_neighbors = search_semantic_memory(
+                query, options, atoms_dir=atoms_dir, chroma_path=chroma_path
+            )
+        except MemoryRecallUnavailable as exc:
+            emit_degradation_warning(str(exc))
+            return direct, neighbors
+        _LAST_RETRIEVAL_FALLBACK.set("dense")
+        return _filter_dense_fallback(query, dense_direct), _filter_dense_fallback(query, dense_neighbors)
     return search_semantic_memory(query, options, atoms_dir=atoms_dir, chroma_path=chroma_path)
 
 
@@ -1634,3 +1678,45 @@ def assemble_bounded_working_context(
         source_sha256_map=sha_map,
         formatted_context=format_context(included),
     )
+
+
+def search_episodes(
+    query: str,
+    *,
+    brain_dir: str = BRAIN_DIR,
+    limit: int = 4,
+) -> list[dict[str, str]]:
+    """Return experience cards from brain/4-experiences/. These are not owner-verified claims."""
+    exp_dir = os.path.join(os.path.abspath(brain_dir), "4-experiences")
+    if not os.path.isdir(exp_dir) or _is_reparse_or_link(exp_dir):
+        return []
+    terms = [tok for tok in TOKEN_PATTERN.findall(str(query or "").casefold()) if tok not in FTS_STOP_WORDS and len(tok) > 1]
+    if not terms:
+        return []
+    hits: list[dict[str, str]] = []
+    for entry in sorted(os.listdir(exp_dir)):
+        path = safe_file_in_dir(exp_dir, entry, allowed_exts={".md"}, must_exist=True)
+        if not path or not os.path.isfile(path) or _is_reparse_or_link(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        haystack = text.casefold()
+        if not any(term in haystack for term in terms):
+            continue
+        summary = ""
+        parsed = split_frontmatter(text)
+        if parsed:
+            for line in parsed[0]:
+                if line.lower().startswith("goal:"):
+                    summary = line.split(":", 1)[1].strip().strip("'\"")
+                    break
+                if line.lower().startswith("result:"):
+                    summary = summary or line.split(":", 1)[1].strip().strip("'\"")
+        summary = summary or entry
+        hits.append({"filename": entry, "summary": summary[:500], "tier": "episodic"})
+        if len(hits) >= max(1, int(limit)):
+            break
+    return hits

@@ -120,6 +120,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "agent_runtime_tests.py")),
     ),
     (
+        "upgrade_recall_tests",
+        "Paraphrase fallback, miss inbox, clause planner, and direct-mode measurement skip (scripts/upgrade_recall_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "upgrade_recall_tests.py")),
+    ),
+    (
         "mobile_vault_client_tests",
         "Cross-runtime Python <-> Node WebCrypto on-device Mobile Vault Client E2EE sync, epistemic recall & offline drop suite (scripts/mobile_vault_client_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "mobile_vault_client_tests.py")),

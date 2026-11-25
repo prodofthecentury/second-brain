@@ -2540,6 +2540,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "creative_media_tests",
                 "stage4_executable_skills_tests",
                 "agent_runtime_tests",
+                "upgrade_recall_tests",
                 "mobile_vault_client_tests",
                 "desktop_ui_tests",
                 "vscode_extension_tests",

@@ -10,6 +10,7 @@ import argparse
 from contextlib import closing
 from dataclasses import dataclass
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -204,6 +205,193 @@ def record_grounded_answer_telemetry(
             (now, str(mode)[:32], len(clean_cited), 1 if abstained else 0, float(latency_ms)),
         )
         conn.commit()
+
+
+_ABSTAIN_WINDOW = datetime.timedelta(days=14)
+_ABSTAIN_ATOM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.md$")
+
+
+def normalize_abstain_query(query: str) -> str:
+    """Lowercase, collapse whitespace, and drop the same stop words lexical recall uses."""
+    from lexical_store import FTS_STOP_WORDS, tokenize
+
+    return " ".join(tok for tok in tokenize(query) if tok not in FTS_STOP_WORDS and len(tok) > 1)
+
+
+def _abstain_draft_filename(inbox_dir: str, query_sha: str) -> str | None:
+    if not os.path.isdir(inbox_dir):
+        return None
+    marker = f"<!-- abstain_key: {query_sha} -->"
+    for entry in sorted(os.listdir(inbox_dir)):
+        path = safe_file_in_dir(inbox_dir, entry, allowed_exts={".md"}, must_exist=True)
+        if not path or not os.path.isfile(path) or _is_reparse_or_link(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                head = handle.read(4096)
+        except OSError:
+            continue
+        if marker in head:
+            return entry
+    return None
+
+
+def _write_abstain_draft(
+    *,
+    inbox_dir: str,
+    query_sha: str,
+    count: int,
+    project_scope: str,
+    question_line: str,
+    rejected_atom_ids: list[str],
+) -> str:
+    os.makedirs(inbox_dir, exist_ok=True)
+    if _is_reparse_or_link(inbox_dir):
+        raise PermissionError("Refusing to write an abstain draft through a symlink.")
+    day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    lines = [
+        "<!-- second_brain_origin: miss_inbox -->",
+        f"<!-- abstain_key: {query_sha} -->",
+        f"<!-- abstain_count: {count} -->",
+        "",
+        "# Repeated unanswered question",
+        "",
+        "This draft is quarantined for the owner. It is not a fact and it was not written by a model.",
+        "",
+        f"- Project: {project_scope or '(unscoped)'}",
+        f"- Abstain count: {count}",
+        "- Window: 14 days",
+        f"- Question: {question_line}",
+        "- Rejected candidate atoms:",
+    ]
+    if rejected_atom_ids:
+        lines.extend(f"  - {atom_id}" for atom_id in rejected_atom_ids)
+    else:
+        lines.append("  - (none)")
+    lines.append("")
+    payload = "\n".join(lines).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    for attempt in range(32):
+        name = f"miss-{day}-{query_sha[:12]}.md" if attempt == 0 else f"miss-{day}-{query_sha[:12]}-{attempt + 1}.md"
+        target = safe_file_in_dir(inbox_dir, name, allowed_exts={".md"}, must_exist=False)
+        if not target:
+            raise ValueError("Invalid abstain draft filename.")
+        try:
+            fd = os.open(target, flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            if os.write(fd, payload) != len(payload):
+                raise OSError("Incomplete abstain draft write.")
+            os.fsync(fd)
+        except Exception:
+            os.close(fd)
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+            raise
+        os.close(fd)
+        return name
+    raise OSError("Could not allocate a unique abstain draft filename.")
+
+
+def record_unanswered_query(
+    query: str,
+    *,
+    project_scope: str | None = None,
+    rejected_atom_ids: list[str] | None = None,
+    brain_dir: str = BRAIN_DIR,
+    db_path: str = TELEMETRY_DB_PATH,
+) -> dict[str, object]:
+    """Count an abstention. The third one within 14 days writes one quarantined inbox draft."""
+    from inbox_workflow import scan_inbox_payload_risks
+
+    normalized = normalize_abstain_query(query)
+    project = re.sub(r"[\r\n\t]+", " ", str(project_scope or "")).strip()[:200]
+    identity = f"{project}\n{normalized}".encode("utf-8")
+    query_sha = hashlib.sha256(identity).hexdigest()
+    risks = scan_inbox_payload_risks(query or "")
+    clean_ids = []
+    for raw_id in rejected_atom_ids or []:
+        name = os.path.basename(str(raw_id or "").strip())
+        if _ABSTAIN_ATOM_RE.fullmatch(name) and name not in clean_ids:
+            clean_ids.append(name)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    now_iso = now.isoformat(timespec="seconds")
+    cutoff = (now - _ABSTAIN_WINDOW).isoformat(timespec="seconds")
+    init_telemetry_db(db_path)
+    conn_init = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        conn_init.execute(
+            """
+            CREATE TABLE IF NOT EXISTS abstention_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at TEXT NOT NULL,
+                normalized_query TEXT NOT NULL,
+                project_scope TEXT NOT NULL,
+                query_sha256 TEXT NOT NULL
+            )
+            """
+        )
+        conn_init.commit()
+    finally:
+        conn_init.close()
+
+    lock_path = os.path.join(os.path.abspath(brain_dir), ".sidecar", "writer.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    inbox_dir = os.path.join(os.path.abspath(brain_dir), "0-raw", "inbox")
+    if risks:
+        question_line = "withheld (" + ", ".join(risks) + ")"
+        stored_normalized = ""
+    else:
+        question_line = "".join(ch for ch in str(query or "") if ch in ("\n", "\t") or ord(ch) >= 32).strip()[:2000]
+        stored_normalized = normalized
+    with review_lock(lock_path):
+        with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+            conn.execute(
+                """
+                INSERT INTO abstention_events (recorded_at, normalized_query, project_scope, query_sha256)
+                VALUES (?, ?, ?, ?)
+                """,
+                (now_iso, stored_normalized, project, query_sha),
+            )
+            count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM abstention_events
+                    WHERE query_sha256 = ? AND project_scope = ? AND recorded_at >= ?
+                    """,
+                    (query_sha, project, cutoff),
+                ).fetchone()[0]
+            )
+            conn.commit()
+        existing = _abstain_draft_filename(inbox_dir, query_sha)
+        drafted = False
+        filename = existing
+        if count >= 3 and not existing:
+            filename = _write_abstain_draft(
+                inbox_dir=inbox_dir,
+                query_sha=query_sha,
+                count=count,
+                project_scope=project,
+                question_line=question_line,
+                rejected_atom_ids=clean_ids,
+            )
+            drafted = True
+            written = os.path.join(inbox_dir, filename)
+            with open(written, encoding="utf-8") as handle:
+                body = handle.read()
+            if risks and str(query or "") and str(query) in body:
+                os.unlink(written)
+                raise PermissionError("Abstain draft retained a secret-shaped query.")
+    return {
+        "count": count,
+        "drafted": drafted,
+        "filename": filename,
+        "withheld": bool(risks),
+        "normalized_query": stored_normalized,
+    }
 
 
 def _brain_dir_for_telemetry_db(db_path: str) -> str | None:

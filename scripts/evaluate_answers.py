@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -350,6 +351,77 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
     return payload
 
 
+def direct_model_available(model: str) -> tuple[bool, str]:
+    """Return whether a local Ollama install can run this model. Never invents timings."""
+    from ollama_utils import installed_model_names
+
+    names = [str(name) for name in installed_model_names()]
+    if not names:
+        return False, "Ollama is not available."
+    wanted = (model or "").strip()
+    if wanted in names or any(name.split(":")[0] == wanted.split(":")[0] and wanted.split(":")[0] for name in names):
+        return True, ""
+    return False, f"Ollama is available but {wanted} is not installed."
+
+
+def summarize_direct_observations(observations: list[dict[str, Any]]) -> dict[str, Any]:
+    """Coverage, trap leakage, and model_ms percentiles for one direct-mode run."""
+    answerable = [row for row in observations if row.get("answerability") == "answerable"]
+    traps = [row for row in observations if row.get("answerability") == "unanswerable"]
+    covered = sum(1 for row in answerable if row.get("answerable") is True)
+    leaked = sum(1 for row in traps if row.get("answerable") is True)
+    timings = [float(row["model_ms"]) for row in observations if isinstance(row.get("model_ms"), (int, float))]
+    return {
+        "answerable_cases": len(answerable),
+        "covered_cases": covered,
+        "coverage": _ratio(covered, len(answerable)),
+        "trap_cases": len(traps),
+        "trap_leakage": leaked,
+        "model_ms_p50": _percentile(timings, 0.50),
+        "model_ms_p95": _percentile(timings, 0.95),
+        "json_fn_runs": sum(1 for row in observations if row.get("json_fn_ran") is True),
+    }
+
+
+def _direct_case_observation(case: dict[str, Any], *, model: str) -> dict[str, Any]:
+    from streaming_chat import chat_events
+
+    events = list(chat_events(str(case.get("query") or ""), mode="direct", model_override=model))
+    context = next((event for event in events if event.get("type") == "context"), {})
+    answer = next((event for event in events if event.get("type") == "verified_answer"), {})
+    verified = list(context.get("verified") or [])
+    model_ms = answer.get("model_ms")
+    return {
+        "case_id": case.get("id"),
+        "answerability": case.get("answerability"),
+        "answerable": bool(answer.get("answerable")),
+        "model_ms": float(model_ms) if isinstance(model_ms, (int, float)) else None,
+        "json_fn_ran": len(verified) >= 2 and answer.get("type") == "verified_answer" and "model_ms" in answer,
+        "claim_count": len(list(answer.get("claims") or [])),
+    }
+
+
+def run_direct_model_check(*, model: str, dataset_path: Path | None = None) -> dict[str, Any]:
+    """Measure direct-mode claim selection. Caller must already know Ollama is installed."""
+    path = dataset_path or DATASET_PATH
+    payload = json.loads(path.read_bytes())
+    cases = [
+        item
+        for item in payload.get("queries", [])
+        if isinstance(item, dict) and item.get("answerability") in {"answerable", "unanswerable"}
+    ]
+    observations = [_direct_case_observation(case, model=model) for case in cases]
+    return {
+        "dataset_id": payload.get("dataset_id"),
+        "dataset_status": payload.get("status") or "pending_owner_review",
+        "note": "The dataset is still pending owner review. This file is a measurement, not a default-model change.",
+        "chat_mode": "direct",
+        "model": model,
+        "observations": observations,
+        "metrics": summarize_direct_observations(observations),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     from hardware_profile import resolve_active_local_generation_model
 
@@ -358,7 +430,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runs", type=int, default=3, help="Complete independent outputs per scored case (1-50).")
     parser.add_argument("--model", default=default_model, help="Installed Ollama generation model (defaults to hardware-tiered selection).")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT_PATH), help="Local JSON result path (default is ignored brain sidecar).")
+    parser.add_argument("--chat-mode", choices=("legacy", "direct"), default="legacy")
+    parser.add_argument("--dataset", default=str(DATASET_PATH))
     args = parser.parse_args(argv)
+    if args.chat_mode == "direct":
+        available, reason = direct_model_available(args.model)
+        if not available:
+            print(f"Answer evaluation skipped: {reason}", file=sys.stderr)
+            return 0
+        try:
+            result = run_direct_model_check(model=args.model, dataset_path=Path(args.dataset))
+            stamp = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+            stamped = ROOT / "docs" / f"answer-evaluation-direct-{stamp}.json"
+            destination = Path(args.output) if args.output != str(DEFAULT_OUTPUT_PATH) else stamped
+            _write_json_atomically(destination, result)
+        except Exception as exc:
+            print(f"Answer evaluation unavailable: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(result["metrics"], indent=2))
+        print(f"Saved direct-mode measurement: {destination}")
+        print("Dataset status: pending owner review. No default model was changed.")
+        return 0
     try:
         result = run_evaluation(runs=args.runs, model=args.model)
         _write_json_atomically(Path(args.output), result)

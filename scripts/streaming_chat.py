@@ -90,12 +90,15 @@ from host_adapters import (  # noqa: E402
 from memory_format import split_frontmatter  # noqa: E402
 from memory_review import parse_frontmatter_values, section_text  # noqa: E402
 from notes_store import NotePaths, search_notes  # noqa: E402
+from query_planner import plan_subqueries  # noqa: E402
 from recall import (  # noqa: E402
     MemoryRecallUnavailable,
     RecallOptions,
     consume_last_degradation_warning,
+    consume_last_retrieval_fallback,
     normalize_project_tag,
     project_tags_match,
+    search_episodes,
     search_memory,
 )
 
@@ -454,8 +457,12 @@ def retrieve_context(
     preferences: list[dict[str, object]] = []
     records: list[dict[str, str]] = []
     warning = None
+    candidate_atom_ids: list[str] = []
+    planned = plan_subqueries(query)
+    retrieval_fallback: str | None = None
     telemetry_db = paths.telemetry_db_path or os.path.join(paths.brain_dir, ".sidecar", "telemetry.sqlite3")
     consume_last_degradation_warning()
+    consume_last_retrieval_fallback()
     try:
         opts = RecallOptions(
             n_results=MAX_VERIFIED,
@@ -469,21 +476,30 @@ def retrieve_context(
             include_expired=bool(include_expired),
             as_of=as_of,
         )
-        direct, neighbors = search_memory(
-            query, opts, atoms_dir=paths.atoms_dir, index_path=paths.lexical_index_path, chroma_path=paths.chroma_path
-        )
-        degraded_banner = consume_last_degradation_warning()
-        if degraded_banner:
-            warning = degraded_banner
-        combined = list(direct)
-        seen_fnames = {r.filename for r in combined}
-        for nb in neighbors:
-            if len(combined) >= MAX_VERIFIED:
-                break
-            if nb.filename not in seen_fnames:
-                seen_fnames.add(nb.filename)
-                combined.append(nb)
-        for result in combined[:MAX_VERIFIED]:
+        primary: list = []
+        secondary: list = []
+        seen_fnames: set[str] = set()
+        for index, piece in enumerate(planned):
+            direct, neighbors = search_memory(
+                piece,
+                opts,
+                atoms_dir=paths.atoms_dir,
+                index_path=paths.lexical_index_path,
+                chroma_path=paths.chroma_path,
+            )
+            degraded_banner = consume_last_degradation_warning()
+            if degraded_banner:
+                warning = degraded_banner
+            if consume_last_retrieval_fallback() == "dense":
+                retrieval_fallback = "dense"
+            bucket = primary if index == 0 else secondary
+            for item in list(direct) + list(neighbors):
+                if item.filename in seen_fnames:
+                    continue
+                seen_fnames.add(item.filename)
+                bucket.append(item)
+        combined = (primary + secondary)[:MAX_VERIFIED]
+        for result in combined:
             claim, evidence = _claim_and_evidence(result.content)
             if not claim:
                 continue
@@ -501,6 +517,7 @@ def retrieve_context(
                 index_path=paths.lexical_index_path,
                 atoms_dir=paths.atoms_dir,
             )
+            candidate_atom_ids = list(candidate_ids)
             record_retrieval_telemetry(
                 [r["filename"] for r in records],
                 candidate_atom_ids=candidate_ids,
@@ -590,8 +607,11 @@ def retrieve_context(
         "sources": sources,
         "retrieval_ms": round((time.perf_counter() - t0) * 1000, 1),
         "warning": warning,
+        "subqueries": list(planned),
+        "retrieval_fallback": retrieval_fallback,
         "_records": records,
         "_note_tags": note_tags,
+        "_candidate_atom_ids": candidate_atom_ids,
     }
 
 
@@ -1111,6 +1131,39 @@ def chat_events(
             for i, lead in enumerate(research_leads, start=1)
         ]
         leads_block = format_unverified_leads_section(research_leads) if research_leads else ""
+        try:
+            episodes = search_episodes(retrieval_query, brain_dir=paths.brain_dir, limit=4)
+        except Exception:
+            episodes = []
+        if episodes:
+            episode_lines: list[str] = []
+            for episode in episodes:
+                episode_lines.append(
+                    f"- [episodic | status=experience | origin=experience] {episode['filename']}: {episode['summary']}"
+                )
+                leads_payload.append(
+                    {
+                        "id": f"E{len(episode_lines)}",
+                        "filename": episode["filename"],
+                        "status": "experience",
+                        "claim": episode["summary"],
+                        "excerpt": episode["summary"],
+                        "source_kind": "episodic",
+                        "review_status": "experience",
+                        "claim_state": "episodic",
+                        "origin": "experience",
+                        "tier": "episodic",
+                        "lead_id": episode["filename"],
+                        "summary": episode["summary"],
+                        "sha256": "",
+                        "risk_flags": [],
+                    }
+                )
+            header = leads_block or (
+                "[UNVERIFIED LEADS]\n"
+                "The following pending, candidate, or quarantined items matched exploratorily and are NOT owner-approved facts:"
+            )
+            leads_block = header + "\n" + "\n".join(episode_lines)
         ctx = {
             **ctx,
             "host_id": active_host_id,
@@ -1125,6 +1178,22 @@ def chat_events(
     ctx["query_expanded"] = query_expanded
     if active_thread_id:
         ctx["thread_id"] = active_thread_id
+
+    def _note_unanswered() -> None:
+        if mode not in {"direct", "verified"}:
+            return
+        try:
+            from cognitive_core import record_unanswered_query
+
+            record_unanswered_query(
+                retrieval_query,
+                project_scope=project_scope,
+                rejected_atom_ids=[str(item) for item in list(ctx.get("_candidate_atom_ids") or [])],
+                brain_dir=paths.brain_dir,
+                db_path=paths.telemetry_db_path or os.path.join(paths.brain_dir, ".sidecar", "telemetry.sqlite3"),
+            )
+        except Exception:
+            pass
 
     def _persist_completed_exchange(
         assistant_text: str,
@@ -1218,6 +1287,7 @@ def chat_events(
 
     if mode == "direct" and len(verified) < 2:
         if not verified:
+            _note_unanswered()
             msg = NO_APPROVED_MEMORY_RESPONSE if want_research else "No owner-verified claim matches this question."
             if leads_block:
                 msg = f"{msg}\n\n{leads_block}"
@@ -1345,6 +1415,7 @@ def chat_events(
 
     if mode in {"verified", "research", "direct"}:
         if not model_verified:
+            _note_unanswered()
             msg = NO_APPROVED_MEMORY_RESPONSE if want_research else "No owner-verified claim matches this question."
             if leads_block:
                 msg = f"{msg}\n\n{leads_block}"
@@ -1461,6 +1532,8 @@ def chat_events(
                 )
                 if want_research and leads_block and "[UNVERIFIED LEADS]" not in text_val:
                     text_val = f"{text_val}\n\n{leads_block}"
+                if not model_errored:
+                    _note_unanswered()
                 abstain_evt: dict[str, object] = {
                     "type": "verified_answer",
                     "answerable": False,
