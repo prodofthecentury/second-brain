@@ -59,9 +59,7 @@ def validate_loopback_service_url(raw_url: str, *, service_name: str = "service"
             f"{service_name} orchestrator target must be strictly local loopback HTTP (127.0.0.1/localhost/[::1]); got {raw_url!r}."
         )
     if hostname == "localhost":
-        clean = clean.replace("://localhost:", "://127.0.0.1:", 1).replace("://localhost/", "://127.0.0.1/", 1)
-        if clean.endswith("://localhost"):
-            clean = clean[: -len("localhost")] + "127.0.0.1"
+        clean = re.sub(r"(?i)://localhost(?=[:/]|$)", "://127.0.0.1", clean, count=1)
     return clean
 
 

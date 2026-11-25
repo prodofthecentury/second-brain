@@ -60,6 +60,7 @@ _BUS_STOP_WORDS = frozenset(
     {
         "the", "and", "for", "with", "that", "this", "from", "into", "when", "where",
         "what", "how", "why", "who", "are", "was", "were", "have", "has", "had",
+        "do", "does", "did",
         "not", "but", "can", "will", "use", "using", "our", "your", "their", "about",
         "is", "to", "of", "in", "on", "at", "by", "or", "an", "be", "as", "it",
     }
@@ -280,11 +281,12 @@ def record_context_signal(
     prewarmed_count = 0
     neighbor_count = 0
     if prewarm and pred_query:
+        eff_n_results = max(1, min(10, int(n_results)))
         projects = (clean_proj,) if clean_proj else ()
         direct, neighbors = search_memory(
             pred_query,
             RecallOptions(
-                n_results=max(1, min(10, int(n_results))),
+                n_results=eff_n_results,
                 follow_links=True,
                 include_statuses={"accepted"},
                 projects=projects,
@@ -309,6 +311,7 @@ def record_context_signal(
             brain_dir=resolved_brain,
             atoms_dir=resolved_atoms,
             entry_kind="prewarm",
+            n_results=eff_n_results,
         )
 
     with _BUS_LOCK:
@@ -348,6 +351,7 @@ def store_l0_entry(
     brain_dir: str | Path | None = None,
     atoms_dir: str | Path | None = None,
     entry_kind: str = "exact",
+    n_results: int | None = None,
     cache_key_override: tuple[str, str, str, str] | None = None,
 ) -> tuple[str, str, str, str]:
     _, _, brain_norm = _normalize_brain_key(brain_dir=brain_dir, atoms_dir=atoms_dir)
@@ -360,6 +364,7 @@ def store_l0_entry(
         else (brain_norm, freshness_key, eff_fp, qhash)
     )
     q_tokens = sorted(_tokenize_query(query))
+    eff_n_results = int(n_results) if n_results is not None else len(direct_items)
     with _BUS_LOCK:
         # Evict stale freshness keys ONLY for the same vault (never wipe another vault's entries)
         stale_keys = [k for k in _L0_HOT_CACHE if k[0] == brain_norm and k[1] != freshness_key]
@@ -376,6 +381,7 @@ def store_l0_entry(
             "project_scope": project_scope,
             "project_scope_norm": proj_norm,
             "direct": list(direct_items),
+            "n_results": eff_n_results,
             "cached_at": time.monotonic(),
         }
         _L0_HOT_CACHE.move_to_end(qkey)
@@ -387,12 +393,20 @@ def store_l0_entry(
     return qkey
 
 
+def _l0_entry_capacity(entry: dict[str, Any]) -> int:
+    raw_n = entry.get("n_results")
+    if raw_n is not None:
+        return int(raw_n)
+    return len(entry.get("items") or entry.get("direct") or ())
+
+
 def lookup_l0_hot(
     query: str,
     *,
     project_scope: str | None = None,
     options_fp: str = "default",
     allow_prewarm_match: bool = True,
+    min_results: int = 1,
     brain_dir: str | Path | None = None,
     atoms_dir: str | Path | None = None,
 ) -> dict[str, Any] | None:
@@ -423,6 +437,7 @@ def lookup_l0_hot(
     freshness = compute_vault_freshness_key(brain_dir=resolved_brain, atoms_dir=resolved_atoms)
     proj_norm = _normalize_scope(project_scope)
     eff_fp = str(options_fp or "default")
+    eff_min_results = max(1, int(min_results))
     qhash = _normalize_query_key(query, proj_norm)
     exact_key = (brain_norm, freshness, eff_fp, qhash)
 
@@ -431,18 +446,23 @@ def lookup_l0_hot(
         match_kind = "exact"
         entry = _L0_HOT_CACHE.get(exact_key)
         if entry is not None:
-            matched_key = exact_key
-        elif eff_fp == "default":
+            if eff_fp != "default" or _l0_entry_capacity(entry) >= eff_min_results:
+                matched_key = exact_key
+            else:
+                entry = None
+
+        if entry is None and allow_prewarm_match:
             prewarm_exact_key = (brain_norm, freshness, "prewarm", qhash)
-            entry = _L0_HOT_CACHE.get(prewarm_exact_key)
-            if entry is not None:
+            cand_exact = _L0_HOT_CACHE.get(prewarm_exact_key)
+            if cand_exact is not None and _l0_entry_capacity(cand_exact) >= eff_min_results:
+                entry = cand_exact
                 matched_key = prewarm_exact_key
                 match_kind = "prewarm_exact"
 
         if entry is None and allow_prewarm_match:
             q_toks = _tokenize_query(query)
             if len(q_toks) >= 2:
-                best_overlap = 1
+                best_score: tuple[float, int] = (0.0, 0)
                 best_key: tuple[str, str, str, str] | None = None
                 for k, cand in _L0_HOT_CACHE.items():
                     if k[0] != brain_norm or k[1] != freshness:
@@ -453,11 +473,19 @@ def lookup_l0_hot(
                         continue
                     if not cand.get("direct"):
                         continue
+                    if _l0_entry_capacity(cand) < eff_min_results:
+                        continue
                     cand_toks = set(cand.get("query_tokens") or ())
                     overlap = len(q_toks & cand_toks)
-                    if overlap >= 2 and overlap > best_overlap:
-                        best_overlap = overlap
-                        best_key = k
+                    coverage = overlap / len(q_toks)
+                    covered = q_toks.issubset(cand_toks) or (
+                        len(q_toks) >= 2 and coverage >= 0.85 and overlap >= 2
+                    )
+                    if covered:
+                        score = (coverage, overlap)
+                        if score > best_score:
+                            best_score = score
+                            best_key = k
                 if best_key is not None:
                     matched_key = best_key
                     entry = _L0_HOT_CACHE[best_key]

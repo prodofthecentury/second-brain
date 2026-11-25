@@ -2540,6 +2540,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
             "phase8_ecosystem_and_canvas_tests",
             "phase9_gen4_cognition_tests",
             "phase10_math_and_formal_discovery_tests",
+            "quantum_leap_api_sdk_tests",
             "goal_1b_completion_tests",
             "release_and_benchmark_tests",
             "live_runtime_integration_tests",

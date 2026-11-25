@@ -440,6 +440,7 @@ def voice_conversation_turn(
     mode: str = "stream",
     host_id: str = "ollama_local",
     project_scope: str | None = None,
+    thread_id: str | None = None,
     voice: str = DEFAULT_VOICE,
     speed: float = 1.0,
     transcriber: Callable[[str], str] | None = None,
@@ -454,6 +455,18 @@ def voice_conversation_turn(
     ext = Path(str(filename or "voice.wav")).suffix.lower() or ".wav"
     if ext not in ALLOWED_VOICE_EXTS:
         raise TtsError(f"Unsupported voice recording extension {ext!r}; allowed: {sorted(ALLOWED_VOICE_EXTS)}")
+
+    clean_thread_id: str | None = None
+    if thread_id is not None:
+        if not isinstance(thread_id, str):
+            raise ValueError("'thread_id' must be a string or null.")
+        stripped_tid = thread_id.strip().lower()
+        if stripped_tid:
+            from chat_threads import THREAD_ID_RE
+
+            if stripped_tid != "new" and not THREAD_ID_RE.fullmatch(stripped_tid):
+                raise ValueError(f"Invalid thread_id: {thread_id!r}")
+            clean_thread_id = stripped_tid
 
     with tempfile.TemporaryDirectory(prefix="sb_voice_") as td:
         audio_path = Path(td) / f"input{ext}"
@@ -495,17 +508,21 @@ def voice_conversation_turn(
     answer_chunks: list[str] = []
     verified_text = ""
     err_msg = ""
+    resolved_thread_id: str | None = clean_thread_id if (clean_thread_id and clean_thread_id != "new") else None
     for evt in chat_events(
         transcript,
         mode=mode,
         paths=cp,
         project_scope=project_scope,
         host_id=host_id,
+        thread_id=clean_thread_id,
         stream_fn=stream_fn,
     ):
         etype = evt.get("type")
         if etype == "context":
             sources = list(evt.get("sources") or [])
+            if evt.get("thread_id"):
+                resolved_thread_id = str(evt["thread_id"])
         elif etype == "token":
             answer_chunks.append(str(evt.get("text") or evt.get("token") or ""))
         elif etype == "verified_answer":
@@ -514,6 +531,9 @@ def voice_conversation_turn(
             verified_text = str(evt.get("text") or evt.get("reason") or "")
         elif etype == "grounding":
             grounding = dict(evt)
+        elif etype == "done":
+            if evt.get("thread_id"):
+                resolved_thread_id = str(evt["thread_id"])
         elif etype == "error":
             err_msg = str(evt.get("error") or "Chat error")
 
@@ -535,6 +555,7 @@ def voice_conversation_turn(
         "status": "ok",
         "transcript": transcript,
         "answer_text": answer_text,
+        "thread_id": resolved_thread_id,
         "sources": sources,
         "grounding": grounding,
         "tts_available": tts_result is not None,

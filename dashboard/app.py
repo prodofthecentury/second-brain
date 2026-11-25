@@ -1341,6 +1341,7 @@ if nav_selection == "💬 Chat with Memory":
 
     chat_mode_labels = {
         "stream": "⚡ Stream Synthesis ([V#]/[N#]/[P#] + Grounding Audit)",
+        "deliberative": "🧠 Deliberative (Meta-Router + Swarm/Sim)",
         "instant": "⚡ Instant Source Cards (<20 ms, No Model Call)",
         "verified": "🔒 Fast Verified Claim Selection",
         "strict_audit_answer": "🛡️ Strict Schema-Validated Host Answer (Multi-Host)",
@@ -1594,12 +1595,28 @@ if nav_selection == "💬 Chat with Memory":
                     for s in uncited:
                         st.caption(f"• {s}")
 
+    def _render_cognitive_route_badge(route: dict | None):
+        if not route or not isinstance(route, dict):
+            return
+        mode_lbl = str(route.get("mode") or "deliberative")
+        path_lbl = str(route.get("path") or "deliberative_path")
+        comp_lbl = str(route.get("complexity") or "")
+        prof_lbl = str(route.get("profile") or "auto")
+        parts = [f"mode=`{mode_lbl}`", f"path=`{path_lbl}`", f"profile=`{prof_lbl}`"]
+        if comp_lbl:
+            parts.append(f"complexity=`{comp_lbl}`")
+        if route.get("contested"):
+            parts.append("contested=yes")
+        st.caption(f"🧭 **Cognitive Meta-Router**: {' · '.join(parts)}")
+
     # Display chat messages
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant":
                 if msg.get("sources"):
                     _render_source_cards(msg["sources"], msg.get("retrieval_ms"))
+                if msg.get("cognitive_route"):
+                    _render_cognitive_route_badge(msg.get("cognitive_route"))
                 if msg.get("claims") and msg.get("draft_json") is not None and msg.get("retrieved_atoms") is not None:
                     replay = validate_standard_answer(
                         msg["draft_json"],
@@ -1608,8 +1625,11 @@ if nav_selection == "💬 Chat with Memory":
                         mode=msg.get("answer_mode", "standard"),
                     )
                     st.text(replay.text)
-                elif msg.get("mode") == "stream":
-                    st.caption("🔬 *Streamed synthesis over `[V#]` verified claims & `[N#]` working notes (not canonical verified fact)*")
+                elif msg.get("mode") in {"stream", "deliberative"}:
+                    if msg.get("mode") == "deliberative":
+                        st.caption("🧠 *Deliberative Meta-Router synthesis (Causal Simulation / Symbolic Sandbox / Cognitive Swarm)*")
+                    else:
+                        st.caption("🔬 *Streamed synthesis over `[V#]` verified claims & `[N#]` working notes (not canonical verified fact)*")
                     st.markdown(_defang_markdown_preview(str(msg.get("content", ""))))
                     _render_grounding_badge(msg.get("grounding"))
                 else:
@@ -1639,6 +1659,7 @@ if nav_selection == "💬 Chat with Memory":
                 sources_list: list[dict] = []
                 retrieval_ms: float | None = None
                 grounding_event: dict | None = None
+                cognitive_route_event: dict | None = None
                 verified_detail: list[dict] = []
                 research_leads_text: str = ""
                 research_leads_label: str = "UNVERIFIED LEADS — NOT OWNER-APPROVED"
@@ -1646,6 +1667,9 @@ if nav_selection == "💬 Chat with Memory":
 
                 if selected_chat_mode == "stream":
                     st.caption("🔬 *Streamed synthesis over `[V#]` verified claims & `[N#]` working notes (not canonical verified fact)*")
+                elif selected_chat_mode == "deliberative":
+                    st.caption("🧠 *Deliberative Meta-Router synthesis (Causal Simulation / Symbolic Sandbox / Cognitive Swarm)*")
+                route_box = st.empty()
                 stream_box = st.empty()
                 token_chunks: list[str] = []
 
@@ -1707,6 +1731,10 @@ if nav_selection == "💬 Chat with Memory":
                                 lines.append(f"  [{src.get('citation_id')}] ({src.get('tier')}) {src.get('filename')}: {body_txt[:220]}")
                             final_text = "\n".join(lines)
                             stream_box.text(final_text)
+                    elif etype == "cognitive_route":
+                        cognitive_route_event = dict(ev)
+                        with route_box:
+                            _render_cognitive_route_badge(cognitive_route_event)
                     elif etype == "research_leads":
                         research_leads_label = str(ev.get("label") or "UNVERIFIED LEADS — NOT OWNER-APPROVED")
                         ev_leads = list(ev.get("leads") or [])
@@ -1732,7 +1760,7 @@ if nav_selection == "💬 Chat with Memory":
                         final_text = err_msg
                         stream_box.error(err_msg)
 
-                if selected_chat_mode == "stream" and token_chunks:
+                if selected_chat_mode in {"stream", "deliberative"} and token_chunks:
                     final_text = "".join(token_chunks)
                     stream_box.markdown(_defang_markdown_preview(final_text))
                     _render_grounding_badge(grounding_event)
@@ -1758,6 +1786,7 @@ if nav_selection == "💬 Chat with Memory":
                     "sources": sources_list,
                     "retrieval_ms": retrieval_ms,
                     "grounding": grounding_event,
+                    "cognitive_route": cognitive_route_event,
                     "verified_claims_detail": verified_detail,
                     "research_leads_text": research_leads_text,
                     "research_leads_label": research_leads_label,
@@ -3307,21 +3336,21 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                         except Exception as exc:
                             st.error(f"CAS promotion failed: {exc}")
                 with dp2:
-                    if st.button("🚫 Deprecate Selected (CAS)", key="btn_gen4_distill_deprecate"):
+                    if st.button("🚫 Revoke Selected (CAS)", key="btn_gen4_distill_deprecate"):
                         try:
                             dres = promote_distilled_artifact(
                                 str(sel_dist["path"]),
                                 expected_sha256=str(sel_dist["sha256"]),
                                 actor=g4_distill_actor.strip() or "dashboard_owner",
-                                action="deprecate",
+                                action="revoke",
                                 reason=g4_distill_reason.strip(),
                                 brain_dir=BRAIN_DIR,
                                 atoms_dir=ATOMS_DIR,
                             )
-                            st.warning(f"Deprecated `{dres.get('filename', sel_dist['filename'])}` (CAS verified).")
+                            st.warning(f"Revoked `{dres.get('filename', sel_dist['filename'])}` (CAS verified).")
                             st.rerun()
                         except Exception as exc:
-                            st.error(f"CAS deprecation failed: {exc}")
+                            st.error(f"CAS revocation failed: {exc}")
             else:
                 st.info("No Principles (`7-principles/`) or Mental Models (`8-mental-models/`) staged yet.")
 

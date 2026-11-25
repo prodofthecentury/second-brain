@@ -39,11 +39,12 @@ from config import (  # noqa: E402
 )
 from memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
 from memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list  # noqa: E402
+from recall import normalize_project_tag, project_tags_match  # noqa: E402
 from review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 _GOAL_LINE_RE = re.compile(
-    r"^\s*-\s+\[(?P<id>[a-zA-Z0-9_-]+)\]\s+(?P<title>.+?)\s+\(domain:\s*(?P<domain>[^,)]+)(?:,\s*target_atoms:\s*(?P<target>\d+))?(?:,\s*parent:\s*(?P<parent>[^)]+))?\)\s*$"
+    r"^\s*-\s+\[(?P<id>[a-zA-Z0-9_-]+)\]\s+(?P<title>.+?)\s+\(domain:\s*(?P<domain>[^,)]+)(?:,\s*target_atoms:\s*(?P<target>\d+))?(?:,\s*parent:\s*(?P<parent>[^,)]+))?(?:,\s*project:\s*(?P<project>[^)]+))?\)\s*$"
 )
 
 
@@ -88,6 +89,48 @@ def _domain_matches_text(dom: str, text_low: str) -> bool:
     return bool(re.search(rf"\b{re.escape(dom)}\b", text_low))
 
 
+def _strictly_matches_project(items: Any, scope_tag: str) -> bool:
+    if not scope_tag:
+        return True
+    proj_tags = [str(c).strip() for c in (items or ()) if str(c).strip().lower().startswith("project:")]
+    if not proj_tags:
+        return False
+    return all(bool(project_tags_match((t,), (scope_tag,))) for t in proj_tags)
+
+
+def _extract_experience_projects(efm: dict[str, Any]) -> list[str]:
+    projs: list[str] = []
+    for key in ("project", "projects", "context", "contexts", "tags"):
+        raw_v = efm.get(key)
+        if isinstance(raw_v, str):
+            raw_s = raw_v.strip()
+            vals = parse_scalar_list(raw_s) if raw_s.startswith("[") else [raw_s]
+        elif isinstance(raw_v, (list, tuple)):
+            vals = list(raw_v)
+        else:
+            vals = []
+        for item in vals:
+            s = str(item or "").strip()
+            if not s:
+                continue
+            if key in ("project", "projects") or s.lower().startswith("project:"):
+                norm = normalize_project_tag(s)
+                if norm and norm not in projs:
+                    projs.append(norm)
+    return projs
+
+
+def _goal_project_tag(goal: dict[str, Any]) -> str:
+    raw_p = str(goal.get("project") or "").strip()
+    if raw_p:
+        return normalize_project_tag(raw_p)
+    for field in ("domain", "parent"):
+        val = str(goal.get(field) or "").strip()
+        if val.lower().startswith("project:"):
+            return normalize_project_tag(val)
+    return ""
+
+
 def upsert_learning_goals(
     goals: list[dict[str, Any]],
     *,
@@ -110,16 +153,22 @@ def upsert_learning_goals(
         domain = str(g.get("domain") or "general").strip().lower()[:64]
         target_atoms = max(1, int(g.get("target_atoms") or 10))
         parent = str(g.get("parent") or "root").strip()[:48]
-        lines.append(f"- [{gid}] {title} (domain: {domain}, target_atoms: {target_atoms}, parent: {parent})")
-        clean_goals.append(
-            {
-                "id": gid,
-                "title": title,
-                "domain": domain,
-                "target_atoms": target_atoms,
-                "parent": parent,
-            }
+        raw_proj = str(g.get("project") or "").strip()[:120]
+        proj_tag = normalize_project_tag(raw_proj) if raw_proj else ""
+        proj_suffix = f", project: {proj_tag}" if proj_tag else ""
+        lines.append(
+            f"- [{gid}] {title} (domain: {domain}, target_atoms: {target_atoms}, parent: {parent}{proj_suffix})"
         )
+        goal_obj: dict[str, Any] = {
+            "id": gid,
+            "title": title,
+            "domain": domain,
+            "target_atoms": target_atoms,
+            "parent": parent,
+        }
+        if proj_tag:
+            goal_obj["project"] = proj_tag
+        clean_goals.append(goal_obj)
     atomic_write_bytes(str(p), ("\n".join(lines).rstrip() + "\n").encode("utf-8"))
     return {"status": "saved", "path": str(p), "goal_count": len(clean_goals), "goals": clean_goals}
 
@@ -132,20 +181,26 @@ def load_learning_goals(*, brain_dir: str | Path | None = None) -> list[dict[str
     for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
         m = _GOAL_LINE_RE.match(line)
         if m:
-            goals.append(
-                {
-                    "id": m.group("id").strip(),
-                    "title": m.group("title").strip(),
-                    "domain": m.group("domain").strip().lower(),
-                    "target_atoms": int(m.group("target") or 10),
-                    "parent": (m.group("parent") or "root").strip(),
-                }
-            )
+            item: dict[str, Any] = {
+                "id": m.group("id").strip(),
+                "title": m.group("title").strip(),
+                "domain": m.group("domain").strip().lower(),
+                "target_atoms": int(m.group("target") or 10),
+                "parent": (m.group("parent") or "root").strip(),
+            }
+            raw_proj = (m.group("project") or "").strip()
+            if raw_proj:
+                norm_p = normalize_project_tag(raw_proj)
+                if norm_p:
+                    item["project"] = norm_p
+            goals.append(item)
     return goals
 
 
 def evaluate_self_model_and_curiosity(
     *,
+    project: str | None = None,
+    include_private_goals: bool = True,
     brain_dir: str | Path | None = None,
     atoms_dir: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -157,7 +212,9 @@ def evaluate_self_model_and_curiosity(
     )
     bpath = Path(resolved_brain)
     apath = Path(resolved_atoms)
-    goals = load_learning_goals(brain_dir=resolved_brain)
+    scope_tag = normalize_project_tag(project) if (project and str(project).strip()) else ""
+    proj_slug = scope_tag.removeprefix("project:").lower() if scope_tag else ""
+    raw_goals = load_learning_goals(brain_dir=resolved_brain)
 
     domain_atoms: dict[str, int] = {}
     if apath.is_dir() and not _is_reparse_or_link(str(apath)):
@@ -186,6 +243,8 @@ def evaluate_self_model_and_curiosity(
             parsed = split_frontmatter(raw)
             fm_vals = parse_frontmatter_values(parsed[0]) if parsed else {}
             tags = parse_scalar_list(fm_vals.get("tags", [])) if isinstance(fm_vals.get("tags"), str) else list(fm_vals.get("tags") or [])
+            if scope_tag and not _strictly_matches_project([*(rec.get("contexts") or ()), *tags], scope_tag):
+                continue
             domains = {
                 str(c).strip().lower()
                 for c in [*(rec.get("contexts") or ()), *tags]
@@ -194,13 +253,35 @@ def evaluate_self_model_and_curiosity(
             for dom in domains or {"general"}:
                 domain_atoms[dom] = domain_atoms.get(dom, 0) + 1
 
+    # Filter goals strictly BEFORE counting playbooks, failures, domains, and curiosity targets.
+    goals: list[dict[str, Any]] = []
+    for g in raw_goals:
+        g_proj = _goal_project_tag(g)
+        if not include_private_goals and not g_proj:
+            continue
+        if scope_tag:
+            if g_proj:
+                if not project_tags_match((g_proj,), (scope_tag,)):
+                    continue
+            else:
+                if g["domain"] not in domain_atoms and g["domain"] != proj_slug:
+                    continue
+        goals.append(g)
+
+    candidate_domains = set(domain_atoms) | {g["domain"] for g in goals}
+
     domain_pbs: dict[str, int] = {}
     try:
-        from skill_playbooks import list_playbooks
+        from skill_playbooks import list_playbooks, playbook_visible_in_scope
 
         for pb in list_playbooks(brain_dir=resolved_brain, atoms_dir=resolved_atoms, active_only=True):
+            if scope_tag:
+                if not playbook_visible_in_scope(pb, (scope_tag,)):
+                    continue
+                if not all(_strictly_matches_project(ctx, scope_tag) for ctx in (pb.backing_atom_contexts or ())):
+                    continue
             tok = (pb.title or pb.filename).lower()
-            for dom in set(domain_atoms) | {g["domain"] for g in goals}:
+            for dom in candidate_domains:
                 if _domain_matches_text(dom, tok):
                     domain_pbs[dom] = domain_pbs.get(dom, 0) + 1
     except Exception:
@@ -221,41 +302,56 @@ def evaluate_self_model_and_curiosity(
                 continue
             eparsed = split_frontmatter(raw_exp)
             efm = parse_frontmatter_values(eparsed[0]) if eparsed else {}
+            if scope_tag:
+                exp_projs = _extract_experience_projects(efm)
+                if not exp_projs or not all(bool(project_tags_match((p,), (scope_tag,))) for p in exp_projs):
+                    continue
             succ_raw = str(efm.get("success") or "").strip().lower()
             is_failure = succ_raw in {"false", "0", "no"}
             if is_failure:
                 txt = raw_exp.lower()
-                for dom in set(domain_atoms) | {g["domain"] for g in goals}:
+                for dom in candidate_domains:
                     if _domain_matches_text(dom, txt):
                         domain_failures[dom] = domain_failures.get(dom, 0) + 1
 
-    all_domains = sorted(set(domain_atoms) | {g["domain"] for g in goals})
+    all_domains = sorted(candidate_domains)
     domain_profiles: list[dict[str, Any]] = []
     now_iso = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
-    dbp = self_model_db_path(resolved_brain)
-    with closing(_connect(dbp)) as conn, conn:
-        conn.execute("DELETE FROM domain_competence")
-        for dom in all_domains:
-            ac = domain_atoms.get(dom, 0)
-            pc = domain_pbs.get(dom, 0)
-            fc = domain_failures.get(dom, 0)
-            comp = max(0.0, min(1.0, round((min(ac, 12) / 12.0) * 0.7 + (min(pc, 3) / 3.0) * 0.3 - (0.08 * fc), 3)))
-            domain_profiles.append(
-                {
-                    "domain": dom,
-                    "atom_count": ac,
-                    "playbook_count": pc,
-                    "failure_count": fc,
-                    "competence_score": comp,
-                }
-            )
-            conn.execute(
-                """
-                INSERT INTO domain_competence(domain, atom_count, playbook_count, failure_count, competence_score, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (dom, ac, pc, fc, comp, now_iso),
-            )
+    for dom in all_domains:
+        ac = domain_atoms.get(dom, 0)
+        pc = domain_pbs.get(dom, 0)
+        fc = domain_failures.get(dom, 0)
+        comp = max(0.0, min(1.0, round((min(ac, 12) / 12.0) * 0.7 + (min(pc, 3) / 3.0) * 0.3 - (0.08 * fc), 3)))
+        domain_profiles.append(
+            {
+                "domain": dom,
+                "atom_count": ac,
+                "playbook_count": pc,
+                "failure_count": fc,
+                "competence_score": comp,
+            }
+        )
+
+    # Only persist global vault competence snapshots; project-scoped or redacted views must not overwrite global DB.
+    if not scope_tag and include_private_goals:
+        dbp = self_model_db_path(resolved_brain)
+        with closing(_connect(dbp)) as conn, conn:
+            conn.execute("DELETE FROM domain_competence")
+            for prof in domain_profiles:
+                conn.execute(
+                    """
+                    INSERT INTO domain_competence(domain, atom_count, playbook_count, failure_count, competence_score, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        prof["domain"],
+                        prof["atom_count"],
+                        prof["playbook_count"],
+                        prof["failure_count"],
+                        prof["competence_score"],
+                        now_iso,
+                    ),
+                )
 
     # Directed Curiosity: rank goal domains with largest coverage deficit
     curiosity_targets: list[dict[str, Any]] = []
@@ -299,6 +395,7 @@ def evaluate_self_model_and_curiosity(
     curiosity_targets.sort(key=lambda x: (-float(x["priority_score"]), x["domain"]))
 
     return {
+        "project": scope_tag or None,
         "self_model_path": str(self_model_md_path(resolved_brain)),
         "goals": goals,
         "domains": domain_profiles,

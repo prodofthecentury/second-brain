@@ -936,6 +936,165 @@ class QuantumLeapApiSdkTests(unittest.TestCase):
         self.assertIn("node_count", sync_payload)
         self.assertGreater(sync_payload["node_count"], 0)
 
+    def test_05_voice_thread_id_l0_recall_and_scoped_curiosity_distill_contracts(self) -> None:
+        import wave
+        import chat_threads
+        import memory_api
+        import tts_engine
+
+        # Build a valid tiny PCM WAV byte buffer for offline voice tests
+        buf_wav = io.BytesIO()
+        with wave.open(buf_wav, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(tts_engine.SAMPLE_RATE_HZ)
+            wf.writeframes(b"\x00\x00" * 240)
+        tiny_wav = buf_wav.getvalue()
+
+        # 1. voice_conversation_turn accepts thread_id='new', persists turns, returns thread_id, and continues thread
+        turn1 = tts_engine.voice_conversation_turn(
+            tiny_wav,
+            "turn1.wav",
+            brain_dir=self.brain,
+            policy_path=self.sec_dir / "policy.json",
+            state_dir=self.sec_dir,
+            mode="stream",
+            project_scope="project:alpha",
+            thread_id="new",
+            transcriber=lambda _p: "How does auth_service sign JWT tokens?",
+            stream_fn=lambda _p, _m="": iter(["auth_service signs JWT tokens using RS256 [V1]."]),
+            synthesizer_fn=lambda _txt, _v, _spd: tiny_wav,
+        )
+        tid = turn1.get("thread_id")
+        self.assertIsInstance(tid, str)
+        assert isinstance(tid, str)
+        self.assertTrue(tid.startswith("thr-"), f"Expected persisted thread_id, got {tid!r}")
+        self.assertIn("RS256", turn1["answer_text"])
+
+        turn2 = tts_engine.voice_conversation_turn(
+            tiny_wav,
+            "turn2.wav",
+            brain_dir=self.brain,
+            policy_path=self.sec_dir / "policy.json",
+            state_dir=self.sec_dir,
+            mode="stream",
+            project_scope="project:alpha",
+            thread_id=tid,
+            transcriber=lambda _p: "What depends on auth_service?",
+            stream_fn=lambda _p, _m="": iter(["api_gateway depends on auth_service verification [V1]."]),
+            synthesizer_fn=lambda _txt, _v, _spd: tiny_wav,
+        )
+        self.assertEqual(turn2["thread_id"], tid)
+        self.assertIn("api_gateway", turn2["answer_text"])
+        persisted = chat_threads.get_chat_thread(tid, max_turns=20, brain_dir=self.brain)
+        self.assertEqual(len(persisted["turns"]), 4)
+
+        # 2. HTTP POST /v1/voice/conversation-turn validates thread_id & forwards it cleanly
+        audio_b64 = base64.b64encode(tiny_wav).decode("ascii")
+        with httpx.Client(trust_env=False, timeout=20.0) as client:
+            r_bad_tid = client.post(
+                f"{self.base}/v1/voice/conversation-turn",
+                headers=self.owner_headers,
+                json={"audio_b64": audio_b64, "filename": "turn.wav", "thread_id": "../evil"},
+            )
+            self.assertEqual(r_bad_tid.status_code, 422, r_bad_tid.text)
+
+            r_missing_tid = client.post(
+                f"{self.base}/v1/voice/conversation-turn",
+                headers=self.owner_headers,
+                json={"audio_b64": audio_b64, "filename": "turn.wav", "thread_id": "thr-deadbeef99"},
+            )
+            self.assertEqual(r_missing_tid.status_code, 404, r_missing_tid.text)
+
+            captured_tid: list[str | None] = []
+
+            def _fake_voice_turn(*_args, **kwargs):
+                captured_tid.append(kwargs.get("thread_id"))
+                return {
+                    "status": "ok",
+                    "transcript": "test",
+                    "answer_text": "ok",
+                    "thread_id": kwargs.get("thread_id"),
+                    "sources": [],
+                    "grounding": {},
+                    "tts_available": False,
+                    "tts_warning": "",
+                    "audio_b64": None,
+                    "mime_type": None,
+                    "sample_rate": None,
+                    "duration_seconds": 0.0,
+                    "clean_spoken_text": "ok",
+                }
+
+            with patch.object(tts_engine, "voice_conversation_turn", side_effect=_fake_voice_turn):
+                r_ok_tid = client.post(
+                    f"{self.base}/v1/voice/conversation-turn",
+                    headers=self.owner_headers,
+                    json={"audio_b64": audio_b64, "filename": "turn.wav", "thread_id": tid},
+                )
+                self.assertEqual(r_ok_tid.status_code, 200, r_ok_tid.text)
+                self.assertEqual(r_ok_tid.json()["thread_id"], tid)
+                self.assertEqual(captured_tid, [tid])
+
+            # 3. HTTP POST /v1/recall wires use_l0_bus strictly for standard non-cross-project lexical/auto queries
+            seen_recall_l0: list[bool] = []
+            orig_api_search = memory_api.search_memory
+
+            def _spy_api_search(query, opts, **kwargs):
+                seen_recall_l0.append(bool(opts.use_l0_bus))
+                return orig_api_search(query, opts, **kwargs)
+
+            with patch.object(memory_api, "search_memory", side_effect=_spy_api_search):
+                for payload in (
+                    {"query": "auth_service RS256", "project_scope": "project:alpha", "retrieval_mode": "lexical"},
+                    {"query": "auth_service RS256", "project_scope": "project:alpha", "retrieval_mode": "lexical", "include_expired": True},
+                    {"query": "auth_service RS256", "project_scope": "project:alpha", "retrieval_mode": "lexical", "as_of": "2026-11-24"},
+                    {"query": "auth_service RS256", "project_scope": "project:alpha", "retrieval_mode": "lexical", "allow_cross_project": True},
+                ):
+                    r_rec = client.post(f"{self.base}/v1/recall", headers=self.agent_headers, json=payload)
+                    self.assertEqual(r_rec.status_code, 200, r_rec.text)
+            self.assertEqual(seen_recall_l0, [True, False, False, False])
+
+            # 4. Scoped /v1/cognitive/curiosity & /v1/principles/distill isolate projects cleanly + deprecate alias
+            _write_approved_atom(
+                self.brain,
+                "beta-reliability-extra.md",
+                claim="Beta checkout service enforces idempotency keys for reliability.",
+                project="project:beta",
+                extra_tags=("reliability",),
+            )
+            r_cur_alpha = client.get(
+                f"{self.base}/v1/cognitive/curiosity?project=project:alpha",
+                headers=self.owner_headers,
+            )
+            self.assertEqual(r_cur_alpha.status_code, 200, r_cur_alpha.text)
+            alpha_rel_dom = next(d for d in r_cur_alpha.json()["domains"] if d["domain"] == "reliability")
+            self.assertEqual(alpha_rel_dom["atom_count"], 3)
+
+            r_dist_beta = client.post(
+                f"{self.base}/v1/principles/distill",
+                headers=self.owner_headers,
+                json={"project": "project:beta"},
+            )
+            self.assertEqual(r_dist_beta.status_code, 201, r_dist_beta.text)
+            self.assertEqual(r_dist_beta.json()["principles_created"], [])
+
+            r_dist_alpha = client.post(
+                f"{self.base}/v1/principles/distill",
+                headers=self.owner_headers,
+                json={"project": "project:alpha"},
+            )
+            self.assertEqual(r_dist_alpha.status_code, 201, r_dist_alpha.text)
+            self.assertEqual(len(r_dist_alpha.json()["principles_created"]), 1)
+            created_p = r_dist_alpha.json()["principles_created"][0]
+            r_depr = client.post(
+                f"{self.base}/v1/principles/{created_p['filename']}/promote",
+                headers=self.owner_headers,
+                json={"expected_sha256": created_p["sha256"], "actor": "camer", "action": "deprecate", "reason": "test alias"},
+            )
+            self.assertEqual(r_depr.status_code, 200, r_depr.text)
+            self.assertEqual(r_depr.json()["status"], "revoked")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -781,7 +781,7 @@ def _prune_empty_dirs(dirs: list[Path], *, stop_at: Path | None = None) -> None:
                 pass
 
 
-_WIN_CMD_METACHARS = frozenset('&|<>^%!\r\n"')
+_WIN_CMD_METACHARS = frozenset('&|<>^%!$`\r\n"')
 _HOOK_HOST_IDS = frozenset({"antigravity", "claude-code", "cursor", "gemini-cli"})
 _HOOK_EVENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,63}$")
 
