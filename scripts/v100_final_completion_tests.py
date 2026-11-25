@@ -34,7 +34,8 @@ if __name__ == "__main__" and not __package__:
         _sb_sys.path[0] = str(_sb_repo)
     elif str(_sb_repo) not in _sb_sys.path:
         _sb_sys.path.insert(0, str(_sb_repo))
-    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
 
 
 import asyncio
