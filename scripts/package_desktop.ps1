@@ -14,7 +14,7 @@ param(
     [string]$PfxPath = $env:SECOND_BRAIN_PFX_PATH,
     [string]$PfxPassword = $env:SECOND_BRAIN_PFX_PASSWORD,
     [string]$Thumbprint = $env:SECOND_BRAIN_CERT_THUMBPRINT,
-    [string]$TimestampUrl = $(if ($env:SECOND_BRAIN_TIMESTAMP_URL) { $env:SECOND_BRAIN_TIMESTAMP_URL } else { "https://timestamp.digicert.com" }),
+    [string]$TimestampUrl = $env:SECOND_BRAIN_TIMESTAMP_URL,
     [switch]$SelfSigned,
     [switch]$SkipSign,
     [switch]$SkipBuild
@@ -43,9 +43,20 @@ try {
     }
 
     # Remove stale prior-version artifacts from dist/ so SHA256SUMS.txt and manifests stay strictly aligned
+    $PreservedUnversioned = @(
+        "SHA256SUMS.txt",
+        ".gitignore",
+        "second-brain-inbox-drop-pwa.zip",
+        "second-brain-mobile-vault-client.zip",
+        "SecondBrain.SecondBrain.yaml",
+        "second-brain.rb",
+        "second-brain-formula.rb",
+        "latest.yml",
+        "latest-mac.yml",
+        "latest-linux.yml"
+    )
     Get-ChildItem -Path $DistDir -File -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -ne "SHA256SUMS.txt" -and
-        $_.Name -ne "second-brain-inbox-drop-pwa.zip" -and
+        $_.Name -notin $PreservedUnversioned -and
         $_.Name -notmatch [regex]::Escape($CurrentVersion)
     } | Remove-Item -Force -ErrorAction SilentlyContinue
 
@@ -85,7 +96,28 @@ try {
 if (-not $SkipBuild) {
     Push-Location $DesktopDir
     try {
-        if (-not (Test-Path (Join-Path $DesktopDir "node_modules"))) {
+        $nodeModulesDir = Join-Path $DesktopDir "node_modules"
+        $pkgJsonFile = Join-Path $DesktopDir "package.json"
+        $lockFile = Join-Path $DesktopDir "package-lock.json"
+        $installedLock = Join-Path $nodeModulesDir ".package-lock.json"
+        $needsNpmSync = (-not (Test-Path $nodeModulesDir)) -or (
+            (Test-Path $lockFile) -and (
+                (-not (Test-Path $installedLock)) -or
+                ((Get-Item $lockFile).LastWriteTimeUtc -gt (Get-Item $installedLock).LastWriteTimeUtc)
+            )
+        )
+        if (-not $needsNpmSync -and (Test-Path $pkgJsonFile)) {
+            $pkgDoc = Get-Content -Raw -Path $pkgJsonFile | ConvertFrom-Json
+            if ($pkgDoc.dependencies) {
+                foreach ($depProp in $pkgDoc.dependencies.PSObject.Properties) {
+                    if (-not (Test-Path (Join-Path $nodeModulesDir $depProp.Name))) {
+                        $needsNpmSync = $true
+                        break
+                    }
+                }
+            }
+        }
+        if ($needsNpmSync) {
             npm ci
             if ($LASTEXITCODE -ne 0) {
                 throw "npm ci failed with code $LASTEXITCODE"
@@ -103,17 +135,20 @@ if (-not $SkipBuild) {
         $dstWheelhouse = Join-Path $DistDir "win-unpacked\resources\backend\wheelhouse"
         if (Test-Path $srcWheelhouse) {
             New-Item -ItemType Directory -Force -Path $dstWheelhouse | Out-Null
+            Get-ChildItem -Path $dstWheelhouse -Filter "*.whl" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
             Copy-Item -Path (Join-Path $srcWheelhouse "*.whl") -Destination $dstWheelhouse -Force
         }
 
         # Stage 2: Deterministically sign inner `win-unpacked/Second Brain.exe` BEFORE wrapping in NSIS/MSI
         $innerExe = Join-Path $DistDir "win-unpacked\Second Brain.exe"
+        $requireTrusted = ($env:SECOND_BRAIN_REQUIRE_TRUSTED_SIGN -in @("1", "true", "TRUE"))
         if (-not $SkipSign) {
             $innerSignArgs = @{
                 SingleFile   = $innerExe
-                TimestampUrl = $TimestampUrl
                 SkipManifest = $true
             }
+            if ($TimestampUrl) { $innerSignArgs["TimestampUrl"] = $TimestampUrl }
+            if ($requireTrusted) { $innerSignArgs["RequireTrustedChain"] = $true }
             if ($Thumbprint) { $innerSignArgs["Thumbprint"] = $Thumbprint }
             elseif ($PfxPath) {
                 $innerSignArgs["PfxPath"] = $PfxPath
@@ -167,26 +202,38 @@ if (-not $SkipBuild) {
 
 Get-ChildItem -Path $DistDir -Filter "*.nsis.7z" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 Remove-Item -Path (Join-Path $DistDir "builder-debug.yml") -Force -ErrorAction SilentlyContinue
+Remove-Item -Path (Join-Path $DistDir "builder-effective-config.yaml") -Force -ErrorAction SilentlyContinue
 
-# Stage 4: Sign outer .exe/.msi installers, verify signatures, and emit SHA256SUMS.txt
-if ($SkipSign) {
+function Write-DistSha256Sums {
+    param([Parameter(Mandatory = $true)][string]$TargetDistDir)
     $sumLines = @()
-    Get-ChildItem -Path $DistDir -File | Where-Object {
-        $_.Extension -in @(".exe", ".msi", ".whl", ".vsix", ".zip", ".blockmap") -or $_.Name.EndsWith(".tar.gz")
+    Get-ChildItem -Path $TargetDistDir -File | Where-Object {
+        -not $_.Name.StartsWith(".") -and
+        $_.Name -notin @("SHA256SUMS.txt", "builder-debug.yml", "builder-effective-config.yaml") -and (
+            $_.Extension -in @(".exe", ".msi", ".whl", ".vsix", ".zip", ".xpi", ".dmg", ".AppImage", ".deb", ".blockmap", ".rb", ".yaml", ".yml") -or
+            $_.Name.EndsWith(".tar.gz")
+        )
     } | Sort-Object Name | ForEach-Object {
         $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         $sumLines += "$hash  $($_.Name)"
     }
     [System.IO.File]::WriteAllText(
-        (Join-Path $DistDir "SHA256SUMS.txt"),
+        (Join-Path $TargetDistDir "SHA256SUMS.txt"),
         ($sumLines -join "`n") + "`n",
         (New-Object System.Text.UTF8Encoding $false)
     )
+}
+
+# Stage 4: Sign outer .exe/.msi installers, verify signatures, and emit SHA256SUMS.txt
+if ($SkipSign) {
+    Write-DistSha256Sums -TargetDistDir $DistDir
 } else {
+    $requireTrustedOuter = ($env:SECOND_BRAIN_REQUIRE_TRUSTED_SIGN -in @("1", "true", "TRUE"))
     $outerSignArgs = @{
-        DistDir      = $DistDir
-        TimestampUrl = $TimestampUrl
+        DistDir = $DistDir
     }
+    if ($TimestampUrl) { $outerSignArgs["TimestampUrl"] = $TimestampUrl }
+    if ($requireTrustedOuter) { $outerSignArgs["RequireTrustedChain"] = $true }
     if ($Thumbprint) { $outerSignArgs["Thumbprint"] = $Thumbprint }
     elseif ($PfxPath) {
         $outerSignArgs["PfxPath"] = $PfxPath
@@ -202,10 +249,34 @@ if ($SkipSign) {
 if ($Target -ne "pack") {
     Push-Location $RepoRoot
     try {
-        uv run --frozen python scripts/build_distribution_manifests.py --manifests-only --out-dir $DistDir --dist-dir $DistDir --require-checksums | Out-Host
+        $repoSlug = $env:GITHUB_REPOSITORY
+        if (-not $repoSlug) {
+            $desktopPkgPath = Join-Path $DesktopDir "package.json"
+            if (Test-Path $desktopPkgPath) {
+                $desktopPkgDoc = Get-Content -Raw -Path $desktopPkgPath | ConvertFrom-Json
+                if ($desktopPkgDoc.build -and $desktopPkgDoc.build.publish -and $desktopPkgDoc.build.publish.Count -gt 0) {
+                    $pubEntry = $desktopPkgDoc.build.publish[0]
+                    if ($pubEntry.owner -and $pubEntry.repo) {
+                        $repoSlug = "$($pubEntry.owner)/$($pubEntry.repo)"
+                    }
+                }
+            }
+        }
+        $mfArgs = @("run", "--frozen", "python", "scripts/build_distribution_manifests.py", "--manifests-only", "--out-dir", $DistDir, "--dist-dir", $DistDir, "--require-checksums")
+        if ($repoSlug) { $mfArgs += @("--repo-slug", $repoSlug) }
+        & uv @mfArgs | Out-Host
         if ($LASTEXITCODE -ne 0) {
             throw "build_distribution_manifests.py --manifests-only exited with code $LASTEXITCODE"
         }
+        $wingetYaml = Join-Path $DistDir "manifests\winget\SecondBrain.SecondBrain.yaml"
+        $brewPrimary = Join-Path $DistDir "manifests\homebrew\second-brain.rb"
+        $brewFormula = Join-Path $DistDir "manifests\homebrew\Formula\second-brain.rb"
+        $wingetZip = Join-Path $DistDir ("manifests\winget-pkgs\second-brain-winget-pkgs-" + $CurrentVersion + ".zip")
+        if (Test-Path $wingetYaml) { Copy-Item -Path $wingetYaml -Destination (Join-Path $DistDir "SecondBrain.SecondBrain.yaml") -Force }
+        if (Test-Path $brewPrimary) { Copy-Item -Path $brewPrimary -Destination (Join-Path $DistDir "second-brain.rb") -Force }
+        if (Test-Path $brewFormula) { Copy-Item -Path $brewFormula -Destination (Join-Path $DistDir "second-brain-formula.rb") -Force }
+        if (Test-Path $wingetZip) { Copy-Item -Path $wingetZip -Destination (Join-Path $DistDir (Split-Path -Leaf $wingetZip)) -Force }
+        Write-DistSha256Sums -TargetDistDir $DistDir
     } finally {
         Pop-Location
     }

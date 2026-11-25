@@ -23,10 +23,19 @@ from atom_mutator import (
     approved_revision_is_current,
     review_lock,
 )
-from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown
+from config import (
+    ATOMS_DIR,
+    BRAIN_DIR,
+    _is_reparse_or_link,
+    is_content_markdown,
+    resolve_module_vault_path,
+    snapshot_module_defaults,
+)
 from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
 
 def _source_snapshot(brain_root: Path, anchor: dict[str, Any]) -> tuple[str, str | None, str | None]:
@@ -51,8 +60,8 @@ def _source_snapshot(brain_root: Path, anchor: dict[str, Any]) -> tuple[str, str
 
 def audit_sources(
     *,
-    atoms_dir: str | Path = ATOMS_DIR,
-    brain_dir: str | Path = BRAIN_DIR,
+    atoms_dir: str | Path | None = None,
+    brain_dir: str | Path | None = None,
     decision_log_path: str | Path | None = None,
     demote_stale: bool = False,
     actor: str | None = None,
@@ -63,8 +72,21 @@ def audit_sources(
     owner decision record. The audit never edits evidence or silently repairs
     an anchor; the owner must inspect the current source before re-approval.
     """
-    atoms_root = Path(atoms_dir).resolve()
-    brain_root = Path(brain_dir).resolve()
+    explicit_atoms = str(atoms_dir) if atoms_dir is not None else None
+    explicit_brain = str(brain_dir) if brain_dir is not None else None
+    if explicit_atoms is not None and explicit_brain is None:
+        atoms_root = Path(explicit_atoms).resolve()
+        brain_root = atoms_root.parent
+    else:
+        brain_str = resolve_module_vault_path(globals(), "BRAIN_DIR", explicit_brain)
+        brain_root = Path(brain_str).resolve()
+        atoms_str = resolve_module_vault_path(
+            globals(),
+            "ATOMS_DIR",
+            explicit_atoms,
+            brain_dir=explicit_brain,
+        )
+        atoms_root = Path(atoms_str).resolve()
     decision_path = (
         Path(decision_log_path).resolve()
         if decision_log_path is not None
@@ -184,8 +206,8 @@ def audit_sources(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--atoms-dir", default=ATOMS_DIR)
-    parser.add_argument("--brain-dir", default=BRAIN_DIR)
+    parser.add_argument("--atoms-dir", default=None)
+    parser.add_argument("--brain-dir", default=None)
     parser.add_argument("--decision-log", default=None)
     parser.add_argument(
         "--check", action="store_true",

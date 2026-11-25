@@ -41,7 +41,7 @@ from filelock import FileLock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import _is_reparse_or_link, resolve_active_brain_dir, security_state_dir  # noqa: E402
+from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, resolve_active_brain_dir, security_state_dir  # noqa: E402
 from host_adapters import read_bounded_security_file, restrict_security_file_permissions  # noqa: E402
 from inbox_drop import create_mobile_drop_pairing, revoke_mobile_drop_pairing  # noqa: E402
 from vault_sync import _resolve_master_key, sync_config_path  # noqa: E402
@@ -62,12 +62,19 @@ BUNDLE_ALLOWED_ROOT_ITEMS: tuple[str, ...] = (
 BUNDLE_EXCLUDED_NAMES: frozenset[str] = frozenset(
     {
         ".git",
+        ".gradle",
         ".DS_Store",
         "__pycache__",
         "node_modules",
+        "Pods",
         "build",
         "DerivedData",
+        "gradle-wrapper.jar",
     }
+)
+BUNDLE_EXCLUDED_REL_PREFIXES: tuple[str, ...] = (
+    "android/app/src/main/assets/public/",
+    "ios/App/App/public/",
 )
 
 _HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -110,7 +117,8 @@ def _assert_no_symlinks(path: Path, *, stop_at: Path | None = None) -> None:
     cur = Path(os.path.abspath(str(path)))
     while True:
         if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
-            raise MobileVaultSecurityError(f"Refusing to traverse symlink or reparse point: {cur}")
+            if not _is_immutable_darwin_root_symlink(cur):
+                raise MobileVaultSecurityError(f"Refusing to traverse symlink or reparse point: {cur}")
         if stop_norm is not None and os.path.normcase(str(cur)) == stop_norm:
             break
         parent = cur.parent
@@ -210,11 +218,14 @@ def create_mobile_vault_pairing(
     s3_read_access_key_id: str = "",
     s3_read_secret_access_key: str = "",
     include_recovery_key: bool = False,
+    allow_bidirectional: bool = False,
+    peer_device_id: str | None = None,
+    peer_pubkey_b64: str | None = None,
     include_inbox_drop_pairing: bool = True,
     pwa_base_url: str = "https://localhost/vault-client/",
     state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Create a read-only zero-knowledge `#vaultpair=` mobile pairing bundle and `0600` registry entry."""
+    """Create a zero-knowledge `#vaultpair=` mobile pairing bundle (optionally bidirectional with peer pubkey pinning)."""
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
     _assert_no_symlinks(active_brain)
     cfg = _load_vault_sync_config_safe(active_brain, state_dir=state_dir)
@@ -320,8 +331,19 @@ def create_mobile_vault_pairing(
         client_bundle["s3_secret_access_key"] = sk
     if recovery_key_b64:
         client_bundle["recovery_key_b64"] = recovery_key_b64
+    client_bundle["allow_bidirectional"] = bool(allow_bidirectional)
     if drop_bundle is not None:
         client_bundle["inbox_drop_pairing"] = drop_bundle
+
+    if peer_device_id and peer_pubkey_b64:
+        register_mobile_peer_pubkey(
+            brain_dir=active_brain,
+            device_id=peer_device_id,
+            device_pubkey_b64=peer_pubkey_b64,
+            state_dir=state_dir,
+        )
+        trusted_peers[peer_device_id] = peer_pubkey_b64
+        client_bundle["trusted_peers"] = trusted_peers
 
     # Defense-in-depth assertion: private signing key material MUST NEVER appear in client_bundle
     if "device_privkey_b64" in client_bundle or "privkey_pkcs8_b64" in json.dumps(client_bundle):
@@ -544,6 +566,8 @@ def export_mobile_vault_client_bundle(
                     if not f_full.is_file():
                         raise MobileVaultSecurityError(f"Refusing to bundle non-regular file: {f_full}")
                     rel_posix = f_full.relative_to(src_root).as_posix()
+                    if any(rel_posix.startswith(pref) for pref in BUNDLE_EXCLUDED_REL_PREFIXES):
+                        continue
                     collected_files.append((rel_posix, f_full))
 
     collected_files.sort(key=lambda pair: pair[0])
@@ -578,6 +602,47 @@ def export_mobile_vault_client_bundle(
     }
 
 
+def register_mobile_peer_pubkey(
+    *,
+    brain_dir: str | Path | None = None,
+    device_id: str,
+    device_pubkey_b64: str,
+    state_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Pin an authenticated mobile device's own Ed25519 PUBLIC key (never private keys) in `trusted_peers`."""
+    clean_dev = str(device_id or "").strip()
+    if not re.fullmatch(r"^[A-Za-z0-9._:-]{3,64}$", clean_dev):
+        raise MobileVaultSecurityError(f"Invalid mobile device_id: {device_id!r}")
+    clean_pub = str(device_pubkey_b64 or "").strip()
+    try:
+        raw_pub = base64.b64decode(clean_pub, validate=True)
+    except Exception as exc:
+        raise MobileVaultSecurityError(f"Malformed base64 Ed25519 public key: {exc}") from exc
+    if len(raw_pub) != 32:
+        raise MobileVaultSecurityError("Mobile Ed25519 public key must be exactly 32 raw bytes.")
+
+    active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    _assert_no_symlinks(active_brain)
+    cfg = _load_vault_sync_config_safe(active_brain, state_dir=state_dir)
+    peers = dict(cfg.get("trusted_peers") or {})
+    if len(peers) >= 32 and clean_dev not in peers:
+        raise MobileVaultError("Maximum trusted peers (32) reached.")
+    peers[clean_dev] = clean_pub
+    cfg["trusted_peers"] = peers
+
+    sec_base = _resolve_security_base(state_dir) if state_dir is not None else None
+    cfg_path = sync_config_path(active_brain, state_dir=sec_base)
+    raw_cfg = (json.dumps(cfg, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    atomic_write_bytes(str(cfg_path), raw_cfg)
+    restrict_security_file_permissions(cfg_path)
+    return {
+        "status": "peer_registered",
+        "device_id": clean_dev,
+        "trusted_peer_count": len(peers),
+        "config_path": str(cfg_path),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Second Brain Full Mobile Vault Client Pairing & Exporter")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -589,7 +654,16 @@ def main(argv: list[str] | None = None) -> int:
     p_pair.add_argument("--endpoint", default=None)
     p_pair.add_argument("--pwa-url", default="https://localhost/vault-client/")
     p_pair.add_argument("--include-recovery-key", action="store_true")
+    p_pair.add_argument("--allow-bidirectional", action="store_true")
+    p_pair.add_argument("--peer-device-id", default=None)
+    p_pair.add_argument("--peer-pubkey-b64", default=None)
     p_pair.add_argument("--json", action="store_true")
+
+    p_peer = sub.add_parser("register-peer", help="Register a mobile device's Ed25519 public key into trusted_peers")
+    p_peer.add_argument("--brain-dir", default=None)
+    p_peer.add_argument("--device-id", required=True)
+    p_peer.add_argument("--pubkey-b64", required=True)
+    p_peer.add_argument("--json", action="store_true")
 
     p_list = sub.add_parser("list", help="List mobile vault pairings")
     p_list.add_argument("--brain-dir", default=None)
@@ -612,9 +686,20 @@ def main(argv: list[str] | None = None) -> int:
             include_passphrase_hint=args.hint,
             sync_endpoint_override=args.endpoint,
             include_recovery_key=args.include_recovery_key,
+            allow_bidirectional=bool(args.allow_bidirectional),
+            peer_device_id=args.peer_device_id,
+            peer_pubkey_b64=args.peer_pubkey_b64,
             pwa_base_url=args.pwa_url,
         )
         print(json.dumps(res, indent=2) if args.json else res["pwa_pairing_url"])
+        return 0
+    if args.cmd == "register-peer":
+        res = register_mobile_peer_pubkey(
+            brain_dir=args.brain_dir,
+            device_id=args.device_id,
+            device_pubkey_b64=args.pubkey_b64,
+        )
+        print(json.dumps(res, indent=2) if args.json else f"Registered {res['device_id']}")
         return 0
     if args.cmd == "list":
         res = list_mobile_vault_pairings(brain_dir=args.brain_dir)

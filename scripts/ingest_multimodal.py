@@ -43,7 +43,9 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import types
 
@@ -61,6 +63,8 @@ from config import (
     INBOX_DIR,
     RAW_DIR,
     SIDECAR_DIR,
+    VIDEO_EXTS,
+    VIDEO_ONLY_EXTS,
     VISION_MODEL,
     WHISPER_SIZE,
     _WINDOWS_RESERVED_STEMS,
@@ -73,8 +77,18 @@ from config import (
     now_slug,
     today,
 )
+from video_extractor import (
+    MAX_VIDEO_BYTES,
+    build_video_timeline_markdown,
+    extract_video_keyframes_and_audio,
+    is_video_container,
+)
 from doc_extractors import EXTRACTION_BODY_MARKER, MAX_DOC_BINARY_BYTES, extract_document
-from hardware_profile import fetch_loopback_json
+from hardware_profile import (
+    call_ollama_chat_maybe_no_think,
+    fetch_loopback_json,
+    strip_reasoning_think_blocks,
+)
 from host_adapters import (
     HostConsentError,
     OutboundSecretBlockedError,
@@ -105,6 +119,10 @@ AUDIO_LIMITATIONS = (
 IMAGE_LIMITATIONS = (
     "Automated local vision-model description; verify OCR text, numbers, and spatial details against "
     "the archived source image."
+)
+VIDEO_LIMITATIONS = (
+    "Automated local video keyframe + ASR timeline extraction; verify visual frame text, speakers, "
+    "and exact quotes against the archived source video."
 )
 
 _DEFAULT_OLLAMA_CHAT = ollama.chat
@@ -612,14 +630,21 @@ Output plain text only."""
             )
         client = ollama.Client(
             host=base_url,
-            timeout=120.0,
+            timeout=480.0,
             follow_redirects=False,
             trust_env=False,
         )
-        response = client.chat(model=model_name, messages=messages)
+        response = call_ollama_chat_maybe_no_think(
+            client.chat,
+            model=model_name,
+            messages=messages,
+            options={"temperature": 0.1, "repeat_penalty": 1.2, "num_predict": 256},
+        )
     if isinstance(response, dict) and response.get("model_digest"):
         model_digest = str(response["model_digest"])
-    return response["message"]["content"].strip(), model_name, model_digest
+    raw_text = str((response.get("message") or {}).get("content") or "").strip()
+    cleaned_text = strip_reasoning_think_blocks(raw_text).strip()
+    return cleaned_text or raw_text, model_name, model_digest
 
 
 _DEFAULT_SELECT_VISION_MODEL = select_vision_model
@@ -723,7 +748,167 @@ def process_document(filepath: str) -> str | None:
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 
-SUPPORTED_INGEST_EXTS = AUDIO_EXTS | IMAGE_EXTS | DOC_EXTS
+SUPPORTED_INGEST_EXTS = AUDIO_EXTS | IMAGE_EXTS | DOC_EXTS | VIDEO_EXTS
+
+
+def process_video(
+    filepath: str,
+    *,
+    runner: object = subprocess.run,
+    frame_describer: object | None = None,
+    audio_transcriber: object | None = None,
+) -> str | None:
+    """Extract deduplicated scene keyframes + 16 kHz ASR audio timeline from a local video."""
+    _validate_media_source(filepath, max_bytes=MAX_VIDEO_BYTES)
+    filename = os.path.basename(filepath)
+    stem = _sanitize_stem(os.path.splitext(filename)[0])
+    source_sha256 = file_sha256(filepath)
+    if not source_sha256:
+        raise RuntimeError(f"Could not compute SHA-256 for video source: {filename}")
+
+    with tempfile.TemporaryDirectory(prefix="sb_video_") as work_dir:
+        extracted = extract_video_keyframes_and_audio(filepath, work_dir, runner=runner)
+        wav_path = extracted.get("wav_path")
+        keyframes = list(extracted.get("keyframes") or [])
+
+        transcript = ""
+        asr_model = "unavailable"
+        asr_digest = "unavailable"
+        if wav_path and os.path.isfile(wav_path):
+            trans_fn = audio_transcriber or transcribe_audio
+            try:
+                transcript = str(trans_fn(wav_path) or "").strip()
+                asr_model = f"faster-whisper {WHISPER_SIZE} (cpu int8)"
+                asr_digest = whisper_model_digest(WHISPER_SIZE)
+            except RuntimeError as exc:
+                if not keyframes:
+                    raise
+                print(f"  [!] Video audio ASR skipped ({exc}); keeping keyframe extraction.")
+
+        frame_notes: list[dict[str, object]] = []
+        vis_model = VISION_MODEL
+        vis_digest = "unavailable"
+        for kf in keyframes:
+            kf_path = str(kf["path"])
+            desc = ""
+            if frame_describer is not None:
+                desc = str(frame_describer(kf_path) or "").strip()
+            elif describe_image is not _DEFAULT_DESCRIBE_IMAGE:
+                desc = str(describe_image(kf_path) or "").strip()
+            else:
+                try:
+                    desc, vis_model, vis_digest = describe_image_with_provenance(kf_path)
+                except Exception as exc:
+                    desc = f"[Visual frame keyframe extracted; local vision model unavailable ({exc}).]"
+            frame_notes.append(
+                {
+                    "timestamp_seconds": kf["timestamp_seconds"],
+                    "timestamp_label": kf["timestamp_label"],
+                    "sha256": kf["sha256"],
+                    "description": desc,
+                }
+            )
+
+    if not transcript and not frame_notes:
+        print(f"  [!] No transcript or keyframes extracted for {filename}. Skipping.")
+        return None
+
+    timeline_body = build_video_timeline_markdown(
+        filename,
+        transcript=transcript,
+        frame_notes=frame_notes,
+    )
+    out_name = f"{now_slug()}-video-{stem}.md"
+    content = render_provenance_capture(
+        capture_type="video_timeline",
+        extractor="ffmpeg+faster-whisper+vision",
+        model=f"{vis_model} | {asr_model}",
+        model_digest=vis_digest if vis_digest != "unavailable" else asr_digest,
+        source_filename=filename,
+        source_sha256=source_sha256,
+        limitations=VIDEO_LIMITATIONS,
+        body=timeline_body,
+        extra={
+            "keyframe_count": len(frame_notes),
+            "keyframe_sha256s": [fn["sha256"] for fn in frame_notes[:24]],
+            "has_audio_track": bool(wav_path),
+            "timestamp_format": "[TIMELINE] [FRAME t=HH:MM:SS.mmm sha256=...] & [MM:SS.mmm -> MM:SS.mmm]",
+        },
+    )
+    archive_note = _is_direct_raw_child(filepath)
+    out_name = save_capture_and_archive(filepath, out_name, content, source_sha256, allow_large=True)
+    print(f"  [✓] Video timeline saved → {out_name}")
+    print("  [✓] Original archived." if archive_note else "  [✓] External original copied into archive.")
+    return out_name
+
+
+def ingest_local_video_file(
+    filepath: str,
+    *,
+    brain_dir: str | os.PathLike[str] | None = None,
+    runner: object = subprocess.run,
+    frame_describer: object | None = None,
+    audio_transcriber: object | None = None,
+) -> dict[str, object]:
+    """Safely ingest an on-disk video file (<=512 MiB) into the active vault without base64 bloat."""
+    raw_path = os.path.abspath(str(filepath or "").strip())
+    if not raw_path or not os.path.isfile(raw_path):
+        raise FileNotFoundError(f"Video file not found: {filepath}")
+    if _is_reparse_or_link(raw_path):
+        raise PermissionError(f"Refusing symlink/reparse video source: {raw_path}")
+    ext = os.path.splitext(raw_path)[1].lower()
+    if ext not in VIDEO_EXTS:
+        raise ValueError(f"Unsupported video extension {ext!r}; supported: {sorted(VIDEO_EXTS)}")
+    _validate_media_source(raw_path, max_bytes=MAX_VIDEO_BYTES)
+    source_sha = file_sha256(raw_path)
+
+    resolved_brain = os.path.abspath(str(brain_dir)) if brain_dir is not None else os.path.dirname(os.path.abspath(RAW_DIR))
+    target_raw = os.path.join(resolved_brain, "0-raw")
+    target_inbox = os.path.join(target_raw, "inbox")
+    target_sidecar = os.path.join(resolved_brain, ".sidecar")
+    for check_p in (resolved_brain, target_raw, target_inbox, target_sidecar):
+        if os.path.lexists(check_p) and _is_reparse_or_link(check_p):
+            raise PermissionError(f"Refusing to ingest video under symlinked directory: {check_p}")
+        os.makedirs(check_p, exist_ok=True)
+
+    prev_ctx = (
+        getattr(_THREAD_VAULT_CONTEXT, "raw_dir", None),
+        getattr(_THREAD_VAULT_CONTEXT, "inbox_dir", None),
+        getattr(_THREAD_VAULT_CONTEXT, "sidecar_dir", None),
+    )
+    _THREAD_VAULT_CONTEXT.raw_dir = target_raw
+    _THREAD_VAULT_CONTEXT.inbox_dir = target_inbox
+    _THREAD_VAULT_CONTEXT.sidecar_dir = target_sidecar
+    _THREAD_VAULT_CONTEXT.last_dlp_flags = []
+    try:
+        if ext == ".webm" and not is_video_container(raw_path):
+            saved_rel = process_audio(raw_path)
+            category = "audio"
+        else:
+            saved_rel = process_video(
+                raw_path,
+                runner=runner,
+                frame_describer=frame_describer,
+                audio_transcriber=audio_transcriber,
+            )
+            category = "video"
+        dlp_hits = list(getattr(_THREAD_VAULT_CONTEXT, "last_dlp_flags", []) or [])
+    finally:
+        _THREAD_VAULT_CONTEXT.raw_dir, _THREAD_VAULT_CONTEXT.inbox_dir, _THREAD_VAULT_CONTEXT.sidecar_dir = prev_ctx
+
+    if not saved_rel:
+        raise ValueError(f"No transcript or visual frames extracted from {os.path.basename(raw_path)}.")
+    quarantined = saved_rel.startswith("inbox/")
+    return {
+        "status": "quarantined" if quarantined else "ingested",
+        "category": category,
+        "source_filename": os.path.basename(raw_path),
+        "source_sha256": source_sha,
+        "output_rel_path": f"0-raw/{saved_rel}",
+        "output_filename": os.path.basename(saved_rel),
+        "quarantined": quarantined,
+        "dlp_flags": dlp_hits,
+    }
 
 
 def ingest_uploaded_media_bytes(
@@ -748,7 +933,9 @@ def ingest_uploaded_media_bytes(
         )
     safe_stem = _sanitize_stem(raw_stem)
     media_category = (
-        "audio" if ext in AUDIO_EXTS else ("image" if ext in IMAGE_EXTS else "document")
+        "video"
+        if ext in VIDEO_ONLY_EXTS
+        else ("audio" if ext in AUDIO_EXTS else ("image" if ext in IMAGE_EXTS else "document"))
     )
 
     resolved_brain = os.path.abspath(str(brain_dir)) if brain_dir is not None else os.path.dirname(os.path.abspath(RAW_DIR))
@@ -810,7 +997,7 @@ def ingest_uploaded_media_bytes(
         dlp_hits = list(getattr(_THREAD_VAULT_CONTEXT, "last_dlp_flags", []) or [])
     except PermissionError:
         raise
-    except (ValueError, RuntimeError, OSError) as exc:
+    except Exception as exc:
         raise ValueError(f"Media ingestion failed or deferred: {exc}") from exc
     finally:
         _THREAD_VAULT_CONTEXT.raw_dir, _THREAD_VAULT_CONTEXT.inbox_dir, _THREAD_VAULT_CONTEXT.sidecar_dir = prev_ctx
@@ -824,6 +1011,8 @@ def ingest_uploaded_media_bytes(
         raise ValueError(f"No text or transcript could be extracted from {os.path.basename(staged_path)}.")
 
     quarantined = saved_rel.startswith("inbox/")
+    if ext == ".webm" and "-video-" in os.path.basename(saved_rel):
+        media_category = "video"
     return {
         "status": "quarantined" if quarantined else "ingested",
         "category": media_category,
@@ -838,6 +1027,8 @@ def ingest_uploaded_media_bytes(
 
 def process_file(filepath: str) -> str | None:
     ext = os.path.splitext(filepath)[1].lower()
+    if ext in VIDEO_ONLY_EXTS or (ext == ".webm" and is_video_container(filepath)):
+        return process_video(filepath)
     if ext in AUDIO_EXTS:
         return process_audio(filepath)
     if ext in IMAGE_EXTS:

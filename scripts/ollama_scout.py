@@ -19,6 +19,8 @@ Usage:
     uv run scripts/ollama_scout.py
 """
 
+from __future__ import annotations
+
 import os
 import re
 import sys
@@ -31,34 +33,50 @@ import ssl
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
-import httpx
-import httpcore
+try:
+    import httpx
+    import httpcore
+    HAS_HTTPX = True
+    _NetworkBackendBase: type = httpcore.NetworkBackend
+    _SyncByteStreamBase: type = httpx.SyncByteStream
+    _BaseTransportBase: type = httpx.BaseTransport
+except ImportError:
+    httpx = None  # type: ignore[assignment]
+    httpcore = None  # type: ignore[assignment]
+    HAS_HTTPX = False
+    _NetworkBackendBase = object
+    _SyncByteStreamBase = object
+    _BaseTransportBase = object
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
     BRIEFINGS_DIR,
-    READING_LIST,
-    SOURCES_DIR,
     RAW_DIR,
+    READING_LIST,
     SIDECAR_DIR,
+    SOURCES_DIR,
     _is_reparse_or_link,
-    today,
     ensure_dirs,
+    resolve_module_vault_path,
+    snapshot_module_defaults,
+    today,
 )
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 from review_atom import atomic_write_bytes, review_lock
 
-try:
-    import trafilatura
-    from trafilatura.settings import use_config
-    HAS_TRAFILATURA = True
-except ImportError:
-    HAS_TRAFILATURA = False
 
-try:
-    from bs4 import BeautifulSoup
-    HAS_BS4 = True
-except ImportError:
-    HAS_BS4 = False
+def __getattr__(name: str):
+    """Lazily report optional extractor availability without importing heavy HTML stacks at import time."""
+    if name == "HAS_TRAFILATURA":
+        import importlib.util
+
+        return importlib.util.find_spec("trafilatura") is not None
+    if name == "HAS_BS4":
+        import importlib.util
+
+        return importlib.util.find_spec("bs4") is not None
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ─── URL Fetching ─────────────────────────────────────────────────────────────
@@ -146,10 +164,12 @@ def validate_remote_url(url: str) -> ValidatedRemoteTarget:
     )
 
 
-class PinnedNetworkBackend(httpcore.NetworkBackend):
+class PinnedNetworkBackend(_NetworkBackendBase):
     """Connect only to the IPs captured by validation while keeping the URL host for TLS/Host."""
 
     def __init__(self, target: ValidatedRemoteTarget, backend=None):
+        if not HAS_HTTPX:
+            raise RuntimeError("Web Scout HTTP client requires 'httpx' and 'httpcore' (`pip install second-brain[scout]`).")
         self.target = target
         self.backend = backend or httpcore.SyncBackend()
 
@@ -178,7 +198,7 @@ class PinnedNetworkBackend(httpcore.NetworkBackend):
         raise UnsafeRemoteUrlError("Unix socket connections are not allowed for remote URLs")
 
 
-class CoreResponseStream(httpx.SyncByteStream):
+class CoreResponseStream(_SyncByteStreamBase):
     def __init__(self, response):
         self.response = response
 
@@ -189,10 +209,12 @@ class CoreResponseStream(httpx.SyncByteStream):
         self.response.close()
 
 
-class PinnedHTTPTransport(httpx.BaseTransport):
+class PinnedHTTPTransport(_BaseTransportBase):
     """HTTPX transport backed by httpcore and an IP-pinned network backend."""
 
     def __init__(self, target: ValidatedRemoteTarget):
+        if not HAS_HTTPX:
+            raise RuntimeError("Web Scout HTTP client requires 'httpx' and 'httpcore' (`pip install second-brain[scout]`).")
         self.pool = httpcore.ConnectionPool(
             ssl_context=ssl.create_default_context(),
             max_connections=5,
@@ -356,11 +378,20 @@ def fetch_article(url: str) -> dict | None:
     content = ""
     word_count = 0
 
-    if HAS_TRAFILATURA:
+    trafilatura_mod = None
+    use_config_fn = None
+    try:
+        import trafilatura as trafilatura_mod
+        from trafilatura.settings import use_config as use_config_fn
+    except ImportError:
+        trafilatura_mod = None
+        use_config_fn = None
+
+    if trafilatura_mod is not None and use_config_fn is not None:
         # Best-in-class article extraction
-        newconfig = use_config()
+        newconfig = use_config_fn()
         newconfig.set("DEFAULT", "EXTRACTION_TIMEOUT", "30")
-        extracted = trafilatura.extract(
+        extracted = trafilatura_mod.extract(
             html,
             url=checked_url,
             include_comments=False,
@@ -368,22 +399,27 @@ def fetch_article(url: str) -> dict | None:
             no_fallback=False,
             config=newconfig,
         )
-        meta = trafilatura.extract_metadata(html, default_url=url)
+        meta = trafilatura_mod.extract_metadata(html, default_url=url)
         if meta:
             title = meta.title or "Unknown"
         content = extracted or ""
-    elif HAS_BS4:
-        # Fallback to BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        title_tag = soup.find("title")
-        title = title_tag.get_text(strip=True) if title_tag else "Unknown"
-        # Remove script/style
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        content = soup.get_text(separator="\n", strip=True)
     else:
-        print("  [!] No extraction library available.")
-        return None
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            BeautifulSoup = None
+        if BeautifulSoup is not None:
+            # Fallback to BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            title_tag = soup.find("title")
+            title = title_tag.get_text(strip=True) if title_tag else "Unknown"
+            # Remove script/style
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            content = soup.get_text(separator="\n", strip=True)
+        else:
+            print("  [!] No extraction library available.")
+            return None
 
     if not content or len(content) < 100:
         print(f"  [!] Content too short or empty — possible bot-block.")
@@ -462,12 +498,13 @@ scout_status: fetched
     return filename
 
 
-def create_intake_pointer(source_filename: str, raw_dir: str = RAW_DIR) -> str:
+def create_intake_pointer(source_filename: str, raw_dir: str | None = None) -> str:
     """Create a quarantined pointer that cannot enter the Refinery without owner promotion."""
-    if os.path.lexists(raw_dir) and _is_reparse_or_link(raw_dir):
-        raise PermissionError(f"Refusing to write intake pointer into symlinked raw directory: {raw_dir}")
+    eff_raw_dir = resolve_module_vault_path(globals(), "RAW_DIR", raw_dir)
+    if os.path.lexists(eff_raw_dir) and _is_reparse_or_link(eff_raw_dir):
+        raise PermissionError(f"Refusing to write intake pointer into symlinked raw directory: {eff_raw_dir}")
     pointer_name = source_filename.replace(".md", ".intake")
-    pointer_path = os.path.join(raw_dir, pointer_name)
+    pointer_path = os.path.join(eff_raw_dir, pointer_name)
     try:
         with open(pointer_path, "x", encoding="utf-8", newline="\n") as f:
             f.write(
@@ -487,13 +524,14 @@ def create_intake_pointer(source_filename: str, raw_dir: str = RAW_DIR) -> str:
 
 def parse_reading_list() -> list[dict]:
     """Return list of uncompleted URL and RSS/Atom feed entries from reading-list.md."""
-    if not os.path.exists(READING_LIST):
+    reading_list_path = resolve_module_vault_path(globals(), "READING_LIST")
+    if not os.path.exists(reading_list_path):
         print("[!] reading-list.md not found.")
         return []
-    if _is_reparse_or_link(READING_LIST):
-        raise PermissionError(f"Refusing to read symlinked reading list: {READING_LIST}")
+    if _is_reparse_or_link(reading_list_path):
+        raise PermissionError(f"Refusing to read symlinked reading list: {reading_list_path}")
 
-    with open(READING_LIST, "r", encoding="utf-8") as f:
+    with open(reading_list_path, "r", encoding="utf-8") as f:
         content = f.read()
 
     entries: list[dict] = []
@@ -514,12 +552,14 @@ def parse_reading_list() -> list[dict]:
 
 def enqueue_discovered_urls(urls: list[str], *, max_new: int = 10) -> list[str]:
     """Append newly discovered RSS/Atom item URLs as uncompleted reading-list items."""
-    if not urls or not os.path.exists(READING_LIST):
+    reading_list_path = resolve_module_vault_path(globals(), "READING_LIST")
+    sidecar_dir = resolve_module_vault_path(globals(), "SIDECAR_DIR")
+    if not urls or not os.path.exists(reading_list_path):
         return []
-    with review_lock(os.path.join(SIDECAR_DIR, "writer.lock")):
-        if _is_reparse_or_link(READING_LIST):
-            raise PermissionError(f"Refusing to modify symlinked reading list: {READING_LIST}")
-        with open(READING_LIST, "r", encoding="utf-8") as f:
+    with review_lock(os.path.join(sidecar_dir, "writer.lock")):
+        if _is_reparse_or_link(reading_list_path):
+            raise PermissionError(f"Refusing to modify symlinked reading list: {reading_list_path}")
+        with open(reading_list_path, "r", encoding="utf-8") as f:
             content = f.read().replace("\r\n", "\n")
         added: list[str] = []
         for candidate in urls:
@@ -534,16 +574,18 @@ def enqueue_discovered_urls(urls: list[str], *, max_new: int = 10) -> list[str]:
         if added:
             suffix = "" if content.endswith("\n") or not content else "\n"
             appended = "\n".join(f"- [ ] {u}" for u in added) + "\n"
-            atomic_write_bytes(READING_LIST, (content + suffix + appended).encode("utf-8"))
+            atomic_write_bytes(reading_list_path, (content + suffix + appended).encode("utf-8"))
         return added
 
 
 def update_reading_list(url: str, status: str, note: str = ""):
     """Mark a URL as [x] (fetched) or [!] (failed) in reading-list.md without regex escape/prefix hazards."""
-    with review_lock(os.path.join(SIDECAR_DIR, "writer.lock")):
-        if _is_reparse_or_link(READING_LIST):
-            raise PermissionError(f"Refusing to modify symlinked reading list: {READING_LIST}")
-        with open(READING_LIST, "r", encoding="utf-8") as f:
+    reading_list_path = resolve_module_vault_path(globals(), "READING_LIST")
+    sidecar_dir = resolve_module_vault_path(globals(), "SIDECAR_DIR")
+    with review_lock(os.path.join(sidecar_dir, "writer.lock")):
+        if _is_reparse_or_link(reading_list_path):
+            raise PermissionError(f"Refusing to modify symlinked reading list: {reading_list_path}")
+        with open(reading_list_path, "r", encoding="utf-8") as f:
             content = f.read().replace("\r\n", "\n")
 
         marker = "[x]" if status == "ok" else "[!]"
@@ -558,7 +600,7 @@ def update_reading_list(url: str, status: str, note: str = ""):
             content,
             count=1,
         )
-        atomic_write_bytes(READING_LIST, updated.encode("utf-8"))
+        atomic_write_bytes(reading_list_path, updated.encode("utf-8"))
 
 
 mark_url_status = update_reading_list
@@ -568,6 +610,7 @@ mark_url_status = update_reading_list
 
 def run_scout():
     ensure_dirs()
+    briefings_dir = resolve_module_vault_path(globals(), "BRIEFINGS_DIR")
     initial_entries = parse_reading_list()
 
     if not initial_entries:

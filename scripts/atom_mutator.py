@@ -17,11 +17,22 @@ import tempfile
 import threading
 import time
 
-from config import ATOMS_DIR, RAW_DIR
+from config import (
+    ATOMS_DIR,
+    BRAIN_DIR,
+    RAW_DIR,
+    _is_reparse_or_link,
+    resolve_module_vault_path,
+    snapshot_module_defaults,
+)
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 from evidence import (
     ANCHOR_FIELDS,
     EvidenceValidationError,
+    extract_evidence_from_body_lines,
     find_evidence_anchor,
+    has_cached_normalized_source,
     verify_evidence_anchor,
     verify_evidence_anchor_known_source,
 )
@@ -38,7 +49,7 @@ from memory_format import (
     set_string_list_field,
     split_frontmatter,
 )
-from memory_review import parse_frontmatter_values
+from memory_review import parse_frontmatter_values, parse_scalar_list
 
 
 DECISION_LOG = os.path.join(RAW_DIR, "archive", "decision-record.jsonl")
@@ -134,10 +145,13 @@ def decision_log_path(brain_dir: str) -> str:
 _DECISION_CACHE_LOCK = threading.Lock()
 # Maps abs_log_path -> (mtime_ns, ctime_ns, size_bytes, prefix_sha256, latest_by_atom_filename_dict)
 _DECISION_LOG_CACHE: dict[str, tuple[int, int, int, str, dict[str, dict]]] = {}
-# Maps atom_sha256 -> (valid_approved_frontmatter_bool, anchors_dict)
-_ATOM_ANCHOR_PARSE_CACHE: dict[str, tuple[bool, dict[str, object]]] = {}
-# Maps (atom_sha256, src_sha256) -> anchor_verified_bool
-_ANCHOR_VERIFY_BY_HASH_CACHE: dict[tuple[str, str], bool] = {}
+# Maps atom_sha256 -> (valid_approved_frontmatter_bool, anchors_dict, clean_src_rel, recorded_src_sha, os_src_rel, sources_tuple, evidence_excerpt)
+_ATOM_ANCHOR_PARSE_CACHE: dict[
+    str,
+    tuple[bool, dict[str, object], str, str, str, tuple[str, ...], str],
+] = {}
+# Maps (norm_brain_dir, atom_sha256, src_sha256) -> anchor_verified_bool
+_ANCHOR_VERIFY_BY_HASH_CACHE: dict[tuple[str, str, str], bool] = {}
 # Maps normcase(abs_src_path) -> (mtime_ns, ctime_ns, size, src_sha256) for large (>64) vaults
 _SOURCE_STAT_SHA_CACHE: dict[str, tuple[int, int, int, str]] = {}
 
@@ -156,7 +170,13 @@ def invalidate_decision_log_cache(decision_log_path: str | None = None) -> None:
 def latest_decisions_by_atom(decision_log_path: str) -> dict[str, dict]:
     """Return latest decision record per atom_filename in O(1) cached time when log is unchanged."""
     abs_log = os.path.abspath(decision_log_path)
-    st = os.stat(abs_log)
+    if _is_reparse_or_link(os.path.dirname(abs_log)):
+        raise PermissionError(f"Refusing symlink or reparse-point decision log parent: {abs_log}")
+    st = _lstat_regular_non_reparse(abs_log)
+    if st is None:
+        if not os.path.lexists(abs_log):
+            raise FileNotFoundError(abs_log)
+        raise PermissionError(f"Refusing symlink or non-regular decision log: {abs_log}")
     with _DECISION_CACHE_LOCK:
         cached = _DECISION_LOG_CACHE.get(abs_log)
     if (
@@ -387,12 +407,19 @@ def apply_atom_mutation(
     decision_log_path: str | None = None,
     history_dir: str | None = None,
     brain_dir: str | None = None,
-    atoms_dir: str = ATOMS_DIR,
+    atoms_dir: str | None = None,
     reviewed_on: str | None = None,
 ) -> dict:
     """Compare, mutate, reindex, and attest one atom revision as one serialized operation."""
-    atoms_dir = os.path.abspath(atoms_dir)
-    brain_dir = os.path.abspath(brain_dir or os.path.dirname(atoms_dir))
+    from config import resolve_module_atoms_and_brain
+
+    resolved_brain, resolved_atoms = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
+    atoms_dir = resolved_atoms
+    brain_dir = resolved_brain
     atom_path = _canonical_atom_path(atom_path, atoms_dir)
     decision_log_path = (
         os.path.abspath(decision_log_path)
@@ -580,6 +607,20 @@ _DISALLOWED_TEMPORAL_ACTORS = {
 }
 
 
+def validate_actor_name(actor: str) -> str:
+    """Validate and normalize an explicit human owner actor name."""
+    clean_actor = str(actor or "").strip()[:120]
+    actor_tokens = {tok for tok in __import__("re").split(r"[^a-z0-9]+", clean_actor.casefold()) if tok}
+    if not clean_actor or bool(actor_tokens & _DISALLOWED_TEMPORAL_ACTORS):
+        raise ReviewTransitionError("This owner-gated operation requires an explicit human owner actor.")
+    return clean_actor
+
+
+def vault_writer_lock(brain_dir: str):
+    """Acquire the canonical sidecar writer.lock for a vault root."""
+    return review_lock(os.path.join(str(brain_dir), ".sidecar", "writer.lock"))
+
+
 def set_atom_temporal_bounds(
     atom_path: str,
     *,
@@ -591,15 +632,20 @@ def set_atom_temporal_bounds(
     decision_log_path: str | None = None,
     history_dir: str | None = None,
     brain_dir: str | None = None,
-    atoms_dir: str = ATOMS_DIR,
+    atoms_dir: str | None = None,
 ) -> dict:
     """Set or clear optional ``valid_from`` / ``valid_until`` bounds on an atom under ``writer.lock``.
 
     Preserves owner approval currency on already-approved atoms by re-verifying source byte-offset
     anchors and recording an attested owner approval; never promotes unapproved/pending atoms.
     """
-    atoms_dir = os.path.abspath(atoms_dir)
-    brain_dir = os.path.abspath(brain_dir or os.path.dirname(atoms_dir))
+    from config import resolve_module_atoms_and_brain
+
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     atom_path = _canonical_atom_path(atom_path, atoms_dir)
     decision_log_path = (
         os.path.abspath(decision_log_path)
@@ -731,16 +777,187 @@ def set_atom_temporal_bounds(
         }
 
 
+def archive_atom_to_cold(
+    atom_path: str,
+    *,
+    expected_sha256: str,
+    actor: str,
+    reason: str = "",
+    decision_log_path: str | None = None,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
+) -> dict:
+    """Reversibly move a low-gravity atom from ``2-atoms/`` to ``2-atoms/.cold-archive/`` under Owner CAS."""
+    from config import resolve_module_atoms_and_brain
+
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
+    atom_path = _canonical_atom_path(atom_path, atoms_dir)
+    decision_log_path = (
+        os.path.abspath(decision_log_path)
+        if decision_log_path is not None
+        else os.path.join(brain_dir, "0-raw", "archive", "decision-record.jsonl")
+    )
+    clean_actor = str(actor or "").strip()[:120]
+    actor_tokens = {tok for tok in __import__("re").split(r"[^a-z0-9]+", clean_actor.casefold()) if tok}
+    if not clean_actor or bool(actor_tokens & _DISALLOWED_TEMPORAL_ACTORS):
+        raise ReviewTransitionError("Cold-archiving an atom requires an explicit human owner actor.")
+    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+        raise ReviewConflictError("An exact 64-character expected SHA-256 is required.")
+
+    cold_dir = os.path.join(atoms_dir, ".cold-archive")
+    if os.path.lexists(cold_dir) and _is_reparse_or_link(cold_dir):
+        raise PermissionError(f"Refusing symlinked cold-archive dir: {cold_dir}")
+    os.makedirs(cold_dir, exist_ok=True)
+    lock_path = os.path.join(brain_dir, ".sidecar", "writer.lock")
+    fname = os.path.basename(atom_path)
+    cold_path = os.path.join(cold_dir, fname)
+
+    with review_lock(lock_path):
+        original = Path(atom_path).read_bytes()
+        actual_hash = content_sha256(original)
+        if actual_hash != expected_sha256:
+            raise ReviewConflictError(f"Atom revision changed (expected {expected_sha256}, found {actual_hash}).")
+        atomic_write_bytes(cold_path, original)
+        os.unlink(atom_path)
+        ts = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+        rec = {
+            "atom_filename": fname,
+            "action": "cold_archive",
+            "actor": clean_actor,
+            "before_sha256": actual_hash,
+            "after_sha256": actual_hash,
+            "cold_archive_path": f"2-atoms/.cold-archive/{fname}",
+            "reason": str(reason or "").strip()[:500],
+            "timestamp": ts,
+        }
+        append_decision_records([rec], decision_log_path)
+        refresh_lexical_index(atoms_dir, brain_dir)
+
+    return {
+        "status": "cold_archived",
+        "filename": fname,
+        "cold_path": cold_path,
+        "sha256": actual_hash,
+        "timestamp": ts,
+    }
+
+
+def restore_cold_archived_atom(
+    cold_atom_path_or_name: str,
+    *,
+    expected_sha256: str,
+    actor: str,
+    reason: str = "",
+    decision_log_path: str | None = None,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
+) -> dict:
+    """Restore a cold-archived atom from ``2-atoms/.cold-archive/`` back into ``2-atoms/`` under Owner CAS."""
+    from config import resolve_module_atoms_and_brain, safe_file_in_dir
+
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
+    decision_log_path = (
+        os.path.abspath(decision_log_path)
+        if decision_log_path is not None
+        else os.path.join(brain_dir, "0-raw", "archive", "decision-record.jsonl")
+    )
+    clean_actor = str(actor or "").strip()[:120]
+    actor_tokens = {tok for tok in __import__("re").split(r"[^a-z0-9]+", clean_actor.casefold()) if tok}
+    if not clean_actor or bool(actor_tokens & _DISALLOWED_TEMPORAL_ACTORS):
+        raise ReviewTransitionError("Restoring a cold-archived atom requires an explicit human owner actor.")
+    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+        raise ReviewConflictError("An exact 64-character expected SHA-256 is required.")
+
+    cold_dir = os.path.join(atoms_dir, ".cold-archive")
+    fname = os.path.basename(str(cold_atom_path_or_name or "").strip())
+    if not fname or not fname.endswith(".md"):
+        raise ReviewTransitionError(f"Invalid cold-archive atom name: {cold_atom_path_or_name!r}")
+    cold_path = safe_file_in_dir(cold_dir, fname, allowed_exts={".md"}, must_exist=True)
+    if not cold_path or not os.path.isfile(cold_path) or _is_reparse_or_link(cold_path):
+        raise FileNotFoundError(f"Cold-archived atom not found: {fname}")
+
+    target_path = os.path.join(atoms_dir, fname)
+    lock_path = os.path.join(brain_dir, ".sidecar", "writer.lock")
+    with review_lock(lock_path):
+        if os.path.exists(target_path):
+            raise ReviewConflictError(f"Cannot restore {fname}: active file already exists at {target_path}.")
+        archived = Path(cold_path).read_bytes()
+        actual_hash = content_sha256(archived)
+        if actual_hash != expected_sha256:
+            raise ReviewConflictError(f"Cold archive revision changed (expected {expected_sha256}, found {actual_hash}).")
+
+        text = archived.decode("utf-8")
+        parsed = split_frontmatter(text)
+        fm_vals = parse_frontmatter_values(parsed[0]) if parsed else {}
+        was_accepted = str(fm_vals.get("review_status", "")).strip() == "accepted" and str(fm_vals.get("claim_state", "")).strip() == "human_reviewed"
+        anchor = None
+        if was_accepted:
+            anchor = find_evidence_anchor(text, brain_dir)
+            if parsed is not None:
+                upd_fm = set_scalar_field(parsed[0], "citation_integrity", "anchored", "origin")
+                for k in ANCHOR_FIELDS:
+                    upd_fm = set_scalar_field(upd_fm, k, str(anchor[k]), "citation_integrity")
+                restored_bytes = render_memory_document(upd_fm, parsed[1]).encode("utf-8")
+            else:
+                restored_bytes = archived
+        else:
+            restored_bytes = archived
+
+        after_hash = content_sha256(restored_bytes)
+        atomic_write_bytes(target_path, restored_bytes)
+        os.unlink(cold_path)
+        ts = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+        rec: dict = {
+            "schema_version": 1,
+            "recorded_at": ts,
+            "atom_filename": fname,
+            "action": "approve" if was_accepted else "restore_cold_archive",
+            "actor": clean_actor,
+            "content_sha256_before": actual_hash,
+            "content_sha256_after": after_hash,
+            "restored_from_cold_archive": True,
+            "reason": str(reason or "").strip()[:500],
+            "timestamp": ts,
+        }
+        if anchor is not None:
+            rec.update(anchor)
+        append_decision_records([rec], decision_log_path)
+        invalidate_decision_log_cache()
+        refresh_lexical_index(atoms_dir, brain_dir)
+
+    return {
+        "status": "restored",
+        "filename": fname,
+        "path": target_path,
+        "sha256": after_hash,
+        "approved_current": bool(was_accepted),
+        "timestamp": ts,
+    }
+
+
 def apply_atom_merge(
     *, survivor_path: str, survivor_expected_sha256: str,
     superseded_path: str, superseded_expected_sha256: str,
     actor: str, rationale: str, decision_log_path: str | None = None,
     history_dir: str | None = None, brain_dir: str | None = None,
-    atoms_dir: str = ATOMS_DIR, reviewed_on: str | None = None,
+    atoms_dir: str | None = None, reviewed_on: str | None = None,
 ) -> list[dict]:
     """Owner-directed two-atom supersession with CAS, rollback, and paired audit."""
-    atoms_dir = os.path.abspath(atoms_dir)
-    brain_dir = os.path.abspath(brain_dir or os.path.dirname(atoms_dir))
+    from config import resolve_module_atoms_and_brain
+
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     survivor_path = _canonical_atom_path(survivor_path, atoms_dir)
     superseded_path = _canonical_atom_path(superseded_path, atoms_dir)
     decision_log_path = (
@@ -964,25 +1181,58 @@ def approved_revision_is_current(
     atom_path: str,
     decision_log_path: str | None = None,
     brain_dir: str | None = None,
-    atoms_dir: str = ATOMS_DIR,
+    atoms_dir: str | None = None,
     *,
     known_atom_bytes: bytes | None = None,
     known_atom_sha256: str | None = None,
     known_decision_map: dict[str, dict] | None = None,
     source_sha_memo: dict[str, str | None] | None = None,
     canonical_atoms_root: str | None = None,
+    known_atom_filename: str | None = None,
+    known_brain_abs: str | None = None,
+    known_norm_brain_abs: str | None = None,
 ) -> bool:
     """Accept only the latest owner approval for the exact atom and evidence revisions."""
     content = ""
     anchors: dict[str, object] = {}
     current_hash = ""
     try:
-        brain_dir = os.path.abspath(brain_dir or os.path.dirname(os.path.abspath(atoms_dir)))
-        resolved_decision_log = (
-            os.path.abspath(decision_log_path)
-            if decision_log_path is not None
-            else os.path.join(brain_dir, "0-raw", "archive", "decision-record.jsonl")
+        has_pre_resolved_brain = (
+            canonical_atoms_root is not None
+            and known_atom_bytes is not None
+            and known_brain_abs is not None
+            and known_norm_brain_abs is not None
         )
+        fast_path = has_pre_resolved_brain or (
+            canonical_atoms_root is not None
+            and known_atom_bytes is not None
+            and brain_dir is not None
+            and os.path.isabs(brain_dir)
+        )
+        if not fast_path:
+            from config import resolve_module_atoms_and_brain
+
+            brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+                globals(),
+                atoms_dir=atoms_dir,
+                brain_dir=brain_dir,
+            )
+        elif atoms_dir is None:
+            atoms_dir = canonical_atoms_root
+        if has_pre_resolved_brain:
+            brain_dir = known_brain_abs
+        if known_decision_map is not None:
+            resolved_decision_log = decision_log_path or ""
+        else:
+            resolved_decision_log = (
+                decision_log_path
+                if (fast_path and decision_log_path is not None and os.path.isabs(decision_log_path))
+                else (
+                    os.path.abspath(decision_log_path)
+                    if decision_log_path is not None
+                    else os.path.join(brain_dir, "0-raw", "archive", "decision-record.jsonl")
+                )
+            )
         if canonical_atoms_root is not None and known_atom_bytes is not None:
             path = atom_path
             content_bytes = known_atom_bytes
@@ -991,10 +1241,15 @@ def approved_revision_is_current(
             path = _canonical_atom_path(atom_path, atoms_dir)
             content_bytes = Path(path).read_bytes()
             current_hash = content_sha256(content_bytes)
+        pre_cached_verify: bool | None = None
         with _DECISION_CACHE_LOCK:
             cached_parse = _ATOM_ANCHOR_PARSE_CACHE.get(current_hash)
+            if cached_parse is not None and has_pre_resolved_brain and cached_parse[0] and cached_parse[3]:
+                pre_cached_verify = _ANCHOR_VERIFY_BY_HASH_CACHE.get(
+                    (known_norm_brain_abs, current_hash, cached_parse[3])  # type: ignore[index]
+                )
         if cached_parse is not None:
-            ok_fm, anchors = cached_parse
+            ok_fm, anchors, clean_src_rel, recorded_src_sha, os_src_rel, preparsed_sources, preparsed_evidence = cached_parse
             if not ok_fm:
                 return False
         else:
@@ -1004,9 +1259,9 @@ def approved_revision_is_current(
                 with _DECISION_CACHE_LOCK:
                     if len(_ATOM_ANCHOR_PARSE_CACHE) > 8192:
                         _ATOM_ANCHOR_PARSE_CACHE.clear()
-                    _ATOM_ANCHOR_PARSE_CACHE[current_hash] = (False, {})
+                    _ATOM_ANCHOR_PARSE_CACHE[current_hash] = (False, {}, "", "", "", (), "")
                 return False
-            frontmatter, _ = parsed
+            frontmatter, body_lines = parsed
             values = parse_frontmatter_values(frontmatter)
             sup_by = values.get("superseded_by", [])
             if isinstance(sup_by, str):
@@ -1019,25 +1274,73 @@ def approved_revision_is_current(
                 and all(anchors.values())
                 and frontmatter_value(frontmatter, "citation_integrity") == "anchored"
             )
+            if ok_fm:
+                raw_sources = values.get("sources", [])
+                if isinstance(raw_sources, str):
+                    src_list = parse_scalar_list(raw_sources)
+                else:
+                    src_list = [str(v).strip() for v in raw_sources if str(v).strip()]
+                preparsed_sources = tuple(src_list)
+                preparsed_evidence = extract_evidence_from_body_lines(body_lines)
+                raw_src_rel = str(anchors.get("evidence_source") or "").strip()
+                src_rel_norm = raw_src_rel.replace("\\", "/")
+                rec_sha = str(anchors.get("evidence_sha256") or "").strip().lower()
+                if (
+                    src_rel_norm
+                    and len(rec_sha) == 64
+                    and "\\" not in raw_src_rel
+                    and ":" not in src_rel_norm
+                    and "\x00" not in src_rel_norm
+                    and not src_rel_norm.startswith("/")
+                    and ".." not in src_rel_norm.split("/")
+                    and src_rel_norm.startswith(("0-raw/", "sources/"))
+                ):
+                    clean_src_rel = src_rel_norm
+                    recorded_src_sha = rec_sha
+                    os_src_rel = src_rel_norm.replace("/", os.sep) if os.sep != "/" else src_rel_norm
+                else:
+                    clean_src_rel = ""
+                    recorded_src_sha = ""
+                    os_src_rel = ""
+            else:
+                preparsed_sources = ()
+                preparsed_evidence = ""
+                clean_src_rel = ""
+                recorded_src_sha = ""
+                os_src_rel = ""
             with _DECISION_CACHE_LOCK:
                 if len(_ATOM_ANCHOR_PARSE_CACHE) > 8192:
                     _ATOM_ANCHOR_PARSE_CACHE.clear()
-                _ATOM_ANCHOR_PARSE_CACHE[current_hash] = (ok_fm, anchors)
+                _ATOM_ANCHOR_PARSE_CACHE[current_hash] = (
+                    ok_fm,
+                    anchors,
+                    clean_src_rel,
+                    recorded_src_sha,
+                    os_src_rel,
+                    preparsed_sources,
+                    preparsed_evidence,
+                )
             if not ok_fm:
                 return False
         latest_map = known_decision_map if known_decision_map is not None else latest_decisions_by_atom(resolved_decision_log)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ReviewTransitionError):
         return False
 
-    latest = latest_map.get(os.path.basename(path))
+    atom_fname = known_atom_filename or os.path.basename(path)
+    latest = latest_map.get(atom_fname)
     if not latest or latest.get("action") != "approve" or latest.get("content_sha256_after") != current_hash:
         return False
 
     # Fast hash-verified source check: avoids re-running quote regexes when source file SHA-256 is unchanged.
-    src_rel = str(anchors.get("evidence_source") or "").replace("\\", "/").strip()
-    recorded_src_sha = str(anchors.get("evidence_sha256") or "").strip().lower()
-    if src_rel and len(recorded_src_sha) == 64 and not src_rel.startswith("/") and ".." not in src_rel.split("/"):
-        src_candidate = os.path.join(brain_dir, *src_rel.split("/"))
+    if clean_src_rel:
+        if has_pre_resolved_brain:
+            brain_abs = known_brain_abs  # type: ignore[assignment]
+            norm_brain_abs = known_norm_brain_abs  # type: ignore[assignment]
+        else:
+            brain_abs = os.path.normpath(brain_dir) if (fast_path and ".." not in brain_dir) else os.path.abspath(brain_dir)
+            norm_brain_abs = os.path.normcase(brain_abs)
+        brain_prefix = brain_abs if brain_abs.endswith(os.sep) else (brain_abs + os.sep)
+        src_candidate = brain_prefix + os_src_rel
         live_src_sha: str | None = None
         src_bytes: bytes | None = None
         if source_sha_memo is not None and src_candidate in source_sha_memo:
@@ -1051,9 +1354,31 @@ def approved_revision_is_current(
             if live_src_sha != recorded_src_sha:
                 return False
         else:
-            src_st = _lstat_regular_non_reparse(src_candidate)
+            src_parents_safe = True
+            cur_dir = os.path.dirname(os.path.abspath(src_candidate))
+            while True:
+                try:
+                    pst = os.lstat(cur_dir)
+                except OSError:
+                    src_parents_safe = False
+                    break
+                if (
+                    not stat.S_ISDIR(pst.st_mode)
+                    or stat.S_ISLNK(pst.st_mode)
+                    or (os.name == "nt" and bool(getattr(pst, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT))
+                ):
+                    src_parents_safe = False
+                    break
+                if os.path.normcase(cur_dir) == norm_brain_abs:
+                    break
+                next_dir = os.path.dirname(cur_dir)
+                if next_dir == cur_dir:
+                    src_parents_safe = False
+                    break
+                cur_dir = next_dir
+            src_st = _lstat_regular_non_reparse(src_candidate) if src_parents_safe else None
             if src_st is not None:
-                src_key = os.path.normcase(os.path.abspath(src_candidate))
+                src_key = os.path.normcase(src_candidate if fast_path else os.path.abspath(src_candidate))
                 use_src_stat_cache = len(latest_map) > LARGE_VAULT_STAT_CACHE_THRESHOLD
                 if use_src_stat_cache:
                     with _DECISION_CACHE_LOCK:
@@ -1096,33 +1421,39 @@ def approved_revision_is_current(
                 source_sha_memo[src_candidate] = None
 
         if live_src_sha == recorded_src_sha:
-            pair_key = (current_hash, live_src_sha)
+            if pre_cached_verify is not None:
+                return pre_cached_verify
+            pair_key = (norm_brain_abs, current_hash, live_src_sha)
             with _DECISION_CACHE_LOCK:
                 cached_verify = _ANCHOR_VERIFY_BY_HASH_CACHE.get(pair_key)
             if cached_verify is not None:
                 return cached_verify
-            if not content:
-                try:
-                    content = content_bytes.decode("utf-8")
-                except UnicodeDecodeError:
-                    return False
-            if src_bytes is None:
+            if src_bytes is None and not has_cached_normalized_source(live_src_sha):
                 try:
                     with open(src_candidate, "rb") as src_fh:
                         src_bytes = src_fh.read()
                     if content_sha256(src_bytes) != live_src_sha:
                         return False
+                    if source_sha_memo is not None:
+                        source_sha_memo[src_candidate] = (live_src_sha, src_bytes)  # type: ignore[assignment]
                 except OSError:
                     return False
             if verify_evidence_anchor_known_source(
                 content,
                 anchors,
-                source_rel=src_rel,
+                source_rel=clean_src_rel,
                 source_sha256=live_src_sha,
                 source_bytes=src_bytes,
+                preparsed_evidence=preparsed_evidence,
+                preparsed_sources=preparsed_sources,
             ):
                 verified = True
             else:
+                if not content:
+                    try:
+                        content = content_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        return False
                 verified = verify_evidence_anchor(content, anchors, brain_dir)
             with _DECISION_CACHE_LOCK:
                 if len(_ANCHOR_VERIFY_BY_HASH_CACHE) > 8192:

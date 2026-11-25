@@ -84,12 +84,30 @@ function buildClipPayload({ url, title, selectedQuote, pageText, rawHtml, tags, 
   return payload;
 }
 
-function validatePairingCode(rawCode) {
+function parsePairingCode(rawCode) {
   const cleaned = String(rawCode || "").trim().toUpperCase();
-  if (!/^SBC-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(cleaned)) {
-    throw new Error("Enter a valid 1-click pairing code (format: SBC-XXXX-XXXX-XXXX).");
+  const match = /^SBC-([A-Z0-9]{4})-([A-Z0-9]{4})-([A-Z0-9]{4})(?:-([0-9]{1,5}))?$/.exec(cleaned);
+  if (!match) {
+    throw new Error("Enter a valid 1-click pairing code (format: SBC-XXXX-XXXX-XXXX or SBC-XXXX-XXXX-XXXX-PORT).");
   }
-  return cleaned;
+  const baseCode = `SBC-${match[1]}-${match[2]}-${match[3]}`;
+  let embeddedPort = null;
+  if (match[4] !== undefined) {
+    const num = Number.parseInt(match[4], 10);
+    if (!Number.isInteger(num) || num < 1 || num > 65535) {
+      throw new Error("Embedded loopback port in pairing code must be between 1 and 65535.");
+    }
+    embeddedPort = num;
+  }
+  return {
+    code: embeddedPort !== null ? `${baseCode}-${embeddedPort}` : baseCode,
+    baseCode,
+    port: embeddedPort,
+  };
+}
+
+function validatePairingCode(rawCode) {
+  return parsePairingCode(rawCode).code;
 }
 
 async function redeemPairingCode({ port, code, origin, label, fetchImpl }) {
@@ -97,8 +115,10 @@ async function redeemPairingCode({ port, code, origin, label, fetchImpl }) {
   if (typeof fn !== "function") {
     throw new Error("fetch API is unavailable in this environment.");
   }
-  const baseUrl = buildLoopbackBaseUrl(port);
-  const safeCode = validatePairingCode(code);
+  const parsedCode = parsePairingCode(code);
+  const effectivePort = parsedCode.port !== null ? parsedCode.port : normalizeLoopbackPort(port);
+  const baseUrl = buildLoopbackBaseUrl(effectivePort);
+  const safeCode = parsedCode.code;
   const cleanOrigin = String(origin || "").trim().toLowerCase().replace(/\/+$/, "");
   if (!cleanOrigin) {
     throw new Error("Browser extension origin is unavailable.");
@@ -121,7 +141,7 @@ async function redeemPairingCode({ port, code, origin, label, fetchImpl }) {
   if (!resp.ok) {
     throw new Error(data.error || `Pairing code redemption failed (HTTP ${resp.status})`);
   }
-  return data;
+  return { ...data, port: effectivePort };
 }
 
 async function clipperRequest({ port, token, method, path, body, fetchImpl }) {
@@ -165,20 +185,64 @@ async function sendWebClip({ port, token, clip, fetchImpl }) {
   return clipperRequest({ port, token, method: "POST", path: "/v1/clipper/clip", body: payload, fetchImpl });
 }
 
+function arrayBufferToBase64(buffer) {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer || 0);
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("base64");
+  }
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function buildMediaPayload({ url, title, kind, contentBase64, tags, destination }) {
+  const cleanUrl = validateClipUrl(url);
+  const cleanKind = String(kind || "").trim().toLowerCase();
+  if (cleanKind !== "screenshot_png" && cleanKind !== "pdf_document") {
+    throw new Error("Media kind must be 'screenshot_png' or 'pdf_document'.");
+  }
+  const cleanTitle = String(title || "").replace(/\s+/g, " ").trim().slice(0, 240);
+  const rawB64 = String(contentBase64 || "").trim();
+  if (!rawB64) {
+    throw new Error("Captured media payload is empty.");
+  }
+  const dest = destination === "inbox" ? "inbox" : "note";
+  return {
+    url: cleanUrl,
+    title: cleanTitle,
+    kind: cleanKind,
+    content_base64: rawB64,
+    tags: parseTagsInput(tags),
+    destination: dest,
+  };
+}
+
+async function sendClipperMedia({ port, token, media, fetchImpl }) {
+  const payload = buildMediaPayload(media);
+  return clipperRequest({ port, token, method: "POST", path: "/v1/clipper/capture-media", body: payload, fetchImpl });
+}
+
 const exported = {
   DEFAULT_PORT,
   CLIPPER_TOKEN_PREFIX,
   normalizeLoopbackPort,
   buildLoopbackBaseUrl,
   validateClipperToken,
+  parsePairingCode,
   validatePairingCode,
   validateClipUrl,
   parseTagsInput,
+  arrayBufferToBase64,
   buildClipPayload,
+  buildMediaPayload,
   clipperRequest,
   redeemPairingCode,
   testClipperConnection,
   sendWebClip,
+  sendClipperMedia,
 };
 
 if (typeof module !== "undefined" && module.exports) {

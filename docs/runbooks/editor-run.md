@@ -8,7 +8,14 @@
 
 ## Prerequisite
 
-Read `house-rules.md` completely before any action.
+1. Read `house-rules.md` completely before any action.
+2. Run create-only synthesis via the guarded Python entrypoint rather than manual overwrites:
+
+```powershell
+uv run --locked python scripts/ollama_editor.py
+```
+
+Note: Under Second Brain safety invariants, `3-threads/` synthesis documents are **create-only** (`YYYY-MM-DD-{topic-slug}.md` / `TOPIC-SLUG.md`) — automated runs never overwrite existing threads in place.
 
 ---
 
@@ -55,21 +62,15 @@ warrant a new thread (see Step 4).
 
 ---
 
-## Step 3 — Update existing threads (one sub-agent per thread)
+## Step 3 — Create supplemental thread notes without overwriting existing threads
 
-For each thread that received new atoms:
+For each topic cluster requiring synthesis (always writing a new create-only thread file so existing human or prior synthesis files are never overwritten):
 
-Open the thread document in `3-threads/`. Read it fully. Then:
-
-1. Add new atoms to the thread's **Atom Index** section
-   (list of `[[wikilink]]` to contributing atoms, sorted by date).
-2. Update the **Synthesis** section to reflect the new knowledge.
-   This is genuine writing: weave the new atoms into the existing
-   narrative. Do not just append a bullet. Integrate.
-3. Update `last-updated` in the frontmatter.
-4. If a `[FRICTION]` from last night touches this thread's topic,
-   add a **⚠ Contested Terrain** callout noting the specific conflict.
-5. Update `open-questions` with any new threads the new atoms open.
+1. Open and read related thread document(s) in `3-threads/` read-only for context.
+2. Create a new timestamped thread file (e.g., `3-threads/YYYY-MM-DD-TOPIC-SLUG.md`) using the create-only contract (`scripts/ollama_editor.py`) instead of mutating existing thread files in place.
+3. Include verified `[[wikilink]]` references in **Atom Index** (only owner-approved atoms for factual claims; clearly label unapproved leads).
+4. If a `[FRICTION]` / contradiction from `second-brain graph contradictions` touches this topic, add a **⚠ Contested Terrain** callout noting both conflicting atoms without auto-resolving either side.
+5. List unresolved topics in `open-questions`.
 
 ---
 

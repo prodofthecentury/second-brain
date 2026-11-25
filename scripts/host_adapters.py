@@ -20,13 +20,16 @@ import os
 from pathlib import Path
 import re
 import socket
-import subprocess
 import sys
 import tempfile
 import threading
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote as url_quote, urlsplit
 
-import httpx
+if TYPE_CHECKING:
+    import httpx as _httpx_mod
+    from ollama_scout import PinnedHTTPTransport as _PinnedHTTPTransportType
+    from ollama_scout import ValidatedRemoteTarget
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("host_adapters", "scripts.host_adapters"):
@@ -44,7 +47,16 @@ from answer_policy import (
     format_unverified_leads_section,
     validate_standard_answer,
 )
-from config import ATOMS_DIR, BRAIN_DIR, GEN_MODEL, _is_reparse_or_link
+from config import (
+    ATOMS_DIR,
+    BRAIN_DIR,
+    GEN_MODEL,
+    _is_reparse_or_link,
+    resolve_module_vault_path,
+    snapshot_module_defaults,
+)
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 from evidence import ANCHOR_FIELDS
 from hardware_profile import (
     call_ollama_chat_maybe_no_think,
@@ -55,20 +67,42 @@ from hardware_profile import (
 )
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
-from ollama_scout import (
-    PinnedHTTPTransport,
-    ValidatedRemoteTarget,
-    _normalized_hostname,
-    is_public_ip_address,
-)
 from recall import normalize_project_tag, project_tags_match
+from security_fs import (
+    MAX_POLICY_FILE_BYTES,
+    _current_windows_principal,
+    read_bounded_security_file,
+    restrict_security_file_permissions,
+)
+
+# Lazily loaded on first HTTP/online call so importing host_adapters stays lightweight;
+# kept as module attributes for backwards-compatible unittest.mock.patch targets.
+httpx: Any = None
+PinnedHTTPTransport: Any = None
+
+
+def _get_httpx():
+    global httpx
+    if httpx is None:
+        import httpx as _httpx
+
+        httpx = _httpx
+    return httpx
+
+
+def _get_pinned_http_transport():
+    global PinnedHTTPTransport
+    if PinnedHTTPTransport is None:
+        from ollama_scout import PinnedHTTPTransport as _PinnedHTTPTransport
+
+        PinnedHTTPTransport = _PinnedHTTPTransport
+    return PinnedHTTPTransport
+
 
 OUTBOUND_AUDIT_FILENAME = "outbound-host-audit.jsonl"
-MAX_POLICY_FILE_BYTES = 65536
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 _PII_PLACEHOLDER_TOKEN_RE = re.compile(r"\[REDACTED_PII:[a-z0-9_]+:\d+\]")
 _AUDIT_LOCK = threading.Lock()
-_CACHED_WINDOWS_USER: str | None = None
 
 # Deterministic secret & PII patterns for outbound context gating
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -230,115 +264,6 @@ def builtin_default_policies() -> dict[str, HostSharingRule]:
     }
 
 
-def _current_windows_principal() -> str | None:
-    global _CACHED_WINDOWS_USER
-    if _CACHED_WINDOWS_USER is not None:
-        return _CACHED_WINDOWS_USER or None
-    if os.name != "nt":
-        _CACHED_WINDOWS_USER = ""
-        return None
-    whoami_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "whoami.exe")
-    user = ""
-    if os.path.isfile(whoami_exe):
-        try:
-            proc = subprocess.run(
-                [whoami_exe],
-                capture_output=True,
-                text=True,
-                timeout=3.0,
-                check=False,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                user = proc.stdout.strip()
-        except Exception:
-            user = ""
-    if not user:
-        user = (os.environ.get("USERNAME") or "").strip()
-    _CACHED_WINDOWS_USER = user
-    return _CACHED_WINDOWS_USER or None
-
-
-def restrict_security_file_permissions(path: Path | str) -> None:
-    """Enforce owner-only permissions on POSIX (0o700/0o600) and Windows NTFS DACLs."""
-    try:
-        path = Path(path)
-        if _is_reparse_or_link(str(path)):
-            return
-        parent = path.parent
-        parent_is_link = os.path.lexists(str(parent)) and _is_reparse_or_link(str(parent))
-        if os.name != "nt":
-            if not parent_is_link and parent.exists():
-                os.chmod(parent, 0o700)
-            if path.exists():
-                os.chmod(path, 0o600)
-            return
-        icacls_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
-        if not os.path.exists(icacls_exe):
-            return
-        principal = _current_windows_principal()
-        if not principal:
-            return
-        def _harden_win_dir(dir_path: Path) -> None:
-            if os.path.lexists(str(dir_path)) and _is_reparse_or_link(str(dir_path)):
-                return
-            if not dir_path.exists():
-                return
-            subprocess.run(
-                [
-                    icacls_exe,
-                    str(dir_path),
-                    "/inheritance:r",
-                    "/grant:r",
-                    "*S-1-5-18:(OI)(CI)(F)",
-                    "*S-1-5-32-544:(OI)(CI)(F)",
-                    f"{principal}:(OI)(CI)(F)",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-                check=False,
-            )
-
-        if parent.parent.name in {"security", "models"}:
-            _harden_win_dir(parent.parent)
-        if (
-            not parent_is_link
-            and parent.exists()
-            and parent.name in {"security", ".sidecar", "snapshots", "sync", "vault-tokens", "keychain", "models", "cross-encoder", "nli"}
-        ):
-            _harden_win_dir(parent)
-        if path.exists():
-            subprocess.run(
-                [
-                    icacls_exe,
-                    str(path),
-                    "/inheritance:r",
-                    "/grant:r",
-                    "*S-1-5-18:(F)",
-                    "*S-1-5-32-544:(F)",
-                    f"{principal}:(F)",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-                check=False,
-            )
-    except OSError:
-        pass
-
-
-def read_bounded_security_file(path: Path, *, max_bytes: int = MAX_POLICY_FILE_BYTES) -> str:
-    """Read a security config/token file safely, rejecting symlinks/reparse points and oversized files."""
-    if os.path.lexists(str(path)) and _is_reparse_or_link(str(path)):
-        raise PermissionError(f"Refusing to read security file via symlink or reparse point: {path}")
-    if os.path.lexists(str(path.parent)) and _is_reparse_or_link(str(path.parent)):
-        raise PermissionError(f"Refusing to read security file under symlinked directory: {path.parent}")
-    stat_info = path.stat()
-    if stat_info.st_size > max_bytes:
-        raise PermissionError(f"Security file exceeds maximum allowed size ({max_bytes} bytes): {path}")
-    return path.read_text(encoding="utf-8")
-
-
 def validate_model_identifier(model: str, *, provider: str | None = None) -> str:
     """Validate model identifier against URL/path injection and control characters."""
     cleaned = str(model or "").strip()
@@ -401,7 +326,12 @@ def load_host_policies(policy_path: Path | None = None) -> dict[str, HostSharing
 
 
 def save_host_policies(policies: dict[str, HostSharingRule], policy_path: Path | None = None) -> Path:
-    target = (policy_path or default_host_policy_path()).expanduser().resolve()
+    raw_target = (policy_path or default_host_policy_path()).expanduser()
+    if os.path.lexists(str(raw_target)) and _is_reparse_or_link(str(raw_target)):
+        raise PermissionError(f"Refusing to overwrite symlinked policy file: {raw_target}")
+    if os.path.lexists(str(raw_target.parent)) and _is_reparse_or_link(str(raw_target.parent)):
+        raise PermissionError(f"Refusing to write policy under symlinked directory: {raw_target.parent}")
+    target = raw_target.resolve()
     if os.path.lexists(str(target)) and _is_reparse_or_link(str(target)):
         raise PermissionError(f"Refusing to overwrite symlinked policy file: {target}")
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -443,6 +373,128 @@ def save_host_policies(policies: dict[str, HostSharingRule], policy_path: Path |
             except OSError:
                 pass
     return target
+
+
+BUILTIN_HOST_IDS = frozenset(
+    {"ollama_local", "openai_online", "anthropic_online", "gemini_online", "owner_custom_local"}
+)
+_CUSTOM_HOST_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{2,47}$")
+_API_KEY_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+
+
+def create_custom_host_policy(
+    host_id: str,
+    *,
+    provider: str,
+    transport: str,
+    endpoint_url: str,
+    default_model: str,
+    api_key_env: str | None = None,
+    allowed_projects: tuple[str, ...] = ("*",),
+    allow_unscoped_atoms: bool = False,
+    allow_preference_atoms: bool = False,
+    redact_pii: bool | None = None,
+    fail_on_secret_detection: bool | None = None,
+    enabled: bool = False,
+    policy_path: Path | None = None,
+) -> HostSharingRule:
+    """Create and persist a validated user-defined AI model host profile in `host-sharing-policy.json`."""
+    clean_id = str(host_id or "").strip().lower()
+    if not _CUSTOM_HOST_ID_RE.fullmatch(clean_id):
+        raise ValueError("Custom host_id must match ^[a-z][a-z0-9_-]{2,47}$.")
+    if clean_id in BUILTIN_HOST_IDS:
+        raise ValueError(f"Host ID '{clean_id}' is a built-in profile and cannot be re-created.")
+
+    clean_prov = str(provider or "").strip()
+    if clean_prov not in {"ollama", "openai_compatible", "anthropic", "gemini"}:
+        raise ValueError(f"Unsupported provider '{clean_prov}'.")
+    clean_transport = str(transport or "").strip()
+    if clean_transport not in {"local", "online"}:
+        raise ValueError(f"Unsupported transport '{clean_transport}'.")
+
+    clean_model = validate_model_identifier(default_model, provider=clean_prov)
+    clean_ep = str(endpoint_url or "").strip().rstrip("/")
+    clean_key_env = str(api_key_env or "").strip() or None
+    if clean_key_env and not _API_KEY_ENV_NAME_RE.fullmatch(clean_key_env):
+        raise ValueError("api_key_env must match ^[A-Z][A-Z0-9_]{1,63}$ (never pass a raw secret).")
+
+    rule = HostSharingRule(
+        host_id=clean_id,
+        provider=clean_prov,
+        transport=clean_transport,
+        endpoint_url=clean_ep,
+        default_model=clean_model,
+        api_key_env=clean_key_env,
+        enabled=bool(enabled),
+        allowed_projects=tuple(str(p).strip() for p in allowed_projects if str(p).strip()),
+        allow_unscoped_atoms=bool(allow_unscoped_atoms),
+        allow_preference_atoms=bool(allow_preference_atoms),
+        redact_pii=True if clean_transport == "online" else bool(True if redact_pii is None else redact_pii),
+        fail_on_secret_detection=True
+        if clean_transport == "online"
+        else bool(True if fail_on_secret_detection is None else fail_on_secret_detection),
+        owner_consent_recorded=bool(enabled),
+    )
+    validate_endpoint_network_boundary(rule)
+    policies = load_host_policies(policy_path)
+    if clean_id in policies:
+        raise ValueError(f"Custom host '{clean_id}' already exists.")
+    policies[clean_id] = rule
+    save_host_policies(policies, policy_path)
+    return rule
+
+
+def delete_custom_host_policy(host_id: str, *, policy_path: Path | None = None) -> bool:
+    """Delete a user-created custom host profile while protecting built-in host profiles."""
+    clean_id = str(host_id or "").strip().lower()
+    if clean_id in BUILTIN_HOST_IDS:
+        raise ValueError(f"Cannot delete built-in host profile '{clean_id}'.")
+    policies = load_host_policies(policy_path)
+    if clean_id not in policies:
+        return False
+    policies.pop(clean_id)
+    save_host_policies(policies, policy_path)
+    return True
+
+
+LLAMA_CPP_SPECULATIVE_HOST_ID = "llama_cpp_speculative"
+
+
+def register_speculative_host_policy(
+    *,
+    endpoint_url: str = "http://127.0.0.1:8081/v1",
+    target_model: str = "speculative-local",
+    enabled: bool = True,
+    policy_path: Path | None = None,
+) -> HostSharingRule:
+    """Register or update the loopback llama.cpp speculative server host profile."""
+    clean_model = validate_model_identifier(target_model, provider="openai_compatible")
+    clean_ep = str(endpoint_url or "http://127.0.0.1:8081/v1").strip().rstrip("/")
+    parsed = urlsplit(clean_ep)
+    if parsed.scheme != "http" or (parsed.hostname or "").strip().lower() not in {"127.0.0.1", "localhost", "::1"}:
+        raise HostConsentError(
+            f"Speculative llama-server endpoint must bind strictly to loopback HTTP; got {endpoint_url!r}."
+        )
+    rule = HostSharingRule(
+        host_id=LLAMA_CPP_SPECULATIVE_HOST_ID,
+        provider="openai_compatible",
+        transport="local",
+        endpoint_url=clean_ep,
+        default_model=clean_model,
+        api_key_env=None,
+        enabled=bool(enabled),
+        allowed_projects=("*",),
+        allow_unscoped_atoms=True,
+        allow_preference_atoms=True,
+        redact_pii=False,
+        fail_on_secret_detection=False,
+        owner_consent_recorded=bool(enabled),
+    )
+    validate_endpoint_network_boundary(rule)
+    policies = load_host_policies(policy_path)
+    policies[LLAMA_CPP_SPECULATIVE_HOST_ID] = rule
+    save_host_policies(policies, policy_path)
+    return rule
 
 
 def inspect_and_redact_outbound(
@@ -593,6 +645,8 @@ def validate_endpoint_network_boundary(
         return None
 
     # Online host: require HTTPS on port 443 and strictly public, DNS-pinned IP answers
+    from ollama_scout import ValidatedRemoteTarget, _normalized_hostname, is_public_ip_address
+
     if parsed.scheme != "https":
         raise HostConsentError(
             f"Online host '{rule.host_id}' must use HTTPS transport (got {rule.endpoint_url!r})."
@@ -711,29 +765,30 @@ def filter_atoms_for_host(
         if not all(fm.get(k) for k in ANCHOR_FIELDS):
             continue
 
-        if isinstance(filename, str) and filename.endswith(".md") and Path(filename).name == filename:
-            check_root = atoms_root
-            check_brain = brain_root
-            if check_root is None and default_atoms_root is not None and (default_atoms_root / filename).is_file():
-                check_root = default_atoms_root
-                check_brain = default_atoms_root.parent
-            if check_root is not None:
-                cand_path = (check_root / filename).resolve()
-                if (
-                    cand_path.parent != check_root
-                    or not cand_path.is_file()
-                    or not approved_revision_is_current(
-                        str(cand_path),
-                        atoms_dir=str(check_root),
-                        brain_dir=str(check_brain or check_root.parent),
-                    )
-                ):
+        if not (isinstance(filename, str) and filename.endswith(".md") and Path(filename).name == filename):
+            continue
+        check_root = atoms_root
+        check_brain = brain_root
+        if check_root is None and default_atoms_root is not None and (default_atoms_root / filename).is_file():
+            check_root = default_atoms_root
+            check_brain = default_atoms_root.parent
+        if check_root is not None:
+            cand_path = (check_root / filename).resolve()
+            if (
+                cand_path.parent != check_root
+                or not cand_path.is_file()
+                or not approved_revision_is_current(
+                    str(cand_path),
+                    atoms_dir=str(check_root),
+                    brain_dir=str(check_brain or check_root.parent),
+                )
+            ):
+                continue
+            try:
+                if hashlib.sha256(cand_path.read_bytes()).hexdigest() != hashlib.sha256(content.encode("utf-8")).hexdigest():
                     continue
-                try:
-                    if hashlib.sha256(cand_path.read_bytes()).hexdigest() != hashlib.sha256(content.encode("utf-8")).hexdigest():
-                        continue
-                except OSError:
-                    continue
+            except OSError:
+                continue
 
         epistemic_label = str(fm.get("epistemic_label", "claim"))
         is_pref = epistemic_label == "preference" or bool(fm.get("epistemic_contract"))
@@ -835,24 +890,55 @@ def _to_gemini_response_schema(schema: dict) -> dict:
     return gem
 
 
+def _prepare_ollama_http_transport(
+    rule: HostSharingRule,
+    http_transport: _httpx_mod.BaseTransport | None,
+    pinned_target: ValidatedRemoteTarget | None,
+) -> tuple[_httpx_mod.BaseTransport | None, _PinnedHTTPTransportType | None, dict[str, str], str]:
+    """Prepare headers and DNS-pinned transport for mock or online ``provider='ollama'`` rules."""
+    api_key = (os.environ.get(rule.api_key_env) or "").strip() if rule.api_key_env else ""
+    if rule.transport == "online" and rule.api_key_env and not api_key:
+        raise HostConsentError(
+            f"Missing API credential in environment variable '{rule.api_key_env}' for online host '{rule.host_id}'."
+        )
+    owned_transport: _PinnedHTTPTransportType | None = None
+    eff_transport = http_transport
+    if eff_transport is None and rule.transport == "online":
+        resolved_t = pinned_target if pinned_target is not None else validate_endpoint_network_boundary(rule)
+        if resolved_t is not None:
+            owned_transport = _get_pinned_http_transport()(resolved_t)
+            eff_transport = owned_transport
+    target_host = (loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url).rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return eff_transport, owned_transport, headers, target_host
+
+
 def _invoke_provider_draft(
     rule: HostSharingRule,
     *,
     model: str,
     prompt: str,
-    timeout_s: float = 45.0,
-    http_transport: httpx.BaseTransport | None = None,
+    timeout_s: float | None = None,
+    http_transport: _httpx_mod.BaseTransport | None = None,
     pinned_target: ValidatedRemoteTarget | None = None,
     json_schema: dict | None = None,
     schema_name: str = "grounded_claim_draft",
     gemini_response_schema: dict | None = None,
 ) -> str:
     """Invoke the configured model endpoint and return raw structured JSON text."""
+    if not rule.enabled or (rule.transport != "local" and not rule.owner_consent_recorded):
+        raise HostConsentError(f"Host policy '{rule.host_id}' is disabled or lacks owner consent.")
     effective_schema = json_schema or ANSWER_DRAFT_SCHEMA
+    effective_timeout_s = float(timeout_s) if timeout_s is not None else (120.0 if rule.provider == "ollama" else 45.0)
     safe_model = validate_model_identifier(model, provider=rule.provider)
     if rule.provider == "ollama":
-        if http_transport is not None:
-            target_host = (loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url).rstrip("/")
+        if http_transport is not None or rule.transport == "online":
+            httpx_mod = _get_httpx()
+            eff_transport, owned_ollama_transport, ollama_headers, target_host = _prepare_ollama_http_transport(
+                rule, http_transport, pinned_target
+            )
             req_json: dict[str, object] = {
                 "model": safe_model,
                 "messages": [{"role": "user", "content": prompt}],
@@ -862,29 +948,38 @@ def _invoke_provider_draft(
             }
             if is_reasoning_model_name(safe_model):
                 req_json["think"] = False
-            with httpx.Client(
-                transport=http_transport,
-                timeout=timeout_s,
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
-                resp = client.post(
-                    f"{target_host}/api/chat",
-                    json=req_json,
-                )
-                if 300 <= resp.status_code < 400:
-                    raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
-                resp.raise_for_status()
-                data = resp.json()
-                raw_txt = str((data.get("message") or {}).get("content") or data.get("response") or "{}")
-                return strip_reasoning_think_blocks(raw_txt) or "{}"
+            ollama_kwargs: dict[str, object] = {
+                "timeout": effective_timeout_s,
+                "follow_redirects": False,
+                "trust_env": False,
+            }
+            if eff_transport is not None:
+                ollama_kwargs["transport"] = eff_transport
+            entered_ollama = False
+            try:
+                with httpx_mod.Client(**ollama_kwargs) as client:
+                    entered_ollama = True
+                    resp = client.post(
+                        f"{target_host}/api/chat",
+                        headers=ollama_headers,
+                        json=req_json,
+                    )
+                    if 300 <= resp.status_code < 400:
+                        raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    raw_txt = str((data.get("message") or {}).get("content") or data.get("response") or "{}")
+                    return strip_reasoning_think_blocks(raw_txt) or "{}"
+            finally:
+                if owned_ollama_transport is not None and not entered_ollama:
+                    owned_ollama_transport.close()
 
         import ollama
 
         target_host = loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url
         client = ollama.Client(
             host=target_host,
-            timeout=timeout_s,
+            timeout=effective_timeout_s,
             follow_redirects=False,
             trust_env=False,
         )
@@ -905,25 +1000,26 @@ def _invoke_provider_draft(
             f"Missing API credential in environment variable '{rule.api_key_env}' for online host '{rule.host_id}'."
         )
 
-    owned_pinned_transport: PinnedHTTPTransport | None = None
+    owned_pinned_transport: _PinnedHTTPTransportType | None = None
     effective_transport = http_transport
     if effective_transport is None and rule.transport == "online":
         resolved_target = pinned_target if pinned_target is not None else validate_endpoint_network_boundary(rule)
         if resolved_target is not None:
-            owned_pinned_transport = PinnedHTTPTransport(resolved_target)
+            owned_pinned_transport = _get_pinned_http_transport()(resolved_target)
             effective_transport = owned_pinned_transport
 
     client_kwargs: dict[str, object] = {
-        "timeout": timeout_s,
+        "timeout": effective_timeout_s,
         "follow_redirects": False,
         "trust_env": False,
     }
     if effective_transport is not None:
         client_kwargs["transport"] = effective_transport
 
+    httpx_mod = _get_httpx()
     client_entered = False
     try:
-        with httpx.Client(**client_kwargs) as client:
+        with httpx_mod.Client(**client_kwargs) as client:
             client_entered = True
             if rule.provider == "openai_compatible":
                 headers = {"Content-Type": "application/json"}
@@ -1040,10 +1136,13 @@ def invoke_provider_stream(
     model: str,
     system_prompt: str = "",
     user_prompt: str,
-    http_transport: httpx.BaseTransport | None = None,
-    timeout_s: float = 60.0,
+    http_transport: _httpx_mod.BaseTransport | None = None,
+    timeout_s: float | None = None,
 ) -> Iterator[str]:
     """Stream text chunks across Ollama, OpenAI-compatible, Anthropic, and Gemini endpoints."""
+    if not rule.enabled or (rule.transport != "local" and not rule.owner_consent_recorded):
+        raise HostConsentError(f"Host policy '{rule.host_id}' is disabled or lacks owner consent.")
+    effective_timeout_s = float(timeout_s) if timeout_s is not None else (120.0 if rule.provider == "ollama" else 60.0)
     safe_model = validate_model_identifier(model, provider=rule.provider)
     messages: list[dict[str, str]] = []
     if system_prompt and system_prompt.strip():
@@ -1051,13 +1150,13 @@ def invoke_provider_stream(
     messages.append({"role": "user", "content": user_prompt})
 
     if rule.provider == "ollama":
-        target_host = (loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url).rstrip("/")
-        if http_transport is None:
+        if http_transport is None and rule.transport != "online":
+            target_host = (loopback_ollama_base_url(rule.endpoint_url) or rule.endpoint_url).rstrip("/")
             import ollama
 
             client = ollama.Client(
                 host=target_host,
-                timeout=timeout_s,
+                timeout=effective_timeout_s,
                 follow_redirects=False,
                 trust_env=False,
             )
@@ -1075,6 +1174,10 @@ def invoke_provider_stream(
                     yield str(piece)
             return
 
+        httpx_mod = _get_httpx()
+        eff_transport, owned_ollama_transport, ollama_headers, target_host = _prepare_ollama_http_transport(
+            rule, http_transport, target
+        )
         stream_body: dict[str, object] = {
             "model": safe_model,
             "messages": messages,
@@ -1083,32 +1186,41 @@ def invoke_provider_stream(
         }
         if is_reasoning_model_name(safe_model):
             stream_body["think"] = False
-        with httpx.Client(
-            transport=http_transport,
-            timeout=timeout_s,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            with client.stream(
-                "POST",
-                f"{target_host}/api/chat",
-                json=stream_body,
-            ) as resp:
-                if 300 <= resp.status_code < 400:
-                    raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
-                resp.raise_for_status()
-                for raw_line in resp.iter_lines():
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
-                    if not line or line == "[DONE]":
-                        continue
-                    obj = json.loads(line)
-                    piece = ((obj.get("message") or {}).get("content")) or obj.get("response") or ""
-                    if piece:
-                        yield str(piece)
+        ollama_kwargs: dict[str, object] = {
+            "timeout": effective_timeout_s,
+            "follow_redirects": False,
+            "trust_env": False,
+        }
+        if eff_transport is not None:
+            ollama_kwargs["transport"] = eff_transport
+        entered_ollama = False
+        try:
+            with httpx_mod.Client(**ollama_kwargs) as client:
+                entered_ollama = True
+                with client.stream(
+                    "POST",
+                    f"{target_host}/api/chat",
+                    headers=ollama_headers,
+                    json=stream_body,
+                ) as resp:
+                    if 300 <= resp.status_code < 400:
+                        raise HostConsentError("HTTP redirects are forbidden on model endpoints.")
+                    resp.raise_for_status()
+                    for raw_line in resp.iter_lines():
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
+                        if not line or line == "[DONE]":
+                            continue
+                        obj = json.loads(line)
+                        piece = ((obj.get("message") or {}).get("content")) or obj.get("response") or ""
+                        if piece:
+                            yield str(piece)
+        finally:
+            if owned_ollama_transport is not None and not entered_ollama:
+                owned_ollama_transport.close()
         return
 
     api_key = ""
@@ -1119,25 +1231,26 @@ def invoke_provider_stream(
             f"Missing API credential in environment variable '{rule.api_key_env}' for online host '{rule.host_id}'."
         )
 
-    owned_pinned_transport: PinnedHTTPTransport | None = None
+    owned_pinned_transport: _PinnedHTTPTransportType | None = None
     effective_transport = http_transport
     if effective_transport is None and rule.transport == "online":
         resolved_target = target if target is not None else validate_endpoint_network_boundary(rule)
         if resolved_target is not None:
-            owned_pinned_transport = PinnedHTTPTransport(resolved_target)
+            owned_pinned_transport = _get_pinned_http_transport()(resolved_target)
             effective_transport = owned_pinned_transport
 
     client_kwargs: dict[str, object] = {
-        "timeout": timeout_s,
+        "timeout": effective_timeout_s,
         "follow_redirects": False,
         "trust_env": False,
     }
     if effective_transport is not None:
         client_kwargs["transport"] = effective_transport
 
+    httpx_mod = _get_httpx()
     client_entered = False
     try:
-        with httpx.Client(**client_kwargs) as client:
+        with httpx_mod.Client(**client_kwargs) as client:
             client_entered = True
             if rule.provider == "openai_compatible":
                 headers = {
@@ -1340,15 +1453,22 @@ def generate_grounded_answer_via_host(
     *,
     host_id: str = "ollama_local",
     model_override: str | None = None,
-    atoms_dir: str = ATOMS_DIR,
-    brain_dir: str = BRAIN_DIR,
+    atoms_dir: str | None = None,
+    brain_dir: str | None = None,
     policy_path: Path | None = None,
     security_dir: str | Path | None = None,
     http_transport: httpx.BaseTransport | None = None,
     skip_dns_check_for_mock_transport: bool = False,
     unverified_leads: Sequence[UnverifiedLead] | None = None,
+    timeout_s: float | None = None,
 ) -> AnswerResult:
     """Execute consent check, scope filter, outbound redaction, DNS-pinned model call, and out-of-model grounding."""
+    if atoms_dir is not None and brain_dir is None:
+        atoms_dir = os.path.abspath(atoms_dir)
+        brain_dir = os.path.dirname(atoms_dir)
+    else:
+        brain_dir = resolve_module_vault_path(globals(), "BRAIN_DIR", brain_dir)
+        atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir, brain_dir=brain_dir)
     policies = load_host_policies(policy_path)
     if host_id not in policies:
         raise HostConsentError(f"Unknown AI host '{host_id}'. Configure it in host-sharing-policy.json first.")
@@ -1442,6 +1562,7 @@ def generate_grounded_answer_via_host(
             rule,
             model=chosen_model,
             prompt=redaction.sanitized_text,
+            timeout_s=timeout_s,
             http_transport=http_transport,
             pinned_target=pinned_target,
         )

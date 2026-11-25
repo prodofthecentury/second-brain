@@ -1165,10 +1165,35 @@ class MobileVaultClientEndToEndTests(unittest.TestCase):
             "mobile-vault-client/www/sw.js",
             "mobile-vault-client/www/lib/vault-crypto.js",
             "mobile-vault-client/www/lib/vault-epistemic-engine.js",
-            "mobile-vault-client/ios/App/App/Info.plist",
+            "mobile-vault-client/android/gradlew",
+            "mobile-vault-client/android/gradlew.bat",
+            "mobile-vault-client/android/gradle/wrapper/gradle-wrapper.properties",
+            "mobile-vault-client/android/build.gradle",
+            "mobile-vault-client/android/settings.gradle",
+            "mobile-vault-client/android/variables.gradle",
+            "mobile-vault-client/android/app/build.gradle",
+            "mobile-vault-client/android/app/proguard-rules.pro",
+            "mobile-vault-client/android/app/src/main/res/values/styles.xml",
+            "mobile-vault-client/android/app/src/main/java/com/secondbrain/vault/MainActivity.kt",
             "mobile-vault-client/android/app/src/main/AndroidManifest.xml",
+            "mobile-vault-client/ios/App/App.xcodeproj/project.pbxproj",
+            "mobile-vault-client/ios/App/App.xcworkspace/contents.xcworkspacedata",
+            "mobile-vault-client/ios/App/Podfile",
+            "mobile-vault-client/ios/App/Package.swift",
+            "mobile-vault-client/ios/App/App/Base.lproj/Main.storyboard",
+            "mobile-vault-client/ios/App/App/AppDelegate.swift",
+            "mobile-vault-client/ios/App/App/Info.plist",
         ):
             self.assertIn(required_member, names)
+
+        # Verify gradlew uses strictly LF endings (zero CR bytes) and native shields are intact
+        gradlew_bytes = (MOBILE_CLIENT_DIR / "android" / "gradlew").read_bytes()
+        self.assertEqual(gradlew_bytes.count(b"\r"), 0, "android/gradlew must have strictly LF line endings")
+        info_plist_text = (MOBILE_CLIENT_DIR / "ios" / "App" / "App" / "Info.plist").read_text(encoding="utf-8")
+        self.assertIn("<key>NSAllowsLocalNetworking</key>\n\t\t<true/>", info_plist_text)
+        app_delegate_text = (MOBILE_CLIENT_DIR / "ios" / "App" / "App" / "AppDelegate.swift").read_text(encoding="utf-8")
+        self.assertIn("UIVisualEffectView", app_delegate_text)
+        self.assertNotIn("window?.isHidden = false", app_delegate_text)
 
         # Symlink / junction inside mobile client staging tree must fail closed!
         staged_src = self.tmp / "staged_mobile_src"

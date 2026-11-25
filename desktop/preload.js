@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld("secondBrain", {
   pickFile: () => ipcRenderer.invoke("dialog:pick-file"),
   pickSaveBackup: () => ipcRenderer.invoke("dialog:pick-save-backup"),
   pickBackupFile: () => ipcRenderer.invoke("dialog:pick-backup-file"),
+  exportBuildArtifacts: (files) => ipcRenderer.invoke("build:export-files", { files }),
   openExternal: (url) => ipcRenderer.invoke("shell:open-external", { url }),
   switchVault: () => ipcRenderer.invoke("vault:switch"),
   chooseVault: () => ipcRenderer.invoke("vault:switch"),
@@ -46,5 +47,14 @@ contextBridge.exposeInMainWorld("secondBrain", {
     const listener = () => callback();
     ipcRenderer.on("sb:capture-focus", listener);
     return () => ipcRenderer.removeListener("sb:capture-focus", listener);
+  },
+  getUpdaterStatus: () => ipcRenderer.invoke("updater:status"),
+  checkForUpdates: () => ipcRenderer.invoke("updater:check"),
+  downloadUpdate: () => ipcRenderer.invoke("updater:download"),
+  installUpdate: () => ipcRenderer.invoke("updater:install"),
+  onUpdaterStatus: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("updater:event", listener);
+    return () => ipcRenderer.removeListener("updater:event", listener);
   },
 });

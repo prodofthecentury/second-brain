@@ -485,6 +485,32 @@ summary {
   margin-top: 10px;
 }
 
+.note-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  margin: 8px 0 6px;
+}
+
+.note-collapsed {
+  max-height: 9.5em;
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, #000 68%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 68%, transparent 100%);
+}
+
+.outbox-panel {
+  margin-top: 12px;
+  margin-bottom: 0;
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .bottom-nav {
   position: fixed;
   left: 0;

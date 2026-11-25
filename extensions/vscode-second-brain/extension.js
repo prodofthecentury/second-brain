@@ -28,6 +28,7 @@ const {
   parseSafeExternalUrl,
   buildChatWebviewHtml,
 } = require("./lib/chat-webview");
+const { buildGraphWebviewHtml } = require("./lib/graph-webview");
 
 const DEFAULT_API_PORT = 8765;
 const LOOPBACK_HOST = "127.0.0.1";
@@ -834,6 +835,7 @@ function activate(context) {
   }
 
   let chatPanel = null;
+  let graphPanel = null;
   let activeChatStream = null;
   let lastChatSourcesByCitation = Object.create(null);
   let activeChatThreadId = "";
@@ -857,10 +859,32 @@ function activate(context) {
     return true;
   }
 
+  let contextSignalTimer = null;
+
+  function clearContextSignalTimer() {
+    if (contextSignalTimer) {
+      clearTimeout(contextSignalTimer);
+      contextSignalTimer = null;
+    }
+  }
+
+  function disposeGraphPanel() {
+    if (graphPanel) {
+      const gp = graphPanel;
+      graphPanel = null;
+      try {
+        gp.dispose();
+      } catch {}
+    }
+  }
+
   activeExtensionState = {
     abortActiveChatStream,
+    disposeGraphPanel,
+    clearContextSignalTimer,
     disposeChatPanel() {
       abortActiveChatStream();
+      clearContextSignalTimer();
       if (chatPanel) {
         const p = chatPanel;
         chatPanel = null;
@@ -868,6 +892,7 @@ function activate(context) {
           p.dispose();
         } catch {}
       }
+      disposeGraphPanel();
     },
     treeProvider,
     noteFsProvider,
@@ -876,9 +901,82 @@ function activate(context) {
   context.subscriptions.push({
     dispose: () => {
       abortActiveChatStream();
+      clearContextSignalTimer();
+      disposeGraphPanel();
       chatPanel = null;
+      graphPanel = null;
     },
   });
+
+  function schedulePredictiveContextSignal(editor) {
+    try {
+      const cfg =
+        vscode.workspace && typeof vscode.workspace.getConfiguration === "function"
+          ? vscode.workspace.getConfiguration("secondBrain")
+          : null;
+      if (
+        cfg &&
+        typeof cfg.get === "function" &&
+        cfg.get("enablePredictiveContextSignal", true) === false
+      ) {
+        return;
+      }
+      const doc = editor && editor.document;
+      if (!doc) return;
+      const scheme = String(doc.uri?.scheme || "file").toLowerCase();
+      if (scheme !== "file" && scheme !== "secondbrain-note") return;
+      const rawPath = String(doc.fileName || doc.uri?.fsPath || doc.uri?.path || "").trim();
+      if (!rawPath) return;
+      const base = path.basename(rawPath);
+      const stem = base ? path.basename(base, path.extname(base)) : "";
+      if (!stem || stem.length < 2) return;
+
+      let projectScope = "";
+      try {
+        const folder =
+          typeof vscode.workspace?.getWorkspaceFolder === "function" && doc.uri
+            ? vscode.workspace.getWorkspaceFolder(doc.uri)
+            : Array.isArray(vscode.workspace?.workspaceFolders)
+            ? vscode.workspace.workspaceFolders[0]
+            : null;
+        const folderName = String(folder?.name || "")
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]+/g, "_")
+          .replace(/^_+|_+$/g, "");
+        if (folderName) {
+          projectScope = `project:${folderName}`;
+        }
+      } catch {}
+
+      clearContextSignalTimer();
+      contextSignalTimer = setTimeout(() => {
+        contextSignalTimer = null;
+        const payload = {
+          active_file: stem.slice(0, 120),
+          cursor_topic: stem.slice(0, 120),
+          prewarm: true,
+        };
+        if (projectScope) {
+          payload.project_scope = projectScope;
+        }
+        apiRequest("POST", "/v1/cognitive/context-signal", payload, {
+          useOwnerToken: true,
+        }).catch(() => {});
+      }, 1500);
+      if (typeof contextSignalTimer.unref === "function") {
+        contextSignalTimer.unref();
+      }
+    } catch {}
+  }
+
+  if (typeof vscode.window.onDidChangeActiveTextEditor === "function") {
+    context.subscriptions.push(
+      vscode.window.onDidChangeActiveTextEditor((editor) => {
+        schedulePredictiveContextSignal(editor);
+      })
+    );
+  }
 
   updateStatusBar();
   const pollTimer = setInterval(updateStatusBar, 30000);
@@ -3973,6 +4071,14 @@ function activate(context) {
               action: "pair",
             },
             {
+              label: "Export Encrypted Recall Index for Paired PWAs (SBMR1)",
+              action: "export_recall",
+            },
+            {
+              label: "Rotate Mobile Recall Encryption Key (SBMR1)",
+              action: "rotate_recall",
+            },
+            {
               label: "Pull & Decrypt Mobile Inbox Drops into Quarantined Inbox",
               action: "pull",
             },
@@ -4004,6 +4110,26 @@ function activate(context) {
                   placeHolder: "https://pages.example/inbox-drop/",
                 });
           if (pwaUrl === undefined) return;
+          let includeRecall;
+          if (opts.include_recall !== undefined) {
+            includeRecall = Boolean(opts.include_recall);
+          } else {
+            const recallPick = await vscode.window.showQuickPick(
+              [
+                {
+                  label: "Yes — Enable Zero-Knowledge Recall & Review Tab (SBMR1, Recommended)",
+                  value: true,
+                },
+                {
+                  label: "No — Drop-Only Key (Write-Only Blind Capture)",
+                  value: false,
+                },
+              ],
+              { placeHolder: "Include encrypted mobile recall key (SBMR1) in pairing URL?" }
+            );
+            if (!recallPick) return;
+            includeRecall = Boolean(recallPick.value);
+          }
           const res = await apiRequest(
             "POST",
             "/v1/sync/inbox-drop/pair",
@@ -4011,6 +4137,7 @@ function activate(context) {
               device_label: label.trim() || "Mobile Quick-Capture",
               pwa_base_url: pwaUrl.trim(),
               include_s3_credentials: Boolean(opts.include_s3_credentials),
+              include_recall: includeRecall,
             },
             { useOwnerToken: true }
           );
@@ -4027,9 +4154,55 @@ function activate(context) {
             await vscode.env.clipboard.writeText(shareLink);
           }
           vscode.window.showInformationMessage(
-            `Paired '${res.data?.device_label}' (token_id=${res.data?.token_id}). Pairing link copied to clipboard.`
+            `Paired '${res.data?.device_label}' (token_id=${res.data?.token_id}, include_recall=${Boolean(
+              res.data?.include_recall ?? includeRecall
+            )}). Pairing link copied to clipboard.`
           );
-          return;
+          return res.data;
+        }
+        if (action === "export_recall") {
+          const res = await apiRequest(
+            "POST",
+            "/v1/sync/inbox-drop/export-recall",
+            {
+              include_pending_review: opts.include_pending_review !== false,
+              sync_to_backend: opts.sync_to_backend !== false,
+            },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(
+              `Export mobile recall index failed: ${res.data?.error || res.status}`
+            );
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Exported encrypted mobile recall index (${res.data?.atom_count ?? 0} atoms -> ${
+              res.data?.object_key || "remote"
+            }).`
+          );
+          return res.data;
+        }
+        if (action === "rotate_recall") {
+          const res = await apiRequest(
+            "POST",
+            "/v1/sync/inbox-drop/rotate-recall",
+            {
+              reexport: opts.reexport !== false,
+              vault_id: opts.vault_id || undefined,
+            },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(
+              `Rotate mobile recall key failed: ${res.data?.error || res.status}`
+            );
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Rotated SBMR1 recall key for vault ${res.data?.vault_id || "active"}. Create new pairings for devices needing the new key.`
+          );
+          return res.data;
         }
         if (action === "pull") {
           const res = await apiRequest(
@@ -4452,6 +4625,7 @@ function activate(context) {
                   { label: "promote", description: "Promote Verified Playbook to Executable Skill" },
                   { label: "execute", description: "Execute Promoted Skill in Isolated Sandbox" },
                   { label: "dry_run", description: "Dry-Run Skill Verification without Subprocess" },
+                  { label: "revoke", description: "Revoke Promoted Executable Skill (CAS SHA-256 Verified)" },
                   { label: "kill_switch", description: "Engage or Release Global / Per-Skill Kill-Switch" },
                   { label: "audit", description: "Verify Hash-Chained Execution Audit Trail" },
                 ],
@@ -4459,6 +4633,20 @@ function activate(context) {
               )
             )?.label;
           if (!action) return;
+
+          const fetchExecutableSkillsCatalog = async () => {
+            try {
+              const listRes = await apiRequest("GET", "/v1/skills?include_inactive=1", null, {
+                useOwnerToken: true,
+              });
+              if (listRes.ok && Array.isArray(listRes.data?.skills)) {
+                return listRes.data.skills;
+              }
+            } catch (_skListErr) {
+              // Fall back to empty catalog
+            }
+            return [];
+          };
 
           if (action === "list") {
             const res = await apiRequest("GET", "/v1/skills?include_inactive=1", null, {
@@ -4476,36 +4664,303 @@ function activate(context) {
           }
 
           if (action === "promote") {
+            let candidates = [];
+            try {
+              const candRes = await apiRequest("GET", "/v1/skills/candidates", null, {
+                useOwnerToken: true,
+              });
+              if (candRes.ok && Array.isArray(candRes.data?.candidates)) {
+                candidates = candRes.data.candidates;
+              }
+            } catch (_candErr) {
+              candidates = [];
+            }
+
+            let selectedCand = null;
+            let playbookId = opts.playbook_id || "";
+            if (!playbookId && candidates.length > 0) {
+              const pickedCand = await vscode.window.showQuickPick(
+                candidates.map((c) => ({
+                  label: String(c.playbook_id || ""),
+                  description: `${Array.isArray(c.steps) ? c.steps.length : 1} step(s) · ${c.eligible_without_override ? "eligible" : "override"}`,
+                  detail: String(c.title || ""),
+                  candidate: c,
+                })),
+                { placeHolder: "Select backing active Playbook to promote to Executable Skill" }
+              );
+              if (!pickedCand) return;
+              selectedCand = pickedCand.candidate;
+              playbookId = pickedCand.label;
+            }
+            if (!playbookId) {
+              playbookId = await vscode.window.showInputBox({
+                prompt: "Backing Active Playbook ID",
+              });
+            }
+            if (!playbookId) return;
+
+            if (!selectedCand) {
+              selectedCand =
+                candidates.find(
+                  (c) =>
+                    String(c.playbook_id || "") === playbookId.trim() ||
+                    String(c.filename || "") === playbookId.trim()
+                ) || null;
+            }
+            let playbookSteps = Array.isArray(selectedCand?.steps) ? selectedCand.steps : [];
+            let expectedSha =
+              opts.expected_playbook_sha256 ||
+              String(selectedCand?.playbook_sha256 || selectedCand?.sha256 || "");
+
+            if (!playbookSteps.length || !expectedSha) {
+              try {
+                const pbRes = await apiRequest("GET", "/v1/playbooks?limit=200", null, {
+                  useOwnerToken: true,
+                });
+                const pbItems = Array.isArray(pbRes.data?.playbooks)
+                  ? pbRes.data.playbooks
+                  : Array.isArray(pbRes.data?.items)
+                    ? pbRes.data.items
+                    : [];
+                const matchedPb = pbItems.find(
+                  (p) =>
+                    String(p.playbook_id || "") === playbookId.trim() ||
+                    String(p.filename || "").replace(/\.md$/i, "") === playbookId.trim()
+                );
+                if (matchedPb) {
+                  if (!expectedSha && matchedPb.sha256) {
+                    expectedSha = String(matchedPb.sha256);
+                  }
+                  if (!playbookSteps.length && Array.isArray(matchedPb.steps)) {
+                    playbookSteps = matchedPb.steps;
+                  }
+                }
+              } catch (_pbErr) {
+                // Fall back to explicit owner input below
+              }
+            }
+
             const skillId =
               opts.skill_id ||
-              (await vscode.window.showInputBox({ prompt: "Executable Skill ID (slug)" }));
+              (await vscode.window.showInputBox({
+                prompt: "Executable Skill ID (slug)",
+                value: `${playbookId.trim().replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}-skill`,
+              }));
             if (!skillId) return;
-            const playbookId =
-              opts.playbook_id ||
-              (await vscode.window.showInputBox({ prompt: "Backing Active Playbook ID" }));
-            if (!playbookId) return;
-            const expectedSha =
-              opts.expected_playbook_sha256 ||
-              (await vscode.window.showInputBox({ prompt: "Expected Playbook SHA-256" }));
+
+            if (!expectedSha) {
+              expectedSha = await vscode.window.showInputBox({
+                prompt: "Expected Playbook SHA-256",
+              });
+            }
             if (!expectedSha) return;
-            const stepActions = opts.step_actions || [
-              { action_type: "vault_audit", audit_kind: "sources", output_file: "audit.json" },
-            ];
+
+            let stepActions = Array.isArray(opts.step_actions) ? opts.step_actions : null;
+            if (!stepActions) {
+              const stepCount = Math.max(1, playbookSteps.length || 1);
+              const modePick = await vscode.window.showQuickPick(
+                [
+                  {
+                    label: "auto",
+                    description: `Auto-map all ${stepCount} step(s) as deterministic read-only vault_audit actions`,
+                  },
+                  {
+                    label: "interactive",
+                    description: `Configure each of the ${stepCount} step action(s) individually`,
+                  },
+                  {
+                    label: "json",
+                    description: `Paste custom step_actions JSON array (${stepCount} step(s))`,
+                  },
+                ],
+                { placeHolder: `Configure ${stepCount} step action(s) for ${playbookId.trim()}` }
+              );
+              if (!modePick) return;
+
+              if (modePick.label === "auto") {
+                const auditKinds = ["sources", "ledger", "contradictions"];
+                stepActions = Array.from({ length: stepCount }, (_, idx) => ({
+                  action_type: "vault_audit",
+                  audit_kind: auditKinds[idx % auditKinds.length],
+                  output_file: `step_${String(idx + 1).padStart(2, "0")}_audit.json`,
+                }));
+              } else if (modePick.label === "json") {
+                const rawJson = await vscode.window.showInputBox({
+                  prompt: `Paste JSON array with exactly ${stepCount} step action(s)`,
+                  value: JSON.stringify(
+                    Array.from({ length: stepCount }, (_, idx) => ({
+                      action_type: "vault_audit",
+                      audit_kind: "sources",
+                      output_file: `step_${String(idx + 1).padStart(2, "0")}_audit.json`,
+                    }))
+                  ),
+                });
+                if (!rawJson) return;
+                try {
+                  const parsed = JSON.parse(rawJson);
+                  if (!Array.isArray(parsed) || parsed.length !== stepCount) {
+                    vscode.window.showErrorMessage(
+                      `step_actions JSON must be an array of exactly ${stepCount} step(s).`
+                    );
+                    return;
+                  }
+                  stepActions = parsed;
+                } catch (parseErr) {
+                  vscode.window.showErrorMessage(`Invalid step_actions JSON: ${parseErr.message}`);
+                  return;
+                }
+              } else {
+                stepActions = [];
+                for (let idx = 0; idx < stepCount; idx += 1) {
+                  const stepLabel = playbookSteps[idx]
+                    ? `Step ${idx + 1}/${stepCount}: ${String(playbookSteps[idx]).slice(0, 80)}`
+                    : `Step ${idx + 1}/${stepCount}`;
+                  const actPick = await vscode.window.showQuickPick(
+                    [
+                      { label: "vault_audit", description: "Read-only sources / ledger / contradictions audit" },
+                      { label: "vault_recall", description: "Grounded vault recall saved to JSON" },
+                      { label: "workspace_write", description: "Write deterministic text artifact in sandbox" },
+                      { label: "workspace_assert", description: "Assert file exists / non_empty / contains / json_key" },
+                      { label: "sandbox_python", description: "Execute isolated sandbox Python script" },
+                    ],
+                    { placeHolder: `Action type for ${stepLabel}` }
+                  );
+                  if (!actPick) return;
+                  const outDefault = `step_${String(idx + 1).padStart(2, "0")}_out.json`;
+                  if (actPick.label === "vault_audit") {
+                    const kindPick = await vscode.window.showQuickPick(
+                      ["sources", "ledger", "contradictions"],
+                      { placeHolder: `Audit kind for ${stepLabel}` }
+                    );
+                    if (!kindPick) return;
+                    stepActions.push({
+                      action_type: "vault_audit",
+                      audit_kind: kindPick,
+                      output_file: `step_${String(idx + 1).padStart(2, "0")}_${kindPick}.json`,
+                    });
+                  } else if (actPick.label === "vault_recall") {
+                    const qText = await vscode.window.showInputBox({
+                      prompt: `Vault recall query for ${stepLabel}`,
+                      value: String(playbookSteps[idx] || "verified runbook"),
+                    });
+                    if (!qText) return;
+                    stepActions.push({
+                      action_type: "vault_recall",
+                      query: qText.trim(),
+                      n_results: 5,
+                      output_file: outDefault,
+                    });
+                  } else if (actPick.label === "workspace_write") {
+                    const relP = await vscode.window.showInputBox({
+                      prompt: `Relative workspace file path for ${stepLabel}`,
+                      value: `step_${String(idx + 1).padStart(2, "0")}.txt`,
+                    });
+                    if (!relP) return;
+                    const bodyTxt = await vscode.window.showInputBox({
+                      prompt: `Content for ${relP.trim()}`,
+                      value: String(playbookSteps[idx] || "ok"),
+                    });
+                    if (bodyTxt === undefined) return;
+                    stepActions.push({
+                      action_type: "workspace_write",
+                      rel_path: relP.trim(),
+                      content: bodyTxt,
+                    });
+                  } else if (actPick.label === "workspace_assert") {
+                    const relP = await vscode.window.showInputBox({
+                      prompt: `Relative workspace file path to assert for ${stepLabel}`,
+                      value: "step_01_sources.json",
+                    });
+                    if (!relP) return;
+                    const opPick = await vscode.window.showQuickPick(
+                      ["exists", "non_empty", "contains", "sha256_equals", "json_key_equals"],
+                      { placeHolder: `Assertion operator for ${relP.trim()}` }
+                    );
+                    if (!opPick) return;
+                    const assertAction = {
+                      action_type: "workspace_assert",
+                      rel_path: relP.trim(),
+                      op: opPick,
+                    };
+                    if (opPick === "json_key_equals") {
+                      const jKey = await vscode.window.showInputBox({ prompt: "Dotted JSON key path" });
+                      if (!jKey) return;
+                      assertAction.json_key = jKey.trim();
+                    }
+                    if (opPick === "contains" || opPick === "sha256_equals" || opPick === "json_key_equals") {
+                      const expVal = await vscode.window.showInputBox({ prompt: `Expected value for ${opPick}` });
+                      if (expVal === undefined) return;
+                      assertAction.expected = expVal;
+                    }
+                    stepActions.push(assertAction);
+                  } else {
+                    const pyBody = await vscode.window.showInputBox({
+                      prompt: `Sandboxed Python script body for ${stepLabel}`,
+                      value: `import json\nfrom pathlib import Path\nPath(${JSON.stringify(outDefault)}).write_text(json.dumps({"ok": True}), encoding="utf-8")\n`,
+                    });
+                    if (!pyBody) return;
+                    stepActions.push({
+                      action_type: "sandbox_python",
+                      script_body: pyBody,
+                      output_file: outDefault,
+                    });
+                  }
+                }
+              }
+            }
+
+            const rationale =
+              opts.rationale !== undefined
+                ? String(opts.rationale)
+                : await vscode.window.showInputBox({
+                    prompt: "Owner promotion rationale (recorded in decision ledger)",
+                    value: "Promoted from VS Code",
+                  });
+            if (rationale === undefined) return;
+
+            let inputSchema = opts.input_schema;
+            if (inputSchema === undefined && !Array.isArray(opts.step_actions)) {
+              const rawSchemaJson = await vscode.window.showInputBox({
+                prompt:
+                  'Optional runtime input_schema JSON (e.g. {"env":{"type":"string","required":true}}; leave blank for none)',
+                value: "",
+              });
+              if (rawSchemaJson === undefined) return;
+              if (rawSchemaJson.trim()) {
+                try {
+                  const parsedSchema = JSON.parse(rawSchemaJson);
+                  if (!parsedSchema || typeof parsedSchema !== "object" || Array.isArray(parsedSchema)) {
+                    vscode.window.showErrorMessage("input_schema must be a JSON object.");
+                    return;
+                  }
+                  inputSchema = parsedSchema;
+                } catch (parseErr) {
+                  vscode.window.showErrorMessage(`Invalid input_schema JSON: ${parseErr.message}`);
+                  return;
+                }
+              }
+            }
+
+            const promoteBody = {
+              skill_id: skillId.trim(),
+              playbook_id: playbookId.trim(),
+              expected_playbook_sha256: expectedSha.trim(),
+              step_actions: stepActions,
+              actor: opts.actor || "vscode_owner",
+              rationale: rationale.trim() || "Promoted from VS Code",
+              allow_early_owner_override:
+                opts.allow_early_owner_override !== undefined
+                  ? Boolean(opts.allow_early_owner_override)
+                  : true,
+            };
+            if (inputSchema && typeof inputSchema === "object" && !Array.isArray(inputSchema)) {
+              promoteBody.input_schema = inputSchema;
+            }
+
             const res = await apiRequest(
               "POST",
               "/v1/skills/promote",
-              {
-                skill_id: skillId.trim(),
-                playbook_id: playbookId.trim(),
-                expected_playbook_sha256: expectedSha.trim(),
-                step_actions: stepActions,
-                actor: opts.actor || "vscode_owner",
-                rationale: opts.rationale || "Promoted from VS Code",
-                allow_early_owner_override:
-                  opts.allow_early_owner_override !== undefined
-                    ? Boolean(opts.allow_early_owner_override)
-                    : true,
-              },
+              promoteBody,
               { useOwnerToken: true }
             );
             if (!res.ok) {
@@ -4517,17 +4972,108 @@ function activate(context) {
           }
 
           if (action === "execute" || action === "dry_run") {
-            const skillId =
-              opts.skill_id ||
-              (await vscode.window.showInputBox({ prompt: "Executable Skill ID to run" }));
-            if (!skillId) return;
+            const catalogSkills = await fetchExecutableSkillsCatalog();
+
+            let skillId = opts.skill_id ? String(opts.skill_id).trim() : "";
+            if (!skillId) {
+              const activeSkills = catalogSkills.filter(
+                (s) => s && s.valid !== false && s.status !== "revoked"
+              );
+              if (activeSkills.length > 0) {
+                const pickedSk = await vscode.window.showQuickPick(
+                  activeSkills.map((s) => ({
+                    label: String(s.skill_id || ""),
+                    description: `${s.status || "active"} · ${
+                      Object.keys(s.input_schema || {}).length
+                    } input(s)`,
+                    detail: String(s.title || s.playbook_id || ""),
+                  })),
+                  { placeHolder: "Select Executable Skill to run" }
+                );
+                if (!pickedSk) return;
+                skillId = pickedSk.label.trim();
+              } else {
+                const rawSkId = await vscode.window.showInputBox({
+                  prompt: "Executable Skill ID to run",
+                });
+                if (!rawSkId) return;
+                skillId = rawSkId.trim();
+              }
+            }
+
+            const matchedSkill =
+              catalogSkills.find((s) => String(s.skill_id || "") === skillId) || null;
+            const schema =
+              matchedSkill &&
+              matchedSkill.input_schema &&
+              typeof matchedSkill.input_schema === "object"
+                ? matchedSkill.input_schema
+                : {};
+
+            let runtimeInputs =
+              opts.inputs && typeof opts.inputs === "object" && !Array.isArray(opts.inputs)
+                ? { ...opts.inputs }
+                : null;
+            if (!runtimeInputs) {
+              runtimeInputs = {};
+              const paramEntries = Object.entries(schema);
+              for (const [paramName, rawSpec] of paramEntries) {
+                const spec = rawSpec && typeof rawSpec === "object" ? rawSpec : {};
+                const pType = String(spec.type || "string").toLowerCase();
+                const reqLabel = spec.required ? "required" : "optional";
+                const descLabel = spec.description ? ` — ${spec.description}` : "";
+                const defaultStr = spec.default !== undefined ? String(spec.default) : "";
+                const rawVal = await vscode.window.showInputBox({
+                  prompt: `Skill input '${paramName}' (${pType}, ${reqLabel})${descLabel}`,
+                  value: defaultStr,
+                });
+                if (rawVal === undefined) return;
+                const trimmed = rawVal.trim();
+                if (!trimmed && !spec.required) {
+                  continue;
+                }
+                if (pType === "boolean") {
+                  if (["true", "1", "yes", "on"].includes(trimmed.toLowerCase())) {
+                    runtimeInputs[paramName] = true;
+                  } else if (["false", "0", "no", "off"].includes(trimmed.toLowerCase())) {
+                    runtimeInputs[paramName] = false;
+                  } else {
+                    vscode.window.showErrorMessage(
+                      `Invalid boolean for '${paramName}': ${rawVal}`
+                    );
+                    return;
+                  }
+                } else if (pType === "integer") {
+                  const n = Number.parseInt(trimmed, 10);
+                  if (!Number.isFinite(n) || !/^-?\d+$/.test(trimmed)) {
+                    vscode.window.showErrorMessage(
+                      `Invalid integer for '${paramName}': ${rawVal}`
+                    );
+                    return;
+                  }
+                  runtimeInputs[paramName] = n;
+                } else if (pType === "number") {
+                  const n = Number(trimmed);
+                  if (!trimmed || !Number.isFinite(n)) {
+                    vscode.window.showErrorMessage(
+                      `Invalid number for '${paramName}': ${rawVal}`
+                    );
+                    return;
+                  }
+                  runtimeInputs[paramName] = n;
+                } else {
+                  runtimeInputs[paramName] = rawVal;
+                }
+              }
+            }
+
             const res = await apiRequest(
               "POST",
-              `/v1/skills/${encodeURIComponent(skillId.trim())}/execute`,
+              `/v1/skills/${encodeURIComponent(skillId)}/execute`,
               {
                 actor: opts.actor || "vscode_owner",
                 dry_run: action === "dry_run" || Boolean(opts.dry_run),
-                inputs: opts.inputs || {},
+                inputs: runtimeInputs,
               },
               { useOwnerToken: true }
             );
@@ -4541,21 +5087,101 @@ function activate(context) {
             return res.data;
           }
 
+          if (action === "revoke") {
+            const catalogSkills = await fetchExecutableSkillsCatalog();
+
+            let skillId = opts.skill_id ? String(opts.skill_id).trim() : "";
+            if (!skillId) {
+              const revokable = catalogSkills.filter((s) => s && s.status !== "revoked");
+              if (!revokable.length) {
+                vscode.window.showInformationMessage("No active Executable Skills to revoke.");
+                return;
+              }
+              const pickedSk = await vscode.window.showQuickPick(
+                revokable.map((s) => ({
+                  label: String(s.skill_id || ""),
+                  description: `${s.status || "active"} · sha256 ${String(s.sha256 || "").slice(0, 12)}`,
+                  detail: String(s.title || s.playbook_id || ""),
+                })),
+                { placeHolder: "Select Executable Skill to revoke" }
+              );
+              if (!pickedSk) return;
+              skillId = pickedSk.label.trim();
+            }
+
+            const matchedSkill =
+              catalogSkills.find((s) => String(s.skill_id || "") === skillId) || null;
+            let expectedSha =
+              opts.expected_skill_sha256 || String(matchedSkill?.sha256 || "");
+            if (!expectedSha) {
+              const rawSha = await vscode.window.showInputBox({
+                prompt: `Expected SHA-256 of skill '${skillId}' for CAS revocation`,
+              });
+              if (!rawSha) return;
+              expectedSha = rawSha.trim();
+            }
+            const reason =
+              opts.reason !== undefined
+                ? String(opts.reason)
+                : await vscode.window.showInputBox({
+                    prompt: "Revocation reason (written to audit trail)",
+                    value: "Revoked by owner from VS Code",
+                  });
+            if (reason === undefined || !reason.trim()) return;
+
+            const res = await apiRequest(
+              "POST",
+              `/v1/skills/${encodeURIComponent(skillId)}/revoke`,
+              {
+                expected_skill_sha256: expectedSha,
+                actor: opts.actor || "vscode_owner",
+                reason: reason.trim(),
+              },
+              { useOwnerToken: true }
+            );
+            if (!res.ok) {
+              vscode.window.showErrorMessage(`Skill revocation failed: ${res.data?.error || res.status}`);
+              return;
+            }
+            vscode.window.showInformationMessage(`Revoked Executable Skill: ${skillId}`);
+            return res.data;
+          }
+
           if (action === "kill_switch") {
-            const engaged =
-              opts.engaged !== undefined
-                ? Boolean(opts.engaged)
-                : (
-                    await vscode.window.showQuickPick(["engage", "release"], {
-                      placeHolder: "Engage or release Executable Skill Kill-Switch?",
-                    })
-                  ) === "engage";
+            let scope = opts.scope ? String(opts.scope).trim() : "";
+            if (!scope) {
+              const scopeChoices = [{ label: "global", description: "Global kill-switch across all Executable Skills" }];
+              const catalogSkills = await fetchExecutableSkillsCatalog();
+              for (const sk of catalogSkills) {
+                if (sk && sk.skill_id) {
+                  scopeChoices.push({
+                    label: String(sk.skill_id),
+                    description: `Per-skill kill-switch (${sk.status || "active"})`,
+                  });
+                }
+              }
+              const pickedScope = await vscode.window.showQuickPick(scopeChoices, {
+                placeHolder: "Select kill-switch scope (global or specific skill)",
+              });
+              if (!pickedScope) return;
+              scope = pickedScope.label;
+            }
+            let engaged;
+            if (opts.engaged !== undefined) {
+              engaged = Boolean(opts.engaged);
+            } else {
+              const pickedChoice = await vscode.window.showQuickPick(["engage", "release"], {
+                placeHolder: `Engage or release Executable Skill Kill-Switch (${scope})?`,
+              });
+              if (!pickedChoice) return;
+              engaged = pickedChoice === "engage";
+            }
             const res = await apiRequest(
               "POST",
               "/v1/skills/kill-switch",
               {
                 engaged,
-                scope: opts.scope || "global",
+                scope,
                 actor: opts.actor || "vscode_owner",
                 reason: opts.reason || "VS Code owner kill-switch toggle",
               },
@@ -4566,7 +5192,7 @@ function activate(context) {
               return;
             }
             vscode.window.showInformationMessage(
-              `Skill Kill-Switch (${opts.scope || "global"}): engaged=${engaged}`
+              `Skill Kill-Switch (${scope}): engaged=${engaged}`
             );
             return res.data;
           }
@@ -4603,6 +5229,7 @@ function activate(context) {
                 { label: "pair", description: "Pair iOS / Android Mobile Vault Client (#vaultpair=)" },
                 { label: "export", description: "Export Standalone Offline Mobile Vault App Bundle (.zip)" },
                 { label: "status", description: "List Paired Mobile Vault Clients" },
+                { label: "revoke", description: "Revoke a Paired Mobile Vault Client" },
               ],
               { placeHolder: "Select Mobile Vault Client action" }
             )
@@ -4634,7 +5261,41 @@ function activate(context) {
             vscode.window.showErrorMessage(`Mobile pairing failed: ${res.data?.error || res.status}`);
             return;
           }
-          vscode.window.showInformationMessage(`Paired Mobile Vault Client: ${res.data?.pairing_id}`);
+          const shareUri = String(
+            res.data?.pwa_pairing_url || res.data?.pairing_url || res.data?.pairing_fragment || ""
+          ).trim();
+          let copied = false;
+          if (shareUri && vscode.env && vscode.env.clipboard && typeof vscode.env.clipboard.writeText === "function") {
+            try {
+              await vscode.env.clipboard.writeText(shareUri);
+              copied = true;
+            } catch (_clipErr) {
+              copied = false;
+            }
+          }
+          const msgActions = shareUri ? ["Show Pairing URI", "Copy Pairing URI"] : [];
+          const pickedMsg = await vscode.window.showInformationMessage(
+            `Paired Mobile Vault Client: ${res.data?.pairing_id}${copied ? " (#vaultpair= URI copied to clipboard)" : ""}`,
+            ...msgActions
+          );
+          if (pickedMsg === "Copy Pairing URI" && shareUri && vscode.env?.clipboard?.writeText) {
+            await vscode.env.clipboard.writeText(shareUri);
+          } else if (pickedMsg === "Show Pairing URI" && shareUri) {
+            const doc = await vscode.workspace.openTextDocument({
+              language: "markdown",
+              content: [
+                `# Mobile Vault Client Pairing: ${res.data?.pairing_id || ""}`,
+                "",
+                "Open this zero-knowledge `#vaultpair=` URI on your phone (never sent to any server):",
+                "",
+                "```text",
+                shareUri,
+                "```",
+                "",
+              ].join("\n"),
+            });
+            await vscode.window.showTextDocument(doc, { preview: true });
+          }
           return res.data;
         }
 
@@ -4663,6 +5324,53 @@ function activate(context) {
             `Paired Mobile Vault Clients: ${(res.data?.pairings || []).length}`
           );
           return res.data;
+        }
+
+        if (action === "revoke") {
+          let pairingId = opts.pairing_id ? String(opts.pairing_id).trim() : "";
+          if (!pairingId) {
+            const listRes = await apiRequest("GET", "/v1/mobile/status", null, {
+              useOwnerToken: true,
+            });
+            if (!listRes.ok) {
+              vscode.window.showErrorMessage(
+                `Mobile status failed: ${listRes.data?.error || listRes.status}`
+              );
+              return;
+            }
+            const active = (listRes.data?.pairings || []).filter((p) => p && !p.revoked);
+            if (!active.length) {
+              vscode.window.showInformationMessage("No active Mobile Vault Client pairings to revoke.");
+              return;
+            }
+            const picked = await vscode.window.showQuickPick(
+              active.map((p) => ({
+                label: String(p.label || p.pairing_id),
+                description: String(p.pairing_id || ""),
+                detail: `Created ${p.created_at || ""}`,
+                pairingId: String(p.pairing_id || ""),
+              })),
+              { placeHolder: "Select Mobile Vault Client pairing to revoke" }
+            );
+            if (!picked) return;
+            pairingId = picked.pairingId;
+          }
+          const revRes = await apiRequest(
+            "POST",
+            "/v1/mobile/revoke",
+            { pairing_id: pairingId },
+            { useOwnerToken: true }
+          );
+          if (!revRes.ok) {
+            vscode.window.showErrorMessage(
+              `Mobile Vault Client revoke failed: ${revRes.data?.error || revRes.status}`
+            );
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Revoked Mobile Vault Client pairing: ${pairingId}`
+          );
+          return revRes.data;
         }
       } catch (err) {
         vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
@@ -4740,12 +5448,806 @@ function activate(context) {
       } catch (err) {
         vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
       }
+    }),
+
+    // ── Bulk Import (Folder or Single File into Quarantined Inbox) ──
+    vscode.commands.registerCommand("secondBrain.bulkImport", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        let action = opts.action || "";
+        if (!action) {
+          const picked = await vscode.window.showQuickPick(
+            [
+              {
+                label: "folder",
+                description: "Import local Markdown/note folder into Quarantined Inbox",
+              },
+              {
+                label: "file",
+                description: "Import a single local file (.md, .txt, .json) into Quarantined Inbox",
+              },
+            ],
+            { placeHolder: "Select Second Brain Bulk Import mode" }
+          );
+          if (!picked) return;
+          action = picked.label;
+        }
+
+        if (action === "file") {
+          const defaultFile =
+            opts.path ||
+            (vscode.window.activeTextEditor?.document?.uri?.scheme === "file"
+              ? vscode.window.activeTextEditor.document.uri.fsPath
+              : "");
+          const filePath =
+            opts.path ||
+            (await vscode.window.showInputBox({
+              prompt: "Absolute local file path to import into 0-raw/inbox/",
+              value: defaultFile,
+            }));
+          if (!filePath || !filePath.trim()) return;
+          const tags =
+            opts.tags !== undefined
+              ? parseListInput(opts.tags)
+              : parseListInput(
+                  await vscode.window.showInputBox({
+                    prompt: "Optional comma-separated tags for imported note",
+                    value: "",
+                  })
+                );
+          const res = await apiRequest(
+            "POST",
+            "/v1/import/file",
+            { path: filePath.trim(), tags },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`File import failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          treeProvider.refresh();
+          vscode.window.showInformationMessage(
+            `Imported file to Quarantined Inbox: ${res.data?.destination || res.data?.filename || filePath.trim()}`
+          );
+          return res.data;
+        }
+
+        const sourceDir =
+          opts.source_dir ||
+          (await vscode.window.showInputBox({
+            prompt: "Local folder path containing notes/transcripts to import",
+          }));
+        if (!sourceDir || !sourceDir.trim()) return;
+        const tags =
+          opts.tags !== undefined
+            ? parseListInput(opts.tags)
+            : parseListInput(
+                await vscode.window.showInputBox({
+                  prompt: "Optional comma-separated tags for imported files",
+                  value: "",
+                })
+              );
+        const res = await apiRequest(
+          "POST",
+          "/v1/import",
+          {
+            source_dir: sourceDir.trim(),
+            tags,
+            dry_run: Boolean(opts.dry_run),
+            overwrite_modified: Boolean(opts.overwrite_modified),
+          },
+          { useOwnerToken: true }
+        );
+        if (!res.ok) {
+          vscode.window.showErrorMessage(`Bulk folder import failed: ${res.data?.error || res.status}`);
+          return;
+        }
+        treeProvider.refresh();
+        vscode.window.showInformationMessage(
+          `Bulk import complete: ${res.data?.imported ?? 0} imported, ${
+            res.data?.skipped ?? 0
+          } skipped.`
+        );
+        return res.data;
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    // ── Active Web Scout (Queue & Discovery) ──
+    vscode.commands.registerCommand("secondBrain.manageScout", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        const action =
+          opts.action ||
+          (
+            await vscode.window.showQuickPick(
+              [
+                { label: "list", description: "Inspect Web Scout reading queue" },
+                { label: "enqueue", description: "Queue a URL or RSS/Atom feed for Web Scout" },
+                { label: "run", description: "Start Web Scout background discovery job" },
+              ],
+              { placeHolder: "Select Active Web Scout action" }
+            )
+          )?.label;
+        if (!action) return;
+
+        if (action === "list") {
+          const res = await apiRequest("GET", "/v1/scout/queue", null, { useOwnerToken: true });
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Scout queue failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          const items = Array.isArray(res.data?.items) ? res.data.items : [];
+          const lines = ["# Active Web Scout Reading Queue", "", `Total entries: ${res.data?.total ?? items.length}`, ""];
+          for (const it of items) {
+            lines.push(`- [${it.status || "queued"}] (${it.kind || "url"}) ${it.url}`);
+          }
+          if (!items.length) lines.push("_Queue is empty._");
+          await openMarkdownPreview(lines.join("\n"));
+          return res.data;
+        }
+
+        if (action === "enqueue") {
+          const url =
+            opts.url ||
+            (await vscode.window.showInputBox({
+              prompt: "HTTPS/HTTP URL to add to Web Scout queue",
+              placeHolder: "https://example.com/article",
+            }));
+          if (!url || !url.trim()) return;
+          let isFeed = Boolean(opts.is_feed);
+          if (opts.is_feed === undefined) {
+            const kindPick = await vscode.window.showQuickPick(["url", "feed"], {
+              placeHolder: "Entry type (single article URL or RSS/Atom feed)",
+            });
+            if (!kindPick) return;
+            isFeed = kindPick === "feed";
+          }
+          const res = await apiRequest(
+            "POST",
+            "/v1/scout/queue",
+            { url: url.trim(), is_feed: isFeed },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Scout enqueue failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Queued ${isFeed ? "feed" : "URL"} for Web Scout: ${res.data?.url || url.trim()}`
+          );
+          return res.data;
+        }
+
+        if (action === "run") {
+          const res = await apiRequest("POST", "/v1/scout/run", {}, { useOwnerToken: true });
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Scout run failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          vscode.window.showInformationMessage(
+            `Started Web Scout job ${res.data?.job_id || ""} (${res.data?.status || "queued"}).`
+          );
+          return res.data;
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    // ── Background Maintenance Jobs (Refinery / Editor / Doctor) ──
+    vscode.commands.registerCommand("secondBrain.runOperatorJob", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        const kind =
+          opts.kind ||
+          (
+            await vscode.window.showQuickPick(
+              [
+                { label: "refinery", description: "Run Knowledge Refinery (extract & link notes)" },
+                { label: "editor", description: "Run Memory Editor / Consolidation job" },
+                { label: "doctor", description: "Run Vault Health & Diagnostics (Doctor)" },
+                { label: "status", description: "Inspect background job status by job_id" },
+              ],
+              { placeHolder: "Select Second Brain operator maintenance job" }
+            )
+          )?.label;
+        if (!kind) return;
+
+        if (kind === "status") {
+          const jobId =
+            opts.job_id ||
+            (await vscode.window.showInputBox({ prompt: "Operator job_id to inspect" }));
+          if (!jobId || !jobId.trim()) return;
+          const res = await apiRequest(
+            "GET",
+            `/v1/jobs/${encodeURIComponent(jobId.trim())}`,
+            null,
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Job lookup failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          await openMarkdownPreview(
+            [
+              `# Operator Job: ${res.data?.job_id || jobId.trim()}`,
+              "",
+              `- **Kind:** ${res.data?.kind || "unknown"}`,
+              `- **Status:** ${res.data?.status || "unknown"}`,
+              `- **Exit Code:** ${res.data?.returncode ?? "-"}`,
+              "",
+              "```json",
+              JSON.stringify(res.data, null, 2),
+              "```",
+            ].join("\n")
+          );
+          return res.data;
+        }
+
+        if (!["refinery", "editor", "doctor"].includes(kind)) {
+          vscode.window.showErrorMessage(`Unsupported operator job kind: ${kind}`);
+          return;
+        }
+        const res = await apiRequest("POST", `/v1/jobs/${kind}`, {}, { useOwnerToken: true });
+        if (!res.ok) {
+          vscode.window.showErrorMessage(`Job start failed: ${res.data?.error || res.status}`);
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Started ${kind} job ${res.data?.job_id || ""} (${res.data?.status || "running"}).`
+        );
+        return res.data;
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    // ── Interactive Knowledge Graph Webview w/ Bi-Temporal Timeline Scrubber ──
+    vscode.commands.registerCommand("secondBrain.openKnowledgeGraph", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        const buildGraphQueryPath = (filters) => {
+          const qs = new URLSearchParams();
+          qs.set("limit", String(opts.limit || 300));
+          qs.set("include_pending", filters.include_pending ? "1" : "0");
+          if (filters.include_expired !== undefined) {
+            qs.set("include_expired", filters.include_expired ? "1" : "0");
+          }
+          if (filters.as_of) {
+            qs.set("as_of", String(filters.as_of).trim());
+          }
+          if (filters.project) {
+            qs.set("project", String(filters.project).trim());
+          }
+          return `/v1/graph/full?${qs.toString()}`;
+        };
+
+        const initialFilters = {
+          as_of: opts.as_of ? String(opts.as_of).trim() : "",
+          include_expired:
+            opts.include_expired !== undefined
+              ? Boolean(opts.include_expired)
+              : !opts.as_of,
+          include_pending: Boolean(opts.include_pending),
+          project: opts.project ? String(opts.project).trim() : "",
+        };
+
+        const res = await apiRequest("GET", buildGraphQueryPath(initialFilters), null, {
+          useOwnerToken: true,
+        });
+        if (!res.ok) {
+          vscode.window.showErrorMessage(
+            `Knowledge Graph fetch failed: ${res.data?.error || res.status}`
+          );
+          return;
+        }
+
+        const mergedInitial = {
+          ...(res.data || {}),
+          ...initialFilters,
+          as_of: res.data?.as_of ?? (initialFilters.as_of || null),
+          include_expired:
+            typeof res.data?.include_expired === "boolean"
+              ? res.data.include_expired
+              : initialFilters.include_expired,
+        };
+
+        if (graphPanel) {
+          graphPanel.reveal(vscode.ViewColumn.Beside);
+          graphPanel.webview.postMessage({ type: "graphData", data: mergedInitial });
+          return { panel: graphPanel, data: mergedInitial };
+        }
+
+        const nonce = crypto.randomBytes(16).toString("base64");
+        const panel = vscode.window.createWebviewPanel(
+          "secondBrainGraph",
+          "Second Brain Knowledge Graph",
+          vscode.ViewColumn.Beside,
+          { enableScripts: true, retainContextWhenHidden: true }
+        );
+        graphPanel = panel;
+        panel.webview.html = buildGraphWebviewHtml({ nonce, initialData: mergedInitial });
+
+        if (typeof panel.onDidDispose === "function") {
+          panel.onDidDispose(() => {
+            if (graphPanel === panel) {
+              graphPanel = null;
+            }
+          });
+        }
+
+        panel.webview.onDidReceiveMessage(async (msg) => {
+          const postGraphError = (errText) => {
+            try {
+              panel.webview.postMessage({
+                type: "graphError",
+                error: String(errText || "Knowledge Graph request failed"),
+              });
+            } catch {}
+          };
+          try {
+            if (!msg || typeof msg !== "object" || typeof msg.action !== "string") {
+              return;
+            }
+            if (msg.action === "openNode") {
+              const fname = String(msg.filename || "").trim();
+              if (!isSafeNoteFilename(fname)) return;
+              await vscode.commands.executeCommand("secondBrain.openTreeItem", {
+                kind: "atom",
+                filename: fname,
+              });
+              return;
+            }
+            if (msg.action === "autoLink") {
+              const linkRes = await apiRequest(
+                "POST",
+                "/v1/graph/auto-link",
+                {
+                  actor: "vscode_owner",
+                  project_scope: msg.project ? String(msg.project).trim() : undefined,
+                  include_pending: Boolean(msg.include_pending),
+                },
+                { useOwnerToken: true }
+              );
+              if (!linkRes.ok) {
+                const errMsg = `Auto-link failed: ${linkRes.data?.error || linkRes.status}`;
+                postGraphError(errMsg);
+                vscode.window.showErrorMessage(errMsg);
+                return;
+              }
+              treeProvider.refresh();
+            }
+            if (msg.action === "reload" || msg.action === "autoLink") {
+              const nextFilters = {
+                as_of: msg.as_of ? String(msg.as_of).trim() : "",
+                include_expired:
+                  msg.include_expired !== undefined
+                    ? Boolean(msg.include_expired)
+                    : !msg.as_of,
+                include_pending: Boolean(msg.include_pending),
+                project: msg.project ? String(msg.project).trim() : "",
+              };
+              const reloadRes = await apiRequest(
+                "GET",
+                buildGraphQueryPath(nextFilters),
+                null,
+                { useOwnerToken: true }
+              );
+              if (!reloadRes.ok) {
+                const errMsg = `Knowledge Graph reload failed: ${reloadRes.data?.error || reloadRes.status}`;
+                postGraphError(errMsg);
+                vscode.window.showErrorMessage(errMsg);
+                return;
+              }
+              panel.webview.postMessage({
+                type: "graphData",
+                data: {
+                  ...(reloadRes.data || {}),
+                  ...nextFilters,
+                  as_of: reloadRes.data?.as_of ?? (nextFilters.as_of || null),
+                  include_expired:
+                    typeof reloadRes.data?.include_expired === "boolean"
+                      ? reloadRes.data.include_expired
+                      : nextFilters.include_expired,
+                },
+              });
+            }
+          } catch (err) {
+            const errMsg = `Knowledge Graph error: ${err?.message || String(err)}`;
+            postGraphError(errMsg);
+            vscode.window.showErrorMessage(errMsg);
+          }
+        });
+
+        return { panel, data: mergedInitial };
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    // ── Multi-Vault Workspaces & Opt-In Federated Recall ──
+    vscode.commands.registerCommand("secondBrain.manageWorkspaces", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        const action =
+          opts.action ||
+          (
+            await vscode.window.showQuickPick(
+              [
+                { label: "list", description: "List registered Multi-Vault workspaces" },
+                { label: "create", description: "Create & register a new isolated vault workspace" },
+                { label: "switch", description: "Switch active vault workspace" },
+                { label: "policy", description: "Update workspace label, host policy & federated search flag" },
+                { label: "federated_recall", description: "Search across federated-searchable workspaces" },
+                { label: "remove", description: "Unregister an inactive workspace (files preserved)" },
+              ],
+              { placeHolder: "Select Multi-Vault Workspace action" }
+            )
+          )?.label;
+        if (!action) return;
+
+        if (action === "list") {
+          const res = await apiRequest("GET", "/v1/vaults", null, { useOwnerToken: true });
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`List vaults failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          const vaults = Array.isArray(res.data?.vaults) ? res.data.vaults : [];
+          const lines = [
+            "# Second Brain Multi-Vault Workspaces",
+            "",
+            `Active Vault ID: \`${res.data?.active_vault_id || "-"}\``,
+            "",
+          ];
+          for (const v of vaults) {
+            lines.push(
+              `- **${v.label || v.vault_id}** (\`${v.vault_id}\`) · policy=\`${
+                v.default_host_policy || "local_only"
+              }\` · federated=\`${Boolean(v.federated_searchable)}\` · path=\`${v.path}\``
+            );
+          }
+          await openMarkdownPreview(lines.join("\n"));
+          return res.data;
+        }
+
+        if (action === "create") {
+          const label =
+            opts.label ||
+            (await vscode.window.showInputBox({
+              prompt: "Workspace label (e.g. Research Vault)",
+            }));
+          if (!label || !label.trim()) return;
+          const vpath =
+            opts.path ||
+            (await vscode.window.showInputBox({
+              prompt: "Absolute path for new workspace directory",
+            }));
+          if (!vpath || !vpath.trim()) return;
+          const hostPolicy =
+            opts.default_host_policy ||
+            (await vscode.window.showQuickPick(["local_only", "ask", "allow"], {
+              placeHolder: "Default host sharing policy for this workspace",
+            }));
+          if (!hostPolicy) return;
+          let fedSearch = Boolean(opts.federated_searchable);
+          if (opts.federated_searchable === undefined) {
+            const fedPick = await vscode.window.showQuickPick(["No (Isolated)", "Yes (Federated Searchable)"], {
+              placeHolder: "Allow opt-in federated recall across this workspace?",
+            });
+            if (!fedPick) return;
+            fedSearch = fedPick.startsWith("Yes");
+          }
+          const res = await apiRequest(
+            "POST",
+            "/v1/vaults",
+            {
+              label: label.trim(),
+              path: vpath.trim(),
+              vault_id: opts.vault_id || undefined,
+              default_host_policy: hostPolicy,
+              federated_searchable: fedSearch,
+              isolated_token: Boolean(opts.isolated_token),
+              activate: Boolean(opts.activate),
+            },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Create vault failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          if (opts.activate) treeProvider.refresh();
+          vscode.window.showInformationMessage(`Created workspace '${res.data?.label}' (${res.data?.vault_id}).`);
+          return res.data;
+        }
+
+        if (action === "switch" || action === "policy" || action === "remove") {
+          let vaultId = opts.vault_id ? String(opts.vault_id).trim() : "";
+          if (!vaultId) {
+            const listRes = await apiRequest("GET", "/v1/vaults", null, { useOwnerToken: true });
+            if (!listRes.ok) {
+              vscode.window.showErrorMessage(`List vaults failed: ${listRes.data?.error || listRes.status}`);
+              return;
+            }
+            const candidates = (listRes.data?.vaults || []).filter((v) =>
+              action === "remove" ? v.vault_id !== listRes.data?.active_vault_id : true
+            );
+            if (!candidates.length) {
+              vscode.window.showInformationMessage("No matching workspaces available.");
+              return;
+            }
+            const picked = await vscode.window.showQuickPick(
+              candidates.map((v) => ({
+                label: String(v.vault_id || ""),
+                description: `${v.label || ""} · policy=${v.default_host_policy || "local_only"} · federated=${Boolean(
+                  v.federated_searchable
+                )}`,
+                detail: String(v.path || ""),
+              })),
+              { placeHolder: `Select workspace for '${action}'` }
+            );
+            if (!picked) return;
+            vaultId = picked.label;
+          }
+
+          if (action === "switch") {
+            const res = await apiRequest(
+              "POST",
+              "/v1/vaults/switch",
+              { vault_id: vaultId },
+              { useOwnerToken: true }
+            );
+            if (!res.ok) {
+              vscode.window.showErrorMessage(`Switch vault failed: ${res.data?.error || res.status}`);
+              return;
+            }
+            treeProvider.refresh();
+            vscode.window.showInformationMessage(`Switched active workspace to '${vaultId}'.`);
+            return res.data;
+          }
+
+          if (action === "remove") {
+            const res = await apiRequest(
+              "DELETE",
+              `/v1/vaults/${encodeURIComponent(vaultId)}`,
+              {},
+              { useOwnerToken: true }
+            );
+            if (!res.ok) {
+              vscode.window.showErrorMessage(`Remove vault failed: ${res.data?.error || res.status}`);
+              return;
+            }
+            vscode.window.showInformationMessage(`Removed workspace '${vaultId}' from registry.`);
+            return res.data;
+          }
+
+          const patchBody = {};
+          if (opts.label !== undefined) patchBody.label = String(opts.label);
+          if (opts.default_host_policy !== undefined) {
+            patchBody.default_host_policy = String(opts.default_host_policy);
+          }
+          if (opts.federated_searchable !== undefined) {
+            patchBody.federated_searchable = Boolean(opts.federated_searchable);
+          }
+          if (!Object.keys(patchBody).length) {
+            const polPick = await vscode.window.showQuickPick(["local_only", "ask", "allow"], {
+              placeHolder: `New default host policy for '${vaultId}'`,
+            });
+            if (!polPick) return;
+            const fedPick = await vscode.window.showQuickPick(["true", "false"], {
+              placeHolder: `Allow federated search on '${vaultId}'?`,
+            });
+            if (!fedPick) return;
+            patchBody.default_host_policy = polPick;
+            patchBody.federated_searchable = fedPick === "true";
+          }
+          const res = await apiRequest(
+            "PATCH",
+            `/v1/vaults/${encodeURIComponent(vaultId)}`,
+            patchBody,
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Update vault policy failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          vscode.window.showInformationMessage(`Updated policy for workspace '${vaultId}'.`);
+          return res.data;
+        }
+
+        if (action === "federated_recall") {
+          const query =
+            opts.query ||
+            (await vscode.window.showInputBox({
+              prompt: "Federated recall query across opted-in workspaces",
+            }));
+          if (!query || !query.trim()) return;
+          const res = await apiRequest(
+            "POST",
+            "/v1/vaults/federated-recall",
+            {
+              query: query.trim(),
+              limit: opts.limit || 5,
+              project_scope: opts.project_scope || undefined,
+              as_of: opts.as_of || undefined,
+              include_expired: Boolean(opts.include_expired),
+            },
+            { useOwnerToken: true }
+          );
+          if (!res.ok) {
+            vscode.window.showErrorMessage(`Federated recall failed: ${res.data?.error || res.status}`);
+            return;
+          }
+          const results = Array.isArray(res.data?.results) ? res.data.results : [];
+          const lines = [
+            `# Federated Recall: "${query.trim()}"`,
+            "",
+            `Hits: ${results.length}`,
+            "",
+          ];
+          for (const hit of results) {
+            lines.push(
+              `- **[${hit.vault_label || hit.vault_id || "vault"}]** \`${hit.filename || ""}\` — ${hit.claim || hit.text || ""}`
+            );
+          }
+          await openMarkdownPreview(lines.join("\n"));
+          return res.data;
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
+    }),
+
+    // ── Sharing & Host Privacy Policies ──
+    vscode.commands.registerCommand("secondBrain.manageHostPolicies", async (arg) => {
+      try {
+        const opts = arg && typeof arg === "object" ? arg : {};
+        const listRes = await apiRequest("GET", "/v1/hosts", null, { useOwnerToken: true });
+        if (!listRes.ok) {
+          vscode.window.showErrorMessage(
+            `Load host policies failed: ${listRes.data?.error || listRes.status}`
+          );
+          return;
+        }
+        const policies = listRes.data && typeof listRes.data === "object" ? listRes.data : {};
+        const hostIds = Object.keys(policies).sort();
+        if (!hostIds.length) {
+          vscode.window.showInformationMessage("No configured host privacy policies found.");
+          return;
+        }
+
+        let hostId = opts.host_id ? String(opts.host_id).trim() : "";
+        if (!hostId) {
+          const pickedHost = await vscode.window.showQuickPick(
+            hostIds.map((hid) => {
+              const p = policies[hid] || {};
+              return {
+                label: hid,
+                description: `${p.enabled ? "enabled" : "disabled"} · ${p.transport || "local"} · projects=[${(
+                  p.allowed_projects || []
+                ).join(", ")}]`,
+                detail: `model=${p.default_model || "-"} · pii_redact=${Boolean(p.redact_pii)}`,
+              };
+            }),
+            { placeHolder: "Select Host Adapter to inspect or update sharing policy" }
+          );
+          if (!pickedHost) return;
+          hostId = pickedHost.label;
+        }
+
+        const current = policies[hostId] || {};
+        const updateFields = [
+          "enabled",
+          "default_model",
+          "endpoint_url",
+          "allowed_projects",
+          "allow_unscoped_atoms",
+          "allow_preference_atoms",
+          "redact_pii",
+          "fail_on_secret_detection",
+          "api_key_env",
+        ];
+        let payload = opts.updates && typeof opts.updates === "object" ? { ...opts.updates } : null;
+        if (!payload) {
+          const direct = {};
+          for (const k of updateFields) {
+            if (opts[k] !== undefined) direct[k] = opts[k];
+          }
+          if (Object.keys(direct).length > 0) {
+            payload = direct;
+          }
+        }
+
+        if (!payload) {
+          const op = await vscode.window.showQuickPick(
+            [
+              { label: "toggle_enabled", description: `Currently enabled=${Boolean(current.enabled)}` },
+              {
+                label: "allowed_projects",
+                description: `Current: ${(current.allowed_projects || []).join(", ") || "(none)"}`,
+              },
+              {
+                label: "default_model",
+                description: `Current: ${current.default_model || "(default)"}`,
+              },
+              {
+                label: "toggle_preferences",
+                description: `Currently allow_preference_atoms=${Boolean(current.allow_preference_atoms)}`,
+              },
+              {
+                label: "toggle_unscoped",
+                description: `Currently allow_unscoped_atoms=${Boolean(current.allow_unscoped_atoms)}`,
+              },
+              { label: "inspect", description: "View full host policy JSON in preview" },
+            ],
+            { placeHolder: `Configure sharing policy for host '${hostId}'` }
+          );
+          if (!op) return;
+
+          if (op.label === "inspect") {
+            await openMarkdownPreview(
+              [`# Host Privacy Policy: ${hostId}`, "", "```json", JSON.stringify(current, null, 2), "```"].join(
+                "\n"
+              )
+            );
+            return current;
+          }
+          payload = {};
+          if (op.label === "toggle_enabled") {
+            payload.enabled = !current.enabled;
+          } else if (op.label === "toggle_preferences") {
+            payload.allow_preference_atoms = !current.allow_preference_atoms;
+          } else if (op.label === "toggle_unscoped") {
+            payload.allow_unscoped_atoms = !current.allow_unscoped_atoms;
+          } else if (op.label === "allowed_projects") {
+            const rawProj = await vscode.window.showInputBox({
+              prompt: `Allowed project scopes for '${hostId}' (comma-separated, blank for none)`,
+              value: (current.allowed_projects || []).join(", "),
+            });
+            if (rawProj === undefined) return;
+            payload.allowed_projects = parseListInput(rawProj);
+          } else if (op.label === "default_model") {
+            const model = await vscode.window.showInputBox({
+              prompt: `Default model for '${hostId}'`,
+              value: String(current.default_model || ""),
+            });
+            if (model === undefined) return;
+            payload.default_model = model.trim();
+          }
+        }
+
+        const putRes = await apiRequest(
+          "PUT",
+          `/v1/hosts/${encodeURIComponent(hostId)}`,
+          payload,
+          { useOwnerToken: true }
+        );
+        if (!putRes.ok) {
+          vscode.window.showErrorMessage(
+            `Update host policy failed: ${putRes.data?.error || putRes.status}`
+          );
+          return;
+        }
+        vscode.window.showInformationMessage(
+          `Updated host policy '${hostId}': enabled=${Boolean(putRes.data?.enabled)}`
+        );
+        return putRes.data;
+      } catch (err) {
+        vscode.window.showErrorMessage(`Second Brain API error: ${err.message}`);
+      }
     })
   );
 }
 
 function deactivate() {
   if (activeExtensionState) {
+    if (typeof activeExtensionState.clearContextSignalTimer === "function") {
+      activeExtensionState.clearContextSignalTimer();
+    }
+    if (typeof activeExtensionState.disposeGraphPanel === "function") {
+      activeExtensionState.disposeGraphPanel();
+    }
     activeExtensionState.disposeChatPanel();
     activeExtensionState = null;
   }

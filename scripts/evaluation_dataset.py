@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
+import stat
 from typing import Callable
 
 
@@ -14,6 +17,67 @@ class EvaluationDatasetError(ValueError):
 
 SPLITS = {"regression", "development", "holdout"}
 ANSWERABILITY = {"answerable", "unanswerable", "exploratory", "preference"}
+_ZERO_SHA256 = "0" * 64
+AGENT_ACTOR_BLOCKLIST = frozenset({
+    "agent",
+    "ai",
+    "antigravity",
+    "assistant",
+    "auto",
+    "automated",
+    "bot",
+    "claude",
+    "cli",
+    "codex",
+    "daemon",
+    "gemini",
+    "gpt",
+    "llm",
+    "mcp",
+    "model",
+    "runner",
+    "service",
+    "system",
+})
+_AGENT_ACTOR_PREFIXES = ("gpt", "claude", "gemini", "codex", "antigravity", "agent")
+
+
+def is_disallowed_agent_actor(actor: str) -> bool:
+    """Return True if ``actor`` is empty, malformed, or appears to identify an AI/service agent."""
+    cleaned = str(actor or "").strip()
+    if not cleaned or len(cleaned) > 64 or any(ord(ch) < 32 for ch in cleaned):
+        return True
+    if cleaned.casefold() in AGENT_ACTOR_BLOCKLIST:
+        return True
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", cleaned.casefold()) if tok]
+    if not tokens:
+        return True
+    if any(tok in AGENT_ACTOR_BLOCKLIST for tok in tokens):
+        return True
+    if any(tok.startswith(_AGENT_ACTOR_PREFIXES) for tok in tokens):
+        return True
+    return False
+
+
+def _is_reparse_or_link(path: Path | str) -> bool:
+    p = str(path)
+    if os.path.islink(p):
+        return True
+    isj = getattr(os.path, "isjunction", None)
+    if callable(isj):
+        try:
+            if isj(p):
+                return True
+        except OSError:
+            pass
+    if os.name == "nt":
+        try:
+            st = os.lstat(p)
+            if bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                return True
+        except OSError:
+            pass
+    return False
 
 
 def _is_atom_filename(value: object) -> bool:
@@ -26,11 +90,16 @@ def _is_atom_filename(value: object) -> bool:
 
 
 def _resolve_atom_path(atoms_root: Path, filename: str) -> Path | None:
+    if _is_reparse_or_link(atoms_root):
+        return None
+    raw_candidate = atoms_root / filename
+    if not os.path.lexists(str(raw_candidate)) or _is_reparse_or_link(raw_candidate):
+        return None
     try:
-        path = (atoms_root / filename).resolve(strict=True)
+        path = raw_candidate.resolve(strict=True)
     except OSError:
         return None
-    if path.parent != atoms_root or not path.is_file():
+    if path.parent != atoms_root.resolve() or not path.is_file():
         return None
     return path
 
@@ -40,6 +109,7 @@ def validate_dataset(
     *,
     atoms_dir: str | Path,
     approval_check: Callable[[Path], bool],
+    check_vault_files: bool = True,
 ) -> dict:
     """Validate labels and bind answerable cases to approved atom bytes.
 
@@ -67,6 +137,8 @@ def validate_dataset(
             for field in ("actor", "date", "scope")
         ):
             errors.append("owner_approval must include actor, date, and scope.")
+        elif is_disallowed_agent_actor(approval["actor"]):
+            errors.append("owner_approval.actor must identify a human owner, not an AI agent.")
     elif status == "pending_owner_review":
         # Agent-drafted labels are never presented as owner decisions; they stay provisional
         # until the owner reviews them and records an explicit owner_approval block.
@@ -85,7 +157,17 @@ def validate_dataset(
         queries = []
 
     seen_ids: set[str] = set()
-    atoms_root = Path(atoms_dir).resolve()
+    atoms_dir_raw = Path(atoms_dir)
+    if check_vault_files and os.path.lexists(str(atoms_dir_raw)) and _is_reparse_or_link(atoms_dir_raw):
+        raise EvaluationDatasetError(f"Refusing symlinked atoms directory: {atoms_dir_raw}")
+    atoms_root = atoms_dir_raw.resolve()
+    if not check_vault_files:
+        has_live_atoms = atoms_root.is_dir() and any(atoms_root.glob("*.md"))
+        has_decision_log = (atoms_root.parent / "0-raw" / "archive" / "decision-record.jsonl").exists()
+        if has_live_atoms or has_decision_log:
+            raise EvaluationDatasetError(
+                "Refusing code-only dataset validation against a populated or initialized vault."
+            )
     for index, case in enumerate(queries):
         label = f"queries[{index}]"
         if not isinstance(case, dict):
@@ -116,9 +198,10 @@ def validate_dataset(
             relevance = []
         elif len(relevance) != len(set(relevance)):
             errors.append(f"{label}.candidate_relevance must not contain duplicates.")
-        for filename in relevance:
-            if _resolve_atom_path(atoms_root, filename) is None:
-                errors.append(f"{label} candidate atom does not exist: {filename}.")
+        if check_vault_files:
+            for filename in relevance:
+                if _resolve_atom_path(atoms_root, filename) is None:
+                    errors.append(f"{label} candidate atom does not exist: {filename}.")
 
         answerability = case.get("answerability")
         if not isinstance(answerability, str) or answerability not in ANSWERABILITY:
@@ -210,13 +293,24 @@ def validate_dataset(
             if not _is_atom_filename(atom_id):
                 errors.append(f"{label} expected atom revision has invalid atom_id.")
                 continue
-            if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-                errors.append(f"{label} expected revision for {atom_id} must be a lowercase SHA-256.")
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+                or (not check_vault_files and digest == _ZERO_SHA256)
+            ):
+                errors.append(
+                    f"{label} expected revision for {atom_id} must be a non-zero lowercase SHA-256."
+                    if not check_vault_files
+                    else f"{label} expected revision for {atom_id} must be a lowercase SHA-256."
+                )
                 continue
             if atom_id in revision_map:
                 errors.append(f"{label} has duplicate revision metadata for {atom_id}.")
                 continue
             revision_map[atom_id] = digest
+            if not check_vault_files:
+                continue
             atom_path = _resolve_atom_path(atoms_root, atom_id)
             if atom_path is None:
                 errors.append(f"{label} expected atom does not exist inside the atom directory: {atom_id}.")
@@ -265,12 +359,17 @@ def load_dataset(
     atoms_dir: str | Path,
     approval_check: Callable[[Path], bool],
 ) -> dict:
-    """Read JSON and validate it before any benchmark score is calculated."""
+    """Read JSON and validate it against live vault atoms before any benchmark score is calculated."""
     try:
         dataset = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise EvaluationDatasetError(f"Could not read evaluation dataset: {exc}") from exc
-    return validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=approval_check)
+    return validate_dataset(
+        dataset,
+        atoms_dir=atoms_dir,
+        approval_check=approval_check,
+        check_vault_files=True,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -292,24 +391,56 @@ def main(argv: list[str] | None = None) -> int:
         default=str(root_dir / "docs" / "retrieval-evaluation-proposed.json"),
         help="Path to the curated evaluation dataset JSON.",
     )
-    parser.add_argument("--atoms-dir", default=ATOMS_DIR, help="Path to canonical atoms directory.")
-    parser.add_argument("--brain-dir", default=BRAIN_DIR, help="Path to vault root directory.")
+    parser.add_argument("--atoms-dir", default=None, help="Path to canonical atoms directory.")
+    parser.add_argument("--brain-dir", default=None, help="Path to vault root directory.")
     parser.add_argument(
         "--require-all-splits",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Require non-empty regression, development, and holdout splits.",
     )
+    parser.add_argument(
+        "--allow-code-only",
+        action="store_true",
+        default=(os.environ.get("BRAIN_CI_CODE_ONLY", "").strip().lower() in {"1", "true", "yes"}),
+        help="Validate schema/splits/revision-format when running on a code-only checkout without vault atoms.",
+    )
     args = parser.parse_args(argv)
 
+    eff_brain_dir = args.brain_dir if args.brain_dir is not None else BRAIN_DIR
+    if args.atoms_dir is not None:
+        eff_atoms_dir = args.atoms_dir
+    elif args.brain_dir is not None:
+        eff_atoms_dir = str(Path(args.brain_dir) / "2-atoms")
+    else:
+        eff_atoms_dir = ATOMS_DIR
+
+    atoms_path = Path(eff_atoms_dir)
+    has_vault_atoms = atoms_path.is_dir() and any(atoms_path.glob("*.md"))
+    has_decision_log = (Path(eff_brain_dir) / "0-raw" / "archive" / "decision-record.jsonl").exists()
+    check_vault_files = True if (has_vault_atoms or has_decision_log or not args.allow_code_only) else False
+
     try:
-        validated = load_dataset(
-            args.dataset,
-            atoms_dir=args.atoms_dir,
-            approval_check=lambda p: approved_revision_is_current(
-                str(p), brain_dir=args.brain_dir, atoms_dir=args.atoms_dir
-            ),
+        approval_fn = lambda p: approved_revision_is_current(
+            str(p), brain_dir=eff_brain_dir, atoms_dir=eff_atoms_dir
         )
+        if check_vault_files:
+            validated = load_dataset(
+                args.dataset,
+                atoms_dir=eff_atoms_dir,
+                approval_check=approval_fn,
+            )
+        else:
+            try:
+                raw_ds = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise EvaluationDatasetError(f"Could not read evaluation dataset: {exc}") from exc
+            validated = validate_dataset(
+                raw_ds,
+                atoms_dir=eff_atoms_dir,
+                approval_check=approval_fn,
+                check_vault_files=False,
+            )
     except EvaluationDatasetError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -326,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = {
         "status": "valid",
+        "validation_mode": "vault_bound" if check_vault_files else "code_only_schema",
         "dataset_id": validated.get("dataset_id"),
         "dataset_version": validated.get("dataset_version"),
         "query_count": len(queries),

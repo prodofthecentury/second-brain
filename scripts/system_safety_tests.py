@@ -204,7 +204,7 @@ class EvaluationDatasetTests(unittest.TestCase):
                 **dataset,
                 "queries": [{
                     **pref_case,
-                    "expected_atom_revisions": [{"atom_id": "indent-pref.md", "revision_sha256": "0" * 64}],
+                    "expected_atom_revisions": [{"atom_id": "indent-pref.md", "revision_sha256": "1" * 64}],
                 }],
             }
             with self.assertRaisesRegex(EvaluationDatasetError, "revision hash is stale"):
@@ -1191,9 +1191,13 @@ class MCPBoundaryTests(unittest.TestCase):
                         "add_to_inbox",
                         "search_notes",
                         "get_note",
+                        "extract_action_items",
                         "remember",
                         "list_playbooks",
                         "get_playbook",
+                        "list_skills",
+                        "get_skill",
+                        "execute_skill",
                         "assemble_plan",
                         "list_contradictions",
                         "graph_neighbors",
@@ -1201,8 +1205,22 @@ class MCPBoundaryTests(unittest.TestCase):
                         "recall_at_snapshot",
                         "verify_ledger",
                         "prove_leaf",
+                        "list_vaults",
+                        "federated_recall",
+                        "media_status",
+                        "list_generated_media",
+                        "git_hook_status",
+                        "distill_git_commits",
                         "record_experience",
                         "record_feedback",
+                        "zoom_memory",
+                        "get_concept",
+                        "simulate_impact",
+                        "verify_symbolic",
+                        "list_principles",
+                        "run_debate",
+                        "curiosity_gaps",
+                        "record_context_signal",
                     },
                 )
                 resources = await mcp_server.handle_list_resources(auth_ctx, None)
@@ -2488,37 +2506,50 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
         self.assertEqual(failures, [])
 
         suite_ids = {suite_id for suite_id, _, _ in test_all.SUITES}
-        self.assertEqual(
-            suite_ids,
-            {
-                "doctor",
-                "evaluation_dataset",
-                "audit_sources",
-                "system_safety_tests",
-                "phase2_safety_tests",
-                "phase3_cognitive_tests",
-                "chroma_rebuild_canary",
-                "archive_manifest_canary",
-                "smoke_test",
-                "phase4_product_tests",
-                "phase5_god_features_tests",
-                "goal2_completion_tests",
-                "goal3_backend_contract_tests",
-                "goal4_sync_and_ui_tests",
-                "goal5_clipper_and_workspaces_tests",
-                "v040_sota_upgrades_tests",
-                "v050_sota_complete_tests",
-                "v100_final_completion_tests",
-                "creative_media_tests",
-                "stage4_executable_skills_tests",
-                "mobile_vault_client_tests",
-                "desktop_ui_tests",
-                "vscode_extension_tests",
-                "dashboard_apptest_tests",
-                "wheel_packaging_tests",
-                "scale_benchmark_1500",
-            },
-        )
+        self.assertEqual(len(suite_ids), len(test_all.SUITES))
+        expected_suites = {
+            "doctor",
+            "evaluation_dataset",
+            "audit_sources",
+            "system_safety_tests",
+            "phase2_safety_tests",
+            "phase3_cognitive_tests",
+            "chroma_rebuild_canary",
+            "archive_manifest_canary",
+            "smoke_test",
+            "phase4_product_tests",
+            "phase5_god_features_tests",
+            "goal2_completion_tests",
+            "goal3_backend_contract_tests",
+            "goal4_sync_and_ui_tests",
+            "goal5_clipper_and_workspaces_tests",
+            "v040_sota_upgrades_tests",
+            "v050_sota_complete_tests",
+            "v100_final_completion_tests",
+            "creative_media_tests",
+            "stage4_executable_skills_tests",
+            "mobile_vault_client_tests",
+            "bugfix_1a_regression_tests",
+            "desktop_ui_tests",
+            "vscode_extension_tests",
+            "dashboard_apptest_tests",
+            "parity_1c_tests",
+            "wheel_packaging_tests",
+            "phase6_release_and_stores_tests",
+            "phase7_platform_and_connectors_tests",
+            "phase8_ecosystem_and_canvas_tests",
+            "phase9_gen4_cognition_tests",
+            "phase10_math_and_formal_discovery_tests",
+            "goal_1b_completion_tests",
+            "release_and_benchmark_tests",
+            "live_runtime_integration_tests",
+            "scale_benchmark_1500",
+        }
+        self.assertEqual(suite_ids, expected_suites)
+        for _sid, _desc, cmd_args in test_all.SUITES:
+            for arg in cmd_args:
+                if str(arg).endswith(".py"):
+                    self.assertTrue(Path(arg).is_file(), f"Registered test_all script missing: {arg}")
 
     def test_launcher_and_bootstrap_script_paths_exist_and_setup_sh_is_lf_only(self):
         launcher_files = (
@@ -2768,6 +2799,67 @@ class IndependentAuditReconciliationTests(unittest.TestCase):
         self.assertIn("scripts/review_atom.py", playbook)
         self.assertIn("scripts/dashboard_auth.py set-password", playbook)
         self.assertIn("--runs 5", playbook)
+
+    def test_refinery_preserves_in_place_anchored_raw_source_files(self):
+        from unittest.mock import patch
+        import ollama_refinery
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            raw_dir = brain / "0-raw"
+            atoms_dir = brain / "2-atoms"
+            sidecar_dir = brain / ".sidecar"
+            raw_dir.mkdir(parents=True)
+            atoms_dir.mkdir(parents=True)
+            sidecar_dir.mkdir(parents=True)
+
+            anchored_raw = raw_dir / "owner-product-target-2026-10-27.md"
+            anchored_raw.write_text("Anchored verbatim owner product target sentence.\n", encoding="utf-8")
+            fresh_raw = raw_dir / "fresh-capture.md"
+            fresh_raw.write_text("Fresh unrefined capture sentence for candidate extraction.\n", encoding="utf-8")
+            (brain / "house-rules.md").write_text("# House Rules\n", encoding="utf-8")
+
+            (atoms_dir / "owner-product-target.md").write_text(
+                "---\n"
+                "id: owner-product-target\n"
+                "type: atom\n"
+                "memory_type: episodic\n"
+                "claim_state: human_reviewed\n"
+                "review_status: accepted\n"
+                "evidence_source: 0-raw/owner-product-target-2026-10-27.md\n"
+                "---\n\n"
+                "## Claim\nAnchored verbatim owner product target sentence.\n\n"
+                "## Evidence\nAnchored verbatim owner product target sentence.\n",
+                encoding="utf-8",
+            )
+
+            anchored_set = ollama_refinery.in_place_anchored_raw_sources(str(atoms_dir), str(brain))
+            self.assertIn("owner-product-target-2026-10-27.md", anchored_set)
+            self.assertNotIn("fresh-capture.md", anchored_set)
+
+            fake_draft = (
+                "---\n"
+                "id: fresh-candidate-atom\n"
+                "type: atom\n"
+                "memory_type: semantic\n"
+                "---\n\n"
+                "## Claim\nFresh unrefined capture sentence for candidate extraction.\n\n"
+                "## Evidence\nFresh unrefined capture sentence for candidate extraction.\n\n"
+                "## Why It Matters\nVerifies refinery archival isolation.\n"
+            )
+            with (
+                patch.object(ollama_refinery, "RAW_DIR", str(raw_dir)),
+                patch.object(ollama_refinery, "ATOMS_DIR", str(atoms_dir)),
+                patch.object(ollama_refinery, "HOUSE_RULES_PATH", str(brain / "house-rules.md")),
+                patch.object(ollama_refinery, "archive_dir", side_effect=lambda: str(raw_dir / "archive" / "2026-11")),
+                patch.object(ollama_refinery, "draft_memory_atoms", return_value=[fake_draft]),
+            ):
+                ollama_refinery.process_raw_files()
+
+            self.assertTrue(anchored_raw.is_file(), "Anchored raw file must remain in 0-raw/ untouched.")
+            self.assertFalse(fresh_raw.exists(), "Unanchored raw file must be archived after refinement.")
+            self.assertTrue((atoms_dir / "fresh-candidate-atom.md").is_file())
+            self.assertTrue((raw_dir / "archive" / "manifest.jsonl").is_file())
 
 
 if __name__ == "__main__":

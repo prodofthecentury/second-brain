@@ -1,0 +1,39 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "second-brain",
+  "title": "Second Brain",
+  "description": "Search verified memory atoms, capture quick notes, drop encrypted captures, and assemble grounded plans via loopback 127.0.0.1.",
+  "icon": "icon.png",
+  "author": "prodofthecentury",
+  "license": "MIT",
+  "categories": ["Productivity", "Developer Tools"],
+  "commands": [
+    {
+      "name": "search-memory",
+      "title": "Search Verified Memory",
+      "description": "Query owner-approved atoms in Second Brain",
+      "mode": "view"
+    },
+    {
+      "name": "quick-remember",
+      "title": "Remember Note",
+      "description": "Stage a quick note in 0-raw/notes",
+      "mode": "view"
+    },
+    {
+      "name": "inbox-drop",
+      "title": "Drop Quarantined Capture",
+      "description": "Stage a URL or snippet in quarantined 0-raw/inbox/",
+      "mode": "view"
+    },
+    {
+      "name": "assemble-plan",
+      "title": "Assemble Executive Plan",
+      "description": "Synthesize a grounded plan backed by playbooks and verified atoms",
+      "mode": "view"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.85.0"
+  }
+}

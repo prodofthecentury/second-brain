@@ -51,6 +51,7 @@ import tempfile
 import threading
 import time
 from urllib.parse import urlsplit
+import warnings
 
 import httpx
 
@@ -81,6 +82,7 @@ from config import (  # noqa: E402
     vault_relative_path,
 )
 from hardware_profile import (  # noqa: E402
+    NOMINAL_16GB_RAM_GIB,
     HardwareCapabilityProfile,
     detect_hardware_profile,
 )
@@ -129,6 +131,7 @@ VIDEO_BACKENDS: tuple[str, ...] = (
     "auto",
     "builtin_procedural_local",
     "comfyui_local",
+    "diffusers_local",
     "ffmpeg_slideshow_local",
 )
 NEURAL_BACKENDS: frozenset[str] = frozenset({
@@ -196,6 +199,10 @@ class CreativeMediaSecretBlockedError(OutboundSecretBlockedError, CreativeMediaP
 
 class CreativeMediaHardwareGateError(CreativeMediaError, ValueError):
     """Raised when requested backend, resolution, or frame budget exceeds hardware gates."""
+
+
+class CreativeMediaUnavailableError(CreativeMediaError):
+    """Raised in 'auto' mode when no local neural backend is ready and procedural fallback is disabled."""
 
 
 # ─── Structured Return Records ───────────────────────────────────────────────
@@ -314,6 +321,8 @@ class GeneratedMediaArtifact(_DictCompatibleMixin):
     hardware_tier: str
     hardware_override_used: bool
     created_at: str
+    degraded_fallback: bool = False
+    warning: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         raw = asdict(self)
@@ -451,8 +460,8 @@ def _tier_budget_for_profile(profile: HardwareCapabilityProfile) -> tuple[str, i
         tier_id == "tier_3_gpu_accelerated"
         or (
             tier_id != "tier_0_lexical_only"
-            and gpu_backend in {"cuda", "metal"}
-            and (vram_gib >= 6.0 or total_ram_gib >= 16.0)
+            and gpu_backend in {"cuda", "rocm", "xpu", "directml", "metal"}
+            and (vram_gib >= 6.0 or (gpu_backend == "metal" and total_ram_gib >= NOMINAL_16GB_RAM_GIB))
         )
     )
     if is_gpu_tier3:
@@ -467,15 +476,15 @@ def _tier_budget_for_profile(profile: HardwareCapabilityProfile) -> tuple[str, i
         )
 
     if tier_id == "tier_2_cpu_balanced":
-        if total_ram_gib >= 16.0:
+        if total_ram_gib >= NOMINAL_16GB_RAM_GIB:
             reason = (
-                f"Tier 2 CPU host ({total_ram_gib:.1f} GiB RAM >= 16 GiB): procedural engine ready; "
-                "local neural backends require an active loopback daemon or allow_hardware_override=True."
+                f"Tier 2 host ({total_ram_gib:.1f} GiB RAM >= {NOMINAL_16GB_RAM_GIB:.1f} GiB nominal 16 GB): "
+                "neural adapters unlocked when a loopback daemon (SD WebUI/ComfyUI) or local diffusers model is configured."
             )
         else:
             reason = (
-                f"Tier 2 CPU host ({total_ram_gib:.1f} GiB RAM < 16 GiB): heavy neural backends gated off "
-                "to prevent swap thrashing unless allow_hardware_override=True."
+                f"Tier 2 CPU host ({total_ram_gib:.1f} GiB RAM < {NOMINAL_16GB_RAM_GIB:.1f} GiB nominal 16 GB): "
+                "heavy neural backends gated off to prevent swap thrashing unless allow_hardware_override=True."
             )
         return ("tier_2_cpu_balanced", 1024, 1024, 36, 16, False, reason)
 
@@ -487,7 +496,7 @@ def _tier_budget_for_profile(profile: HardwareCapabilityProfile) -> tuple[str, i
         24,
         12,
         False,
-        f"{profile.tier_label}: builtin_procedural_local is ready offline; heavy neural GPU backends are gated off unless allow_hardware_override=True.",
+        f"{profile.tier_label}: builtin_procedural_local is ready when explicitly requested; heavy neural GPU backends are gated off unless allow_hardware_override=True.",
     )
 
 
@@ -558,6 +567,60 @@ def _is_diffusers_installed() -> bool:
         return False
 
 
+def _is_pyav_libx264_available() -> bool:
+    """Return True when PyAV (`av`) is installed with compiled `libx264` H.264 encoder support."""
+    try:
+        import av  # type: ignore[import-not-found]
+
+        return "libx264" in getattr(av, "codecs_available", set())
+    except Exception:
+        return False
+
+
+def _discover_local_diffusers_models(*, explicit_model: str | None = None, media_type: str = "image") -> list[str]:
+    """Return configured or locally cached HuggingFace diffusers model specs without network access."""
+    models: list[str] = []
+    candidates = [
+        explicit_model,
+        os.environ.get("BRAIN_DIFFUSERS_VIDEO_MODEL") if media_type == "video" else None,
+        os.environ.get("BRAIN_DIFFUSERS_MODEL"),
+    ]
+    for raw in candidates:
+        clean = str(raw or "").strip()
+        if clean and clean not in models:
+            models.append(clean)
+
+    hub_roots: list[Path] = []
+    for env_key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        val = (os.environ.get(env_key) or "").strip()
+        if val:
+            hub_roots.append(Path(val))
+    hf_home = (os.environ.get("HF_HOME") or "").strip()
+    if hf_home:
+        hub_roots.append(Path(hf_home) / "hub")
+    hub_roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+
+    for root in hub_roots:
+        if not root.is_dir() or _is_reparse_or_link(str(root)):
+            continue
+        try:
+            for entry in sorted(root.iterdir()):
+                if not entry.is_dir() or not entry.name.startswith("models--"):
+                    continue
+                snaps = entry / "snapshots"
+                if not snaps.is_dir():
+                    continue
+                for snap in snaps.iterdir():
+                    if snap.is_dir() and (snap / "model_index.json").is_file():
+                        repo_id = entry.name[len("models--") :].replace("--", "/")
+                        if repo_id not in models:
+                            models.append(repo_id)
+                        break
+        except OSError:
+            continue
+    return models[:32]
+
+
 def get_creative_media_status(
     *,
     hardware_profile: HardwareCapabilityProfile | None = None,
@@ -567,6 +630,7 @@ def get_creative_media_status(
     http_transport: httpx.BaseTransport | None = None,
     ffmpeg_path_override: str | None = None,
     diffusers_available_override: bool | None = None,
+    diffusers_model_name: str | None = None,
 ) -> CreativeMediaStatus:
     """Inspect host hardware capability profile and probe local loopback media backends."""
     profile = hardware_profile or detect_hardware_profile(use_cache=True)
@@ -618,29 +682,52 @@ def get_creative_media_status(
         if diffusers_available_override is not None
         else _is_diffusers_installed()
     )
+    diffusers_models_img = (
+        _discover_local_diffusers_models(explicit_model=diffusers_model_name, media_type="image")
+        if diffusers_ok
+        else []
+    )
+    diffusers_models_vid = (
+        _discover_local_diffusers_models(explicit_model=diffusers_model_name, media_type="video")
+        if diffusers_ok
+        else []
+    )
+    explicit_no_ffmpeg = ffmpeg_path_override is not None and not ffmpeg_path_override.strip()
     ffmpeg_resolved = (
         (ffmpeg_path_override.strip() or None)
         if ffmpeg_path_override is not None
         else shutil.which("ffmpeg")
     )
     ffmpeg_ok = bool(ffmpeg_resolved and os.path.isfile(ffmpeg_resolved))
+    pyav_h264_ok = (not explicit_no_ffmpeg) and _is_pyav_libx264_available()
+    h264_ok = ffmpeg_ok or pyav_h264_ok
 
-    tier2_ram_ok = creative_tier == "tier_2_cpu_balanced" and float(profile.total_ram_gib or 0.0) >= 16.0
-    sd_hw_eligible = tier3_unlocked or (tier2_ram_ok and sd_online)
-    comfy_hw_eligible = tier3_unlocked or (tier2_ram_ok and comfy_online)
-    diffusers_hw_eligible = tier3_unlocked
+    tier2_ram_ok = (
+        creative_tier == "tier_2_cpu_balanced"
+        and float(profile.total_ram_gib or 0.0) >= NOMINAL_16GB_RAM_GIB
+    )
+    neural_unlocked = bool(tier3_unlocked or tier2_ram_ok)
+    sd_hw_eligible = neural_unlocked
+    comfy_hw_eligible = neural_unlocked
+    diffusers_hw_eligible = neural_unlocked
+    diffusers_img_ready = bool(diffusers_ok and diffusers_hw_eligible and diffusers_models_img)
+    diffusers_vid_ready = bool(diffusers_ok and diffusers_hw_eligible and diffusers_models_vid)
 
     if sd_online and sd_hw_eligible:
         rec_img = "sd_webui_local"
     elif comfy_online and comfy_hw_eligible:
         rec_img = "comfyui_local"
+    elif diffusers_img_ready:
+        rec_img = "diffusers_local"
     else:
-        rec_img = "builtin_procedural_local"
+        rec_img = "none"
 
     if comfy_online and comfy_hw_eligible:
         rec_vid = "comfyui_local"
+    elif diffusers_vid_ready:
+        rec_vid = "diffusers_local"
     else:
-        rec_vid = "builtin_procedural_local"
+        rec_vid = "none"
 
     backends: dict[str, dict[str, object]] = {
         "builtin_procedural_local": {
@@ -648,10 +735,15 @@ def get_creative_media_status(
             "reachable": True,
             "hardware_eligible": True,
             "ready": True,
+            "opt_in_only_in_auto": True,
             "endpoint_url": None,
             "supported_media_types": ["image", "video"],
             "models": list(PROCEDURAL_STYLES),
-            "detail": "Deterministic 2x-supersampled Pillow synthesizer + pure-Python ISO-BMFF MP4 & GIF muxer",
+            "detail": (
+                "Deterministic 2x-supersampled Pillow synthesizer + "
+                + ("PyAV libx264 (avc1)" if pyav_h264_ok else "Pure-Python H.264 Baseline (avc1)")
+                + " & GIF muxer (explicit backend or --allow-procedural-fallback)"
+            ),
         },
         "sd_webui_local": {
             "available": sd_online,
@@ -677,21 +769,37 @@ def get_creative_media_status(
             "available": diffusers_ok,
             "reachable": diffusers_ok,
             "hardware_eligible": diffusers_hw_eligible,
-            "ready": bool(diffusers_ok and diffusers_hw_eligible),
+            "ready": bool(diffusers_img_ready or diffusers_vid_ready),
             "endpoint_url": None,
-            "supported_media_types": ["image"],
-            "models": [],
-            "detail": "Local HuggingFace diffusers (local_files_only=True)" if diffusers_ok else "diffusers/torch not installed",
+            "supported_media_types": ["image", "video"],
+            "models": diffusers_models_img,
+            "detail": (
+                f"Local HuggingFace diffusers (local_files_only=True, {len(diffusers_models_img)} model(s))"
+                if diffusers_ok and diffusers_models_img
+                else (
+                    "diffusers/torch installed (configure BRAIN_DIFFUSERS_MODEL or cache local model)"
+                    if diffusers_ok
+                    else "diffusers/torch not installed (install extra: .[creative])"
+                )
+            ),
         },
         "ffmpeg_slideshow_local": {
-            "available": ffmpeg_ok,
-            "reachable": ffmpeg_ok,
+            "available": True,
+            "reachable": True,
             "hardware_eligible": True,
-            "ready": ffmpeg_ok,
+            "ready": True,
             "endpoint_url": None,
             "supported_media_types": ["video"],
-            "models": ["libx264"] if ffmpeg_ok else [],
-            "detail": f"Local ffmpeg CLI ({ffmpeg_resolved})" if ffmpeg_ok else "ffmpeg binary not on PATH (pure-Python MP4 muxer active)",
+            "models": ["libx264"] if h264_ok else ["h264_baseline_ipcm"],
+            "detail": (
+                f"Local ffmpeg CLI ({ffmpeg_resolved})"
+                if ffmpeg_ok
+                else (
+                    "Bundled PyAV FFmpeg libx264 (H.264 avc1 / yuv420p)"
+                    if pyav_h264_ok
+                    else "Pure-Python ISO-BMFF H.264 Baseline (avc1 I_PCM)"
+                )
+            ),
         },
     }
 
@@ -711,12 +819,12 @@ def get_creative_media_status(
         hard_cap_width=HARD_MAX_WIDTH,
         hard_cap_height=HARD_MAX_HEIGHT,
         hard_cap_frames=HARD_MAX_FRAMES,
-        neural_backends_unlocked=bool(tier3_unlocked or (tier2_ram_ok and (sd_online or comfy_online))),
+        neural_backends_unlocked=neural_unlocked,
         neural_gate_reason=gate_reason,
         recommended_image_backend=rec_img,
         recommended_video_backend=rec_vid,
-        ffmpeg_available=ffmpeg_ok,
-        ffmpeg_path=ffmpeg_resolved if ffmpeg_ok else None,
+        ffmpeg_available=h264_ok,
+        ffmpeg_path=ffmpeg_resolved if ffmpeg_ok else ("pyav:libx264" if pyav_h264_ok else None),
         diffusers_available=diffusers_ok,
         offline_mp4_muxer_ready=True,
         backends=backends,
@@ -804,7 +912,7 @@ def enforce_creative_hardware_gate(
         if tier3_unlocked:
             pass
         elif creative_tier == "tier_2_cpu_balanced":
-            ram_ok = float(profile.total_ram_gib or 0.0) >= 16.0
+            ram_ok = float(profile.total_ram_gib or 0.0) >= NOMINAL_16GB_RAM_GIB
             if allow_hardware_override:
                 override_used = True
             elif ram_ok and daemon_online:
@@ -1235,39 +1343,196 @@ def _mp4_full_box(box_type: bytes, version: int, flags: int, payload: bytes) -> 
     return _mp4_box(box_type, struct.pack(">I", ver_flags) + payload)
 
 
-def _mux_mjpeg_mp4(jpeg_frames: Sequence[bytes], width: int, height: int, fps: int) -> bytes:
-    """Mux baseline JPEG frames into a standards-compliant ISO/IEC 14496-12 `.mp4` binary container.
+def _exp_golomb_ue_bits(val: int) -> list[int]:
+    code = val + 1
+    leading_zeros = code.bit_length() - 1
+    out = [0] * leading_zeros + [1]
+    for shift in range(leading_zeros - 1, -1, -1):
+        out.append((code >> shift) & 1)
+    return out
 
-    Produces top-level `ftyp`, `mdat`, and `moov` (`mvhd`, `trak` -> `tkhd` + `mdia` -> `mdhd` +
-    `hdlr` (`vide`) + `minf` -> `vmhd` + `dinf`/`dref` + `stbl` -> `stsd` (`jpeg` VisualSampleEntry,
-    width/height/72dpi/depth=24), `stts`, `stsc`, `stsz`, and `stco`/`co64`) with exact per-frame
-    byte offsets into `mdat`.
-    """
-    if not jpeg_frames:
-        raise ValueError("Cannot mux an empty JPEG frame sequence into MP4.")
-    if width < 16 or height < 16 or width > 65535 or height > 65535:
-        raise ValueError(f"Invalid MP4 VisualSampleEntry dimensions: {width}x{height}")
+
+def _bits_to_rbsp_bytes(bits: list[int]) -> bytes:
+    padded = list(bits) + [1]
+    while len(padded) % 8 != 0:
+        padded.append(0)
+    raw = bytearray()
+    for pos in range(0, len(padded), 8):
+        byte_val = 0
+        for bit_idx in range(8):
+            byte_val = (byte_val << 1) | padded[pos + bit_idx]
+        raw.append(byte_val)
+    return bytes(raw)
+
+
+def _rbsp_to_nal_payload(rbsp: bytes) -> bytes:
+    """Insert H.264 start-code emulation prevention bytes (0x03)."""
+    out = bytearray()
+    zeros = 0
+    for b in rbsp:
+        if zeros >= 2 and b <= 3:
+            out.append(3)
+            zeros = 0
+        out.append(b)
+        zeros = (zeros + 1) if b == 0 else 0
+    return bytes(out)
+
+
+def _h264_sps_nalu(width: int, height: int) -> bytes:
+    mb_w = (width + 15) // 16
+    mb_h = (height + 15) // 16
+    crop_r = (mb_w * 16 - width) // 2
+    crop_b = (mb_h * 16 - height) // 2
+    bits: list[int] = []
+    for byte in (66, 0xC0, 40):  # Baseline Profile (66), constraints 0xC0, Level 4.0
+        bits.extend((byte >> shift) & 1 for shift in range(7, -1, -1))
+    bits.extend(_exp_golomb_ue_bits(0))  # seq_parameter_set_id
+    bits.extend(_exp_golomb_ue_bits(0))  # log2_max_frame_num_minus4
+    bits.extend(_exp_golomb_ue_bits(2))  # pic_order_cnt_type = 2
+    bits.extend(_exp_golomb_ue_bits(0))  # max_num_ref_frames = 0
+    bits.append(0)                       # gaps_in_frame_num_value_allowed_flag
+    bits.extend(_exp_golomb_ue_bits(mb_w - 1))
+    bits.extend(_exp_golomb_ue_bits(mb_h - 1))
+    bits.append(1)                       # frame_mbs_only_flag = 1
+    bits.append(0)                       # direct_8x8_inference_flag
+    if crop_r or crop_b:
+        bits.append(1)
+        bits.extend(_exp_golomb_ue_bits(0))
+        bits.extend(_exp_golomb_ue_bits(crop_r))
+        bits.extend(_exp_golomb_ue_bits(0))
+        bits.extend(_exp_golomb_ue_bits(crop_b))
+    else:
+        bits.append(0)
+    bits.append(0)                       # vui_parameters_present_flag = 0
+    return b"\x67" + _rbsp_to_nal_payload(_bits_to_rbsp_bytes(bits))
+
+
+def _h264_pps_nalu() -> bytes:
+    bits: list[int] = []
+    bits.extend(_exp_golomb_ue_bits(0))  # pic_parameter_set_id
+    bits.extend(_exp_golomb_ue_bits(0))  # seq_parameter_set_id
+    bits.extend([0, 0])                  # entropy_coding_mode_flag, bottom_field_pic_order
+    bits.extend(_exp_golomb_ue_bits(0))  # num_slice_groups_minus1
+    bits.extend(_exp_golomb_ue_bits(0))  # num_ref_idx_l0_default_active_minus1
+    bits.extend(_exp_golomb_ue_bits(0))  # num_ref_idx_l1_default_active_minus1
+    bits.extend([0, 0, 0])               # weighted_pred_flag, weighted_bipred_idc (2 bits)
+    bits.extend(_exp_golomb_ue_bits(0))  # pic_init_qp_minus26
+    bits.extend(_exp_golomb_ue_bits(0))  # pic_init_qs_minus26
+    bits.extend(_exp_golomb_ue_bits(0))  # chroma_qp_index_offset
+    bits.extend([0, 0, 0])               # deblocking, constrained_intra, redundant_pic_cnt
+    return b"\x68" + _rbsp_to_nal_payload(_bits_to_rbsp_bytes(bits))
+
+
+def _encode_pil_frame_to_h264_idr_nalu(frame: Image.Image, width: int, height: int) -> bytes:
+    """Encode a PIL Image into a valid H.264 Baseline `I_PCM` IDR slice NALU (`nal_unit_type=5`)."""
+    rgb = Image.frombytes("RGB", frame.size, frame.convert("RGB").tobytes())
+    if rgb.size != (width, height):
+        rgb = rgb.resize((width, height), Image.Resampling.LANCZOS)
+    mb_w = (width + 15) // 16
+    mb_h = (height + 15) // 16
+    pw, ph = mb_w * 16, mb_h * 16
+    cw = mb_w * 8
+    if (width, height) != (pw, ph):
+        padded = Image.new("RGB", (pw, ph))
+        padded.paste(rgb, (0, 0))
+    else:
+        padded = rgb
+    y_im, cb_im, cr_im = padded.convert("YCbCr").split()
+    y_bytes = y_im.tobytes()
+    cb_bytes = cb_im.resize((pw // 2, ph // 2), Image.Resampling.BILINEAR).tobytes()
+    cr_bytes = cr_im.resize((pw // 2, ph // 2), Image.Resampling.BILINEAR).tobytes()
+
+    bit_buf: list[int] = []
+    bit_buf.extend(_exp_golomb_ue_bits(0))  # first_mb_in_slice
+    bit_buf.extend(_exp_golomb_ue_bits(7))  # slice_type = 7 (I slice)
+    bit_buf.extend(_exp_golomb_ue_bits(0))  # pic_parameter_set_id
+    bit_buf.extend([0, 0, 0, 0])            # frame_num = 0 (4 bits)
+    bit_buf.extend(_exp_golomb_ue_bits(0))  # idr_pic_id = 0
+    bit_buf.extend([0, 0])                  # no_output_of_prior_pics, long_term_reference
+    bit_buf.extend(_exp_golomb_ue_bits(0))  # slice_qp_delta
+
+    rbsp = bytearray()
+    ipcm_bits = _exp_golomb_ue_bits(25)
+
+    def _flush_aligned(pending: list[int]) -> None:
+        rem = len(pending) % 8
+        if rem:
+            pending.extend([0] * (8 - rem))
+        for p in range(0, len(pending), 8):
+            val = 0
+            for j in range(8):
+                val = (val << 1) | pending[p + j]
+            rbsp.append(val)
+        pending.clear()
+
+    for mby in range(mb_h):
+        for mbx in range(mb_w):
+            bit_buf.extend(ipcm_bits)
+            _flush_aligned(bit_buf)
+            y0, x0 = mby * 16, mbx * 16
+            for row in range(16):
+                off = (y0 + row) * pw + x0
+                rbsp.extend(y_bytes[off : off + 16])
+            cy0, cx0 = mby * 8, mbx * 8
+            for row in range(8):
+                off = (cy0 + row) * cw + cx0
+                rbsp.extend(cb_bytes[off : off + 8])
+            for row in range(8):
+                off = (cy0 + row) * cw + cx0
+                rbsp.extend(cr_bytes[off : off + 8])
+    rbsp.append(0x80)  # rbsp_trailing_bits
+    return b"\x65" + _rbsp_to_nal_payload(bytes(rbsp))
+
+
+def _encode_frames_to_h264_avc1_mp4(
+    frames: Sequence[Image.Image],
+    *,
+    width: int,
+    height: int,
+    fps: int,
+) -> bytes:
+    """Mux RGB frames into a browser-playable pure-Python H.264 Baseline (`avc1` + `avcC` + `stss`) `.mp4`."""
+    if not frames:
+        raise ValueError("Cannot mux an empty frame sequence into MP4.")
+    if width < 16 or height < 16 or width > 65535 or height > 65535 or (width % 2) or (height % 2):
+        raise ValueError(f"Invalid H.264 YUV420p dimensions: {width}x{height}")
     if fps < 1 or fps > 240:
         raise ValueError(f"Invalid MP4 frame rate: {fps}")
 
-    frame_sizes: list[int] = []
-    for idx, frame in enumerate(jpeg_frames):
-        if not isinstance(frame, (bytes, bytearray)) or len(frame) < 4:
-            raise ValueError(f"JPEG frame {idx} is empty or truncated.")
-        if frame[:2] != b"\xff\xd8" or frame[-2:] != b"\xff\xd9":
-            raise ValueError(f"JPEG frame {idx} lacks valid SOI (0xFFD8) / EOI (0xFFD9) markers.")
-        frame_sizes.append(len(frame))
+    sps_nalu = _h264_sps_nalu(width, height)
+    pps_nalu = _h264_pps_nalu()
+    avcc_payload = (
+        struct.pack(
+            ">BBBBBBH",
+            1,            # configurationVersion
+            sps_nalu[1],  # AVCProfileIndication
+            sps_nalu[2],  # profile_compatibility
+            sps_nalu[3],  # AVCLevelIndication
+            0xFF,         # lengthSizeMinusOne = 3 (4-byte NAL length prefix)
+            0xE1,         # numOfSequenceParameterSets = 1
+            len(sps_nalu),
+        )
+        + sps_nalu
+        + struct.pack(">BH", 1, len(pps_nalu))
+        + pps_nalu
+    )
+    avcc_box = _mp4_box(b"avcC", avcc_payload)
 
-    # 1. ftyp: ISO Base Media v2 / MP42 compatible container
-    ftyp_payload = struct.pack(">4sI", b"isom", 0x00000200) + b"isomiso2mp41mp42"
+    sample_payloads: list[bytes] = []
+    frame_sizes: list[int] = []
+    for frame in frames:
+        idr_nalu = _encode_pil_frame_to_h264_idr_nalu(frame, width, height)
+        avcc_sample = struct.pack(">I", len(idr_nalu)) + idr_nalu
+        sample_payloads.append(avcc_sample)
+        frame_sizes.append(len(avcc_sample))
+
+    ftyp_payload = struct.pack(">4sI", b"isom", 0x00000200) + b"isomiso2avc1mp41"
     ftyp_box = _mp4_box(b"ftyp", ftyp_payload)
 
-    # 2. mdat: Contiguous baseline JPEG access units
-    mdat_payload = b"".join(jpeg_frames)
+    mdat_payload = b"".join(sample_payloads)
     mdat_header_len = 8 if (8 + len(mdat_payload)) <= 0xFFFFFFFF else 16
     mdat_box = _mp4_box(b"mdat", mdat_payload)
 
-    # Exact file byte offsets of each JPEG sample inside mdat
     first_sample_offset = len(ftyp_box) + mdat_header_len
     chunk_offsets: list[int] = []
     running = first_sample_offset
@@ -1275,7 +1540,6 @@ def _mux_mjpeg_mp4(jpeg_frames: Sequence[bytes], width: int, height: int, fps: i
         chunk_offsets.append(running)
         running += sz
 
-    # 3. moov hierarchy
     sample_count = len(frame_sizes)
     sample_delta = 1000
     timescale = int(fps) * sample_delta
@@ -1286,59 +1550,46 @@ def _mux_mjpeg_mp4(jpeg_frames: Sequence[bytes], width: int, height: int, fps: i
         0, 0x00010000, 0,
         0, 0, 0x40000000,
     )
-
     mvhd_payload = (
         struct.pack(">IIIIihH2I", 0, 0, timescale, total_duration, 0x00010000, 0x0100, 0, 0, 0)
         + unity_matrix
         + struct.pack(">6II", 0, 0, 0, 0, 0, 0, 2)
     )
     mvhd_box = _mp4_full_box(b"mvhd", 0, 0, mvhd_payload)
-
     tkhd_payload = (
         struct.pack(">IIIII2IhhhH", 0, 0, 1, 0, total_duration, 0, 0, 0, 0, 0, 0)
         + unity_matrix
         + struct.pack(">II", width << 16, height << 16)
     )
     tkhd_box = _mp4_full_box(b"tkhd", 0, 0x000007, tkhd_payload)
-
-    mdhd_payload = struct.pack(">IIIIHH", 0, 0, timescale, total_duration, 0x55C4, 0)
-    mdhd_box = _mp4_full_box(b"mdhd", 0, 0, mdhd_payload)
-
-    hdlr_payload = struct.pack(">I4s3I", 0, b"vide", 0, 0, 0) + b"SecondBrain Local Video\x00"
-    hdlr_box = _mp4_full_box(b"hdlr", 0, 0, hdlr_payload)
-
+    mdhd_box = _mp4_full_box(b"mdhd", 0, 0, struct.pack(">IIIIHH", 0, 0, timescale, total_duration, 0x55C4, 0))
+    hdlr_box = _mp4_full_box(
+        b"hdlr",
+        0,
+        0,
+        struct.pack(">I4s3I", 0, b"vide", 0, 0, 0) + b"SecondBrain Local Video\x00",
+    )
     vmhd_box = _mp4_full_box(b"vmhd", 0, 0x000001, struct.pack(">H3H", 0, 0, 0, 0))
     url_box = _mp4_full_box(b"url ", 0, 0x000001, b"")
     dref_box = _mp4_full_box(b"dref", 0, 0, struct.pack(">I", 1) + url_box)
     dinf_box = _mp4_box(b"dinf", dref_box)
 
-    # Canonical 86-byte ISO 14496-12 VisualSampleEntry ('jpeg'):
-    # 6B reserved + 2B data_ref_idx + 2B pre_defined + 2B reserved + 12B pre_defined[3]
-    # + 2B width + 2B height + 4B horizres + 4B vertres + 4B reserved + 2B frame_count
-    # + 32B compressorname + 2B depth + 2B pre_defined(-1) = 78B payload + 8B header = 86B.
-    compressor_label = b"Motion JPEG"
+    compressor_label = b"H.264 Baseline"
     compressor_field = bytes([len(compressor_label)]) + compressor_label + b"\x00" * (31 - len(compressor_label))
     visual_sample_payload = (
         b"\x00" * 6
         + struct.pack(
             ">HHH3IHHIIIH",
-            1,           # data_reference_index
-            0,           # pre_defined
-            0,           # reserved
-            0, 0, 0,     # pre_defined[3]
-            width,       # width
-            height,      # height
-            0x00480000,  # horizresolution = 72.0 dpi
-            0x00480000,  # vertresolution = 72.0 dpi
-            0,           # reserved
-            1,           # frame_count = 1
+            1, 0, 0, 0, 0, 0,
+            width, height,
+            0x00480000, 0x00480000, 0, 1,
         )
         + compressor_field
-        + struct.pack(">Hh", 0x0018, -1)  # depth = 24, pre_defined = -1
+        + struct.pack(">Hh", 0x0018, -1)
+        + avcc_box
     )
-    sample_entry_box = _mp4_box(b"jpeg", visual_sample_payload)
+    sample_entry_box = _mp4_box(b"avc1", visual_sample_payload)
     stsd_box = _mp4_full_box(b"stsd", 0, 0, struct.pack(">I", 1) + sample_entry_box)
-
     stts_box = _mp4_full_box(b"stts", 0, 0, struct.pack(">III", 1, sample_count, sample_delta))
     stsc_box = _mp4_full_box(b"stsc", 0, 0, struct.pack(">IIII", 1, 1, 1, 1))
     stsz_box = _mp4_full_box(
@@ -1347,29 +1598,42 @@ def _mux_mjpeg_mp4(jpeg_frames: Sequence[bytes], width: int, height: int, fps: i
         0,
         struct.pack(">II", 0, sample_count) + struct.pack(f">{sample_count}I", *frame_sizes),
     )
-
+    sync_indices = list(range(1, sample_count + 1))
+    stss_box = _mp4_full_box(
+        b"stss",
+        0,
+        0,
+        struct.pack(">I", sample_count) + struct.pack(f">{sample_count}I", *sync_indices),
+    )
     if chunk_offsets[-1] <= 0xFFFFFFFF:
         stco_box = _mp4_full_box(
-            b"stco",
-            0,
-            0,
-            struct.pack(">I", sample_count) + struct.pack(f">{sample_count}I", *chunk_offsets),
+            b"stco", 0, 0, struct.pack(">I", sample_count) + struct.pack(f">{sample_count}I", *chunk_offsets)
         )
     else:
         stco_box = _mp4_full_box(
-            b"co64",
-            0,
-            0,
-            struct.pack(">I", sample_count) + struct.pack(f">{sample_count}Q", *chunk_offsets),
+            b"co64", 0, 0, struct.pack(">I", sample_count) + struct.pack(f">{sample_count}Q", *chunk_offsets)
         )
 
-    stbl_box = _mp4_box(b"stbl", stsd_box + stts_box + stsc_box + stsz_box + stco_box)
+    stbl_box = _mp4_box(b"stbl", stsd_box + stts_box + stsc_box + stsz_box + stss_box + stco_box)
     minf_box = _mp4_box(b"minf", vmhd_box + dinf_box + stbl_box)
     mdia_box = _mp4_box(b"mdia", mdhd_box + hdlr_box + minf_box)
     trak_box = _mp4_box(b"trak", tkhd_box + mdia_box)
     moov_box = _mp4_box(b"moov", mvhd_box + trak_box)
 
-    return ftyp_box + mdat_box + moov_box
+    mp4_bytes = ftyp_box + mdat_box + moov_box
+    inspect_mp4_container(mp4_bytes)
+    return mp4_bytes
+
+
+def _mux_mjpeg_mp4(jpeg_frames: Sequence[bytes], width: int, height: int, fps: int) -> bytes:
+    """Legacy helper signature retained for compatibility; decodes JPEG frames to browser-playable H.264 `avc1`."""
+    if not jpeg_frames:
+        raise ValueError("Cannot mux an empty frame sequence into MP4.")
+    pil_frames: list[Image.Image] = []
+    for raw_jpg in jpeg_frames:
+        with Image.open(io.BytesIO(raw_jpg)) as im:
+            pil_frames.append(im.convert("RGB"))
+    return _encode_frames_to_h264_avc1_mp4(pil_frames, width=width, height=height, fps=fps)
 
 
 def _iter_bmff_boxes(buf: bytes, start: int = 0, end: int | None = None) -> list[tuple[str, int, int, int]]:
@@ -1466,10 +1730,19 @@ def inspect_mp4_container(mp4_bytes: bytes) -> dict[str, object]:
     if entry_count < 1:
         raise CreativeMediaSecurityError("MP4 stsd has zero sample descriptions.")
     sample_entries = _iter_bmff_boxes(raw, stsd_p + 8, stsd_e)
-    codec_tag, _, se_p, _ = sample_entries[0]
+    codec_tag, _, se_p, se_e = sample_entries[0]
     width, height = struct.unpack(">HH", raw[se_p + 24 : se_p + 28])
     horiz_dpi = struct.unpack(">I", raw[se_p + 28 : se_p + 32])[0] >> 16
     depth = struct.unpack(">H", raw[se_p + 74 : se_p + 76])[0]
+    sample_child_boxes: list[str] = []
+    if se_e > se_p + 78:
+        try:
+            sample_child_boxes = [b[0] for b in _iter_bmff_boxes(raw, se_p + 78, se_e)]
+        except CreativeMediaSecurityError:
+            sample_child_boxes = []
+    has_avcc = "avcC" in sample_child_boxes
+    has_stss = "stss" in stbl_map
+    browser_playable = bool(codec_tag in {"avc1", "avc3", "hev1", "hvc1"} and has_avcc)
 
     # Parse stsz sample sizes
     stsz_p = stbl_map["stsz"][2]
@@ -1509,6 +1782,9 @@ def inspect_mp4_container(mp4_bytes: bytes) -> dict[str, object]:
         "minf_boxes": minf_types,
         "stbl_boxes": list(stbl_map.keys()),
         "codec_tag": codec_tag,
+        "has_avcC": has_avcc,
+        "has_stss": has_stss,
+        "browser_playable": browser_playable,
         "width": width,
         "height": height,
         "horiz_dpi": horiz_dpi,
@@ -2015,6 +2291,72 @@ def _encode_frames_to_gif(frames: Sequence[Image.Image], *, fps: int) -> bytes:
     return gif_bytes
 
 
+def _encode_frames_to_mp4(
+    frames: Sequence[Image.Image],
+    *,
+    width: int,
+    height: int,
+    fps: int,
+    ffmpeg_exe: str | None = None,
+    prefer_ffmpeg: bool = False,
+    allow_pyav: bool = True,
+) -> tuple[bytes, str]:
+    """Encode RGB frames into a browser-playable H.264 (`avc1` + `avcC` + `stss`) `.mp4`."""
+    if prefer_ffmpeg and ffmpeg_exe and os.path.isfile(ffmpeg_exe):
+        try:
+            return (
+                _encode_frames_with_ffmpeg(
+                    frames,
+                    ffmpeg_exe=ffmpeg_exe,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                ),
+                "ffmpeg_libx264",
+            )
+        except CreativeMediaError:
+            pass
+
+    if allow_pyav and _is_pyav_libx264_available():
+        try:
+            return (
+                _encode_frames_with_pyav_libx264(
+                    frames,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                ),
+                "pyav_libx264",
+            )
+        except CreativeMediaError:
+            pass
+
+    if ffmpeg_exe and os.path.isfile(ffmpeg_exe):
+        try:
+            return (
+                _encode_frames_with_ffmpeg(
+                    frames,
+                    ffmpeg_exe=ffmpeg_exe,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                ),
+                "ffmpeg_libx264",
+            )
+        except CreativeMediaError:
+            pass
+
+    return (
+        _encode_frames_to_h264_avc1_mp4(
+            frames,
+            width=width,
+            height=height,
+            fps=fps,
+        ),
+        "iso_bmff_h264_avc1_pure_python",
+    )
+
+
 def _encode_frames_to_mjpeg_mp4(
     frames: Sequence[Image.Image],
     *,
@@ -2023,18 +2365,9 @@ def _encode_frames_to_mjpeg_mp4(
     fps: int,
     jpeg_quality: int = 88,
 ) -> bytes:
-    q = max(40, min(98, int(jpeg_quality)))
-    jpeg_payloads: list[bytes] = []
-    for frame in frames:
-        rgb = Image.frombytes("RGB", frame.size, frame.convert("RGB").tobytes())
-        if rgb.size != (width, height):
-            rgb = rgb.resize((width, height), Image.Resampling.LANCZOS)
-        jbuf = io.BytesIO()
-        rgb.save(jbuf, format="JPEG", quality=q, optimize=False, progressive=False, subsampling=0)
-        jpeg_payloads.append(jbuf.getvalue())
-    mp4_bytes = _mux_mjpeg_mp4(jpeg_payloads, width=width, height=height, fps=fps)
-    inspect_mp4_container(mp4_bytes)
-    return mp4_bytes
+    """Compatibility alias returning browser-playable pure-Python H.264 Baseline `avc1` `.mp4`."""
+    del jpeg_quality
+    return _encode_frames_to_h264_avc1_mp4(frames, width=width, height=height, fps=fps)
 
 
 def _encode_frames_with_ffmpeg(
@@ -2086,6 +2419,48 @@ def _encode_frames_with_ffmpeg(
             raise CreativeMediaError(f"ffmpeg local encoding failed: {proc.stderr[:240]}")
         mp4_bytes = Path(out_mp4).read_bytes()
     inspect_mp4_container(mp4_bytes)
+    return mp4_bytes
+
+
+def _encode_frames_with_pyav_libx264(
+    frames: Sequence[Image.Image],
+    *,
+    width: int,
+    height: int,
+    fps: int,
+) -> bytes:
+    """Encode RGB frames into H.264 (`avc1`, `yuv420p`) `.mp4` via bundled PyAV/libx264."""
+    try:
+        import av  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise CreativeMediaError("PyAV ('av') package is not installed.") from exc
+    if "libx264" not in getattr(av, "codecs_available", set()):
+        raise CreativeMediaError("Bundled PyAV installation lacks libx264 H.264 encoder support.")
+
+    with tempfile.TemporaryDirectory(prefix="sb-creative-pyav-") as tmp_dir:
+        out_mp4 = os.path.join(tmp_dir, "output.mp4")
+        container = av.open(out_mp4, mode="w", format="mp4", options={"movflags": "+faststart"})
+        try:
+            stream = container.add_stream("libx264", rate=max(1, int(fps)))
+            stream.width = int(width)
+            stream.height = int(height)
+            stream.pix_fmt = "yuv420p"
+            stream.options = {"crf": "23", "preset": "veryfast"}
+            for frame in frames:
+                rgb = Image.frombytes("RGB", frame.size, frame.convert("RGB").tobytes())
+                if rgb.size != (width, height):
+                    rgb = rgb.resize((width, height), Image.Resampling.LANCZOS)
+                vframe = av.VideoFrame.from_image(rgb)
+                for packet in stream.encode(vframe):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+        finally:
+            container.close()
+        mp4_bytes = Path(out_mp4).read_bytes()
+    info = inspect_mp4_container(mp4_bytes)
+    if info.get("codec_tag") != "avc1":
+        raise CreativeMediaError(f"Unexpected PyAV H.264 codec tag: {info.get('codec_tag')!r}")
     return mp4_bytes
 
 
@@ -2360,6 +2735,239 @@ def _generate_via_comfyui_image(
     )
 
 
+def _probe_comfy_object_info(client: httpx.Client, endpoint_url: str) -> dict[str, object]:
+    """Fetch ComfyUI `/object_info` summary safely to discover installed temporal video nodes."""
+    try:
+        resp = client.get(f"{endpoint_url}/object_info")
+        if resp.status_code == 200 and "location" not in {k.lower() for k in resp.headers.keys()}:
+            parsed = json.loads(resp.content[: 2 * 1024 * 1024].decode("utf-8"))
+            if isinstance(parsed, dict):
+                return parsed
+    except Exception:
+        pass
+    return {}
+
+
+def _build_comfy_video_workflow(
+    *,
+    ckpt_name: str,
+    prompt: str,
+    negative_prompt: str,
+    width: int,
+    height: int,
+    frames: int,
+    fps: int,
+    seed: int,
+    steps: int,
+    cfg_scale: float,
+    object_info: dict[str, object],
+) -> tuple[dict[str, object], str]:
+    """Construct a real temporal ComfyUI video graph (AnimateDiff / SVD / LTXV / LatentMotionChain)."""
+    clamped_steps = max(1, min(100, int(steps)))
+    clamped_cfg = max(1.0, min(30.0, float(cfg_scale)))
+
+    # Path A: AnimateDiff temporal motion module installed
+    for ad_node in ("ADE_AnimateDiffLoaderGen1", "ADE_AnimateDiffLoaderWithContext"):
+        if ad_node in object_info:
+            motion_models = (
+                object_info.get(ad_node, {})
+                .get("input", {})
+                .get("required", {})
+                .get("model_name", [[]])
+            )
+            mm_name = (
+                str(motion_models[0][0])
+                if isinstance(motion_models, list) and motion_models and isinstance(motion_models[0], list) and motion_models[0]
+                else "mm_sd_v15_v2.ckpt"
+            )
+            wf = {
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt_name}},
+                "2": {"class_type": "EmptyLatentImage", "inputs": {"width": int(width), "height": int(height), "batch_size": int(frames)}},
+                "3": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["1", 1]}},
+                "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative_prompt, "clip": ["1", 1]}},
+                "10": {
+                    "class_type": ad_node,
+                    "inputs": {"model": ["1", 0], "model_name": mm_name, "beta_schedule": "autoselect"},
+                },
+                "5": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "seed": int(seed),
+                        "steps": clamped_steps,
+                        "cfg": clamped_cfg,
+                        "sampler_name": "euler",
+                        "scheduler": "normal",
+                        "denoise": 1.0,
+                        "model": ["10", 0],
+                        "positive": ["3", 0],
+                        "negative": ["4", 0],
+                        "latent_image": ["2", 0],
+                    },
+                },
+                "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+                "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": "SecondBrainAnimateDiff", "images": ["6", 0]}},
+            }
+            return wf, "animatediff"
+
+    # Path B: Stable Video Diffusion image-to-video conditioning
+    if "SVD_img2vid_conditioning" in object_info and "ImageOnlyCheckpointLoader" in object_info:
+        wf = {
+            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt_name}},
+            "2": {"class_type": "EmptyLatentImage", "inputs": {"width": int(width), "height": int(height), "batch_size": 1}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["1", 1]}},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative_prompt, "clip": ["1", 1]}},
+            "5": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": int(seed),
+                    "steps": clamped_steps,
+                    "cfg": clamped_cfg,
+                    "sampler_name": "euler",
+                    "scheduler": "normal",
+                    "denoise": 1.0,
+                    "model": ["1", 0],
+                    "positive": ["3", 0],
+                    "negative": ["4", 0],
+                    "latent_image": ["2", 0],
+                },
+            },
+            "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+            "11": {"class_type": "ImageOnlyCheckpointLoader", "inputs": {"ckpt_name": "svd_xt.safetensors"}},
+            "12": {
+                "class_type": "SVD_img2vid_conditioning",
+                "inputs": {
+                    "clip_vision": ["11", 1],
+                    "init_image": ["6", 0],
+                    "vae": ["11", 2],
+                    "width": int(width),
+                    "height": int(height),
+                    "video_frames": int(frames),
+                    "motion_bucket_id": 127,
+                    "fps": max(1, int(fps)),
+                    "augmentation_level": 0.0,
+                },
+            },
+            "13": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": int(seed) + 1,
+                    "steps": clamped_steps,
+                    "cfg": min(clamped_cfg, 3.0),
+                    "sampler_name": "euler",
+                    "scheduler": "karras",
+                    "denoise": 1.0,
+                    "model": ["11", 0],
+                    "positive": ["12", 0],
+                    "negative": ["12", 1],
+                    "latent_image": ["12", 2],
+                },
+            },
+            "14": {"class_type": "VAEDecode", "inputs": {"samples": ["13", 0], "vae": ["11", 2]}},
+            "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": "SecondBrainSVD", "images": ["14", 0]}},
+        }
+        return wf, "svd_img2vid"
+
+    # Path C: LTXVideo native temporal latent generator
+    if "EmptyLTXVLatentVideo" in object_info:
+        wf = {
+            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt_name}},
+            "2": {
+                "class_type": "EmptyLTXVLatentVideo",
+                "inputs": {"width": int(width), "height": int(height), "length": int(frames), "batch_size": 1},
+            },
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["1", 1]}},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative_prompt, "clip": ["1", 1]}},
+            "5": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": int(seed),
+                    "steps": clamped_steps,
+                    "cfg": clamped_cfg,
+                    "sampler_name": "euler",
+                    "scheduler": "normal",
+                    "denoise": 1.0,
+                    "model": ["1", 0],
+                    "positive": ["3", 0],
+                    "negative": ["4", 0],
+                    "latent_image": ["2", 0],
+                },
+            },
+            "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+            "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": "SecondBrainLTXV", "images": ["6", 0]}},
+        }
+        return wf, "ltxv"
+
+    # Path D: Stock ComfyUI progressive latent-chained camera-motion graph (`batch_size=1` per keyframe step,
+    # NEVER unchained `EmptyLatentImage(batch_size=frames)` which would produce N unrelated random stills!)
+    wf_chain: dict[str, object] = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt_name}},
+        "2": {"class_type": "EmptyLatentImage", "inputs": {"width": int(width), "height": int(height), "batch_size": 1}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["1", 1]}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": negative_prompt, "clip": ["1", 1]}},
+        "5": {
+            "class_type": "KSampler",
+            "inputs": {
+                "seed": int(seed),
+                "steps": clamped_steps,
+                "cfg": clamped_cfg,
+                "sampler_name": "euler",
+                "scheduler": "normal",
+                "denoise": 1.0,
+                "model": ["1", 0],
+                "positive": ["3", 0],
+                "negative": ["4", 0],
+                "latent_image": ["2", 0],
+            },
+        },
+        "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": "SecondBrainMotion_000", "images": ["6", 0]}},
+    }
+    prev_latent_id = "5"
+    step_crop_w = max(64, (int(width * 0.96) // 8) * 8)
+    step_crop_h = max(64, (int(height * 0.96) // 8) * 8)
+    next_id = 20
+    for idx in range(1, min(int(frames), HARD_MAX_FRAMES)):
+        crop_id = str(next_id)
+        upscale_id = str(next_id + 1)
+        samp_id = str(next_id + 2)
+        dec_id = str(next_id + 3)
+        save_id = str(next_id + 4)
+        next_id += 5
+
+        pan_x = (idx * 8) % max(8, width - step_crop_w + 8)
+        pan_y = (idx * 8) % max(8, height - step_crop_h + 8)
+        wf_chain[crop_id] = {
+            "class_type": "LatentCrop",
+            "inputs": {"samples": [prev_latent_id, 0], "width": step_crop_w, "height": step_crop_h, "x": pan_x, "y": pan_y},
+        }
+        wf_chain[upscale_id] = {
+            "class_type": "LatentUpscale",
+            "inputs": {"samples": [crop_id, 0], "upscale_method": "bilinear", "width": int(width), "height": int(height), "crop": "disabled"},
+        }
+        wf_chain[samp_id] = {
+            "class_type": "KSampler",
+            "inputs": {
+                "seed": int(seed) + idx,
+                "steps": max(4, min(clamped_steps, 12)),
+                "cfg": clamped_cfg,
+                "sampler_name": "euler",
+                "scheduler": "normal",
+                "denoise": 0.22,
+                "model": ["1", 0],
+                "positive": ["3", 0],
+                "negative": ["4", 0],
+                "latent_image": [upscale_id, 0],
+            },
+        }
+        wf_chain[dec_id] = {"class_type": "VAEDecode", "inputs": {"samples": [samp_id, 0], "vae": ["1", 2]}}
+        wf_chain[save_id] = {
+            "class_type": "SaveImage",
+            "inputs": {"filename_prefix": f"SecondBrainMotion_{idx:03d}", "images": [dec_id, 0]},
+        }
+        prev_latent_id = samp_id
+    return wf_chain, "latent_motion_chain"
+
+
 def _generate_via_comfyui_video(
     *,
     endpoint_url: str,
@@ -2379,20 +2987,27 @@ def _generate_via_comfyui_video(
     poll_interval: float,
     max_polls: int,
     transport: httpx.BaseTransport | None,
+    ffmpeg_exe: str | None = None,
+    prefer_ffmpeg: bool = False,
+    allow_pyav: bool = True,
 ) -> tuple[bytes, int, str]:
-    """Execute local ComfyUI video/multi-frame workflow and sanitize outputs into `.mp4` or `.gif`."""
+    """Execute temporal ComfyUI video workflow and sanitize outputs into H.264 `.mp4` or `.gif`."""
+    del jpeg_quality
     with _open_loopback_client(timeout=timeout, transport=transport) as client:
         ckpt = _select_comfy_checkpoint(client, endpoint_url, model_name)
-    workflow = _build_comfy_workflow(
+        object_info = _probe_comfy_object_info(client, endpoint_url)
+    workflow, temporal_mode = _build_comfy_video_workflow(
         ckpt_name=ckpt,
         prompt=prompt,
         negative_prompt=negative_prompt,
         width=width,
         height=height,
-        batch_size=frames,
+        frames=frames,
+        fps=fps,
         seed=seed,
         steps=steps,
         cfg_scale=cfg_scale,
+        object_info=object_info,
     )
     assets = _submit_and_collect_comfy_outputs(
         endpoint_url=endpoint_url,
@@ -2406,7 +3021,8 @@ def _generate_via_comfyui_video(
     first_name, first_bytes = assets[0]
     if first_name.endswith(".mp4") and output_format == "mp4":
         info = inspect_mp4_container(first_bytes)
-        return (first_bytes, max(2, int(info.get("sample_count") or frames)), "comfyui_mp4_verified")
+        if info.get("browser_playable"):
+            return (first_bytes, max(2, int(info.get("sample_count") or frames)), f"comfyui_{temporal_mode}_mp4")
 
     decoded_frames: list[Image.Image] = []
     if first_name.endswith(".gif"):
@@ -2434,18 +3050,39 @@ def _generate_via_comfyui_video(
         raise CreativeMediaError("ComfyUI video workflow returned fewer than 2 frames.")
 
     if output_format == "gif":
-        return (_encode_frames_to_gif(decoded_frames, fps=fps), len(decoded_frames), "pillow_gif")
-    return (
-        _encode_frames_to_mjpeg_mp4(
-            decoded_frames,
-            width=width,
-            height=height,
-            fps=fps,
-            jpeg_quality=jpeg_quality,
-        ),
-        len(decoded_frames),
-        "iso_bmff_mjpeg_pure_python",
+        return (_encode_frames_to_gif(decoded_frames, fps=fps), len(decoded_frames), f"comfyui_{temporal_mode}_pillow_gif")
+    mp4_bytes, mp4_enc = _encode_frames_to_mp4(
+        decoded_frames,
+        width=width,
+        height=height,
+        fps=fps,
+        ffmpeg_exe=ffmpeg_exe,
+        prefer_ffmpeg=prefer_ffmpeg,
+        allow_pyav=allow_pyav,
     )
+    return (mp4_bytes, len(decoded_frames), f"comfyui_{temporal_mode}_{mp4_enc}")
+
+
+def _resolve_validated_diffusers_model(model_name: str | None, *, media_type: str = "image") -> str:
+    env_key = "BRAIN_DIFFUSERS_VIDEO_MODEL" if media_type == "video" else "BRAIN_DIFFUSERS_MODEL"
+    candidates = [
+        model_name,
+        os.environ.get(env_key) if media_type == "video" else None,
+        os.environ.get("BRAIN_DIFFUSERS_MODEL"),
+    ]
+    model_id = next((str(c).strip() for c in candidates if c and str(c).strip()), "")
+    if not model_id:
+        cached = _discover_local_diffusers_models(media_type=media_type)
+        model_id = cached[0] if cached else ""
+    if not model_id:
+        raise CreativeMediaError(
+            "diffusers_local requires a locally cached model path or repo ID via model_name or BRAIN_DIFFUSERS_MODEL."
+        )
+    if model_id.lower().startswith(("http://", "https://", "ftp://", "file://")):
+        raise CreativeMediaSecurityError("diffusers_local forbids remote HTTP/HTTPS model URLs.")
+    if model_id.startswith(("\\\\", "//")) or ".." in model_id or not _SAFE_CHECKPOINT_RE.fullmatch(model_id):
+        raise CreativeMediaSecurityError(f"diffusers_local rejected unsafe or UNC model identifier: {model_id!r}")
+    return model_id
 
 
 def _generate_via_diffusers_local(
@@ -2461,16 +3098,8 @@ def _generate_via_diffusers_local(
     output_format: str,
     gpu_backend: str,
 ) -> bytes:
-    """Strictly offline local HuggingFace `diffusers` pipeline (`local_files_only=True`)."""
-    model_id = str(model_name or os.environ.get("BRAIN_DIFFUSERS_MODEL") or "").strip()
-    if not model_id:
-        raise CreativeMediaError(
-            "diffusers_local requires a locally cached model path or repo ID via model_name or BRAIN_DIFFUSERS_MODEL."
-        )
-    if model_id.lower().startswith(("http://", "https://", "ftp://", "file://")):
-        raise CreativeMediaSecurityError("diffusers_local forbids remote HTTP/HTTPS model URLs.")
-    if model_id.startswith(("\\\\", "//")) or ".." in model_id or not _SAFE_CHECKPOINT_RE.fullmatch(model_id):
-        raise CreativeMediaSecurityError(f"diffusers_local rejected unsafe or UNC model identifier: {model_id!r}")
+    """Strictly offline local HuggingFace `diffusers` image pipeline (`local_files_only=True`)."""
+    model_id = _resolve_validated_diffusers_model(model_name, media_type="image")
 
     try:
         import torch  # type: ignore[import-not-found]
@@ -2507,6 +3136,141 @@ def _generate_via_diffusers_local(
     )
 
 
+def _generate_via_diffusers_video(
+    *,
+    prompt: str,
+    negative_prompt: str,
+    model_name: str | None,
+    width: int,
+    height: int,
+    frames: int,
+    fps: int,
+    seed: int,
+    steps: int,
+    cfg_scale: float,
+    output_format: str,
+    gpu_backend: str,
+    ffmpeg_exe: str | None = None,
+    prefer_ffmpeg: bool = False,
+    allow_pyav: bool = True,
+) -> tuple[bytes, int, str]:
+    """Strictly offline local HuggingFace `diffusers` video synthesis (`local_files_only=True`)."""
+    model_id = _resolve_validated_diffusers_model(model_name, media_type="video")
+
+    try:
+        import torch  # type: ignore[import-not-found]
+        import diffusers  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise CreativeMediaError("Local 'diffusers' and 'torch' packages are not installed.") from exc
+
+    device = "cuda" if gpu_backend == "cuda" and torch.cuda.is_available() else (
+        "mps" if gpu_backend == "metal" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"
+    )
+    dtype = torch.float16 if device in {"cuda", "mps"} else torch.float32
+    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+    clamped_steps = max(1, min(80, int(steps)))
+
+    raw_frames: list[Image.Image] = []
+    mode_tag = "diffusers_video"
+
+    # Prefer native temporal video pipelines if installed & matching the checkpoint
+    text_to_video_cls = getattr(diffusers, "TextToVideoSDPipeline", None)
+    if text_to_video_cls is not None:
+        try:
+            vpipe = text_to_video_cls.from_pretrained(model_id, local_files_only=True, torch_dtype=dtype)
+            vpipe = vpipe.to(device)
+            vout = vpipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt or None,
+                width=int(width),
+                height=int(height),
+                num_frames=int(frames),
+                num_inference_steps=clamped_steps,
+                guidance_scale=float(cfg_scale),
+                generator=gen,
+            )
+            seq = getattr(vout, "frames", None) or getattr(vout, "images", None) or []
+            if seq and isinstance(seq[0], list):
+                seq = seq[0]
+            for item in list(seq)[:HARD_MAX_FRAMES]:
+                if isinstance(item, Image.Image):
+                    raw_frames.append(item.convert("RGB"))
+            if raw_frames:
+                mode_tag = "diffusers_t2v"
+        except Exception:
+            raw_frames = []
+
+    if not raw_frames:
+        auto_img_cls = getattr(diffusers, "AutoPipelineForText2Image", None)
+        if auto_img_cls is None:
+            raise CreativeMediaError("Diffusers installation lacks TextToVideoSDPipeline and AutoPipelineForText2Image.")
+        ipipe = auto_img_cls.from_pretrained(model_id, local_files_only=True, torch_dtype=dtype)
+        ipipe = ipipe.to(device)
+        out = ipipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt or None,
+            width=int(width),
+            height=int(height),
+            num_inference_steps=clamped_steps,
+            guidance_scale=float(cfg_scale),
+            generator=gen,
+        )
+        keyframe = out.images[0].convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+        # Try image-to-image sequential camera-motion conditioning when AutoPipelineForImage2Image exists
+        img2img_cls = getattr(diffusers, "AutoPipelineForImage2Image", None)
+        img2img_pipe = None
+        if img2img_cls is not None:
+            try:
+                img2img_pipe = img2img_cls.from_pipe(ipipe)
+            except Exception:
+                img2img_pipe = None
+        raw_frames.append(keyframe)
+        prev_im = keyframe
+        crop_w = max(64, int(width * 0.94))
+        crop_h = max(64, int(height * 0.94))
+        for idx in range(1, int(frames)):
+            t = idx / float(max(1, frames - 1))
+            dx = int((width - crop_w) * 0.5 * (1.0 + math.sin(math.pi * t - 0.5 * math.pi)))
+            dy = int((height - crop_h) * 0.5 * (1.0 + math.cos(math.pi * t)))
+            warped = prev_im.crop((dx, dy, dx + crop_w, dy + crop_h)).resize((width, height), Image.Resampling.BICUBIC)
+            if img2img_pipe is not None:
+                step_gen = torch.Generator(device="cpu").manual_seed(int(seed) + idx)
+                step_out = img2img_pipe(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt or None,
+                    image=warped,
+                    strength=0.22,
+                    num_inference_steps=max(4, min(clamped_steps, 12)),
+                    guidance_scale=float(cfg_scale),
+                    generator=step_gen,
+                )
+                prev_im = step_out.images[0].convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+            else:
+                prev_im = warped
+            raw_frames.append(prev_im)
+        mode_tag = "diffusers_i2i_motion" if img2img_pipe is not None else "diffusers_motion"
+
+    if len(raw_frames) < 2:
+        raise CreativeMediaError("diffusers_local video synthesis produced fewer than 2 frames.")
+
+    clean_frames = [
+        Image.frombytes("RGB", f.size, f.convert("RGB").tobytes()).resize((width, height), Image.Resampling.LANCZOS)
+        for f in raw_frames
+    ]
+    if output_format == "gif":
+        return (_encode_frames_to_gif(clean_frames, fps=fps), len(clean_frames), f"{mode_tag}_pillow_gif")
+    mp4_bytes, mp4_enc = _encode_frames_to_mp4(
+        clean_frames,
+        width=width,
+        height=height,
+        fps=fps,
+        ffmpeg_exe=ffmpeg_exe,
+        prefer_ffmpeg=prefer_ffmpeg,
+        allow_pyav=allow_pyav,
+    )
+    return (mp4_bytes, len(clean_frames), f"{mode_tag}_{mp4_enc}")
+
+
 # ─── Atomic Vault Persistence & Optional Working Note Attachment ─────────────
 
 
@@ -2537,6 +3301,8 @@ def _persist_generated_artifact(
     attach_to_note: bool,
     hardware_tier: str,
     hardware_override_used: bool,
+    degraded_fallback: bool = False,
+    warning: str | None = None,
 ) -> GeneratedMediaArtifact:
     generated_dir = paths["generated_dir"]
     brain_dir = paths["brain_dir"]
@@ -2610,6 +3376,8 @@ def _persist_generated_artifact(
             "attached_note_filename": None,
             "hardware_tier": hardware_tier,
             "hardware_override_used": hardware_override_used,
+            "degraded_fallback": bool(degraded_fallback),
+            "warning": warning,
             "created_at": created_iso,
         }
         atomic_write_bytes(media_path, media_bytes)
@@ -2706,6 +3474,8 @@ def _persist_generated_artifact(
         hardware_tier=hardware_tier,
         hardware_override_used=hardware_override_used,
         created_at=created_iso,
+        degraded_fallback=bool(degraded_fallback),
+        warning=warning,
     )
 
 
@@ -2736,6 +3506,7 @@ def generate_local_image(
     redact_pii: bool = True,
     strict_dlp: bool = True,
     allow_hardware_override: bool = False,
+    allow_procedural_fallback: bool = False,
     policy_path: Path | None = None,
     hardware_profile: HardwareCapabilityProfile | None = None,
     sd_webui_url: str | None = None,
@@ -2798,6 +3569,12 @@ def generate_local_image(
 
     # 3. Hardware Capability Gate & Backend Resolution
     profile = hardware_profile or detect_hardware_profile(use_cache=True)
+    eff_allow_fallback = bool(
+        allow_procedural_fallback
+        or (os.environ.get("BRAIN_MEDIA_ALLOW_PROCEDURAL_FALLBACK") or "").strip() == "1"
+    )
+    degraded_fallback = False
+    fallback_warning: str | None = None
     try:
         if req_backend == "auto":
             base_gate = enforce_creative_hardware_gate(
@@ -2813,8 +3590,33 @@ def generate_local_image(
                 sd_webui_url=validated_sd_url,
                 comfyui_url=validated_comfy_url,
                 http_transport=http_transport,
+                diffusers_model_name=model_name,
             )
             selected_backend = status.recommended_image_backend
+            if selected_backend in {"none", ""}:
+                if eff_allow_fallback:
+                    selected_backend = "builtin_procedural_local"
+                    degraded_fallback = True
+                    fallback_warning = (
+                        "DEGRADED FALLBACK: No local neural image backend was ready "
+                        "(SD WebUI :7860, ComfyUI :8188, and diffusers_local were offline/unconfigured); "
+                        "rendered 2D Pillow procedural card instead."
+                    )
+                    warnings.warn(fallback_warning, RuntimeWarning, stacklevel=2)
+                else:
+                    _append_creative_audit(
+                        paths["audit_path"],
+                        media_type="image",
+                        requested_backend=req_backend,
+                        backend_used="none",
+                        outcome="unavailable_no_neural_backend",
+                        project_scope=norm_scope,
+                        hardware_tier=profile.tier_id,
+                    )
+                    raise CreativeMediaUnavailableError(
+                        "No local neural image backend is ready (checked SD WebUI :7860, ComfyUI :8188, and diffusers_local). "
+                        "Start a local diffusion daemon, set BRAIN_DIFFUSERS_MODEL, or pass backend='builtin_procedural_local' / allow_procedural_fallback=True."
+                    )
             gate_decision = replace(base_gate, backend=selected_backend)
         else:
             daemon_online = False
@@ -2822,6 +3624,11 @@ def generate_local_image(
                 daemon_online, _, _ = _probe_sd_webui_daemon(validated_sd_url, transport=http_transport)
             elif req_backend == "comfyui_local" and profile.tier_id == "tier_2_cpu_balanced":
                 daemon_online, _, _ = _probe_comfyui_daemon(validated_comfy_url, transport=http_transport)
+            elif req_backend == "diffusers_local" and profile.tier_id == "tier_2_cpu_balanced":
+                daemon_online = bool(
+                    _is_diffusers_installed()
+                    and _discover_local_diffusers_models(explicit_model=model_name, media_type="image")
+                )
             gate_decision = enforce_creative_hardware_gate(
                 backend=req_backend,
                 media_type="image",
@@ -2980,6 +3787,8 @@ def generate_local_image(
         attach_to_note=attach_to_note,
         hardware_tier=gate_decision.creative_tier,
         hardware_override_used=gate_decision.hardware_override_used,
+        degraded_fallback=degraded_fallback,
+        warning=fallback_warning,
     )
 
 
@@ -3010,6 +3819,7 @@ def generate_local_video(
     redact_pii: bool = True,
     strict_dlp: bool = True,
     allow_hardware_override: bool = False,
+    allow_procedural_fallback: bool = False,
     policy_path: Path | None = None,
     hardware_profile: HardwareCapabilityProfile | None = None,
     comfyui_url: str | None = None,
@@ -3065,8 +3875,14 @@ def generate_local_video(
         project_scope=norm_scope,
     )
 
-    # 3. Hardware Capability Gate & Backend Resolution
+    # 3. Hardware Capability Gate & Backend Resolution (video)
     profile = hardware_profile or detect_hardware_profile(use_cache=True)
+    eff_allow_fallback = bool(
+        allow_procedural_fallback
+        or (os.environ.get("BRAIN_MEDIA_ALLOW_PROCEDURAL_FALLBACK") or "").strip() == "1"
+    )
+    degraded_fallback = False
+    fallback_warning: str | None = None
     try:
         if req_backend == "auto":
             base_gate = enforce_creative_hardware_gate(
@@ -3084,13 +3900,43 @@ def generate_local_video(
                 comfyui_url=validated_comfy_url,
                 http_transport=http_transport,
                 ffmpeg_path_override=ffmpeg_path_override,
+                diffusers_model_name=model_name,
             )
             selected_backend = status.recommended_video_backend
+            if selected_backend in {"none", ""}:
+                if eff_allow_fallback:
+                    selected_backend = "builtin_procedural_local"
+                    degraded_fallback = True
+                    fallback_warning = (
+                        "DEGRADED FALLBACK: No local neural video backend was ready "
+                        "(ComfyUI :8188 and diffusers_local were offline/unconfigured); "
+                        "rendered 2D Pillow procedural animation instead."
+                    )
+                    warnings.warn(fallback_warning, RuntimeWarning, stacklevel=2)
+                else:
+                    _append_creative_audit(
+                        paths["audit_path"],
+                        media_type="video",
+                        requested_backend=req_backend,
+                        backend_used="none",
+                        outcome="unavailable_no_neural_backend",
+                        project_scope=norm_scope,
+                        hardware_tier=profile.tier_id,
+                    )
+                    raise CreativeMediaUnavailableError(
+                        "No local neural video backend is ready (checked ComfyUI :8188 and diffusers_local). "
+                        "Start ComfyUI, set BRAIN_DIFFUSERS_MODEL / BRAIN_DIFFUSERS_VIDEO_MODEL, or pass backend='builtin_procedural_local' / allow_procedural_fallback=True."
+                    )
             gate_decision = replace(base_gate, backend=selected_backend)
         else:
             daemon_online = False
             if req_backend == "comfyui_local" and profile.tier_id == "tier_2_cpu_balanced":
                 daemon_online, _, _ = _probe_comfyui_daemon(validated_comfy_url, transport=http_transport)
+            elif req_backend == "diffusers_local" and profile.tier_id == "tier_2_cpu_balanced":
+                daemon_online = bool(
+                    _is_diffusers_installed()
+                    and _discover_local_diffusers_models(explicit_model=model_name, media_type="video")
+                )
             gate_decision = enforce_creative_hardware_gate(
                 backend=req_backend,
                 media_type="video",
@@ -3135,6 +3981,7 @@ def generate_local_video(
         pii_count += extra_pii
 
     eff_seed = _derive_seed(sanitized_prompt, seed)
+    explicit_no_ffmpeg = ffmpeg_path_override is not None and not ffmpeg_path_override.strip()
     ffmpeg_exe = (
         (ffmpeg_path_override.strip() or None)
         if ffmpeg_path_override is not None
@@ -3167,6 +4014,33 @@ def generate_local_video(
             poll_interval=comfy_poll_interval,
             max_polls=comfy_max_polls,
             transport=http_transport,
+            ffmpeg_exe=ffmpeg_exe,
+            prefer_ffmpeg=prefer_ffmpeg,
+            allow_pyav=(not explicit_no_ffmpeg),
+        )
+    elif selected_backend == "diffusers_local":
+        neural_prompt = _compose_neural_prompt(
+            sanitized_prompt,
+            style=clean_style,
+            title=sanitized_title,
+            grounded_claims=grounded_claims,
+        )
+        video_bytes, actual_frames, encoder_used = _generate_via_diffusers_video(
+            prompt=neural_prompt,
+            negative_prompt=sanitized_neg,
+            model_name=model_name,
+            width=width,
+            height=height,
+            frames=frames,
+            fps=fps,
+            seed=eff_seed,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            output_format=clean_fmt,
+            gpu_backend=profile.gpu_backend,
+            ffmpeg_exe=ffmpeg_exe,
+            prefer_ffmpeg=prefer_ffmpeg,
+            allow_pyav=(not explicit_no_ffmpeg),
         )
     elif selected_backend in {"builtin_procedural_local", "ffmpeg_slideshow_local"}:
         supersample = 2 if max(width, height) <= 768 else 1
@@ -3191,53 +4065,16 @@ def generate_local_video(
         if clean_fmt == "gif":
             video_bytes = _encode_frames_to_gif(rendered_frames, fps=fps)
             encoder_used = "pillow_gif"
-        elif selected_backend == "ffmpeg_slideshow_local":
-            if ffmpeg_exe and os.path.isfile(ffmpeg_exe):
-                video_bytes = _encode_frames_with_ffmpeg(
-                    rendered_frames,
-                    ffmpeg_exe=ffmpeg_exe,
-                    width=width,
-                    height=height,
-                    fps=fps,
-                )
-                encoder_used = "ffmpeg_libx264"
-            else:
-                video_bytes = _encode_frames_to_mjpeg_mp4(
-                    rendered_frames,
-                    width=width,
-                    height=height,
-                    fps=fps,
-                    jpeg_quality=jpeg_quality,
-                )
-                encoder_used = "iso_bmff_mjpeg_pure_python"
-        elif prefer_ffmpeg and ffmpeg_exe and os.path.isfile(ffmpeg_exe):
-            try:
-                video_bytes = _encode_frames_with_ffmpeg(
-                    rendered_frames,
-                    ffmpeg_exe=ffmpeg_exe,
-                    width=width,
-                    height=height,
-                    fps=fps,
-                )
-                encoder_used = "ffmpeg_libx264"
-            except CreativeMediaError:
-                video_bytes = _encode_frames_to_mjpeg_mp4(
-                    rendered_frames,
-                    width=width,
-                    height=height,
-                    fps=fps,
-                    jpeg_quality=jpeg_quality,
-                )
-                encoder_used = "iso_bmff_mjpeg_pure_python"
         else:
-            video_bytes = _encode_frames_to_mjpeg_mp4(
+            video_bytes, encoder_used = _encode_frames_to_mp4(
                 rendered_frames,
                 width=width,
                 height=height,
                 fps=fps,
-                jpeg_quality=jpeg_quality,
+                ffmpeg_exe=ffmpeg_exe if not explicit_no_ffmpeg else None,
+                prefer_ffmpeg=bool(prefer_ffmpeg or selected_backend == "ffmpeg_slideshow_local"),
+                allow_pyav=(not explicit_no_ffmpeg),
             )
-            encoder_used = "iso_bmff_mjpeg_pure_python"
     else:  # pragma: no cover
         raise CreativeMediaHardwareGateError(f"Unsupported video backend: {selected_backend!r}")
 
@@ -3267,6 +4104,8 @@ def generate_local_video(
         attach_to_note=attach_to_note,
         hardware_tier=gate_decision.creative_tier,
         hardware_override_used=gate_decision.hardware_override_used,
+        degraded_fallback=degraded_fallback,
+        warning=fallback_warning,
     )
 
 
@@ -3435,6 +4274,8 @@ def main(argv: list[str] | None = None) -> int:
     img_p.add_argument("--project", default=None)
     img_p.add_argument("--attach-to-note", action="store_true")
     img_p.add_argument("--allow-hardware-override", action="store_true")
+    img_p.add_argument("--allow-procedural-fallback", action="store_true")
+    img_p.add_argument("--model", dest="model_name", default=None)
     img_p.add_argument("--brain-dir", default=None)
 
     vid_p = sub.add_parser("video", help="Generate a local MP4 or GIF video under brain/sources/generated/.")
@@ -3452,6 +4293,8 @@ def main(argv: list[str] | None = None) -> int:
     vid_p.add_argument("--project", default=None)
     vid_p.add_argument("--attach-to-note", action="store_true")
     vid_p.add_argument("--allow-hardware-override", action="store_true")
+    vid_p.add_argument("--allow-procedural-fallback", action="store_true")
+    vid_p.add_argument("--model", dest="model_name", default=None)
     vid_p.add_argument("--brain-dir", default=None)
 
     list_p = sub.add_parser("list", help="List generated creative media artifacts.")
@@ -3486,10 +4329,12 @@ def main(argv: list[str] | None = None) -> int:
             height=args.height,
             seed=args.seed,
             title=args.title,
+            model_name=args.model_name,
             ground_in_vault=args.ground_in_vault,
             project_scope=args.project,
             attach_to_note=args.attach_to_note,
             allow_hardware_override=args.allow_hardware_override,
+            allow_procedural_fallback=args.allow_procedural_fallback,
         )
         print(json.dumps(art.as_dict(), indent=2, sort_keys=True))
         return 0
@@ -3507,10 +4352,12 @@ def main(argv: list[str] | None = None) -> int:
             fps=args.fps,
             seed=args.seed,
             title=args.title,
+            model_name=args.model_name,
             ground_in_vault=args.ground_in_vault,
             project_scope=args.project,
             attach_to_note=args.attach_to_note,
             allow_hardware_override=args.allow_hardware_override,
+            allow_procedural_fallback=args.allow_procedural_fallback,
         )
         print(json.dumps(art.as_dict(), indent=2, sort_keys=True))
         return 0

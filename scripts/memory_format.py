@@ -123,9 +123,16 @@ def evaluate_temporal_validity(
 
     Returns ``{"status": "active"|"expired"|"not_yet_valid"|"invalid_window", "active": bool, ...}``.
     """
+    vf_raw = str(valid_from or "").strip() if valid_from else ""
+    vu_raw = str(valid_until or "").strip() if valid_until else ""
+    if not vf_raw and not vu_raw and as_of is None:
+        return {
+            "status": "active",
+            "active": True,
+            "valid_from": "",
+            "valid_until": "",
+        }
     ref_dt = _resolve_as_of_utc(as_of)
-    vf_raw = str(valid_from or "").strip()
-    vu_raw = str(valid_until or "").strip()
     try:
         start_dt = parse_temporal_bound(vf_raw, is_end=False) if vf_raw else None
         end_dt = parse_temporal_bound(vu_raw, is_end=True) if vu_raw else None
@@ -189,17 +196,133 @@ def temporal_windows_overlap(
 
 
 def markdown_blocks(text: str) -> list[str]:
-    """Return fenced markdown blocks, or the raw text if no fences exist."""
-    blocks = [match.group(1).strip() for match in CODE_BLOCK_RE.finditer(text or "")]
+    """Return fenced markdown blocks, supporting nested code fences and inline prefixing."""
+    lines = (text or "").splitlines(keepends=True)
+    blocks: list[str] = []
+    in_block = False
+    fence_char = ""
+    fence_len = 0
+    inner_depth = 0
+    current_lines: list[str] = []
+
+    for line in lines:
+        if not in_block:
+            m = re.search(r"([`~]{3,})(.*)$", line)
+            if m:
+                chars, info = m.group(1), m.group(2).strip().lower()
+                clean_info = re.sub(r"[^a-z0-9_-].*$", "", info)
+                if clean_info in {"markdown", "md", ""}:
+                    in_block = True
+                    fence_char = chars[0]
+                    fence_len = len(chars)
+                    inner_depth = 0
+                    current_lines = []
+                    continue
+        else:
+            m_close = re.match(r"^\s*([`~]{3,})\s*$", line)
+            if m_close and m_close.group(1)[0] == fence_char and len(m_close.group(1)) >= fence_len:
+                if inner_depth > 0:
+                    inner_depth -= 1
+                    current_lines.append(line)
+                else:
+                    b = "".join(current_lines).strip()
+                    if b:
+                        blocks.append(b)
+                    in_block = False
+                    current_lines = []
+                continue
+
+            m_inner = re.match(r"^\s*([`~]{3,})\s*([a-zA-Z0-9_-]+)", line)
+            if m_inner:
+                inner_depth += 1
+                current_lines.append(line)
+                continue
+
+            current_lines.append(line)
+
+    if in_block and current_lines:
+        b = "".join(current_lines).strip()
+        if b:
+            blocks.append(b)
+
     if blocks:
-        return [block for block in blocks if block]
+        return blocks
 
     stripped = (text or "").strip()
     return [stripped] if stripped else []
 
 
+def parse_memory_blocks(text: str) -> list[str]:
+    """Extract fenced memory documents, gracefully handling unlabelled inner code blocks."""
+    lines = (text or "").splitlines(keepends=True)
+    blocks: list[str] = []
+    in_block = False
+    inner_code_fence = False
+    current_lines: list[str] = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not in_block:
+            if re.search(r"```(?:markdown|md)?\s*$", stripped, re.IGNORECASE):
+                has_fm = any(lines[j].strip() == "---" or "## Claim" in lines[j] for j in range(i + 1, min(i + 8, len(lines))))
+                if has_fm:
+                    in_block = True
+                    inner_code_fence = False
+                    current_lines = []
+                    continue
+        else:
+            if re.match(r"^```\s*$", stripped):
+                cur_text = "".join(current_lines)
+                has_all_sections = "## Claim" in cur_text and "## Evidence" in cur_text and "## Why It Matters" in cur_text
+
+                next_non_empty = ""
+                for j in range(i + 1, len(lines)):
+                    if lines[j].strip():
+                        next_non_empty = lines[j].strip()
+                        break
+
+                is_boundary = (
+                    not next_non_empty
+                    or "<!-- MEMORY_BOUNDARY -->" in next_non_empty
+                    or re.search(r"```(?:markdown|md)?", next_non_empty, re.IGNORECASE)
+                    or next_non_empty.startswith("---")
+                    or next_non_empty.startswith("#")
+                )
+
+                if has_all_sections and (is_boundary or inner_code_fence):
+                    b = "".join(current_lines).strip()
+                    if b:
+                        blocks.append(b)
+                    in_block = False
+                    inner_code_fence = False
+                    current_lines = []
+                    continue
+                else:
+                    inner_code_fence = not inner_code_fence
+                    current_lines.append(line)
+                    continue
+
+            elif re.match(r"^```[a-zA-Z0-9_-]+\s*$", stripped):
+                inner_code_fence = True
+                current_lines.append(line)
+                continue
+
+            current_lines.append(line)
+
+    if in_block and current_lines:
+        b = "".join(current_lines).strip()
+        if b:
+            blocks.append(b)
+
+    return blocks
+
+
 def split_memory_candidates(text: str) -> list[str]:
     """Split one model output into candidate memory documents."""
+    mem_blocks = parse_memory_blocks(text)
+    if mem_blocks:
+        return mem_blocks
+
     candidates = []
     for block in markdown_blocks(text):
         for part in BOUNDARY_RE.split(block):
@@ -472,9 +595,40 @@ def is_memory_document(content: str) -> bool:
     if parsed is None:
         return False
 
-    _, body = parsed
+    frontmatter, body = parsed
+    id_val = frontmatter_value(frontmatter, "id")
+    if not id_val or id_val.strip().upper() in {"NONE", "NULL"}:
+        return False
+
     body_text = "\n".join(body).lstrip()
-    return body_text.startswith("## Claim") and "## Evidence" in body_text
+    if not (body_text.startswith("## Claim") and "## Evidence" in body_text):
+        return False
+
+    # Check evidence section is not empty
+    ev_idx = body_text.find("## Evidence")
+    after_ev = body_text[ev_idx + len("## Evidence"):].lstrip()
+    next_sec = re.search(r"^##\s+", after_ev, re.MULTILINE)
+    ev_content = (after_ev[:next_sec.start()] if next_sec else after_ev).strip()
+    if not ev_content or len(ev_content) < 5:
+        return False
+
+    # Check claim section is not empty
+    claim_idx = body_text.find("## Claim")
+    after_claim = body_text[claim_idx + len("## Claim"):ev_idx].strip()
+    if not after_claim or len(after_claim) < 5:
+        return False
+
+    # Reject blatant dummy placeholders
+    dummy_patterns = {
+        "a single clear asserting claim sentence",
+        "this chunk contains only boilerplate",
+        "exact quote copied verbatim from raw capture",
+        "no standalone durable claim exists in this chunk",
+    }
+    if after_claim.lower().rstrip(".;:") in dummy_patterns or ev_content.lower().rstrip(".;:") in dummy_patterns:
+        return False
+
+    return True
 
 
 def extract_memory_documents(

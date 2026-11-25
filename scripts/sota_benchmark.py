@@ -141,8 +141,7 @@ def _content_stems(text: str) -> set[str]:
     }
 
 
-def _deterministic_dense_embed(text: str, *, dim: int = _DENSE_DIM) -> list[float]:
-    """Deterministic L2-normalized signed feature-hash dense embedding for offline ChromaDB HNSW runs."""
+def _extract_semantic_text(text: str) -> str:
     raw = str(text or "")
     if raw.lstrip().startswith("---"):
         parsed = split_frontmatter(raw)
@@ -150,42 +149,149 @@ def _deterministic_dense_embed(text: str, *, dim: int = _DENSE_DIM) -> list[floa
             body = "\n".join(parsed[1])
             claim_part = section_text(body, "Claim")
             ev_part = section_text(body, "Evidence")
-            raw = f"{claim_part}\n{ev_part}" if (claim_part or ev_part) else body
+            return f"{claim_part}\n{ev_part}" if (claim_part or ev_part) else body
+    return raw
 
-    raw_tokens = [
-        tok
-        for tok in _TOKEN_RE.findall(raw.lower())
-        if tok not in QUERY_STOP_WORDS and tok not in {"claim", "evidence"}
-    ]
-    if not raw_tokens:
-        vec = [0.0] * dim
-        vec[0] = 1.0
+
+class _SvdTfidfSemanticEmbedder:
+    """Dense continuous Truncated-SVD TF-IDF semantic embedder (no Blake2b/feature hashing)."""
+
+    def __init__(self, corpus_texts: list[str], *, dim: int = 128) -> None:
+        import numpy as np
+
+        self._np = np
+        doc_counters = [self._featurize(txt) for txt in corpus_texts]
+        df_counts: Counter[str] = Counter()
+        for cnt in doc_counters:
+            for feat in cnt:
+                df_counts[feat] += 1
+
+        max_vocab = 4096
+        ranked_vocab = sorted(df_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:max_vocab]
+        self._vocab: dict[str, int] = {feat: idx for idx, (feat, _) in enumerate(ranked_vocab)}
+        self._dim = min(dim, max(1, len(corpus_texts)), max(1, len(self._vocab)))
+        if not self._vocab or not doc_counters:
+            self._idf = np.ones((1,), dtype=np.float64)
+            self._components = np.eye(1, dtype=np.float64)
+            self._dim = 1
+            return
+
+        n_docs = len(doc_counters)
+        n_terms = len(self._vocab)
+        self._idf = np.ones((n_terms,), dtype=np.float64)
+        for feat, idx in self._vocab.items():
+            self._idf[idx] = math.log((1.0 + n_docs) / (1.0 + df_counts[feat])) + 1.0
+
+        mat = self._vectorize_counters(doc_counters)
+        _u, s, vt = np.linalg.svd(mat, full_matrices=False)
+        nonzero = int(np.sum(s > 1e-8))
+        k = max(1, min(dim, nonzero if nonzero > 0 else len(s)))
+        self._components = np.ascontiguousarray(vt[:k], dtype=np.float64)
+        self._dim = int(self._components.shape[0])
+        self._cache: dict[str, list[float]] = {}
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @staticmethod
+    def _featurize(text: str) -> Counter[str]:
+        clean = _extract_semantic_text(text)
+        raw_tokens = [
+            tok
+            for tok in _TOKEN_RE.findall(clean.lower())
+            if tok not in QUERY_STOP_WORDS and tok not in {"claim", "evidence"}
+        ]
+        feats: Counter[str] = Counter()
+        for idx, tok in enumerate(raw_tokens):
+            boost = 2.0 if ("_" in tok or any(ch.isdigit() for ch in tok)) else (1.3 if len(tok) >= 8 else 1.0)
+            feats[f"w:{tok}"] += boost
+            feats[f"s:{_light_stem(tok)}"] += 1.4 * boost
+            if idx + 1 < len(raw_tokens):
+                feats[f"b:{tok}_{raw_tokens[idx + 1]}"] += 0.75
+            if len(tok) >= 5:
+                for pos in range(0, min(len(tok) - 3, 12)):
+                    feats[f"c:{tok[pos : pos + 4]}"] += 0.35
+        return feats
+
+    def _vectorize_counters(self, counters: list[Counter[str]]):
+        np = self._np
+        n_terms = max(1, len(self._vocab))
+        mat = np.zeros((len(counters), n_terms), dtype=np.float64)
+        for row_idx, cnt in enumerate(counters):
+            for feat, tf_val in cnt.items():
+                col_idx = self._vocab.get(feat)
+                if col_idx is not None and tf_val > 0:
+                    mat[row_idx, col_idx] = (1.0 + math.log(float(tf_val))) * self._idf[col_idx]
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        norms[norms == 0.0] = 1.0
+        return mat / norms
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        np = self._np
+        if not self._vocab:
+            return [[1.0] + [0.0] * (self._dim - 1) for _ in texts]
+        counters = [self._featurize(t) for t in texts]
+        mat = self._vectorize_counters(counters)
+        proj = mat @ self._components.T
+        norms = np.linalg.norm(proj, axis=1, keepdims=True)
+        out: list[list[float]] = []
+        for row_idx in range(len(texts)):
+            norm_val = float(norms[row_idx, 0])
+            if norm_val <= 1e-12:
+                vec = [0.0] * self._dim
+                vec[0] = 1.0
+                out.append(vec)
+            else:
+                normed = proj[row_idx] / norm_val
+                out.append([round(float(x), 7) for x in normed])
+        return out
+
+    def embed(self, text: str) -> list[float]:
+        key = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        vec = self.embed_batch([text])[0]
+        if len(self._cache) < 4096:
+            self._cache[key] = vec
         return vec
 
-    tf = Counter(raw_tokens)
-    vec = [0.0] * dim
-    for tok, cnt in tf.items():
-        base_w = 1.0 + math.log(cnt)
-        if "_" in tok or any(ch.isdigit() for ch in tok):
-            base_w *= 2.4
-        elif len(tok) >= 8:
-            base_w *= 1.35
 
-        stem = _light_stem(tok)
-        features = ((f"s:{stem}", base_w), (f"t:{tok}", base_w * 0.65))
-        for feat, w in features:
-            digest = hashlib.blake2b(feat.encode("utf-8"), digest_size=8).digest()
-            h1 = int.from_bytes(digest[:4], "little")
-            h2 = int.from_bytes(digest[4:], "little")
-            idx1 = h1 % dim
-            idx2 = h2 % dim
-            s1 = 1.0 if (h1 & 0x80000000) == 0 else -1.0
-            s2 = 1.0 if (h2 & 0x80000000) == 0 else -1.0
-            vec[idx1] += s1 * w
-            vec[idx2] += s2 * (w * 0.5)
+def _batch_ollama_embed(texts: list[str], *, model: str = EMBED_MODEL, chunk_size: int = 32) -> list[list[float]]:
+    """Batch-embed texts via local Ollama `/api/embed` while honoring monkeypatches and host policies."""
+    if not texts:
+        return []
+    import ollama
 
-    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [round(v / norm, 7) for v in vec]
+    if getattr(ollama, "Client", None) is None or ollama_utils._is_monkeypatched_ollama_fn(
+        ollama.embed, ollama_utils._DEFAULT_OLLAMA_EMBED
+    ):
+        return [ollama_utils.embed_text(txt, model=model) for txt in texts]
+
+    rule, base_url = ollama_utils._resolve_local_ollama_rule_and_url()
+    sanitized: list[str] = []
+    for txt in texts:
+        outbound = txt
+        if rule.redact_pii or rule.fail_on_secret_detection:
+            report, _ = ollama_utils._redact_outbound_with_map(
+                txt,
+                redact_pii=rule.redact_pii,
+                fail_on_secret_detection=rule.fail_on_secret_detection,
+            )
+            outbound = report.sanitized_text
+        sanitized.append(outbound)
+
+    client = ollama.Client(host=base_url, timeout=120.0, follow_redirects=False, trust_env=False)
+    out: list[list[float]] = []
+    for start in range(0, len(sanitized), max(1, chunk_size)):
+        batch = sanitized[start : start + chunk_size]
+        resp = client.embed(model=model, input=batch)
+        for vec in resp["embeddings"]:
+            out.append([float(v) for v in vec])
+    return out
 
 
 def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -287,14 +393,16 @@ def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], d
                 brain_dir=str(brain),
                 atoms_dir=str(atoms_dir),
             )
-        mem0_events.append(
-            {
-                "entity_key": entity_key or stem,
-                "filename": f"{stem}.md",
-                "contexts": (project,),
-                "claim": claim,
-            }
-        )
+        if not stem.startswith(("trap-", "distractor-", "stale-", "tampered-")):
+            mem0_events.append(
+                {
+                    "entity_key": entity_key or stem,
+                    "filename": f"{stem}.md",
+                    "contexts": (project,),
+                    "project": str(project).strip().lower(),
+                    "claim": claim,
+                }
+            )
         return atom_path, src_path
 
     # 1A. Ingested multi-page PDF technical architecture papers -> byte-offset-anchored approved atoms
@@ -519,14 +627,6 @@ def _seed_corpus(brain: Path, total_atoms: int) -> tuple[list[dict[str, Any]], d
         )
         mutated = atom_path.read_text(encoding="utf-8").replace(orig_claim, tampered_claim)
         atom_path.write_text(mutated, encoding="utf-8")
-        mem0_events.append(
-            {
-                "entity_key": f"tamper:{t_topic}",
-                "filename": f"tampered-{idx:04d}.md",
-                "contexts": (proj,),
-                "claim": tampered_claim,
-            }
-        )
         if idx < tamper_query_budget:
             queries.append(
                 {
@@ -849,42 +949,134 @@ class _ChromaHnswUntrustedIndex:
 
 
 class _Mem0StyleFlatMemoryStore:
-    """External mutable flat agent-memory baseline (Mem0-style last-write-wins entity store).
+    """Fair ChromaDB HNSW vector memory baseline with semantic dedup and project-scope filtering.
 
-    Models key/entity-keyed mutable agent memory where later writes overwrite earlier facts
-    without owner CAS approval, without immutable source byte-offset anchors, and in a single
-    flat user namespace without strict multi-project containment.
+    Uses real ChromaDB HNSW cosine retrieval and project metadata filtering on clean memory
+    entries, while lacking Second Brain's owner CAS approval, byte-offset SHA-256 source
+    anchors, and bi-temporal valid_until gating.
     """
 
-    def __init__(self, events: list[dict[str, Any]], embed_fn) -> None:
-        self._embed_fn = embed_fn
-        latest_by_entity: dict[str, dict[str, Any]] = {}
-        for ev in events:
-            latest_by_entity[str(ev["entity_key"])] = ev
-        self._records: list[dict[str, Any]] = []
-        for rec in latest_by_entity.values():
-            vec = self._embed_fn(rec["claim"])
-            self._records.append({**rec, "vec": vec})
+    def __init__(
+        self,
+        events: list[dict[str, Any]],
+        embed_fn,
+        *,
+        store_dir: Path | None = None,
+        dedup_cosine_threshold: float = 0.96,
+    ) -> None:
+        import chromadb
+        import numpy as np
 
-    def search(self, query: str, *, top_k: int = 5) -> list[dict[str, str]]:
-        q_vec = self._embed_fn(query)
-        scored: list[tuple[float, dict[str, str]]] = []
-        for rec in self._records:
-            dot = sum(a * b for a, b in zip(q_vec, rec["vec"]))
-            if dot <= 0.05:
-                continue
-            scored.append(
-                (
-                    dot,
+        self._embed_fn = embed_fn
+        self._tmp_dir: tempfile.TemporaryDirectory[str] | None = None
+        if store_dir is None:
+            self._tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+            resolved_dir = self._tmp_dir.name
+        else:
+            resolved_dir = str(store_dir)
+        self._client = chromadb.PersistentClient(path=resolved_dir)
+        self._collection = self._client.get_or_create_collection(
+            name="mem0_style_chroma_hnsw",
+            configuration={"hnsw": {"space": "cosine"}},
+        )
+
+        kept: list[dict[str, Any]] = []
+        kept_vecs: list[list[float]] = []
+        by_project_slots: dict[str, list[int]] = defaultdict(list)
+
+        for ev in events:
+            claim = str(ev["claim"])
+            contexts = tuple(str(c).strip().lower() for c in (ev.get("contexts") or ()))
+            proj = str(ev.get("project") or (contexts[0] if contexts else "")).strip().lower()
+            vec = self._embed_fn(claim)
+            matched_slot: int | None = None
+            existing_slots = by_project_slots.get(proj, [])
+            if existing_slots:
+                v_arr = np.asarray(vec, dtype=np.float64)
+                k_mat = np.asarray([kept_vecs[i] for i in existing_slots], dtype=np.float64)
+                sims = k_mat @ v_arr
+                best_pos = int(np.argmax(sims))
+                if float(sims[best_pos]) >= dedup_cosine_threshold:
+                    matched_slot = existing_slots[best_pos]
+
+            record = {
+                "id": str(ev.get("filename") or f"mem-{len(kept)}"),
+                "filename": str(ev["filename"]),
+                "contexts": ",".join(contexts),
+                "project": proj,
+                "claim": claim,
+            }
+            if matched_slot is not None:
+                kept[matched_slot] = record
+                kept_vecs[matched_slot] = vec
+            else:
+                slot = len(kept)
+                kept.append(record)
+                kept_vecs.append(vec)
+                by_project_slots[proj].append(slot)
+
+        self._count = len(kept)
+        if kept:
+            self._collection.upsert(
+                ids=[r["id"] for r in kept],
+                documents=[r["claim"] for r in kept],
+                metadatas=[
                     {
-                        "filename": rec["filename"],
-                        "contexts": ",".join(rec["contexts"]),
-                        "claim": rec["claim"],
-                    },
-                )
+                        "filename": r["filename"],
+                        "contexts": r["contexts"],
+                        "project": r["project"],
+                        "claim": r["claim"],
+                    }
+                    for r in kept
+                ],
+                embeddings=kept_vecs,
             )
-        scored.sort(key=lambda item: (-item[0], item[1]["filename"]))
-        return [item[1] for item in scored[:top_k]]
+
+    def search(
+        self,
+        query: str,
+        *,
+        project_scope: str | None = None,
+        top_k: int = 5,
+    ) -> list[dict[str, str]]:
+        if self._count <= 0:
+            return []
+        q_vec = self._embed_fn(query)
+        clean_scope = str(project_scope or "").strip().lower()
+        query_kwargs: dict[str, Any] = {
+            "query_embeddings": [q_vec],
+            "n_results": min(max(top_k, 1), self._count),
+        }
+        if clean_scope:
+            query_kwargs["where"] = {"project": clean_scope}
+        res = self._collection.query(**query_kwargs)
+        metadatas = (res.get("metadatas") or [[]])[0]
+        distances = (res.get("distances") or [[]])[0]
+        out: list[dict[str, str]] = []
+        for idx, meta in enumerate(metadatas):
+            if not isinstance(meta, dict):
+                continue
+            if idx < len(distances) and distances[idx] is not None and float(distances[idx]) > 0.95:
+                continue
+            out.append(
+                {
+                    "filename": str(meta.get("filename") or ""),
+                    "contexts": str(meta.get("contexts") or ""),
+                    "claim": str(meta.get("claim") or ""),
+                }
+            )
+            if len(out) >= top_k:
+                break
+        return out
+
+    def close(self) -> None:
+        if self._client is not None:
+            _close_chroma_client(self._client)
+        self._collection = None
+        self._client = None
+        if self._tmp_dir is not None:
+            self._tmp_dir.cleanup()
+            self._tmp_dir = None
 
 
 class _RankBm25LiveIndex:
@@ -1000,7 +1192,14 @@ class _FaissHnswLiveIndex:
 class _Mem0LiveMemoryStore:
     """Live third-party Mem0 OSS (mem0ai v2.x) memory engine backed by local Ollama + ChromaDB."""
 
-    def __init__(self, events: list[dict[str, Any]], store_dir: Path, *, llm_model: str | None = None) -> None:
+    def __init__(
+        self,
+        events: list[dict[str, Any]],
+        store_dir: Path,
+        *,
+        llm_model: str | None = None,
+        infer: bool = True,
+    ) -> None:
         os.environ["MEM0_TELEMETRY"] = "false"
         os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
         from hardware_profile import resolve_active_local_generation_model
@@ -1036,31 +1235,45 @@ class _Mem0LiveMemoryStore:
             "version": "v1.1",
         }
         self._memory = Memory.from_config(cfg)
-        active_id_by_entity: dict[str, str] = {}
         for ev in events:
-            ekey = str(ev["entity_key"])
-            prev_id = active_id_by_entity.get(ekey)
-            if prev_id:
-                try:
-                    self._memory.delete(prev_id)
-                except Exception:
-                    pass
-            res = self._memory.add(
-                str(ev["claim"]),
-                user_id="owner",
-                metadata={
-                    "filename": str(ev["filename"]),
-                    "contexts": ",".join(ev["contexts"]),
-                    "entity_key": ekey,
-                },
-                infer=False,
-            )
-            results_list = res.get("results", []) if isinstance(res, dict) else []
-            if results_list and isinstance(results_list[0], dict) and results_list[0].get("id"):
-                active_id_by_entity[ekey] = str(results_list[0]["id"])
+            contexts = tuple(str(c).strip().lower() for c in (ev.get("contexts") or ()))
+            primary_project = str(ev.get("project") or (contexts[0] if contexts else "")).strip().lower()
+            mem_meta = {
+                "filename": str(ev["filename"]),
+                "contexts": ",".join(contexts),
+                "project": primary_project,
+                "entity_key": str(ev.get("entity_key") or ev["filename"]),
+            }
+            try:
+                self._memory.add(
+                    str(ev["claim"]),
+                    user_id="owner",
+                    metadata=mem_meta,
+                    infer=bool(infer),
+                )
+            except (ValueError, KeyError, TypeError):
+                if infer:
+                    self._memory.add(
+                        str(ev["claim"]),
+                        user_id="owner",
+                        metadata=mem_meta,
+                        infer=False,
+                    )
+                else:
+                    raise
 
-    def search(self, query: str, *, top_k: int = 5) -> list[dict[str, str]]:
-        res = self._memory.search(query, filters={"user_id": "owner"}, limit=top_k)
+    def search(
+        self,
+        query: str,
+        *,
+        project_scope: str | None = None,
+        top_k: int = 5,
+    ) -> list[dict[str, str]]:
+        m_filters: dict[str, Any] = {"user_id": "owner"}
+        clean_scope = str(project_scope or "").strip().lower()
+        if clean_scope:
+            m_filters["project"] = clean_scope
+        res = self._memory.search(query, filters=m_filters, limit=top_k)
         items = res.get("results", []) if isinstance(res, dict) else (res if isinstance(res, list) else [])
         out: list[dict[str, str]] = []
         for item in items[:top_k]:
@@ -1125,43 +1338,76 @@ def _is_trap_hit(hit_filename: str, expected_trap_filename: str | None) -> bool:
 
 
 def _select_relevant_claims_from_hits(query: str, hits: list[Any]) -> list[str]:
-    """Select relevant claims across single-hop and wikilinked 2-hop hits (zero oracle knowledge)."""
+    """Select relevant claims using Cross-Encoder scoring and 2-hop graph corroboration."""
+    from cross_encoder import score_query_atom_pairs
+
     q_stems = _content_stems(query)
     if not q_stems or not hits:
         return []
-    scored_claims: list[tuple[int, int, str, str, tuple[str, ...]]] = []
+    candidates: list[tuple[int, str, str, tuple[str, ...], int]] = []
+    seen_claims: set[str] = set()
     for rank_idx, h in enumerate(hits):
         raw_content = getattr(h, "content", "") or ""
         if "## Claim" not in raw_content:
             continue
         claim_text = raw_content.split("## Claim", 1)[1].split("##", 1)[0].strip()
-        if not claim_text:
+        if not claim_text or claim_text in seen_claims:
             continue
+        seen_claims.add(claim_text)
         overlap = len(q_stems & _content_stems(claim_text))
         fname = str(getattr(h, "filename", "") or "")
         reasons = tuple(getattr(h, "match_reasons", ()) or ())
-        scored_claims.append((overlap, -rank_idx, fname, claim_text, reasons))
+        candidates.append((rank_idx, fname, claim_text, reasons, overlap))
 
-    if not scored_claims:
+    if not candidates:
         return []
-    max_overlap = max(item[0] for item in scored_claims)
+
+    ce_scores, ce_backend = score_query_atom_pairs(
+        query,
+        [c[2] for c in candidates],
+        allow_onnx=True,
+    )
+    max_overlap = max(c[4] for c in candidates)
+    max_ce = max(ce_scores) if ce_scores else 0.0
     min_required = 2 if len(q_stems) >= 2 else 1
-    if max_overlap < min_required:
+    if max_overlap < min_required and not (
+        ce_backend == "onnx_cross_encoder" and max_ce >= 0.55 and max_overlap >= 1
+    ):
         return []
+
+    scored_rows = [
+        (
+            1 if (overlap >= min_required or (ce_backend == "onnx_cross_encoder" and ce >= 0.55 and overlap >= 1)) else 0,
+            overlap,
+            round(float(ce), 6),
+            -rank_idx,
+            fname,
+            claim_text,
+            reasons,
+        )
+        for (rank_idx, fname, claim_text, reasons, overlap), ce in zip(candidates, ce_scores)
+    ]
+    scored_rows.sort(reverse=True)
+    top_row = scored_rows[0]
+    top_overlap = top_row[1]
+    top_ce = top_row[2]
 
     chosen: list[str] = []
     primary_files: set[str] = set()
     primary_stems: set[str] = set()
-    for overlap, _neg_rank, fname, claim_text, _reasons in sorted(scored_claims, reverse=True):
-        if overlap == max_overlap:
+    for eligible, overlap, ce, _neg_rank, fname, claim_text, _reasons in scored_rows:
+        if not eligible:
+            continue
+        # Only emit the best-matching primary claim(s) (tight ONNX margin within max stem overlap).
+        if overlap == top_overlap and ce >= (top_ce - 0.03):
             primary_files.add(fname)
             primary_stems |= _content_stems(claim_text)
             if claim_text not in chosen:
                 chosen.append(claim_text)
 
     # Include 2nd-hop graph-traversed claims explicitly linked from a primary hit when they corroborate the query.
-    for overlap, _neg_rank, _fname, claim_text, reasons in sorted(scored_claims, reverse=True):
-        if claim_text in chosen or overlap < min_required:
+    for eligible, overlap, _ce, _neg_rank, _fname, claim_text, reasons in scored_rows:
+        if claim_text in chosen or not eligible or overlap < min_required:
             continue
         linked_parents = {
             r.split(":", 1)[1]
@@ -1181,6 +1427,49 @@ def _rank_metrics_at_5(hit_filenames: list[str], expected_filename: str) -> tupl
     return (0.0, 0.0)
 
 
+def _merge_verified_hits(direct: list[Any], neighbors: list[Any], *, top_k: int = 5) -> list[Any]:
+    """Interleave verified 2nd-hop neighbors right after their parent direct hit within the top-k pool."""
+    if not neighbors:
+        return list(direct[:top_k])
+    direct_files = {getattr(item, "filename", "") for item in direct if getattr(item, "filename", "")}
+    by_parent: dict[str, list[Any]] = defaultdict(list)
+    orphan_neighbors: list[Any] = []
+    for nb in neighbors:
+        reasons = tuple(getattr(nb, "match_reasons", ()) or ())
+        parents = [r.split(":", 1)[1] for r in reasons if isinstance(r, str) and r.startswith("linked_from:")]
+        matched_parent = next((p for p in parents if p in direct_files), None)
+        if matched_parent:
+            by_parent[matched_parent].append(nb)
+        else:
+            orphan_neighbors.append(nb)
+
+    merged: list[Any] = []
+    seen: set[str] = set()
+    for item in direct:
+        fname = getattr(item, "filename", "")
+        if fname and fname not in seen:
+            seen.add(fname)
+            merged.append(item)
+            if len(merged) >= top_k:
+                break
+        if fname:
+            for nb in by_parent.get(fname, ())[:2]:
+                nb_name = getattr(nb, "filename", "")
+                if nb_name and nb_name not in seen:
+                    seen.add(nb_name)
+                    merged.append(nb)
+                    if len(merged) >= top_k:
+                        return merged
+    for nb in orphan_neighbors:
+        nb_name = getattr(nb, "filename", "")
+        if nb_name and nb_name not in seen:
+            seen.add(nb_name)
+            merged.append(nb)
+            if len(merged) >= top_k:
+                break
+    return merged[:top_k]
+
+
 def _multihop_rank_metrics_at_5(hit_filenames: list[str], expected_filenames: list[str]) -> tuple[float, float]:
     """Require ALL required multi-hop atoms in the retrieved set; rank by the deepest required hop."""
     positions: list[int] = []
@@ -1190,7 +1479,7 @@ def _multihop_rank_metrics_at_5(hit_filenames: list[str], expected_filenames: li
         positions.append(hit_filenames.index(req) + 1)
     worst_pos = max(positions)
     if worst_pos > 5:
-        return (1.0 / worst_pos, 1.0 / math.log2(worst_pos + 1.0))
+        return (0.0, 0.0)
     return (1.0 / worst_pos, 1.0 / math.log2(worst_pos + 1.0))
 
 
@@ -1234,7 +1523,7 @@ def _run_optional_llm_eval(
                 index_path=lexical_db,
                 chroma_path=str(chroma_dir),
             )
-            hits = list(direct) + list(neighbors)
+            hits = _merge_verified_hits(list(direct), list(neighbors), top_k=5)
             if hits:
                 prompt = build_grounding_prompt(q["query"], hits)
                 resp = ollama_utils.chat_with_fallback(
@@ -1336,29 +1625,41 @@ def run_sota_benchmark(
         use_build_cache = True
 
         if include_dense_ollama:
+            atom_texts = [p.read_text(encoding="utf-8") for p in sorted(atoms_dir.glob("*.md"))]
+            if atom_texts:
+                batch_vecs = _batch_ollama_embed(atom_texts, model=EMBED_MODEL)
+                for txt_val, vec_val in zip(atom_texts, batch_vecs):
+                    key = hashlib.sha256(str(txt_val).encode("utf-8")).hexdigest()
+                    build_vec_cache[key] = vec_val
+
             def _live_embed_fn(txt: str) -> list[float]:
-                if use_build_cache:
-                    key = hashlib.sha256(str(txt).encode("utf-8")).hexdigest()
-                    cached = build_vec_cache.get(key)
-                    if cached is not None:
-                        return cached
-                    vec = ollama_utils.embed_text(txt, model=EMBED_MODEL)
+                key = hashlib.sha256(str(txt).encode("utf-8")).hexdigest()
+                cached = build_vec_cache.get(key)
+                if cached is not None:
+                    return cached
+                vec = ollama_utils.embed_text(txt, model=EMBED_MODEL)
+                if use_build_cache or len(build_vec_cache) < 2048:
                     build_vec_cache[key] = vec
-                    return vec
-                return ollama_utils.embed_text(txt, model=EMBED_MODEL)
+                return vec
 
             embed_fn = _live_embed_fn
             stack.enter_context(
                 patch.object(_rv_mod, "embed_text", side_effect=lambda txt, model=None: _live_embed_fn(txt))
             )
+            embed_backend_label = f"ollama:{EMBED_MODEL}"
         else:
-            embed_fn = _deterministic_dense_embed
+            svd_embedder = _SvdTfidfSemanticEmbedder(
+                [p.read_text(encoding="utf-8") for p in sorted(atoms_dir.glob("*.md"))],
+                dim=128,
+            )
+            embed_fn = svd_embedder.embed
             stack.enter_context(
-                patch.object(ollama_utils, "embed_text", side_effect=lambda txt, model=None: _deterministic_dense_embed(txt))
+                patch.object(ollama_utils, "embed_text", side_effect=lambda txt, model=None: svd_embedder.embed(txt))
             )
             stack.enter_context(
-                patch.object(_rv_mod, "embed_text", side_effect=lambda txt, model=None: _deterministic_dense_embed(txt))
+                patch.object(_rv_mod, "embed_text", side_effect=lambda txt, model=None: svd_embedder.embed(txt))
             )
+            embed_backend_label = f"svd_tfidf_semantic_{svd_embedder.dim}d_chroma_hnsw"
 
         with redirect_stdout(io.StringIO()):
             _rv_mod.rebuild_vectors(
@@ -1376,7 +1677,11 @@ def run_sota_benchmark(
         naive_conn = _build_naive_fts(atoms_dir, Path(tmp) / "naive.sqlite3")
         tfidf_index = _TfidfCosineIndex(atoms_dir)
         chroma_untrusted = _ChromaHnswUntrustedIndex(atoms_dir, naive_chroma_dir, embed_fn)
-        mem0_store = _Mem0StyleFlatMemoryStore(mem0_events, embed_fn)
+        mem0_store = _Mem0StyleFlatMemoryStore(
+            mem0_events,
+            embed_fn,
+            store_dir=Path(tmp) / "mem0_style_chroma",
+        )
 
         rank_bm25_live: _RankBm25LiveIndex | None = None
         faiss_hnsw_live: _FaissHnswLiveIndex | None = None
@@ -1449,7 +1754,7 @@ def run_sota_benchmark(
                 bucket["validation_latencies_ms"].append(val_ms)
                 bucket["latencies_ms"].append(ret_ms + val_ms)
                 q_kind = q_item["kind"]
-                fnames = [h.filename for h in hits]
+                fnames = [h.filename for h in hits[:5]]
                 if q_kind == "positive":
                     bucket["pos_total"] += 1
                     hit_ok = 1 if q_item["expected_filename"] in fnames else 0
@@ -1570,7 +1875,7 @@ def run_sota_benchmark(
                     index_path=lexical_db,
                     chroma_path=str(chroma_dir),
                 )
-                w_hits = list(w_d) + list(w_n)
+                w_hits = _merge_verified_hits(list(w_d), list(w_n), top_k=5)
                 w_cands = _select_relevant_claims_from_hits(wq["query"], w_hits)
                 validate_standard_answer(
                     json.dumps({"claims": w_cands}),
@@ -1578,6 +1883,7 @@ def run_sota_benchmark(
                     atoms_dir=atoms_dir,
                     mode="standard",
                 )
+            gc.collect()
 
             # 1. Second Brain Verified (Lexical + ONNX Cross-Encoder + Graph Links + CAS + Byte Anchors + Scope + Abstention)
             for q in queries:
@@ -1595,7 +1901,7 @@ def run_sota_benchmark(
                     index_path=lexical_db,
                     chroma_path=str(chroma_dir),
                 )
-                lex_hits = list(lex_direct) + list(lex_neighbors)
+                lex_hits = _merge_verified_hits(list(lex_direct), list(lex_neighbors), top_k=5)
                 ret_lex_ms = (time.perf_counter() - t_ret0) * 1000.0
 
                 t_val0 = time.perf_counter()
@@ -1635,7 +1941,7 @@ def run_sota_benchmark(
                     index_path=lexical_db,
                     chroma_path=str(chroma_dir),
                 )
-                rrf_hits = list(rrf_direct) + list(rrf_neighbors)
+                rrf_hits = _merge_verified_hits(list(rrf_direct), list(rrf_neighbors), top_k=5)
                 ret_rrf_ms = (time.perf_counter() - t_ret1) * 1000.0
 
                 t_val1 = time.perf_counter()
@@ -1682,9 +1988,9 @@ def run_sota_benchmark(
                 hyb_ms = (time.perf_counter() - t0) * 1000.0
                 _record_untrusted_baseline(stats["hybrid_bm25_chroma_rrf_no_trust_gate"], hyb_hits, q, hyb_ms)
 
-                # 7. Mem0-Style Flat Overwrite Memory (last-write-wins entity store, no byte anchors, flat namespace)
+                # 7. Mem0-Style Chroma HNSW Memory (project-scoped, no byte anchors or CAS)
                 t0 = time.perf_counter()
-                m0_hits = mem0_store.search(q["query"], top_k=5)
+                m0_hits = mem0_store.search(q["query"], project_scope=q["project_scope"], top_k=5)
                 m0_ms = (time.perf_counter() - t0) * 1000.0
                 _record_untrusted_baseline(
                     stats["mem0_style_flat_overwrite_memory"],
@@ -1716,7 +2022,7 @@ def run_sota_benchmark(
                     _record_untrusted_baseline(stats["faiss_hnsw_live"], fa_hits, q, fa_ms)
 
                     t0 = time.perf_counter()
-                    ml_hits = mem0_live_store.search(q["query"], top_k=5)
+                    ml_hits = mem0_live_store.search(q["query"], project_scope=q["project_scope"], top_k=5)
                     ml_ms = (time.perf_counter() - t0) * 1000.0
                     _record_untrusted_baseline(
                         stats["mem0_live_v2"],
@@ -1804,6 +2110,7 @@ def run_sota_benchmark(
         finally:
             naive_conn.close()
             chroma_untrusted.close()
+            mem0_store.close()
             if mem0_live_store is not None:
                 mem0_live_store.close()
             sb_chroma_collection.close()
@@ -1845,9 +2152,7 @@ def run_sota_benchmark(
             **corpus_meta,
             "query_count": len(queries),
             "rerank_backend": active_rerank_backend,
-            "embedding_backend": (
-                f"ollama:{EMBED_MODEL}" if include_dense_ollama else f"deterministic_feature_hash_{_DENSE_DIM}d_chroma_hnsw"
-            ),
+            "embedding_backend": embed_backend_label,
             "live_third_party_enabled": bool(live_third_party),
             "third_party_versions": _detect_third_party_versions(),
             "hardware_profile": asdict(hw),
@@ -1862,16 +2167,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--json-output", default=None)
     parser.add_argument("--output", default=None, help="Write JSON benchmark report to this file path.")
-    parser.add_argument("--include-llm", action="store_true", help="Run end-to-end local Ollama LLM answer generation evaluation.")
-    parser.add_argument("--llm-model", default=None, help="Preferred local Ollama generation model for --include-llm.")
-    parser.add_argument("--real-embeddings", action="store_true", help="Use live Ollama nomic-embed-text embeddings instead of deterministic dense vectors.")
+    parser.add_argument("--include-llm", action="store_true", help="Force end-to-end local Ollama LLM answer generation evaluation.")
+    parser.add_argument("--no-llm", action="store_true", help="Skip local Ollama LLM answer generation evaluation.")
+    parser.add_argument("--llm-model", default=None, help="Preferred local Ollama generation model for LLM evaluation.")
+    parser.add_argument("--real-embeddings", action="store_true", help="Require live Ollama nomic-embed-text embeddings.")
+    parser.add_argument("--offline", action="store_true", help="Run offline using SVD-TF-IDF semantic embeddings and skip LLM evaluation.")
     parser.add_argument("--live-third-party", action="store_true", help="Benchmark live third-party packages (mem0ai, faiss-cpu, rank-bm25) alongside core baselines.")
     args = parser.parse_args(argv)
 
-    use_real_embeddings = bool(args.real_embeddings or args.live_third_party)
+    installed_models: set[str] = set()
+    if not args.offline:
+        installed_models = set(ollama_utils.installed_model_names())
+    has_embed = any(
+        m == EMBED_MODEL or m.startswith(f"{EMBED_MODEL}:") or m.split(":", 1)[0] == EMBED_MODEL.split(":", 1)[0]
+        for m in installed_models
+    )
+    has_chat = any(
+        m.split(":", 1)[0] != EMBED_MODEL.split(":", 1)[0]
+        for m in installed_models
+    )
+    use_real_embeddings = bool(args.real_embeddings or args.live_third_party or (not args.offline and has_embed))
+    use_llm = bool(args.include_llm or (not args.no_llm and not args.offline and has_chat))
     result = run_sota_benchmark(
         atoms=max(80, args.atoms),
-        include_llm=bool(args.include_llm),
+        include_llm=use_llm,
         llm_model=args.llm_model,
         include_dense_ollama=use_real_embeddings,
         live_third_party=bool(args.live_third_party),

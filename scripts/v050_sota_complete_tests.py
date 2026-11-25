@@ -907,7 +907,7 @@ class V050SotaCompleteTests(unittest.TestCase):
                 clear=False,
             ):
                 listed_tools = asyncio.run(mcp_server.handle_list_tools(None, None))
-                self.assertEqual(len(listed_tools.tools), 17)
+                self.assertEqual(len(listed_tools.tools), 35)
                 mcp_def = asyncio.run(
                     mcp_server.handle_call_tool(
                         None,

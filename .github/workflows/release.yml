@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (defaults to ref name)"
+        description: "Release tag to publish (must match vX.Y.Z; defaults to ref name)"
         required: false
         default: ""
       draft:
@@ -15,11 +15,15 @@ on:
         type: boolean
         default: true
       publish_pypi:
-        description: "Publish Python wheel to PyPI (requires Trusted Publisher or PYPI_API_TOKEN)"
+        description: "Publish Python wheel to PyPI (non-draft dispatch only; requires Trusted Publisher or PYPI_API_TOKEN)"
         type: boolean
         default: false
       publish_extensions:
-        description: "Publish VSIX to VS Code Marketplace / Open VSX (requires VSCE_PAT / OVSX_PAT)"
+        description: "Publish VSIX & Browser Clippers to stores (non-draft dispatch only)"
+        type: boolean
+        default: false
+      publish_registries:
+        description: "Publish Homebrew Tap & WinGet Community manifests PR (non-draft dispatch only)"
         type: boolean
         default: false
 
@@ -33,15 +37,15 @@ concurrency:
 jobs:
   verify-clean-tree:
     name: Verify Code-Only Release Hygiene & Test Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.SB_RELEASE_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Reject private vault data or secrets in release tree
         run: |
           set -euo pipefail
-          FORBIDDEN="$(git ls-files brain/ '.env*' '*token*' '*.pfx' '*.p12' '*.pem' '*.key' || true)"
+          FORBIDDEN="$(git ls-files brain/ ':(glob)**/.env*' '*token*' '*.pfx' '*.p12' '*.pem' '*.key' '*.jks' '*.keystore' '*.p8' '*.sbvault' ':(glob)**/local.properties' || true)"
           if [ -n "$FORBIDDEN" ]; then
             echo "ERROR: Refusing to release repository containing private vault or credential files:"
             echo "$FORBIDDEN"
@@ -49,33 +53,42 @@ jobs:
           fi
 
       - name: Set up uv & Python 3.11
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
-      - name: Sync locked environment & run core test suites
+      - name: Sync locked environment, verify release tag & run core test suites
+        env:
+          BRAIN_CI_CODE_ONLY: "1"
+          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
         run: |
+          set -euo pipefail
           uv python install 3.11
           uv sync --locked --python 3.11
+          if ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: Invalid release tag '${RELEASE_TAG}' (expected vX.Y.Z)." >&2
+            exit 1
+          fi
+          PKG_VER="$(uv run --frozen python -c 'import second_brain; print(second_brain.__version__)' | tr -d '\r\n')"
+          if [ "${RELEASE_TAG#v}" != "${PKG_VER}" ]; then
+            echo "ERROR: Release tag ${RELEASE_TAG} does not match second_brain.__version__=${PKG_VER}" >&2
+            exit 1
+          fi
           uv run --frozen python scripts/make_icons.py
+          export BRAIN_VAULT_DIR="${RUNNER_TEMP}/sb-release-vault"
+          uv run --frozen second-brain install
+          # Run every suite except desktop_ui_tests (run per-OS in build-* jobs) and wheel_packaging_tests (run after build below):
+          # automatically covers doctor, goal4_sync_and_ui_tests, bugfix_1a_regression_tests, parity_1c_tests,
+          # vscode_extension_tests, phase6_release_and_stores_tests, and scale_benchmark_1500.
           uv run --frozen python scripts/test_all.py --fail-fast \
-            --only evaluation_dataset audit_sources system_safety_tests \
-            phase2_safety_tests phase3_cognitive_tests phase4_product_tests \
-            phase5_god_features_tests goal2_completion_tests \
-            goal3_backend_contract_tests goal4_sync_and_ui_tests \
-            goal5_clipper_and_workspaces_tests v040_sota_upgrades_tests \
-            v050_sota_complete_tests v100_final_completion_tests \
-            creative_media_tests stage4_executable_skills_tests \
-            mobile_vault_client_tests \
-            dashboard_apptest_tests chroma_rebuild_canary \
-            archive_manifest_canary smoke_test
+            --exclude desktop_ui_tests wheel_packaging_tests
 
-      - name: Build Python wheel/sdist, VSIX, Browser Clipper & Mobile Inbox Drop PWA and verify clean-wheel installation
+      - name: Build Python wheel/sdist, VSIX, Browser Clipper & Mobile PWA/Vault bundles and verify clean-wheel installation
         run: |
           mkdir -p release-artifacts
           uv build --out-dir release-artifacts
@@ -86,7 +99,7 @@ jobs:
           uv run --frozen python -m unittest scripts.wheel_packaging_tests -v
 
       - name: Upload cross-platform Python packages, VS Code VSIX & Browser Clipper
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-packages
           path: |
@@ -100,13 +113,13 @@ jobs:
   build-windows:
     name: Build Windows Installers (.exe, .msi)
     needs: verify-clean-tree
-    runs-on: windows-latest
+    runs-on: ${{ vars.SB_RELEASE_WINDOWS_RUNNER || 'windows-latest' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up uv & Python 3.11
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
 
@@ -116,37 +129,63 @@ jobs:
           uv sync --locked --python 3.11
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
-      - name: Decode optional production Authenticode PFX
+      - name: Decode optional production Authenticode PFX with restricted NTFS ACLs
         shell: pwsh
         env:
           WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
         run: |
           if ($env:WINDOWS_PFX_BASE64) {
             $pfxPath = Join-Path $env:RUNNER_TEMP "release-signing.pfx"
+            $principal = (whoami.exe).Trim()
+            New-Item -ItemType File -Path $pfxPath -Force | Out-Null
+            icacls.exe $pfxPath /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" "${principal}:(F)" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "icacls.exe failed to restrict NTFS ACLs on $pfxPath (exit code $LASTEXITCODE)"
+            }
             [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
             "SECOND_BRAIN_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
 
-      - name: Run Desktop UI tests & package Windows NSIS + MSI installers
+      - name: Run Desktop UI tests, package Windows NSIS + MSI installers & verify packaged --smoke-test
         shell: pwsh
         env:
           SECOND_BRAIN_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
           SECOND_BRAIN_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+          SECOND_BRAIN_AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          SECOND_BRAIN_AZURE_CODE_SIGNING_ACCOUNT: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT }}
+          SECOND_BRAIN_AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+          SECOND_BRAIN_REQUIRE_TRUSTED_SIGN: ${{ vars.REQUIRE_TRUSTED_SIGNING == 'true' && '1' || '0' }}
+          SECOND_BRAIN_STRICT_WHEELHOUSE: "1"
         run: |
           uv run --frozen python scripts/make_icons.py
           Push-Location desktop
           npm ci
           npm test
           Pop-Location
+          $hasAzureSign = [bool](
+            $env:SECOND_BRAIN_AZURE_TRUSTED_SIGNING_ENDPOINT -and
+            $env:SECOND_BRAIN_AZURE_CODE_SIGNING_ACCOUNT -and
+            $env:SECOND_BRAIN_AZURE_CERT_PROFILE
+          )
+          $requireTrusted = ($env:SECOND_BRAIN_REQUIRE_TRUSTED_SIGN -eq '1')
           if ($env:SECOND_BRAIN_PFX_PATH) {
-            pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package_desktop.ps1 -PfxPath $env:SECOND_BRAIN_PFX_PATH -PfxPassword $env:SECOND_BRAIN_PFX_PASSWORD
+            pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package_desktop.ps1 -PfxPath $env:SECOND_BRAIN_PFX_PATH
+          } elseif ($hasAzureSign -or $requireTrusted) {
+            pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package_desktop.ps1
           } else {
             pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/package_desktop.ps1 -SkipSign
           }
+          if ($requireTrusted) {
+            uv run --frozen python scripts/verify_release_signatures.py --dist-dir dist --json
+          }
+          uv run --frozen python scripts/run_desktop_tests.py --require-packaged --skip-unit
+          $pkgVer = (uv run --frozen python -c "import second_brain; print(second_brain.__version__)" | Select-Object -Last 1).Trim()
+          uv run --frozen python scripts/publish_registries.py validate-winget dist/manifests/winget
+          uv run --frozen python scripts/publish_registries.py validate-winget "dist/manifests/winget-pkgs/manifests/s/SecondBrain/SecondBrain/$pkgVer"
 
       - name: Clean temporary PFX
         if: always()
@@ -156,25 +195,26 @@ jobs:
           if (Test-Path $pfxPath) { Remove-Item -Force $pfxPath }
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-windows
           path: |
             dist/*.exe
             dist/*.exe.blockmap
             dist/*.msi
+            dist/latest.yml
           if-no-files-found: error
 
   build-macos:
     name: Build macOS Universal Installers (.dmg, .zip)
     needs: verify-clean-tree
-    runs-on: macos-latest
+    runs-on: ${{ vars.SB_RELEASE_MACOS_RUNNER || 'macos-latest' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up uv & Python 3.11
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
 
@@ -184,39 +224,51 @@ jobs:
           uv sync --locked --python 3.11
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
-      - name: Run Desktop UI tests & package macOS universal DMG + ZIP
+      - name: Run Desktop UI tests, package macOS universal DMG + ZIP & verify packaged --smoke-test
         env:
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          SECOND_BRAIN_REQUIRE_NOTARIZATION: ${{ vars.REQUIRE_TRUSTED_SIGNING == 'true' && '1' || '0' }}
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.MAC_CSC_LINK != '' && 'true' || 'false' }}
+          SECOND_BRAIN_STRICT_WHEELHOUSE: "1"
         run: |
           uv run --frozen python scripts/make_icons.py
           (cd desktop && npm ci && npm test)
           bash scripts/package_desktop.sh
+          if [ "${SECOND_BRAIN_REQUIRE_NOTARIZATION}" = "1" ]; then
+            uv run --frozen python scripts/verify_release_signatures.py --dist-dir dist --json
+          fi
+          uv run --frozen python scripts/run_desktop_tests.py --require-packaged --skip-unit
 
       - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-macos
           path: |
             dist/*.dmg
+            dist/*.dmg.blockmap
             dist/Second-Brain-*.zip
+            dist/Second-Brain-*.zip.blockmap
+            dist/latest-mac.yml
           if-no-files-found: error
 
   build-linux:
     name: Build Linux Installers (.AppImage, .deb)
     needs: verify-clean-tree
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.SB_RELEASE_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install headless GUI dependencies
         run: |
@@ -227,7 +279,7 @@ jobs:
             libgbm1 libpango-1.0-0 libcairo2
 
       - name: Set up uv & Python 3.11
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
 
@@ -237,73 +289,124 @@ jobs:
           uv sync --locked --python 3.11
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
-      - name: Run Desktop UI tests & package Linux AppImage + DEB
+      - name: Run Desktop UI tests, package Linux AppImage + DEB & verify packaged --smoke-test
+        env:
+          SECOND_BRAIN_STRICT_WHEELHOUSE: "1"
         run: |
           uv run --frozen python scripts/make_icons.py
           (cd desktop && npm ci && xvfb-run -a npm test)
           bash scripts/package_desktop.sh
+          uv run --frozen python scripts/run_desktop_tests.py --require-packaged --skip-unit
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-linux
           path: |
             dist/*.AppImage
             dist/*.deb
+            dist/latest-linux.yml
           if-no-files-found: error
 
   publish-release:
-    name: Merge Checksums & Publish Release
+    name: Merge Checksums, Attest Provenance & Create GitHub Release
     needs: [verify-clean-tree, build-windows, build-macos, build-linux]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.SB_RELEASE_LINUX_RUNNER || 'ubuntu-latest' }}
+    environment: release
     permissions:
       contents: write
       id-token: write
+      attestations: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up uv & Python 3.11
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
 
-      - name: Install Python 3.11
-        run: uv python install 3.11
+      - name: Install Python 3.11 & sync locked runtime environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --no-dev --python 3.11
 
       - name: Download all platform artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: merged-dist
           merge-multiple: true
 
-      - name: Generate unified SHA256SUMS.txt & WinGet / Homebrew Cask manifests
+      - name: Generate unified SHA256SUMS.txt & WinGet / Homebrew Cask + Formula manifests
         working-directory: merged-dist
         env:
           RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          RELEASE_ED25519_PRIVATE_KEY: ${{ secrets.RELEASE_ED25519_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          rm -f SHA256SUMS.txt
-          LC_ALL=C sha256sum $(find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' | sort) > SHA256SUMS.txt
+          rm -f SHA256SUMS.txt SHA256SUMS.txt.sig .gitignore default.gitignore builder-debug.yml builder-effective-config.yaml
+          if ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: Invalid release tag '${RELEASE_TAG}' (expected vX.Y.Z)." >&2
+            exit 1
+          fi
+          PKG_VER="$(uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python -c 'import second_brain; print(second_brain.__version__)' | tr -d '\r\n')"
+          if [ "${RELEASE_TAG#v}" != "${PKG_VER}" ]; then
+            echo "ERROR: Release tag ${RELEASE_TAG} does not match second_brain.__version__=${PKG_VER}" >&2
+            exit 1
+          fi
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' ! -name 'SHA256SUMS.txt.sig' ! -name '.*' -printf '%f\0' \
+            | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
+          MANIFEST_STAGE="$GITHUB_WORKSPACE/release-manifests"
+          mkdir -p "$MANIFEST_STAGE"
           uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python scripts/build_distribution_manifests.py \
-            --manifests-only --dist-dir "$PWD" --out-dir "$PWD" --version "${RELEASE_TAG}" --repo-slug "${GITHUB_REPOSITORY}" --require-checksums
-          cp manifests/winget/SecondBrain.SecondBrain.yaml ./SecondBrain.SecondBrain.yaml
-          cp manifests/homebrew/second-brain.rb ./second-brain.rb
-          rm -rf manifests
-          LC_ALL=C sha256sum $(find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%f\n' | sort) > SHA256SUMS.txt
+            --manifests-only --dist-dir "$PWD" --out-dir "$MANIFEST_STAGE" --version "${RELEASE_TAG}" --repo-slug "${GITHUB_REPOSITORY}" --require-checksums
+          cp "$MANIFEST_STAGE/manifests/winget/SecondBrain.SecondBrain.yaml" ./SecondBrain.SecondBrain.yaml
+          cp "$MANIFEST_STAGE/manifests/homebrew/second-brain.rb" ./second-brain.rb
+          if [ -f "$MANIFEST_STAGE/manifests/homebrew/Formula/second-brain.rb" ]; then
+            cp "$MANIFEST_STAGE/manifests/homebrew/Formula/second-brain.rb" ./second-brain-formula.rb
+          fi
+          VER_CLEAN="${RELEASE_TAG#v}"
+          if [ -f "$MANIFEST_STAGE/manifests/winget-pkgs/second-brain-winget-pkgs-${VER_CLEAN}.zip" ]; then
+            cp "$MANIFEST_STAGE/manifests/winget-pkgs/second-brain-winget-pkgs-${VER_CLEAN}.zip" "./second-brain-winget-pkgs-${VER_CLEAN}.zip"
+          fi
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' ! -name 'SHA256SUMS.txt.sig' ! -name '.*' -printf '%f\0' \
+            | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python scripts/publish_registries.py \
+            verify-release-assets --dist-dir "$PWD" --skip-git-timestamp-check
+          if [ -n "${RELEASE_ED25519_PRIVATE_KEY:-}" ]; then
+            uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python scripts/verify_release_signatures.py \
+              --dist-dir "$PWD" --sign-manifest RELEASE_ED25519_PRIVATE_KEY
+          fi
 
-      - name: Stage Python wheel for PyPI
-        run: |
-          mkdir -p pypi-dist
-          cp merged-dist/*.whl pypi-dist/
+      - name: Attest SLSA Build Provenance for Release Artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            merged-dist/*.whl
+            merged-dist/*.tar.gz
+            merged-dist/*.vsix
+            merged-dist/*.exe
+            merged-dist/*.msi
+            merged-dist/*.dmg
+            merged-dist/*.AppImage
+            merged-dist/*.deb
+            merged-dist/*.zip
+            merged-dist/*.xpi
+
+      - name: Upload preserved distribution manifests (Homebrew Tap + WinGet multi-file)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: distribution-manifests
+          path: release-manifests/manifests/**
+          if-no-files-found: error
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
           name: "Second Brain ${{ inputs.tag != '' && inputs.tag || github.ref_name }}"
@@ -313,45 +416,137 @@ jobs:
           files: |
             merged-dist/*
 
-      - name: Publish Python wheel to PyPI (when configured)
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && (vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
-        uses: pypa/gh-action-pypi-publish@release/v1
+  publish-pypi:
+    name: Publish Python Wheel & sdist to PyPI
+    needs: [publish-release]
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && !inputs.draft && inputs.publish_pypi) }}
+    runs-on: ${{ vars.SB_RELEASE_LINUX_RUNNER || 'ubuntu-latest' }}
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download Python packages
+        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-packages
+          path: dist-packages
+
+      - name: Stage Python wheel & sdist for PyPI
+        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
+        run: |
+          mkdir -p pypi-dist
+          cp dist-packages/*.whl dist-packages/*.tar.gz pypi-dist/
+
+      - name: Publish Python wheel to PyPI
+        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: pypi-dist
           password: ${{ secrets.PYPI_API_TOKEN }}
 
-      - name: Publish VSIX to VS Code Marketplace (when VSCE_PAT secret is set)
-        if: ${{ secrets.VSCE_PAT != '' && (github.event_name == 'push' || inputs.publish_extensions) }}
+  publish-extensions:
+    name: Publish VS Code VSIX & Browser Web Clippers
+    needs: [publish-release]
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && !inputs.draft && inputs.publish_extensions) }}
+    runs-on: ${{ vars.SB_RELEASE_LINUX_RUNNER || 'ubuntu-latest' }}
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv & Python 3.11
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Sync locked runtime environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --no-dev --python 3.11
+
+      - name: Download cross-platform packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-packages
+          path: dist-packages
+
+      - name: Publish VSIX to VS Code Marketplace (env-scoped VSCE_PAT, never argv)
+        if: ${{ secrets.VSCE_PAT != '' }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
-          npx --yes @vscode/vsce@3.3.2 publish --packagePath merged-dist/*.vsix --pat "$VSCE_PAT"
+          VSIX_FILE="$(find dist-packages -maxdepth 1 -name '*.vsix' | head -n 1)"
+          uv run --no-dev --frozen python scripts/publish_registries.py \
+            publish-vsix --vsix "${VSIX_FILE}" --target vscode
 
-      - name: Publish VSIX to Open VSX (when OVSX_PAT secret is set)
-        if: ${{ secrets.OVSX_PAT != '' && (github.event_name == 'push' || inputs.publish_extensions) }}
+      - name: Publish VSIX to Open VSX (env-scoped OVSX_PAT, never argv)
+        if: ${{ secrets.OVSX_PAT != '' }}
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
-          npx --yes ovsx@0.10.1 publish merged-dist/*.vsix -p "$OVSX_PAT"
+          VSIX_FILE="$(find dist-packages -maxdepth 1 -name '*.vsix' | head -n 1)"
+          uv run --no-dev --frozen python scripts/publish_registries.py \
+            publish-vsix --vsix "${VSIX_FILE}" --target ovsx
 
-      - name: Publish Browser Web Clipper to Chrome Web Store, Edge Add-ons & Firefox AMO (when configured)
-        if: ${{ (secrets.CWS_CLIENT_ID != '' || secrets.EDGE_API_KEY != '' || secrets.AMO_JWT_SECRET != '') && (github.event_name == 'push' || inputs.publish_extensions) }}
+      - name: Publish Browser Web Clipper to Chrome Web Store, Edge Add-ons & Firefox AMO
+        if: ${{ secrets.CWS_CLIENT_ID != '' || secrets.EDGE_API_KEY != '' || secrets.AMO_JWT_SECRET != '' }}
         env:
           CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
           CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
           CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
           CWS_EXTENSION_ID: ${{ secrets.CWS_EXTENSION_ID }}
+          CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
           EDGE_PRODUCT_ID: ${{ secrets.EDGE_PRODUCT_ID }}
           EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
           EDGE_API_KEY: ${{ secrets.EDGE_API_KEY }}
           AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
           AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+          AMO_ADDON_SLUG: ${{ secrets.AMO_ADDON_SLUG }}
         run: |
-          uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python scripts/publish_registries.py \
+          CHROMIUM_ZIP="$(find dist-packages -maxdepth 1 -name 'second-brain-clipper-chromium-*.zip' | head -n 1)"
+          FIREFOX_XPI="$(find dist-packages -maxdepth 1 -name 'second-brain-clipper-firefox-*.xpi' | head -n 1)"
+          uv run --no-dev --frozen python scripts/publish_registries.py \
             publish-browser-stores \
-            --chromium-zip "$(ls merged-dist/second-brain-clipper-chromium-*.zip | head -n 1)" \
-            --firefox-xpi "$(ls merged-dist/second-brain-clipper-firefox-*.xpi | head -n 1)" \
+            --chromium-zip "${CHROMIUM_ZIP}" \
+            --firefox-xpi "${FIREFOX_XPI}" \
             --skip-missing-creds
+
+  publish-package-managers:
+    name: Update Live Homebrew Tap & Open WinGet Community PR
+    needs: [publish-release]
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && !inputs.draft && inputs.publish_registries) }}
+    runs-on: ${{ vars.SB_RELEASE_LINUX_RUNNER || 'ubuntu-latest' }}
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv & Python 3.11
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+
+      - name: Sync locked runtime environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --no-dev --python 3.11
+
+      - name: Download preserved distribution manifests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: distribution-manifests
+          path: release-manifests/manifests
 
       - name: Update Live Homebrew Tap (when HOMEBREW_TAP_TOKEN is configured)
         if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
@@ -360,8 +555,24 @@ jobs:
           HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO != '' && vars.HOMEBREW_TAP_REPO || format('{0}/homebrew-second-brain', github.repository_owner) }}
           RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
         run: |
+          TAP_DIR="$GITHUB_WORKSPACE/release-manifests/manifests/homebrew-tap"
           uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python scripts/publish_registries.py \
             publish-homebrew-tap \
             --tap-repo "${HOMEBREW_TAP_REPO}" \
-            --cask merged-dist/second-brain.rb \
+            --cask "${TAP_DIR}/Casks/second-brain.rb" \
+            --formula "${TAP_DIR}/Formula/second-brain.rb" \
+            --readme "${TAP_DIR}/README.md" \
+            --version "${RELEASE_TAG#v}"
+
+      - name: Publish WinGet Community Manifests PR (when WINGET_GITHUB_TOKEN is configured)
+        if: ${{ secrets.WINGET_GITHUB_TOKEN != '' }}
+        env:
+          WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
+          WINGET_PKGS_REPO: ${{ vars.WINGET_PKGS_REPO != '' && vars.WINGET_PKGS_REPO || 'microsoft/winget-pkgs' }}
+          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+        run: |
+          uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python scripts/publish_registries.py \
+            publish-winget-pkgs \
+            --manifest-dir "$GITHUB_WORKSPACE/release-manifests/manifests/winget-pkgs" \
+            --winget-repo "${WINGET_PKGS_REPO}" \
             --version "${RELEASE_TAG#v}"

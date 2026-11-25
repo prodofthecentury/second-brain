@@ -1223,3 +1223,8 @@ label.inline-check {
   flex: 1;
   min-height: 0;
 }
+
+/* Dual-Mode Chat vs Build Canvas (45% Chat / 55% Preview Canvas) */
+.chat-layout.build-mode-active {
+  grid-template-columns: 45fr 55fr;
+}

@@ -12,14 +12,22 @@ records for reuse by CLI, dashboard, or later MCP tools.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
 import sys
 from pathlib import Path
 
-from config import ATOMS_DIR, is_content_markdown
+from config import (
+    ATOMS_DIR,
+    is_content_markdown,
+    resolve_module_vault_path,
+    snapshot_module_defaults,
+)
 from memory_format import split_frontmatter
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
 
 DEFAULT_STATUS = "pending"
@@ -28,6 +36,8 @@ REVIEW_STATUSES = {"pending", "accepted", "needs_edit", "rejected", "merged"}
 
 def _strip_yaml_comment(raw: str) -> str:
     """Strip a YAML `# ...` comment only when `#` is outside quotes and preceded by whitespace (or at start)."""
+    if "#" not in raw:
+        return raw
     in_single = False
     in_double = False
     i = 0
@@ -324,6 +334,21 @@ def _fold_block_scalar(block_lines: list[str], style: str, chomp: str) -> str:
     return joined.rstrip("\r\n")
 
 
+_FM_LIST_RE = re.compile(r"^\s*-\s*(.*)$")
+_FM_KEY_GUARD_RE = re.compile(r"^[A-Za-z0-9_-]+:(?:\s|$)")
+_FM_KV_RE = re.compile(r"^([A-Za-z0-9_-]+):(?:\s+(.*)|\s*)$")
+_FM_BLOCK_RE = re.compile(r"^([|>])([+-]?)$")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+@functools.lru_cache(maxsize=64)
+def _section_pattern(heading: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"^##\s+{re.escape(heading)}\s*\n(.*?)(?=^##\s+|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+
+
 def parse_frontmatter_values(lines: list[str]) -> dict:
     values: dict[str, str | list[str]] = {}
     current_key: str | None = None
@@ -337,8 +362,8 @@ def parse_frontmatter_values(lines: list[str]) -> dict:
             i += 1
             continue
 
-        list_match = re.match(r"^\s*-\s*(.*)$", line)
-        if list_match and current_key and not re.match(r"^[A-Za-z0-9_-]+:(?:\s|$)", line):
+        list_match = _FM_LIST_RE.match(line)
+        if list_match and current_key and not _FM_KEY_GUARD_RE.match(line):
             values.setdefault(current_key, [])
             if isinstance(values[current_key], list):
                 raw_item = list_match.group(1)
@@ -349,7 +374,7 @@ def parse_frontmatter_values(lines: list[str]) -> dict:
             i += 1
             continue
 
-        match = re.match(r"^([A-Za-z0-9_-]+):(?:\s+(.*)|\s*)$", line)
+        match = _FM_KV_RE.match(line)
         if not match:
             current_key = None
             i += 1
@@ -365,7 +390,7 @@ def parse_frontmatter_values(lines: list[str]) -> dict:
             i += 1
             continue
 
-        block_match = re.match(r"^([|>])([+-]?)$", clean_val)
+        block_match = _FM_BLOCK_RE.match(clean_val)
         if block_match:
             style, chomp = block_match.group(1), block_match.group(2)
             i += 1
@@ -400,14 +425,10 @@ def parse_frontmatter_values(lines: list[str]) -> dict:
 
 
 def section_text(body: str, heading: str) -> str:
-    pattern = re.compile(
-        rf"^##\s+{re.escape(heading)}\s*\n(.*?)(?=^##\s+|\Z)",
-        re.MULTILINE | re.DOTALL,
-    )
-    match = pattern.search(body or "")
+    match = _section_pattern(heading).search(body or "")
     if not match:
         return ""
-    return re.sub(r"\s+", " ", match.group(1)).strip()
+    return _WHITESPACE_RE.sub(" ", match.group(1)).strip()
 
 
 def normalize_status(status: str | None) -> str:
@@ -474,16 +495,17 @@ def parse_atom_record(path: str | Path) -> dict:
     return parse_atom_record_text(atom_path.name, content)
 
 
-def list_review_queue(atoms_dir: str = ATOMS_DIR, statuses: set[str] | None = None) -> list[dict]:
+def list_review_queue(atoms_dir: str | None = None, statuses: set[str] | None = None) -> list[dict]:
+    eff_atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
     wanted = {normalize_status(status) for status in (statuses or {DEFAULT_STATUS})}
     records = []
-    if not os.path.isdir(atoms_dir):
+    if not os.path.isdir(eff_atoms_dir):
         return records
 
-    for filename in sorted(os.listdir(atoms_dir)):
+    for filename in sorted(os.listdir(eff_atoms_dir)):
         if not is_content_markdown(filename):
             continue
-        path = os.path.join(atoms_dir, filename)
+        path = os.path.join(eff_atoms_dir, filename)
         try:
             record = parse_atom_record(path)
         except Exception as exc:
@@ -537,7 +559,7 @@ def parse_statuses(value: str) -> set[str]:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="List Second Brain memory atoms by review status.")
-    parser.add_argument("--atoms-dir", default=ATOMS_DIR, help="Directory containing atom Markdown files.")
+    parser.add_argument("--atoms-dir", default=None, help="Directory containing atom Markdown files.")
     parser.add_argument(
         "--status",
         default=DEFAULT_STATUS,

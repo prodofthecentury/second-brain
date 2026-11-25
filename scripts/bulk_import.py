@@ -46,6 +46,7 @@ from notes_store import (  # noqa: E402
     NotePaths,
     _O_BINARY,
     _clean_tags,
+    _resolve_note_paths,
     parse_note,
     render_note,
     slugify,
@@ -197,12 +198,13 @@ def _archive_imported_binary(src: Path, src_sha: str, brain: Path) -> str:
 def import_folder(
     source_root: str | Path,
     *,
-    paths: NotePaths = DEFAULT_PATHS,
+    paths: NotePaths | None = None,
     tags: tuple[str, ...] = (),
     dry_run: bool = False,
     overwrite_modified: bool = False,
     progress=None,
 ) -> ImportStats:
+    paths = _resolve_note_paths(paths)
     expanded_source = Path(source_root).expanduser()
     if _is_reparse_or_link(str(expanded_source)) or _is_reparse_or_link(str(paths.notes_dir)):
         raise PermissionError("Refusing to import from or into a symlink/junction directory.")
@@ -375,11 +377,13 @@ def import_folder(
 def import_file(
     source_file: str | Path,
     *,
-    paths: NotePaths = DEFAULT_PATHS,
+    paths: NotePaths | None = None,
     tags: tuple[str, ...] = (),
 ) -> dict:
     """Import a single local Markdown/text/PDF/DOCX/EPUB/HTML/CSV document into working notes."""
     from notes_store import create_note
+
+    paths = _resolve_note_paths(paths)
 
     if _is_reparse_or_link(str(Path(source_file).expanduser())) or _is_reparse_or_link(str(paths.notes_dir)):
         raise PermissionError("Refusing to import from or into a symlink/junction path.")

@@ -224,7 +224,7 @@
       },
       {
         "command": "secondBrain.mobileInboxDrop",
-        "title": "Second Brain: Mobile E2EE Inbox Drop (Pair PWA / Pull Drops / Revoke)"
+        "title": "Second Brain: Mobile E2EE Inbox Drop (Pair PWA / Recall Export / Pull Drops / Revoke)"
       },
       {
         "command": "secondBrain.ingestMedia",
@@ -248,11 +248,35 @@
       },
       {
         "command": "secondBrain.manageExecutableSkills",
-        "title": "Second Brain: Stage 4 Executable Skills (Promote / Execute in Sandbox / Kill-Switch / Audit)"
+        "title": "Second Brain: Stage 4 Executable Skills (Promote / Execute in Sandbox / Revoke / Kill-Switch / Audit)"
       },
       {
         "command": "secondBrain.mobileVaultClient",
         "title": "Second Brain: Full Mobile Vault Client (Pair iOS/Android App / Export Bundle / Revoke)"
+      },
+      {
+        "command": "secondBrain.bulkImport",
+        "title": "Second Brain: Bulk Import Notes / Transcripts (Folder or File)"
+      },
+      {
+        "command": "secondBrain.manageScout",
+        "title": "Second Brain: Active Web Scout (Queue URL / Run Discovery)"
+      },
+      {
+        "command": "secondBrain.runOperatorJob",
+        "title": "Second Brain: Run Maintenance Job (Refinery / Editor / Doctor)"
+      },
+      {
+        "command": "secondBrain.openKnowledgeGraph",
+        "title": "Second Brain: Knowledge Graph Visualizer (Bi-Temporal Scrubber)"
+      },
+      {
+        "command": "secondBrain.manageWorkspaces",
+        "title": "Second Brain: Workspaces & Federated Recall (Multi-Vault)"
+      },
+      {
+        "command": "secondBrain.manageHostPolicies",
+        "title": "Second Brain: Sharing & Host Privacy Policies"
       },
       {
         "command": "secondBrain.generateCreativeImage",
@@ -446,6 +470,12 @@
           "default": "",
           "scope": "application",
           "description": "Optional explicit path to the local Second Brain owner token file (user/application scope only)."
+        },
+        "secondBrain.enablePredictiveContextSignal": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Emit debounced active filename stem and project scope signals to the local Predictive Memory Bus (/v1/cognitive/context-signal) to warm L0 recall without sending file contents."
         }
       }
     }

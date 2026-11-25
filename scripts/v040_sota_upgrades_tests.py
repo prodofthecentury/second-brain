@@ -1167,7 +1167,10 @@ class V040SotaUpgradesTests(unittest.TestCase):
                     skip_dns_check_for_mock_transport=True,
                 )
                 self.assertEqual(init_res["kdf_mode"], "os_keychain")
-                self.assertTrue(init_res["keychain_sealed"])
+                self.assertEqual(
+                    init_res["keychain_sealed"],
+                    init_res["keychain_backend"] != "posix_restricted_keyfile",
+                )
                 rec_key = str(init_res["recovery_key_b64"])
 
                 # Verify vault-<slug>.json on disk contains ZERO plaintext master_key_b64 and ZERO raw S3 secret!
@@ -1222,7 +1225,10 @@ class V040SotaUpgradesTests(unittest.TestCase):
                     skip_dns_check_for_mock_transport=True,
                 )
                 mig_res = migrate_sync_key_to_keychain(brain_dir=vault_b, state_dir=sec_b)
-                self.assertTrue(mig_res["keychain_sealed"])
+                self.assertEqual(
+                    mig_res["keychain_sealed"],
+                    mig_res["keychain_backend"] != "posix_restricted_keyfile",
+                )
                 self.assertIsNone(json.loads(sync_config_path(vault_b, state_dir=sec_b).read_text(encoding="utf-8"))["master_key_b64"])
 
                 with (

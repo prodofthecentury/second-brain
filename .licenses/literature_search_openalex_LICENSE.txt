@@ -1,0 +1,3 @@
+OpenAlex API Terms of Use Notification
+Timestamp: 2026-11-23T19:29:30+13:00
+Notice: Please review OpenAlex Terms of Use at https://help.openalex.org/ and verify the license of each retrieved paper for any reuse or redistribution restrictions.

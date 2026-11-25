@@ -12,6 +12,9 @@ const PageHelper =
 const ChatHelper =
   (typeof window !== "undefined" && window.SecondBrainChatState) ||
   (typeof require === "function" ? require("./chat_state") : null);
+const BuildHelper =
+  (typeof window !== "undefined" && window.SecondBrainBuildCanvas) ||
+  (typeof require === "function" ? require("./build_canvas") : null);
 const GraphHelper =
   (typeof window !== "undefined" && window.SecondBrainGraph) ||
   (typeof require === "function" ? require("./graph") : null);
@@ -575,6 +578,7 @@ function switchView(name) {
   if (name === "planner") {
     loadPlannerView();
     loadExecutableSkills();
+    loadGen4Workbench();
   }
   if (name === "proof") loadProofView();
   if (name === "graph") loadGraphView();
@@ -602,6 +606,47 @@ function applyShortcutStatus(st) {
   }
 }
 
+function resetActiveVaultUiState() {
+  activeNote = null;
+  activeVaultDoc = null;
+  notesCache = [];
+  const titleEl = document.getElementById("noteTitleInput");
+  const tagsEl = document.getElementById("noteTagsInput");
+  const bodyEl = document.getElementById("noteBodyInput");
+  const bannerEl = document.getElementById("notesBanner");
+  if (titleEl) titleEl.value = "";
+  if (tagsEl) tagsEl.value = "";
+  if (bodyEl) bodyEl.value = "";
+  if (bannerEl) bannerEl.textContent = "Switched vault — select a note or create a new one.";
+  if (typeof setNoteBaseline === "function") setNoteBaseline("", "", "");
+  if (typeof renderBacklinksBar === "function") renderBacklinksBar([]);
+  if (typeof renderNotePreview === "function") renderNotePreview();
+  if (typeof renderActiveVaultDocument === "function") renderActiveVaultDocument();
+  document
+    .querySelectorAll(".note-item.active")
+    .forEach((n) => n.classList.remove("active"));
+}
+
+function refreshActiveViewForCurrentVault() {
+  loadChatHosts();
+  loadDaemonStatus();
+  loadGitHookStatus();
+  loadMobileVaultClient();
+  loadExecutableSkills();
+  loadCreativeMediaStudio();
+  if (activeView === "review") loadReviewQueue();
+  if (activeView === "import") loadScoutQueue();
+  if (activeView === "ide") loadIdeStatus();
+  if (activeView === "system") loadSystemView();
+  if (activeView === "planner") {
+    loadPlannerView();
+    loadGen4Workbench();
+  }
+  if (activeView === "proof") loadProofView();
+  if (activeView === "graph") loadGraphView();
+  if (activeView === "vault") loadVaultBrowser({ append: false });
+}
+
 function handleBackendStatus(st) {
   if (!st) return;
   applyShortcutStatus(st);
@@ -617,15 +662,8 @@ function handleBackendStatus(st) {
     startupBanner.className = "startup-banner";
     refreshHealth();
     loadNotes({ append: false });
-    loadChatHosts();
-    if (activeView === "review") loadReviewQueue();
-    if (activeView === "import") loadScoutQueue();
-    if (activeView === "ide") loadIdeStatus();
-    if (activeView === "system") loadSystemView();
-    if (activeView === "planner") loadPlannerView();
-    if (activeView === "proof") loadProofView();
-    if (activeView === "graph") loadGraphView();
-    if (activeView === "vault") loadVaultBrowser({ append: false });
+    loadWorkspaces();
+    refreshActiveViewForCurrentVault();
   } else if (st.state === "bootstrapping" || st.state === "starting") {
     dot.style.background = "#d29922";
     dot.style.boxShadow = "0 0 10px rgba(210, 153, 34, 0.55)";
@@ -906,6 +944,15 @@ async function openNote(filename, { skipDirtyPrompt = false } = {}) {
 
   document.querySelectorAll(".note-item").forEach((node) => {
     node.classList.toggle("active", node.dataset.filename === filename);
+  });
+
+  const noteProjTag = Array.isArray(activeNote?.tags)
+    ? activeNote.tags.find((t) => String(t || "").toLowerCase().startsWith("project:")) || ""
+    : "";
+  emitCognitiveContextSignal({
+    activeFile: activeNote?.filename || filename,
+    projectScope: noteProjTag,
+    cursorTopic: titleVal || filename,
   });
 }
 
@@ -1573,6 +1620,117 @@ function buildTurnVerifiedClaimsCards(turn) {
   return wrap;
 }
 
+const debateBriefsByTurnId = new Map();
+
+function buildTurnDebateBriefCard(turn) {
+  const brief = turn?.debateBrief || debateBriefsByTurnId.get(turn?.id);
+  if (!brief || typeof brief !== "object") return null;
+
+  const wrap = el("div", "card");
+  wrap.style.marginTop = "8px";
+  wrap.style.gap = "8px";
+
+  const hdr = el("div", "toolbar");
+  hdr.appendChild(el("strong", "", "Two-Sided Debate Brief"));
+  if (brief.topic) {
+    hdr.appendChild(el("span", "badge", `Topic: ${String(brief.topic).slice(0, 64)}`));
+  }
+  const contras = Array.isArray(brief.contradictions_detected)
+    ? brief.contradictions_detected
+    : [];
+  hdr.appendChild(
+    el(
+      "span",
+      `badge ${contras.length > 0 ? "warn" : "ok"}`,
+      `${contras.length} contradiction(s) detected`
+    )
+  );
+  wrap.appendChild(hdr);
+
+  const grid = el("div");
+  grid.style.display = "grid";
+  grid.style.gridTemplateColumns = "repeat(auto-fit, minmax(230px, 1fr))";
+  grid.style.gap = "10px";
+
+  const buildSideCol = (sideObj, fallbackTitle, badgeCls) => {
+    const col = el("div", "sub-panel");
+    col.style.display = "flex";
+    col.style.flexDirection = "column";
+    col.style.gap = "6px";
+
+    const sideHdr = el("div", "toolbar");
+    sideHdr.appendChild(el("span", `badge ${badgeCls}`, sideObj?.label || fallbackTitle));
+    const claims = Array.isArray(sideObj?.claims) ? sideObj.claims : [];
+    sideHdr.appendChild(el("span", "note-item-meta", `${claims.length} claim(s)`));
+    col.appendChild(sideHdr);
+
+    if (!claims.length) {
+      col.appendChild(el("div", "note-item-meta", "No matching verified claims on this side."));
+    } else {
+      for (const c of claims) {
+        const item = el("div", "claim-card");
+        const top = el("div", "toolbar");
+        if (c.filename) {
+          const pill = el("button", "pill clickable", c.filename);
+          pill.type = "button";
+          pill.onclick = (evt) => {
+            evt.stopPropagation();
+            openAtomInspectorModal(c.filename, c);
+          };
+          top.appendChild(pill);
+        }
+        if (c.role_reason) {
+          top.appendChild(el("span", "badge", c.role_reason));
+        }
+        if (c.confidence) {
+          top.appendChild(el("span", "badge mono", `conf:${c.confidence}`));
+        }
+        item.appendChild(top);
+        item.appendChild(el("div", "", c.claim || "(empty claim)"));
+        if (Array.isArray(c.contexts) && c.contexts.length) {
+          item.appendChild(el("div", "note-item-meta", `Contexts: ${c.contexts.join(", ")}`));
+        }
+        col.appendChild(item);
+      }
+    }
+
+    const failures = Array.isArray(sideObj?.related_failures) ? sideObj.related_failures : [];
+    if (failures.length) {
+      col.appendChild(el("div", "field-label", `Historical Failure Warnings (${failures.length}):`));
+      for (const f of failures) {
+        col.appendChild(
+          el(
+            "div",
+            "note-item-meta",
+            `⚠ ${f.experience || "experience"}: ${f.excerpt || ""}`
+          )
+        );
+      }
+    }
+    return col;
+  };
+
+  grid.appendChild(buildSideCol(brief.thesis, "Thesis (Supporting)", "ok"));
+  grid.appendChild(buildSideCol(brief.antithesis, "Antithesis (Conflicting / Cautionary)", "warn"));
+  wrap.appendChild(grid);
+
+  const actions = Array.isArray(brief.owner_adjudication_actions)
+    ? brief.owner_adjudication_actions
+    : [];
+  if (actions.length) {
+    const actRow = el("div", "toolbar");
+    actRow.appendChild(el("span", "field-label", "Owner Adjudication Options:"));
+    for (const act of actions) {
+      const tag = el("span", "badge", act.label || act.action || "Option");
+      if (act.description) tag.title = String(act.description);
+      actRow.appendChild(tag);
+    }
+    wrap.appendChild(actRow);
+  }
+
+  return wrap;
+}
+
 function buildChatTurnCard(turn, isSelected) {
   const card = el("div", `chat-turn-card${isSelected ? " selected" : ""}`);
   card.dataset.turnId = turn.id;
@@ -1633,6 +1791,9 @@ function buildChatTurnCard(turn, isSelected) {
   const verifiedWrap = buildTurnVerifiedClaimsCards(turn);
   if (verifiedWrap) card.appendChild(verifiedWrap);
 
+  const debateCard = buildTurnDebateBriefCard(turn);
+  if (debateCard) card.appendChild(debateCard);
+
   const leadsCard = buildTurnResearchLeadsWarningCard(turn);
   if (leadsCard) card.appendChild(leadsCard);
 
@@ -1662,6 +1823,7 @@ function renderAllChatTurns() {
       buildChatTurnCard(t, Boolean(selected && selected.id === t.id))
     );
   }
+  refreshBuildCanvasFromTurn(selected);
 }
 
 if (window.secondBrain && typeof window.secondBrain.onChatEvent === "function") {
@@ -1684,6 +1846,13 @@ if (window.secondBrain && typeof window.secondBrain.onChatEvent === "function") 
         chatWarningEl.style.display = "none";
       }
       renderChatSourceCards(turn);
+    } else if (resolvedEvent === "debate_brief") {
+      const briefObj = data.brief && typeof data.brief === "object" ? data.brief : data;
+      turn.debateBrief = briefObj;
+      debateBriefsByTurnId.set(turn.id, briefObj);
+      const tCount = Array.isArray(briefObj?.thesis?.claims) ? briefObj.thesis.claims.length : 0;
+      const aCount = Array.isArray(briefObj?.antithesis?.claims) ? briefObj.antithesis.claims.length : 0;
+      chatBannerEl.textContent = `Assembled Debate Brief: ${tCount} thesis vs ${aCount} antithesis claim(s).`;
     } else if (resolvedEvent === "cancelled") {
       chatBannerEl.textContent = "Chat stream cancelled.";
       setChatStreamingState(false);
@@ -1760,6 +1929,11 @@ async function sendChat() {
     ),
     as_of: document.getElementById("chatAsOfInput")?.value || "",
     thread_id: activeTid,
+    work_mode: activeWorkMode,
+    persona_id: activePersonaId,
+    behavior_mode: document.getElementById("behaviorModeSelect")?.value || "autopilot",
+    custom_rules: document.getElementById("chatCustomRulesInput")?.value || "",
+    done_criteria: document.getElementById("chatDoneCriteriaInput")?.value || "",
     history: priorHistory,
   });
 
@@ -1823,6 +1997,7 @@ document
     activeStreamingTurnId = null;
     setChatStreamingState(false);
     chatSession.clearHistory();
+    debateBriefsByTurnId.clear();
     chatWarningEl.style.display = "none";
     chatSourcesEl.replaceChildren();
     if (chatSourcesHeaderEl) {
@@ -1841,6 +2016,7 @@ if (chatThreadSelEl) {
     const tid = chatThreadSelEl.value;
     if (!tid) {
       chatSession.clearHistory();
+      debateBriefsByTurnId.clear();
       chatSession.setThreadId("");
       renderAllChatTurns();
       chatSourcesEl.replaceChildren();
@@ -1851,7 +2027,9 @@ if (chatThreadSelEl) {
       showToast(apiErrorMessage(res, "Could not load chat thread"), "danger");
       return;
     }
+    debateBriefsByTurnId.clear();
     const count = chatSession.loadThreadTurns(res.data || {});
+    applyThreadBuildSettings(res.data || {});
     renderAllChatTurns();
     renderChatSourceCards(chatSession.getSelectedTurn());
     chatBannerEl.textContent = `Loaded thread '${res.data?.title || tid}' (${count} turn(s)).`;
@@ -1869,6 +2047,11 @@ if (chatNewThreadBtnEl) {
       project_scope: scope,
       host_id,
       mode,
+      work_mode: activeWorkMode,
+      persona_id: activePersonaId,
+      behavior_mode: document.getElementById("behaviorModeSelect")?.value || "autopilot",
+      custom_rules: document.getElementById("chatCustomRulesInput")?.value || "",
+      done_criteria: document.getElementById("chatDoneCriteriaInput")?.value || "",
     });
     if (!res.ok) {
       showToast(apiErrorMessage(res, "Could not create chat thread"), "danger");
@@ -1886,6 +2069,435 @@ if (chatNewThreadBtnEl) {
     showToast("Started new multi-turn chat thread", "ok");
   });
 }
+
+// ── Dual-Mode Chat vs Build Canvas, Personas & Per-Chat Rules ──
+let activeWorkMode = "chat";
+let activePersonaId = "grounded_default";
+let activeRightPaneTab = "sources";
+let lastExtractedArtifacts = { files: [], entryHtml: "", cssBundle: "", jsBundle: "", hasPreviewableHtml: false };
+let lastPreviewSrcdoc = "";
+let buildPreviewDebounceTimer = null;
+
+function applyBuildPreviewSrcdoc(nextSrcdoc) {
+  const previewFrame = document.getElementById("buildPreviewFrame");
+  if (!previewFrame) return;
+  const normalized = String(nextSrcdoc || "");
+  if (normalized === lastPreviewSrcdoc) return;
+  lastPreviewSrcdoc = normalized;
+  previewFrame.srcdoc = normalized;
+}
+
+const personaChipEls = [
+  document.getElementById("personaChipGrounded"),
+  document.getElementById("personaChipCoding"),
+  document.getElementById("personaChipWebsite"),
+  document.getElementById("personaChipApp"),
+  document.getElementById("personaChipGame"),
+].filter(Boolean);
+
+function setRightPaneTab(tabName) {
+  activeRightPaneTab = tabName;
+  const sourcesPane = document.getElementById("chatSourcesPane");
+  const buildPane = document.getElementById("buildCanvasPane");
+  const previewFrame = document.getElementById("buildPreviewFrame");
+  const previewNote = document.getElementById("buildPreviewEmptyNote");
+  const filesView = document.getElementById("buildFilesView");
+  const critiqueView = document.getElementById("buildCritiqueView");
+
+  const tabBtns = {
+    sources: document.getElementById("buildPaneTabsSourcesBtn"),
+    preview: document.getElementById("buildPaneTabsPreviewBtn"),
+    files: document.getElementById("buildPaneTabsFilesBtn"),
+    critique: document.getElementById("buildPaneTabsCritiqueBtn"),
+  };
+  for (const [key, btn] of Object.entries(tabBtns)) {
+    if (btn) btn.classList.toggle("primary", key === tabName);
+  }
+  if (sourcesPane) sourcesPane.style.display = tabName === "sources" ? "flex" : "none";
+  if (buildPane) buildPane.style.display = tabName === "sources" ? "none" : "flex";
+  if (previewFrame) previewFrame.style.display = tabName === "preview" ? "block" : "none";
+  if (previewNote) previewNote.style.display = tabName === "preview" ? "block" : "none";
+  if (filesView) filesView.style.display = tabName === "files" ? "flex" : "none";
+  if (critiqueView) critiqueView.style.display = tabName === "critique" ? "flex" : "none";
+}
+
+function setWorkMode(workMode, { autoSwitchTab = true } = {}) {
+  activeWorkMode = workMode === "build" ? "build" : "chat";
+  const gridEl = document.getElementById("chatLayoutGrid");
+  const chatBtn = document.getElementById("workModeChatBtn");
+  const buildBtn = document.getElementById("workModeBuildBtn");
+  if (gridEl) gridEl.classList.toggle("build-mode-active", activeWorkMode === "build");
+  if (chatBtn) chatBtn.classList.toggle("primary", activeWorkMode === "chat");
+  if (buildBtn) buildBtn.classList.toggle("primary", activeWorkMode === "build");
+  if (autoSwitchTab) {
+    setRightPaneTab(activeWorkMode === "build" ? "preview" : "sources");
+  }
+}
+
+function selectPersonaChip(personaId, { syncWorkMode = true } = {}) {
+  const pid = String(personaId || "grounded_default");
+  activePersonaId = pid;
+  for (const chip of personaChipEls) {
+    chip.classList.toggle("primary", chip.dataset.personaId === pid);
+  }
+  if (syncWorkMode && BuildHelper && Array.isArray(BuildHelper.PERSONA_CHIPS)) {
+    const found = BuildHelper.PERSONA_CHIPS.find((p) => p.id === pid);
+    if (found) {
+      setWorkMode(found.defaultWorkMode, { autoSwitchTab: true });
+    }
+  }
+}
+
+function applyThreadBuildSettings(threadDoc) {
+  if (!threadDoc || typeof threadDoc !== "object") return;
+  if (threadDoc.persona_id) {
+    selectPersonaChip(threadDoc.persona_id, { syncWorkMode: false });
+  }
+  if (threadDoc.work_mode) {
+    setWorkMode(threadDoc.work_mode, { autoSwitchTab: false });
+  }
+  const behSel = document.getElementById("behaviorModeSelect");
+  if (behSel && threadDoc.behavior_mode) {
+    behSel.value = threadDoc.behavior_mode;
+  }
+  const rulesEl = document.getElementById("chatCustomRulesInput");
+  if (rulesEl) rulesEl.value = String(threadDoc.custom_rules || "");
+  const doneEl = document.getElementById("chatDoneCriteriaInput");
+  if (doneEl) doneEl.value = String(threadDoc.done_criteria || "");
+}
+
+function refreshBuildCanvasFromTurn(turn) {
+  if (!BuildHelper) return;
+  const markdown = turn ? String(turn.assistantText || "") : "";
+  const extracted = BuildHelper.extractArtifactFiles(markdown);
+  lastExtractedArtifacts = extracted;
+
+  const previewFrame = document.getElementById("buildPreviewFrame");
+  if (previewFrame) {
+    const title = turn?.query ? turn.query.slice(0, 60) : "Second Brain Build Preview";
+    if (turn && turn.status === "streaming") {
+      if (extracted.hasPreviewableHtml) {
+        const nextDoc = BuildHelper.buildSandboxedPreviewDocument(extracted, { title });
+        if (nextDoc !== lastPreviewSrcdoc) {
+          if (buildPreviewDebounceTimer) clearTimeout(buildPreviewDebounceTimer);
+          buildPreviewDebounceTimer = setTimeout(() => {
+            buildPreviewDebounceTimer = null;
+            applyBuildPreviewSrcdoc(nextDoc);
+          }, 500);
+        }
+      }
+    } else {
+      if (buildPreviewDebounceTimer) {
+        clearTimeout(buildPreviewDebounceTimer);
+        buildPreviewDebounceTimer = null;
+      }
+      const nextDoc = BuildHelper.buildSandboxedPreviewDocument(extracted, { title });
+      applyBuildPreviewSrcdoc(nextDoc);
+    }
+  }
+
+  const filesSel = document.getElementById("buildFilesSelect");
+  const filePre = document.getElementById("buildFileContentPre");
+  if (filesSel && filePre) {
+    const prevName = filesSel.value;
+    filesSel.replaceChildren();
+    if (!extracted.files.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(No fenced code artifacts in selected turn)";
+      filesSel.appendChild(opt);
+      filePre.textContent = "";
+    } else {
+      for (const f of extracted.files) {
+        const opt = document.createElement("option");
+        opt.value = f.filename;
+        opt.textContent = `${f.filename} (${f.lang}, ${f.content.length} chars)`;
+        filesSel.appendChild(opt);
+      }
+      const chosen = extracted.files.find((f) => f.filename === prevName) || extracted.files[0];
+      filesSel.value = chosen.filename;
+      filePre.textContent = chosen.content;
+    }
+  }
+  if (activeWorkMode === "build" && extracted.hasPreviewableHtml && activeRightPaneTab === "sources") {
+    setRightPaneTab("preview");
+  }
+}
+
+document.getElementById("workModeChatBtn")?.addEventListener("click", () => setWorkMode("chat"));
+document.getElementById("workModeBuildBtn")?.addEventListener("click", () => setWorkMode("build"));
+document.getElementById("buildPaneTabsSourcesBtn")?.addEventListener("click", () => setRightPaneTab("sources"));
+document.getElementById("buildPaneTabsPreviewBtn")?.addEventListener("click", () => setRightPaneTab("preview"));
+document.getElementById("buildPaneTabsFilesBtn")?.addEventListener("click", () => setRightPaneTab("files"));
+document.getElementById("buildPaneTabsCritiqueBtn")?.addEventListener("click", () => setRightPaneTab("critique"));
+
+for (const chip of personaChipEls) {
+  chip.addEventListener("click", () => selectPersonaChip(chip.dataset.personaId || "grounded_default"));
+}
+
+document.getElementById("toggleBuildRulesBtn")?.addEventListener("click", () => {
+  const drawer = document.getElementById("buildRulesDrawer");
+  if (drawer) {
+    drawer.style.display = drawer.style.display === "none" ? "flex" : "none";
+  }
+});
+
+document.getElementById("saveThreadRulesBtn")?.addEventListener("click", async () => {
+  const tid = chatSession.getThreadId() || document.getElementById("chatThreadSelect")?.value || "";
+  if (!tid) {
+    showToast("Rules saved for this local session (create/select a persistent thread to save to vault sidecar).", "ok");
+    return;
+  }
+  const res = await window.secondBrain.request("PATCH", `/v1/chat/threads/${encodeURIComponent(tid)}`, {
+    work_mode: activeWorkMode,
+    persona_id: activePersonaId,
+    behavior_mode: document.getElementById("behaviorModeSelect")?.value || "autopilot",
+    custom_rules: document.getElementById("chatCustomRulesInput")?.value || "",
+    done_criteria: document.getElementById("chatDoneCriteriaInput")?.value || "",
+  });
+  if (res.ok) {
+    showToast("Saved per-thread Build Mode rules & DoD.", "ok");
+  } else {
+    showToast(apiErrorMessage(res, "Failed to save thread rules"), "danger");
+  }
+});
+
+document.getElementById("buildFilesSelect")?.addEventListener("change", (e) => {
+  const filePre = document.getElementById("buildFileContentPre");
+  const found = (lastExtractedArtifacts.files || []).find((f) => f.filename === e.target.value);
+  if (filePre) filePre.textContent = found ? found.content : "";
+});
+
+document.getElementById("buildCritiqueRunBtn")?.addEventListener("click", async () => {
+  if (!BuildHelper) return;
+  setRightPaneTab("critique");
+  const outEl = document.getElementById("buildCritiqueOutput");
+  if (!outEl) return;
+  outEl.replaceChildren(el("div", "note-item-meta", "Running 5-Panelist Design Critique..."));
+  let critiqueData = null;
+  const apiRes = await window.secondBrain.request("POST", "/v1/design/critique", {
+    files: lastExtractedArtifacts.files || [],
+    persona_id: activePersonaId,
+    done_criteria: document.getElementById("chatDoneCriteriaInput")?.value || "",
+  });
+  if (apiRes.ok && apiRes.data && Array.isArray(apiRes.data.panels)) {
+    critiqueData = apiRes.data;
+  } else {
+    critiqueData = BuildHelper.runLocalDesignCritiquePreview(lastExtractedArtifacts);
+  }
+  outEl.replaceChildren();
+  for (const p of critiqueData.panels || []) {
+    const item = el("div", "card", "");
+    item.appendChild(el("strong", "", `${p.panel} (${p.score}/5)`));
+    item.appendChild(el("div", "note-item-meta", p.note || p.findings || ""));
+    outEl.appendChild(item);
+  }
+});
+
+document.getElementById("buildExportFolderBtn")?.addEventListener("click", async () => {
+  const files = lastExtractedArtifacts.files || [];
+  if (!files.length) {
+    showToast("No extracted code files in the selected turn to export.", "warn");
+    return;
+  }
+  if (!window.secondBrain || typeof window.secondBrain.exportBuildArtifacts !== "function") {
+    showToast("Desktop folder export bridge unavailable.", "danger");
+    return;
+  }
+  const exp = await window.secondBrain.exportBuildArtifacts(files);
+  if (exp && exp.ok) {
+    showToast(`Exported ${(exp.written || []).length} file(s) to ${exp.directory}`, "ok");
+  } else if (!exp?.cancelled) {
+    showToast(exp?.error || "Artifact export failed", "danger");
+  }
+});
+
+refreshBuildCanvasFromTurn(null);
+
+// ── Offline Two-Way Voice Loop (Whisper STT + Kokoro-82M ONNX TTS) ──
+let activeVoiceAudio = null;
+let activeVoiceAudioUrl = "";
+let activeMediaRecorder = null;
+let activeMediaStream = null;
+let activeRecordedChunks = [];
+
+function stopVoicePlayback() {
+  if (activeVoiceAudio) {
+    try {
+      activeVoiceAudio.pause();
+      activeVoiceAudio.src = "";
+    } catch {}
+    activeVoiceAudio = null;
+  }
+  if (activeVoiceAudioUrl) {
+    try {
+      URL.revokeObjectURL(activeVoiceAudioUrl);
+    } catch {}
+    activeVoiceAudioUrl = "";
+  }
+  const stopBtn = document.getElementById("chatStopVoiceBtn");
+  if (stopBtn) stopBtn.disabled = true;
+}
+
+function playBase64WavAudio(audioB64) {
+  if (!audioB64) return;
+  stopVoicePlayback();
+  const bin = atob(String(audioB64));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: "audio/wav" });
+  activeVoiceAudioUrl = URL.createObjectURL(blob);
+  const audio = new Audio(activeVoiceAudioUrl);
+  activeVoiceAudio = audio;
+  const stopBtn = document.getElementById("chatStopVoiceBtn");
+  if (stopBtn) stopBtn.disabled = false;
+  audio.addEventListener("ended", () => stopVoicePlayback());
+  audio.addEventListener("error", () => stopVoicePlayback());
+  audio.play().catch((err) => {
+    stopVoicePlayback();
+    showToast(`Voice playback error: ${err?.message || err}`, "warn");
+  });
+}
+
+document.getElementById("chatStopVoiceBtn")?.addEventListener("click", () => {
+  stopVoicePlayback();
+  showToast("Stopped spoken playback.", "ok");
+});
+
+document.getElementById("chatReadAloudBtn")?.addEventListener("click", async () => {
+  const sel = chatSession.getSelectedTurn();
+  const textToSpeak = sel && sel.assistantText ? sel.assistantText.trim() : "";
+  if (!textToSpeak) {
+    showToast("Ask or select an assistant answer first to speak aloud.", "warn");
+    return;
+  }
+  const res = await window.secondBrain.request("POST", "/v1/voice/speak", {
+    text: textToSpeak.slice(0, 8000),
+    voice: "af_heart",
+    speed: 1.0,
+  });
+  if (!res.ok) {
+    showToast(apiErrorMessage(res, "Kokoro TTS unavailable"), "warn");
+    return;
+  }
+  if (res.data?.audio_b64) {
+    playBase64WavAudio(res.data.audio_b64);
+  }
+});
+
+function uint8ToBase64(u8) {
+  const CHUNK_SIZE = 0x8000;
+  const parts = [];
+  for (let i = 0; i < u8.length; i += CHUNK_SIZE) {
+    parts.push(String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK_SIZE)));
+  }
+  return btoa(parts.join(""));
+}
+
+document.getElementById("chatVoiceTurnBtn")?.addEventListener("click", async () => {
+  const micBtn = document.getElementById("chatVoiceTurnBtn");
+  if (activeMediaRecorder && activeMediaRecorder.state === "recording") {
+    activeMediaRecorder.stop();
+    if (micBtn) micBtn.textContent = "Mic";
+    return;
+  }
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function" || typeof MediaRecorder === "undefined") {
+    showToast("Microphone recording is unavailable in this environment.", "warn");
+    return;
+  }
+  stopVoicePlayback();
+  try {
+    activeMediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    activeRecordedChunks = [];
+    activeMediaRecorder = new MediaRecorder(activeMediaStream);
+    activeMediaRecorder.addEventListener("dataavailable", (evt) => {
+      if (evt.data && evt.data.size > 0) activeRecordedChunks.push(evt.data);
+    });
+    activeMediaRecorder.addEventListener("stop", async () => {
+      try {
+        if (activeMediaStream) {
+          for (const tr of activeMediaStream.getTracks()) tr.stop();
+          activeMediaStream = null;
+        }
+        const blob = new Blob(activeRecordedChunks, { type: "audio/webm" });
+        activeRecordedChunks = [];
+        const arrBuf = await blob.arrayBuffer();
+        const u8 = new Uint8Array(arrBuf);
+        const b64 = uint8ToBase64(u8);
+        chatBannerEl.textContent = "Transcribing speech & running grounded voice turn...";
+        const activeTid =
+          chatSession.getThreadId() ||
+          document.getElementById("chatThreadSelect")?.value ||
+          "";
+        const voicePayload = {
+          audio_b64: b64,
+          filename: "voice-turn.webm",
+          mode: document.getElementById("chatModeSelect")?.value || "stream",
+          host_id: document.getElementById("chatHostSelect")?.value || "ollama_local",
+          project_scope: document.getElementById("chatScopeInput")?.value || "",
+        };
+        if (activeTid) {
+          voicePayload.thread_id = activeTid;
+        }
+        const res = await window.secondBrain.request(
+          "POST",
+          "/v1/voice/conversation-turn",
+          voicePayload
+        );
+        if (!res.ok) {
+          const errMsg = apiErrorMessage(res, "Voice turn failed");
+          chatBannerEl.textContent = `Voice turn error: ${errMsg}`;
+          showToast(errMsg, "danger");
+          return;
+        }
+        if (res.data?.thread_id) {
+          chatSession.setThreadId(res.data.thread_id);
+        }
+        const t = chatSession.startTurn({
+          query: res.data?.transcript || "(Voice input)",
+          mode: document.getElementById("chatModeSelect")?.value || "stream",
+        });
+        chatSession.applyEvent(t.id, "context", {
+          sources: res.data?.sources || [],
+          host_id: document.getElementById("chatHostSelect")?.value || "ollama_local",
+          thread_id: res.data?.thread_id || activeTid || undefined,
+        });
+        chatSession.applyEvent(t.id, "token", { text: res.data?.answer_text || "" });
+        if (res.data?.grounding) chatSession.applyEvent(t.id, "grounding", res.data.grounding);
+        chatSession.applyEvent(t.id, "done", {});
+        chatBannerEl.textContent = `Voice turn complete (${(res.data?.sources || []).length} source(s)).`;
+        renderAllChatTurns();
+        renderChatSourceCards(t);
+        if (res.data?.tts_available && res.data?.audio_b64) {
+          playBase64WavAudio(res.data.audio_b64);
+        } else if (res.data?.tts_warning) {
+          showToast(res.data.tts_warning, "warn");
+        }
+      } catch (err) {
+        const errMsg = err?.message || String(err);
+        chatBannerEl.textContent = `Voice turn failed: ${errMsg}`;
+        showToast(`Voice turn error: ${errMsg}`, "danger");
+      } finally {
+        if (activeMediaStream) {
+          try {
+            for (const tr of activeMediaStream.getTracks()) tr.stop();
+          } catch {}
+          activeMediaStream = null;
+        }
+        activeRecordedChunks = [];
+        if (micBtn) micBtn.textContent = "Mic";
+      }
+    });
+    activeMediaRecorder.start();
+    if (micBtn) micBtn.textContent = "Stop Mic";
+    showToast("Listening... click Stop Mic to send voice query.", "ok");
+  } catch (err) {
+    if (micBtn) micBtn.textContent = "Mic";
+    showToast(`Microphone error: ${err?.message || err}`, "danger");
+  }
+});
 
 const chatPinTurnBtnEl = document.getElementById("chatPinTurnBtn");
 if (chatPinTurnBtnEl) {
@@ -2822,7 +3434,10 @@ async function loadScoutQueue() {
 
 document
   .getElementById("refreshScoutBtn")
-  .addEventListener("click", loadScoutQueue);
+  .addEventListener("click", () => {
+    loadScoutQueue();
+    loadCreativeMediaStudio();
+  });
 
 document
   .getElementById("addScoutUrlBtn")
@@ -3063,7 +3678,37 @@ async function loadIdeStatus() {
   }
 }
 
-document.getElementById("refreshIdeBtn").addEventListener("click", loadIdeStatus);
+document.getElementById("refreshIdeBtn").addEventListener("click", () => {
+  loadIdeStatus();
+  loadGitHookStatus();
+});
+
+document.getElementById("addCustomMcpHostBtn").addEventListener("click", async () => {
+  const hid = document.getElementById("customMcpHostIdInput").value.trim().toLowerCase();
+  const label = document.getElementById("customMcpLabelInput").value.trim() || hid;
+  const configPath = document.getElementById("customMcpPathInput").value.trim();
+  const serversKey = document.getElementById("customMcpKeyInput").value.trim() || "mcpServers";
+  const configFormat = document.getElementById("customMcpFormatSelect").value;
+  if (!hid || !configPath) {
+    showToast("Host ID and Config File Path are required.", "warn");
+    return;
+  }
+  try {
+    await window.secondBrain.ideAction("custom-add", hid, {
+      label,
+      configPath,
+      serversKey,
+      configFormat,
+    });
+    document.getElementById("customMcpHostIdInput").value = "";
+    document.getElementById("customMcpLabelInput").value = "";
+    document.getElementById("customMcpPathInput").value = "";
+    showToast(`Registered custom MCP host: ${hid}`, "ok");
+    loadIdeStatus();
+  } catch (err) {
+    showToast(`Custom MCP registration failed: ${err?.message || String(err)}`, "danger");
+  }
+});
 
 // ─── TAB 6: System Health, Host Sharing Policies, Fitness & Experiences ──────
 
@@ -3213,12 +3858,85 @@ function renderSystemHostsTable(hostsObj) {
       }
     };
     actTd.appendChild(saveBtn);
+    if (rule.is_builtin === false) {
+      const delBtn = el("button", "btn sm danger", "Delete");
+      delBtn.type = "button";
+      delBtn.style.marginLeft = "4px";
+      delBtn.onclick = async () => {
+        try {
+          const res = await window.secondBrain.api(
+            "DELETE",
+            `/v1/hosts/${encodeURIComponent(hostId)}`
+          );
+          if (res.ok) {
+            showToast(`Deleted custom host ${hostId}`, "ok");
+            loadSystemView();
+          } else {
+            showToast(apiErrorMessage(res, `Failed to delete ${hostId}`), "danger");
+          }
+        } catch (err) {
+          showToast(`Delete error: ${err?.message || String(err)}`, "danger");
+        }
+      };
+      actTd.appendChild(delBtn);
+    }
     tr.appendChild(actTd);
     tbody.appendChild(tr);
   }
   table.appendChild(tbody);
   wrap.appendChild(table);
 }
+
+document
+  .getElementById("addCustomModelHostBtn")
+  .addEventListener("click", async () => {
+    const hostId = document
+      .getElementById("customModelHostIdInput")
+      .value.trim()
+      .toLowerCase();
+    const provider = document.getElementById("customModelProviderSelect").value;
+    const transport = document.getElementById("customModelTransportSelect").value;
+    const endpointUrl = document
+      .getElementById("customModelEndpointInput")
+      .value.trim();
+    const defaultModel = document
+      .getElementById("customModelNameInput")
+      .value.trim();
+    const apiKeyEnv = document
+      .getElementById("customModelApiKeyEnvInput")
+      .value.trim();
+    if (!hostId || !endpointUrl || !defaultModel) {
+      showToast(
+        "Host ID, Endpoint URL, and Default Model are required.",
+        "warn"
+      );
+      return;
+    }
+    try {
+      const res = await window.secondBrain.api("POST", "/v1/hosts", {
+        host_id: hostId,
+        provider,
+        transport,
+        endpoint_url: endpointUrl,
+        default_model: defaultModel,
+        api_key_env: apiKeyEnv || null,
+        allowed_projects: ["*"],
+        enabled: false,
+      });
+      if (res.ok) {
+        document.getElementById("customModelHostIdInput").value = "";
+        document.getElementById("customModelEndpointInput").value = "";
+        document.getElementById("customModelNameInput").value = "";
+        document.getElementById("customModelApiKeyEnvInput").value = "";
+        showToast(`Created custom host profile: ${hostId}`, "ok");
+        loadSystemView();
+      } else {
+        showToast(apiErrorMessage(res, "Failed to create custom host"), "danger");
+      }
+    } catch (err) {
+      showToast(`Create host failed: ${err?.message || String(err)}`, "danger");
+    }
+  });
 
 async function loadSystemView() {
   const healthKpis = document.getElementById("systemHealthKpis");
@@ -3397,6 +4115,8 @@ async function loadSystemView() {
   loadInboxDropPairings();
   loadWorkspaces();
   loadClipperPairings();
+  loadDaemonStatus();
+  loadMobileVaultClient();
 }
 
 async function loadOnnxModelsStatus() {
@@ -3532,6 +4252,9 @@ async function loadInboxDropPairings() {
       row.appendChild(el("strong", "", p.label || p.device_label || "Mobile Device"));
       row.appendChild(el("span", "badge mono", `token:${p.token_id || ""}`));
       row.appendChild(
+        el("span", `badge ${p.include_recall ? "ok" : ""}`, p.include_recall ? "SBMR1 Recall" : "Drop-Only")
+      );
+      row.appendChild(
         el("span", `badge ${p.revoked ? "danger" : "ok"}`, p.revoked ? "revoked" : "active")
       );
       if (!p.revoked) {
@@ -3567,11 +4290,13 @@ if (inboxDropPairBtnEl) {
   inboxDropPairBtnEl.addEventListener("click", async () => {
     const label = (document.getElementById("inboxDropDeviceLabelInput")?.value || "Mobile Quick-Capture").trim();
     const pwaUrl = (document.getElementById("inboxDropPwaUrlInput")?.value || "").trim();
+    const incRecall = Boolean(document.getElementById("inboxDropIncludeRecallCheck")?.checked);
     const incS3 = Boolean(document.getElementById("inboxDropIncludeS3Check")?.checked);
     const outEl = document.getElementById("inboxDropOutput");
     const res = await window.secondBrain.request("POST", "/v1/sync/inbox-drop/pair", {
       device_label: label || "Mobile Quick-Capture",
       pwa_base_url: pwaUrl,
+      include_recall: incRecall,
       include_s3_credentials: incS3,
     });
     if (!res.ok) {
@@ -3587,9 +4312,57 @@ if (inboxDropPairBtnEl) {
       }
     } catch {}
     if (outEl) {
-      outEl.textContent = `Paired '${res.data?.device_label}' (token_id=${res.data?.token_id}, copied to clipboard): ${shareTarget}`;
+      outEl.textContent = `Paired '${res.data?.device_label}' (token_id=${res.data?.token_id}, include_recall=${Boolean(res.data?.include_recall)}, copied to clipboard): ${shareTarget}`;
     }
     showToast("Mobile E2EE Inbox Drop pairing copied to clipboard!", "ok");
+    await loadInboxDropPairings();
+  });
+}
+
+const inboxDropExportRecallBtnEl = document.getElementById("inboxDropExportRecallBtn");
+if (inboxDropExportRecallBtnEl) {
+  inboxDropExportRecallBtnEl.addEventListener("click", async () => {
+    const outEl = document.getElementById("inboxDropOutput");
+    const res = await window.secondBrain.request("POST", "/v1/sync/inbox-drop/export-recall", {
+      include_pending_review: true,
+      sync_to_backend: true,
+    });
+    if (!res.ok) {
+      const msg = apiErrorMessage(res, "Export mobile recall index failed");
+      if (outEl) outEl.textContent = msg;
+      showToast(msg, "danger");
+      return;
+    }
+    const d = res.data || {};
+    if (outEl) {
+      outEl.textContent = `Exported ${d.object_key || "mobile-recall"}: ${d.atom_count ?? 0} verified atom(s), ${d.review_count ?? 0} review item(s) (uploaded=${Boolean(d.uploaded_to_sync)}).`;
+    }
+    showToast("Exported encrypted Mobile Recall Index (SBMR1)", "ok");
+  });
+}
+
+const inboxDropRotateRecallBtnEl = document.getElementById("inboxDropRotateRecallBtn");
+if (inboxDropRotateRecallBtnEl) {
+  inboxDropRotateRecallBtnEl.addEventListener("click", async () => {
+    const conf = await modalCtrl.confirm({
+      title: "Rotate Mobile Recall Key (SBMR1)",
+      message: "Rotating the Mobile Recall key invalidates existing recall-enabled pairings until you re-export and re-pair authorized devices.",
+      confirmLabel: "Rotate Key",
+      confirmClass: "warn",
+    });
+    if (!conf.confirmed) return;
+    const outEl = document.getElementById("inboxDropOutput");
+    const res = await window.secondBrain.request("POST", "/v1/sync/inbox-drop/rotate-recall", {});
+    if (!res.ok) {
+      const msg = apiErrorMessage(res, "Rotate mobile recall key failed");
+      if (outEl) outEl.textContent = msg;
+      showToast(msg, "danger");
+      return;
+    }
+    if (outEl) {
+      outEl.textContent = `Rotated Mobile Recall key -> recall_key_id=${res.data?.recall_key_id || "updated"}. Re-export Recall Index & re-pair devices.`;
+    }
+    showToast("Mobile Recall Key rotated", "warn");
     await loadInboxDropPairings();
   });
 }
@@ -4052,6 +4825,10 @@ async function loadWorkspaces() {
 
 async function switchWorkspaceVault(vaultId) {
   if (!vaultId) return;
+  if (!(await confirmDiscardIfDirty())) {
+    await loadWorkspaces();
+    return;
+  }
   const res = await window.secondBrain.request("POST", "/v1/vaults/switch", { vault_id: vaultId });
   if (!res.ok) {
     showToast(apiErrorMessage(res, "Vault switch failed"), "danger");
@@ -4059,7 +4836,9 @@ async function switchWorkspaceVault(vaultId) {
     return;
   }
   showToast(`Switched active vault -> ${res.data?.active_vault_id || vaultId}`, "ok");
+  resetActiveVaultUiState();
   await Promise.all([loadWorkspaces(), refreshHealth(), loadNotes({ append: false })]);
+  refreshActiveViewForCurrentVault();
 }
 
 const sidebarVaultSelectEl = document.getElementById("sidebarVaultSelect");
@@ -4098,7 +4877,9 @@ if (wsCreateBtnEl) {
     showToast(`Created vault '${res.data?.vault_id}'`, "ok");
     await loadWorkspaces();
     if (res.data?.active) {
+      resetActiveVaultUiState();
       await Promise.all([refreshHealth(), loadNotes({ append: false })]);
+      refreshActiveViewForCurrentVault();
     }
   });
 }
@@ -4217,7 +4998,7 @@ if (clipperPairBtnEl) {
     const label = (document.getElementById("clipperLabelInput")?.value || "Browser Clipper").trim();
     const outEl = document.getElementById("clipperOutput");
     if (!origin) {
-      showToast("Paste a chrome-extension:// or moz-extension:// origin first.", "danger");
+      showToast("Paste a chrome-extension://, moz-extension://, or safari-web-extension:// origin first.", "danger");
       return;
     }
     const res = await window.secondBrain.request("POST", "/v1/clipper/pair", { origin, label });
@@ -4237,20 +5018,93 @@ if (clipperPairBtnEl) {
 
 document
   .getElementById("refreshSystemBtn")
-  .addEventListener("click", loadSystemView);
+  .addEventListener("click", () => {
+    loadSystemView();
+    loadDaemonStatus();
+    loadMobileVaultClient();
+    refreshUpdaterStatus();
+  });
+
+function renderUpdaterBanner(st) {
+  const banner = document.getElementById("updaterStatusBanner");
+  const dlBtn = document.getElementById("updaterDownloadBtn");
+  const instBtn = document.getElementById("updaterInstallBtn");
+  if (!banner || !st) return;
+  const ver = st.currentVersion ? `v${st.currentVersion}` : "local";
+  if (st.state === "available") {
+    banner.textContent = `Update v${st.availableVersion} available (current ${ver}). Click Download Update to fetch differential package.`;
+  } else if (st.state === "downloading") {
+    banner.textContent = `Downloading update v${st.availableVersion || ""} (${st.progressPercent || 0}%)...`;
+  } else if (st.state === "downloaded") {
+    banner.textContent = `Update v${st.availableVersion || ""} downloaded and verified. Click Restart & Install to cleanly stop the sidecar and apply.`;
+  } else if (st.state === "up_to_date") {
+    banner.textContent = `Desktop ${ver} is up to date (last checked: ${st.checkedAt || "now"}).`;
+  } else if (st.state === "error") {
+    banner.textContent = `Update check error: ${st.error || "unknown error"}`;
+  } else if (st.state === "dev_mode") {
+    banner.textContent = `Running unpackaged dev build (${ver}); signed feed checks activate in packaged installers.`;
+  } else {
+    banner.textContent = `Desktop ${ver} — manual local-first update checks only (autoDownload=false).`;
+  }
+  if (dlBtn) dlBtn.disabled = st.state !== "available";
+  if (instBtn) instBtn.disabled = !st.downloaded && st.state !== "downloaded";
+}
+
+async function refreshUpdaterStatus() {
+  if (!window.secondBrain || typeof window.secondBrain.getUpdaterStatus !== "function") return;
+  try {
+    const st = await window.secondBrain.getUpdaterStatus();
+    renderUpdaterBanner(st);
+  } catch {}
+}
+
+if (window.secondBrain && typeof window.secondBrain.onUpdaterStatus === "function") {
+  window.secondBrain.onUpdaterStatus((st) => renderUpdaterBanner(st));
+}
+
+document.getElementById("updaterCheckBtn").addEventListener("click", async () => {
+  if (!window.secondBrain || typeof window.secondBrain.checkForUpdates !== "function") return;
+  try {
+    const res = await window.secondBrain.checkForUpdates();
+    if (res && res.status) renderUpdaterBanner(res.status);
+  } catch (err) {
+    showToast(`Update check failed: ${err?.message || String(err)}`, "warn");
+  }
+});
+
+document.getElementById("updaterDownloadBtn").addEventListener("click", async () => {
+  if (!window.secondBrain || typeof window.secondBrain.downloadUpdate !== "function") return;
+  try {
+    const res = await window.secondBrain.downloadUpdate();
+    if (res && res.status) renderUpdaterBanner(res.status);
+  } catch (err) {
+    showToast(`Update download failed: ${err?.message || String(err)}`, "warn");
+  }
+});
+
+document.getElementById("updaterInstallBtn").addEventListener("click", async () => {
+  if (!window.secondBrain || typeof window.secondBrain.installUpdate !== "function") return;
+  try {
+    await window.secondBrain.installUpdate();
+  } catch (err) {
+    showToast(`Update install failed: ${err?.message || String(err)}`, "danger");
+  }
+});
 document
   .getElementById("switchVaultBtn")
   .addEventListener("click", async () => {
     try {
+      if (!(await confirmDiscardIfDirty())) return;
       const res = await window.secondBrain.switchVault();
       if (res && res.canceled) return;
       if (res && res.ok) {
         showToast(`Switched active vault to ${res.vaultDir}`, "ok");
-        activeNote = null;
-        setNoteBaseline("", "", "");
+        resetActiveVaultUiState();
         loadNotes({ append: false });
+        loadWorkspaces();
         loadSystemView();
         refreshHealth();
+        refreshActiveViewForCurrentVault();
       } else if (res && res.error) {
         showToast(res.error, "danger");
       }
@@ -5047,7 +5901,10 @@ document
   .addEventListener("click", runExecutivePlan);
 document
   .getElementById("refreshPlaybooksBtn")
-  .addEventListener("click", loadPlannerView);
+  .addEventListener("click", () => {
+    loadPlannerView();
+    loadExecutableSkills();
+  });
 
 // ─── TAB 8: Merkle Ledger, History, Leaves, Source Audit, Radar & Snapshots ──
 
@@ -6500,6 +7357,8 @@ document
 
 // ─── TAB 9: Interactive 2D Knowledge Graph ───────────────────────────────────
 
+let graphTimelineDates = [];
+
 function ensureGraphViewerInitialized() {
   if (graphViewer) return graphViewer;
   const container = document.getElementById("graphCanvasContainer");
@@ -6513,23 +7372,29 @@ function ensureGraphViewerInitialized() {
 }
 
 function currentGraphFilters() {
+  const asOfEl = document.getElementById("graphAsOfInput");
+  const incExpEl = document.getElementById("graphIncludeExpiredCheck");
   return {
     search: document.getElementById("graphSearchInput").value,
     project: document.getElementById("graphProjectInput").value,
     status: document.getElementById("graphStatusSelect").value,
     memoryType: document.getElementById("graphTypeSelect").value,
     includePending: document.getElementById("graphIncludePendingCheck").checked,
+    asOf: asOfEl ? asOfEl.value.trim() : "",
+    includeExpired: incExpEl ? incExpEl.checked : true,
   };
 }
 
 function rerenderGraphFromState() {
   const viewer = ensureGraphViewerInitialized();
-  const filtered = viewer.render(graphRawData, currentGraphFilters());
+  const filters = currentGraphFilters();
+  const filtered = viewer.render(graphRawData, filters);
   const banner = document.getElementById("graphBanner");
   if (banner) {
+    const asOfTxt = filters.asOf ? ` | as_of=${filters.asOf}` : "";
     banner.textContent = `Showing ${filtered.nodes.length} node(s) and ${
       filtered.edges.length
-    } edge(s)${graphRawData.fallback ? " (synthesized fallback view)" : ""}. Drag to pan, scroll to zoom, click a node to inspect.`;
+    } edge(s)${asOfTxt}${graphRawData.fallback ? " (synthesized fallback view)" : ""}. Drag to pan, scroll to zoom, click a node to inspect.`;
   }
 }
 
@@ -6563,6 +7428,7 @@ async function inspectSelectedGraphNode(node, localEdges = []) {
     )
   );
   badges.appendChild(el("span", "badge", node.memory_type || "semantic"));
+  appendTemporalValidityBadges(badges, node);
   card.appendChild(badges);
 
   if (node.contexts && node.contexts.length) {
@@ -6638,14 +7504,40 @@ async function loadGraphView() {
   const incPending = document.getElementById("graphIncludePendingCheck").checked
     ? "1"
     : "0";
-  const params = [`include_pending=${incPending}`, "limit=300"];
+  const asOfInputEl = document.getElementById("graphAsOfInput");
+  const sliderEl = document.getElementById("graphTimelineSlider");
+  const incExpEl = document.getElementById("graphIncludeExpiredCheck");
+  const metaBadge = document.getElementById("graphTemporalMeta");
+  const asOf = asOfInputEl ? asOfInputEl.value.trim() : "";
+  const incExpired = incExpEl ? (incExpEl.checked ? "1" : "0") : "1";
+
+  const params = [
+    `include_pending=${incPending}`,
+    `include_expired=${incExpired}`,
+    "limit=300",
+  ];
   if (proj) params.push(`project=${encodeURIComponent(proj)}`);
+  if (asOf) params.push(`as_of=${encodeURIComponent(asOf)}`);
 
   const fullRes = await window.secondBrain.request(
     "GET",
     `/v1/graph/full?${params.join("&")}`
   );
   if (fullRes.ok && fullRes.data && Array.isArray(fullRes.data.nodes)) {
+    graphTimelineDates = Array.isArray(fullRes.data.timeline_dates)
+      ? fullRes.data.timeline_dates
+      : [];
+    if (sliderEl) {
+      sliderEl.max = String(graphTimelineDates.length);
+      const matchIdx = asOf ? graphTimelineDates.indexOf(asOf) : -1;
+      sliderEl.value = matchIdx >= 0 ? String(matchIdx + 1) : "0";
+    }
+    if (metaBadge) {
+      const actCnt = fullRes.data.active_temporal_count ?? fullRes.data.nodes.length;
+      const expCnt = fullRes.data.expired_temporal_count ?? 0;
+      const futCnt = fullRes.data.future_temporal_count ?? 0;
+      metaBadge.textContent = `${asOf ? `as_of ${asOf}` : "Live (Now)"} · active=${actCnt} exp=${expCnt} future=${futCnt}`;
+    }
     graphRawData = {
       nodes: fullRes.data.nodes,
       edges: Array.isArray(fullRes.data.edges) ? fullRes.data.edges : [],
@@ -6676,6 +7568,23 @@ for (const id of [
   document.getElementById(id).addEventListener("input", rerenderGraphFromState);
   document.getElementById(id).addEventListener("change", rerenderGraphFromState);
 }
+document.getElementById("graphAsOfInput")?.addEventListener("change", loadGraphView);
+document.getElementById("graphIncludeExpiredCheck")?.addEventListener("change", loadGraphView);
+document.getElementById("graphClearAsOfBtn")?.addEventListener("click", () => {
+  const asOfEl = document.getElementById("graphAsOfInput");
+  const sliderEl = document.getElementById("graphTimelineSlider");
+  if (asOfEl) asOfEl.value = "";
+  if (sliderEl) sliderEl.value = "0";
+  loadGraphView();
+});
+document.getElementById("graphTimelineSlider")?.addEventListener("change", (e) => {
+  const idx = Number(e.target?.value || 0);
+  const asOfEl = document.getElementById("graphAsOfInput");
+  if (asOfEl) {
+    asOfEl.value = idx > 0 && idx <= graphTimelineDates.length ? graphTimelineDates[idx - 1] : "";
+  }
+  loadGraphView();
+});
 document
   .getElementById("graphProjectInput")
   .addEventListener("change", loadGraphView);
@@ -7312,6 +8221,20 @@ document
 
 // ─── Stage 4 Executable Skills, Mobile Vault Client & Creative Media Studio ─
 
+const SAFE_IMAGE_DATA_URI_RE =
+  /^data:image\/(?:png|webp|gif|jpeg);base64,[A-Za-z0-9+/]+={0,2}$/;
+const SAFE_VIDEO_DATA_URI_RE =
+  /^data:video\/mp4;base64,[A-Za-z0-9+/]+={0,2}$/;
+const IMAGE_ONLY_MEDIA_BACKENDS = new Set(["sd_webui_local", "diffusers_local"]);
+
+function isSafeMediaDataUri(uri, expectedKind) {
+  if (typeof uri !== "string" || !uri) return false;
+  if (expectedKind === "video") {
+    return SAFE_VIDEO_DATA_URI_RE.test(uri);
+  }
+  return SAFE_IMAGE_DATA_URI_RE.test(uri);
+}
+
 async function loadCreativeMediaStudio() {
   const badge = document.getElementById("creativeHardwareBadge");
   const galleryWrap = document.getElementById("creativeGalleryWrap");
@@ -7324,8 +8247,11 @@ async function loadCreativeMediaStudio() {
 
   if (stRes.ok && stRes.data) {
     const st = stRes.data;
-    badge.textContent = `${st.tier_id || "tier_0"} · max ${st.max_width || 768}x${st.max_height || 768}`;
-    badge.className = st.neural_generation_eligible ? "badge ok" : "badge";
+    badge.textContent = `${st.tier_id || st.creative_tier || "tier_0"} · max ${st.max_width || 768}x${st.max_height || 768}`;
+    const neuralUnlocked = Boolean(
+      st.neural_backends_unlocked ?? st.neural_generation_eligible
+    );
+    badge.className = neuralUnlocked ? "badge ok" : "badge";
   }
 
   galleryWrap.replaceChildren();
@@ -7369,7 +8295,19 @@ async function previewCreativeAsset(mediaId) {
   wrap.appendChild(
     el("div", "note-item-meta", `${d.filename} (${d.mime_type}, ${d.size_bytes} bytes, SHA-256 ${shortSha(d.sha256)})`)
   );
-  if (String(d.mime_type || "").startsWith("video/")) {
+  const isVideo = String(d.mime_type || "").toLowerCase() === "video/mp4";
+  const expectedKind = isVideo ? "video" : "image";
+  if (!isSafeMediaDataUri(d.data_uri, expectedKind)) {
+    wrap.appendChild(
+      el(
+        "div",
+        "status-banner banner-danger",
+        "Blocked unsafe or unsupported media data URI."
+      )
+    );
+    return;
+  }
+  if (isVideo) {
     const vid = document.createElement("video");
     vid.controls = true;
     vid.autoplay = false;
@@ -7399,11 +8337,20 @@ async function triggerCreativeMediaGen(kind, outputFormat) {
     showToast("Enter a creative generation prompt first.", "warn");
     return;
   }
+  let selectedBackend =
+    document.getElementById("creativeBackendSelect")?.value || "auto";
+  if (kind === "video" && IMAGE_ONLY_MEDIA_BACKENDS.has(selectedBackend)) {
+    showToast(
+      `Backend '${selectedBackend}' is image-only; falling back to 'auto' for video generation.`,
+      "warn"
+    );
+    selectedBackend = "auto";
+  }
   const payload = {
     prompt,
     title: (document.getElementById("creativeTitleInput")?.value || "").trim(),
     style: document.getElementById("creativeStyleSelect")?.value || "concept_card",
-    backend: document.getElementById("creativeBackendSelect")?.value || "auto",
+    backend: selectedBackend,
     output_format: outputFormat,
     project_scope: (document.getElementById("creativeScopeInput")?.value || "").trim() || undefined,
     ground_in_vault: Boolean(document.getElementById("creativeGroundVaultCheck")?.checked),
@@ -7414,7 +8361,12 @@ async function triggerCreativeMediaGen(kind, outputFormat) {
   const res = await window.secondBrain.request("POST", endpoint, payload);
   if (res.ok && res.data) {
     const d = res.data;
-    outEl.textContent = `Generated ${d.filename} (${d.backend_used}, ${d.width}x${d.height}, SHA ${shortSha(d.sha256)}, grounded=${(d.referenced_atoms || []).length} atoms).`;
+    const groundedIds = Array.isArray(d.grounded_atom_ids)
+      ? d.grounded_atom_ids
+      : Array.isArray(d.referenced_atoms)
+        ? d.referenced_atoms
+        : [];
+    outEl.textContent = `Generated ${d.filename} (${d.backend_used}, ${d.width}x${d.height}, SHA ${shortSha(d.sha256)}, grounded=${groundedIds.length} atoms).`;
     showToast(`Generated ${d.filename}`, "ok");
     await previewCreativeAsset(d.media_id);
     await loadCreativeMediaStudio();
@@ -7438,11 +8390,13 @@ async function loadMobileVaultClient() {
   wrap.replaceChildren();
   const pairings = Array.isArray(res.data.pairings) ? res.data.pairings : [];
   for (const p of pairings) {
+    const isRevoked = Boolean(p.revoked || p.status === "revoked");
+    const statusLabel = isRevoked ? "revoked" : (p.status || "active");
     const row = el("div", "toolbar");
     row.appendChild(el("span", "badge mono", p.pairing_id || ""));
     row.appendChild(el("strong", "", p.label || "Mobile Client"));
-    row.appendChild(el("span", "note-item-meta", `${p.status || "active"} · ${p.created_at || ""}`));
-    if (p.status === "active") {
+    row.appendChild(el("span", "note-item-meta", `${statusLabel} · ${p.created_at || ""}`));
+    if (!isRevoked) {
       const revBtn = el("button", "btn sm danger", "Revoke");
       revBtn.type = "button";
       revBtn.style.marginLeft = "auto";
@@ -7475,7 +8429,12 @@ document.getElementById("mobileVaultPairBtn")?.addEventListener("click", async (
   };
   const res = await window.secondBrain.request("POST", "/v1/mobile/pair", payload);
   if (res.ok && res.data) {
-    outEl.textContent = `Paired ${res.data.pairing_id}: ${res.data.pairing_url || res.data.pairing_fragment}`;
+    const shareUri =
+      res.data.pwa_pairing_url ||
+      res.data.pairing_url ||
+      res.data.pairing_fragment ||
+      "";
+    outEl.textContent = `Paired ${res.data.pairing_id}: ${shareUri}`;
     showToast("Mobile Vault Client paired ✓", "ok");
     loadMobileVaultClient();
   } else {
@@ -7513,9 +8472,10 @@ async function loadExecutableSkills() {
     window.secondBrain.request("GET", "/v1/skills/executions?limit=10"),
   ]);
 
+  const killSwitchState = (skRes.ok && skRes.data?.kill_switch) || {};
+  const killedSkillsMap = killSwitchState.killed_skills || {};
   if (skRes.ok && skRes.data) {
-    const ks = skRes.data.kill_switch || {};
-    const globalKilled = Boolean(ks.global_engaged);
+    const globalKilled = Boolean(killSwitchState.global_engaged);
     badge.textContent = globalKilled ? "KILL-SWITCH ENGAGED" : "SANDBOX ARMED";
     badge.className = globalKilled ? "badge danger" : "badge ok";
   }
@@ -7538,23 +8498,52 @@ async function loadExecutableSkills() {
     const hdr = el("div", "toolbar");
     hdr.appendChild(el("strong", "", sk.title || sk.skill_id));
     hdr.appendChild(el("span", `badge ${sk.valid ? "ok" : "warn"}`, sk.status || "unknown"));
+    const schemaKeys = Object.keys(sk.input_schema || {});
+    if (schemaKeys.length) {
+      hdr.appendChild(el("span", "badge mono", `inputs:${schemaKeys.length}`));
+    }
     card.appendChild(hdr);
+    const stepCount = Array.isArray(sk.step_actions)
+      ? sk.step_actions.length
+      : Array.isArray(sk.steps)
+        ? sk.steps.length
+        : 0;
     card.appendChild(
       el(
         "div",
         "note-item-meta",
-        `ID: ${sk.skill_id} · Playbook: ${sk.playbook_id} · Steps: ${(sk.steps || []).length} · SHA ${shortSha(sk.sha256)}`
+        `ID: ${sk.skill_id} · Playbook: ${sk.playbook_id} · Steps: ${stepCount} · SHA ${shortSha(sk.sha256)}`
       )
     );
     const bar = el("div", "toolbar");
-    const dryBtn = el("button", "btn sm", "Dry Run");
+    const dryBtn = el("button", "btn sm", schemaKeys.length ? "Dry Run (Inputs)..." : "Dry Run");
     dryBtn.type = "button";
-    dryBtn.addEventListener("click", () => executeSkillAction(sk.skill_id, true));
-    const runBtn = el("button", "btn sm primary", "Execute in Sandbox");
+    dryBtn.addEventListener("click", () => openSkillExecutePrompt(sk, true));
+    const runBtn = el("button", "btn sm primary", schemaKeys.length ? "Execute (Inputs)..." : "Execute in Sandbox");
     runBtn.type = "button";
-    runBtn.addEventListener("click", () => executeSkillAction(sk.skill_id, false));
+    runBtn.addEventListener("click", () => openSkillExecutePrompt(sk, false));
     bar.appendChild(dryBtn);
     bar.appendChild(runBtn);
+
+    const perSkillKilled = Boolean(killedSkillsMap[sk.skill_id]) || sk.status === "killed";
+    const ksBtn = el("button", `btn sm ${perSkillKilled ? "good" : "warn"}`, perSkillKilled ? "Unkill Skill" : "Kill Skill");
+    ksBtn.type = "button";
+    ksBtn.addEventListener("click", async () => {
+      const actor = (document.getElementById("skillActorInput")?.value || "desktop_owner").trim();
+      const kr = await window.secondBrain.request("POST", "/v1/skills/kill-switch", {
+        engaged: !perSkillKilled,
+        scope: sk.skill_id,
+        actor,
+        reason: `${!perSkillKilled ? "Engaged" : "Released"} per-skill kill-switch from Desktop UI`,
+      });
+      showToast(
+        kr.ok ? `Skill ${sk.skill_id} kill-switch ${!perSkillKilled ? "engaged" : "released"}` : apiErrorMessage(kr, "Kill-switch failed"),
+        kr.ok ? (!perSkillKilled ? "warn" : "ok") : "danger"
+      );
+      loadExecutableSkills();
+    });
+    bar.appendChild(ksBtn);
+
     if (sk.status === "active") {
       const revBtn = el("button", "btn sm danger", "Revoke");
       revBtn.type = "button";
@@ -7605,7 +8594,138 @@ async function loadExecutableSkills() {
   }
 }
 
-async function executeSkillAction(skillId, dryRun) {
+function openSkillExecutePrompt(sk, dryRun) {
+  const schema = sk && typeof sk.input_schema === "object" && sk.input_schema ? sk.input_schema : {};
+  const keys = Object.keys(schema);
+  if (!keys.length) {
+    executeSkillAction(sk.skill_id, dryRun, {});
+    return;
+  }
+
+  const controls = {};
+  let jsonOverrideArea = null;
+
+  modalCtrl.open({
+    title: `${dryRun ? "Dry Run" : "Execute"} Skill: ${sk.skill_id}`,
+    renderBody(body, doc) {
+      const intro = el(
+        "div",
+        "note-item-meta",
+        `Provide validated runtime inputs matching ${sk.skill_id}'s input_schema before ${dryRun ? "dry-running" : "executing in the sandbox"}.`
+      );
+      body.appendChild(intro);
+      for (const pname of keys) {
+        const spec = schema[pname] || {};
+        const ptype = String(spec.type || "string").toLowerCase();
+        const col = el("div", "field-col");
+        col.style.marginTop = "8px";
+        const lbl = el(
+          "span",
+          "field-label",
+          `${pname} (${ptype}${spec.required ? ", required" : ""}${spec.pattern ? ` · pattern ${spec.pattern}` : ""})`
+        );
+        col.appendChild(lbl);
+        let inputEl;
+        if (ptype === "boolean") {
+          const checkWrap = el("label", "inline-check");
+          inputEl = doc.createElement("input");
+          inputEl.type = "checkbox";
+          inputEl.checked = Boolean(spec.default);
+          checkWrap.appendChild(inputEl);
+          checkWrap.appendChild(doc.createTextNode(String(spec.default ?? false)));
+          col.appendChild(checkWrap);
+        } else if (Array.isArray(spec.enum) && spec.enum.length) {
+          inputEl = doc.createElement("select");
+          for (const ev of spec.enum) {
+            const opt = doc.createElement("option");
+            opt.value = String(ev);
+            opt.textContent = String(ev);
+            if (spec.default !== undefined && String(spec.default) === String(ev)) {
+              opt.selected = true;
+            }
+            inputEl.appendChild(opt);
+          }
+          col.appendChild(inputEl);
+        } else {
+          inputEl = doc.createElement("input");
+          inputEl.type = ptype === "integer" || ptype === "number" ? "number" : "text";
+          if (ptype === "integer") inputEl.step = "1";
+          if (spec.default !== undefined && spec.default !== null) {
+            inputEl.value = String(spec.default);
+          } else {
+            inputEl.placeholder = `Enter ${pname}...`;
+          }
+          col.appendChild(inputEl);
+        }
+        controls[pname] = { inputEl, spec, ptype };
+        body.appendChild(col);
+      }
+
+      const ovCol = el("div", "field-col");
+      ovCol.style.marginTop = "10px";
+      ovCol.appendChild(el("span", "field-label", "Optional Raw JSON Inputs Override (overrides fields above if non-empty)"));
+      jsonOverrideArea = doc.createElement("textarea");
+      jsonOverrideArea.rows = 2;
+      jsonOverrideArea.placeholder = '{"service": "shards"}';
+      ovCol.appendChild(jsonOverrideArea);
+      body.appendChild(ovCol);
+    },
+    renderFooter(footer, doc) {
+      const cancelBtn = doc.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "btn";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", () => modalCtrl.close());
+
+      const runBtn = doc.createElement("button");
+      runBtn.type = "button";
+      runBtn.className = dryRun ? "btn primary" : "btn good";
+      runBtn.textContent = dryRun ? "Run Dry-Run" : "Execute in Sandbox";
+      runBtn.addEventListener("click", () => {
+        let collected = {};
+        const rawJson = (jsonOverrideArea?.value || "").trim();
+        if (rawJson) {
+          try {
+            collected = JSON.parse(rawJson);
+          } catch (err) {
+            showToast(`Invalid inputs JSON: ${err.message}`, "danger");
+            return;
+          }
+          if (!collected || typeof collected !== "object" || Array.isArray(collected)) {
+            showToast("Inputs JSON must be an object.", "danger");
+            return;
+          }
+        } else {
+          for (const [pname, entry] of Object.entries(controls)) {
+            const { inputEl, spec, ptype } = entry;
+            if (ptype === "boolean") {
+              collected[pname] = Boolean(inputEl.checked);
+            } else {
+              const rawVal = String(inputEl.value ?? "").trim();
+              if (!rawVal && !spec.required && spec.default === undefined) {
+                continue;
+              }
+              if (ptype === "integer") {
+                collected[pname] = rawVal ? parseInt(rawVal, 10) : spec.default;
+              } else if (ptype === "number") {
+                collected[pname] = rawVal ? Number(rawVal) : spec.default;
+              } else {
+                collected[pname] = rawVal;
+              }
+            }
+          }
+        }
+        modalCtrl.close({ fromCancel: false });
+        executeSkillAction(sk.skill_id, dryRun, collected);
+      });
+
+      footer.appendChild(cancelBtn);
+      footer.appendChild(runBtn);
+    },
+  });
+}
+
+async function executeSkillAction(skillId, dryRun, inputs = {}) {
   const outEl = document.getElementById("executableSkillsOutput");
   const actor = (document.getElementById("skillActorInput")?.value || "desktop_owner").trim();
   if (outEl) {
@@ -7614,7 +8734,7 @@ async function executeSkillAction(skillId, dryRun) {
   const res = await window.secondBrain.request(
     "POST",
     `/v1/skills/${encodeURIComponent(skillId)}/execute`,
-    { actor, dry_run: Boolean(dryRun), inputs: {} }
+    { actor, dry_run: Boolean(dryRun), inputs: inputs || {} }
   );
   if (res.ok && res.data) {
     const d = res.data;
@@ -7656,6 +8776,7 @@ document.getElementById("promoteExecutableSkillBtn")?.addEventListener("click", 
   const playbookId = pbSelect?.value || "";
   const expectedSha = opt?.dataset?.sha256 || "";
   const rawActions = (document.getElementById("skillActionsJsonInput")?.value || "").trim();
+  const rawSchema = (document.getElementById("skillInputSchemaJsonInput")?.value || "").trim();
   if (!skillId || !playbookId || !rawActions) {
     showToast("Provide Skill ID, Backing Playbook, and Step Actions JSON.", "warn");
     return;
@@ -7667,10 +8788,20 @@ document.getElementById("promoteExecutableSkillBtn")?.addEventListener("click", 
     showToast(`Invalid Step Actions JSON: ${err.message}`, "danger");
     return;
   }
+  let parsedSchema = {};
+  if (rawSchema) {
+    try {
+      parsedSchema = JSON.parse(rawSchema);
+    } catch (err) {
+      showToast(`Invalid Input Schema JSON: ${err.message}`, "danger");
+      return;
+    }
+  }
   const res = await window.secondBrain.request("POST", "/v1/skills/promote", {
     skill_id: skillId,
     playbook_id: playbookId,
     expected_playbook_sha256: expectedSha,
+    input_schema: parsedSchema,
     step_actions: parsedActions,
     timeout_seconds: Number(document.getElementById("skillTimeoutInput")?.value || 15),
     actor: (document.getElementById("skillActorInput")?.value || "desktop_owner").trim(),
@@ -7720,6 +8851,521 @@ document.getElementById("skillReleaseGlobalKillBtn")?.addEventListener("click", 
   }
 });
 
+// ─── Gen-4 Cognition Workbench & Predictive Context Signal ───────────────────
+
+let cognitiveSignalDebounceTimer = null;
+
+function emitCognitiveContextSignal({ activeFile = "", projectScope = "", cursorTopic = "" } = {}) {
+  if (!window.secondBrain || typeof window.secondBrain.request !== "function") return;
+  const cleanFile = String(activeFile || "").trim().slice(0, 260);
+  const cleanScope = String(projectScope || "").trim().slice(0, 120);
+  const cleanTopic = String(cursorTopic || "").trim().slice(0, 260);
+  if (!cleanFile && !cleanScope && !cleanTopic) return;
+
+  if (cognitiveSignalDebounceTimer) {
+    clearTimeout(cognitiveSignalDebounceTimer);
+  }
+  cognitiveSignalDebounceTimer = setTimeout(() => {
+    cognitiveSignalDebounceTimer = null;
+    const payload = { prewarm: true };
+    if (cleanFile) payload.active_file = cleanFile;
+    if (cleanScope) payload.project_scope = cleanScope;
+    if (cleanTopic) payload.cursor_topic = cleanTopic;
+    Promise.resolve()
+      .then(() => window.secondBrain.request("POST", "/v1/cognitive/context-signal", payload))
+      .catch(() => {});
+  }, 1200);
+}
+
+for (const scopeInputId of ["chatScopeInput", "graphProjectInput", "planScopeInput"]) {
+  const scopeEl = document.getElementById(scopeInputId);
+  if (scopeEl) {
+    scopeEl.addEventListener("change", () => {
+      const val = scopeEl.value.trim();
+      if (val) {
+        emitCognitiveContextSignal({ projectScope: val, cursorTopic: val });
+      }
+    });
+  }
+}
+
+document.getElementById("sidebarVaultSelect")?.addEventListener("change", (evt) => {
+  const vid = String(evt?.target?.value || "").trim();
+  if (vid) {
+    emitCognitiveContextSignal({ cursorTopic: `vault:${vid}` });
+  }
+});
+
+async function runGen4Zoom(parentId = "") {
+  const outEl = document.getElementById("gen4ZoomOutput");
+  if (!outEl) return;
+  const query = (document.getElementById("gen4ZoomQueryInput")?.value || "").trim();
+  const targetLevel = document.getElementById("gen4ZoomLevelSelect")?.value || "L5";
+  const project = (document.getElementById("gen4ZoomProjectInput")?.value || "").trim();
+
+  outEl.replaceChildren(el("div", "note-item-meta", "Running Fractal Zoom recall..."));
+  const body = { query, target_level: targetLevel, limit: 8 };
+  if (parentId) body.parent_id = parentId;
+  if (project) body.project = project;
+
+  const res = await window.secondBrain.request("POST", "/v1/recall/zoom", body);
+  outEl.replaceChildren();
+  if (!res.ok || !res.data) {
+    outEl.appendChild(
+      el("div", "status-banner banner-danger", apiErrorMessage(res, "Fractal Zoom failed"))
+    );
+    return;
+  }
+
+  const d = res.data;
+  const pathSteps = Array.isArray(d.path) ? d.path : [];
+  if (pathSteps.length) {
+    const crumb = el("div", "toolbar");
+    crumb.appendChild(el("span", "field-label", "Zoom Path:"));
+    for (const st of pathSteps) {
+      crumb.appendChild(
+        el(
+          "span",
+          "badge",
+          `${st.level} (${st.level_name || ""}: ${(st.selected_ids || []).length})`
+        )
+      );
+    }
+    outEl.appendChild(crumb);
+  }
+
+  const nodes = Array.isArray(d.nodes) ? d.nodes : [];
+  if (!nodes.length) {
+    outEl.appendChild(
+      el("div", "note-item-meta", "No matching owner-approved nodes at this zoom level.")
+    );
+    return;
+  }
+
+  const grid = el("div", "cards-grid");
+  grid.style.marginTop = "6px";
+  for (const node of nodes) {
+    const card = el("div", "card");
+    const hdr = el("div", "toolbar");
+    hdr.appendChild(el("span", "badge ok", `${node.level || ""} ${node.level_name || ""}`.trim()));
+    hdr.appendChild(el("strong", "", node.title || node.node_id || "Node"));
+    if (node.score !== undefined && node.score !== null) {
+      hdr.appendChild(el("span", "badge mono", `score:${node.score}`));
+    }
+    card.appendChild(hdr);
+
+    if (node.summary) {
+      card.appendChild(el("div", "", node.summary));
+    }
+    const metaParts = [
+      node.domain ? `domain:${node.domain}` : "",
+      node.project_scope ? `scope:${node.project_scope}` : "",
+      node.source_path ? `src:${node.source_path}` : "",
+      node.byte_end > node.byte_start ? `bytes:[${node.byte_start}..${node.byte_end}]` : "",
+    ].filter(Boolean);
+    if (metaParts.length) {
+      card.appendChild(el("div", "note-item-meta", metaParts.join(" · ")));
+    }
+
+    const bar = el("div", "toolbar");
+    if (node.atom_filename) {
+      const atomBtn = el("button", "btn sm", `Inspect ${node.atom_filename}`);
+      atomBtn.type = "button";
+      atomBtn.addEventListener("click", () => openAtomInspectorModal(node.atom_filename));
+      bar.appendChild(atomBtn);
+    }
+    if (node.level && node.level !== "L5" && node.node_id) {
+      const drillBtn = el("button", "btn sm primary", "Drill Down");
+      drillBtn.type = "button";
+      drillBtn.addEventListener("click", () => runGen4Zoom(node.node_id));
+      bar.appendChild(drillBtn);
+    }
+    if (bar.childNodes.length) card.appendChild(bar);
+    grid.appendChild(card);
+  }
+  outEl.appendChild(grid);
+}
+
+async function inspectGen4Concept(conceptId) {
+  const detailEl = document.getElementById("gen4ConceptDetail");
+  if (!detailEl || !conceptId) return;
+  detailEl.style.display = "block";
+  detailEl.replaceChildren(el("div", "note-item-meta", `Loading concept ${conceptId}...`));
+  const project = (document.getElementById("gen4ConceptsProjectInput")?.value || "").trim();
+  const qs = project ? `?project=${encodeURIComponent(project)}` : "";
+  const res = await window.secondBrain.request(
+    "GET",
+    `/v1/concepts/${encodeURIComponent(conceptId)}${qs}`
+  );
+  detailEl.replaceChildren();
+  if (!res.ok || !res.data) {
+    detailEl.appendChild(
+      el("div", "status-banner banner-danger", apiErrorMessage(res, "Failed to inspect concept"))
+    );
+    return;
+  }
+  const c = res.data;
+  const top = el("div", "toolbar");
+  top.appendChild(el("strong", "", `Living Concept: ${c.name || c.concept_id}`));
+  top.appendChild(el("span", "badge ok", `${c.atom_count ?? 0} atoms`));
+  top.appendChild(el("span", "badge mono", `conf:${Number(c.current_confidence ?? 0).toFixed(2)}`));
+  const closeBtn = el("button", "btn sm", "Close");
+  closeBtn.type = "button";
+  closeBtn.style.marginLeft = "auto";
+  closeBtn.addEventListener("click", () => {
+    detailEl.style.display = "none";
+  });
+  top.appendChild(closeBtn);
+  detailEl.appendChild(top);
+
+  const edges = Array.isArray(c.edges) ? c.edges : [];
+  if (edges.length) {
+    detailEl.appendChild(el("div", "field-label", `Causal / Semantic Edges (${edges.length}):`));
+    for (const ed of edges.slice(0, 10)) {
+      detailEl.appendChild(
+        el(
+          "div",
+          "note-item-meta",
+          `${ed.src_concept} —[${ed.relation}]→ ${ed.dst_concept} (w=${Number(ed.weight ?? 0).toFixed(2)})`
+        )
+      );
+    }
+  } else {
+    detailEl.appendChild(el("div", "note-item-meta", "No typed concept edges recorded yet."));
+  }
+
+  const timeline = Array.isArray(c.confidence_timeline) ? c.confidence_timeline : [];
+  if (timeline.length) {
+    detailEl.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        `Confidence Timeline: ${timeline
+          .map((pt) => `${pt.quarter || pt.period || "?"}:${Number(pt.confidence ?? pt.avg_confidence ?? 0).toFixed(2)}`)
+          .join(" · ")}`
+      )
+    );
+  }
+}
+
+async function loadGen4Concepts() {
+  const listEl = document.getElementById("gen4ConceptsList");
+  if (!listEl) return;
+  const project = (document.getElementById("gen4ConceptsProjectInput")?.value || "").trim();
+  const qs = project ? `?project=${encodeURIComponent(project)}&limit=30` : "?limit=30";
+  const res = await window.secondBrain.request("GET", `/v1/concepts${qs}`);
+  listEl.replaceChildren();
+  if (!res.ok || !res.data) {
+    listEl.appendChild(
+      el("div", "note-item-meta", apiErrorMessage(res, "Living Concepts unavailable"))
+    );
+    return;
+  }
+  const concepts = Array.isArray(res.data.concepts) ? res.data.concepts : [];
+  if (!concepts.length) {
+    listEl.appendChild(el("div", "note-item-meta", "No Living Concepts indexed yet."));
+    return;
+  }
+  for (const c of concepts.slice(0, 16)) {
+    const card = el("div", "card");
+    const hdr = el("div", "toolbar");
+    hdr.appendChild(el("strong", "", c.name || c.concept_id || "Concept"));
+    hdr.appendChild(el("span", "badge ok", `${c.atom_count ?? 0} atoms`));
+    hdr.appendChild(
+      el("span", "badge mono", `conf:${Number(c.current_confidence ?? 0).toFixed(2)}`)
+    );
+    card.appendChild(hdr);
+    const meta = [
+      Array.isArray(c.projects) && c.projects.length ? `projects: ${c.projects.join(", ")}` : "",
+      `playbooks:${(c.playbooks || []).length}`,
+      `mistakes:${(c.mistakes || []).length}`,
+      `questions:${(c.open_questions || []).length}`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    card.appendChild(el("div", "note-item-meta", meta));
+
+    const bar = el("div", "toolbar");
+    const inspBtn = el("button", "btn sm", "Inspect Edges & Timeline");
+    inspBtn.type = "button";
+    inspBtn.addEventListener("click", () => inspectGen4Concept(c.concept_id));
+    bar.appendChild(inspBtn);
+    const simBtn = el("button", "btn sm", "Simulate Impact");
+    simBtn.type = "button";
+    simBtn.addEventListener("click", () => {
+      const targetEl = document.getElementById("gen4SimTargetInput");
+      if (targetEl) targetEl.value = c.name || c.concept_id || "";
+      runGen4ImpactSimulation();
+    });
+    bar.appendChild(simBtn);
+    card.appendChild(bar);
+    listEl.appendChild(card);
+  }
+}
+
+async function promoteGen4DistilledArtifact(kind, item, action) {
+  const outEl = document.getElementById("gen4DistillOutput");
+  const actor = (document.getElementById("gen4DistillActorInput")?.value || "desktop_owner").trim();
+  const reason = (document.getElementById("gen4DistillReasonInput")?.value || "").trim();
+  const basePath = kind === "principle" ? "/v1/principles/" : "/v1/mental-models/";
+  const res = await window.secondBrain.request(
+    "POST",
+    `${basePath}${encodeURIComponent(item.filename)}/promote`,
+    {
+      expected_sha256: item.sha256,
+      actor,
+      action,
+      reason: reason || `Owner ${action} via Desktop Gen-4 Workbench`,
+    }
+  );
+  if (res.ok) {
+    const msg = `${action === "promote" ? "Promoted" : "Deprecated"} ${item.filename} (CAS verified).`;
+    if (outEl) outEl.textContent = msg;
+    showToast(msg, "ok");
+    loadGen4DistilledArtifacts();
+  } else {
+    const msg = apiErrorMessage(res, `Failed to ${action} ${item.filename}`);
+    if (outEl) outEl.textContent = msg;
+    showToast(msg, "danger");
+  }
+}
+
+function renderDistilledArtifactCards(containerEl, items, kind) {
+  if (!containerEl) return;
+  containerEl.replaceChildren();
+  if (!items.length) {
+    containerEl.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        kind === "principle"
+          ? "No principles staged in 7-principles/ yet."
+          : "No mental models staged in 8-mental-models/ yet."
+      )
+    );
+    return;
+  }
+  for (const item of items) {
+    const card = el("div", "card");
+    const hdr = el("div", "toolbar");
+    hdr.appendChild(el("strong", "", item.title || item.filename));
+    const isActive = item.status === "active" && item.valid;
+    hdr.appendChild(el("span", `badge ${isActive ? "ok" : "warn"}`, item.status || "draft"));
+    if (item.sha256) {
+      hdr.appendChild(el("span", "badge mono", `sha:${shortSha(item.sha256)}`));
+    }
+    card.appendChild(hdr);
+    if (item.statement) {
+      card.appendChild(el("div", "", String(item.statement).slice(0, 320)));
+    }
+    card.appendChild(
+      el(
+        "div",
+        "note-item-meta",
+        `${item.filename} · backing atoms: ${(item.source_atoms || []).length}${
+          Array.isArray(item.projects) && item.projects.length
+            ? ` · projects: ${item.projects.join(", ")}`
+            : ""
+        }${item.reason ? ` · ${item.reason}` : ""}`
+      )
+    );
+    const bar = el("div", "toolbar");
+    if (item.status !== "active") {
+      const promBtn = el("button", "btn sm good", "Promote (CAS)");
+      promBtn.type = "button";
+      promBtn.addEventListener("click", () => promoteGen4DistilledArtifact(kind, item, "promote"));
+      bar.appendChild(promBtn);
+    } else {
+      const depBtn = el("button", "btn sm warn", "Deprecate (CAS)");
+      depBtn.type = "button";
+      depBtn.addEventListener("click", () => promoteGen4DistilledArtifact(kind, item, "deprecate"));
+      bar.appendChild(depBtn);
+    }
+    card.appendChild(bar);
+    containerEl.appendChild(card);
+  }
+}
+
+async function loadGen4DistilledArtifacts() {
+  const prEl = document.getElementById("gen4PrinciplesList");
+  const mmEl = document.getElementById("gen4MentalModelsList");
+  const outEl = document.getElementById("gen4DistillOutput");
+  const [prRes, mmRes] = await Promise.all([
+    window.secondBrain.request("GET", "/v1/principles?active_only=false"),
+    window.secondBrain.request("GET", "/v1/mental-models?active_only=false"),
+  ]);
+  const principles = prRes.ok && Array.isArray(prRes.data?.principles) ? prRes.data.principles : [];
+  const models = mmRes.ok && Array.isArray(mmRes.data?.mental_models) ? mmRes.data.mental_models : [];
+  renderDistilledArtifactCards(prEl, principles, "principle");
+  renderDistilledArtifactCards(mmEl, models, "mental_model");
+  if (outEl) {
+    outEl.textContent = `Loaded ${principles.length} principle(s) and ${models.length} mental model(s) (active + draft).`;
+  }
+}
+
+async function runGen4ImpactSimulation() {
+  const outEl = document.getElementById("gen4SimOutput");
+  if (!outEl) return;
+  const target = (document.getElementById("gen4SimTargetInput")?.value || "").trim();
+  if (!target) {
+    showToast("Enter a target concept or module name to simulate impact.", "warn");
+    return;
+  }
+  const maxHops = Number(document.getElementById("gen4SimHopsSelect")?.value || 3);
+  const project = (document.getElementById("gen4SimProjectInput")?.value || "").trim();
+  outEl.replaceChildren(el("div", "note-item-meta", `Simulating downstream impact for '${target}'...`));
+  const payload = { target, max_hops: maxHops };
+  if (project) payload.project = project;
+  const res = await window.secondBrain.request("POST", "/v1/cognitive/simulate", payload);
+  outEl.replaceChildren();
+  if (!res.ok || !res.data) {
+    outEl.appendChild(
+      el("div", "status-banner banner-danger", apiErrorMessage(res, "Impact simulation failed"))
+    );
+    return;
+  }
+  const d = res.data;
+  const prov = d.provenance_summary || {};
+  const summaryRow = el("div", "toolbar");
+  summaryRow.appendChild(el("strong", "", `Target: ${d.target || target}`));
+  summaryRow.appendChild(el("span", "badge", `Impacted: ${d.impacted_count ?? 0}`));
+  summaryRow.appendChild(
+    el("span", "badge ok", `verified_vault_edge: ${prov.verified_vault_edge ?? 0}`)
+  );
+  summaryRow.appendChild(
+    el("span", "badge", `code_ast_dependency: ${prov.code_ast_dependency ?? 0}`)
+  );
+  summaryRow.appendChild(
+    el("span", "badge warn", `inferred_risk: ${prov.inferred_risk ?? 0}`)
+  );
+  outEl.appendChild(summaryRow);
+
+  const nodes = Array.isArray(d.impacted_nodes) ? d.impacted_nodes : [];
+  if (!nodes.length) {
+    outEl.appendChild(
+      el("div", "note-item-meta", "No downstream impacted concepts, AST dependents, or historical failures found.")
+    );
+    return;
+  }
+  for (const imp of nodes) {
+    const row = el("div", "card");
+    row.style.marginTop = "6px";
+    const hdr = el("div", "toolbar");
+    hdr.appendChild(el("span", "badge mono", `hop ${imp.hop ?? 1}`));
+    hdr.appendChild(el("strong", "", imp.node || imp.node_key || "Node"));
+    const pCls =
+      imp.provenance === "verified_vault_edge"
+        ? "ok"
+        : imp.provenance === "inferred_risk"
+        ? "warn"
+        : "";
+    hdr.appendChild(el("span", `badge ${pCls}`, imp.provenance || "edge"));
+    if (imp.relation) {
+      hdr.appendChild(el("span", "note-item-meta", imp.relation));
+    }
+    row.appendChild(hdr);
+    if (imp.evidence) {
+      const evText = Array.isArray(imp.evidence) ? imp.evidence.join(", ") : String(imp.evidence);
+      if (evText) row.appendChild(el("div", "note-item-meta", `Evidence: ${evText}`));
+    }
+    outEl.appendChild(row);
+  }
+}
+
+async function loadGen4Curiosity() {
+  const outEl = document.getElementById("gen4CuriosityOutput");
+  if (!outEl) return;
+  const res = await window.secondBrain.request("GET", "/v1/cognitive/curiosity");
+  outEl.replaceChildren();
+  if (!res.ok || !res.data) {
+    outEl.appendChild(
+      el("div", "note-item-meta", apiErrorMessage(res, "Self-Model & Curiosity unavailable"))
+    );
+    return;
+  }
+  const domains = Array.isArray(res.data.domains) ? res.data.domains : [];
+  const targets = Array.isArray(res.data.curiosity_targets) ? res.data.curiosity_targets : [];
+
+  const kpiRow = el("div", "toolbar");
+  kpiRow.appendChild(el("span", "badge", `Tracked Domains: ${domains.length}`));
+  kpiRow.appendChild(
+    el("span", `badge ${targets.length ? "warn" : "ok"}`, `Curiosity Gaps: ${targets.length}`)
+  );
+  outEl.appendChild(kpiRow);
+
+  if (domains.length) {
+    outEl.appendChild(el("div", "field-label", "Domain Competence Profile:"));
+    for (const dom of domains.slice(0, 12)) {
+      outEl.appendChild(
+        el(
+          "div",
+          "note-item-meta",
+          `${dom.domain}: competence=${Number(dom.competence_score ?? 0).toFixed(2)} · atoms=${dom.atom_count ?? 0} · playbooks=${dom.playbook_count ?? 0} · failures=${dom.failure_count ?? 0}`
+        )
+      );
+    }
+  }
+
+  if (targets.length) {
+    outEl.appendChild(el("div", "field-label", "Prioritized Curiosity / Study Targets:"));
+    for (const t of targets.slice(0, 10)) {
+      const item = el("div", "card");
+      item.style.marginTop = "6px";
+      const hdr = el("div", "toolbar");
+      hdr.appendChild(el("strong", "", t.goal_title || t.domain || "Study Gap"));
+      hdr.appendChild(el("span", "badge warn", `priority:${Number(t.priority_score ?? 0).toFixed(2)}`));
+      hdr.appendChild(
+        el("span", "badge mono", `${t.current_atoms ?? 0}/${t.target_atoms ?? 0} atoms (deficit ${t.deficit ?? 0})`)
+      );
+      item.appendChild(hdr);
+      if (t.suggested_scout_query) {
+        item.appendChild(el("div", "note-item-meta", `Suggested study query: ${t.suggested_scout_query}`));
+      }
+      outEl.appendChild(item);
+    }
+  } else {
+    outEl.appendChild(
+      el("div", "note-item-meta", "No directed curiosity gaps flagged across tracked domains.")
+    );
+  }
+}
+
+function loadGen4Workbench() {
+  if (!window.secondBrain || typeof window.secondBrain.request !== "function") return;
+  loadGen4Concepts();
+  loadGen4DistilledArtifacts();
+  loadGen4Curiosity();
+}
+
+document.getElementById("gen4RefreshAllBtn")?.addEventListener("click", loadGen4Workbench);
+document.getElementById("gen4ZoomRunBtn")?.addEventListener("click", () => runGen4Zoom(""));
+document.getElementById("gen4ZoomQueryInput")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") runGen4Zoom("");
+});
+document.getElementById("gen4ConceptsRefreshBtn")?.addEventListener("click", loadGen4Concepts);
+document.getElementById("gen4DistillRefreshBtn")?.addEventListener("click", loadGen4DistilledArtifacts);
+document.getElementById("gen4DistillRunBtn")?.addEventListener("click", async () => {
+  const outEl = document.getElementById("gen4DistillOutput");
+  const res = await window.secondBrain.request("POST", "/v1/principles/distill", {});
+  if (res.ok && res.data) {
+    const pCnt = (res.data.principles_created || []).length;
+    const mCnt = (res.data.mental_models_created || []).length;
+    const msg = `Distilled ${pCnt} new principle draft(s) and ${mCnt} mental model draft(s).`;
+    if (outEl) outEl.textContent = msg;
+    showToast(msg, "ok");
+    loadGen4DistilledArtifacts();
+  } else {
+    const msg = apiErrorMessage(res, "Distillation failed");
+    if (outEl) outEl.textContent = msg;
+    showToast(msg, "danger");
+  }
+});
+document.getElementById("gen4SimRunBtn")?.addEventListener("click", runGen4ImpactSimulation);
+document.getElementById("gen4SimTargetInput")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") runGen4ImpactSimulation();
+});
+document.getElementById("gen4CuriosityRefreshBtn")?.addEventListener("click", loadGen4Curiosity);
+
 // ─── Global Shortcuts & Init ─────────────────────────────────────────────────
 
 window.addEventListener("keydown", (e) => {
@@ -7760,9 +9406,12 @@ if (window.secondBrain) {
     window.secondBrain.onRefresh(() => {
       loadNotes({ append: false });
       refreshHealth();
+      loadWorkspaces();
+      refreshActiveViewForCurrentVault();
     });
   }
   refreshHealth();
   loadNotes({ append: false });
   loadWorkspaces();
+  refreshActiveViewForCurrentVault();
 }

@@ -16,11 +16,14 @@ Two credentials, two capability tiers:
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable
 from dataclasses import asdict
+from datetime import datetime, timezone
 import hmac
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -40,8 +43,10 @@ from atom_mutator import (  # noqa: E402
     apply_atom_merge,
     apply_review_transition,
     approved_revision_is_current,
+    archive_atom_to_cold,
     atomic_write_bytes,
     content_sha256,
+    restore_cold_archived_atom,
     set_atom_temporal_bounds,
 )
 import config as _config  # noqa: E402
@@ -157,6 +162,7 @@ from web_clipper import (  # noqa: E402
     ClipperSecurityError,
     create_clipper_pairing,
     create_clipper_pairing_code,
+    ingest_clipper_media_bytes,
     ingest_web_clip,
     list_clipper_pairings,
     redeem_clipper_pairing_code,
@@ -444,6 +450,40 @@ def _tags_strictly_in_project_scope(tags: list[str] | tuple[str, ...], project: 
     return bool(proj_tags) and all(bool(project_tags_match((t,), (scope_tag,))) for t in proj_tags)
 
 
+class _BadRequestError(ValueError):
+    """Validation error mapped to HTTP 400 Bad Request inside api_product.dispatch()."""
+
+
+_PROJECT_SCOPE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _optional_project_scope(val: object) -> str | None:
+    """Validate and normalize an optional project:<slug> scope parameter.
+
+    Returns None for None or blank input; raises _BadRequestError (a ValueError subclass
+    mapped to HTTP 400) for malformed or path-traversal project scopes.
+    """
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        raise _BadRequestError("Invalid 'project' scope: must be a string.")
+    raw = val.strip()
+    if not raw:
+        return None
+    if len(raw) > 120 or "\x00" in raw or "\\" in raw or ".." in raw:
+        raise _BadRequestError(f"Invalid 'project' scope: {val!r}")
+    body = raw[len("project:") :] if raw.lower().startswith("project:") else raw
+    if not body or body.startswith("/") or body.endswith("/") or "//" in body:
+        raise _BadRequestError(f"Invalid 'project' scope: {val!r}")
+    segments = body.split("/")
+    if any(seg in {".", ".."} or not _PROJECT_SCOPE_SEGMENT_RE.fullmatch(seg) for seg in segments):
+        raise _BadRequestError(f"Invalid 'project' scope: {val!r}")
+    normalized = normalize_project_tag(raw)
+    if not normalized or normalized == "project:":
+        raise _BadRequestError(f"Invalid 'project' scope: {val!r}")
+    return normalized
+
+
 def _parse_bounded_int(
     q: dict[str, list[str]],
     key: str,
@@ -463,6 +503,90 @@ def _parse_bounded_int(
     except ValueError as exc:
         raise ValueError(f"Invalid integer query parameter '{key}'.") from exc
     return max(min_val, min(parsed, max_val))
+
+
+def _parse_json_int(
+    body: dict,
+    key: str,
+    *,
+    default: int | None = None,
+    min_val: int | None = None,
+    max_val: int | None = None,
+    clamp: bool = False,
+    allow_none: bool = False,
+    error_cls: type[Exception] = ValueError,
+) -> int | None:
+    if key not in body:
+        return default
+    raw = body.get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        if allow_none:
+            return None
+        raise error_cls(f"'{key}' must be an integer.")
+    if isinstance(raw, bool):
+        raise error_cls(f"'{key}' must be an integer, not a boolean.")
+    if isinstance(raw, int):
+        parsed = int(raw)
+    elif isinstance(raw, str):
+        cleaned = raw.strip()
+        if len(cleaned) > 18:
+            raise error_cls(f"'{key}' must be a valid integer.")
+        try:
+            parsed = int(cleaned)
+        except ValueError as exc:
+            raise error_cls(f"'{key}' must be a valid integer.") from exc
+    else:
+        raise error_cls(f"'{key}' must be an integer.")
+    if clamp:
+        if min_val is not None:
+            parsed = max(min_val, parsed)
+        if max_val is not None:
+            parsed = min(max_val, parsed)
+    else:
+        if min_val is not None and parsed < min_val:
+            raise error_cls(f"'{key}' must be >= {min_val}.")
+        if max_val is not None and parsed > max_val:
+            raise error_cls(f"'{key}' must be <= {max_val}.")
+    return parsed
+
+
+def _parse_json_float(
+    body: dict,
+    key: str,
+    *,
+    default: float,
+    error_cls: type[Exception] = ValueError,
+) -> float:
+    if key not in body:
+        return default
+    raw = body.get(key)
+    if raw is None or isinstance(raw, bool):
+        raise error_cls(f"'{key}' must be a finite number.")
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+    elif isinstance(raw, str):
+        cleaned = raw.strip()
+        if not cleaned or len(cleaned) > 32:
+            raise error_cls(f"'{key}' must be a finite number.")
+        try:
+            val = float(cleaned)
+        except ValueError as exc:
+            raise error_cls(f"'{key}' must be a finite number.") from exc
+    else:
+        raise error_cls(f"'{key}' must be a finite number.")
+    if not math.isfinite(val):
+        raise error_cls(f"'{key}' must be a finite number.")
+    return val
+
+
+def _default_mobile_export_dir(rt: object) -> str:
+    """Return a user-writable export directory outside read-only application bundles."""
+    sec_dir = getattr(rt, "security_dir", None) or getattr(rt, "sync_state_dir", None)
+    if sec_dir is not None and str(sec_dir).strip():
+        base_state = Path(str(sec_dir)).expanduser().resolve()
+    else:
+        base_state = _config.security_state_dir().resolve()
+    return str(base_state.parent / "exports" / "mobile-vault-client")
 
 
 def _str(body: dict, key: str, *, max_len: int, required: bool = True, default: str = "") -> str:
@@ -1188,6 +1312,18 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(202 if res["status"] == "quarantined" else 201, res)
 
         # ── Multi-turn Chat Threads (owner-only) & Streaming Chat ──
+        if path == "/v1/chat/personas" and method == "GET":
+            from chat_threads import BEHAVIOR_MODES, WORK_MODES, list_persona_profiles
+
+            return send(
+                200,
+                {
+                    "personas": list_persona_profiles(),
+                    "work_modes": list(WORK_MODES),
+                    "behavior_modes": list(BEHAVIOR_MODES),
+                },
+            )
+
         if path == "/v1/chat/threads" and method == "GET":
             if not owner_only():
                 return True
@@ -1210,6 +1346,13 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 project_scope=_str(body, "project_scope", max_len=120, required=False).strip() or None,
                 host_id=_str(body, "host_id", default="ollama_local", max_len=64, required=False) or "ollama_local",
                 mode=_str(body, "mode", default="verified", max_len=32, required=False) or "verified",
+                work_mode=_str(body, "work_mode", default="chat", max_len=16, required=False) or "chat",
+                persona_id=_str(body, "persona_id", default="grounded_default", max_len=48, required=False)
+                or "grounded_default",
+                behavior_mode=_str(body, "behavior_mode", default="autopilot", max_len=16, required=False)
+                or "autopilot",
+                custom_rules=_str(body, "custom_rules", default="", max_len=4000, required=False),
+                done_criteria=_str(body, "done_criteria", default="", max_len=2000, required=False),
                 brain_dir=rt.brain_dir,
             )
             return send(201, created)
@@ -1217,7 +1360,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path.startswith("/v1/chat/threads/"):
             if not owner_only():
                 return True
-            from chat_threads import delete_chat_thread, get_chat_thread, pin_turn_to_note
+            from chat_threads import (
+                delete_chat_thread,
+                get_chat_thread,
+                pin_turn_to_note,
+                update_chat_thread_settings,
+            )
 
             rest = unquote(path[len("/v1/chat/threads/") :]).strip("/")
             if rest.endswith("/pin") and method == "POST":
@@ -1236,6 +1384,18 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if method == "GET":
                 max_turns = _parse_bounded_int(q, "max_turns", default=100, min_val=1, max_val=500)
                 return send(200, get_chat_thread(rest, max_turns=max_turns, brain_dir=rt.brain_dir))
+            if method == "PATCH":
+                updated = update_chat_thread_settings(
+                    rest,
+                    title=body.get("title") if "title" in body else None,
+                    work_mode=body.get("work_mode") if "work_mode" in body else None,
+                    persona_id=body.get("persona_id") if "persona_id" in body else None,
+                    behavior_mode=body.get("behavior_mode") if "behavior_mode" in body else None,
+                    custom_rules=body.get("custom_rules") if "custom_rules" in body else None,
+                    done_criteria=body.get("done_criteria") if "done_criteria" in body else None,
+                    brain_dir=rt.brain_dir,
+                )
+                return send(200, updated)
             if method == "DELETE":
                 return send(200, delete_chat_thread(rest, brain_dir=rt.brain_dir))
             return send(405, {"error": "Method not allowed."})
@@ -1294,6 +1454,11 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     "allow_unverified_leads": bool(is_owner and (req.answer_view == "research" or req.mode == "research")),
                     "include_expired": bool(req.include_expired),
                     "as_of": req.as_of.strip() if req.as_of and req.as_of.strip() else None,
+                    "work_mode": req.work_mode,
+                    "persona_id": req.persona_id,
+                    "behavior_mode": req.behavior_mode,
+                    "custom_rules": req.custom_rules,
+                    "done_criteria": req.done_criteria,
                 }
                 if req.thread_id:
                     ce_kwargs["thread_id"] = req.thread_id
@@ -1766,7 +1931,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             _sync_lexical_after_atom_mutation(rt, [norm_fname])
             return send(200, {"status": "edited", "atom": _atom_card(atom_path, rt), "decision": record})
 
-        if path.startswith("/v1/atoms/") and method == "POST":
+        if (
+            path.startswith("/v1/atoms/")
+            and method == "POST"
+            and not path.endswith("/cold-archive")
+            and not (path.startswith("/v1/atoms/cold-archive/") and path.endswith("/restore"))
+        ):
             if not owner_only():
                 return True
             rest = unquote(path[len("/v1/atoms/"):])
@@ -1966,10 +2136,69 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             load_fn = getattr(host_adapters, "load_host_sharing_policy", None) or host_adapters.load_host_policies
             policies = load_fn(rt.policy_path)
             serialized = {
-                hid: {**asdict(rule), "allowed_projects": list(rule.allowed_projects)}
+                hid: {
+                    **asdict(rule),
+                    "allowed_projects": list(rule.allowed_projects),
+                    "is_builtin": hid in getattr(host_adapters, "BUILTIN_HOST_IDS", ()),
+                }
                 for hid, rule in sorted(policies.items())
             }
             return send(200, serialized)
+
+        if path == "/v1/hosts" and method == "POST":
+            if not owner_only():
+                return True
+            import host_adapters
+            from recall import normalize_project_tag
+
+            hid = _str(body, "host_id", max_len=48, required=True).strip().lower()
+            prov = _str(body, "provider", max_len=32, required=True).strip()
+            transp = _str(body, "transport", max_len=16, required=True).strip()
+            ep = _str(body, "endpoint_url", max_len=500, required=True).strip()
+            mod = _str(body, "default_model", max_len=128, required=True).strip()
+            key_env = _str(body, "api_key_env", max_len=64, required=False).strip() or None
+            raw_projs = (
+                _str_list(body, "allowed_projects", max_items=32, max_item_len=120)
+                if body.get("allowed_projects") is not None
+                else ["*"]
+            )
+            projs = tuple("*" if p == "*" else normalize_project_tag(p) for p in raw_projs if p)
+            created = host_adapters.create_custom_host_policy(
+                hid,
+                provider=prov,
+                transport=transp,
+                endpoint_url=ep,
+                default_model=mod,
+                api_key_env=key_env,
+                allowed_projects=projs or ("*",),
+                allow_unscoped_atoms=bool(body.get("allow_unscoped_atoms", False)),
+                allow_preference_atoms=bool(body.get("allow_preference_atoms", False)),
+                redact_pii=body.get("redact_pii") if "redact_pii" in body else None,
+                fail_on_secret_detection=(
+                    body.get("fail_on_secret_detection") if "fail_on_secret_detection" in body else None
+                ),
+                enabled=bool(body.get("enabled", False)),
+                policy_path=rt.policy_path,
+            )
+            return send(
+                201,
+                {
+                    **asdict(created),
+                    "allowed_projects": list(created.allowed_projects),
+                    "is_builtin": False,
+                },
+            )
+
+        if path.startswith("/v1/hosts/") and method == "DELETE":
+            if not owner_only():
+                return True
+            host_id = unquote(path[len("/v1/hosts/"):]).strip().lower()
+            import host_adapters
+
+            deleted = host_adapters.delete_custom_host_policy(host_id, policy_path=rt.policy_path)
+            if not deleted:
+                return send(404, {"error": f"Custom host '{host_id}' not found."})
+            return send(200, {"deleted": host_id})
 
         if path.startswith("/v1/hosts/") and method == "PUT":
             if not owner_only():
@@ -2309,39 +2538,90 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         if path == "/v1/graph/summary" and method == "GET":
             from knowledge_graph import build_knowledge_graph
+            from memory_format import normalize_temporal_bound_str
 
             proj = ((q.get("project") or [None])[0] or None)
             if proj and len(proj) > 120:
                 raise ValueError("Invalid project query filter.")
+            raw_as_of = str((q.get("as_of") or [""])[0] or "").strip()
+            as_of_val = normalize_temporal_bound_str(raw_as_of) if raw_as_of else None
+            if "include_expired" in q:
+                inc_expired = str((q.get("include_expired") or ["1"])[0]).strip().lower() in {"1", "true", "yes"}
+            else:
+                inc_expired = False if as_of_val is not None else True
+            bg_sig = inspect.signature(build_knowledge_graph).parameters
             bg_kwargs: dict[str, object] = {
                 "brain_dir": rt.brain_dir,
                 "atoms_dir": rt.atoms_dir,
                 "project_scope": proj,
                 "include_pending": False,
             }
-            if "include_preferences" in inspect.signature(build_knowledge_graph).parameters:
+            if "include_preferences" in bg_sig:
                 bg_kwargs["include_preferences"] = bool(is_owner)
+            if "as_of" in bg_sig:
+                bg_kwargs["as_of"] = as_of_val
+            if "include_expired" in bg_sig:
+                bg_kwargs["include_expired"] = inc_expired
             res = build_knowledge_graph(**bg_kwargs)
-            return send(200, {k: v for k, v in res.items() if k not in {"nodes", "edges"}})
+            timeline_source_nodes = list(res.get("nodes") or [])
+            if is_owner and not inc_expired and "include_expired" in bg_sig:
+                all_res = build_knowledge_graph(**{**bg_kwargs, "include_expired": True})
+                timeline_source_nodes = list(all_res.get("nodes") or [])
+            timeline_dates_set: set[str] = set()
+            for n_item in timeline_source_nodes:
+                for b_field in ("valid_from", "valid_until"):
+                    b_raw = str(n_item.get(b_field) or "").strip()
+                    if len(b_raw) >= 10:
+                        timeline_dates_set.add(b_raw[:10])
+            if timeline_dates_set:
+                timeline_dates_set.add(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+            summary_payload = {k: v for k, v in res.items() if k not in {"nodes", "edges"}}
+            summary_payload["include_expired"] = inc_expired
+            summary_payload["timeline_dates"] = sorted(timeline_dates_set)
+            return send(200, summary_payload)
 
         if path in {"/v1/graph/full", "/v1/graph"} and method == "GET":
             from knowledge_graph import build_knowledge_graph
+            from memory_format import normalize_temporal_bound_str
 
             proj = ((q.get("project") or [None])[0] or None)
             if proj and len(proj) > 120:
                 raise ValueError("Invalid project query filter.")
             limit = _parse_bounded_int(q, "limit", default=300, min_val=1, max_val=1000)
             q_inc_pending = (q.get("include_pending") or ["0"])[0] in {"1", "true", "yes"}
+            raw_as_of = str((q.get("as_of") or [""])[0] or "").strip()
+            as_of_val = normalize_temporal_bound_str(raw_as_of) if raw_as_of else None
+            if "include_expired" in q:
+                inc_expired = str((q.get("include_expired") or ["1"])[0]).strip().lower() in {"1", "true", "yes"}
+            else:
+                inc_expired = False if as_of_val is not None else True
+            bg_sig_full = inspect.signature(build_knowledge_graph).parameters
             bg_kwargs_full: dict[str, object] = {
                 "brain_dir": rt.brain_dir,
                 "atoms_dir": rt.atoms_dir,
                 "project_scope": proj,
                 "include_pending": bool(is_owner and q_inc_pending),
             }
-            if "include_preferences" in inspect.signature(build_knowledge_graph).parameters:
+            if "include_preferences" in bg_sig_full:
                 bg_kwargs_full["include_preferences"] = bool(is_owner)
+            if "as_of" in bg_sig_full:
+                bg_kwargs_full["as_of"] = as_of_val
+            if "include_expired" in bg_sig_full:
+                bg_kwargs_full["include_expired"] = inc_expired
             res = build_knowledge_graph(**bg_kwargs_full)
             nodes_raw = list(res.get("nodes") or [])[:limit]
+            timeline_source_nodes = list(res.get("nodes") or []) if is_owner else nodes_raw
+            if is_owner and not inc_expired and "include_expired" in bg_sig_full:
+                all_res = build_knowledge_graph(**{**bg_kwargs_full, "include_expired": True})
+                timeline_source_nodes = list(all_res.get("nodes") or [])
+            timeline_dates_set_full: set[str] = set()
+            for n_item in timeline_source_nodes:
+                for b_field in ("valid_from", "valid_until"):
+                    b_raw = str(n_item.get(b_field) or "").strip()
+                    if len(b_raw) >= 10:
+                        timeline_dates_set_full.add(b_raw[:10])
+            if timeline_dates_set_full:
+                timeline_dates_set_full.add(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
             kept_ids = {str(n.get("id") or n.get("filename") or "") for n in nodes_raw}
             nodes_norm = [
                 {
@@ -2350,9 +2630,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     "label": str(n.get("claim") or n.get("label") or n.get("filename") or "")[:140],
                     "claim": str(n.get("claim") or ""),
                     "review_status": str(n.get("review_status") or "pending"),
+                    "effective_status": str(n.get("effective_status") or n.get("review_status") or "pending"),
                     "memory_type": str(n.get("memory_type") or "semantic"),
+                    "epistemic_label": str(n.get("epistemic_label") or "claim"),
                     "contexts": list(n.get("contexts") or []),
                     "verified": bool(n.get("approved_current", n.get("verified", False))),
+                    "valid_from": str(n.get("valid_from") or ""),
+                    "valid_until": str(n.get("valid_until") or ""),
+                    "temporal_status": str(n.get("temporal_status") or "unbounded"),
+                    "superseded_by": str(n.get("superseded_by") or ""),
                 }
                 for n in nodes_raw
             ]
@@ -2374,6 +2660,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     "edges": edges_norm,
                     "node_count": len(nodes_norm),
                     "edge_count": len(edges_norm),
+                    "include_expired": inc_expired,
+                    "timeline_dates": sorted(timeline_dates_set_full),
                 },
             )
 
@@ -2469,10 +2757,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             proj = _str(body, "project_scope", max_len=120, required=False).strip() or None
             dry_run = bool(body.get("dry_run", False))
             inc_pending = bool(body.get("include_pending", False))
-            raw_max = body.get("max_links_per_atom", 4)
-            if isinstance(raw_max, bool) or not isinstance(raw_max, (int, str)) or len(str(raw_max).strip()) > 12:
-                raise ValueError("'max_links_per_atom' must be an integer between 1 and 10.")
-            max_links = max(1, min(int(str(raw_max).strip()), 10))
+            max_links = _parse_json_int(
+                body,
+                "max_links_per_atom",
+                default=4,
+                min_val=1,
+                max_val=10,
+                clamp=True,
+            )
+            assert max_links is not None
             res = auto_link_vault_atoms(
                 actor=actor,
                 brain_dir=rt.brain_dir,
@@ -2667,6 +2960,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         redacted_pb["new_backing_atoms"] = []
                     pb_modified.append(redacted_pb)
 
+                raw_sk_changes = dict(res.get("skill_changes") or {})
+                redacted_sk_changes: dict[str, list[dict[str, object]]] = {}
+                for sk_bucket in ("added", "removed", "modified"):
+                    redacted_sk_changes[sk_bucket] = [
+                        {**item, "title": "", "redacted_revoked": True}
+                        for item in (raw_sk_changes.get(sk_bucket) or [])
+                    ]
+
                 prev_summary = dict(res.get("summary") or {})
                 res = {
                     **res,
@@ -2678,6 +2979,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                         "removed": pb_removed,
                         "modified": pb_modified,
                     },
+                    "skill_changes": redacted_sk_changes,
                     "summary": {
                         **prev_summary,
                         "added": len(added),
@@ -2691,10 +2993,16 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             from skill_playbooks import playbook_visible_in_scope
             from time_travel import recall_at_snapshot
 
-            raw_limit = body.get("top_k") if "top_k" in body else body.get("limit", 5)
-            if isinstance(raw_limit, bool) or not isinstance(raw_limit, (int, str)) or len(str(raw_limit).strip()) > 12:
-                raise ValueError("'limit' must be an integer between 1 and 25.")
-            top_k = max(1, min(int(str(raw_limit).strip()), 25))
+            limit_key = "top_k" if "top_k" in body else "limit"
+            top_k = _parse_json_int(
+                body,
+                limit_key,
+                default=5,
+                min_val=1,
+                max_val=25,
+                clamp=True,
+            )
+            assert top_k is not None
             proj_scope = _str(body, "project_scope", max_len=120, required=False).strip() or None
             as_of_str = _str(body, "as_of", max_len=64, required=False).strip() or None
             inc_expired = bool(body.get("include_expired", False))
@@ -2952,10 +3260,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     ),
                 )
             enabled = bool(body.get("enabled", False))
-            raw_iv = body.get("interval_seconds", 300)
-            if isinstance(raw_iv, bool) or not isinstance(raw_iv, (int, str)):
-                raise ValueError("'interval_seconds' must be an integer.")
-            iv = max(5, min(int(str(raw_iv).strip()[:8]), 86400))
+            iv = _parse_json_int(
+                body,
+                "interval_seconds",
+                default=300,
+                min_val=5,
+                max_val=86400,
+                clamp=True,
+            )
+            assert iv is not None
             start_bg = bool(body.get("start_background", True))
             return send(
                 200,
@@ -3214,7 +3527,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 return True
             from inbox_drop import export_mobile_recall_index, rotate_mobile_recall_key
 
-            rot = rotate_mobile_recall_key(brain_dir=rt.brain_dir, state_dir=_drop_state_dir)
+            opt_vid = _str(body, "vault_id", max_len=64, required=False).strip() or None
+            rot = rotate_mobile_recall_key(
+                vault_id=opt_vid,
+                brain_dir=rt.brain_dir,
+                state_dir=_drop_state_dir,
+            )
             if bool(body.get("reexport", True)):
                 exp = export_mobile_recall_index(
                     brain_dir=rt.brain_dir,
@@ -3249,7 +3567,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Local-First Browser Web Clipper (scoped token or owner-only on /ping,/status,/clip; owner-only on pairings) ──
         sec_dir = getattr(rt, "security_dir", None)
-        if path in {"/v1/clipper/ping", "/v1/clipper/status", "/v1/clipper/clip"}:
+        if path in {"/v1/clipper/ping", "/v1/clipper/status", "/v1/clipper/clip", "/v1/clipper/capture-media"}:
             pairing = getattr(handler, "_clipper_pairing", None)
             if pairing is None and not is_owner:
                 return send(
@@ -3316,6 +3634,41 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(201, res)
 
+        if path == "/v1/clipper/capture-media" and method == "POST":
+            client_ip = handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1"
+            if not check_capture_rate_limit(client_ip):
+                return send(
+                    429,
+                    {"error": "Too Many Requests: capture write rate limit exceeded (max 180 per minute)."},
+                )
+            pairing = getattr(handler, "_clipper_pairing", None)
+            src_label = (
+                f"clipper:{pairing.get('pairing_id')}"
+                if isinstance(pairing, dict) and pairing.get("pairing_id")
+                else "browser-clipper"
+            )
+            raw_tags = body.get("tags", [])
+            if isinstance(raw_tags, str):
+                tags_val = raw_tags[:1000]
+            elif isinstance(raw_tags, list):
+                tags_val = [str(t)[:64] for t in raw_tags[:32]]
+            else:
+                raise ClipperError("'tags' must be a list of strings or comma-separated string.")
+            b64_data = body.get("content_base64")
+            if not isinstance(b64_data, str) or not b64_data.strip():
+                raise ClipperError("'content_base64' is required for /v1/clipper/capture-media.")
+            res = ingest_clipper_media_bytes(
+                url=_str(body, "url", max_len=2048),
+                title=_str(body, "title", max_len=240, required=False),
+                kind=_str(body, "kind", max_len=32),
+                content_base64=b64_data,
+                tags=tags_val,
+                destination=_str(body, "destination", default="note", max_len=16, required=False) or "note",
+                capture_source=src_label,
+                brain_dir=rt.brain_dir,
+            )
+            return send(201, res)
+
         if path == "/v1/clipper/pairings" and method == "GET":
             if not owner_only():
                 return True
@@ -3326,11 +3679,24 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if not owner_only():
                 return True
             label = _str(body, "label", default="Browser Clipper", max_len=80, required=False) or "Browser Clipper"
-            raw_ttl = body.get("ttl_seconds", 300)
-            if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, (int, str)):
-                raise ClipperError("'ttl_seconds' must be an integer between 30 and 900.")
-            ttl = max(30, min(int(str(raw_ttl).strip()[:6]), 900))
-            res = create_clipper_pairing_code(label=label, ttl_seconds=ttl, security_dir=sec_dir)
+            ttl = _parse_json_int(
+                body,
+                "ttl_seconds",
+                default=300,
+                min_val=30,
+                max_val=900,
+                clamp=True,
+                error_cls=ClipperError,
+            )
+            assert ttl is not None
+            srv_addr = getattr(getattr(handler, "server", None), "server_address", None)
+            bound_port = int(srv_addr[1]) if isinstance(srv_addr, (tuple, list)) and len(srv_addr) >= 2 else 0
+            res = create_clipper_pairing_code(
+                label=label,
+                ttl_seconds=ttl,
+                port=(bound_port if 1 <= bound_port <= 65535 else None),
+                security_dir=sec_dir,
+            )
             return send(201, res)
 
         if path == "/v1/clipper/redeem" and method == "POST":
@@ -3418,10 +3784,16 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 vids_arg: list[str] | None = [str(x).strip() for x in raw_vids if str(x).strip()]
             else:
                 vids_arg = None
-            raw_lim = body.get("limit", 5)
-            if isinstance(raw_lim, bool) or not isinstance(raw_lim, (int, str)):
-                raise VaultWorkspaceError("'limit' must be an integer between 1 and 25.")
-            lim = max(1, min(int(str(raw_lim).strip()[:6]), 25))
+            lim = _parse_json_int(
+                body,
+                "limit",
+                default=5,
+                min_val=1,
+                max_val=25,
+                clamp=True,
+                error_cls=VaultWorkspaceError,
+            )
+            assert lim is not None
             proj = _str(body, "project_scope", max_len=120, required=False).strip() or None
             ret_mode = _str(body, "retrieval_mode", default="lexical", max_len=16, required=False).strip() or "lexical"
             res = federated_recall(
@@ -3530,6 +3902,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             res = ingest_uploaded_media_bytes(media_bytes, fname, brain_dir=rt.brain_dir)
             return send(201, res)
 
+        if path == "/v1/ingest/video-file" and method == "POST":
+            if not owner_only():
+                return True
+            from ingest_multimodal import ingest_local_video_file
+
+            video_fp = _str(body, "filepath", max_len=1000, required=True).strip()
+            res = ingest_local_video_file(video_fp, brain_dir=rt.brain_dir)
+            return send(201, res)
+
         # ── Git Post-Commit Hook & Coding Session Distiller (owner-only) ──
         if path == "/v1/git/hook" and method == "GET":
             if not owner_only():
@@ -3563,10 +3944,15 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             repo_p = _str(body, "repo", default=default_repo, max_len=1000, required=False).strip() or default_repo
             proj_p = _str(body, "project_scope", max_len=120, required=False).strip() or None
             commit_p = _str(body, "commit_sha", max_len=64, required=False).strip() or None
-            raw_mc = body.get("max_commits", 5)
-            if isinstance(raw_mc, bool) or not isinstance(raw_mc, (int, str)):
-                raise ValueError("'max_commits' must be an integer.")
-            mc_val = max(1, min(int(str(raw_mc).strip()[:4]), 25))
+            mc_val = _parse_json_int(
+                body,
+                "max_commits",
+                default=5,
+                min_val=1,
+                max_val=25,
+                clamp=True,
+            )
+            assert mc_val is not None
             stage_ib = bool(body.get("stage_inbox", True))
             force_d = bool(body.get("force", False))
             return send(
@@ -3772,14 +4158,17 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if raw_schema is not None and not isinstance(raw_schema, dict):
                 raise ValueError("'input_schema' must be an object mapping parameter names to definitions.")
             exp_sk = _str(body, "expected_skill_sha256", max_len=64, required=False).strip() or None
+            timeout_s = _parse_json_float(body, "timeout_seconds", default=15.0)
+            max_out_b = _parse_json_int(body, "max_output_bytes", default=65536)
+            assert max_out_b is not None
             res = promote_playbook_to_executable_skill(
                 skill_id=_str(body, "skill_id", max_len=64),
                 playbook_id=_str(body, "playbook_id", max_len=64),
                 expected_playbook_sha256=_str(body, "expected_playbook_sha256", max_len=64),
                 step_actions=raw_actions,
                 input_schema=raw_schema,
-                timeout_seconds=float(body.get("timeout_seconds", 15.0)),
-                max_output_bytes=int(body.get("max_output_bytes", 65536)),
+                timeout_seconds=timeout_s,
+                max_output_bytes=max_out_b,
                 actor=_str(body, "actor", max_len=120),
                 rationale=_str(body, "rationale", max_len=500, required=False),
                 allow_early_owner_override=bool(body.get("allow_early_owner_override", False)),
@@ -3897,7 +4286,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 return True
             from mobile_vault_client import export_mobile_vault_client_bundle
 
-            default_out = str(Path(__file__).resolve().parents[1] / "dist")
+            default_out = _default_mobile_export_dir(rt)
             out_d = _str(body, "out_dir", max_len=1000, required=False, default=default_out).strip() or default_out
             return send(201, export_mobile_vault_client_bundle(out_d))
 
@@ -3924,7 +4313,6 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path.startswith("/v1/media/file/") and method == "GET":
             if not owner_only():
                 return True
-            import base64
             from creative_media import get_generated_media_file
 
             media_id = unquote(path[len("/v1/media/file/") :]).strip()
@@ -3960,16 +4348,18 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 return True
             from creative_media import generate_local_image
 
-            seed_raw = body.get("seed")
-            seed_val = int(seed_raw) if seed_raw is not None and str(seed_raw).strip() != "" else None
+            seed_val = _parse_json_int(body, "seed", default=None, allow_none=True)
+            width_val = _parse_json_int(body, "width", default=768)
+            height_val = _parse_json_int(body, "height", default=512)
+            assert width_val is not None and height_val is not None
             art = generate_local_image(
                 _str(body, "prompt", max_len=4000),
                 brain_dir=rt.brain_dir,
                 backend=_str(body, "backend", max_len=64, required=False, default="auto") or "auto",
                 style=_str(body, "style", max_len=64, required=False, default="concept_card") or "concept_card",
                 output_format=_str(body, "output_format", max_len=16, required=False, default="png") or "png",
-                width=int(body.get("width", 768)),
-                height=int(body.get("height", 512)),
+                width=width_val,
+                height=height_val,
                 seed=seed_val,
                 negative_prompt=_str(body, "negative_prompt", max_len=2000, required=False),
                 title=_str(body, "title", max_len=200, required=False),
@@ -3980,6 +4370,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 redact_pii=bool(body.get("redact_pii", True)),
                 strict_dlp=bool(body.get("strict_dlp", True)),
                 allow_hardware_override=bool(body.get("allow_hardware_override", False)),
+                allow_procedural_fallback=bool(body.get("allow_procedural_fallback", False)),
                 policy_path=getattr(rt, "policy_path", None),
                 sd_webui_url=_str(body, "sd_webui_url", max_len=256, required=False).strip() or None,
                 comfyui_url=_str(body, "comfyui_url", max_len=256, required=False).strip() or None,
@@ -3992,18 +4383,22 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 return True
             from creative_media import generate_local_video
 
-            seed_raw = body.get("seed")
-            seed_val = int(seed_raw) if seed_raw is not None and str(seed_raw).strip() != "" else None
+            seed_val = _parse_json_int(body, "seed", default=None, allow_none=True)
+            width_val = _parse_json_int(body, "width", default=640)
+            height_val = _parse_json_int(body, "height", default=384)
+            frames_val = _parse_json_int(body, "frames", default=16)
+            fps_val = _parse_json_int(body, "fps", default=12)
+            assert width_val is not None and height_val is not None and frames_val is not None and fps_val is not None
             art = generate_local_video(
                 _str(body, "prompt", max_len=4000),
                 brain_dir=rt.brain_dir,
                 backend=_str(body, "backend", max_len=64, required=False, default="auto") or "auto",
                 style=_str(body, "style", max_len=64, required=False, default="concept_card") or "concept_card",
                 output_format=_str(body, "output_format", max_len=16, required=False, default="mp4") or "mp4",
-                width=int(body.get("width", 640)),
-                height=int(body.get("height", 384)),
-                frames=int(body.get("frames", 16)),
-                fps=int(body.get("fps", 12)),
+                width=width_val,
+                height=height_val,
+                frames=frames_val,
+                fps=fps_val,
                 seed=seed_val,
                 negative_prompt=_str(body, "negative_prompt", max_len=2000, required=False),
                 title=_str(body, "title", max_len=200, required=False),
@@ -4014,11 +4409,1084 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 redact_pii=bool(body.get("redact_pii", True)),
                 strict_dlp=bool(body.get("strict_dlp", True)),
                 allow_hardware_override=bool(body.get("allow_hardware_override", False)),
+                allow_procedural_fallback=bool(body.get("allow_procedural_fallback", False)),
                 policy_path=getattr(rt, "policy_path", None),
                 comfyui_url=_str(body, "comfyui_url", max_len=256, required=False).strip() or None,
                 http_transport=getattr(rt, "http_transport", None),
             )
             return send(201, art.as_dict())
+
+        # ── Jarvis Orchestrator, 5-Panelist Design Critique & Skill Pack Importer (owner) ──
+        if path == "/v1/design/presets" and method == "GET":
+            from design_critique import get_design_presets
+
+            return send(200, {"presets": get_design_presets()})
+
+        if path == "/v1/design/critique" and method == "POST":
+            if not owner_only():
+                return True
+            from design_critique import run_five_panel_critique
+
+            files_raw = body.get("files") if isinstance(body.get("files"), list) else []
+            artifact_txt = _str(body, "artifact_text", default="", max_len=250_000, required=False)
+            preset_val = _str(body, "preset", default="", max_len=64, required=False).strip()
+            if not files_raw and artifact_txt.strip():
+                art_name = _str(body, "filename", default="artifact.html", max_len=120, required=False).strip() or "artifact.html"
+                files_raw = [{"filename": art_name, "lang": "html", "content": artifact_txt}]
+            brief_val = _str(body, "brief", max_len=2000, required=False)
+            if not brief_val.strip() and preset_val:
+                brief_val = f"Evaluate against preset '{preset_val}'."
+            return send(
+                200,
+                run_five_panel_critique(
+                    files_raw,
+                    persona_id=_str(body, "persona_id", max_len=64, required=False),
+                    done_criteria=_str(body, "done_criteria", max_len=2000, required=False),
+                    brief=brief_val,
+                ),
+            )
+
+        if path == "/v1/orchestrator/status" and method == "GET":
+            if not owner_only():
+                return True
+            from jarvis_orchestrator import orchestrator_status
+
+            return send(200, orchestrator_status())
+
+        if path == "/v1/orchestrator/open-webui-tool" and method == "GET":
+            if not owner_only():
+                return True
+            from jarvis_orchestrator import export_open_webui_tool
+
+            srv_addr = getattr(getattr(handler, "server", None), "server_address", None)
+            live_port = (
+                int(srv_addr[1])
+                if isinstance(srv_addr, tuple) and len(srv_addr) >= 2 and isinstance(srv_addr[1], int) and srv_addr[1] >= 1024
+                else 0
+            )
+            rt_port = int(getattr(rt, "port", 0) or 0)
+            api_p = live_port if live_port >= 1024 else (rt_port if rt_port >= 1024 else 8765)
+            raw_proxy_q = (q.get("proxy_port") or [""])[0].strip()
+            p_val = (
+                _parse_bounded_int(q, "proxy_port", default=api_p, min_val=1024, max_val=65535)
+                if raw_proxy_q
+                else api_p
+            )
+            return send(200, export_open_webui_tool(api_port=int(api_p), proxy_port=int(p_val)))
+
+        if path == "/v1/orchestrator/n8n/trigger" and method == "POST":
+            if not owner_only():
+                return True
+            from jarvis_orchestrator import trigger_n8n_workflow
+
+            wh_url = _str(body, "webhook_url", max_len=500, required=True)
+            pl_val = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+            return send(200, trigger_n8n_workflow(wh_url, pl_val, http_transport=getattr(rt, "http_transport", None)))
+
+        if path == "/v1/orchestrator/openhands/dispatch" and method == "POST":
+            if not owner_only():
+                return True
+            from jarvis_orchestrator import dispatch_openhands_task
+
+            return send(
+                200,
+                dispatch_openhands_task(
+                    _str(body, "goal", max_len=4000, required=True),
+                    repo_path=_str(body, "repo_path", max_len=500, required=False),
+                    openhands_url=_str(body, "openhands_url", default="http://127.0.0.1:3002", max_len=300, required=False)
+                    or "http://127.0.0.1:3002",
+                    project_scope=_str(body, "project_scope", max_len=120, required=False) or None,
+                    brain_dir=rt.brain_dir,
+                    http_transport=getattr(rt, "http_transport", None),
+                ),
+            )
+
+        if path == "/v1/orchestrator/appflowy/sync" and method == "POST":
+            if not owner_only():
+                return True
+            from jarvis_orchestrator import sync_appflowy_board_tasks
+
+            bt_raw = body.get("tasks") if isinstance(body.get("tasks"), list) else None
+            return send(
+                200,
+                sync_appflowy_board_tasks(
+                    external_board_tasks=bt_raw,
+                    project=_str(body, "project", max_len=120, required=False) or None,
+                    brain_dir=rt.brain_dir,
+                ),
+            )
+
+        if path == "/v1/packs" and method == "GET":
+            if not owner_only():
+                return True
+            from skill_pack_importer import list_imported_packs
+
+            return send(200, list_imported_packs(brain_dir=rt.brain_dir))
+
+        if path == "/v1/packs/import" and method == "POST":
+            if not owner_only():
+                return True
+            from skill_pack_importer import discover_default_skill_packs, import_skill_pack
+
+            pack_name = _str(body, "pack_name", max_len=64, required=True)
+            src_dir = _str(body, "source_dir", max_len=1000, required=False).strip() or (
+                discover_default_skill_packs().get(pack_name) or ""
+            )
+            if not src_dir:
+                raise ValueError(f"Pack directory for {pack_name!r} not provided and not auto-discovered.")
+            lim_v = _parse_json_int(body, "limit", default=None, allow_none=True)
+            return send(201, import_skill_pack(src_dir, pack_name, brain_dir=rt.brain_dir, limit=lim_v))
+
+        # ── Opt-In Screen OCR ('Eyes'), External Folder Indexer, OpenAI Proxy & Zero-Trust Tunnel ──
+        if path in {"/v1/screen/config", "/v1/screen/status"} and method == "GET":
+            if not owner_only():
+                return True
+            from screen_memory import load_screen_config
+
+            return send(200, load_screen_config(state_dir=getattr(rt, "security_dir", None)))
+
+        if path == "/v1/screen/config" and method == "POST":
+            if not owner_only():
+                return True
+            from screen_memory import configure_screen_memory
+
+            terms_raw = body.get("blocked_window_terms")
+            terms_list = [str(t) for t in terms_raw] if isinstance(terms_raw, list) else None
+            return send(
+                200,
+                configure_screen_memory(
+                    enabled=bool(body["enabled"]) if "enabled" in body else None,
+                    interval_seconds=_parse_json_int(body, "interval_seconds", default=None, allow_none=True),
+                    retention_days=_parse_json_int(body, "retention_days", default=None, allow_none=True),
+                    blocked_window_terms=terms_list,
+                    state_dir=getattr(rt, "security_dir", None),
+                ),
+            )
+
+        if path == "/v1/screen/search" and method == "GET":
+            if not owner_only():
+                return True
+            from screen_memory import search_screen_memory
+
+            query_s = (q.get("query") or [""])[0]
+            lim_s = _parse_bounded_int(q, "limit", default=12, min_val=1, max_val=50)
+            return send(200, {"results": search_screen_memory(query_s, limit=lim_s, brain_dir=rt.brain_dir)})
+
+        if path in {"/v1/screen/capture", "/v1/screen/ingest"} and method == "POST":
+            if not owner_only():
+                return True
+            from screen_memory import ingest_screen_frame
+
+            img_b64 = _str(body, "image_b64", max_len=16_000_000, required=True)
+            try:
+                img_raw = base64.b64decode(img_b64, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("Invalid base64 'image_b64' payload.") from exc
+            return send(
+                200,
+                ingest_screen_frame(
+                    img_raw,
+                    window_title=_str(body, "window_title", max_len=300, required=False),
+                    app_name=_str(body, "app_name", max_len=120, required=False),
+                    brain_dir=rt.brain_dir,
+                    state_dir=getattr(rt, "security_dir", None),
+                    require_enabled=True,
+                ),
+            )
+
+        if path == "/v1/screen/promote" and method == "POST":
+            if not owner_only():
+                return True
+            from screen_memory import promote_capture_to_note
+
+            cid = _parse_json_int(body, "capture_id", default=None, allow_none=False)
+            assert cid is not None
+            return send(201, promote_capture_to_note(cid, brain_dir=rt.brain_dir, tags=_tags(body) if "tags" in body else ()))
+
+        if path in {"/v1/external-folders/config", "/v1/external-folders/status"} and method == "GET":
+            if not owner_only():
+                return True
+            from external_indexer import load_external_config
+
+            return send(200, load_external_config(state_dir=getattr(rt, "security_dir", None)))
+
+        if path == "/v1/external-folders/config" and method == "POST":
+            if not owner_only():
+                return True
+            from external_indexer import configure_external_indexer
+
+            return send(
+                200,
+                configure_external_indexer(
+                    enabled=bool(body["enabled"]) if "enabled" in body else None,
+                    add_folder=_str(body, "add_folder", max_len=1000, required=False) or None,
+                    remove_folder=_str(body, "remove_folder", max_len=1000, required=False) or None,
+                    state_dir=getattr(rt, "security_dir", None),
+                    brain_dir=str(rt.brain_dir),
+                ),
+            )
+
+        if path == "/v1/external-folders/scan" and method == "POST":
+            if not owner_only():
+                return True
+            from external_indexer import scan_external_folders
+
+            return send(
+                200,
+                scan_external_folders(
+                    brain_dir=rt.brain_dir,
+                    state_dir=getattr(rt, "security_dir", None),
+                    require_enabled=True,
+                ),
+            )
+
+        if path == "/v1/external-folders/search" and method == "GET":
+            if not owner_only():
+                return True
+            from external_indexer import search_external_files
+
+            query_e = (q.get("query") or [""])[0]
+            lim_e = _parse_bounded_int(q, "limit", default=12, min_val=1, max_val=50)
+            return send(
+                200,
+                {
+                    "results": search_external_files(
+                        query_e,
+                        limit=lim_e,
+                        brain_dir=rt.brain_dir,
+                        state_dir=getattr(rt, "security_dir", None),
+                    )
+                },
+            )
+
+        if path == "/v1/openai/v1/models" and method == "GET":
+            from local_ai_proxy import handle_openai_models, load_proxy_config
+
+            proxy_cfg = load_proxy_config(state_dir=getattr(rt, "security_dir", None))
+            if not proxy_cfg.get("enabled"):
+                return send(
+                    403,
+                    {
+                        "error": "403 Forbidden: Local OpenAI-compatible AI proxy is disabled by default. Enable it first via 'second-brain proxy enable'."
+                    },
+                )
+            return send(200, handle_openai_models(policy_path=getattr(rt, "policy_path", None)))
+
+        if path == "/v1/openai/v1/chat/completions" and method == "POST":
+            from local_ai_proxy import handle_openai_chat_completions, load_proxy_config
+
+            proxy_cfg = load_proxy_config(state_dir=getattr(rt, "security_dir", None))
+            if not proxy_cfg.get("enabled"):
+                return send(
+                    403,
+                    {
+                        "error": "403 Forbidden: Local OpenAI-compatible AI proxy is disabled by default. Enable it first via 'second-brain proxy enable'."
+                    },
+                )
+            hdr_proj = None
+            if hasattr(handler, "headers") and handler.headers is not None:
+                hdr_proj = handler.headers.get("X-Second-Brain-Project")
+            res_proxy = handle_openai_chat_completions(
+                body,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                lexical_index_path=rt.lexical_index_path,
+                chroma_path=rt.chroma_path,
+                policy_path=getattr(rt, "policy_path", None),
+                project_scope=hdr_proj,
+                http_transport=getattr(rt, "http_transport", None),
+                skip_dns_check_for_mock_transport=bool(getattr(rt, "skip_dns_check_for_mock_transport", False)),
+            )
+            return send(200, res_proxy)
+
+        if path == "/v1/tunnel/status" and method == "GET":
+            if not owner_only():
+                return True
+            from zero_trust_tunnel import tunnel_status
+
+            return send(200, tunnel_status(state_dir=getattr(rt, "security_dir", None)))
+
+        if path == "/v1/tunnel/config" and method == "POST":
+            if not owner_only():
+                return True
+            from zero_trust_tunnel import configure_tunnel
+
+            return send(
+                200,
+                configure_tunnel(
+                    enabled=bool(body["enabled"]) if "enabled" in body else None,
+                    provider=_str(body, "provider", max_len=32, required=False) or None,
+                    target_port=_parse_json_int(body, "target_port", default=None, allow_none=True),
+                    gateway_port=_parse_json_int(body, "gateway_port", default=None, allow_none=True),
+                    rate_limit_per_min=_parse_json_int(body, "rate_limit_per_min", default=None, allow_none=True),
+                    tunnel_id=_str(body, "tunnel_id", max_len=128, required=False) if "tunnel_id" in body else None,
+                    allow_quick_tunnel=bool(body["allow_quick_tunnel"]) if "allow_quick_tunnel" in body else None,
+                    state_dir=getattr(rt, "security_dir", None),
+                ),
+            )
+
+        # ── Local Text-to-Speech (Kokoro-82M ONNX) & Two-Way Voice Loop (owner-only) ──
+        if path == "/v1/voice/status" and method == "GET":
+            if not owner_only():
+                return True
+            import importlib.util as _ilu
+            import ingest_multimodal as _im
+            from tts_engine import tts_status
+
+            probe_fn = getattr(_im, "probe_audio_transcription_backend", None)
+            if callable(probe_fn):
+                stt_ok, stt_detail = probe_fn()
+            elif _ilu.find_spec("faster_whisper") is not None:
+                stt_ok, stt_detail = True, "faster-whisper available"
+            else:
+                stt_ok, stt_detail = False, "faster-whisper not installed"
+            tts_info = tts_status(state_dir=getattr(rt, "security_dir", None))
+            return send(
+                200,
+                {
+                    "tts": tts_info,
+                    "stt": {"available": bool(stt_ok), "detail": str(stt_detail)},
+                },
+            )
+
+        if path == "/v1/voice/speak" and method == "POST":
+            if not owner_only():
+                return True
+            from tts_engine import TtsUnavailableError, synthesize_wav_bytes
+
+            raw_text = _str(body, "text", max_len=8000, required=True)
+            voice_name = _str(body, "voice", default="af_heart", max_len=64, required=False) or "af_heart"
+            raw_spd = body.get("speed", 1.0)
+            try:
+                spd_val = float(raw_spd)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("'speed' must be a numeric float.") from exc
+            try:
+                out_tts = synthesize_wav_bytes(
+                    raw_text,
+                    voice=voice_name,
+                    speed=spd_val,
+                    state_dir=getattr(rt, "security_dir", None),
+                )
+            except TtsUnavailableError as exc:
+                return send(503, {"error": str(exc), "remediation": "second-brain models pull kokoro-tts"})
+            return send(
+                200,
+                {
+                    "status": "ok",
+                    "mime_type": out_tts["mime_type"],
+                    "sample_rate": out_tts["sample_rate"],
+                    "duration_seconds": out_tts["duration_seconds"],
+                    "rtf": out_tts["rtf"],
+                    "clean_text": out_tts["clean_text"],
+                    "voice": out_tts["voice"],
+                    "model_id": out_tts["model_id"],
+                    "audio_b64": base64.b64encode(out_tts["wav_bytes"]).decode("ascii"),
+                },
+            )
+
+        if path == "/v1/voice/conversation-turn" and method == "POST":
+            if not owner_only():
+                return True
+            from tts_engine import voice_conversation_turn
+
+            audio_b64 = _str(body, "audio_b64", max_len=24_000_000, required=True)
+            try:
+                audio_raw = base64.b64decode(audio_b64, validate=True)
+            except Exception as exc:
+                raise ValueError("Invalid base64 'audio_b64' payload.") from exc
+            fname = _str(body, "filename", default="voice-turn.webm", max_len=128, required=False) or "voice-turn.webm"
+            mode_val = _str(body, "mode", default="stream", max_len=32, required=False) or "stream"
+            host_val = _str(body, "host_id", default="ollama_local", max_len=64, required=False) or "ollama_local"
+            scope_val = _str(body, "project_scope", max_len=120, required=False).strip() or None
+            voice_name = _str(body, "voice", default="af_heart", max_len=64, required=False) or "af_heart"
+            try:
+                spd_val = float(body.get("speed", 1.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("'speed' must be a numeric float.") from exc
+            turn_res = voice_conversation_turn(
+                audio_raw,
+                fname,
+                brain_dir=rt.brain_dir,
+                policy_path=getattr(rt, "policy_path", None),
+                state_dir=getattr(rt, "security_dir", None),
+                mode=mode_val,
+                host_id=host_val,
+                project_scope=scope_val,
+                voice=voice_name,
+                speed=spd_val,
+            )
+            return send(200, turn_res)
+
+        # ── Speculative Decoding Runtime (llama.cpp Draft+Target, owner-controlled) ──
+        if path == "/v1/runtime/speculative/status" and method == "GET":
+            if not owner_only():
+                return True
+            from llama_cpp_runner import speculative_status
+
+            port_q = _parse_bounded_int(q, "port", default=0, min_val=0, max_val=65535)
+            return send(
+                200,
+                speculative_status(
+                    state_dir=getattr(rt, "security_dir", None),
+                    port=port_q if port_q >= 1024 else None,
+                ),
+            )
+
+        if path == "/v1/runtime/speculative/start" and method == "POST":
+            if not owner_only():
+                return True
+            from llama_cpp_runner import start_speculative_server
+
+            port_v = _parse_json_int(body, "port", default=8081) or 8081
+            dmax = _parse_json_int(body, "draft_max", default=8) or 8
+            dmin = _parse_json_int(body, "draft_min", default=2) or 2
+            res = start_speculative_server(
+                _str(body, "target_model", max_len=1000, required=True),
+                _str(body, "draft_model", max_len=1000, required=True),
+                port=port_v,
+                draft_max=dmax,
+                draft_min=dmin,
+                threads=_parse_json_int(body, "threads", default=None, allow_none=True),
+                ctx_size=_parse_json_int(body, "ctx_size", default=None, allow_none=True),
+                n_gpu_layers=_parse_json_int(body, "n_gpu_layers", default=None, allow_none=True),
+                state_dir=getattr(rt, "security_dir", None),
+                policy_path=getattr(rt, "policy_path", None),
+                register_host=bool(body.get("register_host", True)),
+            )
+            return send(200, res)
+
+        if path == "/v1/runtime/speculative/stop" and method == "POST":
+            if not owner_only():
+                return True
+            from llama_cpp_runner import stop_speculative_server
+
+            return send(200, stop_speculative_server(state_dir=getattr(rt, "security_dir", None)))
+
+        if path == "/v1/runtime/speculative/benchmark" and method == "POST":
+            if not owner_only():
+                return True
+            from llama_cpp_runner import benchmark_speculative_server
+
+            port_v = _parse_json_int(body, "port", default=None, allow_none=True)
+            max_tok = _parse_json_int(body, "max_tokens", default=96) or 96
+            prompt_v = _str(
+                body,
+                "prompt",
+                default="Summarize why local-first knowledge bases require immutable provenance anchors in 3 bullet points.",
+                max_len=2000,
+                required=False,
+            )
+            return send(
+                200,
+                benchmark_speculative_server(
+                    prompt=prompt_v,
+                    max_tokens=max_tok,
+                    port=port_v,
+                    state_dir=getattr(rt, "security_dir", None),
+                ),
+            )
+
+        # ── Phase 4 / Epic 2D: Gen-4 Cognitive Architecture ("LKE-X") ──
+        if path == "/v1/cognitive/context-signal" and method == "POST":
+            if not owner_only():
+                return True
+            from predictive_memory_bus import record_context_signal
+
+            syms_raw = body.get("open_symbols")
+            syms = [str(s) for s in syms_raw] if isinstance(syms_raw, list) else []
+            return send(
+                200,
+                record_context_signal(
+                    active_file=_str(body, "active_file", default="", max_len=260, required=False),
+                    git_branch=_str(body, "git_branch", default="", max_len=120, required=False),
+                    project_scope=_optional_project_scope(body.get("project") or body.get("project_scope")),
+                    open_symbols=syms,
+                    cursor_topic=_str(body, "cursor_topic", default="", max_len=260, required=False),
+                    prewarm=bool(body.get("prewarm", True)),
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                    lexical_index_path=rt.lexical_index_path,
+                ),
+            )
+
+        if path == "/v1/cognitive/bus-status" and method == "GET":
+            if not owner_only():
+                return True
+            from predictive_memory_bus import bus_status
+
+            return send(200, bus_status(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir))
+
+        if path == "/v1/recall/zoom" and method == "POST":
+            from fractal_zoom import zoom_retrieve
+
+            query_z = _str(body, "query", max_len=1000, default="", required=False)
+            lvl = _str(body, "target_level", max_len=8, default="L5", required=False).upper()
+            parent_id = _str(body, "parent_id", max_len=200, default="", required=False).strip() or None
+            proj_z = _optional_project_scope(body.get("project"))
+            lim_z = _parse_json_int(body, "limit", default=8) or 8
+            return send(
+                200,
+                zoom_retrieve(
+                    query_z,
+                    target_level=lvl,
+                    parent_id=parent_id,
+                    project=proj_z,
+                    limit=lim_z,
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                ),
+            )
+
+        if path == "/v1/cognitive/review-due" and method == "GET":
+            if not owner_only():
+                return True
+            from cognitive_core import compute_knowledge_gravity_report
+
+            as_of_v = (q.get("as_of") or [None])[0]
+            return send(
+                200,
+                compute_knowledge_gravity_report(
+                    atoms_dir=rt.atoms_dir,
+                    brain_dir=rt.brain_dir,
+                    db_path=rt.telemetry_db_path,
+                    as_of=as_of_v,
+                ),
+            )
+
+        if path.startswith("/v1/atoms/cold-archive/") and path.endswith("/restore") and method == "POST":
+            if not owner_only():
+                return True
+            raw_slug = unquote(path[len("/v1/atoms/cold-archive/") : -len("/restore")]).strip()
+            norm_slug = normalize_markdown_filename(raw_slug)
+            if not norm_slug or "/" in norm_slug or "\\" in norm_slug or ".." in norm_slug:
+                raise _BadRequestError(f"Invalid cold-archive atom identifier: {raw_slug!r}")
+            exp_sha = _str(body, "expected_sha256", max_len=64, required=True)
+            actor_v = _str(body, "actor", default="owner", max_len=120, required=False)
+            reason_v = _str(body, "reason", default="", max_len=500, required=False)
+            return send(
+                200,
+                restore_cold_archived_atom(
+                    norm_slug,
+                    expected_sha256=exp_sha,
+                    actor=actor_v,
+                    reason=reason_v,
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                ),
+            )
+
+        if path.startswith("/v1/atoms/") and path.endswith("/cold-archive") and method == "POST":
+            if not owner_only():
+                return True
+            raw_fn = unquote(path[len("/v1/atoms/") : -len("/cold-archive")]).strip()
+            safe_p = safe_file_in_dir(rt.atoms_dir, raw_fn, allowed_exts={".md"}, must_exist=True)
+            if not safe_p:
+                raise FileNotFoundError(f"Atom not found: {raw_fn}")
+            exp_sha = _str(body, "expected_sha256", max_len=64, required=True)
+            actor_v = _str(body, "actor", default="owner", max_len=120, required=False)
+            reason_v = _str(body, "reason", default="", max_len=500, required=False)
+            return send(
+                200,
+                archive_atom_to_cold(
+                    safe_p,
+                    expected_sha256=exp_sha,
+                    actor=actor_v,
+                    reason=reason_v,
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                ),
+            )
+
+        if path == "/v1/principles" and method == "GET":
+            from cognitive_distiller import list_distilled_artifacts
+
+            proj_p = _optional_project_scope((q.get("project") or [None])[0])
+            req_active_only_p = ((q.get("active_only") or ["true"])[0]).strip().lower() not in {"false", "0", "no"}
+            active_only_p = True if not is_owner else req_active_only_p
+            rows_p = list_distilled_artifacts(
+                kind="principle",
+                project=proj_p,
+                active_only=active_only_p,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+            )
+            if not is_owner:
+                rows_p = [{k: v for k, v in item.items() if k != "path"} for item in rows_p]
+            return send(200, {"principles": rows_p})
+
+        if path == "/v1/mental-models" and method == "GET":
+            from cognitive_distiller import list_distilled_artifacts
+
+            proj_m = _optional_project_scope((q.get("project") or [None])[0])
+            req_active_only_m = ((q.get("active_only") or ["true"])[0]).strip().lower() not in {"false", "0", "no"}
+            active_only_m = True if not is_owner else req_active_only_m
+            rows_m = list_distilled_artifacts(
+                kind="mental_model",
+                project=proj_m,
+                active_only=active_only_m,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+            )
+            if not is_owner:
+                rows_m = [{k: v for k, v in item.items() if k != "path"} for item in rows_m]
+            return send(200, {"mental_models": rows_m})
+
+        if path == "/v1/principles/distill" and method == "POST":
+            if not owner_only():
+                return True
+            from cognitive_distiller import distill_cross_project_candidates
+
+            _optional_project_scope(body.get("project"))
+            return send(
+                201,
+                distill_cross_project_candidates(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir),
+            )
+
+        if (
+            (path.startswith("/v1/principles/") or path.startswith("/v1/mental-models/"))
+            and path.endswith("/promote")
+            and method == "POST"
+        ):
+            if not owner_only():
+                return True
+            from cognitive_distiller import promote_distilled_artifact
+
+            is_pr = path.startswith("/v1/principles/")
+            prefix = "/v1/principles/" if is_pr else "/v1/mental-models/"
+            subdir = "7-principles" if is_pr else "8-mental-models"
+            fname = unquote(path[len(prefix) : -len("/promote")]).strip()
+            safe_d = safe_file_in_dir(os.path.join(rt.brain_dir, subdir), fname, allowed_exts={".md"}, must_exist=True)
+            if not safe_d:
+                raise FileNotFoundError(f"Distilled artifact not found: {fname}")
+            reason_val = (
+                _str(body, "reason", default="", max_len=500, required=False)
+                or _str(body, "note", default="", max_len=500, required=False)
+            )
+            return send(
+                200,
+                promote_distilled_artifact(
+                    safe_d,
+                    expected_sha256=_str(body, "expected_sha256", max_len=64, required=True),
+                    actor=_str(body, "actor", default="owner", max_len=120, required=False),
+                    action=_str(body, "action", default="promote", max_len=16, required=False),
+                    reason=reason_val,
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                ),
+            )
+
+        if path == "/v1/concepts" and method == "GET":
+            from concept_graph import list_concepts
+
+            proj_c = _optional_project_scope((q.get("project") or [None])[0])
+            lim_c = _parse_bounded_int(q, "limit", default=50, min_val=1, max_val=200)
+            return send(
+                200,
+                {"concepts": list_concepts(project=proj_c, limit=lim_c, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir)},
+            )
+
+        if path.startswith("/v1/concepts/") and method == "GET":
+            from concept_graph import get_concept
+
+            cid_raw = unquote(path[len("/v1/concepts/") :]).strip()
+            proj_c = _optional_project_scope((q.get("project") or [None])[0])
+            return send(200, get_concept(cid_raw, project=proj_c, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir))
+
+        if path == "/v1/cognitive/debate" and method == "POST":
+            from cognitive_swarm import run_two_sided_debate
+
+            topic_d = _str(body, "topic", max_len=1000, required=True)
+            proj_d = _optional_project_scope(body.get("project"))
+            return send(
+                200,
+                run_two_sided_debate(topic_d, project=proj_d, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir),
+            )
+
+        if path == "/v1/cognitive/swarm" and method == "POST":
+            from cognitive_swarm import run_cognitive_swarm
+
+            goal_s = (
+                _str(body, "goal", max_len=1500, required=False).strip()
+                or _str(body, "query", max_len=1500, required=False).strip()
+            )
+            if not goal_s:
+                raise ValueError("'goal' is required.")
+            proj_s = _optional_project_scope(body.get("project"))
+            prof_s = _str(body, "reasoning_profile", default="auto", max_len=32, required=False)
+            max_atoms_s = _parse_json_int(body, "max_atoms", default=None, min_val=1, max_val=25, allow_none=True)
+            swarm_res = run_cognitive_swarm(
+                goal_s,
+                project=proj_s,
+                reasoning_profile=prof_s,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+                lexical_index_path=rt.lexical_index_path,
+                chroma_path=rt.chroma_path,
+            )
+            if max_atoms_s is not None and isinstance(swarm_res.get("roles"), dict):
+                know = swarm_res["roles"].get("knowledge")
+                if isinstance(know, dict) and isinstance(know.get("atom_citations"), list):
+                    know["atom_citations"] = know["atom_citations"][:max_atoms_s]
+            return send(200, swarm_res)
+
+        if path == "/v1/cognitive/simulate" and method == "POST":
+            from world_model_sim import simulate_change_impact
+
+            target_sim = _str(body, "target", max_len=260, required=True)
+            hops_sim = _parse_json_int(body, "max_hops", default=3) or 3
+            proj_sim = _optional_project_scope(body.get("project"))
+            repo_sim = _str(body, "repo_dir", default="", max_len=1000, required=False).strip() or None
+            if repo_sim is not None and not owner_only():
+                return True
+            return send(
+                200,
+                simulate_change_impact(
+                    target_sim,
+                    max_hops=hops_sim,
+                    project=proj_sim,
+                    repo_dir=repo_sim,
+                    allow_repo_scan=bool(is_owner),
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                ),
+            )
+
+        if path == "/v1/cognitive/self-model" and method == "GET":
+            if not owner_only():
+                return True
+            from self_model_curiosity import evaluate_self_model_and_curiosity
+
+            return send(200, evaluate_self_model_and_curiosity(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir))
+
+        if path == "/v1/cognitive/self-model" and method == "POST":
+            if not owner_only():
+                return True
+            from self_model_curiosity import upsert_learning_goals
+
+            goals_raw = body.get("goals")
+            if not isinstance(goals_raw, list):
+                raise ValueError("'goals' list is required.")
+            return send(200, upsert_learning_goals(goals_raw, brain_dir=rt.brain_dir))
+
+        if path == "/v1/cognitive/curiosity" and method == "GET":
+            if not owner_only():
+                return True
+            from self_model_curiosity import evaluate_self_model_and_curiosity
+
+            _optional_project_scope((q.get("project") or [None])[0])
+            res_sm = evaluate_self_model_and_curiosity(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir)
+            return send(200, {"curiosity_targets": res_sm["curiosity_targets"], "domains": res_sm["domains"]})
+
+        if path == "/v1/cognitive/adr-status" and method == "GET":
+            if not owner_only():
+                return True
+            from adr_gate import list_adr_states
+
+            return send(200, {"adrs": list_adr_states(brain_dir=rt.brain_dir)})
+
+        if path == "/v1/cognitive/adr-enable" and method == "POST":
+            if not owner_only():
+                return True
+            from adr_gate import set_adr_status
+
+            return send(
+                200,
+                set_adr_status(
+                    _str(body, "adr_id", max_len=64, required=True),
+                    enabled=bool(body.get("enabled", True)),
+                    actor=_str(body, "actor", default="owner", max_len=120, required=False),
+                    rationale=_str(body, "rationale", max_len=400, required=True),
+                    expires_on=_str(body, "expires_on", default="", max_len=16, required=False).strip() or None,
+                    brain_dir=rt.brain_dir,
+                ),
+            )
+
+        if path == "/v1/cognitive/replay" and method == "POST":
+            if not owner_only():
+                return True
+            from episodic_replay import run_nightly_replay
+
+            date_val = _str(body, "date_str", default="", max_len=32, required=False).strip() or None
+            if "write_inbox" in body:
+                stage_inbox = bool(body.get("write_inbox"))
+            elif "stage_inbox_proposals" in body:
+                stage_inbox = bool(body.get("stage_inbox_proposals"))
+            else:
+                stage_inbox = False
+            return send(
+                200,
+                run_nightly_replay(
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                    date_str=date_val,
+                    stage_inbox_proposals=stage_inbox,
+                ),
+            )
+
+        if path == "/v1/cognitive/route" and method == "POST":
+            from meta_router import classify_query, resolve_reasoning_profile
+
+            query_r = _str(body, "query", max_len=2000, required=True)
+            req_prof = _str(body, "reasoning_profile", default="auto", max_len=32, required=False).strip() or "auto"
+            has_cloud = bool(body.get("has_cloud_consent", False))
+            resolved_prof = resolve_reasoning_profile(req_prof, has_cloud_consent=has_cloud)
+            budget = classify_query(query_r, reasoning_profile=resolved_prof, has_cloud_consent=has_cloud)
+            return send(
+                200,
+                {
+                    "query": query_r,
+                    "profile": resolved_prof,
+                    "mode": budget.reasoning_mode,
+                    "complexity": budget.complexity,
+                    "path": budget.path,
+                    "budget": asdict(budget),
+                },
+            )
+
+        # ── Phase 5 / Epic 2E: Quantitative Reasoning, 4D Rubric & AlphaProof Nexus ──
+        if path == "/v1/math/solve" and method == "POST":
+            from cgv_reasoner import solve_quantitative_problem
+
+            problem_m = _str(body, "problem", max_len=4000, required=True)
+            vis_ocr = _str(body, "visual_ocr_text", default="", max_len=4000, required=False)
+            if "k_samples" in body:
+                k_m = _parse_json_int(body, "k_samples", default=1, min_val=1, max_val=16) or 1
+            else:
+                k_m = _parse_json_int(body, "samples", default=1, min_val=1, max_val=16) or 1
+            turns_m = _parse_json_int(body, "max_tool_turns", default=4, min_val=1, max_val=8) or 4
+            exp_ans = _str(body, "expected_answer", default="", max_len=1000, required=False).strip() or None
+            return send(
+                200,
+                solve_quantitative_problem(
+                    problem_m,
+                    visual_ocr_text=vis_ocr,
+                    k_samples=k_m,
+                    max_tool_turns=turns_m,
+                    use_local_llm=bool(body.get("use_local_llm", False)),
+                    expected_answer=exp_ans,
+                ),
+            )
+
+        if path == "/v1/math/rubric" and method == "POST":
+            from math_equivalence import extract_final_answer
+            from process_evaluator import score_reasoning_trace
+
+            steps_r = body.get("steps")
+            if steps_r is None and "trace" in body:
+                raw_trace = body.get("trace")
+                if isinstance(raw_trace, list):
+                    steps_r = [str(s) for s in raw_trace]
+                elif isinstance(raw_trace, str):
+                    steps_r = [ln.strip() for ln in raw_trace.splitlines() if ln.strip()]
+            if not isinstance(steps_r, list):
+                raise ValueError("'steps' list is required.")
+            clean_steps = [str(s) for s in steps_r]
+            final_ans = _str(body, "final_answer", default="", max_len=1000, required=False).strip()
+            if not final_ans and clean_steps:
+                final_ans = extract_final_answer("\n".join(clean_steps))
+            return send(
+                200,
+                score_reasoning_trace(
+                    clean_steps,
+                    final_answer=final_ans,
+                    expected_answer=_str(body, "expected_answer", default="", max_len=1000, required=False) or None,
+                ),
+            )
+
+        if path == "/v1/proof/status" and method == "GET":
+            from formal_proof_search import _subgoal_cache_path, verify_lean_binary_available
+
+            lean_bin = verify_lean_binary_available()
+            cache_p = _subgoal_cache_path(rt.brain_dir)
+            status_payload: dict[str, object] = {
+                "lean_available": bool(lean_bin),
+                "lean_installed": bool(lean_bin),
+                "lean_status": "ready" if lean_bin else "lean_toolchain_unavailable",
+                "subgoal_cache_ready": bool(cache_p.is_file() or cache_p.parent.is_dir()),
+            }
+            if is_owner:
+                status_payload["lean_path"] = lean_bin
+                status_payload["subgoal_cache_path"] = str(cache_p)
+            return send(200, status_payload)
+
+        if path == "/v1/proof/verify" and method == "POST":
+            if not owner_only():
+                return True
+            from formal_proof_search import SafeVerifyError, run_test_lemmas, verify_spec_integrity
+
+            base_src = _str(body, "baseline_source", max_len=64000, required=True)
+            cand_src = _str(body, "candidate_source", max_len=64000, required=True)
+            lang_p = _str(body, "language", default="auto", max_len=16, required=False)
+            lemmas_raw = body.get("test_lemmas")
+            lemmas = [str(x) for x in lemmas_raw] if isinstance(lemmas_raw, list) else []
+            try:
+                sv = verify_spec_integrity(base_src, cand_src, language=lang_p)
+            except SafeVerifyError as exc:
+                return send(422, {"valid": False, "error": str(exc)})
+            tl = run_test_lemmas(cand_src, lemmas, language=lang_p) if lemmas else {"passed": True, "checked": 0, "failures": []}
+            return send(200, {**sv, "test_lemmas": tl})
+
+        if path == "/v1/proof/search" and method == "POST":
+            if not owner_only():
+                return True
+            import hashlib as _hl
+            from formal_proof_search import (
+                SafeVerifyError,
+                _detect_language,
+                _extract_skeleton_and_blocks,
+                _verify_candidate,
+                run_agent_d_search,
+                run_ralph_proof_loop,
+                verify_spec_integrity,
+            )
+
+            base_src = _str(body, "baseline_source", max_len=64000, required=True)
+            problem_id = _str(body, "problem_id", default="", max_len=160, required=False).strip()
+            cand_src = _str(body, "candidate_source", default="", max_len=64000, required=False)
+            lang_p = _str(body, "language", default="auto", max_len=16, required=False)
+            search_mode = _str(body, "search_mode", default="auto", max_len=16, required=False).strip().lower() or "auto"
+            if search_mode not in {"auto", "ralph", "agent_d", "single"}:
+                raise ValueError("'search_mode' must be one of auto, ralph, agent_d, single.")
+            tests_raw = body.get("verification_tests")
+            vtests = [str(x) for x in tests_raw] if isinstance(tests_raw, list) else []
+            lemmas_raw = body.get("test_lemmas")
+            tlemmas = [str(x) for x in lemmas_raw] if isinstance(lemmas_raw, list) else []
+            max_iters = _parse_json_int(body, "max_iterations", default=None, min_val=1, max_val=16, allow_none=True)
+            candidates_raw = body.get("candidates")
+            if candidates_raw is not None:
+                if not isinstance(candidates_raw, list) or len(candidates_raw) > 32:
+                    raise ValueError("'candidates' must be a list of up to 32 entries.")
+
+            try:
+                eff_lang = _detect_language(base_src, lang_p)
+                base_skel, base_blocks = _extract_skeleton_and_blocks(base_src.replace("\r\n", "\n"), eff_lang)
+                if not base_blocks:
+                    raise SafeVerifyError("Baseline specification has no EVOLVE-BLOCK or EVOLVE-VALUE markers.")
+                spec_sha = _hl.sha256(base_skel.encode("utf-8")).hexdigest()
+                marker_token = "-- EVOLVE-" if eff_lang == "lean" else "# EVOLVE-"
+
+                # Backwards-compatible single-candidate path when only candidate_source is passed.
+                if (
+                    candidates_raw is None
+                    and max_iters is None
+                    and search_mode in {"auto", "single"}
+                    and cand_src.strip()
+                ):
+                    verify_spec_integrity(base_src, cand_src, language=eff_lang)
+                    single_res = _verify_candidate(base_src, cand_src, vtests, language=eff_lang)
+                    return send(200, single_res)
+
+                use_agent_d = search_mode == "agent_d" or (
+                    search_mode == "auto"
+                    and isinstance(candidates_raw, list)
+                    and len(candidates_raw) >= 2
+                    and any(isinstance(c, dict) for c in candidates_raw)
+                )
+
+                if use_agent_d:
+                    pool: list[dict[str, object]] = []
+                    for idx, item in enumerate(candidates_raw or ()):
+                        cid = f"cand_{idx + 1}"
+                        if isinstance(item, dict):
+                            entry = dict(item)
+                            entry.setdefault("id", cid)
+                            pool.append(entry)
+                        elif isinstance(item, list):
+                            pool.append({"id": cid, "replacements": [str(r) for r in item]})
+                        elif isinstance(item, str):
+                            if marker_token in item:
+                                pool.append({"id": cid, "source": item})
+                            else:
+                                pool.append({"id": cid, "replacements": [item]})
+                        else:
+                            raise ValueError("Each candidate must be a string, list of replacements, or dict.")
+                    if not pool:
+                        pool.append({"id": "cand_1", "source": cand_src if cand_src.strip() else base_src})
+                    ad_res = run_agent_d_search(
+                        base_src,
+                        pool,
+                        verification_tests=vtests,
+                        language=eff_lang,
+                    )
+                    lb = list(ad_res.get("leaderboard") or [])
+                    first_ok = next((row for row in lb if row.get("verified")), None)
+                    first_err = "" if first_ok else next((str(row.get("error") or "") for row in lb if row.get("error")), "")
+                    return send(
+                        200,
+                        {
+                            **ad_res,
+                            "problem_id": problem_id,
+                            "search_mode": "agent_d",
+                            "spec_sha256": spec_sha,
+                            "verified": bool(ad_res.get("verified_count", 0) > 0),
+                            "verified_source": first_ok.get("source") if isinstance(first_ok, dict) else None,
+                            "error": first_err,
+                        },
+                    )
+
+                # Ralph proof loop path (real run_ralph_proof_loop over candidates / baseline).
+                repl_seq: list[list[str]] = []
+                for item in candidates_raw or ():
+                    if isinstance(item, dict):
+                        if isinstance(item.get("replacements"), list):
+                            repl_seq.append([str(r) for r in item["replacements"]])
+                        elif isinstance(item.get("source"), str):
+                            src_i = item["source"]
+                            verify_spec_integrity(base_src, src_i, language=eff_lang)
+                            _, blks_i = _extract_skeleton_and_blocks(src_i.replace("\r\n", "\n"), eff_lang)
+                            repl_seq.append(blks_i)
+                        else:
+                            raise ValueError("Candidate dict requires 'replacements' or 'source'.")
+                    elif isinstance(item, list):
+                        repl_seq.append([str(r) for r in item])
+                    elif isinstance(item, str):
+                        if marker_token in item:
+                            verify_spec_integrity(base_src, item, language=eff_lang)
+                            _, blks_i = _extract_skeleton_and_blocks(item.replace("\r\n", "\n"), eff_lang)
+                            repl_seq.append(blks_i)
+                        else:
+                            repl_seq.append([item])
+                    else:
+                        raise ValueError("Each candidate must be a string, list of replacements, or dict.")
+
+                if not repl_seq:
+                    if cand_src.strip():
+                        verify_spec_integrity(base_src, cand_src, language=eff_lang)
+                        _, cand_blks = _extract_skeleton_and_blocks(cand_src.replace("\r\n", "\n"), eff_lang)
+                        repl_seq.append(cand_blks)
+                    else:
+                        repl_seq.append(base_blocks)
+
+                eff_iters = min(max_iters, len(repl_seq)) if max_iters is not None else len(repl_seq)
+                eff_iters = max(1, eff_iters)
+
+                def _mutate_from_candidates(_baseline: str, iteration: int, _feedback: str) -> list[str]:
+                    return repl_seq[min(iteration - 1, len(repl_seq) - 1)]
+
+                ralph_res = run_ralph_proof_loop(
+                    base_src,
+                    mutate_fn=_mutate_from_candidates,
+                    test_lemmas=tlemmas,
+                    verification_tests=vtests,
+                    language=eff_lang,
+                    max_iterations=eff_iters,
+                    brain_dir=rt.brain_dir,
+                    record_candidate=bool(body.get("record_candidate", False)),
+                )
+                attempts_list = list(ralph_res.get("attempts") or [])
+                last_err = "" if ralph_res.get("verified") else (str(attempts_list[-1].get("error") or "") if attempts_list else "")
+                return send(
+                    200,
+                    {
+                        **ralph_res,
+                        "problem_id": problem_id,
+                        "search_mode": "ralph",
+                        "error": last_err,
+                    },
+                )
+            except SafeVerifyError as exc:
+                return send(422, {"valid": False, "verified": False, "error": str(exc)})
 
     except (MemoryRecallUnavailable, LexicalIndexUnavailable) as exc:
         return send(
@@ -4028,6 +5496,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 "remediation": "Run 'second-brain rebuild-lexical' or start local Ollama.",
             },
         )
+    except _BadRequestError as exc:
+        return send(400, {"error": str(exc)})
     except (ReviewConflictError, SyncConflictError) as exc:
         return send(409, {"error": str(exc), "conflict": True})
     except FileNotFoundError as exc:
@@ -4092,10 +5562,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
     except RuntimeError as exc:
         if "CAS mismatch" in str(exc):
             return send(409, {"error": str(exc), "conflict": True})
-        if exc.__class__.__name__ in {"MobileVaultError", "CreativeMediaError"}:
+        if exc.__class__.__name__ == "TtsUnavailableError":
+            return send(503, {"error": str(exc)})
+        if exc.__class__.__name__ in {"MobileVaultError", "CreativeMediaError", "TtsError"}:
             return send(422, {"error": str(exc)})
         raise
     except Exception as exc:
+        if exc.__class__.__name__ == "CreativeMediaUnavailableError":
+            return send(503, {"error": str(exc)})
         if exc.__class__.__name__ == "CreativeMediaError":
             return send(422, {"error": str(exc)})
         raise

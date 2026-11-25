@@ -38,6 +38,11 @@ exports.default = async function afterPack(context) {
 
   const dstWheelhouse = path.join(resourcesDir, "backend", "wheelhouse");
   fs.mkdirSync(dstWheelhouse, { recursive: true });
+  for (const existing of fs.readdirSync(dstWheelhouse)) {
+    if (existing.endsWith(".whl")) {
+      fs.rmSync(path.join(dstWheelhouse, existing), { force: true });
+    }
+  }
   for (const whl of wheels) {
     fs.copyFileSync(path.join(srcWheelhouse, whl), path.join(dstWheelhouse, whl));
   }

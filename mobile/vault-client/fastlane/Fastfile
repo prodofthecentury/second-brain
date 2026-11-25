@@ -1,0 +1,81 @@
+default_platform(:android)
+
+platform :android do
+  desc "Build signed Android App Bundle (.aab) and release APK"
+  lane :build_aab do
+    gradle(
+      task: "bundleRelease assembleRelease",
+      project_dir: "android",
+      properties: {
+        "android.injected.signing.store.file" => ENV["ANDROID_KEYSTORE_PATH"],
+        "android.injected.signing.store.password" => ENV["ANDROID_KEYSTORE_PASSWORD"],
+        "android.injected.signing.key.alias" => ENV["ANDROID_KEY_ALIAS"],
+        "android.injected.signing.key.password" => ENV["ANDROID_KEY_PASSWORD"]
+      }.compact
+    )
+  end
+
+  desc "Upload Android App Bundle to Google Play Internal Track"
+  lane :deploy_internal do
+    build_aab
+    supply(
+      track: ENV.fetch("GOOGLE_PLAY_TRACK", "internal"),
+      package_name: "com.secondbrain.vault",
+      aab: "android/app/build/outputs/bundle/release/app-release.aab",
+      json_key: ENV.fetch("GOOGLE_PLAY_JSON_KEY_PATH"),
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+  end
+
+  desc "Promote Android build to Google Play Production"
+  lane :deploy_production do
+    supply(
+      track: "internal",
+      track_promote_to: "production",
+      package_name: "com.secondbrain.vault",
+      json_key: ENV.fetch("GOOGLE_PLAY_JSON_KEY_PATH")
+    )
+  end
+end
+
+platform :ios do
+  desc "Build signed iOS .ipa archive for App Store Connect"
+  lane :build_ipa do
+    setup_ci if ENV["CI"]
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_API_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_filepath: ENV.fetch("APP_STORE_CONNECT_API_KEY_PATH"),
+      in_house: false
+    )
+    match(type: "appstore", readonly: true, api_key: api_key)
+    build_app(
+      workspace: "ios/App/App.xcworkspace",
+      scheme: "App",
+      export_method: "app-store",
+      output_directory: "dist-ios",
+      output_name: "SecondBrainVault.ipa"
+    )
+  end
+
+  desc "Upload iOS build to TestFlight via Pilot"
+  lane :deploy_testflight do
+    build_ipa
+    pilot(
+      ipa: "dist-ios/SecondBrainVault.ipa",
+      skip_waiting_for_build_processing: true
+    )
+  end
+
+  desc "Submit reviewed build to App Store via Deliver"
+  lane :deploy_appstore do
+    build_ipa
+    deliver(
+      ipa: "dist-ios/SecondBrainVault.ipa",
+      submit_for_review: false,
+      automatic_release: false
+    )
+  end
+end

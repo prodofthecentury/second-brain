@@ -1,0 +1,5 @@
+app_identifier("com.secondbrain.vault")
+package_name("com.secondbrain.vault")
+apple_id(ENV["APPLE_ID"]) unless ENV["APPLE_ID"].to_s.empty?
+team_id(ENV["APPLE_TEAM_ID"]) unless ENV["APPLE_TEAM_ID"].to_s.empty?
+json_key_file(ENV["GOOGLE_PLAY_JSON_KEY_PATH"]) unless ENV["GOOGLE_PLAY_JSON_KEY_PATH"].to_s.empty?

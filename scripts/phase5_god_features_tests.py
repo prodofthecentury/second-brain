@@ -1752,6 +1752,58 @@ class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_migrate_legacy_sidecar_snapshots_and_hourly_sweep(self):
+        from time_travel import create_snapshot, list_snapshots, migrate_legacy_snapshots, verify_snapshot
+        from vault_backup import create_vault_backup, verify_vault_backup
+        import hourly_sweep
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            atoms_dir = brain / "2-atoms"
+            raw_arch = brain / "0-raw" / "archive"
+            legacy_snaps = brain / ".sidecar" / "snapshots"
+            atoms_dir.mkdir(parents=True)
+            raw_arch.mkdir(parents=True)
+            legacy_snaps.mkdir(parents=True)
+
+            # Create a real snapshot, then convert a second legacy v1 snapshot into .sidecar/snapshots/
+            snap_live = create_snapshot(label="modern-v3", actor="owner", brain_dir=str(brain), atoms_dir=str(atoms_dir))
+            legacy_id = "snap-20261115T071858Z-deadbeef"
+            legacy_doc = {
+                "schema_version": 1,
+                "snapshot_id": legacy_id,
+                "created_at": "2026-11-15T07:18:58+00:00",
+                "actor": "owner",
+                "label": "legacy-sidecar-v1",
+                "merkle_root": snap_live["merkle_root"],
+                "atom_count": 0,
+                "playbook_count": 0,
+                "atoms": {},
+                "playbooks": {},
+            }
+            (legacy_snaps / f"{legacy_id}.json").write_text(json.dumps(legacy_doc, indent=2), encoding="utf-8")
+
+            mig = migrate_legacy_snapshots(brain_dir=str(brain))
+            self.assertEqual(mig["migrated_count"], 1)
+            self.assertIn(legacy_id, mig["migrated_ids"])
+            self.assertFalse((legacy_snaps / f"{legacy_id}.json").exists())
+            self.assertTrue((raw_arch / "snapshots" / f"{legacy_id}.json").is_file())
+            self.assertTrue(verify_snapshot(legacy_id, brain_dir=str(brain))["valid"])
+            self.assertEqual(len(list_snapshots(brain_dir=str(brain))), 2)
+
+            # Verify .sbvault backup now captures both snapshots
+            bundle_path = Path(tmp) / "migrated.sbvault"
+            create_vault_backup(str(bundle_path), passphrase="StrongTestBackupPassword123!", brain_dir=str(brain))
+            ver = verify_vault_backup(str(bundle_path), passphrase="StrongTestBackupPassword123!")
+            self.assertTrue(ver["valid"])
+
+            # Verify hourly_sweep writes latest.json and appends history.jsonl
+            sweep = hourly_sweep.run_hourly_sweep(brain_dir=str(brain), repo_root=str(hourly_sweep.REPO_ROOT))
+            self.assertIn("scores", sweep)
+            self.assertGreaterEqual(sweep["scores"]["overall_completion"], 70)
+            self.assertTrue((brain / ".sidecar" / "hourly-sweeps" / "latest.json").is_file())
+            self.assertTrue((brain / ".sidecar" / "hourly-sweeps" / "history.jsonl").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

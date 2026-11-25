@@ -5,9 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#0b0f19">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src https: http://127.0.0.1:*; manifest-src 'self'; base-uri 'none'; form-action 'none'">
   <title>Second Brain — E2EE Mobile Companion</title>
   <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png" type="image/png" sizes="192x192">
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -73,7 +77,7 @@
           <h2 id="recallHeading">Vault Recall, Search &amp; Review</h2>
           <span id="recallCapabilityBadge" class="badge badge-warn">Drop-Only Key</span>
         </div>
-        <p class="hint">Decrypts <code>mobile-recall/&lt;vault_id&gt;.enc</code> (`SBMR1` AES-256-GCM) in RAM. Only ciphertext is cached offline.</p>
+        <p class="hint">Decrypts <code>mobile-recall/&lt;vault_id&gt;.enc</code> (`SBMR1` AES-256-GCM) in RAM. Pairing secrets are sealed with a non-extractable WebCrypto IndexedDB key (or held in RAM only) — zero plaintext keys or vault notes are stored in localStorage.</p>
 
         <div class="actions recall-sync-actions">
           <button id="syncRecallBtn" type="button" class="btn btn-primary">Sync Encrypted Vault</button>

@@ -32,12 +32,17 @@ from config import (
     file_sha256,
     is_content_markdown,
     normalize_markdown_filename,
+    resolve_module_atoms_and_brain,
+    resolve_module_vault_path,
     safe_file_in_dir,
+    snapshot_module_defaults,
 )
 from lexical_store import search_lexical_index
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values
 from review_atom import review_lock
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
 
 @dataclass(frozen=True)
@@ -63,9 +68,10 @@ class ExperienceRecord:
     reflection: str = ""
 
 
-def init_telemetry_db(db_path: str = TELEMETRY_DB_PATH) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+def init_telemetry_db(db_path: str | None = None) -> None:
+    resolved_db = resolve_module_vault_path(globals(), "TELEMETRY_DB_PATH", db_path)
+    os.makedirs(os.path.dirname(os.path.abspath(resolved_db)), exist_ok=True)
+    with closing(sqlite3.connect(resolved_db, timeout=5.0)) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute(
             """
@@ -115,13 +121,16 @@ def _valid_atom_id(atom_id: str) -> bool:
 def peek_lexical_candidate_atom_ids(
     query: str,
     *,
-    index_path: str = LEXICAL_INDEX_PATH,
-    atoms_dir: str = ATOMS_DIR,
+    index_path: str | None = None,
+    atoms_dir: str | None = None,
     limit: int = 20,
 ) -> list[str]:
     """Return raw FTS5 candidate atom filenames (without content) for bottleneck telemetry."""
+    resolved_atoms = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
+    explicit_brain = os.path.dirname(resolved_atoms) if atoms_dir is not None else None
+    resolved_index = resolve_module_vault_path(globals(), "LEXICAL_INDEX_PATH", index_path, brain_dir=explicit_brain)
     try:
-        candidates = search_lexical_index(query, index_path, n_results=limit, atoms_dir=atoms_dir)
+        candidates = search_lexical_index(query, resolved_index, n_results=limit, atoms_dir=resolved_atoms)
         return [c.filename for c in candidates if _valid_atom_id(c.filename)]
     except Exception:
         return []
@@ -133,15 +142,16 @@ def record_retrieval_telemetry(
     candidate_atom_ids: list[str] | None = None,
     mode: str = "lexical",
     latency_ms: float = 0.0,
-    db_path: str = TELEMETRY_DB_PATH,
+    db_path: str | None = None,
 ) -> None:
     """Record content-free retrieval hit counts in the disposable sidecar SQLite DB."""
-    init_telemetry_db(db_path)
+    resolved_db = resolve_module_vault_path(globals(), "TELEMETRY_DB_PATH", db_path)
+    init_telemetry_db(resolved_db)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     clean_retrieved = [aid for aid in retrieved_atom_ids if _valid_atom_id(aid)]
     clean_candidates = [aid for aid in (candidate_atom_ids or []) if _valid_atom_id(aid)]
 
-    with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+    with closing(sqlite3.connect(resolved_db, timeout=5.0)) as conn:
         for aid in clean_retrieved:
             conn.execute(
                 """
@@ -179,12 +189,13 @@ def record_grounded_answer_telemetry(
     abstained: bool,
     mode: str = "standard",
     latency_ms: float = 0.0,
-    db_path: str = TELEMETRY_DB_PATH,
+    db_path: str | None = None,
 ) -> None:
-    init_telemetry_db(db_path)
+    resolved_db = resolve_module_vault_path(globals(), "TELEMETRY_DB_PATH", db_path)
+    init_telemetry_db(resolved_db)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     clean_cited = [aid for aid in cited_atom_ids if _valid_atom_id(aid)]
-    with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+    with closing(sqlite3.connect(resolved_db, timeout=5.0)) as conn:
         for aid in clean_cited:
             conn.execute(
                 """
@@ -209,8 +220,8 @@ def record_grounded_answer_telemetry(
 def _brain_dir_for_telemetry_db(db_path: str) -> str | None:
     """Telemetry sidecars live at <brain>/.sidecar/telemetry.sqlite3; derive the owning vault."""
     abs_db = os.path.abspath(db_path)
-    if abs_db == os.path.abspath(TELEMETRY_DB_PATH):
-        return BRAIN_DIR
+    if abs_db == os.path.abspath(resolve_module_vault_path(globals(), "TELEMETRY_DB_PATH")):
+        return resolve_module_vault_path(globals(), "BRAIN_DIR")
     parent = os.path.dirname(abs_db)
     if os.path.basename(parent) == ".sidecar":
         return os.path.dirname(parent)
@@ -428,11 +439,17 @@ def record_atom_feedback(
     actor: str = "owner",
     note: str = "",
     feedback_kind: str | None = None,
-    db_path: str = TELEMETRY_DB_PATH,
+    db_path: str | None = None,
     brain_dir: str | None = None,
 ) -> dict[str, object]:
     if not _valid_atom_id(atom_id):
         raise ValueError(f"Invalid atom_id for telemetry feedback: {atom_id!r}")
+    resolved_db = resolve_module_vault_path(globals(), "TELEMETRY_DB_PATH", db_path, brain_dir=brain_dir)
+    resolved_brain = (
+        os.path.abspath(str(brain_dir))
+        if brain_dir is not None and str(brain_dir).strip()
+        else _brain_dir_for_telemetry_db(resolved_db)
+    )
 
     if feedback_kind is not None:
         fk = str(feedback_kind).strip().lower()
@@ -453,7 +470,7 @@ def record_atom_feedback(
     }
     action = action_map[resolved_kind]
 
-    owning_brain = brain_dir or _brain_dir_for_telemetry_db(db_path)
+    owning_brain = resolved_brain
     if owning_brain:
         from atom_mutator import review_lock
 
@@ -475,10 +492,10 @@ def record_atom_feedback(
                 note=clean_note,
             )
 
-    init_telemetry_db(db_path)
+    init_telemetry_db(resolved_db)
     if resolved_kind in {"helpful", "correction"}:
         col = "positive_feedback" if resolved_kind == "helpful" else "corrections"
-        with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+        with closing(sqlite3.connect(resolved_db, timeout=5.0)) as conn:
             conn.execute(
                 f"""
                 INSERT INTO atom_telemetry (atom_id, {col})
@@ -512,11 +529,26 @@ def _load_telemetry_map(db_path: str) -> dict[str, dict[str, object]]:
 
 def compute_memory_fitness_report(
     *,
-    atoms_dir: str = ATOMS_DIR,
-    brain_dir: str = BRAIN_DIR,
-    db_path: str = TELEMETRY_DB_PATH,
+    atoms_dir: str | None = None,
+    brain_dir: str | None = None,
+    db_path: str | None = None,
 ) -> dict[str, object]:
     """Compute read-only memory utility, review bottlenecks, and procedural skill maturity."""
+    resolved_brain, resolved_atoms = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
+    explicit_parent = resolved_brain if (brain_dir is not None or atoms_dir is not None) else None
+    resolved_db = resolve_module_vault_path(
+        globals(),
+        "TELEMETRY_DB_PATH",
+        db_path,
+        brain_dir=explicit_parent,
+    )
+    atoms_dir = resolved_atoms
+    brain_dir = resolved_brain
+    db_path = resolved_db
     telemetry = _load_telemetry_map(db_path)
     durable_feedback = load_durable_feedback_counts(brain_dir)
     corr_log_path = atom_correction_log_path(brain_dir) if brain_dir else ""
@@ -735,11 +767,27 @@ def save_experience_record(
     lessons: list[str] | None = None,
     candidate_procedure_title: str | None = None,
     propose_to_inbox: bool = False,
-    experiences_dir: str = EXPERIENCES_DIR,
-    inbox_dir: str = INBOX_DIR,
-    brain_dir: str = BRAIN_DIR,
+    experiences_dir: str | None = None,
+    inbox_dir: str | None = None,
+    brain_dir: str | None = None,
 ) -> dict[str, object]:
     """Persist an immutable Experience Record (O_CREAT|O_EXCL) without mutating any canonical atom."""
+    explicit_parent = brain_dir
+    if explicit_parent is None and experiences_dir is not None and str(experiences_dir).strip():
+        explicit_parent = os.path.dirname(os.path.abspath(experiences_dir))
+    brain_dir = resolve_module_vault_path(globals(), "BRAIN_DIR", explicit_parent)
+    experiences_dir = resolve_module_vault_path(
+        globals(),
+        "EXPERIENCES_DIR",
+        experiences_dir,
+        brain_dir=explicit_parent,
+    )
+    inbox_dir = resolve_module_vault_path(
+        globals(),
+        "INBOX_DIR",
+        inbox_dir,
+        brain_dir=explicit_parent,
+    )
     goal_clean = _sanitize_single_line(goal, max_len=500)
     summary_clean = _sanitize_multiline_body(result_summary, max_len=4000)
     if not goal_clean or not summary_clean:
@@ -958,26 +1006,276 @@ def save_experience_record(
     }
 
 
-def _cli_cognitive_dirs() -> tuple[str, str, str, str, str]:
-    env_vault = (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
-    if env_vault and os.path.abspath(env_vault) != os.path.abspath(BRAIN_DIR):
-        b = os.path.abspath(env_vault)
-        return (
-            b,
-            os.path.join(b, "2-atoms"),
-            os.path.join(b, "4-experiences"),
-            os.path.join(b, "0-raw", "inbox"),
-            os.path.join(b, ".sidecar", "telemetry.sqlite3"),
+def _extract_atom_link_degrees(atoms_dir: str) -> dict[str, int]:
+    degrees: dict[str, int] = {}
+    link_re = re.compile(r"\[\[([^\[\]|]+)(?:\|[^\[\]]+)?\]\]")
+    if not os.path.isdir(atoms_dir):
+        return degrees
+    for fname in sorted(os.listdir(atoms_dir)):
+        if not is_content_markdown(fname):
+            continue
+        fpath = safe_file_in_dir(atoms_dir, fname, allowed_exts={".md"}, must_exist=True)
+        if not fpath or not os.path.isfile(fpath):
+            continue
+        try:
+            text = Path(fpath).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        targets = {
+            (t.strip() if t.strip().endswith(".md") else f"{t.strip()}.md")
+            for t in link_re.findall(text)
+            if t.strip()
+        }
+        degrees[fname] = degrees.get(fname, 0) + len(targets)
+        for tgt in targets:
+            degrees[tgt] = degrees.get(tgt, 0) + 1
+    return degrees
+
+
+def compute_knowledge_gravity_report(
+    *,
+    atoms_dir: str | None = None,
+    brain_dir: str | None = None,
+    db_path: str | None = None,
+    as_of: str | None = None,
+    s0_days: float = 30.0,
+    cold_age_days: float = 180.0,
+    cold_gravity_threshold: float = 0.25,
+    review_due_decay_ratio: float = 0.65,
+) -> dict[str, object]:
+    """Compute Ebbinghaus stability & Knowledge Gravity scores in telemetry.sqlite3 (Epic 2D.3)."""
+    resolved_brain, resolved_atoms = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
+    explicit_parent = resolved_brain if (brain_dir is not None or atoms_dir is not None) else None
+    resolved_db = resolve_module_vault_path(
+        globals(),
+        "TELEMETRY_DB_PATH",
+        db_path,
+        brain_dir=explicit_parent,
+    )
+    atoms_dir = resolved_atoms
+    brain_dir = resolved_brain
+    db_path = resolved_db
+
+    telemetry = _load_telemetry_map(db_path)
+    durable_feedback = load_durable_feedback_counts(brain_dir)
+    link_degrees = _extract_atom_link_degrees(atoms_dir)
+
+    if as_of:
+        ref_date = datetime.date.fromisoformat(str(as_of).strip()[:10])
+    else:
+        ref_date = datetime.date.today()
+
+    # Check active playbooks/principles dependencies so cold-archive never flags an active dependency
+    protected_backing_atoms: set[str] = set()
+    try:
+        from skill_playbooks import list_playbooks
+
+        for pb in list_playbooks(brain_dir=brain_dir, atoms_dir=atoms_dir, telemetry_db_path=db_path, active_only=True):
+            protected_backing_atoms.update(getattr(pb, "backing_atoms", ()) or ())
+    except Exception:
+        pass
+    try:
+        from cognitive_distiller import list_distilled_artifacts
+
+        for pr in list_distilled_artifacts(kind="principle", active_only=True, brain_dir=brain_dir, atoms_dir=atoms_dir):
+            protected_backing_atoms.update(pr.get("source_atoms") or ())
+    except Exception:
+        pass
+
+    scored_atoms: list[dict[str, object]] = []
+    review_due: list[dict[str, object]] = []
+    cold_candidates: list[dict[str, object]] = []
+
+    if os.path.isdir(atoms_dir):
+        for fname in sorted(os.listdir(atoms_dir)):
+            if not is_content_markdown(fname):
+                continue
+            fpath = safe_file_in_dir(atoms_dir, fname, allowed_exts={".md"}, must_exist=True)
+            if not fpath or not os.path.isfile(fpath):
+                continue
+            try:
+                content = Path(fpath).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            parsed = split_frontmatter(content)
+            if parsed is None:
+                continue
+            fm = parse_frontmatter_values(parsed[0])
+            if str(fm.get("review_status", "pending")).strip() != "accepted":
+                continue
+            if not approved_revision_is_current(fpath, brain_dir=brain_dir, atoms_dir=atoms_dir):
+                continue
+            sup = fm.get("superseded_by") or []
+            if (isinstance(sup, str) and sup.strip()) or (isinstance(sup, list) and any(str(x).strip() for x in sup)):
+                continue
+
+            stats = telemetry.get(fname, {})
+            d_stats = durable_feedback.get(fname, {})
+            citations = int(stats.get("grounded_citations", 0) or 0)
+            pos_fb = max(int(stats.get("positive_feedback", 0) or 0), int(d_stats.get("positive_feedback", 0) or 0))
+            last_ref_raw = str(stats.get("last_cited_at") or fm.get("last-reviewed") or fm.get("created") or ref_date.isoformat())[:10]
+            try:
+                last_ref_date = datetime.date.fromisoformat(last_ref_raw)
+            except ValueError:
+                last_ref_date = ref_date
+            delta_days = max(0.0, float((ref_date - last_ref_date).days))
+            k_reviews = citations + pos_fb
+            stability_days = max(1.0, float(s0_days) * (1.0 + float(k_reviews)))
+            decay_factor = 2.0 ** (-delta_days / stability_days)
+            hub_score = min(2.0, float(link_degrees.get(fname, 0)) / 4.0)
+            base_mass = math.log1p((2.0 * citations) + (1.5 * pos_fb)) * (1.0 + (0.5 * hub_score))
+            gravity = round(base_mass * decay_factor, 6)
+
+            item: dict[str, object] = {
+                "atom_id": fname,
+                "title": str(fm.get("title") or fm.get("id") or fname[:-3]),
+                "gravity": gravity,
+                "base_mass": round(base_mass, 6),
+                "decay_factor": round(decay_factor, 6),
+                "stability_days": round(stability_days, 2),
+                "delta_days": round(delta_days, 1),
+                "hub_score": round(hub_score, 3),
+                "citations": citations,
+                "positive_feedback": pos_fb,
+                "protected_backing": fname in protected_backing_atoms,
+            }
+            scored_atoms.append(item)
+
+            if base_mass > 0.4 and decay_factor <= float(review_due_decay_ratio):
+                review_due.append(item)
+            if (
+                delta_days >= float(cold_age_days)
+                and gravity <= float(cold_gravity_threshold)
+                and fname not in protected_backing_atoms
+            ):
+                cold_candidates.append(item)
+
+    scored_atoms.sort(key=lambda x: (-float(x["gravity"]), str(x["atom_id"])))
+    review_due.sort(key=lambda x: (float(x["decay_factor"]), -float(x["base_mass"]), str(x["atom_id"])))
+    cold_candidates.sort(key=lambda x: (float(x["gravity"]), -float(x["delta_days"]), str(x["atom_id"])))
+
+    # Persist computed scores into disposable telemetry.sqlite3 without dirtying Git Markdown history
+    init_telemetry_db(db_path)
+    now_iso = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+    with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS atom_gravity (
+                atom_id TEXT PRIMARY KEY,
+                gravity REAL NOT NULL,
+                stability_days REAL NOT NULL,
+                decay_factor REAL NOT NULL,
+                hub_score REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
         )
-    return BRAIN_DIR, ATOMS_DIR, EXPERIENCES_DIR, INBOX_DIR, TELEMETRY_DB_PATH
+        with conn:
+            conn.execute("DELETE FROM atom_gravity")
+            for row in scored_atoms:
+                conn.execute(
+                    """
+                    INSERT INTO atom_gravity(atom_id, gravity, stability_days, decay_factor, hub_score, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(row["atom_id"]),
+                        float(row["gravity"]),
+                        float(row["stability_days"]),
+                        float(row["decay_factor"]),
+                        float(row["hub_score"]),
+                        now_iso,
+                    ),
+                )
+
+    return {
+        "schema_version": 1,
+        "as_of": ref_date.isoformat(),
+        "total_scored": len(scored_atoms),
+        "items": scored_atoms,
+        "review_due_candidates": review_due,
+        "cold_archive_candidates": cold_candidates,
+    }
+
+
+def compute_knowledge_gravity(
+    *,
+    atoms_dir: str | None = None,
+    brain_dir: str | None = None,
+    db_path: str | None = None,
+    as_of: str | None = None,
+) -> dict[str, float]:
+    """Return ``{atom_filename: gravity_score}`` for currently approved atoms."""
+    report = compute_knowledge_gravity_report(
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+        db_path=db_path,
+        as_of=as_of,
+    )
+    items = report.get("items") or []
+    return {
+        str(item["atom_id"]): float(item["gravity"])
+        for item in items
+        if isinstance(item, dict) and item.get("atom_id")
+    }
+
+
+def _cli_cognitive_dirs() -> tuple[str, str, str, str, str]:
+    b = resolve_module_vault_path(globals(), "BRAIN_DIR")
+    return (
+        b,
+        resolve_module_vault_path(globals(), "ATOMS_DIR", brain_dir=b),
+        resolve_module_vault_path(globals(), "EXPERIENCES_DIR", brain_dir=b),
+        resolve_module_vault_path(globals(), "INBOX_DIR", brain_dir=b),
+        resolve_module_vault_path(globals(), "TELEMETRY_DB_PATH", brain_dir=b),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    delegate_map: dict[str, tuple[str, list[str]]] = {
+        "zoom": ("fractal_zoom", []),
+        "distill": ("cognitive_distiller", []),
+        "concepts": ("concept_graph", []),
+        "debate": ("cognitive_swarm", ["debate"]),
+        "swarm": ("cognitive_swarm", ["swarm"]),
+        "simulate": ("world_model_sim", []),
+        "replay": ("episodic_replay", []),
+        "curiosity": ("self_model_curiosity", []),
+        "adr": ("adr_gate", []),
+        "bus": ("predictive_memory_bus", []),
+        "route": ("meta_router", []),
+    }
+    if raw_argv and raw_argv[0] in delegate_map:
+        mod_name, prefix = delegate_map[raw_argv[0]]
+        mod = __import__(mod_name, fromlist=["main"])
+        return int(mod.main([*prefix, *raw_argv[1:]]))
+
     parser = argparse.ArgumentParser(description="Second Brain Cognitive Core reports and experience logger.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     fit_p = sub.add_parser("fitness", help="Generate a Memory Fitness & Skill Candidate report.")
     fit_p.add_argument("--json", action="store_true")
+
+    grav_p = sub.add_parser("gravity", help="Compute Knowledge Gravity & Ebbinghaus decay report.")
+    grav_p.add_argument("--as-of", default=None)
+    grav_p.add_argument("--json", action="store_true")
+
+    sub.add_parser("zoom", help="Run L0-L5 Fractal Zoom retrieval.").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("distill", help="Propose/list Principles & Mental Models.").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("concepts", help="Inspect Living Concept Objects & Timelines.").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("debate", help="Run Two-Sided Debate Mode over conflicting memories.").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("swarm", help="Run Internal Cognitive Swarm over approved memories.").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("simulate", help="Run World-Model Impact Simulation.").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("replay", help="Run Nightly Hippocampal Episodic Replay.").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("curiosity", help="Evaluate Self-Model & Directed Curiosity.").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("adr", help="Inspect/manage owner experimental ADRs.").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("bus", help="Inspect/warm Predictive Memory Bus (L0-L3).").add_argument("args", nargs=argparse.REMAINDER)
+    sub.add_parser("route", help="Classify query complexity & Meta-Reasoning budget.").add_argument("args", nargs=argparse.REMAINDER)
 
     fb_p = sub.add_parser("feedback", help="Record helpful/correction feedback for an atom in sidecar telemetry.")
     fb_p.add_argument("atom_id")
@@ -1004,7 +1302,7 @@ def main(argv: list[str] | None = None) -> int:
     exp_p.add_argument("--lesson", action="append", default=[])
     exp_p.add_argument("--propose-inbox", action="store_true")
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     eff_brain, eff_atoms, eff_exp, eff_inbox, eff_db = _cli_cognitive_dirs()
 
     if args.command == "fitness":
@@ -1018,6 +1316,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Cold verified atoms:         {len(report['cold_verified_atoms'])}")
             print(f"Pending review bottlenecks:  {len(report['pending_review_bottlenecks'])}")
             print(f"Procedural memories tracked: {len(report['procedure_maturity'])}")
+        return 0
+
+    if args.command == "gravity":
+        report = compute_knowledge_gravity_report(
+            atoms_dir=eff_atoms,
+            brain_dir=eff_brain,
+            db_path=eff_db,
+            as_of=args.as_of,
+        )
+        print(
+            json.dumps(report, indent=2, sort_keys=True)
+            if args.json
+            else f"scored={report['total_scored']} review_due={len(report['review_due_candidates'])} cold={len(report['cold_archive_candidates'])}"
+        )
         return 0
 
     if args.command == "feedback":

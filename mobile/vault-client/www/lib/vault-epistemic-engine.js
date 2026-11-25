@@ -2901,6 +2901,206 @@
     });
   }
 
+  function safeSlugForNote(rawName) {
+    const clean = String(rawName || "")
+      .replace(/^notes\//i, "")
+      .replace(/\.md$/i, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 64);
+    if (!clean || clean === "." || clean === "..") {
+      return "mobile-note-" + Date.now();
+    }
+    return clean;
+  }
+
+  function createOrUpdateNoteOffline(filesMap, options) {
+    const opts = options || {};
+    const nextFiles = Object.assign({}, filesMap || {});
+    const slug = safeSlugForNote(opts.filename || opts.title || "mobile-note");
+    const relPath = "notes/" + slug + ".md";
+    VaultCrypto.validateSyncRelPath(relPath);
+    const title = String(opts.title || slug).replace(/[\r\n]+/g, " ").trim().slice(0, 200);
+    const tags = Array.isArray(opts.tags)
+      ? opts.tags.map(function (t) { return String(t || "").trim(); }).filter(Boolean).slice(0, 16)
+      : [];
+    const nowIso = String(opts.timestamp || new Date().toISOString().replace(/\.\d{3}Z$/, "Z"));
+    const mdLines = [
+      "---",
+      'title: "' + title.replace(/"/g, '\\"') + '"',
+      "tags: [" + tags.map(function (t) { return '"' + t.replace(/"/g, '\\"') + '"'; }).join(", ") + "]",
+      "updated_at: " + nowIso,
+      'origin: "mobile_owner"',
+      "---",
+      "",
+      String(opts.body || "").replace(/\r\n/g, "\n"),
+    ];
+    const bytes = VaultCrypto.utf8Bytes(mdLines.join("\n") + "\n");
+    nextFiles[relPath] = bytes;
+    return {
+      relPath: relPath,
+      bytes: bytes,
+      sha256: VaultCrypto.sha256HexSync(bytes),
+      files: nextFiles,
+    };
+  }
+
+  function listPendingAtomsOffline(filesMap) {
+    const out = [];
+    const decRes = parseLatestDecisionRecords(filesMap);
+    const latestDecisions = decRes.map || {};
+    const paths = listFilePaths(filesMap);
+    for (let i = 0; i < paths.length; i += 1) {
+      const rp = paths[i];
+      if (!rp.startsWith("2-atoms/") || !rp.endsWith(".md")) {
+        continue;
+      }
+      const fname = rp.slice("2-atoms/".length);
+      if (!isContentMarkdownFilename(fname)) {
+        continue;
+      }
+      const rawBytes = getFileBytes(filesMap, rp);
+      const sha = VaultCrypto.sha256HexSync(rawBytes);
+      let text;
+      try {
+        text = VaultCrypto.utf8DecodeStrict(rawBytes);
+      } catch (_e) {
+        continue;
+      }
+      const split = splitFrontmatter(text);
+      if (!split) {
+        continue;
+      }
+      const fm = parseFrontmatterValues(split.frontmatter);
+      const dec = latestDecisions[fname];
+      const fmStatus = String(fm.review_status || "pending").toLowerCase();
+      const effStatus = dec ? String(dec.decision || fmStatus).toLowerCase() : fmStatus;
+      if (effStatus === "pending" || effStatus === "proposed") {
+        const anchor = verifyEvidenceAnchor(text, filesMap, fm);
+        out.push({
+          filename: fname,
+          relPath: rp,
+          sha256: sha,
+          review_status: effStatus,
+          claim: sectionText(split.body.join("\n"), "Claim") || String(fm.title || fname),
+          anchor_valid: Boolean(anchor.valid),
+          anchor_reason: anchor.reason,
+        });
+      }
+    }
+    return out;
+  }
+
+  function reviewAtomOffline(filesMap, filename, decision, options) {
+    const opts = options || {};
+    const cleanDecision = String(decision || "").trim().toLowerCase();
+    if (!new Set(["accepted", "approved", "rejected", "pending", "quarantined"]).has(cleanDecision)) {
+      throw new Error("Unsupported review decision: " + decision);
+    }
+    const normalizedDec = cleanDecision === "approved" ? "accepted" : cleanDecision;
+    const relPath = filename.startsWith("2-atoms/") ? filename : "2-atoms/" + filename;
+    VaultCrypto.validateSyncRelPath(relPath);
+    const bareName = relPath.slice("2-atoms/".length);
+    const rawBytes = getFileBytes(filesMap, relPath);
+    if (!rawBytes) {
+      throw new Error("Atom not found in mobile store: " + relPath);
+    }
+    const actualSha = VaultCrypto.sha256HexSync(rawBytes);
+    if (opts.expectedSha256 && opts.expectedSha256 !== actualSha) {
+      throw new Error("CAS conflict: atom SHA-256 changed before review.");
+    }
+    const text = VaultCrypto.utf8DecodeStrict(rawBytes);
+    const split = splitFrontmatter(text);
+    const fm = split ? parseFrontmatterValues(split.frontmatter) : {};
+    let anchor = { valid: false, reason: "unchecked", source: fm.evidence_source || "", source_sha256: fm.evidence_sha256 || "" };
+    if (normalizedDec === "accepted") {
+      anchor = verifyEvidenceAnchor(text, filesMap, fm);
+      if (!anchor.valid) {
+        throw new Error("Refusing to approve atom with invalid source anchor: " + anchor.reason);
+      }
+    }
+    if (!split) {
+      throw new Error("Invalid atom format: missing YAML frontmatter in " + relPath);
+    }
+    let updatedFmText = split.frontmatter.join("\n").replace(
+      /^(review_status\s*:\s*).*$/m,
+      "$1" + (normalizedDec === "accepted" ? "accepted" : normalizedDec)
+    );
+    if (normalizedDec === "accepted") {
+      if (/^(claim_state\s*:).*$/m.test(updatedFmText)) {
+        updatedFmText = updatedFmText.replace(/^(claim_state\s*:\s*).*$/m, "$1human_reviewed");
+      }
+      if (/^(citation_integrity\s*:).*$/m.test(updatedFmText)) {
+        updatedFmText = updatedFmText.replace(/^(citation_integrity\s*:\s*).*$/m, "$1anchored");
+      }
+    }
+    const trailingNewline = text.endsWith("\n") ? "\n" : "";
+    const bodyJoined = split.body.join("\n");
+    const updatedText = "---\n" + updatedFmText + "\n---" + (bodyJoined ? "\n" + bodyJoined : "") + trailingNewline;
+    const updatedBytes = VaultCrypto.utf8Bytes(updatedText);
+    const nextSha = VaultCrypto.sha256HexSync(updatedBytes);
+    const nextFiles = Object.assign({}, filesMap);
+    nextFiles[relPath] = updatedBytes;
+
+    const decPath = "0-raw/archive/decision-record.jsonl";
+    const existingLogBytes = getFileBytes(filesMap, decPath);
+    const existingLog = existingLogBytes ? VaultCrypto.utf8DecodeStrict(existingLogBytes).trimEnd() : "";
+    const tsIso = String(opts.timestamp || new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00"));
+    const actionMap = {
+      accepted: "approve",
+      rejected: "reject",
+      pending: "demote",
+      quarantined: "quarantine",
+    };
+    const entry = {
+      schema_version: 1,
+      action: actionMap[normalizedDec] || normalizedDec,
+      atom_filename: bareName,
+      content_sha256_before: actualSha,
+      content_sha256_after: nextSha,
+      atom_sha256: nextSha,
+      prior_atom_sha256: actualSha,
+      decision: normalizedDec === "accepted" ? "approved" : normalizedDec,
+      actor: String(opts.actor || "mobile-owner"),
+      rationale: String(opts.rationale || "Reviewed on verified mobile client"),
+      recorded_at: tsIso,
+      timestamp: tsIso,
+    };
+    const nextLogText = (existingLog ? existingLog + "\n" : "") + JSON.stringify(entry) + "\n";
+    nextFiles[decPath] = VaultCrypto.utf8Bytes(nextLogText);
+
+    return {
+      relPath: relPath,
+      decision: normalizedDec,
+      newSha256: nextSha,
+      files: nextFiles,
+    };
+  }
+
+  function resolveSyncConflictOffline(filesMap, conflict, choice) {
+    const nextFiles = Object.assign({}, filesMap || {});
+    if (!conflict || !conflict.relPath) {
+      throw new Error("Invalid conflict object.");
+    }
+    const rp = conflict.relPath;
+    VaultCrypto.validateSyncRelPath(rp);
+    if (choice === "keep_local") {
+      nextFiles[rp] = conflict.localBytes;
+    } else if (choice === "accept_remote") {
+      nextFiles[rp] = conflict.remoteBytes;
+    } else if (choice === "keep_both") {
+      nextFiles[rp] = conflict.remoteBytes;
+      const baseName = rp.split("/").pop().replace(/\.md$/i, "");
+      const copyRel = "notes/" + safeSlugForNote(baseName + "-mobile-conflict") + ".md";
+      VaultCrypto.validateSyncRelPath(copyRel);
+      nextFiles[copyRel] = conflict.localBytes;
+    } else {
+      throw new Error("Unsupported conflict resolution choice: " + choice);
+    }
+    return nextFiles;
+  }
+
   return {
     NO_APPROVED_MEMORY_RESPONSE: NO_APPROVED_MEMORY_RESPONSE,
     VALIDATION_ABSTENTION_RESPONSE: VALIDATION_ABSTENTION_RESPONSE,
@@ -2931,5 +3131,9 @@
     checkCitations: checkCitations,
     validateGroundedAnswer: validateGroundedAnswer,
     answerGroundedQuestion: answerGroundedQuestion,
+    createOrUpdateNoteOffline: createOrUpdateNoteOffline,
+    listPendingAtomsOffline: listPendingAtomsOffline,
+    reviewAtomOffline: reviewAtomOffline,
+    resolveSyncConflictOffline: resolveSyncConflictOffline,
   };
 });

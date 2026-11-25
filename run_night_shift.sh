@@ -20,8 +20,16 @@ echo "[1/2] Second Brain Night Shift — Refinery"
 uv run --locked python scripts/ollama_refinery.py
 
 echo ""
-echo "[2/2] Second Brain Morning Shift — Thread Synthesis"
+echo "[2/4] Second Brain Morning Shift — Thread Synthesis"
 uv run --locked python scripts/ollama_editor.py
+
+echo ""
+echo "[3/4] Second Brain Hippocampal Replay — Counterfactual Briefing"
+uv run --locked python scripts/episodic_replay.py || true
+
+echo ""
+echo "[4/4] Second Brain Continuous Distillation — Draft Principles"
+uv run --locked python scripts/cognitive_distiller.py distill || true
 
 echo ""
 echo "Night Shift Complete!"

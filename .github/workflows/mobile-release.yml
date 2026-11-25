@@ -1,0 +1,145 @@
+name: Mobile Release (Android & iOS)
+
+on:
+  push:
+    tags:
+      - "mobile-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      track:
+        description: "Google Play track (internal | alpha | beta | production)"
+        required: false
+        default: "internal"
+      upload_play_store:
+        description: "Upload signed .aab to Google Play Console"
+        type: boolean
+        default: false
+      upload_testflight:
+        description: "Upload signed .ipa to Apple TestFlight"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-android:
+    name: Build Android (.aab & .apk) & Optional Play Store Upload
+    runs-on: ${{ vars.SB_LINUX_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Verify Mobile Vault tests & sync Capacitor assets
+        working-directory: mobile/vault-client
+        run: |
+          npm ci --ignore-scripts
+          npm test
+          npx cap copy android
+
+      - name: Decode optional Android signing keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload-keystore.jks"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/upload-keystore.jks" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build Android App Bundle (bundleRelease) & APK (assembleRelease)
+        working-directory: mobile/vault-client/android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew bundleRelease assembleRelease --no-daemon
+
+      - name: Upload to Google Play Console via Fastlane supply (when configured)
+        if: ${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 != '' && (github.event_name == 'push' || inputs.upload_play_store) }}
+        working-directory: mobile/vault-client
+        env:
+          GOOGLE_PLAY_JSON_KEY_BASE64: ${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 }}
+          GOOGLE_PLAY_TRACK: ${{ inputs.track || 'internal' }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$GOOGLE_PLAY_JSON_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/play-key.json"
+          export GOOGLE_PLAY_JSON_KEY_PATH="$RUNNER_TEMP/play-key.json"
+          fastlane android deploy_internal
+
+      - name: Clean temporary Android credentials
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/upload-keystore.jks" "$RUNNER_TEMP/play-key.json"
+
+      - name: Upload Android build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-android-dist
+          path: |
+            mobile/vault-client/android/app/build/outputs/bundle/release/*.aab
+            mobile/vault-client/android/app/build/outputs/apk/release/*.apk
+
+  build-ios:
+    name: Build iOS (Xcode / TestFlight)
+    runs-on: ${{ vars.SB_MACOS_RUNNER || 'macos-latest' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run Mobile Vault JS tests
+        working-directory: mobile/vault-client
+        run: |
+          npm ci --ignore-scripts
+          npm test
+
+      - name: Copy web assets into iOS Capacitor project
+        working-directory: mobile/vault-client
+        run: npx cap copy ios
+
+      - name: Upload signed iOS build to TestFlight via Fastlane (when App Store Connect API Key configured)
+        if: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 != '' && (github.event_name == 'push' || inputs.upload_testflight) }}
+        working-directory: mobile/vault-client
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_URL: ${{ vars.MATCH_GIT_URL }}
+        run: |
+          echo "$APP_STORE_CONNECT_API_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/asc-key.p8"
+          export APP_STORE_CONNECT_API_KEY_PATH="$RUNNER_TEMP/asc-key.p8"
+          fastlane ios deploy_testflight
+
+      - name: Archive unsigned/simulator Xcode project validation when App Store secrets absent
+        if: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 == '' }}
+        working-directory: mobile/vault-client/ios/App
+        run: |
+          xcodebuild -project App.xcodeproj -scheme App -configuration Release -sdk iphonesimulator CODE_SIGNING_ALLOWED=NO build

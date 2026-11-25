@@ -22,7 +22,7 @@ overrides, beacons, credentials) is diverted to the quarantined inbox.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import datetime
 import hashlib
 import json
@@ -51,10 +51,13 @@ from config import (  # noqa: E402
     _WINDOWS_RESERVED_STEMS,
     _is_reparse_or_link,
     resolve_active_brain_dir,
+    resolve_module_vault_path,
     safe_file_in_dir,
+    snapshot_module_defaults,
 )
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 from evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
-from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
 from memory_format import evaluate_temporal_validity, normalize_temporal_bound_str  # noqa: E402
 from lexical_store import (  # noqa: E402
     LexicalIndexUnavailable,
@@ -93,12 +96,12 @@ class NoteError(ValueError):
 
 @dataclass(frozen=True)
 class NotePaths:
-    brain_dir: str = BRAIN_DIR
-    notes_dir: str = NOTES_DIR
-    index_path: str = NOTES_INDEX_PATH
-    atoms_dir: str = ATOMS_DIR
-    inbox_dir: str = INBOX_DIR
-    snapshots_dir: str = NOTE_SNAPSHOTS_DIR
+    brain_dir: str = field(default_factory=lambda: resolve_module_vault_path(globals(), "BRAIN_DIR"))
+    notes_dir: str = field(default_factory=lambda: resolve_module_vault_path(globals(), "NOTES_DIR"))
+    index_path: str = field(default_factory=lambda: resolve_module_vault_path(globals(), "NOTES_INDEX_PATH"))
+    atoms_dir: str = field(default_factory=lambda: resolve_module_vault_path(globals(), "ATOMS_DIR"))
+    inbox_dir: str = field(default_factory=lambda: resolve_module_vault_path(globals(), "INBOX_DIR"))
+    snapshots_dir: str = field(default_factory=lambda: resolve_module_vault_path(globals(), "NOTE_SNAPSHOTS_DIR"))
 
     @classmethod
     def for_brain(cls, brain_dir: str) -> "NotePaths":
@@ -119,6 +122,14 @@ class NotePaths:
 
 DEFAULT_PATHS = NotePaths()
 _INITIAL_DEFAULT_PATHS = DEFAULT_PATHS
+
+
+def _resolve_note_paths(paths: NotePaths | None = None) -> NotePaths:
+    if paths is not None:
+        return paths
+    if DEFAULT_PATHS != _INITIAL_DEFAULT_PATHS:
+        return DEFAULT_PATHS
+    return NotePaths()
 
 
 def _extract_derived_contexts(tags: tuple[str, ...]) -> list[str]:
@@ -354,10 +365,11 @@ def create_note(
     tags=(),
     source_path: str | None = None,
     capture_source: str = "owner",
-    paths: NotePaths = DEFAULT_PATHS,
+    paths: NotePaths | None = None,
     reindex: bool = True,
 ) -> dict[str, object]:
     """Create a new note and make it searchable immediately. Never overwrites."""
+    paths = _resolve_note_paths(paths)
     if origin not in NOTE_ORIGINS:
         raise NoteError(f"Unsupported note origin: {origin!r}")
     clean_title = _clean_line(title) or _clean_line(str(body or "").strip().splitlines()[0] if str(body or "").strip() else "") or "Untitled"
@@ -365,6 +377,8 @@ def create_note(
     if origin in AGENT_ORIGINS:
         if len(text_body) > MAX_AGENT_CAPTURE_CHARS:
             raise NoteError(f"Agent capture exceeds {MAX_AGENT_CAPTURE_CHARS} characters.")
+        from inbox_workflow import scan_inbox_payload_risks
+
         risks = scan_inbox_payload_risks(f"{clean_title}\n{text_body}")
         if risks:
             return _quarantine_agent_capture(paths, clean_title, text_body, risks, capture_source)
@@ -395,9 +409,10 @@ def update_note(
     expected_sha256: str,
     title: str | None = None,
     tags=None,
-    paths: NotePaths = DEFAULT_PATHS,
+    paths: NotePaths | None = None,
 ) -> dict[str, object]:
     """Compare-and-swap save. The app passes back the hash it loaded; the owner never sees it."""
+    paths = _resolve_note_paths(paths)
     _ensure_dirs(paths)
     with review_lock(paths.lock_path):
         target = _resolve_note(paths, filename)
@@ -438,8 +453,9 @@ def update_note(
     return {"status": "saved", "filename": filename, "sha256": content_sha256(rendered), "previous_sha256": current}
 
 
-def delete_note(filename: str, *, expected_sha256: str, paths: NotePaths = DEFAULT_PATHS) -> dict[str, object]:
+def delete_note(filename: str, *, expected_sha256: str, paths: NotePaths | None = None) -> dict[str, object]:
     """Reversible delete: moves the note to notes/.trash."""
+    paths = _resolve_note_paths(paths)
     with review_lock(paths.lock_path):
         target = _resolve_note(paths, filename)
         current = content_sha256(target.read_bytes())
@@ -455,14 +471,16 @@ def delete_note(filename: str, *, expected_sha256: str, paths: NotePaths = DEFAU
     return {"status": "trashed", "filename": filename, "trash_path": str(dest)}
 
 
-def get_note(filename: str, *, paths: NotePaths = DEFAULT_PATHS) -> NoteRecord:
+def get_note(filename: str, *, paths: NotePaths | None = None) -> NoteRecord:
+    paths = _resolve_note_paths(paths)
     target = _resolve_note(paths, filename)
     raw = target.read_bytes()
     return _record_from_text(filename, raw.decode("utf-8"), content_sha256(raw), include_body=True)
 
 
-def ensure_notes_index(paths: NotePaths = DEFAULT_PATHS) -> dict[str, object]:
+def ensure_notes_index(paths: NotePaths | None = None) -> dict[str, object]:
     """Self-heal the notes index after out-of-band edits (incremental diff, not full rebuild)."""
+    paths = _resolve_note_paths(paths)
     _ensure_dirs(paths)
     with review_lock(paths.lock_path):
         return sync_lexical_index(paths.notes_dir, paths.index_path)
@@ -489,8 +507,9 @@ def search_notes(
     *,
     limit: int = 8,
     project: str | None = None,
-    paths: NotePaths = DEFAULT_PATHS,
+    paths: NotePaths | None = None,
 ) -> list[NoteRecord]:
+    paths = _resolve_note_paths(paths)
     eff_limit = max(1, int(limit))
     scope_raw = (project or "").strip()
     scope_tag = normalize_project_tag(scope_raw) if scope_raw else ""
@@ -511,8 +530,9 @@ def search_notes(
 
 
 def list_notes(
-    *, query: str = "", limit: int = 100, offset: int = 0, paths: NotePaths = DEFAULT_PATHS
+    *, query: str = "", limit: int = 100, offset: int = 0, paths: NotePaths | None = None
 ) -> tuple[list[NoteRecord], int]:
+    paths = _resolve_note_paths(paths)
     if not os.path.isfile(paths.index_path) or not lexical_index_is_current(paths.notes_dir, paths.index_path):
         ensure_notes_index(paths)
     items, total = _search_with_heal(
@@ -522,8 +542,9 @@ def list_notes(
     return [_record_from_text(i.filename, i.content, i.content_sha256, query=query) for i in items], total
 
 
-def backlinks(filename: str, *, paths: NotePaths = DEFAULT_PATHS, limit: int = 50) -> list[NoteRecord]:
+def backlinks(filename: str, *, paths: NotePaths | None = None, limit: int = 50) -> list[NoteRecord]:
     """Notes linking to ``filename`` via [[wikilink]] (title, stem, [[target|alias]], or [[target#heading]])."""
+    paths = _resolve_note_paths(paths)
     target_note = get_note(filename, paths=paths)
     title_cf = target_note.title.strip().casefold()
     stem_cf = Path(filename).stem.strip().casefold()
@@ -564,7 +585,7 @@ def verify_note_excerpt(
     tags=(),
     valid_from: str | None = None,
     valid_until: str | None = None,
-    paths: NotePaths = DEFAULT_PATHS,
+    paths: NotePaths | None = None,
 ) -> dict[str, object]:
     """One-click owner promotion of a note excerpt into a source-anchored, approved atom.
 
@@ -572,6 +593,7 @@ def verify_note_excerpt(
     SHA-256 pinning, decision record). Only a human actor may call this; API surfaces
     must gate it behind the owner credential, never the agent token.
     """
+    paths = _resolve_note_paths(paths)
     clean_actor = _clean_line(actor, 120)
     if clean_actor.casefold() in DISALLOWED_ACTORS:
         raise NoteError("Verification requires an explicit human owner actor.")
@@ -601,6 +623,8 @@ def verify_note_excerpt(
     flat_claim = re.sub(r"^(?:>+\s*|#{1,6}\s+|[-*]\s+)+", "", raw_claim).strip() or raw_claim
     if not flat_claim or len(flat_claim) > 2000:
         raise NoteError("Claim must be between 1 and 2,000 characters.")
+    from inbox_workflow import scan_inbox_payload_risks
+
     risks = scan_inbox_payload_risks(flat_claim + "\n" + "\n".join(candidates))
     if risks:
         raise NoteError(f"Cannot verify excerpt containing security risk flags: {', '.join(risks)}")
@@ -766,7 +790,8 @@ def verify_note_excerpt(
     }
 
 
-def rebuild_notes_index(paths: NotePaths = DEFAULT_PATHS) -> dict[str, object]:
+def rebuild_notes_index(paths: NotePaths | None = None) -> dict[str, object]:
+    paths = _resolve_note_paths(paths)
     _ensure_dirs(paths)
     with review_lock(paths.lock_path):
         return rebuild_lexical_index(paths.notes_dir, paths.index_path)
@@ -782,9 +807,7 @@ def _split_cli_tags(raw_tags: list[str] | None) -> list[str]:
 
 
 def _active_cli_note_paths() -> NotePaths:
-    if DEFAULT_PATHS != _INITIAL_DEFAULT_PATHS:
-        return DEFAULT_PATHS
-    return NotePaths.for_brain(resolve_active_brain_dir())
+    return _resolve_note_paths(None)
 
 
 def _parse_due_date(line_text: str) -> str | None:
@@ -954,7 +977,7 @@ def _scan_file_action_items(
 
 def extract_action_items(
     *,
-    paths: NotePaths = DEFAULT_PATHS,
+    paths: NotePaths | None = None,
     raw_dir: str | Path | None = None,
     include_completed: bool = False,
     include_raw: bool = True,
@@ -962,6 +985,7 @@ def extract_action_items(
     tag: str | None = None,
 ) -> list[dict[str, object]]:
     """Model-free deterministic scanner for tasks and action items across working notes and local raw captures."""
+    paths = _resolve_note_paths(paths)
     scope_raw = (project or "").strip()
     scope_tag = normalize_project_tag(scope_raw) if scope_raw else ""
     wanted_tag = (tag or "").strip().lstrip("#").casefold()

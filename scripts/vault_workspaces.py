@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import review_lock  # noqa: E402
 from config import (  # noqa: E402
+    _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     ensure_dirs,
     is_content_markdown,
@@ -114,7 +115,8 @@ def _assert_no_symlink_ancestors(target: str) -> None:
     while cur and cur not in visited:
         visited.add(cur)
         if os.path.lexists(cur) and _is_reparse_or_link(cur):
-            raise VaultWorkspaceSecurityError(f"Refusing to use vault path with symlinked or junctioned component: {cur}")
+            if not _is_immutable_darwin_root_symlink(cur):
+                raise VaultWorkspaceSecurityError(f"Refusing to use vault path with symlinked or junctioned component: {cur}")
         parent = os.path.dirname(cur)
         if not parent or parent == cur:
             break

@@ -44,7 +44,7 @@ uv run --frozen python scripts/test_all.py
 
 Because search and telemetry SQLite databases (`brain/.sidecar/lexical.sqlite3`, `brain/.sidecar/notes.sqlite3`, `brain/.sidecar/telemetry.sqlite3`) and ChromaDB (`brain/.chroma/`) are strictly disposable projections of `brain/2-atoms/*.md` and `brain/notes/*.md`, you can delete and rebuild those index files at any time without losing canonical knowledge or approval attestations.
 
-> **Important `.sidecar/` Checkpoint Preservation:** Do **not** delete the entire `brain/.sidecar/` folder blindly if you use Phase 5 Merkle checkpoints or Time-Travel snapshots: `brain/.sidecar/vault-ledger.jsonl` (hash-chained Merkle audit checkpoints) and `brain/.sidecar/snapshots/*.json` (immutable point-in-time vault snapshots) hold historical checkpoint records and should be preserved and backed up alongside `brain/`. Delete only `*.sqlite3*` index files when clearing caches.
+> **Important Archive Checkpoint Preservation:** Do **not** delete `brain/0-raw/archive/` blindly: `brain/0-raw/archive/vault-ledger.jsonl` (hash-chained Merkle audit checkpoints) and `brain/0-raw/archive/snapshots/*.json` (immutable point-in-time vault snapshots) hold durable historical checkpoint records under the Three-Store boundary, whereas `brain/.sidecar/` SQLite caches can be rebuilt cleanly at any time.
 
 ### 2.1 Rebuild SQLite FTS5 Lexical Index (Model-Free / Offline)
 ```bash
@@ -171,16 +171,17 @@ uv run --frozen python scripts/review_atom.py transition quarantine <atom>.md --
 
 Run the complete verification gate before any release tag or schema change:
 ```bash
-# 1. Unified 12-suite CI test orchestrator (doctor, dataset schema, source audit, Phase 1-5 safety/cognitive/product/Merkle suites, 1,500-note scale canary, Chroma canary, archive manifest canary, live smoke test)
+# 1. Unified 36-suite CI test orchestrator (doctor, dataset schema, source audit, Phase 1-10 safety/cognitive/product/Merkle/release/platform/ecosystem/gen4/formal-discovery/live-runtime suites, 1,500-note scale canary, Chroma canary, archive manifest canary, live smoke test)
 uv run --frozen python scripts/test_all.py
 
-# 2. Verify cryptographic Merkle audit ledger & Contradiction Radar
+# 2. Verify cryptographic Merkle audit ledger, Contradiction Radar & Human Owner Gates
 uv run --frozen second-brain ledger verify
 uv run --frozen second-brain graph contradictions
+uv run --frozen second-brain gates status
 
-# 3. Comparative external SOTA benchmark & 30-case Retrieval Benchmark
-uv run --frozen second-brain sota-benchmark --atoms 300
-uv run --frozen python scripts/evaluate_retrieval.py --output docs/retrieval-evaluation-results-2026-11-15.json
+# 3. Comparative external SOTA benchmark (--offline dense baseline) & 90-case Retrieval Benchmark
+uv run --frozen second-brain sota-benchmark --atoms 300 --offline
+uv run --frozen python scripts/evaluate_retrieval.py --output docs/retrieval-evaluation-results-2026-11-22.json
 
 # 4. Multi-run Grounded Answer Evaluation (N >= 5 passes)
 uv run --frozen python scripts/evaluate_answers.py --model qwen2.5-coder:7b --runs 5

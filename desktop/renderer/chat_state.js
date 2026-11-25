@@ -37,6 +37,21 @@
       if (asOfVal) payload.as_of = asOfVal;
       const tid = String(params.thread_id || "").trim();
       if (tid) payload.thread_id = tid;
+      if (params.work_mode) {
+        payload.work_mode = String(params.work_mode).trim().toLowerCase();
+      }
+      if (params.persona_id) {
+        payload.persona_id = String(params.persona_id).trim().toLowerCase();
+      }
+      if (params.behavior_mode) {
+        payload.behavior_mode = String(params.behavior_mode).trim().toLowerCase();
+      }
+      if (typeof params.custom_rules === "string" && params.custom_rules.trim()) {
+        payload.custom_rules = params.custom_rules.trim().slice(0, 4000);
+      }
+      if (typeof params.done_criteria === "string" && params.done_criteria.trim()) {
+        payload.done_criteria = params.done_criteria.trim().slice(0, 2000);
+      }
       if (Array.isArray(params.history) && params.history.length > 0) {
         payload.history = params.history
           .filter((h) => h && (h.role === "user" || h.role === "assistant") && String(h.content || "").trim())
@@ -66,6 +81,9 @@
             id,
             query: String(params.query || "").trim(),
             mode: String(params.mode || "stream"),
+            work_mode: String(params.work_mode || "chat"),
+            persona_id: String(params.persona_id || "grounded_default"),
+            behavior_mode: String(params.behavior_mode || "autopilot"),
             host_id: String(params.host_id || "ollama_local"),
             model_override: String(params.model_override || "").trim(),
             retrieval_mode: String(params.retrieval_mode || "auto"),
@@ -118,6 +136,9 @@
             }
             turn.warning = data.warning ? String(data.warning) : "";
             if (data.host_id) turn.host_id = String(data.host_id);
+            if (data.work_mode) turn.work_mode = String(data.work_mode);
+            if (data.persona_id) turn.persona_id = String(data.persona_id);
+            if (data.behavior_mode) turn.behavior_mode = String(data.behavior_mode);
             if (data.retrieval_mode) {
               turn.retrieval_mode = String(data.retrieval_mode);
             }
@@ -282,6 +303,9 @@
                 query: String(pendingUser?.content || "(continued turn)"),
                 mode: String(threadDoc?.mode || "stream"),
                 host_id: String(threadDoc?.host_id || "ollama_local"),
+                work_mode: String(threadDoc?.work_mode || "chat"),
+                persona_id: String(threadDoc?.persona_id || "grounded_default"),
+                behavior_mode: String(threadDoc?.behavior_mode || "autopilot"),
                 model_override: "",
                 retrieval_mode: "auto",
                 answer_view: "standard",

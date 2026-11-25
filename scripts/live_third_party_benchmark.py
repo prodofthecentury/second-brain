@@ -24,6 +24,9 @@ memory and retrieval engines over the real 78-atom vault (`brain/2-atoms`) and t
   5. chromadb_hnsw_live             (Real `chromadb` `PersistentClient` HNSW cosine without trust gate)
   6. rank_bm25_okapi_live           (Real `rank-bm25` `BM25Okapi` without trust gate)
   7. sqlite_fts5_untrusted_live     (Real SQLite FTS5 BM25 without CAS/approval/scope trust gate)
+  8. basic_memory_live              (Optional live `basic-memory` Markdown+SQLite vault adapter)
+  9. graphiti_kuzu_live             (Optional live `graphiti-core` + embedded `kuzu` + local Ollama adapter)
+ 10. zep_live                       (Optional `zep-cloud`/`zep-python` adapter when configured via env)
 
 All third-party stores are built inside an isolated temporary directory so the live
 vault (`brain/`) is read-only throughout the benchmark. Telemetry in Mem0 and Chroma
@@ -37,10 +40,12 @@ Run:
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
 import gc
 import hashlib
+import importlib
 import importlib.metadata
 import json
 import math
@@ -69,7 +74,12 @@ from config import (  # noqa: E402
     GEN_MODEL,
     LEXICAL_INDEX_PATH,
     is_content_markdown,
+    resolve_module_atoms_and_brain,
+    resolve_module_vault_path,
+    snapshot_module_defaults,
 )
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 from cross_encoder import score_query_atom_pairs  # noqa: E402
 from evaluation_dataset import load_dataset  # noqa: E402
 from hardware_profile import detect_hardware_profile, resolve_active_local_generation_model  # noqa: E402
@@ -165,7 +175,19 @@ def _load_vault_atoms(atoms_dir: Path) -> tuple[list[dict[str, Any]], set[str]]:
 
 def _package_versions() -> dict[str, str]:
     versions: dict[str, str] = {}
-    for pkg in ("mem0ai", "faiss-cpu", "rank-bm25", "chromadb", "onnxruntime", "ollama"):
+    for pkg in (
+        "mem0ai",
+        "faiss-cpu",
+        "rank-bm25",
+        "chromadb",
+        "onnxruntime",
+        "ollama",
+        "basic-memory",
+        "graphiti-core",
+        "kuzu",
+        "zep-cloud",
+        "zep-python",
+    ):
         try:
             versions[pkg] = importlib.metadata.version(pkg)
         except importlib.metadata.PackageNotFoundError:
@@ -173,10 +195,375 @@ def _package_versions() -> dict[str, str]:
     return versions
 
 
+def _map_text_to_filename(text: str, atoms_by_claim: list[tuple[str, str]]) -> str | None:
+    """Resolve an external memory adapter hit back to a vault atom filename."""
+    s = str(text or "")
+    marker = "[ATOM:"
+    if marker in s:
+        after = s.split(marker, 1)[1]
+        cand = after.split("]", 1)[0].strip()
+        for fname, _claim in atoms_by_claim:
+            if cand == fname or cand == Path(fname).stem:
+                return fname
+    s_low = s.lower()
+    for fname, claim in atoms_by_claim:
+        stem = Path(fname).stem.lower()
+        if fname.lower() in s_low or (len(stem) >= 4 and stem in s_low):
+            return fname
+        claim_prefix = claim.strip().lower()[:48]
+        if len(claim_prefix) >= 12 and claim_prefix in s_low:
+            return fname
+    return None
+
+
+class _ExternalMemoryAdapter:
+    """Base protocol for optional isolated live third-party benchmark adapters."""
+
+    name: str = "external"
+    packages: tuple[str, ...] = ()
+
+    def check_available(self) -> tuple[bool, str]:
+        return False, "not implemented"
+
+    def setup(
+        self,
+        vault_atoms: list[dict[str, Any]],
+        tmp_path: Path,
+        *,
+        active_llm: str,
+        base_url: str,
+        embed_dim: int,
+    ) -> float:
+        raise NotImplementedError
+
+    def search(self, query: str, *, project_scope: str = "", top_k: int = TOP_K) -> list[str]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return None
+
+
+class BasicMemoryLiveAdapter(_ExternalMemoryAdapter):
+    """Isolated adapter for `basic-memory` Markdown + local SQLite FTS/entity store."""
+
+    name = "basic_memory_live"
+    packages = ("basic-memory",)
+
+    def __init__(self) -> None:
+        self._atoms_by_claim: list[tuple[str, str]] = []
+        self._engine: Any = None
+        self._project_dir: Path | None = None
+
+    def check_available(self) -> tuple[bool, str]:
+        try:
+            importlib.import_module("basic_memory")
+            return True, "available"
+        except ImportError as exc:
+            return False, f"basic-memory package not installed ({exc}); invoke via `uv run --with basic-memory`."
+
+    def setup(
+        self,
+        vault_atoms: list[dict[str, Any]],
+        tmp_path: Path,
+        *,
+        active_llm: str,
+        base_url: str,
+        embed_dim: int,
+    ) -> float:
+        t0 = time.perf_counter()
+        bm = importlib.import_module("basic_memory")
+        proj_dir = tmp_path / "basic_memory_vault"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        self._project_dir = proj_dir
+        self._atoms_by_claim = [(a["filename"], a["claim"]) for a in vault_atoms]
+
+        for atom in vault_atoms:
+            scope = ",".join(atom.get("project_tags") or ())
+            note_md = (
+                f"---\n"
+                f"title: {Path(atom['filename']).stem}\n"
+                f"tags: [{scope}]\n"
+                f"---\n\n"
+                f"[ATOM:{atom['filename']}]\n\n"
+                f"{atom['raw_text']}\n"
+            )
+            (proj_dir / atom["filename"]).write_text(note_md, encoding="utf-8")
+
+        engine_cls = getattr(bm, "BasicMemoryIndex", None) or getattr(bm, "MemoryStore", None)
+        if engine_cls is not None:
+            self._engine = engine_cls(vault_dir=str(proj_dir), db_path=str(tmp_path / "basic_memory.sqlite3"))
+            self._engine.index_directory(str(proj_dir))
+            return round((time.perf_counter() - t0) * 1000.0, 2)
+
+        # Native basic-memory library surface
+        search_fn = getattr(bm, "search_notes", None)
+        if callable(search_fn):
+            self._engine = bm
+            return round((time.perf_counter() - t0) * 1000.0, 2)
+
+        raise RuntimeError("Installed `basic_memory` module does not expose an index/search entry point.")
+
+    def search(self, query: str, *, project_scope: str = "", top_k: int = TOP_K) -> list[str]:
+        if self._engine is None:
+            return []
+        if hasattr(self._engine, "search"):
+            hits = self._engine.search(query, project=project_scope or None, limit=top_k)
+        else:
+            hits = self._engine.search_notes(
+                query, vault_dir=str(self._project_dir), project=project_scope or None, limit=top_k
+            )
+        ranked: list[str] = []
+        for h in hits or []:
+            fname = None
+            if isinstance(h, dict):
+                fname = h.get("filename") or _map_text_to_filename(str(h.get("text") or h.get("title") or ""), self._atoms_by_claim)
+            else:
+                fname = getattr(h, "filename", None) or _map_text_to_filename(str(h), self._atoms_by_claim)
+            if fname and fname not in ranked:
+                ranked.append(str(fname))
+        return ranked[:top_k]
+
+
+class GraphitiKuzuLiveAdapter(_ExternalMemoryAdapter):
+    """Isolated adapter for `graphiti-core` + embedded `kuzu` graph + local Ollama."""
+
+    name = "graphiti_kuzu_live"
+    packages = ("graphiti-core", "kuzu")
+
+    def __init__(self) -> None:
+        self._client: Any = None
+        self._atoms_by_claim: list[tuple[str, str]] = []
+
+    def check_available(self) -> tuple[bool, str]:
+        missing: list[str] = []
+        for pkg in ("graphiti_core", "kuzu"):
+            try:
+                importlib.import_module(pkg)
+            except ImportError:
+                missing.append(pkg)
+        if missing:
+            return False, f"Missing optional packages ({', '.join(missing)}); invoke via `uv run --with graphiti-core --with kuzu`."
+        return True, "available"
+
+    def setup(
+        self,
+        vault_atoms: list[dict[str, Any]],
+        tmp_path: Path,
+        *,
+        active_llm: str,
+        base_url: str,
+        embed_dim: int,
+    ) -> float:
+        t0 = time.perf_counter()
+        g_mod = importlib.import_module("graphiti_core")
+        self._atoms_by_claim = [(a["filename"], a["claim"]) for a in vault_atoms]
+        graph_cls = getattr(g_mod, "Graphiti")
+        db_dir = str(tmp_path / "graphiti_kuzu_db")
+
+        # Try lightweight injected or KuzuDriver-backed construction without cloud calls
+        try:
+            driver_mod = importlib.import_module("graphiti_core.driver.kuzu_driver")
+            kuzu_driver = driver_mod.KuzuDriver(db=db_dir)
+            llm_mod = importlib.import_module("graphiti_core.llm_client.openai_client")
+            emb_mod = importlib.import_module("graphiti_core.embedder.openai")
+            openai_base = base_url.rstrip("/") + "/v1"
+            llm_client = llm_mod.OpenAIClient(model=active_llm, base_url=openai_base, api_key="ollama-local")
+            embedder = emb_mod.OpenAIEmbedder(
+                embedding_model=EMBED_MODEL,
+                embedding_dim=embed_dim,
+                base_url=openai_base,
+                api_key="ollama-local",
+            )
+            self._client = graph_cls(graph_driver=kuzu_driver, llm_client=llm_client, embedder=embedder)
+        except (ImportError, AttributeError, TypeError):
+            self._client = graph_cls(db_path=db_dir, model=active_llm, embed_model=EMBED_MODEL, base_url=base_url)
+
+        async def _ingest() -> None:
+            if hasattr(self._client, "build_indices_and_constraints"):
+                res = self._client.build_indices_and_constraints()
+                if asyncio.iscoroutine(res):
+                    await res
+            for atom in vault_atoms:
+                grp = atom["project_tags"][0] if atom.get("project_tags") else "global"
+                ep_body = f"[ATOM:{atom['filename']}] {atom['claim']}"
+                res = self._client.add_episode(
+                    name=atom["filename"],
+                    episode_body=ep_body,
+                    source_description="vault-atom",
+                    reference_time=datetime.now(timezone.utc),
+                    group_id=grp,
+                )
+                if asyncio.iscoroutine(res):
+                    await res
+
+        asyncio.run(_ingest())
+        return round((time.perf_counter() - t0) * 1000.0, 2)
+
+    def search(self, query: str, *, project_scope: str = "", top_k: int = TOP_K) -> list[str]:
+        if self._client is None:
+            return []
+
+        async def _query() -> Any:
+            kwargs: dict[str, Any] = {"num_results": top_k}
+            if project_scope:
+                kwargs["group_ids"] = [project_scope]
+            try:
+                res = self._client.search(query, **kwargs)
+            except TypeError:
+                res = self._client.search(query)
+            if asyncio.iscoroutine(res):
+                return await res
+            return res
+
+        hits = asyncio.run(_query())
+        ranked: list[str] = []
+        for h in hits or []:
+            text = (
+                h.get("fact") or h.get("name") or h.get("content") or ""
+                if isinstance(h, dict)
+                else f"{getattr(h, 'name', '')} {getattr(h, 'fact', '')} {getattr(h, 'content', '')}"
+            )
+            fname = _map_text_to_filename(text, self._atoms_by_claim)
+            if fname and fname not in ranked:
+                ranked.append(fname)
+        return ranked[:top_k]
+
+    def close(self) -> None:
+        if self._client is not None and hasattr(self._client, "close"):
+            try:
+                res = self._client.close()
+                if asyncio.iscoroutine(res):
+                    asyncio.run(res)
+            except Exception:
+                pass
+
+
+class ZepLiveAdapter(_ExternalMemoryAdapter):
+    """Isolated opt-in adapter for `zep-cloud` / `zep-python` when env credentials exist."""
+
+    name = "zep_live"
+    packages = ("zep-cloud", "zep-python")
+
+    def __init__(self) -> None:
+        self._client: Any = None
+        self._session_id: str = ""
+        self._atoms_by_claim: list[tuple[str, str]] = []
+
+    def check_available(self) -> tuple[bool, str]:
+        api_key = (os.environ.get("ZEP_API_KEY") or "").strip()
+        api_url = (os.environ.get("ZEP_API_URL") or "").strip()
+        mod = None
+        for pkg in ("zep_cloud", "zep_python"):
+            try:
+                mod = importlib.import_module(pkg)
+                break
+            except ImportError:
+                continue
+        if mod is None:
+            return False, "Missing optional `zep-cloud`/`zep-python` package."
+        if not api_key and not api_url:
+            return False, "Zep server/key not configured (`ZEP_API_KEY` or `ZEP_API_URL` required)."
+        return True, "available"
+
+    def setup(
+        self,
+        vault_atoms: list[dict[str, Any]],
+        tmp_path: Path,
+        *,
+        active_llm: str,
+        base_url: str,
+        embed_dim: int,
+    ) -> float:
+        t0 = time.perf_counter()
+        self._atoms_by_claim = [(a["filename"], a["claim"]) for a in vault_atoms]
+        mod = None
+        for pkg in ("zep_cloud", "zep_python"):
+            try:
+                mod = importlib.import_module(pkg)
+                break
+            except ImportError:
+                continue
+        if mod is None:
+            raise RuntimeError("Zep client module unavailable.")
+        client_cls = getattr(mod, "Zep", None) or getattr(mod, "ZepClient", None)
+        if client_cls is None:
+            raise RuntimeError("Zep module missing Zep/ZepClient class.")
+        api_key = (os.environ.get("ZEP_API_KEY") or "").strip() or None
+        api_url = (os.environ.get("ZEP_API_URL") or "").strip() or None
+        self._client = client_cls(api_key=api_key, base_url=api_url) if api_url else client_cls(api_key=api_key)
+        self._session_id = f"sb_bench_{int(time.time())}"
+        if hasattr(self._client, "index_vault"):
+            self._client.index_vault(vault_atoms, session_id=self._session_id)
+        elif hasattr(self._client, "memory") and hasattr(self._client.memory, "add"):
+            msg_cls = getattr(mod, "Message", dict)
+            msgs = [
+                msg_cls(role="user", role_type="user", content=f"[ATOM:{a['filename']}] {a['claim']}")
+                for a in vault_atoms
+            ]
+            self._client.memory.add(self._session_id, messages=msgs)
+        return round((time.perf_counter() - t0) * 1000.0, 2)
+
+    def search(self, query: str, *, project_scope: str = "", top_k: int = TOP_K) -> list[str]:
+        if self._client is None:
+            return []
+        if hasattr(self._client, "search_session"):
+            hits = self._client.search_session(self._session_id, query=query, limit=top_k)
+        elif hasattr(self._client, "memory") and hasattr(self._client.memory, "search_sessions"):
+            hits = self._client.memory.search_sessions(session_ids=[self._session_id], text=query, limit=top_k)
+            hits = getattr(hits, "results", hits)
+        else:
+            return []
+        ranked: list[str] = []
+        for h in hits or []:
+            content = (
+                h.get("content") or h.get("fact") or ""
+                if isinstance(h, dict)
+                else f"{getattr(h, 'fact', '')} {getattr(getattr(h, 'message', None), 'content', '')}"
+            )
+            fname = _map_text_to_filename(content, self._atoms_by_claim)
+            if fname and fname not in ranked:
+                ranked.append(fname)
+        return ranked[:top_k]
+
+
+def default_optional_adapters() -> list[_ExternalMemoryAdapter]:
+    return [BasicMemoryLiveAdapter(), GraphitiKuzuLiveAdapter(), ZepLiveAdapter()]
+
+
+def build_ephemeral_uv_benchmark_command(
+    *,
+    dataset_path: Path = DEFAULT_DATASET_PATH,
+    output_path: Path | None = None,
+    include_mem0: bool = True,
+    include_basic_memory: bool = True,
+    include_graphiti_kuzu: bool = True,
+    include_zep: bool = False,
+) -> list[str]:
+    """Build an isolated `uv run --with ...` invocation without mutating pyproject.toml or uv.lock."""
+    cmd = ["uv", "run"]
+    for pkg in ("rank-bm25", "faiss-cpu"):
+        cmd.extend(["--with", pkg])
+    if include_mem0:
+        cmd.extend(["--with", "mem0ai"])
+    if include_basic_memory:
+        cmd.extend(["--with", "basic-memory"])
+    if include_graphiti_kuzu:
+        cmd.extend(["--with", "graphiti-core", "--with", "kuzu"])
+    if include_zep:
+        cmd.extend(["--with", "zep-cloud"])
+    cmd.extend(["python", str(Path(__file__).resolve()), "--dataset", str(dataset_path)])
+    if output_path is not None:
+        cmd.extend(["--output", str(output_path)])
+    return cmd
+
+
 def run_live_third_party_benchmark(
     *,
     dataset_path: Path = DEFAULT_DATASET_PATH,
-    atoms_dir: Path = Path(ATOMS_DIR),
+    atoms_dir: Path | None = None,
+    mem0_infer: bool = True,
+    optional_adapters: list[_ExternalMemoryAdapter] | None = None,
+    include_optional_adapters: bool = True,
 ) -> dict[str, Any]:
     import chromadb
     import faiss
@@ -184,17 +571,23 @@ def run_live_third_party_benchmark(
     import numpy as np
     from rank_bm25 import BM25Okapi
 
+    resolved_brain_str, resolved_atoms_str = resolve_module_atoms_and_brain(globals(), atoms_dir=atoms_dir)
+    resolved_atoms_dir = Path(resolved_atoms_str)
+    resolved_brain_for_live = resolved_brain_str if atoms_dir is not None else None
+    resolved_chroma_path = resolve_module_vault_path(globals(), "CHROMA_PATH", brain_dir=resolved_brain_for_live)
+    resolved_lexical_path = resolve_module_vault_path(globals(), "LEXICAL_INDEX_PATH", brain_dir=resolved_brain_for_live)
+
     hw = detect_hardware_profile()
     active_llm = resolve_active_local_generation_model(fallback=GEN_MODEL)
     base_url = ollama_utils.ollama_base_url()
 
     corpus = load_dataset(
         dataset_path,
-        atoms_dir=str(atoms_dir),
-        approval_check=lambda path: approved_revision_is_current(str(path), atoms_dir=str(atoms_dir)),
+        atoms_dir=str(resolved_atoms_dir),
+        approval_check=lambda path: approved_revision_is_current(str(path), atoms_dir=str(resolved_atoms_dir)),
     )
     dataset_sha256 = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
-    vault_atoms, unapproved_set = _load_vault_atoms(atoms_dir)
+    vault_atoms, unapproved_set = _load_vault_atoms(resolved_atoms_dir)
 
     # Embed all 78 vault files once via live Ollama nomic-embed-text (768d) for fair dense index setup
     t_embed0 = time.perf_counter()
@@ -280,22 +673,71 @@ def run_live_third_party_benchmark(
         }
         mem0_engine = Memory.from_config(mem0_cfg)
         for item in vault_atoms:
-            mem0_engine.add(
-                item["claim"],
-                user_id="owner",
-                metadata={
-                    "filename": item["filename"],
-                    "contexts": ",".join(item["project_tags"]),
-                    "review_status": item["review_status"],
-                },
-                infer=False,
-            )
+            primary_project = item["project_tags"][0] if item["project_tags"] else ""
+            mem0_meta = {
+                "filename": item["filename"],
+                "contexts": ",".join(item["project_tags"]),
+                "project": primary_project,
+                "review_status": item["review_status"],
+            }
+            try:
+                mem0_engine.add(
+                    item["claim"],
+                    user_id="owner",
+                    metadata=mem0_meta,
+                    infer=bool(mem0_infer),
+                )
+            except (ValueError, KeyError, TypeError):
+                # Some minimal/short facts yield empty structured JSON under LLM infer=True
+                if mem0_infer:
+                    mem0_engine.add(
+                        item["claim"],
+                        user_id="owner",
+                        metadata=mem0_meta,
+                        infer=False,
+                    )
+                else:
+                    raise
         mem0_setup_ms = round((time.perf_counter() - t_mem0_setup) * 1000.0, 2)
 
         # Keep Second Brain's live Chroma collection open during the run
-        sb_live_col = get_vector_collection(CHROMA_PATH, name="atoms", create=False)
+        sb_live_col = get_vector_collection(resolved_chroma_path, name="atoms", create=False)
         import recall as _recall_mod
         from unittest.mock import patch
+
+        active_optional_adapters: list[_ExternalMemoryAdapter] = []
+        skipped_systems: dict[str, dict[str, Any]] = {}
+        optional_setup_timings: dict[str, float] = {}
+        candidate_adapters = (
+            list(optional_adapters)
+            if optional_adapters is not None
+            else (default_optional_adapters() if include_optional_adapters else [])
+        )
+        for adapter in candidate_adapters:
+            avail_ok, avail_reason = adapter.check_available()
+            if not avail_ok:
+                skipped_systems[adapter.name] = {
+                    "status": "skipped_unavailable",
+                    "packages": list(adapter.packages),
+                    "reason": avail_reason,
+                }
+                continue
+            try:
+                setup_ms = adapter.setup(
+                    vault_atoms,
+                    tmp_path,
+                    active_llm=active_llm,
+                    base_url=base_url,
+                    embed_dim=embed_dim,
+                )
+                active_optional_adapters.append(adapter)
+                optional_setup_timings[f"{adapter.name}_setup_ms"] = setup_ms
+            except Exception as exc:
+                skipped_systems[adapter.name] = {
+                    "status": "skipped_unavailable",
+                    "packages": list(adapter.packages),
+                    "reason": f"Adapter initialization failed: {exc}",
+                }
 
         system_names = (
             "second_brain_verified",
@@ -305,6 +747,7 @@ def run_live_third_party_benchmark(
             "chromadb_hnsw_live",
             "rank_bm25_okapi_live",
             "sqlite_fts5_untrusted_live",
+            *[a.name for a in active_optional_adapters],
         )
         metrics_acc: dict[str, dict[str, Any]] = {
             s: {
@@ -391,12 +834,15 @@ def run_live_third_party_benchmark(
                             retrieval_mode="auto",
                             projects=proj_tuple,
                         ),
+                        atoms_dir=str(resolved_atoms_dir),
+                        index_path=resolved_lexical_path,
+                        chroma_path=resolved_chroma_path,
                     )
                     sb_lex_ms = (time.perf_counter() - t0) * 1000.0
                     sb_lex_trusted = [h.filename for h in (list(sb_lex_direct) + list(sb_lex_neighbors))[:TOP_K]]
                     if ans_type in ("preference", "exploratory"):
                         raw_lex = search_lexical_index(
-                            q_text, LEXICAL_INDEX_PATH, n_results=TOP_K, atoms_dir=str(atoms_dir)
+                            q_text, resolved_lexical_path, n_results=TOP_K, atoms_dir=str(resolved_atoms_dir)
                         )
                         sb_lex_cand = [h.filename for h in raw_lex[:TOP_K]]
                     else:
@@ -419,6 +865,9 @@ def run_live_third_party_benchmark(
                             retrieval_mode="rrf",
                             projects=proj_tuple,
                         ),
+                        atoms_dir=str(resolved_atoms_dir),
+                        index_path=resolved_lexical_path,
+                        chroma_path=resolved_chroma_path,
                     )
                     sb_rrf_ms = (time.perf_counter() - t0) * 1000.0
                     sb_rrf_trusted = [h.filename for h in (list(sb_rrf_direct) + list(sb_rrf_neighbors))[:TOP_K]]
@@ -431,6 +880,9 @@ def run_live_third_party_benchmark(
                                 allow_unreviewed_exploratory=True,
                                 projects=proj_tuple,
                             ),
+                            atoms_dir=str(resolved_atoms_dir),
+                            index_path=resolved_lexical_path,
+                            chroma_path=resolved_chroma_path,
                         )
                         sb_rrf_cand = [h.filename for h in exp_rrf[:TOP_K]]
                     else:
@@ -443,9 +895,12 @@ def run_live_third_party_benchmark(
                         latency_ms=sb_rrf_ms,
                     )
 
-                    # 3. Live Mem0 v2.x (mem0ai Memory.search with Ollama 768d + Chroma)
+                    # 3. Live Mem0 v2.x (mem0ai Memory.search with Ollama 768d + Chroma + project scope filter)
                     t0 = time.perf_counter()
-                    m0_res = mem0_engine.search(q_text, filters={"user_id": "owner"}, limit=TOP_K)
+                    m0_filters: dict[str, Any] = {"user_id": "owner"}
+                    if proj_tuple:
+                        m0_filters["project"] = proj_tuple[0]
+                    m0_res = mem0_engine.search(q_text, filters=m0_filters, limit=TOP_K)
                     m0_ms = (time.perf_counter() - t0) * 1000.0
                     m0_items = m0_res.get("results", []) if isinstance(m0_res, dict) else []
                     m0_ranked = [
@@ -551,7 +1006,23 @@ def run_live_third_party_benchmark(
                         case=case,
                         latency_ms=fts_ms,
                     )
+
+                    # 8..10. Optional isolated adapters (basic_memory_live, graphiti_kuzu_live, zep_live)
+                    scope_str = proj_tuple[0] if proj_tuple else ""
+                    for adapter in active_optional_adapters:
+                        t0 = time.perf_counter()
+                        opt_ranked = adapter.search(q_text, project_scope=scope_str, top_k=TOP_K)
+                        opt_ms = (time.perf_counter() - t0) * 1000.0
+                        _score_query_run(
+                            adapter.name,
+                            trusted_ranked=opt_ranked,
+                            candidate_ranked=opt_ranked,
+                            case=case,
+                            latency_ms=opt_ms,
+                        )
         finally:
+            for adapter in active_optional_adapters:
+                adapter.close()
             fts_conn.close()
             _close_chroma_client(chroma_client)
             m0_vs = getattr(mem0_engine, "vector_store", None)
@@ -605,9 +1076,11 @@ def run_live_third_party_benchmark(
         "setup_timing_ms": {
             "vault_78_atom_ollama_embed_ms": vault_embed_setup_ms,
             "mem0_live_index_setup_ms": mem0_setup_ms,
+            **optional_setup_timings,
         },
         "hardware_profile": asdict(hw),
         "systems": systems_summary,
+        "skipped_systems": skipped_systems,
     }
 
 
@@ -623,10 +1096,37 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional path to write full JSON benchmark results.",
     )
+    parser.add_argument(
+        "--mem0-no-infer",
+        action="store_true",
+        help="Bypass Mem0 LLM extraction (`infer=False`) instead of fair default `infer=True`.",
+    )
+    parser.add_argument(
+        "--skip-optional",
+        action="store_true",
+        help="Skip probing optional Basic Memory / Graphiti+Kuzu / Zep adapters.",
+    )
+    parser.add_argument(
+        "--print-ephemeral-command",
+        action="store_true",
+        help="Print the isolated `uv run --with ...` invocation covering all optional adapters and exit.",
+    )
     parser.add_argument("--json", action="store_true", help="Print full JSON payload to stdout.")
     args = parser.parse_args(argv)
 
-    result = run_live_third_party_benchmark(dataset_path=Path(args.dataset))
+    if args.print_ephemeral_command:
+        cmd = build_ephemeral_uv_benchmark_command(
+            dataset_path=Path(args.dataset),
+            output_path=Path(args.output) if args.output else None,
+        )
+        print(" ".join(cmd))
+        return 0
+
+    result = run_live_third_party_benchmark(
+        dataset_path=Path(args.dataset),
+        mem0_infer=not bool(args.mem0_no_infer),
+        include_optional_adapters=not bool(args.skip_optional),
+    )
     if args.output:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -650,6 +1150,8 @@ def main(argv: list[str] | None = None) -> int:
             f"cross_leak={m['cross_project_leak_pct']:5.1f}% "
             f"p50={m['latency_p50_ms']:6.2f}ms p95={m['latency_p95_ms']:6.2f}ms"
         )
+    for skipped_name, info in (result.get("skipped_systems") or {}).items():
+        print(f"  {skipped_name:28s} [SKIPPED: {info.get('reason')}]")
     return 0
 
 

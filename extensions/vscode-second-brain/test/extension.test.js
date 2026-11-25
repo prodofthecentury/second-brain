@@ -401,6 +401,12 @@ function createVsCodeMock() {
     },
 
     env: {
+      clipboard: {
+        async writeText(val) {
+          state.clipboardWrites = state.clipboardWrites || [];
+          state.clipboardWrites.push(String(val ?? ""));
+        },
+      },
       async openExternal(uri) {
         state.openedExternalUris.push(uri.toString());
         return true;
@@ -436,9 +442,10 @@ class MiniTextNode {
 }
 
 class MiniElement {
-  constructor(tagName, ownerDoc) {
+  constructor(tagName, ownerDoc, namespaceURI = "") {
     this.nodeType = 1;
     this.tagName = String(tagName || "div").toUpperCase();
+    this.namespaceURI = namespaceURI;
     this.ownerDocument = ownerDoc;
     this.id = "";
     this.className = "";
@@ -448,10 +455,21 @@ class MiniElement {
     this.checked = false;
     this.disabled = false;
     this.style = {};
+    this.attributes = Object.create(null);
     this.dataset = Object.create(null);
     this.children = [];
     this._listeners = Object.create(null);
     this._rawText = "";
+  }
+
+  setAttribute(k, v) {
+    this.attributes[String(k)] = String(v);
+  }
+
+  getAttribute(k) {
+    return Object.prototype.hasOwnProperty.call(this.attributes, String(k))
+      ? this.attributes[String(k)]
+      : null;
   }
 
   get textContent() {
@@ -531,6 +549,9 @@ function mountWebviewVm(panel) {
   const doc = {
     createElement(tag) {
       return new MiniElement(tag, doc);
+    },
+    createElementNS(ns, tag) {
+      return new MiniElement(tag, doc, ns);
     },
     createTextNode(txt) {
       return new MiniTextNode(txt);
@@ -1247,6 +1268,332 @@ async function createLoopbackFixture() {
         });
       }
 
+      // ── Stage 4 Executable Skills & Mobile Vault Client ──
+      if (pathname === "/v1/skills" && req.method === "GET") {
+        const list = (vault.promotedSkills || []).map((sk) => ({
+          skill_id: sk.skill_id,
+          playbook_id: sk.playbook_id,
+          title: sk.title || sk.skill_id,
+          valid: true,
+          status: sk.status || "active",
+          sha256: sk.sha256 || sha256Hex(`skill:${sk.skill_id}`),
+          input_schema: sk.input_schema || {},
+        }));
+        return sendJson(res, 200, {
+          count: list.length,
+          kill_switch: vault.killSwitch || { global_engaged: false, killed_skills: {} },
+          skills: list,
+        });
+      }
+
+      if (pathname === "/v1/skills/candidates" && req.method === "GET") {
+        if (!requireOwner(req, res)) return;
+        return sendJson(res, 200, {
+          count: 1,
+          candidates: [
+            {
+              playbook_id: "multi-step-release",
+              title: "Multi-Step Release Audit",
+              playbook_sha256: sha256Hex("multi-step-release-v1"),
+              steps: [
+                "Check source byte-offset anchors.",
+                "Verify Merkle vault ledger integrity.",
+                "Audit candidate review backlog.",
+              ],
+            },
+          ],
+        });
+      }
+
+      if (pathname === "/v1/skills/promote" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        const actions = Array.isArray(body?.step_actions) ? body.step_actions : [];
+        if (actions.length !== 3) {
+          return sendJson(res, 422, {
+            error: `Expected 3 step_actions matching playbook.steps, got ${actions.length}.`,
+          });
+        }
+        const skSha = sha256Hex(`skill:${body.skill_id}:${actions.length}`);
+        vault.promotedSkills = vault.promotedSkills || [];
+        vault.promotedSkills.push({
+          ...body,
+          sha256: skSha,
+          status: "active",
+        });
+        return sendJson(res, 201, {
+          skill_id: body.skill_id,
+          playbook_id: body.playbook_id,
+          step_actions: actions,
+          input_schema: body.input_schema || {},
+          sha256: skSha,
+        });
+      }
+
+      if (pathname.startsWith("/v1/skills/") && req.method === "POST" && pathname !== "/v1/skills/kill-switch") {
+        if (!requireOwner(req, res)) return;
+        const parts = pathname.slice("/v1/skills/".length).split("/").filter(Boolean);
+        if (parts.length === 2) {
+          const skId = decodeURIComponent(parts[0]);
+          const skAction = parts[1];
+          const found = (vault.promotedSkills || []).find((s) => s.skill_id === skId);
+          if (!found) return sendJson(res, 404, { error: "Skill not found" });
+          if (skAction === "execute") {
+            return sendJson(res, 200, {
+              skill_id: skId,
+              status: body?.dry_run ? "dry_run_passed" : "completed",
+              dry_run: Boolean(body?.dry_run),
+              inputs: body?.inputs || {},
+              execution_sha256: sha256Hex(`exec:${skId}`),
+            });
+          }
+          if (skAction === "revoke") {
+            if (body?.expected_skill_sha256 !== found.sha256) {
+              return sendJson(res, 409, { error: "Skill SHA-256 mismatch" });
+            }
+            found.status = "revoked";
+            return sendJson(res, 200, {
+              skill_id: skId,
+              status: "revoked",
+              revoked_by: body?.actor,
+              reason: body?.reason,
+            });
+          }
+        }
+      }
+
+      if (pathname === "/v1/skills/kill-switch" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        const ks = vault.killSwitch || { global_engaged: false, killed_skills: {} };
+        const scope = String(body?.scope || "global");
+        if (scope === "global") {
+          ks.global_engaged = Boolean(body?.engaged);
+        } else {
+          ks.killed_skills = { ...(ks.killed_skills || {}), [scope]: Boolean(body?.engaged) };
+        }
+        vault.killSwitch = ks;
+        return sendJson(res, 200, {
+          engaged: Boolean(body?.engaged),
+          scope,
+        });
+      }
+
+      if (pathname === "/v1/mobile/pair" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        const frag = "#vaultpair=eyJ2IjoxLCJ2YXVsdF9pZCI6IjExMTExMTExIn0";
+        vault.mobilePairings = vault.mobilePairings || [];
+        const rec = {
+          pairing_id: `mvc-test-${String(vault.mobilePairings.length + 1).padStart(3, "0")}`,
+          label: body?.label || "VS Code Mobile",
+          revoked: false,
+          created_at: "2026-11-23T00:00:00Z",
+        };
+        vault.mobilePairings.push(rec);
+        return sendJson(res, 201, {
+          ...rec,
+          pairing_fragment: frag,
+          pwa_pairing_url: `https://localhost/vault-client/${frag}`,
+        });
+      }
+
+      if (pathname === "/v1/mobile/status" && req.method === "GET") {
+        if (!requireOwner(req, res)) return;
+        return sendJson(res, 200, { pairings: vault.mobilePairings || [] });
+      }
+
+      if (pathname === "/v1/mobile/revoke" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        const p = (vault.mobilePairings || []).find((x) => x.pairing_id === body?.pairing_id);
+        if (!p) return sendJson(res, 404, { error: "Pairing not found" });
+        p.revoked = true;
+        return sendJson(res, 200, { pairing_id: p.pairing_id, revoked: true });
+      }
+
+      // ── Mobile Inbox Drop Recall & Pairing ──
+      if (pathname === "/v1/sync/inbox-drop/pair" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        const incRec = Boolean(body?.include_recall);
+        return sendJson(res, 201, {
+          token_id: "drop-tok-001",
+          device_label: body?.device_label || "Mobile Quick-Capture",
+          include_recall: incRec,
+          pairing_fragment: "#pair=testpair",
+          pwa_pairing_url: "https://localhost/inbox-drop/#pair=testpair",
+        });
+      }
+
+      if (pathname === "/v1/sync/inbox-drop/export-recall" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        return sendJson(res, 200, {
+          atom_count: 5,
+          object_key: "mobile-recall/index.enc",
+        });
+      }
+
+      if (pathname === "/v1/sync/inbox-drop/rotate-recall" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        return sendJson(res, 200, {
+          vault_id: "vault-001",
+          recall_key_id: "sbmr1-rot-2",
+        });
+      }
+
+      // ── Bulk Import ──
+      if (pathname === "/v1/import" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        return sendJson(res, 200, { imported: 3, skipped: 1 });
+      }
+      if (pathname === "/v1/import/file" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        return sendJson(res, 201, { destination: "0-raw/inbox/imported-note.md", filename: "imported-note.md" });
+      }
+
+      // ── Web Scout & Operator Jobs ──
+      if (pathname === "/v1/scout/queue" && req.method === "GET") {
+        if (!requireOwner(req, res)) return;
+        const items = vault.scoutItems || [{ url: "https://example.com/feed.xml", status: "queued", kind: "feed" }];
+        return sendJson(res, 200, { total: items.length, count: items.length, items });
+      }
+      if (pathname === "/v1/scout/queue" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        vault.scoutItems = vault.scoutItems || [];
+        const entry = { url: body?.url, status: "queued", kind: body?.is_feed ? "feed" : "url" };
+        vault.scoutItems.push(entry);
+        return sendJson(res, 201, entry);
+      }
+      if (pathname === "/v1/scout/run" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        return sendJson(res, 202, { job_id: "job-scout-1", kind: "scout", status: "running" });
+      }
+      if (pathname.startsWith("/v1/jobs/") && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        const kind = pathname.split("/").pop();
+        return sendJson(res, 202, { job_id: `job-${kind}-1`, kind, status: "running" });
+      }
+      if (pathname.startsWith("/v1/jobs/") && req.method === "GET") {
+        if (!requireOwner(req, res)) return;
+        const jid = decodeURIComponent(pathname.slice("/v1/jobs/".length));
+        return sendJson(res, 200, { job_id: jid, kind: "refinery", status: "completed", returncode: 0 });
+      }
+
+      // ── Bi-Temporal Knowledge Graph ──
+      if (pathname === "/v1/graph/full" && req.method === "GET") {
+        const asOf = urlObj.searchParams.get("as_of") || "";
+        const incExp = (urlObj.searchParams.get("include_expired") || "1") === "1";
+        const allNodes = [
+          {
+            id: "atom-alpha.md",
+            filename: "atom-alpha.md",
+            label: "Loopback API binds strictly to 127.0.0.1.",
+            claim: "Loopback API binds strictly to 127.0.0.1.",
+            review_status: "accepted",
+            verified: true,
+            valid_from: "2025-01-01",
+            valid_until: "",
+            temporal_status: "active",
+            memory_type: "semantic",
+            contexts: ["project:core"],
+          },
+          {
+            id: "atom-legacy-2024.md",
+            filename: "atom-legacy-2024.md",
+            label: "Legacy v0 rule (expired 2024).",
+            claim: "Legacy v0 rule.",
+            review_status: "accepted",
+            verified: true,
+            valid_from: "2024-01-01",
+            valid_until: "2024-12-31",
+            temporal_status: asOf && asOf <= "2024-12-31" ? "active" : "expired",
+            memory_type: "semantic",
+            contexts: ["project:core"],
+          },
+        ];
+        const nodes = incExp ? allNodes : allNodes.filter((n) => n.temporal_status === "active");
+        return sendJson(res, 200, {
+          nodes,
+          edges: nodes.length > 1 ? [{ from: "atom-legacy-2024.md", to: "atom-alpha.md", kind: "supersedes" }] : [],
+          timeline_dates: ["2024-01-01", "2024-12-31", "2025-01-01", "2026-11-23"],
+          as_of: asOf || null,
+          include_expired: incExp,
+          active_temporal_count: nodes.filter((n) => n.temporal_status === "active").length,
+          expired_temporal_count: nodes.filter((n) => n.temporal_status === "expired").length,
+          future_temporal_count: 0,
+        });
+      }
+      if (pathname === "/v1/graph/auto-link" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        return sendJson(res, 200, { links_added: 1, status: "ok" });
+      }
+
+      // ── Multi-Vault Workspaces & Host Sharing Policies ──
+      if (pathname === "/v1/vaults" && req.method === "GET") {
+        if (!requireOwner(req, res)) return;
+        const list = vault.workspaces || [
+          {
+            vault_id: "default",
+            label: "Default Vault",
+            path: "/vault/default",
+            default_host_policy: "local_only",
+            federated_searchable: true,
+          },
+        ];
+        return sendJson(res, 200, { active_vault_id: vault.activeVaultId || "default", vaults: list });
+      }
+      if (pathname === "/v1/vaults" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        vault.workspaces = vault.workspaces || [
+          { vault_id: "default", label: "Default Vault", path: "/vault/default", default_host_policy: "local_only", federated_searchable: true },
+        ];
+        const created = {
+          vault_id: body?.vault_id || "ws-research",
+          label: body?.label,
+          path: body?.path,
+          default_host_policy: body?.default_host_policy || "local_only",
+          federated_searchable: Boolean(body?.federated_searchable),
+        };
+        vault.workspaces.push(created);
+        if (body?.activate) vault.activeVaultId = created.vault_id;
+        return sendJson(res, 201, created);
+      }
+      if (pathname === "/v1/vaults/switch" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        vault.activeVaultId = body?.vault_id;
+        return sendJson(res, 200, { status: "switched", active_vault_id: vault.activeVaultId });
+      }
+      if (pathname === "/v1/vaults/federated-recall" && req.method === "POST") {
+        if (!requireOwner(req, res)) return;
+        return sendJson(res, 200, {
+          query: body?.query,
+          results: [{ vault_id: "ws-research", vault_label: "Research", filename: "atom-alpha.md", claim: "Loopback API binds strictly to 127.0.0.1." }],
+        });
+      }
+      if (pathname.startsWith("/v1/vaults/") && (req.method === "PATCH" || req.method === "DELETE")) {
+        if (!requireOwner(req, res)) return;
+        const vid = decodeURIComponent(pathname.slice("/v1/vaults/".length));
+        if (req.method === "PATCH") {
+          const item = (vault.workspaces || []).find((w) => w.vault_id === vid);
+          if (!item) return sendJson(res, 404, { error: "Workspace missing" });
+          if (body?.federated_searchable !== undefined) item.federated_searchable = Boolean(body.federated_searchable);
+          if (body?.default_host_policy !== undefined) item.default_host_policy = body.default_host_policy;
+          return sendJson(res, 200, item);
+        }
+        vault.workspaces = (vault.workspaces || []).filter((w) => w.vault_id !== vid);
+        return sendJson(res, 200, { status: "removed", vault_id: vid });
+      }
+      if (pathname === "/v1/hosts" && req.method === "GET") {
+        if (!requireOwner(req, res)) return;
+        vault.hosts = vault.hosts || {
+          ollama_local: { enabled: true, transport: "local", default_model: "qwen2.5-coder:7b", allowed_projects: ["project:core"], allow_unscoped_atoms: true, allow_preference_atoms: false, redact_pii: true },
+        };
+        return sendJson(res, 200, vault.hosts);
+      }
+      if (pathname.startsWith("/v1/hosts/") && req.method === "PUT") {
+        if (!requireOwner(req, res)) return;
+        const hid = decodeURIComponent(pathname.slice("/v1/hosts/".length));
+        vault.hosts = vault.hosts || { ollama_local: { enabled: true, allowed_projects: [] } };
+        vault.hosts[hid] = { ...(vault.hosts[hid] || {}), ...(body || {}) };
+        return sendJson(res, 200, vault.hosts[hid]);
+      }
+
       sendJson(res, 404, { error: `Unhandled route: ${req.method} ${pathname}` });
     });
   });
@@ -1371,7 +1718,13 @@ test("1. Port auto-discovery: live PID used, dead PID falls back to 8765, explic
     delete vscodeMock._state.configGlobalValues.apiPort;
     const ctx = activateExtensionFresh();
     try {
-      await new Promise((r) => setTimeout(r, 40));
+      const deadline = Date.now() + 2000;
+      while (
+        Date.now() < deadline &&
+        vscodeMock._state.statusBarItems[0]?.text === "$(pulse) Second Brain: checking..."
+      ) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
       assert.equal(vscodeMock._state.statusBarItems[0].text, "$(pulse) Second Brain (1)");
     } finally {
       ctx.disposeAll();
@@ -2059,6 +2412,259 @@ test("8. Security file bounds (<= 4096 bytes), EPERM PID liveness, 409 Reload Re
     delete process.env.BRAIN_SECURITY_STATE_DIR;
     await fx1.close();
     await fx2.close();
+  }
+});
+
+test("9. Bugfix 1A regressions: Kill-Switch cancel never disarms, Mobile Vault pair copies #vaultpair= URI, and multi-step Skill promote builds N actions", async () => {
+  const fx = await createLoopbackFixture();
+  fx.vault.killSwitch = { global_engaged: true, killed_skills: {} };
+  process.env.BRAIN_SECURITY_STATE_DIR = fx.tempSecDir;
+  const ctx = activateExtensionFresh();
+
+  try {
+    // (a) Defect #3: Cancelling the Kill-Switch QuickPick (Escape -> undefined) MUST NOT POST { engaged: false }
+    vscodeMock._state.quickPickQueue.push(
+      { label: "kill_switch" },
+      { label: "global" },
+      undefined // user pressed Escape on ["engage", "release"]
+    );
+    await vscodeMock.commands.executeCommand("secondBrain.manageExecutableSkills");
+    assert.equal(
+      fx.vault.requests.some((r) => r.pathname === "/v1/skills/kill-switch"),
+      false,
+      "Cancelling Kill-Switch QuickPick must never POST /v1/skills/kill-switch"
+    );
+    assert.equal(
+      fx.vault.killSwitch.global_engaged,
+      true,
+      "Active emergency kill-switch must remain engaged after user cancels prompt"
+    );
+
+    // (b) Defect #9: Mobile Vault Client pair copies #vaultpair= URI and offers Show/Copy actions
+    vscodeMock._state.clipboardWrites = [];
+    vscodeMock._state.quickPickQueue.push({ label: "pair" });
+    vscodeMock._state.inputQueue.push("Test Pixel 9");
+    vscodeMock._state.infoQueue.push("Show Pairing URI");
+    const docsBefore = vscodeMock._state.openedMarkdownDocs.length;
+    await vscodeMock.commands.executeCommand("secondBrain.mobileVaultClient");
+    assert.ok(
+      vscodeMock._state.clipboardWrites.some((c) => c.includes("#vaultpair=")),
+      "Pairing URI (#vaultpair=...) must be copied to clipboard"
+    );
+    assert.ok(
+      vscodeMock._state.openedMarkdownDocs.length > docsBefore,
+      "Selecting 'Show Pairing URI' must open a Markdown document containing the URI"
+    );
+    const lastDoc =
+      vscodeMock._state.openedMarkdownDocs[vscodeMock._state.openedMarkdownDocs.length - 1];
+    assert.ok(
+      String(typeof lastDoc?.getText === "function" ? lastDoc.getText() : lastDoc?.content || "").includes("#vaultpair="),
+      "Opened pairing preview document must display the #vaultpair= URI"
+    );
+
+    // (c) Defect #10: Multi-step playbook promotion (3 steps) generates 3 matching step_actions (auto & interactive)
+    vscodeMock._state.quickPickQueue.push(
+      { label: "promote" },
+      (items) => items[0], // select multi-step-release (3 steps)
+      { label: "auto" }
+    );
+    vscodeMock._state.inputQueue.push("skill-release-auto", "");
+    await vscodeMock.commands.executeCommand("secondBrain.manageExecutableSkills");
+    assert.equal(fx.vault.promotedSkills.length, 1);
+    assert.equal(fx.vault.promotedSkills[0].skill_id, "skill-release-auto");
+    assert.equal(fx.vault.promotedSkills[0].step_actions.length, 3);
+
+    // Also test interactive step-by-step mode across all 3 steps
+    vscodeMock._state.quickPickQueue.push(
+      { label: "promote" },
+      (items) => items[0], // multi-step-release (3 steps)
+      { label: "interactive" },
+      // Step 1: vault_audit -> sources
+      { label: "vault_audit" },
+      "sources",
+      // Step 2: vault_audit -> ledger
+      { label: "vault_audit" },
+      "ledger",
+      // Step 3: vault_audit -> contradictions
+      { label: "vault_audit" },
+      "contradictions"
+    );
+    vscodeMock._state.inputQueue.push("skill-release-interactive", "");
+    await vscodeMock.commands.executeCommand("secondBrain.manageExecutableSkills");
+    assert.equal(fx.vault.promotedSkills.length, 2);
+    assert.equal(fx.vault.promotedSkills[1].skill_id, "skill-release-interactive");
+    assert.equal(fx.vault.promotedSkills[1].step_actions.length, 3);
+    assert.deepEqual(
+      fx.vault.promotedSkills[1].step_actions.map((a) => a.audit_kind),
+      ["sources", "ledger", "contradictions"]
+    );
+  } finally {
+    ctx.disposeAll();
+    delete process.env.BRAIN_SECURITY_STATE_DIR;
+    await fx.close();
+  }
+});
+
+test("10. 1C Parity: Inbox Drop Recall, Skill input_schema & revoke, Mobile Vault revoke, Bulk Import, Scout, Jobs, Bi-Temporal Graph Webview, Workspaces, and Host Policies", async () => {
+  const fx = await createLoopbackFixture();
+  process.env.BRAIN_SECURITY_STATE_DIR = fx.tempSecDir;
+  const ctx = activateExtensionFresh();
+
+  try {
+    // 1. Mobile Inbox Drop include_recall + export_recall + rotate_recall
+    vscodeMock._state.clipboardWrites = [];
+    const pairDropRes = await vscodeMock.commands.executeCommand("secondBrain.mobileInboxDrop", {
+      action: "pair",
+      device_label: "Field iPhone",
+      pwa_base_url: "https://localhost/inbox-drop/",
+      include_recall: true,
+    });
+    assert.equal(pairDropRes.include_recall, true);
+    const expDropRes = await vscodeMock.commands.executeCommand("secondBrain.mobileInboxDrop", {
+      action: "export_recall",
+    });
+    assert.equal(expDropRes.atom_count, 5);
+    const rotDropRes = await vscodeMock.commands.executeCommand("secondBrain.mobileInboxDrop", {
+      action: "rotate_recall",
+    });
+    assert.equal(rotDropRes.recall_key_id, "sbmr1-rot-2");
+
+    // 2. Stage 4 Executable Skills: promote with input_schema, execute with dynamic coerced inputs, per-skill kill-switch, CAS revoke
+    await vscodeMock.commands.executeCommand("secondBrain.manageExecutableSkills", {
+      action: "promote",
+      skill_id: "schema-skill",
+      playbook_id: "multi-step-release",
+      expected_playbook_sha256: sha256Hex("multi-step-release-v1"),
+      step_actions: [
+        { action_type: "vault_audit", audit_kind: "sources", output_file: "s1.json" },
+        { action_type: "vault_audit", audit_kind: "ledger", output_file: "s2.json" },
+        { action_type: "vault_audit", audit_kind: "contradictions", output_file: "s3.json" },
+      ],
+      input_schema: {
+        env: { type: "string", required: true },
+        retries: { type: "integer", required: true },
+        strict: { type: "boolean", required: false },
+      },
+    });
+    vscodeMock._state.inputQueue.push("prod", "3", "true");
+    const execRes = await vscodeMock.commands.executeCommand("secondBrain.manageExecutableSkills", {
+      action: "execute",
+      skill_id: "schema-skill",
+    });
+    assert.deepEqual(execRes.inputs, { env: "prod", retries: 3, strict: true });
+
+    await vscodeMock.commands.executeCommand("secondBrain.manageExecutableSkills", {
+      action: "kill_switch",
+      scope: "schema-skill",
+      engaged: true,
+    });
+    assert.equal(fx.vault.killSwitch.killed_skills["schema-skill"], true);
+
+    const revokeSkRes = await vscodeMock.commands.executeCommand("secondBrain.manageExecutableSkills", {
+      action: "revoke",
+      skill_id: "schema-skill",
+      reason: "Superseded",
+    });
+    assert.equal(revokeSkRes.status, "revoked");
+
+    // 3. Mobile Vault Client revoke
+    await vscodeMock.commands.executeCommand("secondBrain.mobileVaultClient", {
+      action: "pair",
+      label: "Spare Tablet",
+    });
+    const revMobile = await vscodeMock.commands.executeCommand("secondBrain.mobileVaultClient", {
+      action: "revoke",
+      pairing_id: "mvc-test-001",
+    });
+    assert.equal(revMobile.revoked, true);
+
+    // 4. Bulk Import (folder + single file)
+    const dirImp = await vscodeMock.commands.executeCommand("secondBrain.bulkImport", {
+      action: "folder",
+      source_dir: "/tmp/notes",
+      tags: "project:core, imported",
+    });
+    assert.equal(dirImp.imported, 3);
+    const fileImp = await vscodeMock.commands.executeCommand("secondBrain.bulkImport", {
+      action: "file",
+      path: "/tmp/notes/single.md",
+      tags: ["project:core"],
+    });
+    assert.equal(fileImp.filename, "imported-note.md");
+
+    // 5. Web Scout & Operator Jobs
+    await vscodeMock.commands.executeCommand("secondBrain.manageScout", {
+      action: "enqueue",
+      url: "https://example.com/rss",
+      is_feed: true,
+    });
+    const scoutRun = await vscodeMock.commands.executeCommand("secondBrain.manageScout", {
+      action: "run",
+    });
+    assert.equal(scoutRun.job_id, "job-scout-1");
+
+    const refJob = await vscodeMock.commands.executeCommand("secondBrain.runOperatorJob", {
+      kind: "refinery",
+    });
+    assert.equal(refJob.job_id, "job-refinery-1");
+    const jobStat = await vscodeMock.commands.executeCommand("secondBrain.runOperatorJob", {
+      kind: "status",
+      job_id: "job-refinery-1",
+    });
+    assert.equal(jobStat.status, "completed");
+
+    // 6. Interactive Knowledge Graph Webview w/ strict CSP + Bi-Temporal Scrubber
+    const graphOpen = await vscodeMock.commands.executeCommand("secondBrain.openKnowledgeGraph", {
+      include_expired: true,
+    });
+    assert.ok(graphOpen?.panel);
+    const gVm = mountWebviewVm(graphOpen.panel);
+    assert.ok(Buffer.from(gVm.scriptNonce, "base64").length === 16);
+    assert.ok(
+      gVm.doc.getElementById("graphSvg").findAll((el) => el.tagName === "CIRCLE").length >= 2,
+      "Expected SVG graph circles rendered via createElementNS"
+    );
+    gVm.doc.getElementById("asOfInput").value = "2024-06-15";
+    gVm.doc.getElementById("includeExpiredCheck").checked = false;
+    gVm.doc.getElementById("asOfInput").dispatchEvent("change");
+    await new Promise((r) => setTimeout(r, 30));
+    const reloadReq = fx.vault.requests.find(
+      (r) => r.pathname === "/v1/graph/full" && r.url.includes("as_of=2024-06-15")
+    );
+    assert.ok(reloadReq, "Changing Bi-Temporal As-Of scrubber must re-query /v1/graph/full with as_of");
+
+    // 7. Multi-Vault Workspaces & Federated Recall + Host Privacy Policies
+    const createdWs = await vscodeMock.commands.executeCommand("secondBrain.manageWorkspaces", {
+      action: "create",
+      label: "Research Vault",
+      path: "/tmp/ws-research",
+      default_host_policy: "ask",
+      federated_searchable: false,
+      activate: false,
+    });
+    assert.equal(createdWs.vault_id, "ws-research");
+    const patchedWs = await vscodeMock.commands.executeCommand("secondBrain.manageWorkspaces", {
+      action: "policy",
+      vault_id: "ws-research",
+      federated_searchable: true,
+    });
+    assert.equal(patchedWs.federated_searchable, true);
+    const fedRes = await vscodeMock.commands.executeCommand("secondBrain.manageWorkspaces", {
+      action: "federated_recall",
+      query: "loopback",
+    });
+    assert.equal(fedRes.results.length, 1);
+
+    const hostUpd = await vscodeMock.commands.executeCommand("secondBrain.manageHostPolicies", {
+      host_id: "ollama_local",
+      updates: { allowed_projects: ["project:core", "project:research"], allow_preference_atoms: true },
+    });
+    assert.deepEqual(hostUpd.allowed_projects, ["project:core", "project:research"]);
+    assert.equal(hostUpd.allow_preference_atoms, true);
+  } finally {
+    ctx.disposeAll();
+    delete process.env.BRAIN_SECURITY_STATE_DIR;
+    await fx.close();
   }
 });
 

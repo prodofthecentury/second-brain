@@ -1,0 +1,25 @@
+{
+  "second-brain-auto-recall": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "uv run --frozen python scripts/antigravity_hook.py --host antigravity --event SessionStart",
+        "timeout": 8
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "uv run --frozen python scripts/antigravity_hook.py --host antigravity --event PreInvocation",
+        "timeout": 8
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "uv run --frozen python scripts/antigravity_hook.py --host antigravity --event Stop",
+        "timeout": 8
+      }
+    ]
+  }
+}

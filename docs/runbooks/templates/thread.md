@@ -14,6 +14,8 @@ open-questions:
 
 # {Topic Title}
 
+> **Create-Only Synthesis Thread Contract:** Thread files in `3-threads/` (`YYYY-MM-DD-{topic-slug}.md`) are create-only so automated synthesis never overwrites existing threads or human edits.
+
 > **Thread summary** (1–2 sentences): What is this synthesis about, and
 > what is its current state of understanding?
 

@@ -43,9 +43,16 @@ __pycache__/
 tmp/
 tmp/pdfs/
 
-# Node dependencies and desktop/extension build artifacts
+# Node dependencies and desktop/extension/mobile build artifacts
 node_modules/
 desktop/node_modules/
+mobile/vault-client/node_modules/
+mobile/vault-client/android/.gradle/
+mobile/vault-client/android/build/
+mobile/vault-client/android/app/build/
+mobile/vault-client/android/local.properties
+mobile/vault-client/ios/App/Pods/
+mobile/vault-client/ios/DerivedData/
 dist/
 desktop/dist/
 release-artifacts/

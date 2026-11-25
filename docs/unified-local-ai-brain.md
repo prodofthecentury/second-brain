@@ -38,32 +38,31 @@ researching, deciding, and creating.
 
 ## Commands
 
-- Smoke test: `uv run scripts/smoke_test.py`
-- Health check: `uv run scripts/doctor.py`
-- Terminal chat: `uv run chat_with_memory.py`
-- Refinery batch: `uv run scripts/ollama_refinery.py`
-- Single-source refinery canary: `uv run scripts/ollama_refinery.py --file brain/0-raw/example.md --keep-source --skip-critic`
-- Editor shift: `uv run scripts/ollama_editor.py`
-- Web scout: `uv run scripts/ollama_scout.py`
-- Dashboard: `.\run_dashboard.ps1`
-- Watchdog daemon: `.\run_daemon.ps1`
-- Full night shift: `.\run_night_shift.ps1`
+- Health & gates: `uv run --locked second-brain doctor`, `uv run --locked second-brain gates status`
+- Unified test gate (`34` suites): `uv run --locked python scripts/test_all.py`
+- Smoke test: `uv run --locked python scripts/smoke_test.py`
+- Terminal chat & capture: `uv run --locked second-brain chat "<question>" --mode stream`, `uv run --locked second-brain capture "<note>"`
+- Refinery batch / single-source canary: `uv run --locked python scripts/ollama_refinery.py`, `uv run --locked python scripts/ollama_refinery.py --file brain/0-raw/example.md --keep-source --skip-critic`
+- Create-only thread synthesis: `uv run --locked python scripts/ollama_editor.py`
+- DNS-pinned Web scout: `uv run --locked python scripts/ollama_scout.py`
+- Local creative media: `uv run --locked second-brain media status`
+- Dashboard / Daemon / Loopback API: `.\run_dashboard.ps1`, `.\run_daemon.ps1`, `uv run --locked second-brain serve --port 8765`
 
 ## Project Structure
 
-- `brain/0-raw/`: raw captures and intake pointers.
-- `brain/0-raw/archive/`: processed raw captures, retained for audit.
-- `brain/sources/`: cleaned source documents from web or file ingestion.
-- `brain/1-desk/`: scratch workspace for intermediate processing.
-- `brain/2-atoms/`: typed atomic memories, one claim/event/procedure/system fact per file.
-- `brain/3-threads/`: synthesis documents linking related atoms.
+- `brain/0-raw/`: captures, quarantined `inbox/`, `note-snapshots/`, and durable `archive/` (processed captures, `decision-record.jsonl`, `vault-ledger.jsonl`, and `snapshots/*.json`).
+- `brain/sources/`: captured/extracted source artifacts and `generated/` CAS creative media assets.
+- `brain/1-desk/`: temporary working area.
+- `brain/2-atoms/`: canonical Markdown atoms and immutable `.history/` revisions.
+- `brain/3-threads/`: create-only, non-overwriting synthesis threads.
+- `brain/4-experiences/`: create-only Cognitive Core episodic task records.
 - `brain/5-playbooks/`: owner-gated CAS Skill Playbooks and `.history/` revisions.
+- `brain/6-skills/`: owner-promoted Stage 4 Sandboxed Executable Skills and `.history/` revisions.
+- `brain/notes/`: zero-friction working notes (kept separate from verified atoms).
 - `docs/runbooks/`: human-readable operator workflows and Markdown templates (`docs/runbooks/templates/`).
-- `brain/.chroma/`: rebuildable vector recall layer.
-- `scripts/`: local engine core.
-- `dashboard/`: local operator interface.
-- `docs/`: architecture and design notes.
-- `tasks/`: implementation plan and task queue.
+- `brain/.sidecar/` & `brain/.chroma/`: strictly disposable rebuildable FTS5/notes/chat/telemetry SQLite DBs, runtime locks, and dense vectors.
+- `scripts/`, `dashboard/`, `desktop/`, `extensions/`, `mobile/`: runtime, UIs, IDE/Clipper extensions, and Mobile Drop/Vault Client.
+- `docs/` & `tasks/`: architecture specs, benchmark/review artifacts, implementation plan, and task queue.
 
 ## Memory Contract
 
@@ -168,11 +167,9 @@ Long term:
 - Project work can write durable decisions, tasks, and architecture memories.
 - The system remains usable offline once local models and packages are installed.
 
-## Open Questions
+## Resolved Architecture Decisions
 
-- Should unreviewed `pending` memories be included in chat by default, or only
-  shown as lower-trust context?
-- Should review records live inline in each atom, in a separate log, or both?
-- Which local coding agent interface should be the first project-aware target:
-  dashboard, MCP, CLI chat, or all three behind one shared query layer?
-- Which local image-generation stack should be supported first if installed?
+1. **Unreviewed Pending Isolation:** Unreviewed `pending` memories are excluded from default verified recall and factual synthesis (requiring `accepted` + current live CAS approval + byte-offset anchor verification) and are surfaced only inside explicit exploratory `Research` view (`[UNVERIFIED LEADS]`) without promotion to verified claims.
+2. **Dual Canonical Review State:** Human approval state lives both in human-readable Markdown frontmatter (`review_status`, `claim_state`) and in the append-only canonical decision log (`brain/0-raw/archive/decision-record.jsonl`), enforced against exact current SHA-256 content hashes.
+3. **Unified Shared Query Layer:** All surfaces (`dashboard/`, CLI, Electron `desktop/`, VS Code extension, and opt-in 27-tool MCP server) execute over one canonical verification and recall stack (`scripts/recall.py`, `scripts/answer_policy.py`, `scripts/memory_api.py`).
+4. **Local Creative Media Stack:** Offline image and video synthesis runs hardware-gated through optional local Diffusers (`local/sdxl-turbo`) and bundled PyAV (`libx264` MP4 / GIF) via `scripts/creative_media.py`.

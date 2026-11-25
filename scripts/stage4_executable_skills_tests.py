@@ -1541,6 +1541,7 @@ class AssertionOpsAuditKindsDlpOutputAndCliTests(Stage4IsolatedTestCase):
             self.assertTrue(m_st["backends"]["builtin_procedural_local"]["ready"])
             img_res = owner_client.generate_image(
                 "Deterministic Second Brain architecture diagram",
+                backend="builtin_procedural_local",
                 style="blueprint",
                 width=384,
                 height=256,
@@ -1550,6 +1551,7 @@ class AssertionOpsAuditKindsDlpOutputAndCliTests(Stage4IsolatedTestCase):
             self.assertEqual(img_res["media_type"], "image")
             vid_res = owner_client.generate_video(
                 "Animated Merkle proof flow",
+                backend="builtin_procedural_local",
                 style="concept_card",
                 output_format="mp4",
                 width=320,

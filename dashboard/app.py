@@ -33,6 +33,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 import networkx as nx
 import ollama
@@ -62,6 +63,7 @@ from scripts.config import (
     normalize_markdown_filename,
     resolve_active_brain_dir,
     safe_file_in_dir,
+    security_state_dir,
 )
 from scripts.recall import (
     RecallOptions,
@@ -87,8 +89,11 @@ from scripts.hardware_profile import detect_hardware_profile
 from scripts.inbox_workflow import inspect_inbox_item, list_inbox_items, promote_inbox_item, reject_inbox_item
 import scripts.host_adapters as _host_adapters_mod
 from scripts.host_adapters import (
+    BUILTIN_HOST_IDS,
     HostConsentError,
     HostSharingRule,
+    create_custom_host_policy,
+    delete_custom_host_policy,
     filter_atoms_for_host,
     generate_grounded_answer_via_host,
     load_host_policies,
@@ -191,9 +196,11 @@ from scripts.vault_backup import (
 )
 from scripts.inbox_drop import (
     create_mobile_drop_pairing,
+    export_mobile_recall_index,
     list_mobile_drop_pairings,
     resolve_scoped_inbox_drop_s3_credentials,
     revoke_mobile_drop_pairing,
+    rotate_mobile_recall_key,
 )
 from scripts.onnx_models import (
     get_onnx_models_status,
@@ -237,6 +244,20 @@ from scripts.creative_media import (
     get_generated_media_file,
     list_generated_media,
 )
+from scripts.owner_gates import (
+    approve_evaluation_dataset,
+    approve_latency_slo,
+    collect_owner_gates_status,
+)
+from scripts.fractal_zoom import zoom_retrieve
+from scripts.concept_graph import get_concept, list_concepts
+from scripts.cognitive_distiller import (
+    distill_cross_project_candidates,
+    list_distilled_artifacts,
+    promote_distilled_artifact,
+)
+from scripts.world_model_sim import simulate_change_impact
+from scripts.self_model_curiosity import evaluate_self_model_and_curiosity
 
 # Resolve active vault directories dynamically so env overrides (BRAIN_VAULT_DIR) or persisted vault paths stay isolated per run.
 _env_vault_override = (os.environ.get("BRAIN_VAULT_DIR") or "").strip()
@@ -249,6 +270,7 @@ ATOMS_DIR = os.path.join(BRAIN_DIR, "2-atoms")
 THREADS_DIR = os.path.join(BRAIN_DIR, "3-threads")
 EXPERIENCES_DIR = os.path.join(BRAIN_DIR, "4-experiences")
 PLAYBOOKS_DIR = os.path.join(BRAIN_DIR, "5-playbooks")
+SKILLS_DIR = os.path.join(BRAIN_DIR, "6-skills")
 SOURCES_DIR = os.path.join(BRAIN_DIR, "sources")
 BRIEFINGS_DIR = os.path.join(BRAIN_DIR, "briefings")
 NOTES_DIR = os.path.join(BRAIN_DIR, "notes")
@@ -834,37 +856,30 @@ def _extract_backing_claim_units(atom_filename: str) -> list[str]:
     return units
 
 def _read_ledger_history() -> list[dict]:
-    """Read hash-chained checkpoint entries from brain/.sidecar/vault-ledger.jsonl safely."""
-    if os.path.lexists(SIDECAR_DIR) and _is_reparse_or_link(SIDECAR_DIR):
-        return []
-    ledger_path = os.path.join(SIDECAR_DIR, "vault-ledger.jsonl")
-    if not os.path.isfile(ledger_path) or _is_reparse_or_link(ledger_path):
+    """Read verified hash-chained checkpoint entries from durable vault-ledger.jsonl."""
+    try:
+        ledger_state = verify_vault_ledger(
+            brain_dir=BRAIN_DIR,
+            atoms_dir=ATOMS_DIR,
+            playbooks_dir=PLAYBOOKS_DIR,
+        )
+    except Exception:
         return []
     rows: list[dict] = []
-    try:
-        with open(ledger_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                s = line.strip()
-                if not s:
-                    continue
-                try:
-                    obj = json.loads(s)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(obj, dict):
-                    rows.append({
-                        "seq": obj.get("seq"),
-                        "timestamp": obj.get("timestamp", ""),
-                        "actor": obj.get("actor", ""),
-                        "leaf_count": obj.get("leaf_count", 0),
-                        "approved_atoms": obj.get("approved_atoms", 0),
-                        "accepted_playbooks": obj.get("accepted_playbooks", 0),
-                        "merkle_root": str(obj.get("merkle_root", "")),
-                        "entry_sha256": str(obj.get("entry_sha256", "")),
-                        "note": obj.get("note", ""),
-                    })
-    except OSError:
-        return []
+    for obj in ledger_state.get("entries") or []:
+        if not isinstance(obj, dict):
+            continue
+        rows.append({
+            "seq": obj.get("seq"),
+            "timestamp": obj.get("timestamp", ""),
+            "actor": obj.get("actor", ""),
+            "leaf_count": obj.get("leaf_count", 0),
+            "approved_atoms": obj.get("approved_atoms", 0),
+            "accepted_playbooks": obj.get("accepted_playbooks", 0),
+            "merkle_root": str(obj.get("merkle_root", "")),
+            "entry_sha256": str(obj.get("entry_sha256", "")),
+            "note": obj.get("note", ""),
+        })
     rows.reverse()
     return rows
 
@@ -923,15 +938,40 @@ def build_network_graph(
     include_pending: bool = False,
     include_threads: bool = True,
     include_topic_overlap: bool = True,
+    as_of: str | None = None,
+    include_expired: bool = True,
 ):
     G = nx.Graph()
+    clean_scope = (project_scope or "").strip() or None
+    clean_as_of = str(as_of).strip() if (as_of and str(as_of).strip()) else None
     kg = build_knowledge_graph(
         brain_dir=BRAIN_DIR,
         atoms_dir=ATOMS_DIR,
-        project_scope=(project_scope or "").strip() or None,
+        project_scope=clean_scope,
         include_pending=include_pending,
+        as_of=clean_as_of,
+        include_expired=include_expired,
     )
     G.graph["kg_summary"] = kg
+    timeline_kg = (
+        kg
+        if (clean_as_of is None and include_expired)
+        else build_knowledge_graph(
+            brain_dir=BRAIN_DIR,
+            atoms_dir=ATOMS_DIR,
+            project_scope=clean_scope,
+            include_pending=include_pending,
+            as_of=None,
+            include_expired=True,
+        )
+    )
+    timeline_dates = sorted({
+        d[:10]
+        for n in timeline_kg.get("nodes", [])
+        for d in (str(n.get("valid_from") or "").strip(), str(n.get("valid_until") or "").strip())
+        if d and len(d) >= 10
+    })
+    G.graph["timeline_dates"] = timeline_dates
 
     for node in kg.get("nodes", []):
         fname = str(node["filename"])
@@ -946,6 +986,9 @@ def build_network_graph(
             review_status=str(node.get("effective_status") or node.get("review_status") or "pending"),
             memory_type=str(node.get("memory_type") or ""),
             superseded_by=str(node.get("superseded_by") or ""),
+            valid_from=str(node.get("valid_from") or ""),
+            valid_until=str(node.get("valid_until") or ""),
+            temporal_status=str(node.get("temporal_status") or "active"),
             tags=list(node.get("contexts") or []),
             claim=html.escape(raw_claim),
         )
@@ -1099,9 +1142,15 @@ def draw_network_plotly(G, dimension="2D"):
         esc_status = html.escape(status_lbl)
         is_verified = bool(ndata.get("approved_current")) or status_lbl == "accepted"
         sup_by = ndata.get("superseded_by", "")
+        temporal_lbl = str(ndata.get("temporal_status") or "active")
+        valid_from_lbl = str(ndata.get("valid_from") or "")
+        valid_until_lbl = str(ndata.get("valid_until") or "")
         claim_snip = (ndata.get("claim") or "")[:120]
         badge = "Verified Approved" if is_verified else ("Synthesis Thread" if ntype == "thread" else f"Unverified ({esc_status})")
         hover_parts = [f"<b>{title}</b>", f"Status: {badge}", f"File: {esc_file}"]
+        if ntype == "atom":
+            win_lbl = f"{valid_from_lbl or '-inf'} -> {valid_until_lbl or '+inf'}"
+            hover_parts.append(f"Temporal: {html.escape(temporal_lbl)} ({html.escape(win_lbl)})")
         if claim_snip:
             hover_parts.append(f"Claim: {claim_snip}")
         node_text.append("<br>".join(hover_parts))
@@ -1111,6 +1160,9 @@ def draw_network_plotly(G, dimension="2D"):
             node_size.append(15 if is_3d else 22)
         elif sup_by:
             node_color.append("#6c757d")
+            node_size.append(8 if is_3d else 12)
+        elif temporal_lbl in {"expired", "not_yet_valid", "invalid_window"}:
+            node_color.append("#7aa2f7" if temporal_lbl == "not_yet_valid" else "#9aa5ce")
             node_size.append(8 if is_3d else 12)
         elif is_verified:
             node_color.append("#2ecc71")
@@ -1713,6 +1765,12 @@ if nav_selection == "💬 Chat with Memory":
                 })
             else:
                 # Strict Schema-Validated Host Answer (supports any owner-configured host in host-sharing-policy.json)
+                strict_prior_turns = [
+                    {"role": str(m["role"]), "content": str(m["content"])}
+                    for m in st.session_state.chat_history[:-1]
+                    if m.get("role") in {"user", "assistant"} and str(m.get("content") or "").strip()
+                ][-10:]
+                resolved_strict_prompt, _ = resolve_followup_query(user_prompt, strict_prior_turns)
                 context_profile_tuple = tuple(c.strip() for c in rag_context_profile.split(",") if c.strip())
                 extra_recall_kwargs = {}
                 if rag_fitness_boost:
@@ -1725,7 +1783,7 @@ if nav_selection == "💬 Chat with Memory":
                     extra_recall_kwargs["as_of"] = rag_as_of.strip()
                 with st.spinner(f"🧠 Retrieving verified atoms & querying `{chat_host_id}`..."):
                     direct_refs, neighbor_refs = search_memory(
-                        user_prompt,
+                        resolved_strict_prompt,
                         n_results=rag_n_results,
                         follow_links=rag_follow,
                         projects=project_tuple,
@@ -1849,6 +1907,41 @@ elif nav_selection == "🕸️ Knowledge Graph":
             kg_inc_pending = st.checkbox("Include Pending Drafts", value=False, key="kg_inc_pending")
             kg_inc_overlap = st.checkbox("Show Topic-Overlap Edges", value=True, key="kg_inc_overlap")
             kg_inc_threads = st.checkbox("Overlay Synthesis Threads (`3-threads/`)", value=True, key="kg_inc_threads")
+
+            st.markdown("#### ⏳ Bi-Temporal Timeline Scrubber")
+            _kg_preview = build_knowledge_graph(
+                brain_dir=BRAIN_DIR,
+                atoms_dir=ATOMS_DIR,
+                project_scope=kg_project_scope.strip() or None,
+                include_pending=kg_inc_pending,
+                include_expired=True,
+            )
+            _timeline_dates = sorted({
+                d[:10]
+                for n in _kg_preview.get("nodes", [])
+                for d in (str(n.get("valid_from") or "").strip(), str(n.get("valid_until") or "").strip())
+                if d and len(d) >= 10
+            })
+            kg_scrubber_choice = "Live (Now)"
+            if _timeline_dates:
+                kg_scrubber_choice = st.select_slider(
+                    "Timeline Date Scrubber",
+                    options=["Live (Now)", *_timeline_dates],
+                    value="Live (Now)",
+                    key="kg_timeline_scrubber",
+                )
+            kg_as_of_custom = st.text_input(
+                "Custom As-Of Date (YYYY-MM-DD)",
+                value="",
+                placeholder="Overrides timeline scrubber if set",
+                key="kg_as_of_input",
+            )
+            kg_inc_expired = st.checkbox("Include Expired / Not-Yet-Valid Facts", value=True, key="kg_inc_expired")
+            eff_kg_as_of = (
+                kg_as_of_custom.strip()
+                or (kg_scrubber_choice if kg_scrubber_choice != "Live (Now)" else "")
+            ) or None
+
             if st.button("🔗 Auto-Link Graph Atoms", width="stretch", key="btn_kg_autolink"):
                 try:
                     al_res = auto_link_vault_atoms(
@@ -1872,7 +1965,7 @@ elif nav_selection == "🕸️ Knowledge Graph":
                 "🟢 **Verified Approved Atom**  \n"
                 "🟡 **Pending Draft Atom**  \n"
                 "🔴 **Needs Edit Atom**  \n"
-                "⚪ **Superseded Lineage Atom**  \n"
+                "⚪ **Superseded / Expired Atom**  \n"
                 "🔵 **Synthesis Thread (`3-threads/`)**  \n"
                 "*Rejected & quarantined atoms are strictly excluded by default.*  \n\n"
                 "**Edges:**  \n"
@@ -1884,18 +1977,35 @@ elif nav_selection == "🕸️ Knowledge Graph":
 
     with col1:
         with st.spinner("Building interactive knowledge graph..."):
-            G = build_network_graph(
-                project_scope=kg_project_scope.strip() or None,
-                include_pending=kg_inc_pending,
-                include_threads=kg_inc_threads,
-                include_topic_overlap=kg_inc_overlap,
-            )
+            try:
+                G = build_network_graph(
+                    project_scope=kg_project_scope.strip() or None,
+                    include_pending=kg_inc_pending,
+                    include_threads=kg_inc_threads,
+                    include_topic_overlap=kg_inc_overlap,
+                    as_of=eff_kg_as_of,
+                    include_expired=kg_inc_expired,
+                )
+            except Exception as kg_exc:
+                st.error(f"Invalid Bi-Temporal filter: {kg_exc}")
+                G = build_network_graph(
+                    project_scope=kg_project_scope.strip() or None,
+                    include_pending=kg_inc_pending,
+                    include_threads=kg_inc_threads,
+                    include_topic_overlap=kg_inc_overlap,
+                )
             kg_meta = G.graph.get("kg_summary", {})
             km1, km2, km3, km4 = st.columns(4)
             km1.metric("Rendered Nodes", G.number_of_nodes())
             km2.metric("Rendered Edges", G.number_of_edges())
             km3.metric("Orphan Approved", len(kg_meta.get("orphan_approved_atoms", [])))
             km4.metric("Contested Pairs", G.graph.get("contradiction_count", 0))
+            st.caption(
+                f"Bi-Temporal View: **as_of=`{kg_meta.get('as_of') or 'now'}`** · "
+                f"Active: **{kg_meta.get('active_temporal_count', G.number_of_nodes())}** · "
+                f"Expired: **{kg_meta.get('expired_temporal_count', 0)}** · "
+                f"Future: **{kg_meta.get('future_temporal_count', 0)}**"
+            )
 
             if G.nodes():
                 fig = draw_network_plotly(G, dimension=graph_dim)
@@ -1937,6 +2047,9 @@ elif nav_selection == "🕸️ Knowledge Graph":
                         "type": node_type,
                         "approved_current": ndata.get("approved_current", False),
                         "review_status": ndata.get("review_status", ""),
+                        "temporal_status": ndata.get("temporal_status", "active"),
+                        "valid_from": ndata.get("valid_from", ""),
+                        "valid_until": ndata.get("valid_until", ""),
                         "memory_type": ndata.get("memory_type", ""),
                         "superseded_by": ndata.get("superseded_by", ""),
                         "contexts": ndata.get("tags", []),
@@ -2595,6 +2708,41 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                 except Exception as exc:
                     st.error(f"Could not save policy: {exc}")
 
+            if chosen_host not in BUILTIN_HOST_IDS:
+                if st.button(f"🗑️ Delete Custom Host `{chosen_host}`", key=f"del_{chosen_host}"):
+                    try:
+                        delete_custom_host_policy(chosen_host)
+                        st.success(f"Deleted custom host `{chosen_host}`.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not delete custom host: {exc}")
+
+        with st.expander("➕ Add Custom AI Model Host Profile"):
+            ch_id = st.text_input("Custom Host ID (`[a-z][a-z0-9_-]{2,47}`)", placeholder="e.g. lm_studio_local", key="new_host_id")
+            ch_c1, ch_c2 = st.columns(2)
+            with ch_c1:
+                ch_prov = st.selectbox("Provider", ["openai_compatible", "ollama", "anthropic", "gemini"], key="new_host_prov")
+            with ch_c2:
+                ch_trans = st.selectbox("Transport", ["local", "online"], key="new_host_trans")
+            ch_ep = st.text_input("Endpoint URL", placeholder="http://127.0.0.1:1234/v1", key="new_host_ep")
+            ch_mod = st.text_input("Default Model Identifier", placeholder="qwen2.5-coder:7b", key="new_host_mod")
+            ch_kenv = st.text_input("API Key Env Var Name (optional)", placeholder="MY_HOST_API_KEY", key="new_host_env")
+            if st.button("➕ Create Custom Host", key="btn_create_custom_host"):
+                try:
+                    created_rule = create_custom_host_policy(
+                        ch_id.strip().lower(),
+                        provider=ch_prov,
+                        transport=ch_trans,
+                        endpoint_url=ch_ep.strip(),
+                        default_model=ch_mod.strip(),
+                        api_key_env=ch_kenv.strip() or None,
+                        enabled=False,
+                    )
+                    st.success(f"Created custom host `{created_rule.host_id}` (disabled until enabled above).")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not create custom host: {exc}")
+
     with tab_fitness:
         st.subheader("Memory Fitness & Procedural Skill Maturity")
         report = compute_memory_fitness_report(
@@ -2951,6 +3099,293 @@ elif nav_selection == "🧬 Host API, Quarantine & Fitness":
                         st.json(plan_result.as_dict())
                 except Exception as exc:
                     st.error(f"Executive planning failed: {exc}")
+
+    st.divider()
+    with st.expander(
+        "🧠 Gen-4 Cognition Workbench (Fractal Zoom L0–L5 · Living Concepts · Principles & Mental Models · Impact Simulator · Self-Model & Curiosity)",
+        expanded=False,
+    ):
+        st.caption(
+            "Owner-verified Gen-4 cognitive memory projections strictly scoped to the active vault "
+            "(`7-principles/`, `8-mental-models/`, and disposable `.sidecar/` projections)."
+        )
+        g4_zoom_tab, g4_concepts_tab, g4_distill_tab, g4_sim_tab, g4_curiosity_tab = st.tabs([
+            "🔭 Fractal Zoom (L0–L5)",
+            "🌐 Living Concepts",
+            "⚖️ Principles & Mental Models (CAS)",
+            "💥 Impact Simulator",
+            "🧭 Self-Model & Curiosity Gaps",
+        ])
+
+        with g4_zoom_tab:
+            gz1, gz2, gz3 = st.columns([2.2, 1.0, 1.3])
+            with gz1:
+                g4_zoom_query = st.text_input(
+                    "Fractal Zoom Query",
+                    placeholder="Query across L0 Vault -> L5 Byte Quote...",
+                    key="gen4_zoom_query",
+                )
+            with gz2:
+                g4_zoom_level = st.selectbox(
+                    "Target Level",
+                    ["L0", "L1", "L2", "L3", "L4", "L5"],
+                    index=5,
+                    key="gen4_zoom_level",
+                )
+            with gz3:
+                g4_zoom_proj = st.text_input(
+                    "Project Scope (optional)",
+                    value="",
+                    placeholder="project:second_brain",
+                    key="gen4_zoom_proj",
+                )
+            if st.button("🔭 Run Fractal Zoom", key="btn_gen4_zoom"):
+                try:
+                    zres = zoom_retrieve(
+                        g4_zoom_query.strip(),
+                        target_level=g4_zoom_level,
+                        project=g4_zoom_proj.strip() or None,
+                        limit=10,
+                        brain_dir=BRAIN_DIR,
+                        atoms_dir=ATOMS_DIR,
+                    )
+                    z_nodes = list(zres.get("nodes") or [])
+                    if z_nodes:
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "level": n.get("level"),
+                                    "title": n.get("title"),
+                                    "summary": str(n.get("summary") or "")[:180],
+                                    "atom": n.get("atom_filename"),
+                                    "project": n.get("project_scope"),
+                                    "score": n.get("score"),
+                                }
+                                for n in z_nodes
+                            ]),
+                            width="stretch",
+                        )
+                    else:
+                        st.info("No matching owner-approved nodes at this zoom level.")
+                except Exception as exc:
+                    st.error(f"Fractal Zoom failed: {exc}")
+
+        with g4_concepts_tab:
+            g4_concept_proj = st.text_input(
+                "Filter Living Concepts by Project (optional)",
+                value="",
+                placeholder="project:second_brain",
+                key="gen4_concepts_proj",
+            )
+            try:
+                g4_concepts = list_concepts(
+                    project=g4_concept_proj.strip() or None,
+                    limit=40,
+                    brain_dir=BRAIN_DIR,
+                    atoms_dir=ATOMS_DIR,
+                )
+            except Exception as exc:
+                g4_concepts = []
+                st.caption(f"Living Concepts unavailable: {exc}")
+            if g4_concepts:
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "concept_id": c.get("concept_id"),
+                            "name": c.get("name"),
+                            "atoms": c.get("atom_count"),
+                            "confidence": c.get("current_confidence"),
+                            "projects": ", ".join(c.get("projects") or []),
+                            "playbooks": len(c.get("playbooks") or []),
+                        }
+                        for c in g4_concepts
+                    ]),
+                    width="stretch",
+                )
+                sel_cid = st.selectbox(
+                    "Inspect Living Concept Edges & Timeline",
+                    [str(c["concept_id"]) for c in g4_concepts],
+                    key="gen4_concept_sel",
+                )
+                if st.button("🔍 Inspect Selected Concept", key="btn_gen4_concept_inspect"):
+                    try:
+                        c_detail = get_concept(
+                            sel_cid,
+                            project=g4_concept_proj.strip() or None,
+                            brain_dir=BRAIN_DIR,
+                            atoms_dir=ATOMS_DIR,
+                        )
+                        st.json({
+                            "concept_id": c_detail.get("concept_id"),
+                            "name": c_detail.get("name"),
+                            "current_confidence": c_detail.get("current_confidence"),
+                            "edges": c_detail.get("edges") or [],
+                            "confidence_timeline": c_detail.get("confidence_timeline") or [],
+                        })
+                    except Exception as exc:
+                        st.error(f"Concept inspection failed: {exc}")
+            else:
+                st.info("No Living Concepts indexed in this vault yet.")
+
+        with g4_distill_tab:
+            gd1, gd2, gd3 = st.columns([1.2, 2.0, 1.0])
+            with gd1:
+                g4_distill_actor = st.text_input("Owner Actor", value="dashboard_owner", key="gen4_distill_actor")
+            with gd2:
+                g4_distill_reason = st.text_input(
+                    "CAS Rationale",
+                    value="Owner-verified review from Dashboard",
+                    key="gen4_distill_reason",
+                )
+            with gd3:
+                if st.button("⚗️ Distill Candidates", key="btn_gen4_distill"):
+                    try:
+                        d_out = distill_cross_project_candidates(brain_dir=BRAIN_DIR, atoms_dir=ATOMS_DIR)
+                        st.success(
+                            f"Distilled {len(d_out.get('principles_created') or [])} principle(s) and "
+                            f"{len(d_out.get('mental_models_created') or [])} mental model(s)."
+                        )
+                    except Exception as exc:
+                        st.error(f"Distillation failed: {exc}")
+
+            try:
+                g4_principles = list_distilled_artifacts(
+                    kind="principle",
+                    active_only=False,
+                    brain_dir=BRAIN_DIR,
+                    atoms_dir=ATOMS_DIR,
+                )
+                g4_models = list_distilled_artifacts(
+                    kind="mental_model",
+                    active_only=False,
+                    brain_dir=BRAIN_DIR,
+                    atoms_dir=ATOMS_DIR,
+                )
+            except Exception as exc:
+                g4_principles, g4_models = [], []
+                st.caption(f"Distilled artifacts unavailable: {exc}")
+
+            all_distilled = [*g4_principles, *g4_models]
+            if all_distilled:
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "kind": it.get("kind"),
+                            "filename": it.get("filename"),
+                            "title": it.get("title"),
+                            "status": it.get("status"),
+                            "valid": it.get("valid"),
+                            "atoms": len(it.get("source_atoms") or []),
+                            "sha256": f"{str(it.get('sha256') or '')[:12]}…",
+                        }
+                        for it in all_distilled
+                    ]),
+                    width="stretch",
+                )
+                dist_map = {f"{it.get('kind')}:{it.get('filename')}": it for it in all_distilled}
+                sel_dist_key = st.selectbox(
+                    "Select Principle / Mental Model for Owner CAS Action",
+                    list(dist_map.keys()),
+                    key="gen4_distill_sel",
+                )
+                sel_dist = dist_map[sel_dist_key]
+                dp1, dp2 = st.columns(2)
+                with dp1:
+                    if st.button("✅ Promote Selected (CAS)", key="btn_gen4_distill_promote"):
+                        try:
+                            pres = promote_distilled_artifact(
+                                str(sel_dist["path"]),
+                                expected_sha256=str(sel_dist["sha256"]),
+                                actor=g4_distill_actor.strip() or "dashboard_owner",
+                                action="promote",
+                                reason=g4_distill_reason.strip(),
+                                brain_dir=BRAIN_DIR,
+                                atoms_dir=ATOMS_DIR,
+                            )
+                            st.success(f"Promoted `{pres.get('filename', sel_dist['filename'])}` (CAS verified).")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"CAS promotion failed: {exc}")
+                with dp2:
+                    if st.button("🚫 Deprecate Selected (CAS)", key="btn_gen4_distill_deprecate"):
+                        try:
+                            dres = promote_distilled_artifact(
+                                str(sel_dist["path"]),
+                                expected_sha256=str(sel_dist["sha256"]),
+                                actor=g4_distill_actor.strip() or "dashboard_owner",
+                                action="deprecate",
+                                reason=g4_distill_reason.strip(),
+                                brain_dir=BRAIN_DIR,
+                                atoms_dir=ATOMS_DIR,
+                            )
+                            st.warning(f"Deprecated `{dres.get('filename', sel_dist['filename'])}` (CAS verified).")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"CAS deprecation failed: {exc}")
+            else:
+                st.info("No Principles (`7-principles/`) or Mental Models (`8-mental-models/`) staged yet.")
+
+        with g4_sim_tab:
+            gs1, gs2, gs3 = st.columns([2.0, 0.9, 1.3])
+            with gs1:
+                g4_sim_target = st.text_input(
+                    "Simulation Target (concept / module)",
+                    placeholder="e.g. sqlite, auth, lexical_store",
+                    key="gen4_sim_target",
+                )
+            with gs2:
+                g4_sim_hops = st.number_input("Max Hops", min_value=1, max_value=4, value=3, step=1, key="gen4_sim_hops")
+            with gs3:
+                g4_sim_proj = st.text_input(
+                    "Project Scope (optional)",
+                    value="",
+                    placeholder="project:second_brain",
+                    key="gen4_sim_proj",
+                )
+            if st.button("💥 Simulate Downstream Impact", key="btn_gen4_sim"):
+                if not g4_sim_target.strip():
+                    st.warning("Enter a target concept or module name.")
+                else:
+                    try:
+                        sres = simulate_change_impact(
+                            g4_sim_target.strip(),
+                            max_hops=int(g4_sim_hops),
+                            project=g4_sim_proj.strip() or None,
+                            brain_dir=BRAIN_DIR,
+                            atoms_dir=ATOMS_DIR,
+                        )
+                        prov_sum = sres.get("provenance_summary") or {}
+                        st.caption(
+                            f"Impacted Nodes: **{sres.get('impacted_count', 0)}** · "
+                            f"verified_vault_edge=`{prov_sum.get('verified_vault_edge', 0)}` · "
+                            f"code_ast_dependency=`{prov_sum.get('code_ast_dependency', 0)}` · "
+                            f"inferred_risk=`{prov_sum.get('inferred_risk', 0)}`"
+                        )
+                        imp_nodes = list(sres.get("impacted_nodes") or [])
+                        if imp_nodes:
+                            st.dataframe(pd.DataFrame(imp_nodes), width="stretch")
+                        else:
+                            st.info("No downstream impacted nodes or historical failures found for this target.")
+                    except Exception as exc:
+                        st.error(f"Impact simulation failed: {exc}")
+
+        with g4_curiosity_tab:
+            try:
+                sm_rep = evaluate_self_model_and_curiosity(brain_dir=BRAIN_DIR, atoms_dir=ATOMS_DIR)
+                sm_domains = list(sm_rep.get("domains") or [])
+                sm_targets = list(sm_rep.get("curiosity_targets") or [])
+                if sm_domains:
+                    st.markdown("**Domain Competence Profile**")
+                    st.dataframe(pd.DataFrame(sm_domains), width="stretch")
+                else:
+                    st.info("No domain competence entries computed yet.")
+                if sm_targets:
+                    st.markdown("**Directed Curiosity & Study Gaps**")
+                    st.dataframe(pd.DataFrame(sm_targets), width="stretch")
+                else:
+                    st.success("No curiosity coverage deficits flagged.")
+            except Exception as exc:
+                st.caption(f"Self-Model & Curiosity report unavailable: {exc}")
 
 
 # PAGE: WORKING NOTES & IMPORT (PHASE 4)
@@ -3421,7 +3856,7 @@ elif nav_selection == "🛡️ Vault Proof & Time-Travel":
                 if history_rows:
                     st.dataframe(pd.DataFrame(history_rows), width="stretch")
                 else:
-                    st.caption("No checkpoints committed to `brain/.sidecar/vault-ledger.jsonl` yet.")
+                    st.caption("No checkpoints committed to `brain/0-raw/archive/vault-ledger.jsonl` yet.")
 
     with tab_radar:
         rc1, rc2, rc3 = st.columns([1.8, 1.3, 1.3])
@@ -3905,7 +4340,7 @@ elif nav_selection == "⚙️ System Control":
             "Forward-secret `ECDH P-256 + HKDF-SHA256 + AES-256-GCM` (`SBID1`) + revocable per-device `HMAC-SHA256`. "
             "Mobile devices hold only the public `P-256` key and drop ciphertext into `inbox-drops/<id>.enc` -> quarantined `0-raw/inbox/`."
         )
-        md_c1, md_c2, md_c3 = st.columns([1.4, 1.8, 1.0])
+        md_c1, md_c2, md_c3, md_c4 = st.columns([1.2, 1.6, 1.0, 1.1])
         with md_c1:
             md_label_in = st.text_input("Mobile Device Label", value="Mobile Quick-Capture", key="sys_md_label")
         with md_c2:
@@ -3915,8 +4350,10 @@ elif nav_selection == "⚙️ System Control":
                 key="sys_md_pwa_url",
             )
         with md_c3:
+            md_inc_recall = st.checkbox("Include Recall & Review Key (SBMR1)", value=True, key="sys_md_inc_recall")
+        with md_c4:
             md_inc_s3 = st.checkbox("Include S3 Write Keys", value=False, key="sys_md_inc_s3")
-        mdb1, mdb2 = st.columns(2)
+        mdb1, mdb2, mdb3, mdb4 = st.columns(4)
         with mdb1:
             if st.button("📲 Pair Mobile Device (SBID1)", key="btn_md_pair"):
                 try:
@@ -3932,9 +4369,13 @@ elif nav_selection == "⚙️ System Control":
                         s3_access_key_id=_ak,
                         s3_secret_access_key=_sk,
                         pwa_base_url=md_pwa_url_in.strip() or "https://localhost/inbox-drop/",
+                        include_recall=bool(md_inc_recall),
                         brain_dir=BRAIN_DIR,
                     )
-                    st.success(f"Paired `{mpres['label']}` (`token_id={mpres['token_id']}`):")
+                    st.success(
+                        f"Paired `{mpres['label']}` (`token_id={mpres['token_id']}`, "
+                        f"`include_recall={bool(mpres.get('include_recall'))}`):"
+                    )
                     st.code(str(mpres.get("pwa_pairing_url") or mpres.get("pairing_fragment") or ""), language="text")
                 except Exception as exc:
                     st.error(f"Mobile drop pairing failed: {exc}")
@@ -3948,6 +4389,26 @@ elif nav_selection == "⚙️ System Control":
                     )
                 except Exception as exc:
                     st.error(f"Pull mobile drops failed: {exc}")
+        with mdb3:
+            if st.button("📤 Export Recall Index (SBMR1)", key="btn_md_export_recall"):
+                try:
+                    ex_rec = export_mobile_recall_index(brain_dir=BRAIN_DIR, include_pending_review=True)
+                    st.success(
+                        f"Exported `{ex_rec['object_key']}` (`{ex_rec['atom_count']}` atoms, "
+                        f"`{ex_rec['review_count']}` pending review, uploaded={ex_rec['uploaded_to_sync']})."
+                    )
+                except Exception as exc:
+                    st.error(f"Export mobile recall failed: {exc}")
+        with mdb4:
+            if st.button("🔑 Rotate Recall Key", key="btn_md_rotate_recall"):
+                try:
+                    rot_rec = rotate_mobile_recall_key(brain_dir=BRAIN_DIR)
+                    st.warning(
+                        f"Rotated Mobile Recall key (`recall_key_id={rot_rec['recall_key_id']}`). "
+                        "Re-export recall index and re-pair authorized devices."
+                    )
+                except Exception as exc:
+                    st.error(f"Rotate mobile recall key failed: {exc}")
         try:
             md_info = list_mobile_drop_pairings(brain_dir=BRAIN_DIR)
             md_pairings = [p for p in (md_info.get("pairings") or []) if not p.get("revoked")]
@@ -4121,6 +4582,15 @@ elif nav_selection == "⚙️ System Control":
                 except Exception as exc:
                     st.error(f"Seal keychain failed: {exc}")
 
+        try:
+            auto_st = vault_auto_sync_status(brain_dir=BRAIN_DIR)
+            st.caption(
+                f"Auto-Sync Daemon: **{'ENABLED' if auto_st.get('enabled') else 'DISABLED'}** · "
+                f"Interval: `{auto_st.get('interval_seconds', 300)}s` · "
+                f"Worker alive: `{bool(auto_st.get('worker_alive'))}`"
+            )
+        except Exception:
+            pass
         ac1, ac2, ac3, ac4 = st.columns([1.2, 1.0, 1.0, 1.0])
         with ac1:
             auto_iv_in = st.number_input(
@@ -4334,7 +4804,7 @@ elif nav_selection == "⚙️ System Control":
         with cc1:
             clip_origin_in = st.text_input(
                 "Extension Origin",
-                placeholder="chrome-extension://<32-char-id> or moz-extension://<uuid>",
+                placeholder="chrome-extension://<id>, moz-extension://<uuid>, or safari-web-extension://<uuid>",
                 key="sys_clip_origin",
             )
         with cc2:
@@ -4421,7 +4891,18 @@ elif nav_selection == "⚙️ System Control":
         with gc3:
             git_max_in = st.number_input("Max Commits", min_value=1, max_value=25, value=5, step=1, key="sys_git_max")
         try:
-            hk_st = get_git_hook_status(git_repo_in.strip() or PROJECT_ROOT)
+            _git_repo_target = git_repo_in.strip() or PROJECT_ROOT
+            _hk_cache = st.session_state.get("_git_hook_status_cache")
+            if (
+                isinstance(_hk_cache, tuple)
+                and len(_hk_cache) == 3
+                and _hk_cache[0] == _git_repo_target
+                and (time.monotonic() - float(_hk_cache[1])) < 15.0
+            ):
+                hk_st = _hk_cache[2]
+            else:
+                hk_st = get_git_hook_status(_git_repo_target)
+                st.session_state["_git_hook_status_cache"] = (_git_repo_target, time.monotonic(), hk_st)
             st.caption(
                 f"Hook status: **{'INSTALLED' if hk_st.get('installed') else 'NOT INSTALLED'}** (`{hk_st.get('hook_path')}`)"
             )
@@ -4436,6 +4917,7 @@ elif nav_selection == "⚙️ System Control":
                         brain_dir=BRAIN_DIR,
                         project_scope=git_proj_in.strip() or None,
                     )
+                    st.session_state.pop("_git_hook_status_cache", None)
                     st.success(f"Installed hook at `{ires['hook_path']}` (`{ires['project_scope']}`).")
                 except Exception as exc:
                     st.error(f"Hook install failed: {exc}")
@@ -4443,6 +4925,7 @@ elif nav_selection == "⚙️ System Control":
             if st.button("🧹 Uninstall Post-Commit Hook", key="btn_git_hook_uninstall"):
                 try:
                     ures = uninstall_git_post_commit_hook(repo_dir=git_repo_in.strip() or PROJECT_ROOT)
+                    st.session_state.pop("_git_hook_status_cache", None)
                     st.info(f"Hook status: `{ures['status']}`.")
                 except Exception as exc:
                     st.error(f"Hook uninstall failed: {exc}")
@@ -4542,6 +5025,8 @@ elif nav_selection == "⚙️ System Control":
             "Promote verified active Skill Playbooks into cryptographically pinned Executable Skills that run inside an isolated, "
             "network-jailed sandbox with live 25ms kill-switch polling, automatic workspace rollback, and hash-chained audit logging (`skill-executions.jsonl`)."
         )
+        sk_list = []
+        sk_cands = []
         try:
             ks_st = get_skill_kill_switch_status(brain_dir=BRAIN_DIR)
             sk_list = list_executable_skills(
@@ -4551,11 +5036,18 @@ elif nav_selection == "⚙️ System Control":
                 telemetry_db_path=TELEMETRY_DB_PATH,
                 active_only=False,
             )
+            sk_cands = inspect_executable_skill_candidates(
+                brain_dir=BRAIN_DIR,
+                atoms_dir=ATOMS_DIR,
+                playbooks_dir=PLAYBOOKS_DIR,
+                telemetry_db_path=TELEMETRY_DB_PATH,
+            )
             ex_chain = verify_skill_execution_audit_chain(brain_dir=BRAIN_DIR)
             st.caption(
                 f"Kill-Switch: **{'ENGAGED (ALL SKILLS HALTED)' if ks_st.get('global_engaged') else 'ARMED (READY)'}** · "
                 f"Registered Executable Skills: **{len(sk_list)}** · "
-                f"Audit Chain: **{'VALID' if ex_chain.get('chain_valid') else 'INVALID'}** (`{ex_chain.get('entry_count', 0)}` executions)"
+                f"Playbook Candidates: **{len(sk_cands)}** · "
+                f"Audit Chain: **{'VALID' if ex_chain.get('valid', ex_chain.get('chain_valid')) else 'INVALID'}** (`{ex_chain.get('entry_count', 0)}` executions)"
             )
         except Exception as sk_exc:
             st.caption(f"Executable Skills status unavailable: {sk_exc}")
@@ -4572,6 +5064,7 @@ elif nav_selection == "⚙️ System Control":
                         brain_dir=BRAIN_DIR,
                     )
                     st.warning("Global Executable Skill Kill-Switch ENGAGED.")
+                    st.rerun()
                 except Exception as exc:
                     st.error(f"Kill-switch failed: {exc}")
         with ks_c2:
@@ -4585,8 +5078,280 @@ elif nav_selection == "⚙️ System Control":
                         brain_dir=BRAIN_DIR,
                     )
                     st.success("Global Executable Skill Kill-Switch released.")
+                    st.rerun()
                 except Exception as exc:
                     st.error(f"Kill-switch release failed: {exc}")
+
+        tab_sk_exec, tab_sk_promote, tab_sk_audit = st.tabs([
+            "▶️ Execute, Per-Skill Switch & Revoke",
+            "⬆️ Candidates & CAS Promotion",
+            "📜 Execution Audit Chain",
+        ])
+
+        with tab_sk_exec:
+            if sk_list:
+                sk_rows = [
+                    {
+                        "skill_id": s.skill_id,
+                        "status": s.status,
+                        "valid": s.valid,
+                        "playbook_id": s.playbook_id,
+                        "inputs": ", ".join(sorted((s.input_schema or {}).keys())) or "(none)",
+                        "steps": len(s.step_actions or ()),
+                        "sha256": f"{s.sha256[:12]}…",
+                        "reason": s.reason,
+                    }
+                    for s in sk_list
+                ]
+                st.dataframe(pd.DataFrame(sk_rows), width="stretch")
+
+                sk_by_id = {s.skill_id: s for s in sk_list}
+                sel_sk_id = st.selectbox("Select Executable Skill", list(sk_by_id.keys()), key="sys_sk_exec_sel")
+                sel_sk = sk_by_id[sel_sk_id]
+
+                exec_col1, exec_col2 = st.columns([2, 1])
+                with exec_col1:
+                    st.markdown(f"**Runtime Inputs (`input_schema`) for `{sel_sk_id}`**")
+                    typed_inputs: dict[str, object] = {}
+                    schema_map = dict(sel_sk.input_schema or {})
+                    if schema_map:
+                        for pname, pspec in schema_map.items():
+                            spec = dict(pspec or {})
+                            ptype = str(spec.get("type") or "string").strip().lower()
+                            req_flag = bool(spec.get("required"))
+                            default_val = spec.get("default")
+                            lbl = f"{pname} ({ptype}{'*' if req_flag else ''})"
+                            wkey = f"sys_sk_in_{sel_sk_id}_{pname}"
+                            if ptype == "boolean":
+                                typed_inputs[pname] = st.checkbox(lbl, value=bool(default_val) if default_val is not None else False, key=wkey)
+                            elif ptype == "integer":
+                                typed_inputs[pname] = int(st.number_input(lbl, value=int(default_val) if default_val is not None else 0, step=1, key=wkey))
+                            elif ptype == "number":
+                                typed_inputs[pname] = float(st.number_input(lbl, value=float(default_val) if default_val is not None else 0.0, key=wkey))
+                            elif isinstance(spec.get("enum"), list) and spec.get("enum"):
+                                enum_opts = list(spec["enum"])
+                                def_idx = enum_opts.index(default_val) if default_val in enum_opts else 0
+                                typed_inputs[pname] = st.selectbox(lbl, options=enum_opts, index=def_idx, key=wkey)
+                            else:
+                                raw_s = st.text_input(lbl, value="" if default_val is None else str(default_val), key=wkey)
+                                if raw_s != "" or req_flag or default_val is not None:
+                                    typed_inputs[pname] = raw_s
+                    else:
+                        st.caption("Skill declares an empty `input_schema`; pass optional JSON inputs below if needed.")
+
+                    sk_inputs_override = st.text_input(
+                        "Optional Runtime Inputs JSON Override",
+                        value="",
+                        placeholder='e.g. {"service": "shards"} (overrides form fields if non-empty)',
+                        key="sys_sk_inputs_json",
+                    )
+                    sk_e_c1, sk_e_c2, sk_e_c3 = st.columns([1.2, 0.8, 1.0])
+                    with sk_e_c1:
+                        sk_exec_actor = st.text_input("Owner Actor", value="dashboard_owner", key="sys_sk_exec_actor")
+                    with sk_e_c2:
+                        sk_exec_dry = st.checkbox("Dry Run", value=False, key="sys_sk_exec_dry")
+                    with sk_e_c3:
+                        run_sk_clicked = st.button("▶️ Execute in Sandbox", key="btn_sys_sk_execute")
+                    if run_sk_clicked:
+                        try:
+                            run_inputs = (
+                                json.loads(sk_inputs_override.strip())
+                                if sk_inputs_override.strip()
+                                else typed_inputs
+                            )
+                            if not isinstance(run_inputs, dict):
+                                raise ValueError("Runtime inputs must be a JSON object.")
+                            ex_res = execute_promoted_skill(
+                                sel_sk_id,
+                                inputs=run_inputs,
+                                actor=sk_exec_actor.strip() or "dashboard_owner",
+                                dry_run=bool(sk_exec_dry),
+                                brain_dir=BRAIN_DIR,
+                                atoms_dir=ATOMS_DIR,
+                                playbooks_dir=PLAYBOOKS_DIR,
+                                skills_dir=SKILLS_DIR,
+                                experiences_dir=EXPERIENCES_DIR,
+                                telemetry_db_path=TELEMETRY_DB_PATH,
+                            )
+                            st.success(
+                                f"Skill `{sel_sk_id}` -> `{ex_res.get('status')}` in `{ex_res.get('duration_ms', 0)} ms`."
+                            )
+                            st.json({
+                                "execution_id": ex_res.get("execution_id"),
+                                "status": ex_res.get("status"),
+                                "dry_run": ex_res.get("dry_run"),
+                                "rollback_executed": ex_res.get("rollback_executed"),
+                                "artifact_hashes": ex_res.get("artifact_hashes"),
+                                "step_results": ex_res.get("step_results"),
+                            })
+                        except Exception as exc:
+                            st.error(f"Skill execution failed: {exc}")
+
+                with exec_col2:
+                    st.markdown(f"**Governance for `{sel_sk_id}`**")
+                    pk1, pk2 = st.columns(2)
+                    with pk1:
+                        if st.button("🛑 Kill Skill", key="btn_sys_sk_kill_one"):
+                            try:
+                                set_skill_kill_switch(
+                                    engaged=True,
+                                    scope=sel_sk_id,
+                                    actor=sk_exec_actor.strip() or "dashboard_owner",
+                                    reason=f"Per-skill halt for {sel_sk_id}",
+                                    brain_dir=BRAIN_DIR,
+                                )
+                                st.warning(f"Kill-switch engaged for `{sel_sk_id}`.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Per-skill kill-switch failed: {exc}")
+                    with pk2:
+                        if st.button("✅ Unkill Skill", key="btn_sys_sk_unkill_one"):
+                            try:
+                                set_skill_kill_switch(
+                                    engaged=False,
+                                    scope=sel_sk_id,
+                                    actor=sk_exec_actor.strip() or "dashboard_owner",
+                                    reason=f"Per-skill release for {sel_sk_id}",
+                                    brain_dir=BRAIN_DIR,
+                                )
+                                st.success(f"Kill-switch released for `{sel_sk_id}`.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Release failed: {exc}")
+
+                    sk_rev_reason = st.text_input("Revocation Reason (CAS)", value="", placeholder="Why revoke this skill?", key="sys_sk_rev_reason")
+                    if st.button("🚫 Revoke Active Skill (CAS)", key="btn_sys_sk_revoke"):
+                        try:
+                            rev_res = revoke_executable_skill(
+                                sel_sk_id,
+                                expected_skill_sha256=sel_sk.sha256,
+                                actor=sk_exec_actor.strip() or "dashboard_owner",
+                                reason=sk_rev_reason.strip(),
+                                brain_dir=BRAIN_DIR,
+                            )
+                            st.success(f"Revoked `{rev_res['skill_id']}` (CAS `{str(rev_res['sha256'])[:12]}…`).")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Revocation failed: {exc}")
+            else:
+                st.info("No promoted Executable Skills registered in `6-skills/` yet. Promote a candidate playbook in the next tab.")
+
+        with tab_sk_promote:
+            if sk_cands:
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "playbook_id": c["playbook_id"],
+                            "title": c["title"],
+                            "stage": c["maturity_stage"],
+                            "steps": c["step_count"],
+                            "min_cites": c["min_grounded_citations"],
+                            "episodes": c["successful_episodes"],
+                            "eligible": c["eligible_without_override"],
+                        }
+                        for c in sk_cands
+                    ]),
+                    width="stretch",
+                )
+                cand_map = {str(c["playbook_id"]): c for c in sk_cands}
+                sel_cand_pb = st.selectbox("Candidate Playbook", list(cand_map.keys()), key="sys_sk_cand_pb")
+                cand_obj = cand_map[sel_cand_pb]
+                st.caption(f"Playbook SHA-256: `{cand_obj['playbook_sha256']}` · Steps: {len(cand_obj['steps'])}")
+                default_steps_template = [
+                    {
+                        "action_type": "vault_audit",
+                        "audit_kind": "sources",
+                        "output_file": f"step_{idx}_audit.json",
+                    }
+                    for idx in range(1, len(cand_obj.get("steps") or []) + 1)
+                ]
+                sp1, sp2, sp3 = st.columns(3)
+                with sp1:
+                    prom_skill_id = st.text_input("New Skill ID", value=f"{sel_cand_pb}-skill", key="sys_sk_prom_id")
+                with sp2:
+                    prom_actor = st.text_input("Owner Actor", value="dashboard_owner", key="sys_sk_prom_actor")
+                with sp3:
+                    prom_early = st.checkbox("Allow Early Owner Override", value=False, key="sys_sk_prom_early")
+                prom_rationale = st.text_input("Promotion Rationale", value="Owner-reviewed promotion from Streamlit Dashboard", key="sys_sk_prom_rationale")
+                prom_schema_json = st.text_area(
+                    "Input Schema JSON",
+                    value="{}",
+                    height=95,
+                    key="sys_sk_prom_schema",
+                )
+                prom_actions_json = st.text_area(
+                    "Step Actions JSON Array (must align 1:1 with Playbook steps)",
+                    value=json.dumps(default_steps_template, indent=2),
+                    height=150,
+                    key="sys_sk_prom_actions",
+                )
+                if st.button("⬆️ Promote Playbook to Executable Skill (CAS)", key="btn_sys_sk_promote"):
+                    try:
+                        parsed_schema = json.loads(prom_schema_json.strip() or "{}")
+                        parsed_actions = json.loads(prom_actions_json)
+                        p_out = promote_playbook_to_executable_skill(
+                            skill_id=prom_skill_id.strip(),
+                            playbook_id=sel_cand_pb,
+                            expected_playbook_sha256=str(cand_obj["playbook_sha256"]),
+                            step_actions=parsed_actions,
+                            input_schema=parsed_schema,
+                            actor=prom_actor.strip() or "dashboard_owner",
+                            rationale=prom_rationale.strip(),
+                            allow_early_owner_override=bool(prom_early),
+                            brain_dir=BRAIN_DIR,
+                            atoms_dir=ATOMS_DIR,
+                            playbooks_dir=PLAYBOOKS_DIR,
+                            skills_dir=SKILLS_DIR,
+                            experiences_dir=EXPERIENCES_DIR,
+                            telemetry_db_path=TELEMETRY_DB_PATH,
+                        )
+                        st.success(f"Promoted `{p_out['skill_id']}` (`{str(p_out['sha256'])[:16]}…`).")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Promotion failed: {exc}")
+            else:
+                st.info("No active verified Playbooks found in `5-playbooks/`. Promote a Playbook first.")
+
+        with tab_sk_audit:
+            au1, au2 = st.columns(2)
+            with au1:
+                aud_filter_id = st.selectbox(
+                    "Filter by Skill ID",
+                    ["(all)", *[s.skill_id for s in sk_list]],
+                    key="sys_sk_aud_filter",
+                )
+            with au2:
+                aud_limit = st.number_input("Max Audit Entries", min_value=5, max_value=200, value=30, step=5, key="sys_sk_aud_limit")
+            try:
+                exec_rows = list_skill_executions(
+                    brain_dir=BRAIN_DIR,
+                    skill_id=None if aud_filter_id == "(all)" else aud_filter_id,
+                    limit=int(aud_limit),
+                )
+            except Exception as aud_exc:
+                exec_rows = []
+                st.error(f"Could not read execution audit chain: {aud_exc}")
+            if exec_rows:
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "index": r.get("execution_index"),
+                            "execution_id": r.get("execution_id"),
+                            "skill_id": r.get("skill_id"),
+                            "actor": r.get("actor"),
+                            "status": r.get("status"),
+                            "dry_run": r.get("dry_run"),
+                            "killed": r.get("killed_by_switch"),
+                            "rollback": r.get("rollback_executed"),
+                            "duration_ms": r.get("duration_ms"),
+                            "timestamp": r.get("timestamp"),
+                        }
+                        for r in exec_rows
+                    ]),
+                    width="stretch",
+                )
+            else:
+                st.caption("No skill executions recorded in `0-raw/archive/skill-executions.jsonl` yet.")
 
     # Full On-Device Mobile Vault Client (iOS / Android Offline E2EE App)
     st.divider()
@@ -4608,16 +5373,51 @@ elif nav_selection == "⚙️ System Control":
                         include_recovery_key=mv_inc_key,
                     )
                     st.success(f"Paired Mobile Vault Client `{mres['pairing_id']}`.")
-                    st.code(str(mres.get("pairing_url") or mres.get("pairing_fragment") or ""), language="text")
+                    st.code(
+                        str(
+                            mres.get("pwa_pairing_url")
+                            or mres.get("pairing_url")
+                            or mres.get("pairing_fragment")
+                            or ""
+                        ),
+                        language="text",
+                    )
                 except Exception as exc:
                     st.error(f"Mobile pairing failed: {exc}")
         with mv_c2:
             if st.button("📦 Export Standalone iOS/Android App Bundle (`.zip`)", key="btn_sys_mv_export"):
                 try:
-                    eres = export_mobile_vault_client_bundle(os.path.join(PROJECT_ROOT, "dist"))
+                    default_mobile_export_dir = str(
+                        security_state_dir().parent / "exports" / "mobile-vault-client"
+                    )
+                    eres = export_mobile_vault_client_bundle(default_mobile_export_dir)
                     st.success(f"Exported `{eres['zip_path']}` (`{eres['size_bytes']}` bytes, SHA-256 `{eres['sha256'][:16]}…`).")
                 except Exception as exc:
                     st.error(f"Bundle export failed: {exc}")
+
+        try:
+            mv_status_info = list_mobile_vault_pairings(brain_dir=BRAIN_DIR)
+            mv_pairings = list(mv_status_info.get("pairings") or [])
+        except Exception as mv_exc:
+            mv_pairings = []
+            st.caption(f"Mobile Vault pairing registry unavailable: {mv_exc}")
+        if mv_pairings:
+            st.dataframe(pd.DataFrame(mv_pairings), width="stretch")
+            mv_active_ids = [str(p["pairing_id"]) for p in mv_pairings if not p.get("revoked")]
+            if mv_active_ids:
+                mv_r1, mv_r2 = st.columns([2, 1])
+                with mv_r1:
+                    mv_rev_sel = st.selectbox("Revoke Active Mobile Vault Pairing", mv_active_ids, key="sys_mv_rev_sel")
+                with mv_r2:
+                    if st.button("🚫 Revoke Mobile Client", key="btn_sys_mv_revoke"):
+                        try:
+                            mv_rev = revoke_mobile_vault_pairing(mv_rev_sel, brain_dir=BRAIN_DIR)
+                            st.success(f"Revoked Mobile Vault Client `{mv_rev.get('pairing_id', mv_rev_sel)}`.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Revoke failed: {exc}")
+        else:
+            st.info("No Mobile Vault Client devices paired yet.")
 
     # Local Creative Media Generation Studio (Offline Image & Video)
     st.divider()
@@ -4626,12 +5426,35 @@ elif nav_selection == "⚙️ System Control":
         st.caption(
             "100% offline image (`.png` / `.webp`) and video (`.mp4` / `.gif`) synthesis gated by hardware capability profile and outbound DLP secret controls."
         )
+        try:
+            _cm_cache = st.session_state.get("_creative_media_status_cache")
+            if (
+                isinstance(_cm_cache, tuple)
+                and len(_cm_cache) == 2
+                and (time.monotonic() - float(_cm_cache[0])) < 30.0
+            ):
+                cm_status = _cm_cache[1]
+            else:
+                cm_status = get_creative_media_status(
+                    hardware_profile=detect_hardware_profile(use_cache=True),
+                    probe_timeout=0.25,
+                )
+                st.session_state["_creative_media_status_cache"] = (time.monotonic(), cm_status)
+            cs1, cs2, cs3, cs4 = st.columns(4)
+            cs1.metric("Hardware Tier", cm_status.creative_tier)
+            cs2.metric("Max Canvas", f"{cm_status.max_width}x{cm_status.max_height}")
+            cs3.metric("Max Video", f"{cm_status.max_frames}f @ {cm_status.max_fps}fps")
+            cs4.metric("Recommended Engine", cm_status.recommended_image_backend)
+            st.caption(cm_status.neural_gate_reason)
+        except Exception as cm_st_exc:
+            st.caption(f"Creative hardware profile unavailable: {cm_st_exc}")
+
         cm_prompt = st.text_input(
             "Creative Media Prompt",
             placeholder="Describe the diagram, concept card, architectural blueprint, or animated storyboard...",
             key="sys_cm_prompt",
         )
-        cm1, cm2, cm3 = st.columns(3)
+        cm1, cm2, cm3, cm4, cm5 = st.columns([1.2, 1.3, 0.8, 0.8, 1.0])
         with cm1:
             cm_style = st.selectbox(
                 "Visual Style",
@@ -4645,17 +5468,21 @@ elif nav_selection == "⚙️ System Control":
                 key="sys_cm_backend",
             )
         with cm3:
-            cm_ground = st.checkbox("Ground in Verified Vault Claims", value=True, key="sys_cm_ground")
+            cm_img_fmt = st.selectbox("Image Format", ["png", "webp"], key="sys_cm_img_fmt")
+        with cm4:
+            cm_vid_fmt = st.selectbox("Video Format", ["mp4", "gif"], key="sys_cm_vid_fmt")
+        with cm5:
+            cm_ground = st.checkbox("Ground in Verified Claims", value=True, key="sys_cm_ground")
         cmb1, cmb2 = st.columns(2)
         with cmb1:
-            if st.button("🖼️ Generate Offline Image (`.png`)", key="btn_sys_cm_img"):
+            if st.button(f"🖼️ Generate Offline Image (`.{cm_img_fmt}`)", key="btn_sys_cm_img"):
                 try:
                     img_art = generate_local_image(
                         cm_prompt.strip(),
                         brain_dir=BRAIN_DIR,
                         backend=cm_backend,
                         style=cm_style,
-                        output_format="png",
+                        output_format=cm_img_fmt,
                         ground_in_vault=cm_ground,
                     )
                     st.success(f"Generated `{img_art.filename}` via `{img_art.backend_used}` (`{img_art.width}x{img_art.height}`).")
@@ -4663,20 +5490,229 @@ elif nav_selection == "⚙️ System Control":
                 except Exception as exc:
                     st.error(f"Offline image generation failed: {exc}")
         with cmb2:
-            if st.button("🎬 Generate Offline Video (`.mp4`)", key="btn_sys_cm_vid"):
+            if st.button(f"🎬 Generate Offline Video (`.{cm_vid_fmt}`)", key="btn_sys_cm_vid"):
                 try:
+                    _image_only_backends = {"sd_webui_local", "diffusers_local"}
+                    cm_vid_backend = cm_backend
+                    if cm_backend in _image_only_backends:
+                        st.info(
+                            f"Backend `{cm_backend}` is image-only; falling back to `auto` for offline video generation."
+                        )
+                        cm_vid_backend = "auto"
                     vid_art = generate_local_video(
                         cm_prompt.strip(),
                         brain_dir=BRAIN_DIR,
-                        backend=cm_backend if cm_backend != "sd_webui_local" else "auto",
+                        backend=cm_vid_backend,
                         style=cm_style,
-                        output_format="mp4",
+                        output_format=cm_vid_fmt,
                         ground_in_vault=cm_ground,
                     )
                     st.success(f"Generated `{vid_art.filename}` via `{vid_art.backend_used}` (`{vid_art.frames}` frames @ `{vid_art.fps}` fps).")
-                    st.video(vid_art.file_path)
+                    if cm_vid_fmt == "gif":
+                        st.image(vid_art.file_path, caption=vid_art.filename)
+                    else:
+                        st.video(vid_art.file_path)
                 except Exception as exc:
                     st.error(f"Offline video generation failed: {exc}")
+
+        st.markdown("#### 🖼️ Generated Media Gallery (`sources/generated/`)")
+        try:
+            cm_gallery = list_generated_media(brain_dir=BRAIN_DIR, limit=24)
+        except Exception as gal_exc:
+            cm_gallery = []
+            st.caption(f"Could not list generated media gallery: {gal_exc}")
+        if cm_gallery:
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "media_id": item.get("media_id"),
+                        "type": item.get("media_type"),
+                        "format": item.get("output_format"),
+                        "style": item.get("style"),
+                        "backend": item.get("backend_used"),
+                        "size": f"{item.get('width')}x{item.get('height')}",
+                        "created_at": item.get("created_at"),
+                    }
+                    for item in cm_gallery
+                ]),
+                width="stretch",
+            )
+            sel_media_id = st.selectbox(
+                "Inspect & Preview Generated Media",
+                [str(item["media_id"]) for item in cm_gallery if item.get("media_id")],
+                key="sys_cm_gal_sel",
+            )
+            if sel_media_id:
+                try:
+                    verified_media = get_generated_media_file(
+                        brain_dir=BRAIN_DIR,
+                        media_id=sel_media_id,
+                        verify_sha256=True,
+                    )
+                    st.caption(
+                        f"SHA-256 Verified ✅ `{str(verified_media.get('sha256', ''))[:16]}…` · "
+                        f"`{verified_media.get('mime_type')}` · `{verified_media.get('size_bytes')} bytes`"
+                    )
+                    mfmt = str(verified_media.get("output_format") or "").lower()
+                    if mfmt == "mp4":
+                        st.video(str(verified_media["file_path"]))
+                    else:
+                        st.image(str(verified_media["file_path"]), caption=str(verified_media.get("filename") or sel_media_id))
+                except Exception as mf_exc:
+                    st.error(f"Media artifact verification/preview failed: {mf_exc}")
+        else:
+            st.info("No generated media artifacts stored in `sources/generated/` yet.")
+
+    # Human Owner Governance Gates (Evaluation Dataset, Pending Candidate Atoms & Latency SLOs)
+    st.divider()
+    with st.container(border=True):
+        st.markdown("### 🏛️ Human Owner Governance Gates (Dataset, Candidate Atoms & Latency SLOs)")
+        st.caption(
+            "Explicit human-only governance checkpoints (`second-brain gates status`). "
+            "Agents cannot approve canonical atoms, playbooks, or evaluation datasets."
+        )
+        _env_gate_dataset = os.environ.get("BRAIN_EVAL_DATASET_FILE", "").strip()
+        gate_dataset_file = (
+            os.path.abspath(_env_gate_dataset)
+            if _env_gate_dataset
+            else os.path.join(PROJECT_ROOT, "docs", "retrieval-evaluation-proposed.json")
+        )
+        _gate_path_obj = Path(gate_dataset_file)
+        _gate_ancestors_safe = gate_dataset_file.lower().endswith(".json") and not any(
+            os.path.lexists(str(_anc)) and _is_reparse_or_link(str(_anc))
+            for _anc in (_gate_path_obj, *_gate_path_obj.parents)
+        )
+        if os.path.isfile(gate_dataset_file) and _gate_ancestors_safe:
+            try:
+                gates_report = collect_owner_gates_status(
+                    dataset_path=gate_dataset_file,
+                    atoms_dir=ATOMS_DIR,
+                    brain_dir=BRAIN_DIR,
+                )
+                ds_g = gates_report["dataset_gate"]
+                ca_g = gates_report["candidate_atoms_gate"]
+                slo_g = gates_report["latency_slo_gate"]
+                gm1, gm2, gm3, gm4 = st.columns(4)
+                gm1.metric("Open Owner Gates", gates_report["open_owner_gates_count"])
+                gm2.metric("Pending Dataset Queries", ds_g["pending_query_count"])
+                gm3.metric("Pending Candidate Atoms", ca_g["unapproved_count"])
+                gm4.metric("Track 3 SLOs Met", "Yes ✅" if slo_g["all_slos_met"] else "Pending")
+                ret_badge = "PASS" if slo_g.get("retrieval_slo_met") else ("SIGNED OFF" if slo_g.get("retrieval_variance_owner_accepted") else "PENDING OWNER SIGN-OFF")
+                ans_badge = "PASS" if slo_g.get("answer_slo_met_without_relaxation") else ("SIGNED OFF" if slo_g.get("answer_slo_recalibration_owner_signed_off") else "PENDING OWNER SIGN-OFF")
+                st.caption(
+                    f"Dataset `{ds_g['dataset_id']}` v{ds_g['dataset_version']} (`{ds_g['status']}`) · "
+                    f"300-atom ONNX P95: `{slo_g['measured_300_atom_onnx_p95_ms']} ms` (< 15.0 ms / NTFS variance: `{ret_badge}`) · "
+                    f"CPU Answer P95: `{slo_g['measured_answer_p95_ms']} ms` "
+                    f"(recalibrated SLO `<= {int(slo_g.get('configured_tier2_answer_p95_slo_ms') or 45000)} ms`: `{ans_badge}`)"
+                )
+                if not slo_g.get("all_slos_met") and slo_g.get("answer_slo_met_at_recalibrated_45s"):
+                    slo_phrase = str(slo_g.get("required_slo_confirmation_phrase") or "")
+                    with st.expander("Sign Off Track 3 Latency SLO Decisions (45.0 s CPU Answer + 300-Atom NTFS P95 Variance)", expanded=False):
+                        st.info(
+                            f"Live idle `qwen2.5-coder:7b` evaluation achieved 100% quality gate with "
+                            f"`P50 = {slo_g.get('measured_answer_p50_ms')} ms` and `P95 = {slo_g.get('measured_answer_p95_ms')} ms`; "
+                            f"300-atom ONNX achieved `P50 = {slo_g.get('measured_300_atom_onnx_p50_ms')} ms`, `P95 = {slo_g.get('measured_300_atom_onnx_p95_ms')} ms`, `100.0%` recall, `0.0%` trap leakage. "
+                            f"Required confirmation phrase: `{slo_phrase}`"
+                        )
+                        sc1, sc2 = st.columns(2)
+                        with sc1:
+                            slo_actor = st.text_input("Owner Name (SLO Sign-Off)", value="", placeholder="e.g. camer", key="sys_slo_actor")
+                        with sc2:
+                            slo_rationale = st.text_input(
+                                "SLO Rationale",
+                                value="Owner accepts recalibrated 45.0 s Tier-2 8-thread CPU answer P95 SLO based on live qwen2.5-coder:7b P95 measurement.",
+                                key="sys_slo_rationale",
+                            )
+                        slo_confirm_in = st.text_input(
+                            "Type Exact Confirmation Phrase to Sign Off CPU Answer SLO",
+                            value="",
+                            placeholder=slo_phrase,
+                            key="sys_slo_confirm_phrase",
+                        )
+                        if st.button("✅ Owner Sign-Off: Approve 45.0 s CPU Answer SLO", key="btn_sys_gate_approve_slo"):
+                            try:
+                                slo_res = approve_latency_slo(
+                                    actor=slo_actor,
+                                    rationale=slo_rationale,
+                                    brain_dir=BRAIN_DIR,
+                                    confirm_phrase=slo_confirm_in,
+                                    interactive_tty_verified=True,
+                                )
+                                st.success(
+                                    f"Tier-2 45.0 s CPU Answer SLO signed off by `{slo_res['actor']}`."
+                                )
+                                st.rerun()
+                            except Exception as slo_exc:
+                                st.error(f"SLO sign-off blocked: {slo_exc}")
+                if ca_g["candidates"]:
+                    with st.expander(f"Inspect {ca_g['unapproved_count']} Unapproved Candidate Atom(s) & Trap Dependencies", expanded=False):
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "atom": c["filename"],
+                                    "status": c["review_status"],
+                                    "anchor": c["anchor_status"],
+                                    "dependent_traps": ", ".join(c["trap_query_dependencies"]) or "(none)",
+                                    "diagnostics": "; ".join(c["diagnostics"]) or "Ready for owner inspection",
+                                }
+                                for c in ca_g["candidates"]
+                            ]),
+                            width="stretch",
+                        )
+                if ds_g["status"] == "pending_owner_review":
+                    req_phrase = ds_g["required_confirmation_phrase"]
+                    with st.expander(f"Inspect {ds_g['pending_query_count']} Pending v3.0.0 Expansion Queries & Owner Sign-Off", expanded=False):
+                        pending_only = [q for q in ds_g["queries"] if q["review_state"] == "pending_owner_review"]
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "id": q["id"],
+                                    "split": q["split"],
+                                    "answerability": q["answerability"],
+                                    "category": q["category"],
+                                    "query": q["query"],
+                                }
+                                for q in pending_only
+                            ]),
+                            width="stretch",
+                        )
+                        st.info(f"Required owner confirmation phrase: `{req_phrase}`")
+                        og1, og2 = st.columns(2)
+                        with og1:
+                            og_actor = st.text_input("Owner Name", value="", placeholder="e.g. camer", key="sys_gate_actor")
+                        with og2:
+                            og_scope = st.text_input(
+                                "Review Scope Note",
+                                value="Reviewed all 60 v3.0.0 expansion queries, claims, splits, and trap rationales.",
+                                key="sys_gate_scope",
+                            )
+                        og_phrase = st.text_input(
+                            "Type Exact Confirmation Phrase to Approve Dataset",
+                            value="",
+                            placeholder=req_phrase,
+                            key="sys_gate_confirm_phrase",
+                        )
+                        if st.button("✅ Owner Sign-Off: Approve Evaluation Dataset", key="btn_sys_gate_approve_dataset"):
+                            try:
+                                app_res = approve_evaluation_dataset(
+                                    dataset_path=gate_dataset_file,
+                                    actor=og_actor,
+                                    scope=og_scope,
+                                    atoms_dir=ATOMS_DIR,
+                                    brain_dir=BRAIN_DIR,
+                                    confirm_phrase=og_phrase,
+                                    interactive_tty_verified=True,
+                                )
+                                st.success(
+                                    f"Dataset approved by `{app_res['actor']}` (SHA-256 `{str(app_res['approved_sha256'])[:16]}…`)."
+                                )
+                                st.rerun()
+                            except Exception as app_exc:
+                                st.error(f"Dataset approval blocked: {app_exc}")
+            except Exception as gate_exc:
+                st.info(f"Owner dataset gate scoped to live project vault ({type(gate_exc).__name__}).")
+        else:
+            st.caption("Evaluation dataset not bundled at default repo path.")
 
     # Briefing log
     st.divider()

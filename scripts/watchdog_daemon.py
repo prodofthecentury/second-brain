@@ -58,6 +58,8 @@ from config import (
     RAW_DIR,
     SIDECAR_DIR,
     TEXT_EXTS,
+    VIDEO_EXTS,
+    VIDEO_ONLY_EXTS,
     _is_reparse_or_link,
     ensure_dirs,
 )
@@ -197,6 +199,15 @@ def can_auto_run_stage(ext: str, profile: HardwareCapabilityProfile) -> tuple[bo
     """Decide whether automatic background extraction may run on the current hardware profile."""
     if ext in DOC_EXTS:
         return True, "deterministic_document_extractor"
+    if ext in VIDEO_ONLY_EXTS:
+        from video_extractor import resolve_ffmpeg_tools
+
+        ffmpeg_bin, _ = resolve_ffmpeg_tools()
+        if not ffmpeg_bin and not _has_module("av"):
+            return False, "missing_ffmpeg_video_extractor"
+        if not _has_module("PIL"):
+            return False, "missing_pillow_image_gate"
+        return True, "video_ready"
     if ext in AUDIO_EXTS:
         if not _has_module("faster_whisper"):
             return False, "missing_faster_whisper"
@@ -263,10 +274,14 @@ def handle_new_file(filepath: str) -> str | list[str] | None:
             log.error(f"  Document extraction failed: {exc}")
             return None
 
-    if ext in AUDIO_EXTS or ext in IMAGE_EXTS:
+    if ext in AUDIO_EXTS or ext in IMAGE_EXTS or ext in VIDEO_EXTS:
         allowed, reason = can_auto_run_stage(ext, profile)
         if not allowed:
-            stage = "audio_transcription" if ext in AUDIO_EXTS else "image_vision"
+            stage = (
+                "video_ingestion"
+                if ext in VIDEO_ONLY_EXTS
+                else ("audio_transcription" if ext in AUDIO_EXTS else "image_vision")
+            )
             log.info(f"→ Deferring {stage} for {filename} ({reason}); keeping file queued safely in 0-raw/.")
             _record_deferred_capture(filepath, stage=stage, reason=reason, raw_dir=RAW_DIR)
             return None
@@ -420,6 +435,7 @@ def scan_unprocessed_raw_files(dispatcher: WatchdogDispatcher, raw_dir: str | No
         if (
             ext in AUDIO_EXTS
             or ext in IMAGE_EXTS
+            or ext in VIDEO_EXTS
             or ext in DOC_EXTS
             or ext in TEXT_EXTS
             or is_supported_refinery_target(filepath)

@@ -25,6 +25,7 @@ from hardware_profile import (
     fetch_loopback_json,
     is_reasoning_model_name,
     loopback_ollama_base_url,
+    recommended_ollama_runtime_options,
     resolve_active_local_generation_model,
     strip_reasoning_think_blocks,
 )
@@ -259,25 +260,74 @@ def chat_with_fallback(messages: list[dict], model: str | None = None, **kwargs)
         try:
             if candidate != effective_target:
                 print(f"[*] Trying fallback generation model: {candidate}")
+            call_kwargs = {k: v for k, v in kwargs.items() if k != "timeout"}
+            if "options" not in call_kwargs:
+                try:
+                    hw_cached = detect_hardware_profile(use_cache=True)
+                except Exception:
+                    hw_cached = None
+                runtime_opts = recommended_ollama_runtime_options(hw_cached, model_name=candidate)
+                if not _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
+                    call_kwargs["options"] = runtime_opts
+                else:
+                    try:
+                        sig = inspect.signature(ollama.chat)
+                        if "options" in sig.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                        ):
+                            call_kwargs["options"] = runtime_opts
+                    except (TypeError, ValueError):
+                        pass
             if _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
                 resp = call_ollama_chat_maybe_no_think(
-                    ollama.chat, model=candidate, messages=outbound_messages, **kwargs
+                    ollama.chat, model=candidate, messages=outbound_messages, **call_kwargs
                 )
             else:
                 if getattr(ollama, "Client", None) is None:
                     raise RuntimeError(
                         "Python 'ollama' package is not installed; install 'second-brain[online]' for local model generation."
                     )
-                timeout_val = 120.0 if is_reasoning_model_name(candidate) else 60.0
+                timeout_arg = kwargs.get("timeout")
+                env_timeout = os.environ.get("BRAIN_OLLAMA_TIMEOUT")
+                if env_timeout:
+                    try:
+                        timeout_val = float(env_timeout)
+                    except ValueError:
+                        timeout_val = 360.0 if is_reasoning_model_name(candidate) else 360.0
+                elif timeout_arg is not None:
+                    timeout_val = float(timeout_arg)
+                else:
+                    timeout_val = 360.0 if is_reasoning_model_name(candidate) else 360.0
                 client = ollama.Client(
                     host=base_url,
                     timeout=timeout_val,
                     follow_redirects=False,
                     trust_env=False,
                 )
+                call_kwargs.setdefault("stream", True)
                 resp = call_ollama_chat_maybe_no_think(
-                    client.chat, model=candidate, messages=outbound_messages, **kwargs
+                    client.chat, model=candidate, messages=outbound_messages, **call_kwargs
                 )
+            if hasattr(resp, "__iter__") and not isinstance(resp, (dict, list, str, bytes)):
+                chunks = []
+                last_chunk = {}
+                for chunk in resp:
+                    last_chunk = chunk if isinstance(chunk, dict) else getattr(chunk, "__dict__", {})
+                    if isinstance(chunk, dict):
+                        text_piece = chunk.get("message", {}).get("content", "")
+                    else:
+                        msg = getattr(chunk, "message", None)
+                        text_piece = getattr(msg, "content", "") if msg else ""
+                    if text_piece:
+                        chunks.append(text_piece)
+                full_content = strip_reasoning_think_blocks("".join(chunks))
+                return {
+                    **(last_chunk if isinstance(last_chunk, dict) else {}),
+                    "message": {
+                        **(last_chunk.get("message") if isinstance(last_chunk, dict) and isinstance(last_chunk.get("message"), dict) else {}),
+                        "content": full_content,
+                    },
+                }
             if isinstance(resp, dict) and isinstance(resp.get("message"), dict) and isinstance(resp["message"].get("content"), str):
                 return {
                     **resp,

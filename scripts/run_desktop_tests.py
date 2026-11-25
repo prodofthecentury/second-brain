@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -69,8 +70,8 @@ def find_packaged_binary() -> Path | None:
     return None
 
 
-def run_packaged_smoke_test(exe_path: Path) -> tuple[bool, str]:
-    with tempfile.TemporaryDirectory(prefix="sb-desktop-smoke-") as tmp_str:
+def run_packaged_smoke_test(exe_path: Path, *, require_packaged: bool = False) -> tuple[bool, str]:
+    with tempfile.TemporaryDirectory(prefix="sb-desktop-smoke-", ignore_cleanup_errors=True) as tmp_str:
         tmp_dir = Path(tmp_str)
         sec_dir = tmp_dir / "security"
         sec_dir.mkdir(parents=True, exist_ok=True)
@@ -83,11 +84,16 @@ def run_packaged_smoke_test(exe_path: Path) -> tuple[bool, str]:
         env["ELECTRON_ENABLE_LOGGING"] = "1"
 
         cmd = [str(exe_path), "--smoke-test"]
-        if sys.platform.startswith("linux") and not env.get("DISPLAY"):
-            xvfb = shutil.which("xvfb-run")
-            if not xvfb:
-                return True, "Skipped Linux packaged smoke-test (no DISPLAY or xvfb-run)."
-            cmd = [xvfb, "-a", *cmd, "--no-sandbox"]
+        if sys.platform.startswith("linux"):
+            if not env.get("DISPLAY"):
+                xvfb = shutil.which("xvfb-run")
+                if not xvfb:
+                    if require_packaged:
+                        return False, "FAIL: Linux packaged smoke-test requires DISPLAY or xvfb-run when --require-packaged is set."
+                    return True, "Skipped Linux packaged smoke-test (no DISPLAY or xvfb-run)."
+                cmd = [xvfb, "-a", *cmd, "--no-sandbox"]
+            elif env.get("CI"):
+                cmd = [*cmd, "--no-sandbox"]
 
         with out_path.open("wb") as out_fh, err_path.open("wb") as err_fh:
             proc = subprocess.run(
@@ -133,7 +139,20 @@ def run_packaged_smoke_test(exe_path: Path) -> tuple[bool, str]:
         return True, f"Packaged smoke-test PASS ({exe_path.name}, apiPort={smoke_payload.get('apiPort')})"
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--require-packaged",
+        action="store_true",
+        help="Fail closed if no packaged desktop binary is present under dist/ for --smoke-test.",
+    )
+    parser.add_argument(
+        "--skip-unit",
+        action="store_true",
+        help="Skip `npm test` unit/DOM suites and run only HTML sink + packaged --smoke-test checks.",
+    )
+    args = parser.parse_args(argv)
+
     violations = check_zero_html_sinks()
     if violations:
         print("FAIL: Forbidden HTML sink(s) detected in Desktop sources:", file=sys.stderr)
@@ -141,33 +160,37 @@ def main() -> int:
             print(f"  - {v}", file=sys.stderr)
         return 1
 
-    npm_bin = shutil.which("npm.cmd" if sys.platform == "win32" else "npm") or shutil.which("npm")
-    node_bin = shutil.which("node")
-    if npm_bin:
-        test_cmd = [npm_bin, "test"]
-    elif node_bin:
-        test_cmd = [node_bin, "--test", "tests/"]
-    else:
-        print("FAIL: Neither `npm` nor `node` found on PATH.", file=sys.stderr)
-        return 1
+    if not args.skip_unit:
+        npm_bin = shutil.which("npm.cmd" if sys.platform == "win32" else "npm") or shutil.which("npm")
+        node_bin = shutil.which("node")
+        if npm_bin:
+            test_cmd = [npm_bin, "test"]
+        elif node_bin:
+            test_cmd = [node_bin, "--test", "tests/"]
+        else:
+            print("FAIL: Neither `npm` nor `node` found on PATH.", file=sys.stderr)
+            return 1
 
-    res = subprocess.run(
-        test_cmd,
-        cwd=str(DESKTOP_DIR),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    if res.returncode != 0:
-        return res.returncode
+        res = subprocess.run(
+            test_cmd,
+            cwd=str(DESKTOP_DIR),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if res.returncode != 0:
+            return res.returncode
 
     exe_path = find_packaged_binary()
     if exe_path is not None:
-        ok, detail = run_packaged_smoke_test(exe_path)
+        ok, detail = run_packaged_smoke_test(exe_path, require_packaged=bool(args.require_packaged))
         print(detail)
         if not ok:
             return 1
+    elif args.require_packaged:
+        print("FAIL: --require-packaged specified, but no packaged desktop binary was found under dist/.", file=sys.stderr)
+        return 1
     else:
         print("Packaged desktop binary not present in dist/; unit/DOM suites passed.")
 

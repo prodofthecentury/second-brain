@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import hashlib
 import os
 from pathlib import Path
@@ -70,26 +71,44 @@ def _normalize_with_offsets(value: str) -> tuple[str, list[int]]:
     return "".join(normalized), offsets
 
 
-def _evidence_text(content: str) -> str:
-    parsed = split_frontmatter(content)
-    if parsed is None:
-        raise EvidenceValidationError("Atom has no valid frontmatter.")
-    _, body = parsed
-    lines = []
+_EVIDENCE_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$")
+_BLOCKQUOTE_PREFIX_RE = re.compile(r"^\s*>\s?")
+_QUOTE_PAIRS = {('"', '"'), ("'", "'"), ("\u201c", "\u201d"), ("\u2018", "\u2019")}
+
+
+def extract_evidence_from_body_lines(body: Sequence[str]) -> str:
+    """Extract and unquote the ## Evidence section text from split body lines."""
+    lines: list[str] = []
     active = False
     for line in body:
-        heading = re.match(r"^##\s+(.+?)\s*$", line)
+        heading = _EVIDENCE_HEADING_RE.match(line)
         if heading:
             if active:
                 break
             active = heading.group(1).strip().casefold() == "evidence"
             continue
         if active:
-            lines.append(re.sub(r"^\s*>\s?", "", line))
+            lines.append(_BLOCKQUOTE_PREFIX_RE.sub("", line))
     evidence = "\n".join(lines).strip()
-    _QUOTE_PAIRS = {('"', '"'), ("'", "'"), ("\u201c", "\u201d"), ("\u2018", "\u2019")}
     if len(evidence) >= 2 and (evidence[0], evidence[-1]) in _QUOTE_PAIRS:
         evidence = evidence[1:-1].strip()
+    return evidence
+
+
+def has_cached_normalized_source(source_sha256: str) -> bool:
+    """Return True if the normalized form of this verified source SHA-256 is already cached in memory."""
+    if not source_sha256:
+        return False
+    with _SOURCE_NORM_LOCK:
+        return source_sha256 in _SOURCE_NORM_CACHE
+
+
+def _evidence_text(content: str) -> str:
+    parsed = split_frontmatter(content)
+    if parsed is None:
+        raise EvidenceValidationError("Atom has no valid frontmatter.")
+    _, body = parsed
+    evidence = extract_evidence_from_body_lines(body)
     if not evidence:
         raise EvidenceValidationError("The atom has no evidence excerpt to verify.")
     return evidence
@@ -190,11 +209,13 @@ def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
     return matches[0]
 
 
-def _normalized_source_from_bytes(source_sha256: str, raw: bytes) -> tuple[str, str, list[int]] | None:
+def _normalized_source_from_bytes(source_sha256: str, raw: bytes | None = None) -> tuple[str, str, list[int]] | None:
     with _SOURCE_NORM_LOCK:
         cached = _SOURCE_NORM_CACHE.get(source_sha256)
     if cached is not None:
         return cached
+    if raw is None:
+        return None
     try:
         source_text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -213,7 +234,9 @@ def verify_evidence_anchor_known_source(
     *,
     source_rel: str,
     source_sha256: str,
-    source_bytes: bytes,
+    source_bytes: bytes | None = None,
+    preparsed_evidence: str | None = None,
+    preparsed_sources: Sequence[str] | None = None,
 ) -> bool:
     """Verify anchor fields against already-validated, hash-verified source bytes without extra disk I/O."""
     clean_rel = source_rel.replace("\\", "/").strip()
@@ -224,8 +247,13 @@ def verify_evidence_anchor_known_source(
     if str(anchor.get("evidence_sha256") or "") != source_sha256:
         return False
     try:
-        evidence = _evidence_text(content)
-        sources = _source_values(content)
+        if preparsed_evidence is not None:
+            if not preparsed_evidence:
+                return False
+            evidence = preparsed_evidence
+        else:
+            evidence = _evidence_text(content)
+        sources = list(preparsed_sources) if preparsed_sources is not None else _source_values(content)
     except EvidenceValidationError:
         return False
     if len(sources) != 1:

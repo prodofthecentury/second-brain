@@ -37,7 +37,11 @@ from config import (
     THREADS_DIR,
     VISION_MODEL,
     is_content_markdown,
+    resolve_module_vault_path,
+    snapshot_module_defaults,
 )
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 from hardware_profile import (
     _NoRedirectHandler,
     detect_hardware_profile,
@@ -109,10 +113,11 @@ def count_files(directory: str, suffixes: tuple[str, ...]) -> int:
     return count
 
 
-def queued_reading_items() -> int:
-    if not os.path.exists(READING_LIST):
+def queued_reading_items(reading_list_path: str | None = None) -> int:
+    target = reading_list_path or resolve_module_vault_path(globals(), "READING_LIST")
+    if not os.path.exists(target):
         return 0
-    with open(READING_LIST, "r", encoding="utf-8") as file:
+    with open(target, "r", encoding="utf-8") as file:
         return sum(
             1
             for line in file
@@ -194,8 +199,20 @@ def gpu_driver_status() -> str:
     return "No discrete CUDA GPU detected (CPU inference mode)"
 
 
-def run_checks() -> list[tuple[str, str, str]]:
+def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     checks = []
+    eff_brain = resolve_module_vault_path(globals(), "BRAIN_DIR", brain_dir)
+    eff_raw = resolve_module_vault_path(globals(), "RAW_DIR", brain_dir=brain_dir)
+    eff_inbox = resolve_module_vault_path(globals(), "INBOX_DIR", brain_dir=brain_dir)
+    eff_atoms = resolve_module_vault_path(globals(), "ATOMS_DIR", brain_dir=brain_dir)
+    eff_threads = resolve_module_vault_path(globals(), "THREADS_DIR", brain_dir=brain_dir)
+    eff_experiences = resolve_module_vault_path(globals(), "EXPERIENCES_DIR", brain_dir=brain_dir)
+    eff_playbooks = resolve_module_vault_path(globals(), "PLAYBOOKS_DIR", brain_dir=brain_dir)
+    eff_sources = resolve_module_vault_path(globals(), "SOURCES_DIR", brain_dir=brain_dir)
+    eff_briefings = resolve_module_vault_path(globals(), "BRIEFINGS_DIR", brain_dir=brain_dir)
+    eff_chroma = resolve_module_vault_path(globals(), "CHROMA_PATH", brain_dir=brain_dir)
+    eff_lexical = resolve_module_vault_path(globals(), "LEXICAL_INDEX_PATH", brain_dir=brain_dir)
+    eff_reading_list = resolve_module_vault_path(globals(), "READING_LIST", brain_dir=brain_dir)
 
     checks.append(ok(
         "host runtime",
@@ -251,14 +268,14 @@ def run_checks() -> list[tuple[str, str, str]]:
         checks.append(fail("uv", "uv is not available on PATH"))
 
     required_dirs = [
-        RAW_DIR,
-        INBOX_DIR,
-        ATOMS_DIR,
-        THREADS_DIR,
-        EXPERIENCES_DIR,
-        PLAYBOOKS_DIR,
-        SOURCES_DIR,
-        BRIEFINGS_DIR,
+        eff_raw,
+        eff_inbox,
+        eff_atoms,
+        eff_threads,
+        eff_experiences,
+        eff_playbooks,
+        eff_sources,
+        eff_briefings,
     ]
     missing = [path for path in required_dirs if not os.path.isdir(path)]
     if missing:
@@ -266,16 +283,16 @@ def run_checks() -> list[tuple[str, str, str]]:
     else:
         checks.append(ok("vault dirs", "All vault directories exist (including quarantined inbox, experiences, playbooks)"))
 
-    index_manifest = load_index_manifest(CHROMA_PATH)
-    json_fallback_file = json_collection_path(CHROMA_PATH, "atoms")
-    if not os.path.isdir(CHROMA_PATH) or (index_manifest is None and not os.path.exists(json_fallback_file)):
+    index_manifest = load_index_manifest(eff_chroma)
+    json_fallback_file = json_collection_path(eff_chroma, "atoms")
+    if not os.path.isdir(eff_chroma) or (index_manifest is None and not os.path.exists(json_fallback_file)):
         checks.append(warn("vector store", "No dense index is installed; model-free lexical recall remains available"))
     else:
-        vector_collection = get_vector_collection(CHROMA_PATH, name="atoms", create=False)
+        vector_collection = get_vector_collection(eff_chroma, name="atoms", create=False)
         try:
             if isinstance(vector_collection, JsonVectorCollection):
                 reason = f" ({vector_collection.fallback_reason})" if vector_collection.fallback_reason else ""
-                if not index_manifest or not index_manifest_is_current(index_manifest, ATOMS_DIR):
+                if not index_manifest or not index_manifest_is_current(index_manifest, eff_atoms):
                     checks.append(warn("vector store", f"JSON fallback files are present but no current generation is served{reason}"))
                 else:
                     checks.append(warn("vector store", f"Validated dense generation uses the JSON fallback{reason}"))
@@ -286,7 +303,7 @@ def run_checks() -> list[tuple[str, str, str]]:
 
     if index_manifest is None:
         checks.append(warn("index generation", "No verified index manifest; dense recall is intentionally unavailable"))
-    elif not index_manifest_is_current(index_manifest, ATOMS_DIR):
+    elif not index_manifest_is_current(index_manifest, eff_atoms):
         checks.append(warn("index generation", "Index manifest is stale; run the staged vector rebuild"))
     elif index_manifest.get("embedding_model") != EMBED_MODEL:
         checks.append(warn("index generation", "Index model differs from configured embedder; run the staged vector rebuild"))
@@ -296,18 +313,18 @@ def run_checks() -> list[tuple[str, str, str]]:
             f"{index_manifest.get('generation_id')} ({index_manifest.get('indexed_count')} indexed atom(s))",
         ))
 
-    if lexical_index_is_current(ATOMS_DIR, LEXICAL_INDEX_PATH):
+    if lexical_index_is_current(eff_atoms, eff_lexical):
         checks.append(ok("lexical recall", "Local FTS index is current and does not require an embedding service"))
     else:
         checks.append(fail("lexical recall", "Local FTS index is missing or stale; run scripts/rebuild_lexical_index.py"))
 
     current_approvals = 0
-    if os.path.isdir(ATOMS_DIR):
-        for filename in os.listdir(ATOMS_DIR):
+    if os.path.isdir(eff_atoms):
+        for filename in os.listdir(eff_atoms):
             if not is_content_markdown(filename):
                 continue
-            atom_path = os.path.join(ATOMS_DIR, filename)
-            if approved_revision_is_current(atom_path, brain_dir=BRAIN_DIR):
+            atom_path = os.path.join(eff_atoms, filename)
+            if approved_revision_is_current(atom_path, brain_dir=eff_brain, atoms_dir=eff_atoms):
                 current_approvals += 1
     if current_approvals:
         checks.append(ok("approved memories", f"{current_approvals} atom revision(s) have current, verifiable owner approval"))
@@ -349,26 +366,26 @@ def run_checks() -> list[tuple[str, str, str]]:
             f"{VISION_MODEL} is not installed and no vision-capable fallback model was found",
         ))
 
-    checks.append(ok("atoms", f"{count_files(ATOMS_DIR, ('.md',))} atom file(s)"))
-    checks.append(ok("threads", f"{count_files(THREADS_DIR, ('.md',))} thread file(s)"))
-    checks.append(ok("experiences", f"{count_files(EXPERIENCES_DIR, ('.md',))} experience record(s)"))
-    playbook_total = count_files(PLAYBOOKS_DIR, (".md",))
+    checks.append(ok("atoms", f"{count_files(eff_atoms, ('.md',))} atom file(s)"))
+    checks.append(ok("threads", f"{count_files(eff_threads, ('.md',))} thread file(s)"))
+    checks.append(ok("experiences", f"{count_files(eff_experiences, ('.md',))} experience record(s)"))
+    playbook_total = count_files(eff_playbooks, (".md",))
     active_playbooks = 0
     if playbook_total:
         try:
             from skill_playbooks import list_playbooks
 
             reports = list_playbooks(
-                playbooks_dir=PLAYBOOKS_DIR,
-                atoms_dir=ATOMS_DIR,
-                brain_dir=BRAIN_DIR,
+                playbooks_dir=eff_playbooks,
+                atoms_dir=eff_atoms,
+                brain_dir=eff_brain,
                 active_only=False,
             )
             active_playbooks = sum(1 for item in reports if item.valid)
         except Exception:
             active_playbooks = 0
     checks.append(ok("playbooks", f"{playbook_total} playbook file(s) ({active_playbooks} active)"))
-    skills_dir = os.path.join(BRAIN_DIR, "6-skills")
+    skills_dir = os.path.join(eff_brain, "6-skills")
     skill_total = count_files(skills_dir, (".md",)) if os.path.isdir(skills_dir) else 0
     active_skills = 0
     if skill_total:
@@ -377,19 +394,19 @@ def run_checks() -> list[tuple[str, str, str]]:
 
             sk_reports = list_executable_skills(
                 skills_dir=skills_dir,
-                playbooks_dir=PLAYBOOKS_DIR,
-                atoms_dir=ATOMS_DIR,
-                brain_dir=BRAIN_DIR,
+                playbooks_dir=eff_playbooks,
+                atoms_dir=eff_atoms,
+                brain_dir=eff_brain,
                 active_only=False,
             )
             active_skills = sum(1 for item in sk_reports if item.valid and item.status == "active")
         except Exception:
             active_skills = 0
     checks.append(ok("executable skills", f"{skill_total} executable skill file(s) ({active_skills} active)"))
-    checks.append(ok("sources", f"{count_files(SOURCES_DIR, ('.md',))} source file(s)"))
+    checks.append(ok("sources", f"{count_files(eff_sources, ('.md',))} source file(s)"))
 
-    notes_dir = os.path.join(BRAIN_DIR, "notes")
-    notes_index = os.path.join(BRAIN_DIR, ".sidecar", "notes.sqlite3")
+    notes_dir = os.path.join(eff_brain, "notes")
+    notes_index = os.path.join(eff_brain, ".sidecar", "notes.sqlite3")
     if os.path.isdir(notes_dir):
         idx_state = "indexed" if os.path.isfile(notes_index) else "index created on demand"
         checks.append(ok("notes", f"{count_files(notes_dir, ('.md',))} working note(s) ({idx_state})"))
@@ -400,9 +417,9 @@ def run_checks() -> list[tuple[str, str, str]]:
         from vault_ledger import verify_vault_ledger
 
         ledger_status = verify_vault_ledger(
-            brain_dir=BRAIN_DIR,
-            atoms_dir=ATOMS_DIR,
-            playbooks_dir=PLAYBOOKS_DIR,
+            brain_dir=eff_brain,
+            atoms_dir=eff_atoms,
+            playbooks_dir=eff_playbooks,
         )
         if ledger_status.get("chain_valid", False):
             cp_count = int(ledger_status.get("entry_count", 0))
@@ -461,12 +478,12 @@ def run_checks() -> list[tuple[str, str, str]]:
     except Exception as exc:
         checks.append(warn("onnx models", f"Could not inspect ONNX models: {exc}"))
 
-    raw_count = count_files(RAW_DIR, (".md", ".txt", ".intake"))
-    if os.path.exists(READING_LIST):
+    raw_count = count_files(eff_raw, (".md", ".txt", ".intake"))
+    if os.path.exists(eff_reading_list):
         raw_count = max(0, raw_count - 1)
-    inbox_count = count_files(INBOX_DIR, (".md", ".txt", ".intake"))
+    inbox_count = count_files(eff_inbox, (".md", ".txt", ".intake"))
     checks.append(ok("raw queue", f"{raw_count} queued capture(s), {inbox_count} quarantined in 0-raw/inbox"))
-    checks.append(ok("reading list", f"{queued_reading_items()} queued URL(s)"))
+    checks.append(ok("reading list", f"{queued_reading_items(eff_reading_list)} queued URL(s)"))
 
     dashboard = fetch_text("http://127.0.0.1:8501/_stcore/health", timeout=2.0)
     if dashboard is None:

@@ -1461,7 +1461,7 @@ class ExpandedMcpAndConnectorParityTests(unittest.TestCase):
             async def _run_all() -> None:
                 listed = await mcp_server.handle_list_tools(ctx, None)
                 self.assertEqual({tool.name for tool in listed.tools}, mcp_server.TOOL_NAMES)
-                self.assertEqual(len(listed.tools), 17)
+                self.assertEqual(len(listed.tools), 35)
 
                 # search_notes(project=...) strict scope isolation
                 sn_apollo = await _call("search_notes", {"query": "failover procedure", "project": "apollo"})

@@ -230,6 +230,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
         ),
     )
     scored_cases = [case for case in corpus["queries"] if case["answerability"] in {"answerable", "unanswerable"}]
+    cpu_eval_options = {"temperature": 0, "num_ctx": 1024, "num_predict": 192}
     if not _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
         try:
             call_ollama_chat_maybe_no_think(
@@ -237,7 +238,8 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                 model=model,
                 messages=[{"role": "user", "content": 'Return {"claims":[]}.'}],
                 format=ANSWER_DRAFT_SCHEMA,
-                options={"temperature": 0, "num_ctx": 1536, "num_predict": 16},
+                options=cpu_eval_options,
+                keep_alive="10m",
                 stream=False,
             )
         except Exception:
@@ -300,7 +302,8 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                         model=model,
                         messages=[{"role": "user", "content": redaction.sanitized_text}],
                         format=ANSWER_DRAFT_SCHEMA,
-                        options={"temperature": 0, "num_ctx": 1536},
+                        options=cpu_eval_options,
+                        keep_alive="10m",
                         stream=False,
                     )
                 raw_content = strip_reasoning_think_blocks(str(response["message"]["content"])) or "{}"

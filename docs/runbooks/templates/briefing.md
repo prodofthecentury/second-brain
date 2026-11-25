@@ -26,8 +26,8 @@ shift-end: 6:00 AM
 
 ## Contradictions You Should Resolve
 
-> These are flagged by the Critic. They are not auto-resolved.
-> Each one needs a human decision. Open both links, read them, decide.
+> Flagged via `second-brain graph contradictions` / Critic review. These are not auto-resolved (`AGENTS.md` Invariant 9).
+> Pending owner governance items can also be inspected via `uv run --locked second-brain gates status`.
 
 <!-- High priority = one directly contradicts the other             -->
 <!-- Medium priority = one weakens or qualifies the other           -->

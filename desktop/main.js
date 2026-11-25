@@ -28,8 +28,10 @@ const {
   removePortDiscoveryFileIfOwned,
   formatShortcut,
   buildPackagedRuntimeConfig,
+  buildUvBootstrapSteps,
   buildUvBootstrapArgs,
 } = require("./lib/port_discovery");
+const { createUpdaterController } = require("./lib/updater");
 
 const IS_SMOKE_TEST = process.argv.includes("--smoke-test");
 const isSmokeTest = IS_SMOKE_TEST;
@@ -435,7 +437,7 @@ function spawnBackendCli(args) {
   }
   return spawn(
     resolveUvBinary(),
-    ["--directory", cfg.backendRoot, "run", "--frozen", "python", ...resolvedArgs],
+    ["--directory", cfg.backendRoot, "run", "--frozen", "--no-dev", "python", ...resolvedArgs],
     {
       cwd: cfg.runtimeCwd,
       env,
@@ -547,9 +549,26 @@ function directoryExistsSafe(dirPath) {
 async function ensureBackendBootstrapped() {
   const cfg = getRuntimeConfig();
   const venvPy = getVenvPythonPath();
+  const bootstrapMarker = path.join(cfg.venvDir, ".sb-bootstrap-complete");
+  const expectedMarker = app.isPackaged ? `${String(app.getVersion() || "1.0.0")}:py3.11:v2` : "dev";
+  let markerMatches = false;
+  if (fs.existsSync(venvPy)) {
+    if (!app.isPackaged) {
+      markerMatches = true;
+    } else {
+      try {
+        const st = fs.lstatSync(bootstrapMarker);
+        if (st.isFile() && !st.isSymbolicLink() && st.size <= 128) {
+          markerMatches = fs.readFileSync(bootstrapMarker, "utf8").trim() === expectedMarker;
+        }
+      } catch {
+        markerMatches = false;
+      }
+    }
+  }
   let freshlySynced = false;
 
-  if (!fs.existsSync(venvPy)) {
+  if (!fs.existsSync(venvPy) || !markerMatches) {
     startupState.progressLines = [];
     emitBackendStatus(
       "bootstrapping",
@@ -560,34 +579,51 @@ async function ensureBackendBootstrapped() {
     if (app.isPackaged) {
       fs.mkdirSync(path.dirname(cfg.venvDir), { recursive: true });
     }
-    const hasWheelhouse = directoryExistsSafe(cfg.wheelhouseDir);
+    let hasWheelhouse = false;
+    if (directoryExistsSafe(cfg.wheelhouseDir)) {
+      try {
+        hasWheelhouse = fs
+          .readdirSync(cfg.wheelhouseDir)
+          .some((name) => name.endsWith(".whl"));
+      } catch {
+        hasWheelhouse = false;
+      }
+    }
     const uvBin = resolveUvBinary();
-    const uvArgs = buildUvBootstrapArgs({
+    const strictOffline = process.env.SECOND_BRAIN_STRICT_OFFLINE === "1";
+    const bootstrapSteps = buildUvBootstrapSteps({
       backendRoot: cfg.backendRoot,
       wheelhouseDir: cfg.wheelhouseDir,
+      venvDir: cfg.venvDir,
+      venvPython: cfg.venvPython,
       hasWheelhouse,
+      strictOffline,
     });
 
     try {
-      await runBootstrapStep(uvBin, uvArgs, cfg.runtimeCwd, env, {
-        timeoutMs: BOOTSTRAP_TIMEOUT_MS,
-        label: hasWheelhouse ? "Offline wheelhouse sync" : "Python env sync",
-      });
+      for (const step of bootstrapSteps) {
+        await runBootstrapStep(uvBin, step.args, cfg.runtimeCwd, env, {
+          timeoutMs: BOOTSTRAP_TIMEOUT_MS,
+          label: step.label,
+        });
+      }
       freshlySynced = true;
     } catch (err) {
       if (
         hasWheelhouse &&
         err?.code !== "ENOENT" &&
-        process.env.SECOND_BRAIN_STRICT_OFFLINE !== "1"
+        !strictOffline
       ) {
-        const onlineArgs = buildUvBootstrapArgs({
+        const onlineSteps = buildUvBootstrapSteps({
           backendRoot: cfg.backendRoot,
           hasWheelhouse: false,
         });
-        await runBootstrapStep(uvBin, onlineArgs, cfg.runtimeCwd, env, {
-          timeoutMs: BOOTSTRAP_TIMEOUT_MS,
-          label: "Python env sync (online fallback)",
-        });
+        for (const step of onlineSteps) {
+          await runBootstrapStep(uvBin, step.args, cfg.runtimeCwd, env, {
+            timeoutMs: BOOTSTRAP_TIMEOUT_MS,
+            label: `${step.label} (online fallback)`,
+          });
+        }
         freshlySynced = true;
       } else if (err && err.code === "ENOENT") {
         if (process.platform === "win32") {
@@ -626,6 +662,18 @@ async function ensureBackendBootstrapped() {
       } else {
         throw err;
       }
+    }
+    if (freshlySynced && app.isPackaged && fs.existsSync(venvPy)) {
+      await runBootstrapStep(
+        venvPy,
+        ["-c", "import second_brain, cryptography, httpx, yaml"],
+        cfg.runtimeCwd,
+        env,
+        { timeoutMs: 30000, label: "Verifying isolated Python runtime" }
+      );
+      try {
+        fs.writeFileSync(bootstrapMarker, `${expectedMarker}\n`, { encoding: "utf8", mode: 0o600 });
+      } catch {}
     }
   }
 
@@ -1503,6 +1551,76 @@ const handlePickFolderIpc = async (event) => {
 ipcMain.handle("dialog:pick-folder", handlePickFolderIpc);
 ipcMain.handle("dialog:pickFolder", handlePickFolderIpc);
 
+ipcMain.handle("build:export-files", async (event, payload = {}) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  const rawFiles = Array.isArray(payload?.files) ? payload.files : [];
+  if (!rawFiles.length) {
+    return { ok: false, error: "No build artifacts to export." };
+  }
+  if (rawFiles.length > 24) {
+    return { ok: false, error: "Too many build artifact files (max 24)." };
+  }
+  const dlg = await dialog.showOpenDialog(mainWindow || undefined, {
+    title: "Choose Folder to Export Build Artifacts",
+    properties: ["openDirectory", "createDirectory"],
+  });
+  if (dlg.canceled || !dlg.filePaths.length) {
+    return { ok: false, cancelled: true };
+  }
+  const WINDOWS_RESERVED_STEM_RE = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i;
+  const baseReal = fs.realpathSync(dlg.filePaths[0]);
+  const basePrefix = baseReal.endsWith(path.sep) ? baseReal : baseReal + path.sep;
+  const written = [];
+  for (const item of rawFiles) {
+    const rawRel = String(item?.filename || "")
+      .replace(/\\/g, "/")
+      .replace(/^\/+|\/+$/g, "")
+      .trim();
+    if (!rawRel || rawRel.includes("\0") || /^[A-Za-z]:/.test(rawRel)) {
+      throw new Error(`Invalid relative artifact path: ${rawRel}`);
+    }
+    const segs = rawRel.split("/").filter(Boolean);
+    if (
+      !segs.length ||
+      segs.some(
+        (s) =>
+          s === "." ||
+          s === ".." ||
+          /[^A-Za-z0-9._-]/.test(s) ||
+          s.endsWith(".") ||
+          WINDOWS_RESERVED_STEM_RE.test(s)
+      )
+    ) {
+      throw new Error(`Unsafe artifact path segment in: ${rawRel}`);
+    }
+    const contentStr = String(item?.content ?? "");
+    if (Buffer.byteLength(contentStr, "utf8") > 1_000_000) {
+      throw new Error(`Artifact exceeds 1 MB limit: ${rawRel}`);
+    }
+    const targetPath = path.resolve(baseReal, ...segs);
+    if (!targetPath.startsWith(basePrefix)) {
+      throw new Error(`Resolved path escapes target directory: ${rawRel}`);
+    }
+    let cur = baseReal;
+    for (const dirSeg of segs.slice(0, -1)) {
+      cur = path.join(cur, dirSeg);
+      if (fs.existsSync(cur)) {
+        if (fs.lstatSync(cur).isSymbolicLink()) {
+          throw new Error(`Refusing symlinked export subdirectory: ${cur}`);
+        }
+      } else {
+        fs.mkdirSync(cur);
+      }
+    }
+    if (fs.existsSync(targetPath) && fs.lstatSync(targetPath).isSymbolicLink()) {
+      throw new Error(`Refusing symlinked export file: ${targetPath}`);
+    }
+    fs.writeFileSync(targetPath, contentStr, "utf8");
+    written.push(targetPath);
+  }
+  return { ok: true, directory: baseReal, written };
+});
+
 ipcMain.handle("dialog:pick-save-backup", async (event) => {
   assertTrustedRenderer(event, { allowCapture: false });
   const stamp = new Date().toISOString().slice(0, 10);
@@ -1579,8 +1697,8 @@ ipcMain.handle("shell:open-external", async (event, payload = {}) => {
   return { ok: true };
 });
 
-const ALLOWED_IDE_ACTIONS = new Set(["status", "add", "remove"]);
-const IDE_TARGET_RE = /^[a-z0-9-]+$/;
+const ALLOWED_IDE_ACTIONS = new Set(["status", "add", "remove", "custom-add", "custom-remove"]);
+const IDE_TARGET_RE = /^[a-z0-9_-]{2,48}$/;
 
 ipcMain.handle("ide:action", async (event, payload = {}) => {
   assertTrustedRenderer(event, { allowCapture: false });
@@ -1595,7 +1713,7 @@ ipcMain.handle("ide:action", async (event, payload = {}) => {
   if (!ALLOWED_IDE_ACTIONS.has(action)) {
     throw new Error(`Disallowed IDE action: ${String(action)}`);
   }
-  if (action === "add" || action === "remove") {
+  if (action === "add" || action === "remove" || action === "custom-add" || action === "custom-remove") {
     if (
       typeof target !== "string" ||
       target.startsWith("-") ||
@@ -1622,6 +1740,22 @@ ipcMain.handle("ide:action", async (event, payload = {}) => {
   if (action === "add" && options?.confirmPrivacy === true) {
     args.push("--yes");
   }
+  if (action === "custom-add") {
+    const cfgPath = String(options?.configPath || "").trim();
+    if (!cfgPath || cfgPath.includes("\0")) {
+      throw new Error("configPath is required for custom-add.");
+    }
+    if (options?.label) {
+      args.push("--label", String(options.label).slice(0, 120));
+    }
+    args.push("--config-path", cfgPath);
+    if (options?.serversKey) {
+      args.push("--servers-key", String(options.serversKey).slice(0, 64));
+    }
+    if (options?.configFormat) {
+      args.push("--format", String(options.configFormat).slice(0, 16));
+    }
+  }
   args.push("--json");
   const { stdout } = await runBackendCli(args);
   const parsed = JSON.parse(stdout);
@@ -1641,6 +1775,42 @@ ipcMain.handle("capture:close", (event) => {
 ipcMain.handle("capture:saved", (event) => {
   assertTrustedRenderer(event, { allowCapture: true });
   notifyMainWindowRefresh();
+});
+
+const updaterController = createUpdaterController({
+  app,
+  emitStatus: (st) => {
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("updater:event", st);
+      }
+    } catch {}
+  },
+  onBeforeQuitInstall: async () => {
+    isQuitting = true;
+    abortActiveChatStream();
+    await stopApiSidecar();
+  },
+});
+
+ipcMain.handle("updater:status", (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  return updaterController.getStatus();
+});
+
+ipcMain.handle("updater:check", async (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  return updaterController.checkForUpdates();
+});
+
+ipcMain.handle("updater:download", async (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  return updaterController.downloadUpdate();
+});
+
+ipcMain.handle("updater:install", async (event) => {
+  assertTrustedRenderer(event, { allowCapture: false });
+  return updaterController.quitAndInstallUpdate();
 });
 
 app.on("activate", () => {
@@ -1715,18 +1885,40 @@ app.whenReady().then(async () => {
     });
 });
 
-app.on("before-quit", () => {
+let quitCleanupComplete = false;
+let quitCleanupInFlight = false;
+
+app.on("before-quit", (event) => {
+  if (quitCleanupComplete) {
+    return;
+  }
+  if (quitCleanupInFlight) {
+    event.preventDefault();
+    return;
+  }
   isQuitting = true;
   apiReady = false;
   abortActiveChatStream();
   globalShortcut.unregisterAll();
   const pidToClean = spawnedApiPid || (apiProcess && apiProcess.pid) || null;
-  spawnedApiPid = null;
   if (apiProcess) {
+    event.preventDefault();
+    quitCleanupInFlight = true;
+    spawnedApiPid = null;
     const proc = apiProcess;
     apiProcess = null;
-    killProcessTree(proc).finally(() => cleanupOwnedPortFile(pidToClean));
+    Promise.resolve()
+      .then(() => killProcessTree(proc))
+      .catch(() => {})
+      .finally(() => {
+        cleanupOwnedPortFile(pidToClean);
+        quitCleanupComplete = true;
+        quitCleanupInFlight = false;
+        app.quit();
+      });
   } else {
+    spawnedApiPid = null;
     cleanupOwnedPortFile(pidToClean);
+    quitCleanupComplete = true;
   }
 });

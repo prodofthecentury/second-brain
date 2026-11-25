@@ -38,8 +38,12 @@ from config import (
     TELEMETRY_DB_PATH,
     _is_reparse_or_link,
     is_content_markdown,
+    resolve_module_vault_path,
     safe_file_in_dir,
+    snapshot_module_defaults,
 )
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 from evidence import verify_evidence_anchor
 from host_adapters import (
     HostConsentError,
@@ -472,13 +476,13 @@ def _save_plan_briefing(plan: ExecutivePlanResult, *, brain_dir: str, briefings_
 def assemble_executive_plan(
     request: ExecutivePlanRequest,
     *,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
-    playbooks_dir: str = PLAYBOOKS_DIR,
-    briefings_dir: str = BRIEFINGS_DIR,
-    lexical_index_path: str = LEXICAL_INDEX_PATH,
-    chroma_path: str = CHROMA_PATH,
-    telemetry_db_path: str = TELEMETRY_DB_PATH,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
+    playbooks_dir: str | None = None,
+    briefings_dir: str | None = None,
+    lexical_index_path: str | None = None,
+    chroma_path: str | None = None,
+    telemetry_db_path: str | None = None,
     policy_path: Path | None = None,
     security_dir: str | Path | None = None,
     http_transport: httpx.BaseTransport | None = None,
@@ -491,6 +495,17 @@ def assemble_executive_plan(
         raise ValueError("ExecutivePlanRequest requires a non-empty goal.")
     if request.mode not in {"deterministic", "model_assisted"}:
         raise ValueError(f"Unsupported planning mode: {request.mode!r}")
+
+    explicit_brain_for_siblings = brain_dir
+    if brain_dir is None and atoms_dir is not None and str(atoms_dir).strip():
+        explicit_brain_for_siblings = os.path.dirname(os.path.abspath(atoms_dir))
+    brain_dir = resolve_module_vault_path(globals(), "BRAIN_DIR", explicit_brain_for_siblings)
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir, brain_dir=explicit_brain_for_siblings)
+    playbooks_dir = resolve_module_vault_path(globals(), "PLAYBOOKS_DIR", playbooks_dir, brain_dir=explicit_brain_for_siblings)
+    briefings_dir = resolve_module_vault_path(globals(), "BRIEFINGS_DIR", briefings_dir, brain_dir=explicit_brain_for_siblings)
+    lexical_index_path = resolve_module_vault_path(globals(), "LEXICAL_INDEX_PATH", lexical_index_path, brain_dir=explicit_brain_for_siblings)
+    chroma_path = resolve_module_vault_path(globals(), "CHROMA_PATH", chroma_path, brain_dir=explicit_brain_for_siblings)
+    telemetry_db_path = resolve_module_vault_path(globals(), "TELEMETRY_DB_PATH", telemetry_db_path, brain_dir=explicit_brain_for_siblings)
 
     projects = (request.project_scope.strip(),) if request.project_scope and request.project_scope.strip() else ()
 
@@ -843,6 +858,23 @@ def assemble_executive_plan(
         for r in pb.failure_recovery:
             if r not in final_rollback_checkpoints:
                 final_rollback_checkpoints.append(r)
+
+    try:
+        from cognitive_distiller import list_distilled_artifacts
+
+        proj_arg = None if request.allow_cross_project else (projects[0] if len(projects) == 1 else None)
+        for pr in list_distilled_artifacts(kind="principle", project=proj_arg, active_only=True, brain_dir=brain_dir, atoms_dir=atoms_dir)[:3]:
+            stmt = str(pr.get("statement") or pr.get("title") or "").strip()
+            tag = f"[Principle: {pr['filename']}] {stmt}"
+            if stmt and tag not in final_preconditions:
+                final_preconditions.append(tag)
+        for mm in list_distilled_artifacts(kind="mental_model", project=proj_arg, active_only=True, brain_dir=brain_dir, atoms_dir=atoms_dir)[:2]:
+            stmt = str(mm.get("statement") or mm.get("title") or "").strip()
+            tag = f"[Mental Model: {mm['filename']}] {stmt}"
+            if stmt and tag not in final_preconditions:
+                final_preconditions.append(tag)
+    except Exception:
+        pass
 
     selected_atom_count = sum(1 for s in selected_steps if s.kind in {"procedural_atom", "semantic_constraint"})
     plan = ExecutivePlanResult(

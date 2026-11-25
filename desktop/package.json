@@ -16,6 +16,9 @@
   },
   "author": "Second Brain",
   "license": "MIT",
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
   "devDependencies": {
     "electron": "^35.0.0",
     "electron-builder": "^26.0.12"
@@ -23,8 +26,16 @@
   "build": {
     "appId": "com.secondbrain.desktop",
     "productName": "Second Brain",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "prodofthecentury",
+        "repo": "second-brain"
+      }
+    ],
     "afterPack": "./build/afterPack.js",
     "afterSign": "./build/notarize.js",
+    "afterAllArtifactBuild": "./build/afterAllArtifactBuild.js",
     "toolsets": {
       "winCodeSign": "1.1.0"
     },
@@ -50,7 +61,13 @@
         "from": "../scripts",
         "to": "backend/scripts",
         "filter": [
-          "**/*.py"
+          "**/*.py",
+          "!**/*_tests.py",
+          "!test_all.py",
+          "!smoke_test.py",
+          "!run_desktop_tests.py",
+          "!run_vscode_tests.py",
+          "!**/*_canary.py"
         ]
       },
       {
@@ -78,14 +95,49 @@
       },
       {
         "from": "../plugins",
-        "to": "backend/plugins"
+        "to": "backend/plugins",
+        "filter": [
+          "**/*",
+          "!**/mcp_config.json",
+          "!**/*.bak*",
+          "!**/.env*",
+          "!**/*.key",
+          "!**/*.pem",
+          "!**/*.pfx",
+          "!**/*.p12"
+        ]
       },
       {
         "from": "../mobile",
         "to": "backend/mobile",
         "filter": [
           "**/*",
-          "!**/node_modules/**"
+          "!**/node_modules/**",
+          "!**/test/**",
+          "!**/tests/**",
+          "!**/androidTest/**",
+          "!**/fastlane/**",
+          "!**/package-lock.json",
+          "!**/.gradle/**",
+          "!**/android/build/**",
+          "!**/android/app/build/**",
+          "!**/android/local.properties",
+          "!**/gradle-wrapper.jar",
+          "!**/android/app/src/main/assets/public/**",
+          "!**/ios/Pods/**",
+          "!**/ios/DerivedData/**",
+          "!**/ios/App/App/public/**",
+          "!**/*.jks",
+          "!**/*.keystore",
+          "!**/*.p12",
+          "!**/*.pfx",
+          "!**/*.p8",
+          "!**/*.pem",
+          "!**/*.key",
+          "!**/*.sbvault",
+          "!**/.env*",
+          "!**/google-services.json",
+          "!**/play-key.json"
         ]
       },
       {

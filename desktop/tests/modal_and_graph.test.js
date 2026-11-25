@@ -182,4 +182,86 @@ describe("Modal Workflow Helpers & Interactive 2D SVG Knowledge Graph", () => {
     assert.equal(selectedEvents[0].node.id, "pg-lock.md");
     assert.ok(selectedEvents[0].edges.length >= 1);
   });
+
+  it("filters bi-temporal nodes via asOf & includeExpired and styles expired SVG circles dashed", () => {
+    const graphPayload = {
+      nodes: [
+        {
+          id: "active-2026.md",
+          label: "Current API v2 Policy",
+          review_status: "accepted",
+          verified: true,
+          valid_from: "2026-01-01",
+          valid_until: "2026-12-31",
+          temporal_status: "active",
+        },
+        {
+          id: "legacy-2024.md",
+          label: "Deprecated API v1 Policy",
+          review_status: "accepted",
+          verified: true,
+          valid_from: "2024-01-01",
+          valid_until: "2024-12-31",
+          temporal_status: "expired",
+        },
+        {
+          id: "future-2028.md",
+          label: "Planned API v3 Policy",
+          review_status: "accepted",
+          verified: true,
+          valid_from: "2028-01-01",
+          temporal_status: "not_yet_valid",
+        },
+      ],
+      edges: [
+        { from: "legacy-2024.md", to: "active-2026.md", kind: "supersedes" },
+      ],
+    };
+
+    // As Of 2024-06-15 -> only legacy-2024.md is active
+    const hist2024 = filterGraphData(graphPayload, {
+      asOf: "2024-06-15",
+      includeExpired: false,
+      includePending: true,
+    });
+    assert.deepEqual(hist2024.nodes.map((n) => n.id), ["legacy-2024.md"]);
+    assert.equal(hist2024.edges.length, 0);
+
+    // As Of 2026-06-15 with includeExpired=false -> only active-2026.md
+    const mid2026 = filterGraphData(graphPayload, {
+      asOf: "2026-06-15",
+      includeExpired: false,
+      includePending: true,
+    });
+    assert.deepEqual(mid2026.nodes.map((n) => n.id), ["active-2026.md"]);
+
+    // As Of 2026-06-15 with includeExpired=true -> legacy-2024 marked expired, active-2026 active, future-2028 marked not_yet_valid
+    const withExpired = filterGraphData(graphPayload, {
+      asOf: "2026-06-15",
+      includeExpired: true,
+      includePending: true,
+    });
+    assert.equal(withExpired.nodes.length, 3);
+    const byId = new Map(withExpired.nodes.map((n) => [n.id, n]));
+    assert.equal(byId.get("legacy-2024.md").temporal_status, "expired");
+    assert.equal(byId.get("active-2026.md").temporal_status, "active");
+    assert.equal(byId.get("future-2028.md").temporal_status, "not_yet_valid");
+
+    // Render SVG and verify expired node carries dashed styling
+    const { doc, body } = createTestDom();
+    const container = doc.createElement("div");
+    body.appendChild(container);
+    const viewer = createGraphViewer(container, { doc, width: 640, height: 420 });
+    viewer.render(graphPayload, {
+      asOf: "2026-06-15",
+      includeExpired: true,
+      includePending: true,
+    });
+    const circles = container.querySelectorAll("circle");
+    assert.equal(circles.length, 3);
+    assert.ok(
+      circles.some((c) => c.getAttribute("stroke-dasharray")),
+      "Expected at least one dashed SVG circle for expired/future bi-temporal node"
+    );
+  });
 });

@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import sys
 from typing import Any
 import zipfile
 
@@ -25,7 +26,16 @@ INCLUDE_FILES = (
     "README.md",
     "lib/clipper-client.js",
     "lib/readability-markdown.js",
+    "icons/icon-16.png",
+    "icons/icon-32.png",
+    "icons/icon-48.png",
+    "icons/icon-128.png",
 )
+FIREFOX_BACKGROUND_SCRIPTS = [
+    "lib/clipper-client.js",
+    "lib/readability-markdown.js",
+    "background.js",
+]
 _FIXED_ZIP_DT = (2026, 1, 1, 0, 0, 0)
 
 
@@ -94,14 +104,20 @@ def build_store_clipper_bundles(out_dir: str | Path | None = None) -> dict[str, 
     version = str(base_manifest.get("version") or "1.0.0")
     dest_dir = universal_path.parent
 
-    icons = {sz: _render_clipper_icon_png(sz) for sz in (16, 48, 128)}
-    icon_map = {str(sz): f"icons/icon-{sz}.png" for sz in (16, 48, 128)}
+    icons = {
+        sz: (CLIPPER_DIR / f"icons/icon-{sz}.png").read_bytes()
+        if (CLIPPER_DIR / f"icons/icon-{sz}.png").is_file()
+        else _render_clipper_icon_png(sz)
+        for sz in (16, 32, 48, 128)
+    }
+    icon_map = {str(sz): f"icons/icon-{sz}.png" for sz in (16, 32, 48, 128)}
 
     # 1. Chromium (Chrome Web Store + Microsoft Edge Add-ons): strict service_worker-only MV3 + icons
     chromium_manifest = dict(base_manifest)
     chromium_manifest.pop("browser_specific_settings", None)
     chromium_bg = dict(chromium_manifest.get("background") or {})
     chromium_bg.pop("scripts", None)
+    chromium_bg.setdefault("service_worker", "background.js")
     chromium_manifest["background"] = chromium_bg
     chromium_manifest["icons"] = icon_map
     chromium_action = dict(chromium_manifest.get("action") or {})
@@ -126,7 +142,7 @@ def build_store_clipper_bundles(out_dir: str | Path | None = None) -> dict[str, 
         )
         _write_deterministic_entry(zf, "background.js", chromium_bg_js)
         for rel in INCLUDE_FILES:
-            if rel in {"manifest.json", "background.js"}:
+            if rel in {"manifest.json", "background.js"} or rel.startswith("icons/"):
                 continue
             _write_deterministic_entry(zf, rel, (CLIPPER_DIR / rel).read_bytes())
         for sz, png_bytes in icons.items():
@@ -136,6 +152,7 @@ def build_store_clipper_bundles(out_dir: str | Path | None = None) -> dict[str, 
     firefox_manifest = dict(base_manifest)
     firefox_bg = dict(firefox_manifest.get("background") or {})
     firefox_bg.pop("service_worker", None)
+    firefox_bg["scripts"] = list(FIREFOX_BACKGROUND_SCRIPTS)
     firefox_manifest["background"] = firefox_bg
     gecko = dict((firefox_manifest.get("browser_specific_settings") or {}).get("gecko") or {})
     gecko.setdefault("id", "clipper@secondbrain.local")
@@ -153,9 +170,28 @@ def build_store_clipper_bundles(out_dir: str | Path | None = None) -> dict[str, 
             zf, "manifest.json", (json.dumps(firefox_manifest, indent=2) + "\n").encode("utf-8")
         )
         for rel in INCLUDE_FILES:
-            if rel == "manifest.json":
+            if rel == "manifest.json" or rel.startswith("icons/"):
                 continue
             _write_deterministic_entry(zf, rel, (CLIPPER_DIR / rel).read_bytes())
+        for sz, png_bytes in icons.items():
+            _write_deterministic_entry(zf, f"icons/icon-{sz}.png", png_bytes)
+
+    # 4. Safari Web Extension MV3 bundle (.zip ready for xcrun safari-web-extension-converter / Xcode)
+    safari_manifest = dict(base_manifest)
+    safari_manifest.pop("browser_specific_settings", None)
+    safari_bg = dict(safari_manifest.get("background") or {})
+    safari_bg["service_worker"] = "background.js"
+    safari_manifest["background"] = safari_bg
+    safari_path = dest_dir / f"second-brain-clipper-safari-{version}.zip"
+    with zipfile.ZipFile(safari_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        _write_deterministic_entry(
+            zf, "manifest.json", (json.dumps(safari_manifest, indent=2) + "\n").encode("utf-8")
+        )
+        for rel in INCLUDE_FILES:
+            if rel in {"manifest.json", "background.js"} or rel.startswith("icons/"):
+                continue
+            _write_deterministic_entry(zf, rel, (CLIPPER_DIR / rel).read_bytes())
+        _write_deterministic_entry(zf, "background.js", chromium_bg_js)
         for sz, png_bytes in icons.items():
             _write_deterministic_entry(zf, f"icons/icon-{sz}.png", png_bytes)
 
@@ -167,7 +203,64 @@ def build_store_clipper_bundles(out_dir: str | Path | None = None) -> dict[str, 
         "chromium_sha256": hashlib.sha256(chromium_path.read_bytes()).hexdigest(),
         "firefox_xpi": str(firefox_path),
         "firefox_sha256": hashlib.sha256(firefox_path.read_bytes()).hexdigest(),
+        "safari_zip": str(safari_path),
+        "safari_sha256": hashlib.sha256(safari_path.read_bytes()).hexdigest(),
     }
+
+
+def convert_safari_web_extension(
+    *,
+    project_out_dir: str | Path,
+    app_name: str = "SecondBrainClipper",
+    bundle_identifier: str = "com.secondbrain.clipper.safari",
+    runner: object | None = None,
+) -> dict[str, Any]:
+    """Generate an Xcode Safari Web Extension wrapper on macOS via xcrun (never modifies base MV3 files)."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    exec_runner = runner or subprocess.run
+    if sys.platform != "darwin" and runner is None:
+        return {
+            "status": "skipped_non_macos",
+            "reason": "xcrun safari-web-extension-converter requires macOS Xcode tools.",
+        }
+    xcrun_bin = shutil.which("xcrun") or "xcrun"
+    dest = Path(project_out_dir).expanduser().resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="sb_safari_src_") as tmp:
+        bundles = build_store_clipper_bundles(tmp)
+        unpacked = Path(tmp) / "safari-extension"
+        unpacked.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(bundles["safari_zip"], "r") as zf:
+            zf.extractall(unpacked)
+        cmd = [
+            xcrun_bin,
+            "safari-web-extension-converter",
+            str(unpacked),
+            "--project-location",
+            str(dest),
+            "--app-name",
+            str(app_name),
+            "--bundle-identifier",
+            str(bundle_identifier),
+            "--no-open",
+            "--no-prompt",
+            "--force",
+        ]
+        proc = exec_runner(cmd, check=False, capture_output=True, text=True)
+        if getattr(proc, "returncode", 1) != 0:
+            raise RuntimeError(
+                f"Safari Web Extension converter failed: {getattr(proc, 'stderr', '') or getattr(proc, 'stdout', '')}"
+            )
+        return {
+            "status": "converted",
+            "project_location": str(dest),
+            "app_name": app_name,
+            "bundle_identifier": bundle_identifier,
+            "safari_zip": bundles["safari_zip"],
+        }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -182,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Built Browser Web Clipper (universal): {res['universal_zip']}")
         print(f"Built Browser Web Clipper (Chrome/Edge): {res['chromium_zip']}")
         print(f"Built Browser Web Clipper (Firefox AMO): {res['firefox_xpi']}")
+        print(f"Built Browser Web Clipper (Safari MV3): {res['safari_zip']}")
     return 0
 
 

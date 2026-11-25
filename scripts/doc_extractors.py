@@ -101,6 +101,22 @@ class DocumentExtraction:
 def _clean_line(value: str) -> str:
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
     text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
+    # Preserve raw LaTeX display/inline spans verbatim without collapsing spacing inside equations
+    if "$" in text or "\\[" in text or "\\(" in text or "\\begin{" in text:
+        from math_equivalence import _LATEX_SPAN_RE
+
+        placeholders: list[str] = []
+
+        def _stash(match: re.Match[str]) -> str:
+            idx = len(placeholders)
+            placeholders.append(match.group(0))
+            return f" __LATEX_SPAN_{idx}__ "
+
+        masked = _LATEX_SPAN_RE.sub(_stash, text)
+        cleaned = _WS_RE.sub(" ", masked).strip()
+        for idx, original in enumerate(placeholders):
+            cleaned = cleaned.replace(f"__LATEX_SPAN_{idx}__", original)
+        return cleaned
     return _WS_RE.sub(" ", text).strip()
 
 
@@ -503,6 +519,220 @@ def _sanitize_pdf_image_to_png(raw_bytes: bytes) -> bytes | None:
         return None
 
 
+def _extract_page_image_bytes(page, *, max_depth: int = 3) -> list[bytes]:
+    """Collect embedded image byte blobs from a PDF page and nested Form XObjects."""
+    blobs: list[bytes] = []
+    try:
+        for img_obj in getattr(page, "images", ()) or ():
+            raw = getattr(img_obj, "data", None)
+            if isinstance(raw, (bytes, bytearray)) and raw:
+                blobs.append(bytes(raw))
+    except Exception:
+        pass
+
+    visited_refs: set[object] = set()
+
+    def _walk_resources(resources_obj: Any, depth: int) -> None:
+        if depth > max_depth or resources_obj is None:
+            return
+        try:
+            res = resources_obj.get_object() if hasattr(resources_obj, "get_object") else resources_obj
+            if not isinstance(res, dict):
+                return
+            xobjs = res.get("/XObject")
+            xobjs = xobjs.get_object() if hasattr(xobjs, "get_object") else xobjs
+            if not isinstance(xobjs, dict):
+                return
+            for _name, val in xobjs.items():
+                ref = getattr(val, "indirect_reference", None)
+                if ref is not None:
+                    if ref in visited_refs:
+                        continue
+                    visited_refs.add(ref)
+                obj = val.get_object() if hasattr(val, "get_object") else val
+                subtype = str(obj.get("/Subtype") or "") if hasattr(obj, "get") else ""
+                if subtype == "/Image":
+                    data_bytes = None
+                    try:
+                        data_bytes = obj.get_data()
+                    except Exception:
+                        pass
+                    if isinstance(data_bytes, (bytes, bytearray)) and data_bytes:
+                        raw_b = bytes(data_bytes)
+                        if raw_b not in blobs:
+                            blobs.append(raw_b)
+                elif subtype == "/Form":
+                    _walk_resources(obj.get("/Resources"), depth + 1)
+        except Exception:
+            return
+
+    if not blobs:
+        try:
+            _walk_resources(page.get("/Resources"), 0)
+        except Exception:
+            pass
+    return blobs
+
+
+def _page_has_non_text_visual_content(page) -> bool:
+    """Return True when a PDF page embeds images or non-trivial drawing operators."""
+    if _extract_page_image_bytes(page, max_depth=2):
+        return True
+    try:
+        contents = page.get_contents()
+        if contents is not None:
+            raw_stream = contents.get_data() if hasattr(contents, "get_data") else b""
+            if isinstance(raw_stream, (bytes, bytearray)) and len(bytes(raw_stream).strip()) > 12:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _rasterize_pdf_page_to_png(pdf_path: str | Path, page_number: int) -> bytes | None:
+    """Render a 1-indexed PDF page into a Pillow-validated PNG byte string, or return None."""
+    target = str(pdf_path)
+    if not os.path.isfile(target) or page_number < 1:
+        return None
+
+    # 1. pypdfium2 (fast pure wheel when installed)
+    try:
+        import pypdfium2 as pdfium  # type: ignore[import-not-found]
+
+        doc = pdfium.PdfDocument(target)
+        try:
+            if page_number <= len(doc):
+                page = doc[page_number - 1]
+                pil_img = page.render(scale=150.0 / 72.0).to_pil()
+                buf = io.BytesIO()
+                pil_img.save(buf, format="PNG")
+                return _sanitize_pdf_image_to_png(buf.getvalue())
+        finally:
+            doc.close()
+    except Exception:
+        pass
+
+    # 2. PyMuPDF (fitz)
+    try:
+        import fitz  # type: ignore[import-not-found]
+
+        doc = fitz.open(target)
+        try:
+            if page_number <= len(doc):
+                pix = doc[page_number - 1].get_pixmap(dpi=150)
+                return _sanitize_pdf_image_to_png(pix.tobytes("png"))
+        finally:
+            doc.close()
+    except Exception:
+        pass
+
+    # 3. Poppler pdftoppm CLI
+    pdftoppm = shutil.which("pdftoppm")
+    if pdftoppm and not _is_reparse_or_link(pdftoppm):
+        with tempfile.TemporaryDirectory(prefix=".sb-pdftoppm-") as tmpdir:
+            out_prefix = os.path.join(tmpdir, "page")
+            try:
+                proc = subprocess.run(
+                    [pdftoppm, "-png", "-r", "150", "-f", str(page_number), "-l", str(page_number), "-singlefile", target, out_prefix],
+                    capture_output=True,
+                    timeout=20.0,
+                    check=False,
+                )
+                out_png = Path(f"{out_prefix}.png")
+                if proc.returncode == 0 and out_png.is_file():
+                    return _sanitize_pdf_image_to_png(out_png.read_bytes())
+            except Exception:
+                pass
+
+    # 4. MuPDF mutool CLI
+    mutool = shutil.which("mutool")
+    if mutool and not _is_reparse_or_link(mutool):
+        with tempfile.TemporaryDirectory(prefix=".sb-mutool-") as tmpdir:
+            out_png = Path(tmpdir) / "page.png"
+            try:
+                proc = subprocess.run(
+                    [mutool, "draw", "-F", "png", "-r", "150", "-o", str(out_png), target, str(page_number)],
+                    capture_output=True,
+                    timeout=20.0,
+                    check=False,
+                )
+                if proc.returncode == 0 and out_png.is_file():
+                    return _sanitize_pdf_image_to_png(out_png.read_bytes())
+            except Exception:
+                pass
+
+    # 5. Windows built-in WinRT PDF renderer (Windows.Data.Pdf.PdfDocument)
+    if sys.platform == "win32":
+        with tempfile.TemporaryDirectory(prefix=".sb-winpdf-") as tmpdir:
+            out_png = Path(tmpdir) / "page.png"
+            ps_script = (
+                "$ErrorActionPreference='Stop'; "
+                "Add-Type -AssemblyName System.Runtime.WindowsRuntime; "
+                "$null = [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType=WindowsRuntime]; "
+                "$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]; "
+                "$null = [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType=WindowsRuntime]; "
+                "$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethodDefinition })[0]; "
+                "$asTaskAction = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and -not $_.IsGenericMethodDefinition })[0]; "
+                "function Await($op, $t) { $m = $asTask.MakeGenericMethod($t); $task = $m.Invoke($null, @($op)); $task.Wait(); return $task.Result }; "
+                "function AwaitAction($op) { $task = $asTaskAction.Invoke($null, @($op)); $task.Wait() }; "
+                "$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($env:SB_PDF_PATH)) ([Windows.Storage.StorageFile]); "
+                "$doc = Await ([Windows.Data.Pdf.PdfDocument]::LoadFromFileAsync($file)) ([Windows.Data.Pdf.PdfDocument]); "
+                "$idx = [uint32]$env:SB_PDF_PAGE_ZERO; "
+                "if ($idx -ge $doc.PageCount) { exit 2 }; "
+                "$pg = $doc.GetPage($idx); "
+                "$stream = [Windows.Storage.Streams.InMemoryRandomAccessStream]::new(); "
+                "AwaitAction ($pg.RenderToStreamAsync($stream)); "
+                "$stream.Seek(0); "
+                "$netStream = [System.IO.WindowsRuntimeStreamExtensions]::AsStream($stream); "
+                "$fs = [System.IO.File]::Create($env:SB_PNG_PATH); "
+                "$netStream.CopyTo($fs); $fs.Dispose(); $pg.Dispose();"
+            )
+            env = dict(os.environ)
+            env["SB_PDF_PATH"] = os.path.abspath(target)
+            env["SB_PNG_PATH"] = str(out_png)
+            env["SB_PDF_PAGE_ZERO"] = str(page_number - 1)
+            ps_exe = os.path.join(
+                os.environ.get("SystemRoot") or r"C:\Windows",
+                "System32",
+                "WindowsPowerShell",
+                "v1.0",
+                "powershell.exe",
+            )
+            if os.path.isfile(ps_exe) and not _is_reparse_or_link(ps_exe):
+                try:
+                    proc = subprocess.run(
+                        [ps_exe, "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                        env=env,
+                        capture_output=True,
+                        timeout=15.0,
+                        check=False,
+                    )
+                    if proc.returncode == 0 and out_png.is_file():
+                        return _sanitize_pdf_image_to_png(out_png.read_bytes())
+                except Exception:
+                    pass
+
+    # 6. macOS Quartz / sips fallback (page 1 when sips is present)
+    if sys.platform == "darwin":
+        sips = shutil.which("sips")
+        if sips and page_number == 1 and not _is_reparse_or_link(sips):
+            with tempfile.TemporaryDirectory(prefix=".sb-sips-") as tmpdir:
+                out_png = Path(tmpdir) / "page.png"
+                try:
+                    proc = subprocess.run(
+                        [sips, "-s", "format", "png", target, "--out", str(out_png)],
+                        capture_output=True,
+                        timeout=15.0,
+                        check=False,
+                    )
+                    if proc.returncode == 0 and out_png.is_file():
+                        return _sanitize_pdf_image_to_png(out_png.read_bytes())
+                except Exception:
+                    pass
+
+    return None
+
+
 def _run_local_ocr_on_png(
     png_bytes: bytes,
     page_number: int,
@@ -551,15 +781,23 @@ def _run_local_ocr_on_png(
         try:
             import base64
             from config import VISION_MODEL
+            from hardware_profile import call_ollama_chat_maybe_no_think, strip_reasoning_think_blocks
             from host_adapters import validate_model_identifier
             import ollama
             from ollama_utils import _resolve_local_ollama_rule_and_url
 
             _eff_rule, base_url = _resolve_local_ollama_rule_and_url()
-            safe_vision_model = validate_model_identifier(VISION_MODEL, provider="ollama")
+            try:
+                from ingest_multimodal import select_vision_model
+
+                chosen_vision = select_vision_model() or VISION_MODEL
+            except Exception:
+                chosen_vision = VISION_MODEL
+            safe_vision_model = validate_model_identifier(chosen_vision, provider="ollama")
             b64_img = base64.b64encode(png_bytes).decode("ascii")
-            client = ollama.Client(host=base_url, timeout=30.0, follow_redirects=False, trust_env=False)
-            resp = client.chat(
+            client = ollama.Client(host=base_url, timeout=480.0, follow_redirects=False, trust_env=False)
+            resp = call_ollama_chat_maybe_no_think(
+                client.chat,
                 model=safe_vision_model,
                 messages=[
                     {
@@ -568,9 +806,10 @@ def _run_local_ocr_on_png(
                         "images": [b64_img],
                     }
                 ],
-                options={"temperature": 0.0, "num_predict": 1024},
+                options={"temperature": 0.1, "repeat_penalty": 1.2, "num_predict": 384},
             )
-            txt = str((resp.get("message") or {}).get("content") or "").strip()
+            raw_txt = str((resp.get("message") or {}).get("content") or "").strip()
+            txt = (strip_reasoning_think_blocks(raw_txt) or raw_txt).strip()
             if txt:
                 return txt, f"ollama-vision:{safe_vision_model}"
         except Exception:
@@ -589,6 +828,9 @@ def extract_pdf(
     allow_vision_ocr: bool = False,
     ocr_fn: Callable[[bytes, int], str] | None = None,
 ) -> DocumentExtraction:
+    if _is_reparse_or_link(str(path)):
+        raise PermissionError(f"Refusing to extract PDF through symlink or reparse point: {path}")
+    path = os.path.abspath(str(path))
     try:
         from pypdf import PdfReader
         from pypdf.errors import PdfReadError
@@ -596,7 +838,7 @@ def extract_pdf(
         raise DocumentExtractionError("pypdf is required for PDF extraction (uv sync --locked).") from exc
     try:
         reader = PdfReader(path, strict=False)
-        if reader.is_encrypted:
+        if getattr(reader, "is_encrypted", False):
             try:
                 if not reader.decrypt(""):
                     raise DocumentExtractionError("Encrypted PDF requires a password; refusing to extract.")
@@ -614,6 +856,7 @@ def extract_pdf(
 
     outline_titles = _pdf_outline_titles(reader)
     raw_pages: list[list[str]] = []
+    page_visuals: list[bool] = []
     warnings: list[str] = []
     any_layout_upgraded = False
     ocr_engines_used: list[str] = []
@@ -634,22 +877,18 @@ def extract_pdf(
             for ln in lines
             if ln and ln.strip()
         )
+        has_visual = _page_has_non_text_visual_content(page)
+        page_visuals.append(has_visual)
         if enable_ocr and printable_chars < 20:
-            try:
-                page_images = list(getattr(page, "images", ()) or ())
-            except Exception:
-                page_images = []
+            raw_img_blobs = _extract_page_image_bytes(page, max_depth=3)
             ocr_lines: list[str] = []
-            for img_obj in page_images[:4]:
+            for img_bytes in raw_img_blobs[:4]:
                 if ocr_images_processed >= MAX_OCR_IMAGES_PER_PDF:
                     if not ocr_budget_warned:
                         warnings.append(f"OCR image budget ({MAX_OCR_IMAGES_PER_PDF} images per PDF) reached; remaining sparse pages skipped.")
                         ocr_budget_warned = True
                     break
-                img_bytes = getattr(img_obj, "data", None)
-                if not isinstance(img_bytes, (bytes, bytearray)):
-                    continue
-                clean_png = _sanitize_pdf_image_to_png(bytes(img_bytes))
+                clean_png = _sanitize_pdf_image_to_png(img_bytes)
                 if clean_png is None:
                     continue
                 ocr_images_processed += 1
@@ -666,6 +905,24 @@ def extract_pdf(
                         cl = _clean_line(raw_ln)
                         if cl:
                             ocr_lines.append(cl)
+            # Full-page rasterization fallback for vector graphics or Form XObject scans without embedded image blobs
+            if not ocr_lines and ocr_images_processed < MAX_OCR_IMAGES_PER_PDF:
+                raster_png = _rasterize_pdf_page_to_png(path, index)
+                if raster_png is not None:
+                    ocr_images_processed += 1
+                    ocr_txt, eng = _run_local_ocr_on_png(
+                        raster_png,
+                        index,
+                        ocr_fn=ocr_fn,
+                        allow_vision_ocr=allow_vision_ocr,
+                    )
+                    if ocr_txt:
+                        if eng and eng not in ocr_engines_used:
+                            ocr_engines_used.append(eng)
+                        for raw_ln in ocr_txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                            cl = _clean_line(raw_ln)
+                            if cl:
+                                ocr_lines.append(cl)
             if ocr_lines:
                 lines = [ln for ln in lines if ln] + ocr_lines
 
@@ -682,6 +939,7 @@ def extract_pdf(
         title = ""
 
     page_blocks: list[str] = []
+    pages_with_text = 0
     for index, lines in enumerate(raw_pages, start=1):
         parts: list[str] = []
         paragraph: list[str] = []
@@ -711,8 +969,26 @@ def extract_pdf(
             if line.endswith((".", "?", "!", ":")) and len(" ".join(paragraph)) > 400:
                 flush()
         flush()
-        body = "\n\n".join(parts) if parts else "_(no extractable text on this page)_"
+        if parts:
+            pages_with_text += 1
+            body = "\n\n".join(parts)
+        else:
+            has_vis = page_visuals[index - 1]
+            reason = (
+                "contains non-text visual content" if has_vis else "yielded no text objects"
+            )
+            warnings.append(
+                f"Page {index} {reason} and OCR was unavailable (install tesseract CLI or set BRAIN_PDF_VISION_OCR=1)."
+            )
+            body = f"[OCR DEFERRED: page {index} {reason}; install tesseract or set BRAIN_PDF_VISION_OCR=1]"
         page_blocks.append(f"## [page {index}]\n\n{body}")
+
+    if pages_with_text == 0:
+        raise DocumentExtractionError(
+            f"No extractable text found in PDF ({len(page_objs)} page(s)): "
+            "all pages appear to be scanned images or vector graphics and no OCR backend "
+            "(tesseract CLI or BRAIN_PDF_VISION_OCR=1) produced text."
+        )
 
     header = f"# {_neutralize(title)}\n\n" if title else ""
     # Compute UTF-8 byte spans of every page block relative to the start of the body, then append
@@ -886,6 +1162,12 @@ _HTML_BLOCKS = ("h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "pre", "blockquot
 
 def _html_to_blocks(markup: str | bytes, *, heading_offset: int = 0) -> tuple[str, list[str]]:
     from bs4 import BeautifulSoup
+    try:
+        from math_equivalence import preserve_latex_in_html
+
+        markup = preserve_latex_in_html(markup)
+    except Exception:
+        pass
 
     soup = BeautifulSoup(markup, "html.parser")
     for bad in soup(["script", "style", "noscript", "template", "svg", "iframe", "object", "embed", "head"]):

@@ -29,11 +29,31 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-Write-Host "`n[2/2] Second Brain Morning Shift — Thread Synthesis" -ForegroundColor Yellow
+Write-Host "`n[2/3] Second Brain Morning Shift — Thread & Briefing Synthesis" -ForegroundColor Yellow
 uv run --locked python scripts/ollama_editor.py
 if ($LASTEXITCODE -ne 0) {
     Write-Host "`nEditor failed." -ForegroundColor Red
     exit $LASTEXITCODE
+}
+
+if (Test-Path -LiteralPath (Join-Path $ProjectRoot "brain\.chroma\index-manifest.json")) {
+    Write-Host "`n[3/5] Refreshing Chroma Dense Vector Index..." -ForegroundColor Yellow
+    uv run --locked python scripts/rebuild_vectors.py
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`nDense vector refresh deferred (lexical FTS5 remains active)." -ForegroundColor DarkYellow
+    }
+}
+
+Write-Host "`n[4/5] Second Brain Hippocampal Replay — Counterfactual Briefing" -ForegroundColor Yellow
+uv run --locked python scripts/episodic_replay.py
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "`nEpisodic replay completed with warnings." -ForegroundColor DarkYellow
+}
+
+Write-Host "`n[5/5] Second Brain Continuous Distillation — Draft Principles" -ForegroundColor Yellow
+uv run --locked python scripts/cognitive_distiller.py distill
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "`nDraft distillation completed with warnings." -ForegroundColor DarkYellow
 }
 
 Write-Host "`nNight Shift Complete!" -ForegroundColor Green

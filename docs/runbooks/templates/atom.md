@@ -1,8 +1,7 @@
 ---
-id: YYYY-MMDD-{slug}
+id: YYYY-MM-DD-{slug}
 type: atom
 memory_type: semantic
-certainty: tentative
 created: YYYY-MM-DD
 last-reviewed: YYYY-MM-DD
 importance: 0.50
@@ -10,13 +9,17 @@ confidence: 0.50
 sources:
   - sources/YYYY-MM-DD-{source-slug}.md
 links:
-  - "[[related-atom-id-1]]"
-  - "[[related-atom-id-2]]"
+  - "[[related-atom-id-1.md]]"
 tags: []
 contexts: []
 supersedes: []
 superseded_by: []
 contested_by: []
+origin: user_local
+citation_integrity: missing
+claim_state: candidate
+epistemic_label: claim
+review_status: pending
 ---
 
 ## Claim
@@ -25,10 +28,7 @@ contested_by: []
 
 ## Evidence
 
-{Exact contiguous excerpt copied from the named source. Do not paraphrase.
-Always cite the source file and, where possible, the section/paragraph.}
-
-> Source: [[sources/YYYY-MM-DD-{source-slug}]] — {section or paragraph reference}
+{Exact contiguous verbatim excerpt copied strictly from the named file in `sources:` above — do not add quotes, prefixes, or commentary inside `## Evidence` so cryptographic UTF-8 byte-offset anchoring (`scripts/evidence.py`) succeeds cleanly.}
 
 ## Why It Matters
 

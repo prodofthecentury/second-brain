@@ -25,6 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 import uuid
@@ -51,9 +52,11 @@ from config import (
     is_content_markdown,
     normalize_markdown_filename,
     resolve_active_brain_dir,
+    resolve_module_vault_path,
     resolve_under,
     safe_file_in_dir,
     security_state_dir,
+    snapshot_module_defaults,
 )
 from host_adapters import (
     OutboundSecretBlockedError,
@@ -63,6 +66,8 @@ from host_adapters import (
 from inbox_workflow import scan_inbox_payload_risks
 from knowledge_graph import detect_contradictions
 from lexical_store import LexicalIndexUnavailable
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 from memory_format import (
     frontmatter_has_key,
     remove_frontmatter_fields,
@@ -128,8 +133,22 @@ ALLOWED_INPUT_TYPES: frozenset[str] = frozenset({"string", "integer", "number", 
 FORBIDDEN_SANDBOX_IMPORTS: frozenset[str] = frozenset(
     {
         "ctypes",
+        "_ctypes",
         "winreg",
+        "_winapi",
+        "msvcrt",
+        "fcntl",
+        "mmap",
+        "sqlite3",
+        "_sqlite3",
+        "dbm",
+        "_dbm",
+        "_gdbm",
         "pty",
+        "tty",
+        "termios",
+        "resource",
+        "signal",
         "webbrowser",
         "urllib",
         "httpx",
@@ -137,22 +156,82 @@ FORBIDDEN_SANDBOX_IMPORTS: frozenset[str] = frozenset(
         "http",
         "ftplib",
         "smtplib",
+        "poplib",
+        "imaplib",
         "telnetlib",
         "xmlrpc",
+        "ssl",
+        "_ssl",
         "multiprocessing",
+        "concurrent",
+        "threading",
+        "_thread",
         "subprocess",
+        "_posixsubprocess",
         "importlib",
         "builtins",
         "_imp",
+        "zipimport",
+        "pkgutil",
+        "runpy",
+        "code",
+        "codeop",
         "pickle",
+        "_pickle",
         "shelve",
         "marshal",
         "asyncio",
+        "gc",
+        "inspect",
+        "dis",
+        "ast",
+        "sysconfig",
+        "shutil",
+        "tempfile",
     }
 )
 
 FORBIDDEN_BUILTIN_CALLS: frozenset[str] = frozenset(
-    {"eval", "exec", "compile", "__import__", "breakpoint", "input"}
+    {
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+        "breakpoint",
+        "input",
+        "getattr",
+        "setattr",
+        "delattr",
+        "globals",
+        "locals",
+        "vars",
+        "dir",
+    }
+)
+
+FORBIDDEN_DUNDER_NAMES_AND_ATTRS: frozenset[str] = frozenset(
+    {
+        "__builtins__",
+        "__import__",
+        "__subclasses__",
+        "__globals__",
+        "__code__",
+        "__closure__",
+        "__loader__",
+        "__spec__",
+        "__dict__",
+        "__class__",
+        "__bases__",
+        "__mro__",
+        "__getattribute__",
+        "__getattr__",
+        "__setattr__",
+        "__delattr__",
+        "__reduce__",
+        "__reduce_ex__",
+        "_getframe",
+        "_current_frames",
+    }
 )
 
 FORBIDDEN_OS_ATTR_CALLS: frozenset[str] = frozenset(
@@ -261,17 +340,20 @@ class ExecutableSkillIntegrityReport:
         }
 
 
-def default_skills_dir(brain_dir: str = BRAIN_DIR) -> str:
+def default_skills_dir(brain_dir: str | None = None) -> str:
     """Return the canonical `6-skills/` directory under a vault root."""
-    return os.path.join(brain_dir, "6-skills")
+    eff_brain = resolve_module_vault_path(globals(), "BRAIN_DIR", brain_dir)
+    return os.path.join(eff_brain, "6-skills")
 
 
-def skill_decision_log_path(brain_dir: str = BRAIN_DIR) -> str:
-    return os.path.join(brain_dir, "0-raw", "archive", "skill-decisions.jsonl")
+def skill_decision_log_path(brain_dir: str | None = None) -> str:
+    eff_brain = resolve_module_vault_path(globals(), "BRAIN_DIR", brain_dir)
+    return os.path.join(eff_brain, "0-raw", "archive", "skill-decisions.jsonl")
 
 
-def skill_execution_log_path(brain_dir: str = BRAIN_DIR) -> str:
-    return os.path.join(brain_dir, "0-raw", "archive", "skill-executions.jsonl")
+def skill_execution_log_path(brain_dir: str | None = None) -> str:
+    eff_brain = resolve_module_vault_path(globals(), "BRAIN_DIR", brain_dir)
+    return os.path.join(eff_brain, "0-raw", "archive", "skill-executions.jsonl")
 
 
 def skill_kill_switch_path(security_dir: str | Path | None = None) -> Path:
@@ -292,7 +374,7 @@ def _canonical_json(obj: Any) -> str:
 
 def _resolve_vault_dirs(
     *,
-    brain_dir: str = BRAIN_DIR,
+    brain_dir: str | None = None,
     atoms_dir: str | None = None,
     playbooks_dir: str | None = None,
     skills_dir: str | None = None,
@@ -301,38 +383,28 @@ def _resolve_vault_dirs(
     chroma_path: str | None = None,
     telemetry_db_path: str | None = None,
 ) -> dict[str, str]:
-    eff_brain = os.path.abspath(brain_dir)
-    same_as_default = os.path.normcase(eff_brain) == os.path.normcase(os.path.abspath(BRAIN_DIR))
+    eff_brain = resolve_module_vault_path(globals(), "BRAIN_DIR", brain_dir)
+    parent_override = eff_brain if brain_dir is not None and str(brain_dir).strip() else None
     return {
         "brain_dir": eff_brain,
-        "atoms_dir": os.path.abspath(atoms_dir)
-        if atoms_dir is not None
-        else (os.path.abspath(ATOMS_DIR) if same_as_default else os.path.join(eff_brain, "2-atoms")),
-        "playbooks_dir": os.path.abspath(playbooks_dir)
-        if playbooks_dir is not None
-        else (os.path.abspath(PLAYBOOKS_DIR) if same_as_default else os.path.join(eff_brain, "5-playbooks")),
+        "atoms_dir": resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir, brain_dir=parent_override),
+        "playbooks_dir": resolve_module_vault_path(
+            globals(), "PLAYBOOKS_DIR", playbooks_dir, brain_dir=parent_override
+        ),
         "skills_dir": os.path.abspath(skills_dir)
         if skills_dir is not None
         else default_skills_dir(eff_brain),
-        "experiences_dir": os.path.abspath(experiences_dir)
-        if experiences_dir is not None
-        else (os.path.abspath(EXPERIENCES_DIR) if same_as_default else os.path.join(eff_brain, "4-experiences")),
-        "lexical_index_path": os.path.abspath(lexical_index_path)
-        if lexical_index_path is not None
-        else (
-            os.path.abspath(LEXICAL_INDEX_PATH)
-            if same_as_default
-            else os.path.join(eff_brain, ".sidecar", "lexical.sqlite3")
+        "experiences_dir": resolve_module_vault_path(
+            globals(), "EXPERIENCES_DIR", experiences_dir, brain_dir=parent_override
         ),
-        "chroma_path": os.path.abspath(chroma_path)
-        if chroma_path is not None
-        else (os.path.abspath(CHROMA_PATH) if same_as_default else os.path.join(eff_brain, ".chroma")),
-        "telemetry_db_path": os.path.abspath(telemetry_db_path)
-        if telemetry_db_path is not None
-        else (
-            os.path.abspath(TELEMETRY_DB_PATH)
-            if same_as_default
-            else os.path.join(eff_brain, ".sidecar", "telemetry.sqlite3")
+        "lexical_index_path": resolve_module_vault_path(
+            globals(), "LEXICAL_INDEX_PATH", lexical_index_path, brain_dir=parent_override
+        ),
+        "chroma_path": resolve_module_vault_path(
+            globals(), "CHROMA_PATH", chroma_path, brain_dir=parent_override
+        ),
+        "telemetry_db_path": resolve_module_vault_path(
+            globals(), "TELEMETRY_DB_PATH", telemetry_db_path, brain_dir=parent_override
         ),
     }
 
@@ -676,12 +748,25 @@ def _validate_sandbox_python_ast(script_body: str) -> None:
                         raise ExecutableSkillValidationError(
                             f"Forbidden os import 'from os import {alias.name}' in sandbox_python."
                         )
+        elif isinstance(node, ast.Name) and node.id in FORBIDDEN_DUNDER_NAMES_AND_ATTRS:
+            raise ExecutableSkillValidationError(
+                f"Forbidden dunder identifier '{node.id}' in sandbox_python."
+            )
+        elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_DUNDER_NAMES_AND_ATTRS:
+            raise ExecutableSkillValidationError(
+                f"Forbidden dunder attribute access '.{node.attr}' in sandbox_python."
+            )
         elif isinstance(node, ast.Call):
             func = node.func
-            if isinstance(func, ast.Name) and func.id in FORBIDDEN_BUILTIN_CALLS:
-                raise ExecutableSkillValidationError(
-                    f"Forbidden dynamic call '{func.id}(...)' in sandbox_python."
-                )
+            if isinstance(func, ast.Name):
+                if func.id in FORBIDDEN_BUILTIN_CALLS:
+                    raise ExecutableSkillValidationError(
+                        f"Forbidden dynamic call '{func.id}(...)' in sandbox_python."
+                    )
+                if func.id == "type" and (len(node.args) != 1 or node.keywords):
+                    raise ExecutableSkillValidationError(
+                        "Forbidden dynamic class creation 'type(name, bases, ns)' in sandbox_python."
+                    )
             if isinstance(func, ast.Attribute):
                 if func.attr in FORBIDDEN_BUILTIN_CALLS:
                     raise ExecutableSkillValidationError(
@@ -1094,9 +1179,28 @@ def _evaluate_playbook_skill_readiness(
     }
 
 
+_KILL_SWITCH_IO_LOCK = threading.RLock()
+
+
+def _replace_file_retry(src_path: str | Path, dst_path: str | Path, *, attempts: int = 20) -> None:
+    """Atomically replace `dst_path`, retrying brief Windows sharing violations (WinError 5/32)."""
+    for attempt in range(attempts):
+        try:
+            os.replace(src_path, dst_path)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt + 1 >= attempts:
+                raise
+            time.sleep(0.01 * min(attempt + 1, 5))
+        except OSError as exc:
+            if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32) or attempt + 1 >= attempts:
+                raise
+            time.sleep(0.01 * min(attempt + 1, 5))
+
+
 def get_skill_kill_switch_status(
     *,
-    brain_dir: str | None = BRAIN_DIR,
+    brain_dir: str | None = None,
     security_dir: str | Path | None = None,
 ) -> dict[str, object]:
     """Read emergency kill-switch state; fail closed (`global_engaged=True`) on symlinks or corrupt JSON."""
@@ -1116,29 +1220,45 @@ def get_skill_kill_switch_status(
             "path": ks_str,
         }
 
-    if os.path.lexists(parent_str) and _is_reparse_or_link(parent_str):
-        return _fail_closed("symlinked_kill_switch_parent_directory")
-    if not os.path.lexists(ks_str):
-        return {
-            "global_engaged": False,
-            "global_reason": "",
-            "global_actor": "",
-            "global_updated_at": "",
-            "killed_skills": {},
-            "corrupt": False,
-            "path": ks_str,
-        }
-    if _is_reparse_or_link(ks_str):
-        return _fail_closed("symlinked_kill_switch_file")
+    with _KILL_SWITCH_IO_LOCK:
+        if os.path.lexists(parent_str) and _is_reparse_or_link(parent_str):
+            return _fail_closed("symlinked_kill_switch_parent_directory")
+        if not os.path.lexists(ks_str):
+            return {
+                "global_engaged": False,
+                "global_reason": "",
+                "global_actor": "",
+                "global_updated_at": "",
+                "killed_skills": {},
+                "corrupt": False,
+                "path": ks_str,
+            }
+        if _is_reparse_or_link(ks_str):
+            return _fail_closed("symlinked_kill_switch_file")
 
-    try:
-        st = os.lstat(ks_str)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_KILL_SWITCH_FILE_BYTES:
-            return _fail_closed("invalid_or_oversized_kill_switch_file")
-        raw_text = ks_path.read_text(encoding="utf-8")
-        data = json.loads(raw_text)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return _fail_closed("corrupt_kill_switch_json")
+        raw_text = ""
+        read_ok = False
+        for attempt in range(10):
+            try:
+                st = os.lstat(ks_str)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_KILL_SWITCH_FILE_BYTES:
+                    return _fail_closed("invalid_or_oversized_kill_switch_file")
+                raw_text = ks_path.read_text(encoding="utf-8")
+                read_ok = True
+                break
+            except PermissionError:
+                if os.name == "nt" and attempt + 1 < 10:
+                    time.sleep(0.01)
+                    continue
+                return _fail_closed("corrupt_kill_switch_json")
+            except (OSError, UnicodeDecodeError):
+                return _fail_closed("corrupt_kill_switch_json")
+        if not read_ok:
+            return _fail_closed("corrupt_kill_switch_json")
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            return _fail_closed("corrupt_kill_switch_json")
 
     if (
         not isinstance(data, dict)
@@ -1191,7 +1311,7 @@ def set_skill_kill_switch(
     scope: str = "global",
     actor: str,
     reason: str = "",
-    brain_dir: str | None = BRAIN_DIR,
+    brain_dir: str | None = None,
     security_dir: str | Path | None = None,
 ) -> dict[str, object]:
     """Engage or release the global or per-skill emergency kill-switch with owner attribution."""
@@ -1206,85 +1326,86 @@ def set_skill_kill_switch(
     norm_scope = "global" if raw_scope.lower() == "global" else _normalize_skill_id(raw_scope)
 
     ks_path = skill_kill_switch_path(security_dir)
-    _assert_not_reparse(ks_path.parent, "security_dir")
-    ks_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _assert_not_reparse(ks_path.parent, "security_dir")
-    _assert_not_reparse(ks_path, "skill-kill-switch.json")
+    with _KILL_SWITCH_IO_LOCK:
+        _assert_not_reparse(ks_path.parent, "security_dir")
+        ks_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _assert_not_reparse(ks_path.parent, "security_dir")
+        _assert_not_reparse(ks_path, "skill-kill-switch.json")
 
-    current = get_skill_kill_switch_status(brain_dir=brain_dir, security_dir=security_dir)
-    if bool(current.get("corrupt")):
-        if not engaged and norm_scope != "global":
-            raise ExecutableSkillValidationError(
-                "Kill-switch file is corrupt (fail-closed global lock active); "
-                "release scope='global' explicitly after inspection to reset."
-            )
-        global_engaged = True if norm_scope != "global" else False
-        global_reason = str(current.get("global_reason") or "") if global_engaged else ""
-        global_actor = clean_actor
-        global_updated_at = ""
-        killed_skills: dict[str, dict[str, object]] = {}
-    else:
-        global_engaged = bool(current["global_engaged"])
-        global_reason = str(current["global_reason"])
-        global_actor = str(current["global_actor"])
-        global_updated_at = str(current["global_updated_at"])
-        killed_skills = {
-            str(k): dict(v)
-            for k, v in dict(current.get("killed_skills") or {}).items()  # type: ignore[arg-type]
-            if isinstance(v, dict)
-        }
-
-    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    if norm_scope == "global":
-        global_engaged = engaged
-        global_reason = clean_reason if engaged else ""
-        global_actor = clean_actor
-        global_updated_at = now_iso
-    else:
-        if engaged:
-            killed_skills[norm_scope] = {
-                "engaged": True,
-                "reason": clean_reason,
-                "actor": clean_actor,
-                "updated_at": now_iso,
-            }
+        current = get_skill_kill_switch_status(brain_dir=brain_dir, security_dir=security_dir)
+        if bool(current.get("corrupt")):
+            if not engaged and norm_scope != "global":
+                raise ExecutableSkillValidationError(
+                    "Kill-switch file is corrupt (fail-closed global lock active); "
+                    "release scope='global' explicitly after inspection to reset."
+                )
+            global_engaged = True if norm_scope != "global" else False
+            global_reason = str(current.get("global_reason") or "") if global_engaged else ""
+            global_actor = clean_actor
+            global_updated_at = ""
+            killed_skills: dict[str, dict[str, object]] = {}
         else:
-            killed_skills.pop(norm_scope, None)
+            global_engaged = bool(current["global_engaged"])
+            global_reason = str(current["global_reason"])
+            global_actor = str(current["global_actor"])
+            global_updated_at = str(current["global_updated_at"])
+            killed_skills = {
+                str(k): dict(v)
+                for k, v in dict(current.get("killed_skills") or {}).items()  # type: ignore[arg-type]
+                if isinstance(v, dict)
+            }
 
-    payload = {
-        "schema_version": 1,
-        "global_engaged": global_engaged,
-        "global_reason": global_reason,
-        "global_actor": global_actor,
-        "global_updated_at": global_updated_at,
-        "killed_skills": killed_skills,
-        "updated_at": now_iso,
-    }
-    encoded = (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        if norm_scope == "global":
+            global_engaged = engaged
+            global_reason = clean_reason if engaged else ""
+            global_actor = clean_actor
+            global_updated_at = now_iso
+        else:
+            if engaged:
+                killed_skills[norm_scope] = {
+                    "engaged": True,
+                    "reason": clean_reason,
+                    "actor": clean_actor,
+                    "updated_at": now_iso,
+                }
+            else:
+                killed_skills.pop(norm_scope, None)
 
-    fd, tmp_path = tempfile.mkstemp(dir=str(ks_path.parent), prefix=".skill-ks-", suffix=".tmp")
-    closed = False
-    try:
-        if os.name != "nt":
-            os.chmod(tmp_path, 0o600)
-        if os.write(fd, encoded) != len(encoded):
-            raise OSError("Incomplete write to skill-kill-switch.json.")
-        os.fsync(fd)
-        os.close(fd)
-        closed = True
-        os.replace(tmp_path, ks_path)
-        restrict_security_file_permissions(ks_path)
-    finally:
-        if not closed:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        payload = {
+            "schema_version": 1,
+            "global_engaged": global_engaged,
+            "global_reason": global_reason,
+            "global_actor": global_actor,
+            "global_updated_at": global_updated_at,
+            "killed_skills": killed_skills,
+            "updated_at": now_iso,
+        }
+        encoded = (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+
+        fd, tmp_path = tempfile.mkstemp(dir=str(ks_path.parent), prefix=".skill-ks-", suffix=".tmp")
+        closed = False
+        try:
+            if os.name != "nt":
+                os.chmod(tmp_path, 0o600)
+            if os.write(fd, encoded) != len(encoded):
+                raise OSError("Incomplete write to skill-kill-switch.json.")
+            os.fsync(fd)
+            os.close(fd)
+            closed = True
+            _replace_file_retry(tmp_path, ks_path)
+        finally:
+            if not closed:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    restrict_security_file_permissions(ks_path)
 
     if brain_dir and str(brain_dir).strip() and os.path.lexists(str(brain_dir)):
         _assert_not_reparse(brain_dir, "brain_dir")
@@ -1321,7 +1442,7 @@ def skill_visible_in_scope(skill: ExecutableSkillIntegrityReport, projects: tupl
 
 def inspect_executable_skill_candidates(
     *,
-    brain_dir: str = BRAIN_DIR,
+    brain_dir: str | None = None,
     atoms_dir: str | None = None,
     playbooks_dir: str | None = None,
     skills_dir: str | None = None,
@@ -1411,7 +1532,7 @@ def promote_playbook_to_executable_skill(
     rationale: str = "",
     allow_early_owner_override: bool = False,
     expected_skill_sha256: str | None = None,
-    brain_dir: str = BRAIN_DIR,
+    brain_dir: str | None = None,
     atoms_dir: str | None = None,
     playbooks_dir: str | None = None,
     skills_dir: str | None = None,
@@ -1691,7 +1812,7 @@ def promote_playbook_to_executable_skill(
 def verify_executable_skill_integrity(
     skill_path_or_id: str,
     *,
-    brain_dir: str = BRAIN_DIR,
+    brain_dir: str | None = None,
     atoms_dir: str | None = None,
     playbooks_dir: str | None = None,
     skills_dir: str | None = None,
@@ -1999,7 +2120,7 @@ def verify_executable_skill_integrity(
 def list_executable_skills(
     *,
     skills_dir: str | None = None,
-    brain_dir: str = BRAIN_DIR,
+    brain_dir: str | None = None,
     atoms_dir: str | None = None,
     playbooks_dir: str | None = None,
     telemetry_db_path: str | None = None,
@@ -2042,7 +2163,7 @@ def revoke_executable_skill(
     expected_skill_sha256: str,
     actor: str,
     reason: str,
-    brain_dir: str = BRAIN_DIR,
+    brain_dir: str | None = None,
     skills_dir: str | None = None,
 ) -> dict[str, object]:
     """CAS-locked human owner revocation of an Executable Skill in `6-skills/`."""
@@ -2223,9 +2344,9 @@ def _read_execution_chain_entries(log_file: Path) -> tuple[list[dict[str, Any]],
     return entries, errors
 
 
-def verify_skill_execution_audit_chain(brain_dir: str = BRAIN_DIR) -> dict[str, object]:
+def verify_skill_execution_audit_chain(brain_dir: str | None = None) -> dict[str, object]:
     """Verify genesis `0*64`, monotonic `execution_index`, `prev_execution_sha256`, and `execution_sha256` digests."""
-    eff_brain = os.path.abspath(brain_dir)
+    eff_brain = resolve_module_vault_path(globals(), "BRAIN_DIR", brain_dir)
     log_file = Path(skill_execution_log_path(eff_brain))
     entries, errors = _read_execution_chain_entries(log_file)
     valid = len(errors) == 0
@@ -2242,7 +2363,7 @@ def verify_skill_execution_audit_chain(brain_dir: str = BRAIN_DIR) -> dict[str, 
 
 
 def list_skill_executions(
-    brain_dir: str = BRAIN_DIR,
+    brain_dir: str | None = None,
     skill_id: str | None = None,
     limit: int = 50,
 ) -> list[dict[str, object]]:
@@ -2318,14 +2439,17 @@ _SANDBOX_SITECUSTOMIZE_SOURCE = '''"""Second Brain Stage 4 Executable Skill runt
 
 def _install_sandbox_guard() -> None:
     import builtins as _builtins
+    import errno as _errno
     import io as _io
     import os as _os
+    import pathlib as _pathlib
     import socket as _socket
     import sys as _sys
 
     _NET_ERR = "Network access is disabled inside Second Brain Executable Skill sandbox"
     _FS_ERR = "Filesystem access outside SB_SANDBOX_WORKSPACE is disabled inside Second Brain sandbox"
     _CHDIR_ERR = "os.chdir outside SB_SANDBOX_WORKSPACE is disabled inside Second Brain sandbox"
+    _QUOTA_ERR = "Disk quota exceeded inside Second Brain Executable Skill sandbox"
 
     _WORKSPACE_RAW = _os.environ.get("SB_SANDBOX_WORKSPACE") or ""
     _WORKSPACE_REAL = _os.path.realpath(_WORKSPACE_RAW) if _WORKSPACE_RAW else ""
@@ -2337,6 +2461,23 @@ def _install_sandbox_guard() -> None:
 
     _GUARD_DIR_REAL = _os.path.dirname(_INPUTS_REAL) if _INPUTS_REAL else ""
     _NORM_GUARD_DIR = _os.path.normcase(_GUARD_DIR_REAL) if _GUARD_DIR_REAL else ""
+
+    try:
+        _MAX_BYTES = max(1024, int(_os.environ.get("SB_SANDBOX_MAX_BYTES") or "1048576"))
+    except Exception:
+        _MAX_BYTES = 1048576
+
+    if _os.name != "nt":
+        try:
+            import resource as _res
+            if hasattr(_res, "RLIMIT_FSIZE"):
+                _res.setrlimit(_res.RLIMIT_FSIZE, (_MAX_BYTES, _MAX_BYTES))
+            if hasattr(_res, "RLIMIT_CORE"):
+                _res.setrlimit(_res.RLIMIT_CORE, (0, 0))
+            if _sys.platform.startswith("linux") and hasattr(_res, "RLIMIT_AS"):
+                _res.setrlimit(_res.RLIMIT_AS, (536870912, 536870912))
+        except Exception:
+            pass
 
     _STDLIB_NORM_ROOTS = []
     for _cand in (
@@ -2364,9 +2505,16 @@ def _install_sandbox_guard() -> None:
             _STDLIB_NORM_ROOTS.append(_np)
 
     _FORBIDDEN_MODULES = frozenset({
-        "ctypes", "_ctypes", "winreg", "pty", "webbrowser", "httpx", "requests",
-        "http", "ftplib", "smtplib", "telnetlib", "xmlrpc", "multiprocessing",
-        "subprocess", "pickle", "shelve", "asyncio", "gc", "inspect",
+        "ctypes", "_ctypes", "winreg", "_winapi", "msvcrt", "fcntl", "mmap",
+        "sqlite3", "_sqlite3", "dbm", "_dbm", "_gdbm",
+        "pty", "tty", "termios", "resource", "signal",
+        "webbrowser", "httpx", "requests", "http", "ftplib", "smtplib",
+        "poplib", "imaplib", "telnetlib", "xmlrpc", "ssl", "_ssl",
+        "multiprocessing", "concurrent", "threading", "_thread",
+        "subprocess", "_posixsubprocess",
+        "importlib", "_imp", "zipimport", "pkgutil", "runpy", "code", "codeop",
+        "pickle", "_pickle", "shelve", "marshal", "asyncio",
+        "gc", "inspect", "dis", "ast", "sysconfig", "shutil", "tempfile", "builtins",
     })
     _FORBIDDEN_EXACT_OR_PREFIX = (
         "urllib.request",
@@ -2399,6 +2547,9 @@ def _install_sandbox_guard() -> None:
     _orig_io_open = _io.open
     _orig_fileio = _io.FileIO
     _orig_os_open = _os.open
+    _orig_os_write = _os.write
+    _orig_os_walk = _os.walk
+    _orig_os_stat = _os.stat
     _orig_chdir = _os.chdir
     _orig_remove = _os.remove
     _orig_unlink = _os.unlink
@@ -2410,6 +2561,133 @@ def _install_sandbox_guard() -> None:
     _orig_truncate = getattr(_os, "truncate", None)
     _orig_chmod = getattr(_os, "chmod", None)
     _orig_utime = getattr(_os, "utime", None)
+
+    def _workspace_used_bytes() -> int:
+        if not _WORKSPACE_REAL:
+            return 0
+        total = 0
+        try:
+            for _r, _ds, _fs in _orig_os_walk(_WORKSPACE_REAL):
+                for _fn in _fs:
+                    try:
+                        total += _orig_os_stat(_os.path.join(_r, _fn)).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total
+
+    _quota_state = [_workspace_used_bytes()]
+
+    def _charge_quota(delta_bytes: int) -> None:
+        if delta_bytes <= 0:
+            return
+        projected = _quota_state[0] + int(delta_bytes)
+        if projected > _MAX_BYTES:
+            raise OSError(_errno.EFBIG, f"{_QUOTA_ERR} ({projected} > {_MAX_BYTES} bytes)")
+        _quota_state[0] = projected
+
+    def _data_byte_len(data) -> int:
+        if isinstance(data, str):
+            return len(data.encode("utf-8", errors="replace"))
+        try:
+            return len(memoryview(data))
+        except TypeError:
+            return len(data)
+
+    def _make_quota_writer(raw_fh):
+        def _write(data):
+            _charge_quota(_data_byte_len(data))
+            return raw_fh.write(data)
+
+        def _writelines(lines):
+            buf = list(lines)
+            total_n = 0
+            for item in buf:
+                total_n += _data_byte_len(item)
+            _charge_quota(total_n)
+            return raw_fh.writelines(buf)
+
+        def _truncate(size=None):
+            if size is not None and int(size) > 0:
+                _charge_quota(int(size))
+            return raw_fh.truncate(size)
+
+        class _QuotaStream:
+            __slots__ = ()
+
+            def write(self, data):
+                return _write(data)
+
+            def writelines(self, lines):
+                return _writelines(lines)
+
+            def truncate(self, size=None):
+                return _truncate(size)
+
+            def flush(self):
+                return raw_fh.flush()
+
+            def close(self):
+                return raw_fh.close()
+
+            def read(self, *a, **kw):
+                return raw_fh.read(*a, **kw)
+
+            def readline(self, *a, **kw):
+                return raw_fh.readline(*a, **kw)
+
+            def readlines(self, *a, **kw):
+                return raw_fh.readlines(*a, **kw)
+
+            def seek(self, *a, **kw):
+                return raw_fh.seek(*a, **kw)
+
+            def tell(self):
+                return raw_fh.tell()
+
+            def readable(self):
+                return raw_fh.readable()
+
+            def writable(self):
+                return raw_fh.writable()
+
+            def seekable(self):
+                return raw_fh.seekable()
+
+            def fileno(self):
+                return raw_fh.fileno()
+
+            @property
+            def closed(self):
+                return raw_fh.closed
+
+            @property
+            def mode(self):
+                return getattr(raw_fh, "mode", "")
+
+            @property
+            def name(self):
+                return getattr(raw_fh, "name", "")
+
+            @property
+            def encoding(self):
+                return getattr(raw_fh, "encoding", None)
+
+            def __enter__(self):
+                raw_fh.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return raw_fh.__exit__(exc_type, exc_val, exc_tb)
+
+            def __iter__(self):
+                return iter(raw_fh)
+
+            def __next__(self):
+                return next(raw_fh)
+
+        return _QuotaStream()
 
     def _is_inside_workspace(target) -> bool:
         if not _NORM_WS or isinstance(target, int):
@@ -2462,23 +2740,27 @@ def _install_sandbox_guard() -> None:
 
     def _guarded_open(file, mode="r", *args, **kwargs):
         mode_str = str(mode or "r")
-        if any(flag in mode_str for flag in ("w", "a", "x", "+")):
+        is_w = any(flag in mode_str for flag in ("w", "a", "x", "+"))
+        if is_w:
             if not _is_inside_workspace(file):
                 raise PermissionError(f"{_FS_ERR}: {file!r}")
         else:
             if not _is_allowed_read(file):
                 raise PermissionError(f"{_FS_ERR}: {file!r}")
-        return _orig_open(file, mode, *args, **kwargs)
+        fh = _orig_open(file, mode, *args, **kwargs)
+        return _make_quota_writer(fh) if is_w else fh
 
     def _guarded_io_open(file, mode="r", *args, **kwargs):
         mode_str = str(mode or "r")
-        if any(flag in mode_str for flag in ("w", "a", "x", "+")):
+        is_w = any(flag in mode_str for flag in ("w", "a", "x", "+"))
+        if is_w:
             if not _is_inside_workspace(file):
                 raise PermissionError(f"{_FS_ERR}: {file!r}")
         else:
             if not _is_allowed_read(file):
                 raise PermissionError(f"{_FS_ERR}: {file!r}")
-        return _orig_io_open(file, mode, *args, **kwargs)
+        fh = _orig_io_open(file, mode, *args, **kwargs)
+        return _make_quota_writer(fh) if is_w else fh
 
     class _GuardedFileIO(_orig_fileio):
         def __init__(self, file, mode="r", closefd=True, opener=None):
@@ -2492,6 +2774,20 @@ def _install_sandbox_guard() -> None:
                 if not _is_allowed_read(file):
                     raise PermissionError(f"{_FS_ERR}: {file!r}")
             super().__init__(file, mode, closefd=closefd, opener=opener)
+
+        def write(self, b):
+            _charge_quota(_data_byte_len(b))
+            return super().write(b)
+
+        def writelines(self, lines):
+            buf = list(lines)
+            _charge_quota(sum(_data_byte_len(x) for x in buf))
+            return super().writelines(buf)
+
+        def truncate(self, size=None):
+            if size is not None and int(size) > 0:
+                _charge_quota(int(size))
+            return super().truncate(size)
 
     _WRITE_FLAGS = (
         getattr(_os, "O_WRONLY", 1)
@@ -2512,17 +2808,24 @@ def _install_sandbox_guard() -> None:
                 raise PermissionError(f"{_FS_ERR}: {path!r}")
         return _orig_os_open(path, flags, mode)
 
+    def _guarded_os_write(fd, data):
+        if fd not in (1, 2):
+            _charge_quota(_data_byte_len(data))
+        return _orig_os_write(fd, data)
+
     def _guarded_chdir(path):
         if not _is_inside_workspace(path):
             raise PermissionError(f"{_CHDIR_ERR}: {path!r}")
         return _orig_chdir(path)
 
-    def _wrap_single_path(fn):
+    def _wrap_single_path(fn, *, check_truncate=False):
         def _wrapped(path, *args, **kwargs):
             if "dir_fd" in kwargs and kwargs["dir_fd"] is not None:
                 raise PermissionError(f"{_FS_ERR}: dir_fd forbidden")
             if not _is_inside_workspace(path):
                 raise PermissionError(f"{_FS_ERR}: {path!r}")
+            if check_truncate and args and isinstance(args[0], int) and args[0] > 0:
+                _charge_quota(args[0])
             return fn(path, *args, **kwargs)
         return _wrapped
 
@@ -2543,9 +2846,17 @@ def _install_sandbox_guard() -> None:
     def _audit_hook(event, args):
         if event.startswith("socket.") or event == "urllib.Request":
             raise PermissionError(_NET_ERR)
-        if event in (
-            "subprocess.Popen", "os.system", "os.exec", "os.spawn",
-            "os.fork", "os.posix_spawn", "ctypes.dlopen", "ctypes.dlsym",
+        if (
+            event.startswith("sqlite3.")
+            or event.startswith("ctypes.")
+            or event.startswith("mmap.")
+            or event.startswith("winreg.")
+            or event.startswith("_winapi.")
+            or event in (
+                "subprocess.Popen", "os.system", "os.exec", "os.spawn",
+                "os.fork", "os.posix_spawn", "os.startfile", "sys._current_frames",
+                "gc.get_objects", "gc.get_referrers", "pickle.find_class",
+            )
         ):
             raise PermissionError(f"Blocked runtime event {event!r} inside Second Brain sandbox")
         if event in ("os.symlink", "os.link"):
@@ -2586,6 +2897,7 @@ def _install_sandbox_guard() -> None:
         setattr(_sys.modules["_io"], "open", _guarded_io_open)
         setattr(_sys.modules["_io"], "FileIO", _GuardedFileIO)
     _os.open = _guarded_os_open
+    _os.write = _guarded_os_write
     _os.chdir = _guarded_chdir
     _os.remove = _wrap_single_path(_orig_remove)
     _os.unlink = _wrap_single_path(_orig_unlink)
@@ -2595,7 +2907,7 @@ def _install_sandbox_guard() -> None:
     _os.rename = _wrap_two_paths(_orig_rename)
     _os.replace = _wrap_two_paths(_orig_replace)
     if _orig_truncate is not None:
-        _os.truncate = _wrap_single_path(_orig_truncate)
+        _os.truncate = _wrap_single_path(_orig_truncate, check_truncate=True)
     if _orig_chmod is not None:
         _os.chmod = _wrap_single_path(_orig_chmod)
     if _orig_utime is not None:
@@ -2619,6 +2931,7 @@ del _install_sandbox_guard
 '''
 
 _SANDBOX_RUNNER_SOURCE = '''"""Bootstrap loader for `python -I -B`: activates `_guard/sitecustomize.py` before user script."""
+import builtins as _real_builtins
 import os as _os
 import sys as _sys
 
@@ -2635,11 +2948,82 @@ _sc_code = compile(_sc_bytes, _sc_path, "exec")
 _script_code = compile(_script_bytes, _target_script, "exec")
 del _sc_bytes, _script_bytes, _fh, _sfh, _sc_path, _guard_dir
 
-_sc_ns = {"__name__": "sitecustomize", "__builtins__": __builtins__}
+_sc_ns = {"__name__": "sitecustomize", "__builtins__": _real_builtins}
 exec(_sc_code, _sc_ns)
 _sc_ns.clear()
 del _sc_ns, _sc_code
 _sys.modules.pop("sitecustomize", None)
+
+_FORBIDDEN_USER_MODULES = frozenset({
+    "ctypes", "_ctypes", "winreg", "_winapi", "msvcrt", "fcntl", "mmap",
+    "sqlite3", "_sqlite3", "dbm", "_dbm", "_gdbm",
+    "pty", "tty", "termios", "resource", "signal",
+    "webbrowser", "urllib", "httpx", "requests", "http", "ftplib", "smtplib",
+    "poplib", "imaplib", "telnetlib", "xmlrpc", "ssl", "_ssl",
+    "multiprocessing", "concurrent", "threading", "_thread",
+    "subprocess", "_posixsubprocess",
+    "importlib", "_imp", "zipimport", "pkgutil", "runpy", "code", "codeop",
+    "pickle", "_pickle", "shelve", "marshal", "asyncio",
+    "gc", "inspect", "dis", "ast", "sysconfig", "shutil", "tempfile", "builtins",
+})
+_orig_import = _real_builtins.__import__
+
+
+def _safe_user_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if level and int(level) > 0:
+        raise ImportError("Relative imports are disabled inside Second Brain sandbox")
+    root = str(name or "").split(".", 1)[0].strip()
+    if not root or root in _FORBIDDEN_USER_MODULES:
+        raise ImportError(f"Module {name!r} is blocked inside Second Brain Executable Skill sandbox")
+    mod = _orig_import(name, globals, locals, fromlist, level)
+    if root == "os" and fromlist:
+        for _item in fromlist:
+            if _item in (
+                "system", "popen", "startfile", "fork", "forkpty", "kill", "killpg",
+                "symlink", "link", "execl", "execle", "execlp", "execlpe",
+                "execv", "execve", "execvp", "execvpe",
+                "spawnl", "spawnle", "spawnlp", "spawnlpe",
+                "spawnv", "spawnve", "spawnvp", "spawnvpe", "*",
+            ):
+                raise ImportError(f"from os import {_item} is blocked inside Second Brain sandbox")
+    return mod
+
+
+def _safe_type(*args):
+    if len(args) != 1:
+        raise PermissionError("Dynamic 3-argument type() class creation is disabled inside Second Brain sandbox")
+    return _real_builtins.type(args[0])
+
+
+_ALLOWED_BUILTIN_NAMES = (
+    "None", "False", "True", "Ellipsis", "NotImplemented",
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+    "callable", "chr", "classmethod", "complex", "dict", "divmod",
+    "enumerate", "filter", "float", "format", "frozenset", "hash", "hex",
+    "id", "int", "isinstance", "issubclass", "iter", "len", "list", "map",
+    "max", "min", "next", "object", "oct", "open", "ord", "pow", "print",
+    "property", "range", "repr", "reversed", "round", "set", "slice",
+    "sorted", "staticmethod", "str", "sum", "super", "tuple", "zip",
+    "__build_class__",
+    "BaseException", "Exception", "ArithmeticError", "AssertionError",
+    "AttributeError", "BufferError", "EOFError", "FileExistsError",
+    "FileNotFoundError", "FloatingPointError", "ImportError", "IndexError",
+    "InterruptedError", "IsADirectoryError", "KeyError", "LookupError",
+    "MemoryError", "ModuleNotFoundError", "NameError", "NotADirectoryError",
+    "NotImplementedError", "OSError", "OverflowError", "PermissionError",
+    "ProcessLookupError", "RecursionError", "RuntimeError", "StopAsyncIteration",
+    "StopIteration", "SyntaxError", "SystemError", "SystemExit", "TimeoutError",
+    "TypeError", "UnboundLocalError", "UnicodeDecodeError", "UnicodeEncodeError",
+    "UnicodeError", "ValueError", "ZeroDivisionError",
+    "Warning", "DeprecationWarning", "RuntimeWarning", "UserWarning",
+)
+_safe_builtins = {
+    _k: getattr(_real_builtins, _k)
+    for _k in _ALLOWED_BUILTIN_NAMES
+    if hasattr(_real_builtins, _k)
+}
+_safe_builtins["__import__"] = _safe_user_import
+_safe_builtins["type"] = _safe_type
 
 _sys.argv = [_target_script]
 _main_globals = {
@@ -2647,9 +3031,9 @@ _main_globals = {
     "__file__": _target_script,
     "__doc__": None,
     "__package__": None,
-    "__builtins__": __builtins__,
+    "__builtins__": _safe_builtins,
 }
-del _target_script, _os, _sys
+del _target_script, _os, _sys, _real_builtins, _ALLOWED_BUILTIN_NAMES
 exec(_script_code, _main_globals)
 '''
 
@@ -2660,6 +3044,7 @@ def _build_sandbox_child_env(
     workspace_dir: str,
     inputs_json_path: str,
     sandbox_tmp_dir: str,
+    max_workspace_bytes: int = 1048576,
 ) -> dict[str, str]:
     """Construct a minimal, secret-free environment for `sandbox_python` subprocesses."""
     env: dict[str, str] = {}
@@ -2675,7 +3060,293 @@ def _build_sandbox_child_env(
     env["PYTHONIOENCODING"] = "utf-8"
     env["SB_SANDBOX_WORKSPACE"] = workspace_dir
     env["SB_SANDBOX_INPUTS"] = inputs_json_path
+    env["SB_SANDBOX_MAX_BYTES"] = str(max(1024, int(max_workspace_bytes)))
     return env
+
+
+_BWRAP_USABLE_CACHE: bool | None = None
+_SEATBELT_USABLE_CACHE: bool | None = None
+
+
+def _linux_bwrap_usable() -> str | None:
+    global _BWRAP_USABLE_CACHE
+    if not sys.platform.startswith("linux"):
+        return None
+    bwrap_bin = shutil.which("bwrap")
+    if not bwrap_bin:
+        return None
+    if _BWRAP_USABLE_CACHE is None:
+        try:
+            probe = subprocess.run(
+                [
+                    bwrap_bin,
+                    "--unshare-net",
+                    "--die-with-parent",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--",
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    "pass",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=3.0,
+                check=False,
+            )
+            _BWRAP_USABLE_CACHE = probe.returncode == 0
+        except Exception:
+            _BWRAP_USABLE_CACHE = False
+    return bwrap_bin if _BWRAP_USABLE_CACHE else None
+
+
+def _macos_seatbelt_usable() -> str | None:
+    global _SEATBELT_USABLE_CACHE
+    if sys.platform != "darwin":
+        return None
+    sb_bin = "/usr/bin/sandbox-exec"
+    if not os.path.isfile(sb_bin):
+        return None
+    if _SEATBELT_USABLE_CACHE is None:
+        try:
+            probe = subprocess.run(
+                [sb_bin, "-p", "(version 1)(allow default)(deny network*)", sys.executable, "-I", "-c", "pass"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=3.0,
+                check=False,
+            )
+            _SEATBELT_USABLE_CACHE = probe.returncode == 0
+        except Exception:
+            _SEATBELT_USABLE_CACHE = False
+    return sb_bin if _SEATBELT_USABLE_CACHE else None
+
+
+def _seatbelt_escape(path_str: str) -> str:
+    return path_str.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _build_sandbox_command(
+    *,
+    runner_path: str,
+    script_path: str,
+    workspace_dir: str,
+    sandbox_root: str,
+    sandbox_tmp_dir: str,
+) -> tuple[list[str], str]:
+    base_py = [sys.executable, "-I", "-B", "-X", "utf8", runner_path, script_path]
+    bwrap_bin = _linux_bwrap_usable()
+    if bwrap_bin:
+        ws_real = os.path.realpath(workspace_dir)
+        tmp_real = os.path.realpath(sandbox_tmp_dir)
+        cmd = [
+            bwrap_bin,
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--bind",
+            ws_real,
+            ws_real,
+            "--bind",
+            tmp_real,
+            tmp_real,
+            "--chdir",
+            ws_real,
+            "--",
+            *base_py,
+        ]
+        return cmd, "linux_bwrap_rlimit"
+    sb_bin = _macos_seatbelt_usable()
+    if sb_bin:
+        ws_real = _seatbelt_escape(os.path.realpath(workspace_dir))
+        tmp_real = _seatbelt_escape(os.path.realpath(sandbox_tmp_dir))
+        root_real = _seatbelt_escape(os.path.realpath(sandbox_root))
+        profile = (
+            "(version 1)"
+            "(allow default)"
+            "(deny network*)"
+            "(deny process-fork)"
+            '(deny file-write* (subpath "/"))'
+            f'(allow file-write* (subpath "{ws_real}") (subpath "{tmp_real}") (literal "/dev/null"))'
+            f'(deny file-write* (subpath "{root_real}/_guard") (subpath "{root_real}/_scripts"))'
+        )
+        return [sb_bin, "-p", profile, *base_py], "macos_seatbelt_rlimit"
+    if os.name == "nt":
+        return base_py, "windows_job_object"
+    return base_py, "posix_rlimit"
+
+
+def _make_posix_preexec(*, max_fsize_bytes: int, timeout_seconds: float) -> Callable[[], None]:
+    def _preexec() -> None:
+        try:
+            import resource as _res
+
+            if hasattr(_res, "RLIMIT_CORE"):
+                _res.setrlimit(_res.RLIMIT_CORE, (0, 0))
+            if hasattr(_res, "RLIMIT_FSIZE"):
+                _res.setrlimit(_res.RLIMIT_FSIZE, (max_fsize_bytes, max_fsize_bytes))
+            if hasattr(_res, "RLIMIT_CPU"):
+                cpu_s = max(2, int(math.ceil(timeout_seconds)) + 2)
+                _res.setrlimit(_res.RLIMIT_CPU, (cpu_s, cpu_s))
+            if sys.platform.startswith("linux") and hasattr(_res, "RLIMIT_AS"):
+                _res.setrlimit(_res.RLIMIT_AS, (536870912, 536870912))
+            if hasattr(_res, "RLIMIT_NPROC") and sys.platform.startswith("linux"):
+                # Prevent fork-bombs while allowing existing user threads
+                pass
+        except Exception:
+            pass
+
+    return _preexec
+
+
+class _Win32SandboxJob:
+    """Win32 Job Object enforcing active-process=1, 512 MiB memory cap, UI isolation, and kill-on-close."""
+
+    def __init__(self, *, memory_limit_bytes: int = 512 * 1024 * 1024) -> None:
+        self._handle: int = 0
+        self._memory_limit = int(memory_limit_bytes)
+
+    def attach_and_resume(self, proc: subprocess.Popen[bytes]) -> None:
+        if os.name != "nt":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll")
+
+        class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        class _JOBOBJECT_BASIC_UI_RESTRICTIONS(ctypes.Structure):
+            _fields_ = [("UIRestrictionsClass", wintypes.DWORD)]
+
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+        ntdll.NtResumeProcess.restype = ctypes.c_long
+
+        proc_handle = int(getattr(proc, "_handle", 0) or 0)
+        h_job = kernel32.CreateJobObjectW(None, None)
+        if not h_job:
+            proc.kill()
+            raise PermissionError(f"CreateJobObjectW failed (winerr={ctypes.get_last_error()}).")
+        self._handle = int(h_job)
+
+        # LimitFlags: ACTIVE_PROCESS(0x8) | PROCESS_MEMORY(0x100) | JOB_MEMORY(0x200)
+        #             | DIE_ON_UNHANDLED_EXCEPTION(0x400) | KILL_ON_JOB_CLOSE(0x2000)
+        # Note: Windows venv / uv trampolines (.venv\Scripts\python.exe) spawn sys._base_executable
+        # and wait on it (2 active processes); direct python.exe needs only 1. Either way, the
+        # running interpreter has zero remaining process quota to spawn any child process!
+        base_exe = getattr(sys, "_base_executable", None) or sys.executable
+        uses_trampoline = os.path.normcase(os.path.abspath(sys.executable)) != os.path.normcase(
+            os.path.abspath(base_exe)
+        )
+        ext = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        ext.BasicLimitInformation.LimitFlags = 0x0008 | 0x0100 | 0x0200 | 0x0400 | 0x2000
+        ext.BasicLimitInformation.ActiveProcessLimit = 2 if uses_trampoline else 1
+        ext.ProcessMemoryLimit = self._memory_limit
+        ext.JobMemoryLimit = self._memory_limit
+        if not kernel32.SetInformationJobObject(
+            h_job, 9, ctypes.byref(ext), ctypes.sizeof(ext)
+        ):
+            winerr = ctypes.get_last_error()
+            self.close()
+            proc.kill()
+            raise PermissionError(f"SetInformationJobObject(ExtendedLimit) failed (winerr={winerr}).")
+
+        ui_rest = _JOBOBJECT_BASIC_UI_RESTRICTIONS(0x000000FF)
+        kernel32.SetInformationJobObject(h_job, 4, ctypes.byref(ui_rest), ctypes.sizeof(ui_rest))
+
+        if not kernel32.AssignProcessToJobObject(h_job, wintypes.HANDLE(proc_handle)):
+            winerr = ctypes.get_last_error()
+            self.close()
+            proc.kill()
+            raise PermissionError(f"AssignProcessToJobObject failed (winerr={winerr}).")
+
+        status = ntdll.NtResumeProcess(wintypes.HANDLE(proc_handle))
+        if status != 0:
+            self.close()
+            proc.kill()
+            raise PermissionError(f"NtResumeProcess failed (ntstatus=0x{status & 0xFFFFFFFF:08x}).")
+
+    def close(self) -> None:
+        if os.name == "nt" and self._handle:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(wintypes.HANDLE(self._handle))
+            self._handle = 0
+
+
+def _compute_dir_bytes_fast(root_dir: str) -> int:
+    total = 0
+    if not os.path.isdir(root_dir):
+        return 0
+    try:
+        for cur, _dirs, files in os.walk(root_dir, followlinks=False):
+            for fn in files:
+                try:
+                    total += os.lstat(os.path.join(cur, fn)).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
 
 
 def _terminate_process_tree(proc: subprocess.Popen[bytes]) -> None:
@@ -2938,7 +3609,7 @@ def execute_promoted_skill(
     actor: str,
     dry_run: bool = False,
     keep_sandbox_copy_dir: str | None = None,
-    brain_dir: str = BRAIN_DIR,
+    brain_dir: str | None = None,
     atoms_dir: str | None = None,
     playbooks_dir: str | None = None,
     skills_dir: str | None = None,
@@ -3333,13 +4004,59 @@ def execute_promoted_skill(
                             playbooks_dir=dirs["playbooks_dir"],
                         )
                     elif audit_kind == "contradictions":
-                        contra = detect_contradictions(
-                            brain_dir=dirs["brain_dir"],
-                            atoms_dir=dirs["atoms_dir"],
-                            project_scope=skill_projects[0] if len(skill_projects) == 1 else None,
-                            include_pending=False,
-                            enable_nli=False,
-                        )
+                        if len(skill_projects) > 1:
+                            from knowledge_graph import build_knowledge_graph
+                            from recall import normalize_project_tag
+
+                            raw_graph = build_knowledge_graph(
+                                brain_dir=dirs["brain_dir"],
+                                atoms_dir=dirs["atoms_dir"],
+                                project_scope=None,
+                                include_pending=False,
+                                include_preferences=False,
+                            )
+                            norm_skill_projects = tuple(
+                                p for p in (normalize_project_tag(sp) for sp in skill_projects) if p
+                            )
+                            allowed_nodes = []
+                            for node in raw_graph.get("nodes") or []:
+                                node_proj_tags = [
+                                    str(c).strip()
+                                    for c in (node.get("contexts") or [])
+                                    if str(c).strip().lower().startswith("project:")
+                                ]
+                                if node_proj_tags and all(
+                                    bool(project_tags_match((tag,), norm_skill_projects))
+                                    for tag in node_proj_tags
+                                ):
+                                    allowed_nodes.append(node)
+                            allowed_files = {str(n.get("filename") or "") for n in allowed_nodes}
+                            filtered_edges = [
+                                e
+                                for e in (raw_graph.get("edges") or [])
+                                if str(e.get("from") or "") in allowed_files
+                                and str(e.get("to") or "") in allowed_files
+                            ]
+                            scoped_graph = {
+                                **raw_graph,
+                                "nodes": allowed_nodes,
+                                "edges": filtered_edges,
+                            }
+                            contra = detect_contradictions(
+                                brain_dir=dirs["brain_dir"],
+                                atoms_dir=dirs["atoms_dir"],
+                                graph=scoped_graph,
+                                include_pending=False,
+                                enable_nli=False,
+                            )
+                        else:
+                            contra = detect_contradictions(
+                                brain_dir=dirs["brain_dir"],
+                                atoms_dir=dirs["atoms_dir"],
+                                project_scope=skill_projects[0] if len(skill_projects) == 1 else None,
+                                include_pending=False,
+                                enable_nli=False,
+                            )
                         audit_data = {
                             "contradiction_count": contra.get("contradiction_count", 0),
                             "high_severity_count": contra.get("high_severity_count", 0),
@@ -3443,10 +4160,20 @@ def execute_promoted_skill(
 
                     stdout_log = os.path.join(sandbox_tmp_dir, f"step_{step_num:02d}.stdout")
                     stderr_log = os.path.join(sandbox_tmp_dir, f"step_{step_num:02d}.stderr")
+                    max_ws_bytes = max(rep.max_output_bytes * 4, 65536)
+                    max_tmp_bytes = max(rep.max_output_bytes * 8, 1048576)
                     child_env = _build_sandbox_child_env(
                         guard_dir=guard_dir,
                         workspace_dir=workspace_dir,
                         inputs_json_path=inputs_json_path,
+                        sandbox_tmp_dir=sandbox_tmp_dir,
+                        max_workspace_bytes=max_ws_bytes,
+                    )
+                    sandbox_cmd, containment_backend = _build_sandbox_command(
+                        runner_path=runner_path,
+                        script_path=script_path,
+                        workspace_dir=workspace_dir,
+                        sandbox_root=sandbox_root,
                         sandbox_tmp_dir=sandbox_tmp_dir,
                     )
 
@@ -3456,36 +4183,75 @@ def execute_promoted_skill(
                         "stdin": subprocess.DEVNULL,
                         "shell": False,
                     }
+                    win_job: _Win32SandboxJob | None = None
                     if os.name == "nt":
-                        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                        CREATE_SUSPENDED = 0x00000004
+                        CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                        CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                        popen_kwargs["creationflags"] = (
+                            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+                        )
+                        win_job = _Win32SandboxJob(memory_limit_bytes=512 * 1024 * 1024)
                     else:
                         popen_kwargs["start_new_session"] = True
+                        popen_kwargs["preexec_fn"] = _make_posix_preexec(
+                            max_fsize_bytes=max(max_ws_bytes, max_tmp_bytes),
+                            timeout_seconds=rep.timeout_seconds,
+                        )
 
                     sub_killed = False
                     sub_timed_out = False
+                    sub_quota_exceeded = False
+                    quota_detail = ""
                     killed_detail = ""
-                    with open(stdout_log, "wb") as out_fh, open(stderr_log, "wb") as err_fh:
-                        proc = subprocess.Popen(
-                            [sys.executable, "-I", "-B", "-X", "utf8", runner_path, script_path],
-                            stdout=out_fh,
-                            stderr=err_fh,
-                            **popen_kwargs,
-                        )
-                        while proc.poll() is None:
-                            ks_mid = get_skill_kill_switch_status(
-                                brain_dir=dirs["brain_dir"], security_dir=security_dir
+                    try:
+                        with open(stdout_log, "wb") as out_fh, open(stderr_log, "wb") as err_fh:
+                            proc = subprocess.Popen(
+                                sandbox_cmd,
+                                stdout=out_fh,
+                                stderr=err_fh,
+                                **popen_kwargs,
                             )
-                            killed_now, ks_mid_reason = _is_skill_killed(ks_mid, rep.skill_id)
-                            if killed_now:
-                                sub_killed = True
-                                killed_detail = ks_mid_reason
-                                _terminate_process_tree(proc)
-                                break
-                            if time.monotonic() >= deadline:
-                                sub_timed_out = True
-                                _terminate_process_tree(proc)
-                                break
-                            time.sleep(POLL_INTERVAL_SECONDS)
+                            if win_job is not None:
+                                win_job.attach_and_resume(proc)
+                            def _kill_sandbox_fast() -> None:
+                                if win_job is not None:
+                                    win_job.close()
+                                    try:
+                                        proc.wait(timeout=0.5)
+                                    except subprocess.TimeoutExpired:
+                                        pass
+                                if proc.poll() is None:
+                                    _terminate_process_tree(proc)
+
+                            while proc.poll() is None:
+                                ks_mid = get_skill_kill_switch_status(
+                                    brain_dir=dirs["brain_dir"], security_dir=security_dir
+                                )
+                                killed_now, ks_mid_reason = _is_skill_killed(ks_mid, rep.skill_id)
+                                if killed_now:
+                                    sub_killed = True
+                                    killed_detail = ks_mid_reason
+                                    _kill_sandbox_fast()
+                                    break
+                                if time.monotonic() >= deadline:
+                                    sub_timed_out = True
+                                    _kill_sandbox_fast()
+                                    break
+                                ws_live_bytes = _compute_dir_bytes_fast(workspace_dir)
+                                tmp_live_bytes = _compute_dir_bytes_fast(sandbox_tmp_dir)
+                                if ws_live_bytes > max_ws_bytes or tmp_live_bytes > max_tmp_bytes:
+                                    sub_quota_exceeded = True
+                                    quota_detail = (
+                                        f"disk_quota_exceeded:ws={ws_live_bytes}/{max_ws_bytes},"
+                                        f"tmp={tmp_live_bytes}/{max_tmp_bytes}"
+                                    )
+                                    _kill_sandbox_fast()
+                                    break
+                                time.sleep(POLL_INTERVAL_SECONDS)
+                    finally:
+                        if win_job is not None:
+                            win_job.close()
 
                     stdout_text, stdout_trunc = _read_bounded_redacted_stream(stdout_log, rep.max_output_bytes)
                     stderr_text, stderr_trunc = _read_bounded_redacted_stream(stderr_log, rep.max_output_bytes)
@@ -3500,6 +4266,7 @@ def execute_promoted_skill(
                                 "step_index": step_num,
                                 "action_type": atype,
                                 "status": "killed_by_switch",
+                                "containment_backend": containment_backend,
                                 "returncode": proc.returncode,
                                 "detail": f"kill_switch_engaged:{killed_detail}",
                                 "stdout": stdout_text,
@@ -3519,8 +4286,29 @@ def execute_promoted_skill(
                                 "step_index": step_num,
                                 "action_type": atype,
                                 "status": "timed_out",
+                                "containment_backend": containment_backend,
                                 "returncode": proc.returncode,
                                 "detail": f"timeout_exceeded:{rep.timeout_seconds}s",
+                                "stdout": stdout_text,
+                                "stderr": stderr_text,
+                                "output_truncated": bool(stdout_trunc or stderr_trunc),
+                                "duration_ms": round((time.monotonic() - step_t0) * 1000.0, 3),
+                            }
+                        )
+                        break
+
+                    if sub_quota_exceeded:
+                        final_status = "failed_rolled_back"
+                        _restore_workspace_snapshot(workspace_dir, pre_workspace_snapshot)
+                        rollback_executed = True
+                        step_results.append(
+                            {
+                                "step_index": step_num,
+                                "action_type": atype,
+                                "status": "failed",
+                                "containment_backend": containment_backend,
+                                "returncode": proc.returncode,
+                                "detail": quota_detail,
                                 "stdout": stdout_text,
                                 "stderr": stderr_text,
                                 "output_truncated": bool(stdout_trunc or stderr_trunc),
@@ -3552,6 +4340,7 @@ def execute_promoted_skill(
                                 "step_index": step_num,
                                 "action_type": atype,
                                 "status": "failed",
+                                "containment_backend": containment_backend,
                                 "returncode": rc,
                                 "detail": (
                                     f"missing_declared_output:{declared_out}"
@@ -3571,6 +4360,7 @@ def execute_promoted_skill(
                             "step_index": step_num,
                             "action_type": atype,
                             "status": "ok",
+                            "containment_backend": containment_backend,
                             "returncode": 0,
                             "output_file": declared_out,
                             "output_sha256": out_sha,
@@ -3585,7 +4375,7 @@ def execute_promoted_skill(
                 try:
                     artifact_hashes = _hash_workspace_artifacts(
                         workspace_dir,
-                        max_total_bytes=max(rep.max_output_bytes * 4, 1048576),
+                        max_total_bytes=max(rep.max_output_bytes * 4, 65536),
                     )
                 except (PermissionError, ExecutableSkillValidationError) as exc:
                     final_status = "failed_rolled_back"
@@ -3696,6 +4486,22 @@ def main(argv: list[str] | None = None) -> int:
     cand_p = sub.add_parser("candidates", help="Inspect verified Playbooks for Executable Skill readiness.")
     cand_p.add_argument("--json", action="store_true")
 
+    prom_p = sub.add_parser("promote", help="Promote an active verified Playbook into a Stage 4 Executable Skill via CAS.")
+    prom_p.add_argument("skill_id", nargs="?", default="", help="Skill slug identifier (or pass --skill-id).")
+    prom_p.add_argument("--skill-id", dest="skill_id_opt", default="", help="Skill slug identifier.")
+    prom_p.add_argument("--playbook-id", required=True, help="Backing active Playbook ID.")
+    prom_p.add_argument("--expected-playbook-sha256", required=True, help="64-char SHA-256 of the backing Playbook.")
+    prom_p.add_argument("--step-actions-json", default="", help="JSON array of sandboxed step action objects (or @path).")
+    prom_p.add_argument("--step-actions-file", default="", help="Path to JSON file containing step_actions list.")
+    prom_p.add_argument("--input-schema-json", default="", help="Optional JSON object defining runtime input_schema.")
+    prom_p.add_argument("--timeout-seconds", type=float, default=15.0)
+    prom_p.add_argument("--max-output-bytes", type=int, default=65536)
+    prom_p.add_argument("--actor", required=True, help="Human owner actor identifier.")
+    prom_p.add_argument("--rationale", default="", help="Owner promotion rationale.")
+    prom_p.add_argument("--allow-early-owner-override", action="store_true")
+    prom_p.add_argument("--expected-skill-sha256", default=None, help="64-char SHA-256 when updating an existing skill via CAS.")
+    prom_p.add_argument("--json", action="store_true")
+
     list_p = sub.add_parser("list", help="List Executable Skills and verify live cryptographic integrity.")
     list_p.add_argument("--all", action="store_true", help="Include stale, revoked, or killed skills.")
     list_p.add_argument("--json", action="store_true")
@@ -3750,6 +4556,48 @@ def main(argv: list[str] | None = None) -> int:
                     f"{c['playbook_id']:28} | stage={c['maturity_stage']:22} | "
                     f"min_cites={c['min_grounded_citations']} | episodes={c['successful_episodes']}"
                 )
+        return 0
+
+    if args.command == "promote":
+        eff_skill_id = str(args.skill_id_opt or args.skill_id or "").strip()
+        if not eff_skill_id:
+            parser.error("promote requires a skill_id (positional or --skill-id).")
+        raw_actions_src = str(args.step_actions_json or "").strip()
+        if args.step_actions_file:
+            act_path = Path(args.step_actions_file).expanduser().resolve()
+            _assert_not_reparse(act_path, "step_actions_file")
+            raw_actions_src = act_path.read_text(encoding="utf-8")
+        elif raw_actions_src.startswith("@"):
+            act_path = Path(raw_actions_src[1:]).expanduser().resolve()
+            _assert_not_reparse(act_path, "step_actions_file")
+            raw_actions_src = act_path.read_text(encoding="utf-8")
+        if not raw_actions_src:
+            parser.error("promote requires --step-actions-json or --step-actions-file.")
+        parsed_actions = json.loads(raw_actions_src)
+        if not isinstance(parsed_actions, list):
+            raise ExecutableSkillValidationError("step_actions must be a JSON array of step action objects.")
+        parsed_schema = json.loads(args.input_schema_json) if str(args.input_schema_json or "").strip() else None
+        promoted = promote_playbook_to_executable_skill(
+            skill_id=eff_skill_id,
+            playbook_id=args.playbook_id,
+            expected_playbook_sha256=args.expected_playbook_sha256,
+            step_actions=parsed_actions,
+            input_schema=parsed_schema,
+            timeout_seconds=args.timeout_seconds,
+            max_output_bytes=args.max_output_bytes,
+            actor=args.actor,
+            rationale=args.rationale,
+            allow_early_owner_override=bool(args.allow_early_owner_override),
+            expected_skill_sha256=args.expected_skill_sha256,
+            brain_dir=cli_brain,
+        )
+        if args.json:
+            print(json.dumps(promoted, indent=2, sort_keys=True))
+        else:
+            print(
+                f"Promoted skill={promoted['skill_id']} playbook={promoted['playbook_id']} "
+                f"sha256={str(promoted['sha256'])[:16]}..."
+            )
         return 0
 
     if args.command == "list":

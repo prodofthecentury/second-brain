@@ -120,6 +120,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "mobile_vault_client_tests.py")),
     ),
     (
+        "bugfix_1a_regression_tests",
+        "1A live bugs, Stage 4 sandbox hardening, keychain sealing, Merkle/snapshot parity, skill-executions sync merge, ephemeral clipper port, numeric 422 & minimal-wheel imports (scripts/bugfix_1a_regression_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "bugfix_1a_regression_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),
@@ -135,9 +140,59 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "dashboard_apptest_tests.py")),
     ),
     (
+        "parity_1c_tests",
+        "1C cross-layer parity: bi-temporal graph API/SDK, 27-tool MCP + ONNX NLI, CLI commands & PWA/clipper manifests/icons (scripts/parity_1c_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "parity_1c_tests.py")),
+    ),
+    (
         "wheel_packaging_tests",
         "Clean wheel namespace, isolated temp-venv CLI/API/dashboard, VSIX, icons & offline wheelhouse suite (scripts/wheel_packaging_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "wheel_packaging_tests.py")),
+    ),
+    (
+        "phase6_release_and_stores_tests",
+        "Epic 2A multi-store publishers (CWS v2, AMO v5, Edge, PyPI, VSIX, WinGet PR), Azure/DMG notarization, Ed25519 manifest sigs & Fastlane workflows (scripts/phase6_release_and_stores_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "phase6_release_and_stores_tests.py")),
+    ),
+    (
+        "phase7_platform_and_connectors_tests",
+        "Epic 2B video ingestion, desktop auto-updater, bidirectional mobile E2EE, 14 IDE/AI host connectors, Safari/media browser clipper & optional live benchmarks (scripts/phase7_platform_and_connectors_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "phase7_platform_and_connectors_tests.py")),
+    ),
+    (
+        "phase8_ecosystem_and_canvas_tests",
+        "Epic 2C dual-mode Build Canvas, speculative llama.cpp decoding, Kokoro ONNX TTS voice loop, opt-in Screen OCR/External Indexer/OpenAI Proxy/Tunnel, Jarvis orchestrator, 5-panel critique & quarantined skill packs (scripts/phase8_ecosystem_and_canvas_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "phase8_ecosystem_and_canvas_tests.py")),
+    ),
+    (
+        "phase9_gen4_cognition_tests",
+        "Epic 2D Gen-4 cognitive architecture: Fractal Zoom L0-L5, Predictive L0-L3 Bus invalidation, Principles & Mental Models CAS/Merkle, Knowledge Gravity & cold-archive, Living Concepts timelines & spreading activation, Meta-Router/Swarm/Debate, Nightly Replay, World-Model Simulator, Self-Model/Curiosity & ADR gates (scripts/phase9_gen4_cognition_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "phase9_gen4_cognition_tests.py")),
+    ),
+    (
+        "phase10_math_and_formal_discovery_tests",
+        "Epic 2E quantitative reasoning, neuro-symbolic verification & formal proof search: LaTeX preservation, symbolic equivalence & Minerva majority@k, AST-jailed sandbox & CGV/DUP/ToRA loop, 4D Process Rubric & anti-sycophancy refiner, SafeVerify EVOLVE-BLOCK/Ralph/Agent-D Plackett-Luce Gibbs Elo & Subgoal Cache, perturbation invariance & decontamination (scripts/phase10_math_and_formal_discovery_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "phase10_math_and_formal_discovery_tests.py")),
+    ),
+    (
+        "quantum_leap_api_sdk_tests",
+        "Quantum Leap end-to-end loopback HTTP coverage for all Phase 9-10 routes, owner/opt-in security gates, full Phase 8-10 MemoryApiClient SDK parity, meta_router deliberative chat & CLI parity (scripts/quantum_leap_api_sdk_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "quantum_leap_api_sdk_tests.py")),
+    ),
+    (
+        "goal_1b_completion_tests",
+        "1B completion regression suite: Capacitor mobile native/JS, Creative Media fail-closed & H.264 MP4, ONNX unconditional rerank, registry CLI & AMO polling, Linux AppImage/deb sigs, fair SOTA benchmarks, macOS/GPU/PDF OCR, dynamic vault paths, dashboard cookie, chat REPL shim & smart critic (scripts/goal_1b_completion_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "goal_1b_completion_tests.py")),
+    ),
+    (
+        "release_and_benchmark_tests",
+        "Diffusers local/SDXL pipelines, owner gates (Track 3/4), release publisher, Ed25519 verification & doc/CLI parity suite (scripts/release_and_benchmark_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "release_and_benchmark_tests.py")),
+    ),
+    (
+        "live_runtime_integration_tests",
+        "Unmocked ONNX weights, faster-whisper tiny.en, Ollama llava/nomic-embed/qwen2.5-coder:7b, PyAV libx264 & loopback TCP daemon suite (scripts/live_runtime_integration_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "live_runtime_integration_tests.py")),
     ),
     (
         "scale_benchmark_1500",
@@ -204,16 +259,33 @@ def main(argv: list[str] | None = None) -> int:
         nargs="*",
         help="Optional subset of suite IDs to run.",
     )
+    parser.add_argument(
+        "--exclude",
+        nargs="*",
+        help="Optional subset of suite IDs to skip (cannot be combined with --only).",
+    )
     args = parser.parse_args(argv)
 
+    if args.only and args.exclude:
+        print("Cannot combine --only and --exclude.", file=sys.stderr)
+        return 2
+
+    all_ids = {s[0] for s in SUITES}
     selected = SUITES
     if args.only:
         wanted = set(args.only)
         selected = tuple(s for s in SUITES if s[0] in wanted)
-        unknown = wanted - {s[0] for s in selected}
+        unknown = wanted - all_ids
         if unknown:
             print(f"Unknown suite ID(s): {', '.join(sorted(unknown))}", file=sys.stderr)
             return 2
+    elif args.exclude:
+        excluded = set(args.exclude)
+        unknown = excluded - all_ids
+        if unknown:
+            print(f"Unknown excluded suite ID(s): {', '.join(sorted(unknown))}", file=sys.stderr)
+            return 2
+        selected = tuple(s for s in SUITES if s[0] not in excluded)
 
     print("=" * 84)
     print("SECOND BRAIN — UNIFIED PRODUCTION TEST GATE")

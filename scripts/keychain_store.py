@@ -48,11 +48,14 @@ class KeychainUnavailableError(KeychainError):
 
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-_DPAPI_ENTROPY = b"SecondBrain-VaultSync-MasterKey-v1"
+_DPAPI_ENTROP = b"SecondBrain-VaultSync-MasterKey-v1"
+_DPAPI_ENTROPY = _DPAPI_ENTROP
 _DPAPI_FILE_MAGIC = b"SBDP1\x00"
 _FALLBACK_FILE_MAGIC = b"SBKF1\x00"
+_SEALED_FALLBACK_MAGIC = b"SBKF2\x00"
 _CRYPTPROTECT_UI_FORBIDDEN = 0x00000001
 MAX_SECRET_BYTES = 4096
+NATIVE_KEYCHAIN_BACKENDS = frozenset({"windows_dpapi", "macos_keychain", "linux_secret_service"})
 
 
 def _validate_identifier(value: str, label: str) -> str:
@@ -225,17 +228,100 @@ def dpapi_unprotect_bytes(ciphertext: bytes, *, entropy: bytes = _DPAPI_ENTROPY)
 
 # ─── macOS Keychain & Linux Secret Service Helpers ───────────────────────────
 
-def _macos_security_available(state_dir: Path | None) -> bool:
-    return sys.platform == "darwin" and state_dir is None and os.path.isfile("/usr/bin/security")
+def _scoped_os_service(service: str, state_dir: Path | None) -> str:
+    """Namespace OS keychain service by `state_dir` when a non-default state directory is used."""
+    if state_dir is None:
+        return service
+    try:
+        resolved_custom = Path(state_dir).resolve()
+        resolved_default = security_state_dir().resolve()
+    except OSError:
+        resolved_custom = Path(os.path.abspath(str(state_dir)))
+        resolved_default = Path(os.path.abspath(str(security_state_dir())))
+    if os.path.normcase(str(resolved_custom)) == os.path.normcase(str(resolved_default)):
+        return service
+    state_hash = hashlib.sha256(os.path.normcase(str(resolved_custom)).encode("utf-8")).hexdigest()[:12]
+    suffix = f".sd-{state_hash}"
+    base = service[: max(1, 128 - len(suffix))]
+    return f"{base}{suffix}"
 
 
-def _linux_secret_tool_available(state_dir: Path | None) -> bool:
+def _macos_security_available(state_dir: Path | None = None) -> bool:
+    _ = state_dir
+    return sys.platform == "darwin" and os.path.isfile("/usr/bin/security")
+
+
+def _linux_secret_tool_available(state_dir: Path | None = None) -> bool:
+    _ = state_dir
     return (
         sys.platform.startswith("linux")
-        and state_dir is None
         and bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
         and shutil.which("secret-tool") is not None
     )
+
+
+def _derive_local_wrap_subkey(kdir: Path, service: str, account: str, *, create: bool) -> bytes | None:
+    wrap_path = kdir / ".wrap.key"
+    if os.path.lexists(str(wrap_path)):
+        st = _assert_regular_secret_file(wrap_path)
+        if st.st_size != 32:
+            raise KeychainError(f"Corrupted local wrap key length ({st.st_size} bytes): {wrap_path}")
+        root_key = wrap_path.read_bytes()
+    else:
+        if not create:
+            return None
+        root_key = os.urandom(32)
+        _atomic_write_secret_file(wrap_path, root_key)
+    uid_tag = str(os.getuid()) if hasattr(os, "getuid") else (os.environ.get("USERNAME") or "local")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"SecondBrain-LocalWrap-Salt-v2",
+        info=f"sb-keyfile-v2:{uid_tag}:{service}:{account}".encode("utf-8"),
+    ).derive(root_key)
+
+
+def _seal_fallback_blob(kdir: Path, service: str, account: str, plaintext: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    subkey = _derive_local_wrap_subkey(kdir, service, account, create=True)
+    if subkey is None:
+        raise KeychainError("Failed to initialize local wrap key.")
+    nonce = os.urandom(12)
+    aad = f"SBKF2:{service}:{account}".encode("utf-8")
+    ct = AESGCM(subkey).encrypt(nonce, plaintext, aad)
+    return _SEALED_FALLBACK_MAGIC + nonce + ct
+
+
+def _unseal_fallback_blob(kdir: Path, service: str, account: str, blob: bytes) -> bytes:
+    if blob.startswith(_SEALED_FALLBACK_MAGIC):
+        payload = blob[len(_SEALED_FALLBACK_MAGIC) :]
+        if len(payload) < 12 + 16 + 1:
+            raise KeychainError("Truncated SBKF2 keychain file.")
+        subkey = _derive_local_wrap_subkey(kdir, service, account, create=False)
+        if subkey is None:
+            raise KeychainError("Missing local wrap key (.wrap.key) required to unseal SBKF2 secret.")
+        nonce = payload[:12]
+        ct = payload[12:]
+        aad = f"SBKF2:{service}:{account}".encode("utf-8")
+        from cryptography.exceptions import InvalidTag
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        try:
+            return AESGCM(subkey).decrypt(nonce, ct, aad)
+        except InvalidTag as exc:
+            raise KeychainError("Local SBKF2 keychain file authentication failed (tampered or wrong wrap key).") from exc
+    if blob.startswith(_FALLBACK_FILE_MAGIC):
+        return blob[len(_FALLBACK_FILE_MAGIC) :]
+    raise KeychainError("Malformed restricted keychain file header.")
+
+
+def is_native_keychain_backend(backend: str | None) -> bool:
+    """Return True only when sealed by an OS-managed keychain/DPAPI provider (never file fallback)."""
+    return (backend or "").strip().lower() in NATIVE_KEYCHAIN_BACKENDS
 
 
 def keychain_backend_name(*, state_dir: Path | None = None) -> str:
@@ -272,9 +358,12 @@ def store_secret(
         _atomic_write_secret_file(dest, _DPAPI_FILE_MAGIC + sealed)
         return {"backend": "windows_dpapi", "service": svc, "account": acc}
 
+    os_svc = _scoped_os_service(svc, state_dir)
+    native_attempted_and_failed = False
+
     if _macos_security_available(state_dir):
         b64_val = base64.b64encode(raw).decode("ascii")
-        cmd_line = f'add-generic-password -U -s "{svc}" -a "{acc}" -w "{b64_val}"\n'
+        cmd_line = f'add-generic-password -U -s "{os_svc}" -a "{acc}" -w "{b64_val}"\n'
         proc = subprocess.run(
             ["/usr/bin/security", "-i"],
             input=cmd_line,
@@ -285,13 +374,14 @@ def store_secret(
         )
         if proc.returncode == 0:
             return {"backend": "macos_keychain", "service": svc, "account": acc}
+        native_attempted_and_failed = True
 
     if _linux_secret_tool_available(state_dir):
         st_bin = shutil.which("secret-tool")
         if st_bin:
             b64_val = base64.b64encode(raw).decode("ascii")
             proc = subprocess.run(
-                [st_bin, "store", "--label=Second Brain Vault Key", "service", svc, "account", acc],
+                [st_bin, "store", "--label=Second Brain Vault Key", "service", os_svc, "account", acc],
                 input=b64_val,
                 text=True,
                 capture_output=True,
@@ -300,18 +390,24 @@ def store_secret(
             )
             if proc.returncode == 0:
                 return {"backend": "linux_secret_service", "service": svc, "account": acc}
+            native_attempted_and_failed = True
 
-    fallback_permitted = (
-        allow_file_fallback
-        if allow_file_fallback is not None
-        else (state_dir is not None or (os.environ.get("BRAIN_ALLOW_KEYFILE_FALLBACK") or "").strip() == "1")
-    )
+    env_fallback = (os.environ.get("BRAIN_ALLOW_KEYFILE_FALLBACK") or "").strip() == "1"
+    if allow_file_fallback is not None:
+        fallback_permitted = bool(allow_file_fallback)
+    elif native_attempted_and_failed:
+        # Native OS keychain exists on this machine but refused/failed (e.g. locked keychain): fail closed unless explicitly overridden!
+        fallback_permitted = env_fallback
+    else:
+        # Headless POSIX container without Secret Service / security binary: allow AEAD-wrapped local fallback when isolated state_dir or env opt-in is used
+        fallback_permitted = state_dir is not None or env_fallback
+
     if not fallback_permitted:
         raise KeychainUnavailableError(
-            "Native OS Keychain / Secret Service is unavailable or locked; refusing silent plaintext keyfile fallback."
+            "Native OS Keychain / Secret Service is unavailable or locked; refusing fallback keyfile."
         )
     dest = kdir / f"{slug}.key"
-    _atomic_write_secret_file(dest, _FALLBACK_FILE_MAGIC + raw)
+    _atomic_write_secret_file(dest, _seal_fallback_blob(kdir, svc, acc, raw))
     return {"backend": "posix_restricted_keyfile", "service": svc, "account": acc}
 
 
@@ -349,18 +445,21 @@ def load_secret(
                 raise KeychainError("Malformed DPAPI keychain file header.")
             return dpapi_unprotect_bytes(blob[len(_DPAPI_FILE_MAGIC) :])
 
+    os_svc = _scoped_os_service(svc, state_dir)
+
     if preferred == "macos_keychain":
         if not _macos_security_available(state_dir):
             return None
-        proc = subprocess.run(
-            ["/usr/bin/security", "find-generic-password", "-s", svc, "-a", acc, "-w"],
-            text=True,
-            capture_output=True,
-            timeout=10.0,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            return base64.b64decode(proc.stdout.strip())
+        for candidate_svc in ([os_svc, svc] if os_svc != svc else [svc]):
+            proc = subprocess.run(
+                ["/usr/bin/security", "find-generic-password", "-s", candidate_svc, "-a", acc, "-w"],
+                text=True,
+                capture_output=True,
+                timeout=10.0,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return base64.b64decode(proc.stdout.strip())
         return None
 
     if preferred == "linux_secret_service":
@@ -369,21 +468,9 @@ def load_secret(
         st_bin = shutil.which("secret-tool")
         if not st_bin:
             return None
-        proc = subprocess.run(
-            [st_bin, "lookup", "service", svc, "account", acc],
-            text=True,
-            capture_output=True,
-            timeout=10.0,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            return base64.b64decode(proc.stdout.strip())
-        return None
-
-    if preferred == "":
-        if _macos_security_available(state_dir):
+        for candidate_svc in ([os_svc, svc] if os_svc != svc else [svc]):
             proc = subprocess.run(
-                ["/usr/bin/security", "find-generic-password", "-s", svc, "-a", acc, "-w"],
+                [st_bin, "lookup", "service", candidate_svc, "account", acc],
                 text=True,
                 capture_output=True,
                 timeout=10.0,
@@ -391,11 +478,13 @@ def load_secret(
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 return base64.b64decode(proc.stdout.strip())
-        if _linux_secret_tool_available(state_dir):
-            st_bin = shutil.which("secret-tool")
-            if st_bin:
+        return None
+
+    if preferred == "":
+        if _macos_security_available(state_dir):
+            for candidate_svc in ([os_svc, svc] if os_svc != svc else [svc]):
                 proc = subprocess.run(
-                    [st_bin, "lookup", "service", svc, "account", acc],
+                    ["/usr/bin/security", "find-generic-password", "-s", candidate_svc, "-a", acc, "-w"],
                     text=True,
                     capture_output=True,
                     timeout=10.0,
@@ -403,17 +492,28 @@ def load_secret(
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
                     return base64.b64decode(proc.stdout.strip())
+        if _linux_secret_tool_available(state_dir):
+            st_bin = shutil.which("secret-tool")
+            if st_bin:
+                for candidate_svc in ([os_svc, svc] if os_svc != svc else [svc]):
+                    proc = subprocess.run(
+                        [st_bin, "lookup", "service", candidate_svc, "account", acc],
+                        text=True,
+                        capture_output=True,
+                        timeout=10.0,
+                        check=False,
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        return base64.b64decode(proc.stdout.strip())
 
     fallback = kdir / f"{slug}.key"
     if not os.path.lexists(str(fallback)):
         return None
     st = _assert_regular_secret_file(fallback)
-    if st.st_size > MAX_SECRET_BYTES + 64:
+    if st.st_size > MAX_SECRET_BYTES + 128:
         raise KeychainError(f"Oversized keychain file rejected: {fallback}")
     blob = fallback.read_bytes()
-    if not blob.startswith(_FALLBACK_FILE_MAGIC):
-        raise KeychainError("Malformed restricted keychain file header.")
-    return blob[len(_FALLBACK_FILE_MAGIC) :]
+    return _unseal_fallback_blob(kdir, svc, acc, blob)
 
 
 def delete_secret(
@@ -437,22 +537,12 @@ def delete_secret(
             removed = True
         return removed
 
-    if _macos_security_available(state_dir):
-        proc = subprocess.run(
-            ["/usr/bin/security", "delete-generic-password", "-s", svc, "-a", acc],
-            text=True,
-            capture_output=True,
-            timeout=10.0,
-            check=False,
-        )
-        if proc.returncode == 0:
-            removed = True
+    os_svc = _scoped_os_service(svc, state_dir)
 
-    if _linux_secret_tool_available(state_dir):
-        st_bin = shutil.which("secret-tool")
-        if st_bin:
+    if _macos_security_available(state_dir):
+        for candidate_svc in ([os_svc, svc] if os_svc != svc else [svc]):
             proc = subprocess.run(
-                [st_bin, "clear", "service", svc, "account", acc],
+                ["/usr/bin/security", "delete-generic-password", "-s", candidate_svc, "-a", acc],
                 text=True,
                 capture_output=True,
                 timeout=10.0,
@@ -460,6 +550,20 @@ def delete_secret(
             )
             if proc.returncode == 0:
                 removed = True
+
+    if _linux_secret_tool_available(state_dir):
+        st_bin = shutil.which("secret-tool")
+        if st_bin:
+            for candidate_svc in ([os_svc, svc] if os_svc != svc else [svc]):
+                proc = subprocess.run(
+                    [st_bin, "clear", "service", candidate_svc, "account", acc],
+                    text=True,
+                    capture_output=True,
+                    timeout=10.0,
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    removed = True
 
     fallback = kdir / f"{slug}.key"
     if os.path.lexists(str(fallback)):

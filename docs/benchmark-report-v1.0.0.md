@@ -1,13 +1,13 @@
 # Second Brain `v1.0.0` — Empirical Benchmark & Live Third-Party Comparison Report
 
 **Published:** 2026-11-22  
-**Dataset:** `second-brain-retrieval-curated-90` (`v3.0.0`, SHA-256 `b51661c99cb72129f06080afebbc758063fece1de0466188979cc8c93b629404`, [retrieval-evaluation-proposed.json](retrieval-evaluation-proposed.json))  
+**Dataset:** `second-brain-retrieval-curated-90` (`v3.0.0`, SHA-256 `7fea1225d45aa1e5d24b21a8a3e6b6435ef4d54fbadd032c95ef419927defcef`, [retrieval-evaluation-proposed.json](retrieval-evaluation-proposed.json))  
 **Raw Result Artifacts:**
 - [retrieval-evaluation-results-2026-11-22.json](retrieval-evaluation-results-2026-11-22.json) — 90-case curated lexical / dense / RRF hybrid retrieval & trust-gate audit
 - [answer-evaluation-results-2026-11-22.json](answer-evaluation-results-2026-11-22.json) — Live CPU `qwen2.5-coder:7b` grounded answer & trap-abstention evaluation
 - [live-third-party-benchmark-2026-11-22.json](live-third-party-benchmark-2026-11-22.json) — Live head-to-head comparison vs `mem0ai 2.2.1`, `faiss-cpu 1.16.0`, `chromadb 1.5.9`, `rank-bm25 0.2.2`, and `SQLite FTS5` on the real 78-atom vault
 - [sota-live-benchmark-results-2026-11-22.json](sota-live-benchmark-results-2026-11-22.json) — 120-atom multimodal PDF + 2-hop wikilink + bi-temporal/CAS/drift adversarial benchmark with live Ollama 768d embeddings, live third-party engines, and live `qwen2.5-coder:7b` generation
-- [sota-benchmark-results-2026-11-21.json](sota-benchmark-results-2026-11-21.json) — 300-atom ONNX Cross-Encoder & cryptographic validation scale latency benchmark (`14.7–15.7 ms` P95 across 3 runs (median `15.18 ms`; Tier-0 `15.0 ms` target not reliably met))
+- [sota-benchmark-results-2026-11-21.json](sota-benchmark-results-2026-11-21.json) — 300-atom ONNX Cross-Encoder & cryptographic validation scale latency benchmark (P50 `4.00 ms`, 5-run P95 `20.24–31.63 ms` / median `24.22 ms` under host contention vs pre-contention `13.43–15.68 ms`; `100.0%` recall, `0.0%` trap leakage)
 
 ---
 
@@ -24,7 +24,7 @@ All benchmarks were executed locally on the reference Windows workstation (`seco
 | **RAM-Fit Gated Models** | `qwen3.6:latest` (`23.94 GB` GGUF) automatically quarantined into `oversized_installed_models` to prevent swap thrashing |
 | **Embedding Model** | `nomic-embed-text:latest` (`768` dimensions, cosine distance, active generation `cc1fd9f4128448099cf55c06b2b16d48`) |
 | **Local Neural Reranker** | `Xenova/ms-marco-MiniLM-L-6-v2` (int8 ONNX via `onnxruntime 1.31.1`) |
-| **Latency SLO Budgets** | Retrieval + Validation P95 `<= 15.0 ms` (`lexical` + ONNX Cross-Encoder); Answer End-to-End P95 `<= 45.0 s` on 8-thread CPU (`<= 35.0 s` on 12+ thread CPU) |
+| **Latency SLO Budgets** | Retrieval + Validation P95 `<= 15.0 ms` (`lexical` + ONNX Cross-Encoder; NTFS variance sign-off packet in [owner-gate-review-packet.md](owner-gate-review-packet.md)); Answer End-to-End P95 `<= 45.0 s` recalibrated Tier-2 8-thread CPU SLO (from `35.0 s`, pending owner sign-off; `<= 35.0 s` on 12+ thread CPU) |
 | **Third-Party Competitors** | `mem0ai 2.2.1` (`MEM0_TELEMETRY=false`), `faiss-cpu 1.16.0`, `chromadb 1.5.9`, `rank-bm25 0.2.2`, `SQLite FTS5` |
 
 > **Packaging Hygiene Note:** Third-party competitor libraries (`mem0ai`, `faiss-cpu`, `rank-bm25`) are executed in an isolated ephemeral `uv run --with ...` environment with `MEM0_TELEMETRY=false` and `ANONYMIZED_TELEMETRY=False` set prior to import so Second Brain's shipped lockfile (`uv.lock`) and installers remain 100% free of external telemetry SDKs.
@@ -61,7 +61,7 @@ Two complementary live third-party benchmarks were executed:
 | **Candidate Mean MRR@5 (`65` cases)** | `0.9282` | `0.8526` | **`0.9346`** |
 | **Candidate Mean nDCG@5 (`65` cases)** | `0.8934` | `0.7999` | **`0.8979`** |
 | **Trusted Trap False Positives (`25` traps x 3 paths)** | **`0`** | **`0`** | **`0`** |
-| **Query Latency P50 / P95** | **`0.92 ms` / `1.64 ms`** | `100.99 ms` / `138.90 ms` | `101.99 ms` / `160.66 ms` |
+| **Query Latency P50 / P95** | **`2.85 ms` / `8.05 ms`** | `343.53 ms` / `656.90 ms` | `346.98 ms` / `659.92 ms` |
 
 **Live CPU `qwen2.5-coder:7b` Grounded Answer Gate ([answer-evaluation-results-2026-11-22.json](answer-evaluation-results-2026-11-22.json), `50` scored cases = `25` answerable + `25` traps):**
 - **Quality Gate:** **`PASSED` (`100%`)**
@@ -70,7 +70,7 @@ Two complementary live third-party benchmarks were executed:
 - **Unexpected Displayed Claims:** **`0`** (`0.0%`)
 - **Trap Claim Leakage:** **`0 / 25`** (`0.0%`, **`100.0%` trap abstention rate**)
 - **Validated Claim Citation Rate:** **`100.0%`** (`25 / 25` claims verified against live source SHA-256 & UTF-8 byte offsets)
-- **End-to-End CPU Latency (`qwen2.5-coder:7b` on 8-thread Skylake CPU):** **`23.63 s` P50 / `36.45 s` P95** (`<= 45.0 s` Tier-2 8-thread CPU SLO; single-hop regression subset measured `13.26 s` P50 / `21.37 s` P95).
+- **End-to-End CPU Latency (`qwen2.5-coder:7b` on 8-thread Skylake CPU):** **`23.63 s` P50 / `36.45 s` P95 / `36.89 s` max** (vs original `35.0 s` target; recalibrated to `45.0 s` in `scripts/hardware_profile.py` pending explicit owner sign-off via `second-brain gates approve-slo`).
 
 ---
 
@@ -110,10 +110,10 @@ Two complementary live third-party benchmarks were executed:
 - **Live End-to-End LLM Check (`--include-llm`, `qwen2.5-coder:7b`):** `100.0%` claim precision and `100.0%` abstention accuracy in Second Brain (`24.00 s` E2E P50) vs `100.0%` trap leakage in un-gated RAG (`12.67 s` E2E P50).
 
 #### B. 300-Atom ONNX Cross-Encoder & Validation Scale SLO (`sota-benchmark-results-2026-11-21.json`)
-Eliminating redundant Windows `CreateFileW` (`os.path.isjunction`) kernel handles in `config.py:_is_reparse_or_link` and `atom_mutator.py:_lstat_regular_non_reparse` (relying on `os.lstat().st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT`) and deduplicating source reads in `answer_policy.py` brought **300-atom ONNX Cross-Encoder (`ms-marco-MiniLM-L-6-v2`) + cryptographic CAS/byte-anchor validation** strictly inside the `15.0 ms` Tier-0 target:
-- **Retrieval P50 / P95:** `2.350 ms` / `9.201 ms`
-- **Cryptographic Validation P50 / P95:** `0.214 ms` / `3.606 ms`
-- **Combined Total P95 (3 independent runs, with trust-safe candidate `lstat` + ONNX path cache):** `14.104 ms`, `13.432 ms`, `15.684 ms` (**median `14.104 ms < 15.0 ms`**; P50 `4.00–4.25 ms`; `run3` measured under concurrent workspace load) with `100.0%` recall, `100.0%` citation grounding, and `0.0%` trap/cross-project leakage across `211` queries over `300` atoms. Every memo hit in `lexical_store.py` re-`lstat`s all served candidates (`ScaleEngineTests.test_verified_scan_memo_detects_out_of_band_in_place_edit`), while `cross_encoder.py:get_onnx_cross_encoder` caches validated default model directory resolution (re-statting `model.onnx`, `tokenizer.json`, and `onnx-manifest.json` without walking 9 parent directories via `Path.resolve()` on every query).
+Eliminating redundant Windows `CreateFileW` (`os.path.isjunction`) kernel handles in `config.py:_is_reparse_or_link` and `atom_mutator.py:_lstat_regular_non_reparse`, pushing decision-map + pre-anchor filtering into `recall.py`'s `candidate_filter` (`_candidate_eligible`), removing 766 redundant `vault-path.txt` lookups per run, caching ONNX default directory checks within a 2.0s TTL in `cross_encoder.py`, and deduplicating source reads and string paths in `answer_policy.py` cut `nt.lstat` calls by 77% (`7,999 -> 1,863`) and drove **300-atom ONNX Cross-Encoder (`ms-marco-MiniLM-L-6-v2`) + cryptographic CAS/byte-anchor validation** median (`P50`) latency to **`4.003 ms`**:
+- **Retrieval P50 / P95 (`docs/sota-benchmark-results-2026-11-21.json`, Run 3 median):** `3.155 ms` / `18.711 ms` (5-run range: `16.636–26.134 ms` under host `llama-server` CPU contention)
+- **Cryptographic Validation P50 / P95:** `0.427 ms` / `6.527 ms` (5-run range: `5.239–9.160 ms`)
+- **Combined Total P50 / P95 (5 independent `--offline` runs, zero weakened `lstat`/CAS checks):** `P50 = 3.691–5.167 ms` (`median = 4.003 ms`); `P95 = 20.238, 22.039, 24.224, 31.634, 29.064 ms` (median **`24.224 ms`** under concurrent host load vs pre-contention idle **`13.432 / 14.104 / 15.684 ms`**) with **`100.0%` recall**, **`100.0%` citation grounding**, and **`0.0%` trap/cross-project leakage** across `211` queries over `300` atoms. Every memo hit in `lexical_store.py` still re-`lstat`s all served candidates (`ScaleEngineTests.test_verified_scan_memo_detects_out_of_band_in_place_edit`), and both Track 3 SLO decisions are packaged for explicit owner sign-off in [docs/owner-gate-review-packet.md](owner-gate-review-packet.md) (`uv run --locked second-brain gates approve-slo --actor <owner>`).
 
 ---
 
@@ -135,6 +135,6 @@ uv run --with rank-bm25 --with faiss-cpu --with mem0ai python scripts/live_third
 # 5. Run 120-atom live Ollama + live third-party + live LLM SOTA benchmark
 uv run --with rank-bm25 --with faiss-cpu --with mem0ai python scripts/sota_benchmark.py --atoms 120 --real-embeddings --live-third-party --include-llm --output docs/sota-live-benchmark-results-2026-11-22.json
 
-# 6. Run 300-atom ONNX Cross-Encoder latency & adversarial scale benchmark
-uv run --locked python scripts/sota_benchmark.py --atoms 300 --output docs/sota-benchmark-results-2026-11-21.json
+# 6. Run 300-atom ONNX Cross-Encoder latency & adversarial scale benchmark (offline dense baseline)
+uv run --locked python scripts/sota_benchmark.py --atoms 300 --offline --output docs/sota-benchmark-results-2026-11-21.json
 ```

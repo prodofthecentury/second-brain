@@ -72,6 +72,7 @@ from index_manifest import invalidate_atom_revision_cache, load_index_manifest  
 from config import (  # noqa: E402
     BRAIN_DIR,
     _WINDOWS_RESERVED_STEMS,
+    _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     resolve_active_brain_dir,
     safe_file_in_dir,
@@ -86,6 +87,7 @@ from host_adapters import (  # noqa: E402
 )
 from keychain_store import (  # noqa: E402
     KeychainError,
+    is_native_keychain_backend,
     keychain_backend_name,
     load_secret,
     store_secret,
@@ -125,6 +127,8 @@ _ALLOWED_ROOT_DIRS = frozenset(
         "4-experiences",
         "5-playbooks",
         "6-skills",
+        "7-principles",
+        "8-mental-models",
         "notes",
         "sources",
         "briefings",
@@ -148,11 +152,13 @@ _APPEND_ONLY_JSONL_PATHS = frozenset(
         "0-raw/archive/atom-feedback.jsonl",
         "0-raw/archive/playbook-decisions.jsonl",
         "0-raw/archive/skill-decisions.jsonl",
+        "0-raw/archive/skill-executions.jsonl",
+        "0-raw/archive/distillation-decisions.jsonl",
         "0-raw/archive/creative-media-audit.jsonl",
         "0-raw/archive/mcp-audit.jsonl",
     }
 )
-_HISTORY_PROTECTED_PREFIXES = ("2-atoms/", "5-playbooks/", "6-skills/")
+_HISTORY_PROTECTED_PREFIXES = ("2-atoms/", "5-playbooks/", "6-skills/", "7-principles/", "8-mental-models/")
 
 
 class SyncError(RuntimeError):
@@ -196,7 +202,8 @@ def _assert_no_symlink_chain(path: Path, *, stop_at: Path | None = None) -> None
     cur = Path(os.path.abspath(str(path)))
     while True:
         if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
-            raise SyncSecurityError(f"Refusing to traverse symlink or reparse point: {cur}")
+            if not _is_immutable_darwin_root_symlink(cur):
+                raise SyncSecurityError(f"Refusing to traverse symlink or reparse point: {cur}")
         if stop_norm is not None and os.path.normcase(str(cur)) == stop_norm:
             break
         parent = cur.parent
@@ -1129,8 +1136,99 @@ def _ts_sort_key(raw_ts: str) -> tuple[int, float | str]:
         return (0, raw_ts)
 
 
-def _merge_append_only_jsonl(local_bytes: bytes, remote_bytes: bytes) -> bytes:
+def _parse_and_verify_skill_execution_chain(raw_bytes: bytes, label: str) -> list[dict[str, Any]]:
+    genesis = "0" * 64
+    expected_prev = genesis
+    entries: list[dict[str, Any]] = []
+    for line_no, raw_line in enumerate(raw_bytes.decode("utf-8", errors="strict").splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise SyncSecurityError(f"Malformed JSON in {label} skill-executions.jsonl line {line_no}: {exc}") from exc
+        if not isinstance(obj, dict):
+            raise SyncSecurityError(f"Non-object record in {label} skill-executions.jsonl line {line_no}.")
+        idx_val = obj.get("execution_index")
+        if isinstance(idx_val, bool) or not isinstance(idx_val, int) or idx_val != len(entries) + 1:
+            raise SyncSecurityError(
+                f"Broken execution_index={idx_val!r} in {label} skill-executions.jsonl line {line_no}."
+            )
+        prev_val = str(obj.get("prev_execution_sha256") or "")
+        if prev_val != expected_prev:
+            raise SyncSecurityError(
+                f"Broken prev_execution_sha256 in {label} skill-executions.jsonl line {line_no}."
+            )
+        rec_sha = str(obj.get("execution_sha256") or "")
+        body = {k: v for k, v in obj.items() if k != "execution_sha256"}
+        canon_body = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        comp_sha = hashlib.sha256(canon_body.encode("utf-8")).hexdigest()
+        if len(rec_sha) != 64 or rec_sha != comp_sha:
+            raise SyncSecurityError(
+                f"Tampered execution_sha256 in {label} skill-executions.jsonl line {line_no}."
+            )
+        expected_prev = rec_sha
+        entries.append(obj)
+    return entries
+
+
+def _merge_skill_executions_jsonl(local_bytes: bytes, remote_bytes: bytes) -> bytes:
+    """Verify both hash chains, deduplicate by execution payload, and re-link monotonic execution hashes."""
+    try:
+        local_entries = _parse_and_verify_skill_execution_chain(local_bytes, "local")
+        remote_entries = _parse_and_verify_skill_execution_chain(remote_bytes, "remote")
+    except UnicodeDecodeError as exc:
+        raise SyncSecurityError(f"Invalid UTF-8 in skill-executions.jsonl: {exc}") from exc
+
+    chain_keys = {"execution_index", "prev_execution_sha256", "execution_sha256"}
+    by_id: dict[str, tuple[tuple[int, float | str], int, str, dict[str, Any]]] = {}
+    seq_idx = 0
+    for seq_entries in (local_entries, remote_entries):
+        for entry in seq_entries:
+            payload = {k: v for k, v in entry.items() if k not in chain_keys}
+            payload_canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            payload_sha = hashlib.sha256(payload_canon.encode("utf-8")).hexdigest()
+            exec_id = str(entry.get("execution_id") or "").strip() or payload_sha
+            existing = by_id.get(exec_id)
+            if existing is not None:
+                if existing[2] != payload_sha:
+                    raise SyncSecurityError(
+                        f"Conflicting skill-executions.jsonl records share execution_id={exec_id!r}."
+                    )
+                continue
+            sort_ts = ""
+            for key in ("timestamp", "recorded_at", "created_at", "ts"):
+                val = payload.get(key)
+                if isinstance(val, str) and val.strip():
+                    sort_ts = val.strip()
+                    break
+            by_id[exec_id] = (_ts_sort_key(sort_ts), seq_idx, payload_sha, payload)
+            seq_idx += 1
+
+    if not by_id:
+        return b""
+    ordered = sorted(by_id.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0]))
+    prev_sha = "0" * 64
+    out_lines: list[str] = []
+    for idx, (_eid, (_ts, _seq, _psha, payload)) in enumerate(ordered, start=1):
+        rec_body = {
+            **payload,
+            "execution_index": idx,
+            "prev_execution_sha256": prev_sha,
+        }
+        canon_body = json.dumps(rec_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        exec_sha = hashlib.sha256(canon_body.encode("utf-8")).hexdigest()
+        full_rec = {**rec_body, "execution_sha256": exec_sha}
+        out_lines.append(json.dumps(full_rec, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        prev_sha = exec_sha
+    return ("\n".join(out_lines) + "\n").encode("utf-8")
+
+
+def _merge_append_only_jsonl(local_bytes: bytes, remote_bytes: bytes, *, rel_path: str = "") -> bytes:
     """Deterministic deduplicated set-union merge for append-only JSONL audit/lineage logs."""
+    if rel_path == "0-raw/archive/skill-executions.jsonl":
+        return _merge_skill_executions_jsonl(local_bytes, remote_bytes)
     by_hash: dict[str, tuple[tuple[int, float | str], int, str]] = {}
     seq_idx = 0
     for blob in (local_bytes, remote_bytes):
@@ -1526,7 +1624,7 @@ def init_sync(
         "auth_mode": norm_auth,
         "target": cfg["target"],
         "kdf_mode": local_kdf_mode,
-        "keychain_sealed": bool(kc_meta),
+        "keychain_sealed": bool(kc_meta and is_native_keychain_backend(kc_meta.get("backend"))),
         "keychain_backend": kc_meta["backend"] if kc_meta else None,
         "recovery_key_b64": recovery_key_b64,
     }
@@ -1682,7 +1780,7 @@ def join_sync(
         "auth_mode": norm_auth,
         "target": norm_target,
         "kdf_mode": local_kdf_mode,
-        "keychain_sealed": bool(kc_meta),
+        "keychain_sealed": bool(kc_meta and is_native_keychain_backend(kc_meta.get("backend"))),
         "keychain_backend": kc_meta["backend"] if kc_meta else None,
         "trusted_peer_count": len(trusted_peers),
     }
@@ -1716,7 +1814,7 @@ def migrate_sync_key_to_keychain(
         "status": "migrated",
         "vault_id": cfg["vault_id"],
         "kdf_mode": cfg["kdf_mode"],
-        "keychain_sealed": kc_meta["backend"] != "posix_restricted_keyfile",
+        "keychain_sealed": is_native_keychain_backend(kc_meta.get("backend")),
         "keychain_backend": kc_meta["backend"],
     }
 
@@ -1778,7 +1876,10 @@ def sync_status(
         "s3_region": cfg.get("s3_region"),
         "target": cfg["target"],
         "kdf_mode": cfg["kdf_mode"],
-        "keychain_sealed": bool(cfg.get("keychain_account")),
+        "keychain_sealed": bool(
+            cfg.get("keychain_account")
+            and is_native_keychain_backend(str(cfg.get("keychain_backend") or keychain_backend_name(state_dir=state_dir)))
+        ),
         "keychain_backend": cfg.get("keychain_backend") or keychain_backend_name(state_dir=state_dir),
         "local_epoch": int(local_state.get("last_seen_epoch", 0)),
         "remote_epoch": remote_epoch,
@@ -2189,7 +2290,7 @@ def sync_pull(
 
             # Both local and remote changed since base!
             if clean_rel in _APPEND_ONLY_JSONL_PATHS:
-                merged = _merge_append_only_jsonl(dest.read_bytes(), remote_bytes)
+                merged = _merge_append_only_jsonl(dest.read_bytes(), remote_bytes, rel_path=clean_rel)
                 atomic_write_bytes(str(dest), merged)
                 merged_sha = content_sha256(merged)
                 _cache_sync_base_blob(active_brain, merged_sha, merged)
@@ -2712,6 +2813,22 @@ def _demote_unapproved_canonical_merge(
             return render_memory_document(updated_fm, body_lines).encode("utf-8"), True
         rebuilt_sk = f"---\ntype: executable_skill\nskill_status: revoked\n---\n\n{text.strip()}\n"
         return rebuilt_sk.encode("utf-8"), True
+    if (
+        (clean_rel.startswith("7-principles/") or clean_rel.startswith("8-mental-models/"))
+        and clean_rel.count("/") == 1
+        and clean_rel.endswith(".md")
+    ):
+        text = candidate_bytes.decode("utf-8", errors="replace")
+        parsed = split_frontmatter(text)
+        if parsed is not None:
+            fm_lines, body_lines = parsed
+            updated_fm = set_scalar_field(fm_lines, "status", '"draft"', "type")
+            sub_k = "principle_status" if clean_rel.startswith("7-principles/") else "model_status"
+            updated_fm = set_scalar_field(updated_fm, sub_k, '"draft"', "status")
+            return render_memory_document(updated_fm, body_lines).encode("utf-8"), True
+        dkind = "principle" if clean_rel.startswith("7-principles/") else "mental_model"
+        rebuilt_d = f'---\ntype: "{dkind}"\nstatus: "draft"\n---\n\n{text.strip()}\n'
+        return rebuilt_d.encode("utf-8"), True
     return candidate_bytes, False
 
 

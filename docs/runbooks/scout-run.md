@@ -33,25 +33,19 @@ Open `0-raw/reading-list.md`. Collect every URL marked with status `[ ]`
 For each uncompleted URL, assign one sub-agent. Run all sub-agents in
 parallel. Each sub-agent does Steps 3–5 independently.
 
-### Step 3 — Fetch the content
+### Step 3 — Fetch via DNS-pinned SSRF-guarded Scout (`scripts/ollama_scout.py`)
 
-Use WebBridge (or system browser) to open the URL in the real browser,
-inheriting the user's existing cookies and session. Extract:
+Execute the vetted local Scout runner rather than ad-hoc fetches:
 
-- Full article body text (not just the visible fold)
-- Title
-- Author(s) if shown
-- Publication date if shown
-- Word count
+```powershell
+uv run --locked python scripts/ollama_scout.py
+```
 
-If the page is paywalled and no content loads after login: mark `[!]` and
-log the failure. Never generate placeholder content for missing pages.
+`ollama_scout.py` validates scheme/ports, rejects loopback, RFC 1918 private ranges, link-local metadata IPs, and NAT64 targets, blocks HTTP redirects, and pins outbound sockets directly to the validated DNS IP (`PinnedHTTPTransport`), capping response size and timeouts. If a page is paywalled or returns <100 words, mark `[!]` in `0-raw/reading-list.md`; never invent placeholder content.
 
-### Step 4 — Save to sources/
+### Step 4 — Save verbatim capture with sticky `web_remote` provenance into `0-raw/inbox/`
 
-Write a new file: `sources/YYYY-MM-DD-{slug}.md`
-
-Where `{slug}` is a URL-safe lowercase version of the title (max 60 chars).
+Write fetched source artifacts and intake captures strictly inside the **quarantined** inbox (`brain/0-raw/inbox/YYYY-MM-DD-{slug}.md`) alongside `sources/YYYY-MM-DD-{slug}.md` with `origin: web_remote` so untrusted web captures remain isolated from verified recall until explicit owner inspection and promotion (`uv run --locked second-brain inbox promote <capture.md> --expected-sha256 <64-char-sha256> --actor <owner>`).
 
 Frontmatter format:
 
@@ -62,6 +56,7 @@ title: "Full article title"
 author: "Author name(s) or Unknown"
 publication_date: YYYY-MM-DD or "Unknown"
 captured_date: YYYY-MM-DD
+origin: web_remote
 word_count: N
 scout_status: fetched
 ---
@@ -69,20 +64,9 @@ scout_status: fetched
 
 Body: the full article text, verbatim. No editing. No summarizing.
 
-### Step 5 — Drop intake pointer
+### Step 5 — Quarantined Intake vs Promoted Processing
 
-Create a one-line pointer file in `0-raw/`:
-
-Filename: `YYYY-MM-DD-{slug}.intake`
-
-Content:
-```
-source: sources/YYYY-MM-DD-{slug}.md
-queued_for_refinery: true
-```
-
-This is what the Refinery Run watches for. Without this pointer, the
-Refinery will not know a new source is ready.
+External Scout captures remain quarantined under `brain/0-raw/inbox/` (`origin: web_remote`) and never enter `brain/0-raw/` active refinery queues or `brain/2-atoms/` without explicit human owner triage (`second-brain inbox list` -> `promote` or `reject`).
 
 ### Step 6 — Update the reading list
 

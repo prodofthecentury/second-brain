@@ -90,7 +90,7 @@ def run_case(root: str, archive: bool):
         refinery.ATOMS_DIR = atoms_dir
         refinery.archive_dir = lambda: archive_dir
         refinery.append_archive_manifest_entry = (
-            lambda entry: original_append_manifest(entry, manifest_path=manifest_path)
+            lambda entry, **_kwargs: original_append_manifest(entry, manifest_path=manifest_path)
         )
         refinery.draft_memory_atoms = draft_canary_atom
         refinery.embed_atom_content = lambda collection, atom_file, content: None

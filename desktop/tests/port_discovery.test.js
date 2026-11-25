@@ -16,6 +16,7 @@ const {
   resolveClientApiPort,
   formatShortcut,
   buildPackagedRuntimeConfig,
+  buildUvBootstrapSteps,
   buildUvBootstrapArgs,
 } = require("../lib/port_discovery");
 
@@ -168,19 +169,76 @@ describe("Port Discovery, Cross-Platform Shortcuts & Packaged Runtime Config", (
       path.join(cfg.backendRoot, "scripts/memory_api.py")
     );
 
-    const offlineArgs = buildUvBootstrapArgs({
+    const offlineSteps = buildUvBootstrapSteps({
       backendRoot: cfg.backendRoot,
       wheelhouseDir: cfg.wheelhouseDir,
+      venvDir: cfg.venvDir,
+      venvPython: cfg.venvPython,
       hasWheelhouse: true,
+      strictOffline: true,
     });
-    assert.deepEqual(offlineArgs, [
+    assert.deepEqual(
+      offlineSteps.map((s) => s.args),
+      [
+        ["venv", cfg.venvDir, "--python", "3.11", "--clear", "--offline"],
+        [
+          "pip",
+          "install",
+          "--offline",
+          "--no-index",
+          "--find-links",
+          cfg.wheelhouseDir,
+          "--python",
+          cfg.venvPython,
+          "second-brain",
+        ],
+      ]
+    );
+
+    const onlineSteps = buildUvBootstrapSteps({
+      backendRoot: cfg.backendRoot,
+      hasWheelhouse: false,
+    });
+    assert.deepEqual(onlineSteps[0].args, [
       "--directory",
       cfg.backendRoot,
       "sync",
       "--frozen",
+      "--no-dev",
+      "--python",
+      "3.11",
+    ]);
+
+    const offlineArgs = buildUvBootstrapArgs({
+      backendRoot: cfg.backendRoot,
+      wheelhouseDir: cfg.wheelhouseDir,
+      venvPython: cfg.venvPython,
+      hasWheelhouse: true,
+    });
+    assert.deepEqual(offlineArgs, [
+      "pip",
+      "install",
       "--offline",
+      "--no-index",
       "--find-links",
       cfg.wheelhouseDir,
+      "--python",
+      cfg.venvPython,
+      "second-brain",
+    ]);
+
+    const onlineArgs = buildUvBootstrapArgs({
+      backendRoot: cfg.backendRoot,
+      hasWheelhouse: false,
+    });
+    assert.deepEqual(onlineArgs, [
+      "--directory",
+      cfg.backendRoot,
+      "sync",
+      "--frozen",
+      "--no-dev",
+      "--python",
+      "3.11",
     ]);
 
     assert.equal(

@@ -1,12 +1,15 @@
 "use strict";
 
-const CACHE_NAME = "second-brain-inbox-drop-v2";
+const CACHE_NAME = "second-brain-inbox-drop-v3";
 const APP_SHELL = [
   "./index.html",
   "./styles.css",
   "./drop-crypto.js",
   "./app.js",
-  "./manifest.webmanifest"
+  "./manifest.webmanifest",
+  "./icons/icon-192.png",
+  "./icons/icon-512.png",
+  "./icons/apple-touch-icon.png"
 ];
 
 self.addEventListener("install", (event) => {

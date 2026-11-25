@@ -11,6 +11,7 @@ reduced to literal word tokens and passed through SQLite parameter binding.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import datetime
 import functools
@@ -20,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -274,16 +276,26 @@ def _read_metadata(connection: sqlite3.Connection) -> dict[str, object] | None:
     return metadata
 
 
+VERIFIED_SCAN_MEMO_TTL_SECONDS = 30.0
 _MEM_FTS_LOCK = threading.Lock()
 # (thread_id, norm_abs_index_path) -> (mtime_ns, ctime_ns, size, in_memory_conn, metadata_dict)
 _MEM_FTS_MIRRORS: dict[tuple[int, str], tuple[int, int, int, sqlite3.Connection, dict[str, object] | None]] = {}
 # (norm_abs_atoms_dir, norm_abs_index_path) -> (dir_mtime_ns, idx_mtime_ns, expires_mono, verified_sha_map, stat_sigs)
-_VERIFIED_SCAN_MEMO: dict[tuple[str, str], tuple[int, int, float, dict[str, str], dict[str, tuple[int, int]]]] = {}
+_VERIFIED_SCAN_MEMO: dict[
+    tuple[str, str],
+    tuple[int, int, float, dict[str, str], dict[str, tuple[int, int, int]]],
+] = {}
 
 
-def _scan_stat_sigs(abs_atoms_dir: str) -> dict[str, tuple[int, int]] | None:
-    """One scandir pass capturing (mtime_ns, size) for every indexable atom."""
-    sigs: dict[str, tuple[int, int]] = {}
+def _lstat_is_reparse(st: os.stat_result) -> bool:
+    return stat.S_ISLNK(st.st_mode) or (
+        os.name == "nt" and bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    )
+
+
+def _scan_stat_sigs(abs_atoms_dir: str) -> dict[str, tuple[int, int, int]] | None:
+    """One scandir pass capturing regular non-reparse (mtime_ns, ctime_ns, size) per indexable atom."""
+    sigs: dict[str, tuple[int, int, int]] = {}
     try:
         with os.scandir(abs_atoms_dir) as it:
             for entry in it:
@@ -291,7 +303,9 @@ def _scan_stat_sigs(abs_atoms_dir: str) -> dict[str, tuple[int, int]] | None:
                 if not name.endswith(".md") or name == "README.md":
                     continue
                 st = entry.stat(follow_symlinks=False)
-                sigs[name] = (st.st_mtime_ns, st.st_size)
+                if not stat.S_ISREG(st.st_mode) or _lstat_is_reparse(st):
+                    return None
+                sigs[name] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
     except OSError:
         return None
     return sigs
@@ -325,18 +339,24 @@ def _evict_mem_fts_mirror(index_path: str | None = None) -> None:
             pass
 
 
-def _get_query_connection(index_path: str) -> tuple[sqlite3.Connection, dict[str, object] | None, bool]:
-    """Return (conn, cached_meta_or_None, should_close).
+def _get_query_connection(index_path: str) -> tuple[sqlite3.Connection, dict[str, object] | None, bool, int]:
+    """Return (conn, cached_meta_or_None, should_close, idx_mtime_ns).
 
     For larger indexes (>64 KB or >64 atoms), mirrors the verified disk SQLite DB into a
     thread-local ':memory:' connection and closes the disk file handle immediately (zero Windows
     file locks, <0.15ms FTS5 queries, invalidated immediately when mtime/ctime/size changes).
     """
     abs_idx = os.path.abspath(index_path)
-    if _is_reparse_or_link(abs_idx):
-        abs_idx = str(Path(index_path).resolve())
     try:
-        st = os.stat(abs_idx)
+        lst = os.lstat(abs_idx)
+        is_link = stat.S_ISLNK(lst.st_mode) or (
+            os.name == "nt" and bool(getattr(lst, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        )
+        if is_link:
+            abs_idx = str(Path(index_path).resolve())
+            st = os.stat(abs_idx)
+        else:
+            st = lst
     except OSError as exc:
         raise LexicalIndexUnavailable("Lexical recall index is unavailable; rebuild it first.") from exc
 
@@ -345,7 +365,7 @@ def _get_query_connection(index_path: str) -> tuple[sqlite3.Connection, dict[str
     with _MEM_FTS_LOCK:
         cached = _MEM_FTS_MIRRORS.get(cache_key)
     if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_ctime_ns and cached[2] == st.st_size:
-        return cached[3], cached[4], False
+        return cached[3], cached[4], False, st.st_mtime_ns
 
     disk_conn = _readonly_connection(abs_idx)
     meta = _read_metadata(disk_conn)
@@ -356,7 +376,7 @@ def _get_query_connection(index_path: str) -> tuple[sqlite3.Connection, dict[str
             disk_conn.backup(mem_conn)
             disk_conn.close()
         except sqlite3.Error:
-            return disk_conn, meta, True
+            return disk_conn, meta, True, st.st_mtime_ns
         evicted: list[sqlite3.Connection] = []
         with _MEM_FTS_LOCK:
             if len(_MEM_FTS_MIRRORS) >= 16:
@@ -372,8 +392,8 @@ def _get_query_connection(index_path: str) -> tuple[sqlite3.Connection, dict[str
                 c.close()
             except Exception:
                 pass
-        return mem_conn, meta, False
-    return disk_conn, meta, True
+        return mem_conn, meta, False, st.st_mtime_ns
+    return disk_conn, meta, True, st.st_mtime_ns
 
 
 def _readonly_connection(index_path: str) -> sqlite3.Connection:
@@ -654,6 +674,7 @@ def _search_lexical_index_verified(
     index_path: str,
     n_results: int = 5,
     atoms_dir: str | None = None,
+    candidate_filter: Callable[[str, str, str], bool] | None = None,
 ) -> tuple[list[LexicalCandidate], dict[str, str] | None]:
     """Return (candidates, verified_filename_sha_map) using one SQLite open and one atoms_dir scan."""
     expression = _fts_query(query)
@@ -666,7 +687,7 @@ def _search_lexical_index_verified(
     memo_stat_sigs: dict[str, tuple[int, int]] | None = None
     memo_key: tuple[str, str] | None = None
     abs_atoms_dir = os.path.abspath(atoms_dir) if atoms_dir is not None else ""
-    connection, pre_meta, should_close = _get_query_connection(index_path)
+    connection, pre_meta, should_close, idx_mtime_ns = _get_query_connection(index_path)
     try:
         if atoms_dir is not None:
             metadata = pre_meta if pre_meta is not None else _read_metadata(connection)
@@ -674,11 +695,14 @@ def _search_lexical_index_verified(
                 raise LexicalIndexUnavailable("Lexical recall index is stale; rebuild it before serving memory.")
             memo_key = (os.path.normcase(abs_atoms_dir), os.path.normcase(os.path.abspath(index_path)))
             try:
-                dir_mtime_ns = os.lstat(abs_atoms_dir).st_mtime_ns
-                idx_mtime_ns = os.stat(index_path).st_mtime_ns
+                dir_st = os.lstat(abs_atoms_dir)
+                dir_mtime_ns = (
+                    dir_st.st_mtime_ns
+                    if (stat.S_ISDIR(dir_st.st_mode) and not _lstat_is_reparse(dir_st))
+                    else -1
+                )
             except OSError:
                 dir_mtime_ns = -1
-                idx_mtime_ns = -1
             now_mono = time.monotonic()
             with _MEM_FTS_LOCK:
                 scan_memo = _VERIFIED_SCAN_MEMO.get(memo_key)
@@ -703,7 +727,7 @@ def _search_lexical_index_verified(
                             _VERIFIED_SCAN_MEMO[memo_key] = (
                                 dir_mtime_ns,
                                 idx_mtime_ns,
-                                time.monotonic() + 5.0,
+                                time.monotonic() + VERIFIED_SCAN_MEMO_TTL_SECONDS,
                                 verified_map,
                                 sigs,
                             )
@@ -714,21 +738,52 @@ def _search_lexical_index_verified(
             f"FROM {FTS_TABLE} WHERE {FTS_TABLE} MATCH ? ORDER BY rank LIMIT ?",
             (expression, limit),
         ).fetchall()
+        checked_rows = (
+            [r for r in rows if candidate_filter(str(r[0]), str(r[1]), str(r[2]))]
+            if candidate_filter is not None and rows
+            else rows
+        )
         # Memo hits must still prove every served candidate is unchanged on disk: out-of-band
-        # in-place edits do not bump the directory mtime on NTFS, so stat each returned row.
-        if memo_stat_sigs is not None and rows:
-            for row in rows:
-                fname_str = str(row[0])
-                try:
-                    cur = os.lstat(os.path.join(abs_atoms_dir, fname_str))
-                    cur_sig = (cur.st_mtime_ns, cur.st_size)
-                except OSError:
-                    cur_sig = (-1, -1)
-                if memo_stat_sigs.get(fname_str) != cur_sig:
-                    with _MEM_FTS_LOCK:
-                        _VERIFIED_SCAN_MEMO.pop(memo_key, None)
-                    verified_map = _full_verified_scan(atoms_dir, metadata)
-                    break
+        # in-place edits do not bump the directory mtime on NTFS, so stat each eligible row.
+        if memo_stat_sigs is not None and checked_rows:
+            use_scandir = len(checked_rows) >= 12 and len(memo_stat_sigs) <= 320
+            live_sigs = _scan_stat_sigs(abs_atoms_dir) if use_scandir else None
+            if live_sigs is not None:
+                for row in checked_rows:
+                    fname_str = str(row[0])
+                    if live_sigs.get(fname_str) != memo_stat_sigs.get(fname_str):
+                        with _MEM_FTS_LOCK:
+                            _VERIFIED_SCAN_MEMO.pop(memo_key, None)
+                        verified_map = _full_verified_scan(atoms_dir, metadata)
+                        break
+            else:
+                atoms_prefix = abs_atoms_dir if abs_atoms_dir.endswith(os.sep) else (abs_atoms_dir + os.sep)
+                for row in checked_rows:
+                    fname_str = str(row[0])
+                    if (
+                        not fname_str
+                        or "/" in fname_str
+                        or "\\" in fname_str
+                        or ":" in fname_str
+                        or "\x00" in fname_str
+                        or fname_str in {".", ".."}
+                    ):
+                        cur_sig = (-1, -1, -1)
+                    else:
+                        row_path = atoms_prefix + fname_str
+                        try:
+                            cur = os.lstat(row_path)
+                            if not stat.S_ISREG(cur.st_mode) or _lstat_is_reparse(cur):
+                                cur_sig = (-1, -1, -1)
+                            else:
+                                cur_sig = (cur.st_mtime_ns, cur.st_ctime_ns, cur.st_size)
+                        except OSError:
+                            cur_sig = (-1, -1, -1)
+                    if memo_stat_sigs.get(fname_str) != cur_sig:
+                        with _MEM_FTS_LOCK:
+                            _VERIFIED_SCAN_MEMO.pop(memo_key, None)
+                        verified_map = _full_verified_scan(atoms_dir, metadata)
+                        break
     except sqlite3.Error as exc:
         raise LexicalIndexUnavailable(f"Lexical recall query failed: {exc}") from exc
     finally:
@@ -742,7 +797,7 @@ def _search_lexical_index_verified(
             content_sha256=str(content_sha256),
             rank=float(rank),
         )
-        for filename, content, content_sha256, rank in rows
+        for filename, content, content_sha256, rank in checked_rows
     ]
     return candidates, verified_map
 
@@ -756,7 +811,7 @@ def load_indexed_contents_by_filenames(
     if not names:
         return {}
     try:
-        conn, _meta, should_close = _get_query_connection(index_path)
+        conn, _meta, should_close, _idx_mtime = _get_query_connection(index_path)
     except LexicalIndexUnavailable:
         return {}
     try:

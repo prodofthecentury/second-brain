@@ -8,7 +8,15 @@
 
 ## Prerequisite
 
-Read `house-rules.md` completely before any action.
+1. Read `house-rules.md` completely before any action.
+2. Run deterministic pre-flight audits first (read-only; never auto-demote without owner confirmation):
+
+```powershell
+uv run --locked python scripts/audit_sources.py --check
+uv run --locked second-brain ledger verify
+uv run --locked second-brain graph contradictions
+uv run --locked second-brain gates status
+```
 
 ---
 
@@ -39,16 +47,16 @@ For each orphan found:
 
 ---
 
-## Step 2 — Scan for stale tentative atoms
+## Step 2 — Scan for stale unapproved candidate atoms
 
-A **stale tentative atom** has `certainty: tentative` and a
+A **stale candidate atom** has `review_status: pending` (with `claim_state: candidate` or `citation_integrity: missing` / `needs_edit`) and a
 `last-reviewed` date older than 14 days (or no `last-reviewed` date at all).
 
-Tentative atoms are working hypotheses, not settled knowledge. After
-two weeks without review, they either need to be promoted to
-`established` or flagged for human check-in.
+Pending candidate atoms are working extractions, not settled canonical memory. After
+two weeks without owner review, they either need primary-source byte anchoring and CAS transition to
+`review_status: accepted` (`claim_state: human_reviewed`) or flagging for human check-in.
 
-For each stale tentative atom found:
+For each stale pending candidate atom found:
 - Record its ID and claim
 - Note how many days since last review
 - Note whether it has been linked to from any threads

@@ -1,0 +1,10 @@
+{
+  "id": "second-brain-vault-bridge",
+  "name": "Second Brain Verified Memory Bridge",
+  "version": "1.2.0",
+  "minAppVersion": "1.4.0",
+  "description": "Connect Obsidian notes to your local Second Brain loopback API (127.0.0.1): approval badges, citation proof verification, Promote Selection, and Contradiction Radar.",
+  "author": "Second Brain",
+  "authorUrl": "https://github.com/prodofthecentury/second-brain",
+  "isDesktopOnly": true
+}

@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 from typing import Any
@@ -31,15 +32,59 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import _is_reparse_or_link  # noqa: E402
+from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link  # noqa: E402
 from inbox_drop import export_static_pwa_bundle  # noqa: E402
 
 
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
-_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*?)(?:\.git)?/?$")
 _SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _SAFE_ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _ZERO_SHA256 = "0" * 64
+
+
+def _is_valid_repo_slug(slug: str) -> bool:
+    return bool(slug and _REPO_SLUG_RE.fullmatch(slug) and ".." not in slug)
+
+
+def _resolve_default_repo_slug() -> str:
+    env_slug = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    if _is_valid_repo_slug(env_slug):
+        return env_slug
+
+    pkg_path = ROOT / "desktop" / "package.json"
+    if pkg_path.is_file():
+        try:
+            pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
+            pub = (pkg.get("build") or {}).get("publish") or []
+            if isinstance(pub, list) and pub and isinstance(pub[0], dict):
+                owner = str(pub[0].get("owner") or "").strip()
+                repo = str(pub[0].get("repo") or "").strip()
+                cand = f"{owner}/{repo}" if (owner and repo) else ""
+                if _is_valid_repo_slug(cand):
+                    return cand
+        except (OSError, ValueError, TypeError):
+            pass
+
+    if (ROOT / ".git").exists():
+        try:
+            proc = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if proc.returncode == 0:
+                m = _GITHUB_REMOTE_RE.search(proc.stdout.strip())
+                if m and _is_valid_repo_slug(m.group(1)):
+                    return m.group(1)
+        except OSError:
+            pass
+
+    return "prodofthecentury/second-brain"
 
 
 def _resolve_project_version(explicit_version: str | None = None) -> str:
@@ -57,7 +102,8 @@ def _resolve_project_version(explicit_version: str | None = None) -> str:
 def _assert_no_symlink_ancestors(path: Path) -> None:
     for cur in (path, *path.parents):
         if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
-            raise PermissionError(f"Refusing to write distribution artifact under symlink/reparse path: {cur}")
+            if not _is_immutable_darwin_root_symlink(cur):
+                raise PermissionError(f"Refusing to write distribution artifact under symlink/reparse path: {cur}")
 
 
 def build_inbox_drop_pwa_zip(out_dir: str | Path = ROOT / "dist") -> dict[str, Any]:
@@ -124,6 +170,7 @@ def _load_checksums(dist_dir: Path) -> dict[str, str]:
             if (
                 entry.is_file()
                 and not _is_reparse_or_link(str(entry))
+                and not entry.name.startswith(".")
                 and entry.name != "SHA256SUMS.txt"
                 and _SAFE_ARTIFACT_NAME_RE.fullmatch(entry.name)
             ):
@@ -182,6 +229,7 @@ def _collect_homebrew_resources() -> list[tuple[str, str, str]]:
         return []
     try:
         import tomllib
+        from build_wheelhouse import _parse_version_tuple, _requires_python_matches, evaluate_pep508_marker
 
         data = tomllib.loads(lock_path.read_text(encoding="utf-8"))
     except Exception:
@@ -189,29 +237,71 @@ def _collect_homebrew_resources() -> list[tuple[str, str, str]]:
     packages = data.get("package")
     if not isinstance(packages, list):
         return []
-    by_name = {str(p.get("name")): p for p in packages if isinstance(p, dict) and p.get("name")}
-    sb = by_name.get("second-brain")
+
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    sb: dict[str, Any] | None = None
+    for pkg in packages:
+        if not isinstance(pkg, dict) or not pkg.get("name"):
+            continue
+        pname = str(pkg["name"]).strip().lower()
+        pver = str(pkg.get("version") or "").strip()
+        by_key[(pname, pver)] = pkg
+        by_name.setdefault(pname, []).append(pkg)
+        if pname == "second-brain":
+            sb = pkg
     if not isinstance(sb, dict):
         return []
 
-    seen: set[str] = set()
-    queue: list[str] = [
-        str(dep["name"])
+    brew_py = (3, 11, 14)
+
+    def _marker_ok(dep: dict[str, Any]) -> bool:
+        marker = dep.get("marker")
+        return evaluate_pep508_marker(
+            str(marker) if marker else None,
+            target_os="darwin",
+            target_arch="arm64",
+            py_version=brew_py,
+        )
+
+    queue: list[tuple[str, str | None]] = [
+        (str(dep["name"]).strip().lower(), str(dep["version"]).strip() if dep.get("version") else None)
         for dep in (sb.get("dependencies") or [])
-        if isinstance(dep, dict) and dep.get("name") and "win32" not in str(dep.get("marker") or "")
+        if isinstance(dep, dict) and dep.get("name") and _marker_ok(dep)
     ]
+    resolved: dict[str, dict[str, Any]] = {}
     while queue:
-        pkg_name = queue.pop(0)
-        if pkg_name in seen or pkg_name == "second-brain" or pkg_name not in by_name:
+        pkg_name, explicit_ver = queue.pop(0)
+        if pkg_name == "second-brain" or pkg_name in resolved:
             continue
-        seen.add(pkg_name)
-        for dep in (by_name[pkg_name].get("dependencies") or []):
-            if isinstance(dep, dict) and dep.get("name") and "win32" not in str(dep.get("marker") or ""):
-                queue.append(str(dep["name"]))
+        cand: dict[str, Any] | None = None
+        if explicit_ver and (pkg_name, explicit_ver) in by_key:
+            cand = by_key[(pkg_name, explicit_ver)]
+        elif pkg_name in by_name:
+            matches = by_name[pkg_name]
+            compat = [
+                item
+                for item in matches
+                if _requires_python_matches(str(item.get("requires-python") or ""), brew_py)
+            ]
+            pool = compat if compat else matches
+            cand = sorted(
+                pool,
+                key=lambda item: _parse_version_tuple(str(item.get("version") or "0")),
+                reverse=True,
+            )[0]
+        if cand is None:
+            continue
+        resolved[pkg_name] = cand
+        for dep in (cand.get("dependencies") or []):
+            if isinstance(dep, dict) and dep.get("name") and _marker_ok(dep):
+                queue.append(
+                    (str(dep["name"]).strip().lower(), str(dep["version"]).strip() if dep.get("version") else None)
+                )
 
     resources: list[tuple[str, str, str]] = []
-    for pkg_name in sorted(seen):
-        sdist = by_name[pkg_name].get("sdist")
+    for pkg_name in sorted(resolved):
+        sdist = resolved[pkg_name].get("sdist")
         if not isinstance(sdist, dict):
             continue
         url = str(sdist.get("url") or "").strip()
@@ -223,16 +313,53 @@ def _collect_homebrew_resources() -> list[tuple[str, str, str]]:
     return resources
 
 
+_HOMEBREW_BUILD_BACKEND_RESOURCES: tuple[tuple[str, str, str], ...] = (
+    (
+        "flit-core",
+        "https://files.pythonhosted.org/packages/d9/f0/e546c28b937f094b354ca29b9060c5f1dd5043a332b2905049a51420b7a2/flit_core-4.2.0-py3-none-any.whl",
+        "2bee22dc8ba89c2e35b4e1ad575e596aac945c85672dd8f3cad21b629036e044",
+    ),
+    (
+        "packaging",
+        "https://files.pythonhosted.org/packages/63/34/ba1c580383c9eada3711951fef0795c80b829a078d72188184bcab9dd527/packaging-26.3-py3-none-any.whl",
+        "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c",
+    ),
+    (
+        "pathspec",
+        "https://files.pythonhosted.org/packages/f1/d9/7fb5aa316bc299258e68c73ba3bddbc499654a07f151cba08f6153988714/pathspec-1.1.1-py3-none-any.whl",
+        "a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189",
+    ),
+    (
+        "pluggy",
+        "https://files.pythonhosted.org/packages/40/9e/2b38731e0fc536806f16490e1a12d7f0dc2a1235aa8cc07bcc75416a7daa/pluggy-1.7.0-py3-none-any.whl",
+        "7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec",
+    ),
+    (
+        "trove-classifiers",
+        "https://files.pythonhosted.org/packages/30/81/0da8afb52a71d0a4f2bd3152357b1a441e393b286374802b9d3addab4ab5/trove_classifiers-2026.9.21.13-py3-none-any.whl",
+        "8b1ff4f9c191b1040b71c37f1e445ab99732911e3cd91de52838453a854d7a17",
+    ),
+    (
+        "hatchling",
+        "https://files.pythonhosted.org/packages/32/64/4afe5dd77b2939a93e8c9513f8082dbd049ecba9c1484a379a0f6ae29d6b/hatchling-1.33.0-py3-none-any.whl",
+        "415290b84f464d2884303fca8974d38e7b85579069fab02a15db0828fbb1446d",
+    ),
+)
+
+
 def _render_homebrew_formula(*, slug: str, version: str, base_download: str, artifact_name: str, artifact_sha: str) -> str:
-    resources = _collect_homebrew_resources()
+    runtime_resources = _collect_homebrew_resources()
+    runtime_names = {r_name for r_name, _, _ in runtime_resources}
+    build_resources = [entry for entry in _HOMEBREW_BUILD_BACKEND_RESOURCES if entry[0] not in runtime_names]
+    all_resources = [*build_resources, *runtime_resources]
     resource_stanzas = ""
-    if resources:
+    if all_resources:
         blocks = [
             f'  resource "{r_name}" do\n'
             f'    url "{r_url}"\n'
             f'    sha256 "{r_sha}"\n'
             "  end\n"
-            for r_name, r_url, r_sha in resources
+            for r_name, r_url, r_sha in all_resources
         ]
         resource_stanzas = "\n" + "\n".join(blocks)
     return (
@@ -244,10 +371,15 @@ def _render_homebrew_formula(*, slug: str, version: str, base_download: str, art
         f'  version "{version}"\n'
         f'  sha256 "{artifact_sha.lower()}"\n'
         '  license "MIT"\n\n'
+        '  depends_on "maturin" => :build\n'
+        '  depends_on "pkgconf" => :build\n'
         '  depends_on "rust" => :build\n'
+        '  depends_on "libffi"\n'
+        '  depends_on "openssl@3"\n'
         '  depends_on "python@3.11"\n'
         f"{resource_stanzas}\n"
         "  def install\n"
+        '    ENV["OPENSSL_DIR"] = Formula["openssl@3"].opt_prefix\n'
         "    virtualenv_install_with_resources\n"
         "  end\n\n"
         "  test do\n"
@@ -273,7 +405,9 @@ def _render_homebrew_cask(*, slug: str, version: str, base_download: str, dmg_na
         '  app "Second Brain.app"\n\n'
         "  zap trash: [\n"
         '    "~/Library/Application Support/SecondBrain",\n'
-        '    "~/Library/Preferences/ai.secondbrain.desktop.plist",\n'
+        '    "~/Library/Preferences/com.secondbrain.desktop.plist",\n'
+        '    "~/Library/Preferences/com.secondbrain.desktop.helper.plist",\n'
+        '    "~/Library/Caches/com.secondbrain.desktop",\n'
         "  ]\n"
         "end\n"
     )
@@ -286,11 +420,12 @@ def build_package_manager_manifests(
     version: str | None = None,
     repo_slug: str | None = None,
     require_checksums: bool = False,
+    allow_missing_exe: bool = False,
 ) -> dict[str, Any]:
     """Generate validated WinGet YAML and Homebrew `.rb` manifests strictly bound to `version`."""
     ver = _resolve_project_version(version)
-    slug = (repo_slug or os.environ.get("GITHUB_REPOSITORY") or "second-brain/second-brain").strip()
-    if not _REPO_SLUG_RE.fullmatch(slug):
+    slug = (repo_slug or _resolve_default_repo_slug()).strip()
+    if not _is_valid_repo_slug(slug):
         raise ValueError(f"Invalid GitHub repository slug: {slug!r}")
 
     dest_root = Path(os.path.abspath(str(out_dir)))
@@ -299,9 +434,8 @@ def build_package_manager_manifests(
     _assert_no_symlink_ancestors(artifact_dir)
 
     checksums = _load_checksums(artifact_dir)
-    exe_match = _match_artifact(checksums, ".exe", version=ver, required=True)
-    assert exe_match is not None
-    exe_name, exe_sha = exe_match
+    exe_match = _match_artifact(checksums, ".exe", version=ver, required=not allow_missing_exe)
+    exe_name, exe_sha = exe_match if exe_match is not None else ("", "")
 
     msi_match = _match_artifact(checksums, ".msi", version=ver, required=False)
     dmg_match = _match_artifact(checksums, ".dmg", version=ver, required=False)
@@ -319,43 +453,53 @@ def build_package_manager_manifests(
     base_download = f"https://github.com/{slug}/releases/download/v{ver}"
     # Emit the NSIS (`nullsoft`) installer in the WinGet singleton manifest so `winget validate`
     # passes strictly without requiring an extracted MSI ProductCode GUID.
-    installers: list[dict[str, Any]] = [
-        {
-            "Architecture": "x64",
-            "InstallerType": "nullsoft",
-            "InstallerUrl": f"{base_download}/{exe_name}",
-            "InstallerSha256": exe_sha.upper(),
-        }
-    ]
-
-    winget_doc: dict[str, Any] = {
-        "PackageIdentifier": "SecondBrain.SecondBrain",
-        "PackageVersion": ver,
-        "PackageLocale": "en-US",
-        "Publisher": "Second Brain",
-        "PublisherUrl": f"https://github.com/{slug}",
-        "PackageName": "Second Brain",
-        "PackageUrl": f"https://github.com/{slug}",
-        "License": "MIT",
-        "ShortDescription": "Local-first verifiable AI memory platform with cryptographic byte-offset provenance.",
-        "Commands": ["second-brain"],
-        "Installers": installers,
-        "ManifestType": "singleton",
-        "ManifestVersion": "1.6.0",
-    }
-    winget_header = (
-        "# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.6.0.schema.json\n"
-    )
-    winget_yaml = winget_header + yaml.safe_dump(winget_doc, sort_keys=False, allow_unicode=True)
-    parsed_yaml = yaml.safe_load(winget_yaml)
-    if not isinstance(parsed_yaml, dict) or parsed_yaml.get("PackageVersion") != ver:
-        raise RuntimeError("Generated WinGet YAML failed validation.")
+    installers: list[dict[str, Any]] = []
+    if exe_match is not None:
+        installers.append(
+            {
+                "Architecture": "x64",
+                "InstallerType": "nullsoft",
+                "InstallerUrl": f"{base_download}/{exe_name}",
+                "InstallerSha256": exe_sha.upper(),
+            }
+        )
 
     winget_path = dest_root / "manifests" / "winget" / "SecondBrain.SecondBrain.yaml"
     homebrew_path = dest_root / "manifests" / "homebrew" / "second-brain.rb"
     formula_subpath = dest_root / "manifests" / "homebrew" / "Formula" / "second-brain.rb"
-    winget_path.parent.mkdir(parents=True, exist_ok=True)
     homebrew_path.parent.mkdir(parents=True, exist_ok=True)
+
+    winget_pkgs_dir = (
+        dest_root / "manifests" / "winget-pkgs" / "manifests" / "s" / "SecondBrain" / "SecondBrain" / ver
+    )
+    winget_pkgs_root = dest_root / "manifests" / "winget-pkgs"
+    winget_pkgs_zip = winget_pkgs_root / f"second-brain-winget-pkgs-{ver}.zip"
+
+    if installers:
+        winget_doc: dict[str, Any] = {
+            "PackageIdentifier": "SecondBrain.SecondBrain",
+            "PackageVersion": ver,
+            "PackageLocale": "en-US",
+            "Publisher": "Second Brain",
+            "PublisherUrl": f"https://github.com/{slug}",
+            "PackageName": "Second Brain",
+            "PackageUrl": f"https://github.com/{slug}",
+            "License": "MIT",
+            "ShortDescription": "Local-first verifiable AI memory platform with cryptographic byte-offset provenance.",
+            "Commands": ["second-brain"],
+            "Installers": installers,
+            "ManifestType": "singleton",
+            "ManifestVersion": "1.6.0",
+        }
+        winget_header = (
+            "# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.6.0.schema.json\n"
+        )
+        winget_yaml = winget_header + yaml.safe_dump(winget_doc, sort_keys=False, allow_unicode=True)
+        parsed_yaml = yaml.safe_load(winget_yaml)
+        if not isinstance(parsed_yaml, dict) or parsed_yaml.get("PackageVersion") != ver:
+            raise RuntimeError("Generated WinGet YAML failed validation.")
+        winget_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(str(winget_path), winget_yaml.encode("utf-8"))
 
     formula_rb: str | None = None
     if py_match is not None:
@@ -383,67 +527,85 @@ def build_package_manager_manifests(
         assert formula_rb is not None
         primary_brew_rb = formula_rb
 
-    atomic_write_bytes(str(winget_path), winget_yaml.encode("utf-8"))
     atomic_write_bytes(str(homebrew_path), primary_brew_rb.encode("utf-8"))
 
-    # Also emit official microsoft/winget-pkgs multi-file 1.6.0 manifests (version + installer + defaultLocale)
-    winget_pkgs_dir = (
-        dest_root / "manifests" / "winget-pkgs" / "manifests" / "s" / "SecondBrain" / "SecondBrain" / ver
-    )
-    winget_pkgs_dir.mkdir(parents=True, exist_ok=True)
-    ver_manifest = (
-        "# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json\n"
-        + yaml.safe_dump(
-            {
-                "PackageIdentifier": "SecondBrain.SecondBrain",
-                "PackageVersion": ver,
-                "DefaultLocale": "en-US",
-                "ManifestType": "version",
-                "ManifestVersion": "1.6.0",
-            },
-            sort_keys=False,
-            allow_unicode=True,
+    # Also emit official microsoft/winget-pkgs multi-file 1.6.0 manifests (version + installer + defaultLocale) when installers present
+    if installers:
+        winget_pkgs_dir.mkdir(parents=True, exist_ok=True)
+        ver_manifest = (
+            "# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json\n"
+            + yaml.safe_dump(
+                {
+                    "PackageIdentifier": "SecondBrain.SecondBrain",
+                    "PackageVersion": ver,
+                    "DefaultLocale": "en-US",
+                    "ManifestType": "version",
+                    "ManifestVersion": "1.6.0",
+                },
+                sort_keys=False,
+                allow_unicode=True,
+            )
         )
-    )
-    inst_manifest = (
-        "# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json\n"
-        + yaml.safe_dump(
-            {
-                "PackageIdentifier": "SecondBrain.SecondBrain",
-                "PackageVersion": ver,
-                "Commands": ["second-brain"],
-                "Installers": installers,
-                "ManifestType": "installer",
-                "ManifestVersion": "1.6.0",
-            },
-            sort_keys=False,
-            allow_unicode=True,
+        inst_manifest = (
+            "# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json\n"
+            + yaml.safe_dump(
+                {
+                    "PackageIdentifier": "SecondBrain.SecondBrain",
+                    "PackageVersion": ver,
+                    "Commands": ["second-brain"],
+                    "Installers": installers,
+                    "ManifestType": "installer",
+                    "ManifestVersion": "1.6.0",
+                },
+                sort_keys=False,
+                allow_unicode=True,
+            )
         )
-    )
-    loc_manifest = (
-        "# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json\n"
-        + yaml.safe_dump(
-            {
-                "PackageIdentifier": "SecondBrain.SecondBrain",
-                "PackageVersion": ver,
-                "PackageLocale": "en-US",
-                "Publisher": "Second Brain",
-                "PublisherUrl": f"https://github.com/{slug}",
-                "PackageName": "Second Brain",
-                "PackageUrl": f"https://github.com/{slug}",
-                "License": "MIT",
-                "ShortDescription": "Local-first verifiable AI memory platform with cryptographic byte-offset provenance.",
-                "Tags": ["ai", "memory", "knowledge-base", "local-first", "rag", "mcp"],
-                "ManifestType": "defaultLocale",
-                "ManifestVersion": "1.6.0",
-            },
-            sort_keys=False,
-            allow_unicode=True,
+        loc_manifest = (
+            "# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json\n"
+            + yaml.safe_dump(
+                {
+                    "PackageIdentifier": "SecondBrain.SecondBrain",
+                    "PackageVersion": ver,
+                    "PackageLocale": "en-US",
+                    "Publisher": "Second Brain",
+                    "PublisherUrl": f"https://github.com/{slug}",
+                    "PackageName": "Second Brain",
+                    "PackageUrl": f"https://github.com/{slug}",
+                    "License": "MIT",
+                    "ShortDescription": "Local-first verifiable AI memory platform with cryptographic byte-offset provenance.",
+                    "Tags": ["ai", "memory", "knowledge-base", "local-first", "rag", "mcp"],
+                    "ManifestType": "defaultLocale",
+                    "ManifestVersion": "1.6.0",
+                },
+                sort_keys=False,
+                allow_unicode=True,
+            )
         )
-    )
-    atomic_write_bytes(str(winget_pkgs_dir / "SecondBrain.SecondBrain.yaml"), ver_manifest.encode("utf-8"))
-    atomic_write_bytes(str(winget_pkgs_dir / "SecondBrain.SecondBrain.installer.yaml"), inst_manifest.encode("utf-8"))
-    atomic_write_bytes(str(winget_pkgs_dir / "SecondBrain.SecondBrain.locale.en-US.yaml"), loc_manifest.encode("utf-8"))
+        atomic_write_bytes(str(winget_pkgs_dir / "SecondBrain.SecondBrain.yaml"), ver_manifest.encode("utf-8"))
+        atomic_write_bytes(str(winget_pkgs_dir / "SecondBrain.SecondBrain.installer.yaml"), inst_manifest.encode("utf-8"))
+        atomic_write_bytes(str(winget_pkgs_dir / "SecondBrain.SecondBrain.locale.en-US.yaml"), loc_manifest.encode("utf-8"))
+
+        tmp_wg_zip = winget_pkgs_root / f".tmp-winget-pkgs-{os.getpid()}.zip"
+        try:
+            with zipfile.ZipFile(tmp_wg_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for mf_name, mf_text in (
+                    ("SecondBrain.SecondBrain.yaml", ver_manifest),
+                    ("SecondBrain.SecondBrain.installer.yaml", inst_manifest),
+                    ("SecondBrain.SecondBrain.locale.en-US.yaml", loc_manifest),
+                ):
+                    arcname = f"manifests/s/SecondBrain/SecondBrain/{ver}/{mf_name}"
+                    zinfo = zipfile.ZipInfo(filename=arcname, date_time=(2026, 1, 1, 0, 0, 0))
+                    zinfo.compress_type = zipfile.ZIP_DEFLATED
+                    zinfo.external_attr = 0o644 << 16
+                    zf.writestr(zinfo, mf_text.encode("utf-8"))
+            atomic_write_bytes(str(winget_pkgs_zip), tmp_wg_zip.read_bytes())
+        finally:
+            if tmp_wg_zip.exists():
+                try:
+                    tmp_wg_zip.unlink()
+                except OSError:
+                    pass
 
     # Emit ready-to-push Homebrew Tap repository layout (Casks/second-brain.rb + Formula/second-brain.rb + README.md)
     tap_owner = slug.split("/", 1)[0]
@@ -470,9 +632,9 @@ def build_package_manager_manifests(
     )
     atomic_write_bytes(str(tap_dir / "README.md"), tap_readme.encode("utf-8"))
 
-    bound: dict[str, Any] = {
-        "windows_exe": {"filename": exe_name, "sha256": exe_sha},
-    }
+    bound: dict[str, Any] = {}
+    if exe_match is not None:
+        bound["windows_exe"] = {"filename": exe_name, "sha256": exe_sha}
     if msi_match is not None:
         bound["windows_msi"] = {"filename": msi_match[0], "sha256": msi_match[1]}
     if dmg_match is not None:
@@ -483,8 +645,9 @@ def build_package_manager_manifests(
     return {
         "version": ver,
         "repo_slug": slug,
-        "winget_manifest": str(winget_path),
-        "winget_pkgs_dir": str(winget_pkgs_dir),
+        "winget_manifest": str(winget_path) if installers else None,
+        "winget_pkgs_dir": str(winget_pkgs_dir) if installers else None,
+        "winget_pkgs_zip": str(winget_pkgs_zip) if installers else None,
         "homebrew_cask": str(homebrew_path),
         "homebrew_formula": str(formula_subpath) if py_match is not None else str(homebrew_path),
         "homebrew_tap_dir": str(tap_dir),
@@ -499,6 +662,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", default=None, help="Explicit semantic version override.")
     parser.add_argument("--repo-slug", default=None, help="GitHub owner/repo slug.")
     parser.add_argument("--require-checksums", action="store_true", help="Require verified release checksums.")
+    parser.add_argument("--allow-missing-exe", action="store_true", help="Build Homebrew manifests without requiring a Windows .exe.")
     parser.add_argument("--pwa-only", action="store_true", help="Only build second-brain-inbox-drop-pwa.zip.")
     parser.add_argument("--manifests-only", action="store_true", help="Only build WinGet & Homebrew manifests.")
     parser.add_argument("--json", action="store_true")
@@ -520,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
             version=args.version,
             repo_slug=args.repo_slug,
             require_checksums=bool(args.require_checksums),
+            allow_missing_exe=bool(args.allow_missing_exe),
         )
 
     if args.json:

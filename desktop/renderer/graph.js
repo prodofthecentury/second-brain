@@ -35,6 +35,9 @@
       const label = String(
         raw.label || raw.claim || raw.title || id
       ).trim();
+      const validFrom = String(raw.valid_from || "").trim();
+      const validUntil = String(raw.valid_until || "").trim();
+      const temporalStatus = String(raw.temporal_status || "active").trim().toLowerCase() || "active";
       return {
         id,
         label,
@@ -43,8 +46,24 @@
         memory_type: memoryType,
         contexts,
         verified,
+        valid_from: validFrom,
+        valid_until: validUntil,
+        temporal_status: temporalStatus,
         raw,
       };
+    }
+
+    function evaluateTemporalStatusForNode(node, asOfRaw = "") {
+      const asOfDate = String(asOfRaw || "").trim().slice(0, 10);
+      const vf = String(node?.valid_from || "").trim().slice(0, 10);
+      const vu = String(node?.valid_until || "").trim().slice(0, 10);
+      if (!asOfDate) {
+        return String(node?.temporal_status || "active").toLowerCase() || "active";
+      }
+      if (vf && vu && vf > vu) return "invalid_window";
+      if (vf && asOfDate < vf) return "not_yet_valid";
+      if (vu && asOfDate > vu) return "expired";
+      return "active";
     }
 
     function synthesizeFallbackGraph(atoms = [], radarData = {}) {
@@ -117,6 +136,11 @@
         filters.includePending !== undefined
           ? Boolean(filters.includePending)
           : true;
+      const asOf = String(filters.asOf || "").trim();
+      const includeExpired =
+        filters.includeExpired !== undefined
+          ? Boolean(filters.includeExpired)
+          : !asOf;
 
       const nodes = [];
       const keptIds = new Set();
@@ -124,6 +148,16 @@
       for (const item of rawNodes) {
         const node = item.shortLabel ? item : normalizeNode(item);
         if (!node) continue;
+
+        const effTemporal = evaluateTemporalStatusForNode(node, asOf);
+        if (
+          !includeExpired &&
+          (effTemporal === "expired" ||
+            effTemporal === "not_yet_valid" ||
+            effTemporal === "invalid_window")
+        ) {
+          continue;
+        }
 
         if (!includePending && !node.verified && node.review_status !== "accepted") {
           continue;
@@ -156,7 +190,7 @@
           if (!hay.includes(search)) continue;
         }
 
-        nodes.push(node);
+        nodes.push(effTemporal !== node.temporal_status ? { ...node, temporal_status: effTemporal } : node);
         keptIds.add(node.id);
       }
 
@@ -175,6 +209,12 @@
       if (!node) return "#58a6ff";
       if (node.review_status === "needs_edit" || node.review_status === "quarantined") {
         return "#f85149";
+      }
+      if (node.temporal_status === "expired" || node.temporal_status === "invalid_window") {
+        return "#6e7681";
+      }
+      if (node.temporal_status === "not_yet_valid") {
+        return "#79c0ff";
       }
       if (!node.verified && node.review_status !== "accepted") {
         return "#d29922";
@@ -516,6 +556,9 @@
             circle.setAttribute("fill", nodeColorFor(node));
             circle.setAttribute("stroke", "#0d1117");
             circle.setAttribute("stroke-width", "1.8");
+            if (node.temporal_status === "expired" || node.temporal_status === "not_yet_valid") {
+              circle.setAttribute("stroke-dasharray", "3,2");
+            }
 
             const label = createSvgEl(doc, "text");
             label.setAttribute("x", "14");
@@ -525,7 +568,11 @@
             label.textContent = node.id.replace(/\.md$/i, "");
 
             const tooltip = createSvgEl(doc, "title");
-            tooltip.textContent = `${node.id} (${node.memory_type}, ${node.review_status})\n${node.label}`;
+            const temporalInfo =
+              node.valid_from || node.valid_until || node.temporal_status !== "active"
+                ? ` [${node.temporal_status}: ${node.valid_from || "-inf"}..${node.valid_until || "+inf"}]`
+                : "";
+            tooltip.textContent = `${node.id} (${node.memory_type}, ${node.review_status})${temporalInfo}\n${node.label}`;
 
             g.appendChild(circle);
             g.appendChild(label);

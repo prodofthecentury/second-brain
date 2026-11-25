@@ -15,6 +15,11 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 from contextlib import redirect_stdout
 from typing import Any
@@ -305,9 +310,14 @@ def group_atoms(atoms: list[dict], *, model: str | None = None) -> dict[str, lis
     ])
 
     prompt = f"""
-Group these atomic notes into 1 to {DEFAULT_MAX_TOPICS} coherent synthesis topics.
-Return only a valid JSON object mapping a short topic name to an array of exact filenames.
-Do not include prose, markdown, comments, or filenames that are not listed.
+Group these atomic notes into 2 to {DEFAULT_MAX_TOPICS} coherent synthesis topics.
+Output ONLY a valid JSON object wrapped in ```json and ``` mapping short topic names to arrays of exact filenames from the list below:
+```json
+{{
+  "Topic Name": ["filename-1.md", "filename-2.md"]
+}}
+```
+Do not include any text, markdown, or comments outside the JSON block.
 
 ATOMS:
 {catalog}
@@ -318,7 +328,8 @@ ATOMS:
         topics = parse_topic_mapping(response["message"]["content"], {a["filename"] for a in atoms})
         if topics:
             return topics
-        print("  [!] DEFERRED: Model topic grouping output was invalid; deferring cluster without writing stub threads.")
+        preview = repr((response["message"]["content"] or "")[:200])
+        print(f"  [!] DEFERRED: Model topic grouping output was invalid (preview={preview}); deferring cluster without writing stub threads.")
         return None
     except Exception as exc:
         print(f"  [!] DEFERRED: Model grouping unavailable ({exc}); deferring cluster until Ollama is reachable.")
@@ -507,6 +518,9 @@ last-updated: {today}
     try:
         response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model)
         output = extract_markdown_block(response["message"]["content"])
+        fm_start = output.find("---")
+        if fm_start >= 0:
+            output = output[fm_start:]
         if (
             output.startswith("---")
             and split_frontmatter(output) is not None
@@ -519,7 +533,8 @@ last-updated: {today}
                 project_scope=scope_label,
                 contexts=scope_contexts,
             )
-        print(f"  [!] DEFERRED thread '{topic_name}': Model output did not match required thread template.")
+        preview = repr((output or "")[:150])
+        print(f"  [!] DEFERRED thread '{topic_name}': Model output did not match required thread template (preview={preview}).")
         return None
     except Exception as exc:
         print(f"  [!] DEFERRED thread '{topic_name}': Model synthesis unavailable ({exc}).")

@@ -1,0 +1,5 @@
+git_url(ENV.fetch("MATCH_GIT_URL", "https://github.com/prodofthecentury/second-brain-ios-certs"))
+storage_mode("git")
+type("appstore")
+app_identifier(["com.secondbrain.vault"])
+readonly(true)

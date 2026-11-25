@@ -25,7 +25,9 @@ param(
     [string]$AzureEndpoint = $env:SECOND_BRAIN_AZURE_TRUSTED_SIGNING_ENDPOINT,
     [string]$AzureAccount = $env:SECOND_BRAIN_AZURE_CODE_SIGNING_ACCOUNT,
     [string]$AzureCertProfile = $env:SECOND_BRAIN_AZURE_CERT_PROFILE,
-    [string]$TimestampUrl = $(if ($env:SECOND_BRAIN_TIMESTAMP_URL) { $env:SECOND_BRAIN_TIMESTAMP_URL } else { "http://timestamp.acs.microsoft.com" }),
+    [string]$AzureDlibPath = $env:SECOND_BRAIN_AZURE_DLIB_PATH,
+    [string]$TimestampUrl = $(if ($env:SECOND_BRAIN_TIMESTAMP_URL) { $env:SECOND_BRAIN_TIMESTAMP_URL } else { "https://timestamp.acs.microsoft.com" }),
+    [string]$TimestampFallbackUrl = "https://timestamp.digicert.com",
     [switch]$SelfSigned,
     [switch]$RequireTrustedChain,
     [switch]$SkipManifest
@@ -113,6 +115,25 @@ function Assert-VerifiedAuthenticode {
     Write-Host "  Verified signature: $($verified.Status) [Subject=$($verified.SignerCertificate.Subject), Thumbprint=$($verified.SignerCertificate.Thumbprint)]"
 }
 
+function Resolve-AzureDlibPath {
+    param([string]$Explicit = "")
+    $candidates = @()
+    if ($Explicit) { $candidates += $Explicit }
+    if ($env:RUNNER_TEMP) {
+        $candidates += (Join-Path $env:RUNNER_TEMP "Azure.CodeSigning.Dlib\bin\x64\Azure.CodeSigning.Dlib.dll")
+        $candidates += (Join-Path $env:RUNNER_TEMP "Azure.CodeSigning.Dlib\Azure.CodeSigning.Dlib.dll")
+    }
+    if ($env:LOCALAPPDATA) {
+        $candidates += (Join-Path $env:LOCALAPPDATA "Microsoft\AzureCodeSigning\Azure.CodeSigning.Dlib.dll")
+    }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+    return $null
+}
+
 function Invoke-AuthenticodeSignAndVerify {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -120,17 +141,44 @@ function Invoke-AuthenticodeSignAndVerify {
     )
     Write-Host "Signing $FilePath..."
     if ($AzureEndpoint -and $AzureAccount -and $AzureCertProfile) {
-        if (-not (Get-Command Invoke-TrustedSigning -ErrorAction SilentlyContinue)) {
-            throw "TrustedSigning PowerShell module is not installed. Run: Install-Module TrustedSigning -Scope CurrentUser"
+        $resolvedDlib = Resolve-AzureDlibPath -Explicit $AzureDlibPath
+        if ($resolvedDlib) {
+            $signtool = Resolve-SigntoolExe
+            $metaPath = Join-Path ([System.IO.Path]::GetTempPath()) ("sb-azure-signing-" + [Guid]::NewGuid().ToString("N") + ".json")
+            try {
+                $metaJson = @{
+                    Endpoint               = $AzureEndpoint
+                    CodeSigningAccountName = $AzureAccount
+                    CertificateProfileName = $AzureCertProfile
+                } | ConvertTo-Json -Compress
+                [System.IO.File]::WriteAllText($metaPath, $metaJson, (New-Object System.Text.UTF8Encoding $false))
+                $tsUrls = @($TimestampUrl, $TimestampFallbackUrl) | Where-Object { $_ } | Select-Object -Unique
+                $signed = $false
+                foreach ($ts in $tsUrls) {
+                    & $signtool sign /v /fd SHA256 /tr $ts /td SHA256 /dlib $resolvedDlib /dmdf $metaPath $FilePath
+                    if ($LASTEXITCODE -eq 0) {
+                        $signed = $true
+                        break
+                    }
+                }
+                if (-not $signed) {
+                    throw "signtool Azure Trusted Signing failed via dlib for $FilePath"
+                }
+            } finally {
+                if (Test-Path $metaPath) { Remove-Item -Force $metaPath -ErrorAction SilentlyContinue }
+            }
+        } elseif (Get-Command Invoke-TrustedSigning -ErrorAction SilentlyContinue) {
+            Invoke-TrustedSigning `
+                -Endpoint $AzureEndpoint `
+                -CodeSigningAccountName $AzureAccount `
+                -CertificateProfileName $AzureCertProfile `
+                -Files $FilePath `
+                -FileDigest "SHA256" `
+                -TimestampRfc3161 $TimestampUrl `
+                -TimestampDigest "SHA256"
+        } else {
+            throw "Neither Azure.CodeSigning.Dlib.dll nor Invoke-TrustedSigning PowerShell module is available. Install TrustedSigning module or set SECOND_BRAIN_AZURE_DLIB_PATH."
         }
-        Invoke-TrustedSigning `
-            -Endpoint $AzureEndpoint `
-            -CodeSigningAccountName $AzureAccount `
-            -CertificateProfileName $AzureCertProfile `
-            -Files $FilePath `
-            -FileDigest "SHA256" `
-            -TimestampRfc3161 $TimestampUrl `
-            -TimestampDigest "SHA256"
     } elseif ($CspName -and $KeyContainerName) {
         $signtool = Resolve-SigntoolExe
         $stArgs = @("sign", "/fd", "SHA256", "/csp", $CspName, "/kc", $KeyContainerName)
@@ -201,7 +249,22 @@ try {
             }
         }
         foreach ($file in $outerSignTargets) {
-            Invoke-AuthenticodeSignAndVerify -FilePath $file.FullName -Certificate $signCert
+            $existingSig = Get-AuthenticodeSignature -FilePath $file.FullName
+            $alreadyValid = (
+                $null -ne $existingSig.SignerCertificate -and
+                $existingSig.Status -notin @("NotSigned", "HashMismatch") -and (
+                    (-not $RequireTrustedChain) -or (
+                        $existingSig.Status -eq "Valid" -and
+                        $existingSig.SignerCertificate.Subject -ne $existingSig.SignerCertificate.Issuer -and
+                        $null -ne $existingSig.TimeStamperCertificate
+                    )
+                )
+            )
+            if ($alreadyValid) {
+                Assert-VerifiedAuthenticode -FilePath $file.FullName
+            } else {
+                Invoke-AuthenticodeSignAndVerify -FilePath $file.FullName -Certificate $signCert
+            }
         }
     } else {
         Write-Host "No signing certificate configured; skipping Authenticode signing (pass -SelfSigned, -Thumbprint, -PfxPath, HSM -CspName, or Azure Trusted Signing)."
@@ -216,8 +279,11 @@ if (-not $SkipManifest) {
     $manifestTargets = @(
         Get-ChildItem -Path $DistDir -File |
             Where-Object {
-                $_.Extension -in @(".exe", ".msi", ".vsix", ".whl", ".dmg", ".zip", ".xpi", ".AppImage", ".deb", ".blockmap") -or
-                $_.Name.EndsWith(".tar.gz")
+                -not $_.Name.StartsWith(".") -and
+                $_.Name -notin @("SHA256SUMS.txt", "builder-debug.yml", "builder-effective-config.yaml") -and (
+                    $_.Extension -in @(".exe", ".msi", ".vsix", ".whl", ".dmg", ".zip", ".xpi", ".AppImage", ".deb", ".blockmap", ".rb", ".yaml", ".yml") -or
+                    $_.Name.EndsWith(".tar.gz")
+                )
             }
     )
     if (-not $manifestTargets) {

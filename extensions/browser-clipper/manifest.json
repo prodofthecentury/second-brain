@@ -12,17 +12,47 @@
   "host_permissions": [
     "http://127.0.0.1/*"
   ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Clip to Second Brain"
+    "default_title": "Clip to Second Brain",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
   },
   "background": {
-    "service_worker": "background.js",
-    "scripts": [
-      "lib/clipper-client.js",
-      "lib/readability-markdown.js",
-      "background.js"
-    ]
+    "service_worker": "background.js"
+  },
+  "commands": {
+    "clip-page": {
+      "suggested_key": {
+        "default": "Alt+Shift+S",
+        "mac": "Alt+Shift+S"
+      },
+      "description": "Clip active page or selection to Second Brain"
+    },
+    "capture-screenshot": {
+      "suggested_key": {
+        "default": "Alt+Shift+V",
+        "mac": "Alt+Shift+V"
+      },
+      "description": "Capture visible tab screenshot (PNG) to Second Brain"
+    },
+    "capture-pdf": {
+      "suggested_key": {
+        "default": "Alt+Shift+P",
+        "mac": "Alt+Shift+P"
+      },
+      "description": "Capture in-browser PDF document to Second Brain"
+    }
   },
   "browser_specific_settings": {
     "gecko": {

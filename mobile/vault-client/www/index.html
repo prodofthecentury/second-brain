@@ -12,7 +12,8 @@
   <title>Second Brain — Verifiable Mobile Vault</title>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="alternate icon" href="icons/icon-192.png" type="image/png" sizes="192x192">
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -55,6 +56,7 @@
         </label>
         <div class="actions-inline">
           <button id="unlockVaultBtn" type="button" class="btn btn-primary">Unlock Vault</button>
+          <button id="biometricUnlockBtn" type="button" class="btn btn-secondary">Biometric Unlock</button>
           <button id="wipeVaultBtn" type="button" class="btn btn-danger">Wipe Local Ciphertext</button>
         </div>
       </div>
@@ -125,10 +127,28 @@
             </label>
           </div>
 
-          <div class="actions">
+          <div class="actions actions-row">
             <button id="pullSyncBtn" type="button" class="btn btn-primary">Pull &amp; Verify E2EE Vault</button>
+            <button id="pushSyncBtn" type="button" class="btn btn-secondary">Push Signed Delta</button>
           </div>
           <p id="syncStatsLine" class="meta-line">No sync pull run in this session yet.</p>
+          <div id="syncConflictsCard" class="subpanel outbox-panel hidden" aria-live="polite">
+            <div class="row-between">
+              <strong>3-Way Sync Conflicts Detected</strong>
+              <span id="syncConflictsCountBadge" class="badge badge-warn">0 conflicts</span>
+            </div>
+            <div id="syncConflictsList" class="stack-list"></div>
+          </div>
+          <details class="sub-details">
+            <summary>Device Ed25519 Identity &amp; Background Sync</summary>
+            <div class="details-body">
+              <p id="mobileDeviceIdentityText" class="citation-mono">No mobile Ed25519 write-back key generated yet.</p>
+              <div class="actions-inline">
+                <button id="genDeviceIdentityBtn" type="button" class="btn btn-tiny">Generate / Show Peer Key</button>
+                <button id="scheduleBgSyncBtn" type="button" class="btn btn-tiny">Schedule Background Sync</button>
+              </div>
+            </div>
+          </details>
         </div>
 
         <div class="card">
@@ -240,9 +260,24 @@
               <button id="saveDropPairBtn" type="button" class="btn btn-tiny">Save Drop Pairing</button>
             </div>
           </details>
+          <label class="field">
+            <span>Camera Photo or Voice Memo Capture (encapsulated into SBID1 drop)</span>
+            <input id="dropMediaCaptureInput" type="file" accept="image/*,audio/*" capture="environment">
+          </label>
           <div class="actions">
             <button id="sendDropBtn" type="button" class="btn btn-primary">Encrypt &amp; Upload `SBID1`</button>
             <button id="exportDropEncBtn" type="button" class="btn btn-ghost">Export `.enc`</button>
+          </div>
+          <div id="outboxCard" class="subpanel outbox-panel hidden" aria-live="polite">
+            <div class="row-between">
+              <strong>Offline `SBID1` Outbox Queue</strong>
+              <span id="outboxCountBadge" class="badge badge-warn">0 queued</span>
+            </div>
+            <p class="hint">Forward-secret `SBID1` ciphertexts queued offline (zero plaintext stored). Flushes automatically when back online.</p>
+            <div class="actions-inline">
+              <button id="flushOutboxBtn" type="button" class="btn btn-tiny">Flush Outbox Now</button>
+              <button id="clearOutboxBtn" type="button" class="btn btn-tiny btn-danger">Clear Outbox</button>
+            </div>
           </div>
         </div>
 
@@ -251,13 +286,39 @@
             <h2>Synced Working Notes</h2>
             <span class="badge badge-warn">Unverified Tier</span>
           </div>
-          <p class="hint">Working notes from `notes/*.md` are immediately readable offline and explicitly badged as unverified notes.</p>
+          <p class="hint">Create or edit encrypted Markdown working notes offline (`notes/*.md`). Push via bidirectional `SBSY1` sync when ready.</p>
+          <details class="sub-details">
+            <summary>Create / Edit Working Note</summary>
+            <div class="details-body">
+              <label class="field">
+                <span>Note Filename / Slug</span>
+                <input id="noteEditorFilenameInput" type="text" maxlength="80" placeholder="e.g. mobile-field-notes.md">
+              </label>
+              <label class="field">
+                <span>Note Title</span>
+                <input id="noteEditorTitleInput" type="text" maxlength="180" placeholder="Title">
+              </label>
+              <label class="field">
+                <span>Note Body (Markdown)</span>
+                <textarea id="noteEditorBodyInput" rows="4" maxlength="32000" placeholder="Write Markdown notes offline..."></textarea>
+              </label>
+              <button id="saveMobileNoteBtn" type="button" class="btn btn-secondary btn-compact">Save Encrypted Note</button>
+            </div>
+          </details>
           <div id="notesBrowseList" class="stack-list"></div>
         </div>
       </section>
 
       <!-- TAB 5: MERKLE AUDIT & LEDGER -->
       <section id="tab-audit" class="tab-panel hidden" aria-labelledby="auditHeading">
+        <div class="card">
+          <div class="row-between">
+            <h2>Pending Atom Review (Local CAS -> Sync)</h2>
+            <button id="refreshPendingAtomsBtn" type="button" class="btn btn-secondary btn-compact">Refresh Queue</button>
+          </div>
+          <p class="hint">Approve (anchor-checked) or reject pending atoms locally; appends canonical records to `decision-record.jsonl` for union-merge on sync.</p>
+          <div id="pendingAtomsList" class="stack-list"></div>
+        </div>
         <div class="card">
           <div class="row-between">
             <h2 id="auditHeading">Offline Merkle &amp; Ledger Audit</h2>

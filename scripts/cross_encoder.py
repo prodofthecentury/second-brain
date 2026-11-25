@@ -15,7 +15,7 @@ Supports two deterministic local-only execution backends (zero network calls):
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 import json
 import math
@@ -25,6 +25,7 @@ import re
 import stat
 import sys
 import threading
+import time
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +33,7 @@ if __name__ in ("cross_encoder", "scripts.cross_encoder"):
     sys.modules.setdefault("cross_encoder", sys.modules[__name__])
     sys.modules.setdefault("scripts.cross_encoder", sys.modules[__name__])
 
-from config import _is_reparse_or_link, security_state_dir
+from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, security_state_dir
 from lexical_store import FTS_STOP_WORDS, TOKEN_PATTERN, porter_stem
 from memory_format import split_frontmatter
 from memory_review import section_text
@@ -53,12 +54,68 @@ _IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{1,63}")
 
 _ONNX_CACHE_LOCK = threading.Lock()
 _CACHED_ONNX_ENCODERS: dict[tuple[str, int], tuple[float, float, "OnnxCrossEncoder"]] = {}
-_DEFAULT_RESOLVED_DIR: tuple[str, int, int, int, int, int, int] | None = None
+_DEFAULT_RESOLVED_DIR: tuple[str, int, int, int, int, int, int, int, int] | None = None
+_DEFAULT_RESOLVED_CHECKED_MONO: float = 0.0
+_ONNX_STAT_TTL_SECONDS: float = 0.0
 _VERIFIED_DIR_CACHE: dict[tuple[Any, ...], bool] = {}
-_ONNX_PAIR_SCORE_MEMO: dict[tuple[str, int, str, str], float] = {}
+_ONNX_PAIR_SCORE_MEMO: dict[tuple[str, int, tuple[int, int, int, int, int, int], str, str], float] = {}
+
+
+def _stat_is_reparse(st: os.stat_result) -> bool:
+    return stat.S_ISLNK(st.st_mode) or (
+        os.name == "nt" and bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    )
+
+
+def _lstat_file_sig(fp: str | Path, *, allow_missing: bool = False) -> tuple[int, int] | None:
+    """Return regular non-reparse ``(st_mtime_ns, st_size)`` for ``fp``, or None on unsafe/missing."""
+    p_str = str(fp)
+    try:
+        st = os.lstat(p_str)
+    except FileNotFoundError:
+        return (0, 0) if allow_missing else None
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or _stat_is_reparse(st):
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _ancestors_reparse_free(cand: Path) -> bool:
+    try:
+        dir_st = os.lstat(str(cand))
+    except OSError:
+        return False
+    if not stat.S_ISDIR(dir_st.st_mode) or _stat_is_reparse(dir_st):
+        return False
+    for ancestor in cand.parents:
+        try:
+            ast = os.lstat(str(ancestor))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if _stat_is_reparse(ast):
+            return False
+    return True
 
 _DOC_INTERACTION_LOCK = threading.Lock()
-_DOC_INTERACTION_CACHE: dict[int, tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], frozenset[str]]] = {}
+_DOC_INTERACTION_CACHE: dict[
+    int,
+    tuple[
+        str,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        frozenset[str],
+        frozenset[str],
+        frozenset[str],
+        frozenset[str],
+        frozenset[str],
+        str,
+    ],
+] = {}
 
 
 def _clamp01(val: float) -> float:
@@ -86,6 +143,8 @@ def resolve_cross_encoder_dir(explicit_dir: str | Path | None = None) -> Path | 
         return None
     for ancestor in (cand, *cand.parents):
         if os.path.lexists(str(ancestor)) and _is_reparse_or_link(str(ancestor)):
+            if _is_immutable_darwin_root_symlink(ancestor):
+                continue
             return None
     if not cand.is_dir():
         return None
@@ -175,9 +234,13 @@ class OnnxCrossEncoder:
 
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_opts.intra_op_num_threads = max(1, min(2, os.cpu_count() or 1))
+        sess_opts.intra_op_num_threads = max(1, min(4, (os.cpu_count() or 2) // 2))
         sess_opts.inter_op_num_threads = 1
         self._model_dir_str = str(model_dir)
+        m_sig = _lstat_file_sig(model_path) or (0, 0)
+        t_sig = _lstat_file_sig(tok_path) or (0, 0)
+        c_sig = _lstat_file_sig(model_dir / "config.json", allow_missing=True) or (-1, -1)
+        self._model_stat_sig: tuple[int, int, int, int, int, int] = (*m_sig, *t_sig, *c_sig)
         self._session = ort.InferenceSession(
             str(model_path),
             sess_options=sess_opts,
@@ -256,7 +319,9 @@ class OnnxCrossEncoder:
         pairs: list[tuple[str, str]] = []
         with _ONNX_CACHE_LOCK:
             for i, (q_s, d_s) in enumerate(raw_pairs):
-                hit = _ONNX_PAIR_SCORE_MEMO.get((self._model_dir_str, self._max_length, q_s, d_s))
+                hit = _ONNX_PAIR_SCORE_MEMO.get(
+                    (self._model_dir_str, self._max_length, self._model_stat_sig, q_s, d_s)
+                )
                 if hit is not None:
                     final_scores[i] = hit
                 else:
@@ -331,7 +396,9 @@ class OnnxCrossEncoder:
             if len(_ONNX_PAIR_SCORE_MEMO) >= 4096:
                 _ONNX_PAIR_SCORE_MEMO.clear()
             for orig_i, (q_s, d_s), sc in zip(uncached_indices, pairs, scores):
-                _ONNX_PAIR_SCORE_MEMO[(self._model_dir_str, self._max_length, q_s, d_s)] = sc
+                _ONNX_PAIR_SCORE_MEMO[
+                    (self._model_dir_str, self._max_length, self._model_stat_sig, q_s, d_s)
+                ] = sc
                 final_scores[orig_i] = sc
         return [float(s or 0.0) for s in final_scores]
 
@@ -383,38 +450,45 @@ def get_onnx_cross_encoder(
     max_length: int = 128,
 ) -> OnnxCrossEncoder | None:
     """Load and cache the ONNX cross-encoder when a validated local model directory is present."""
-    global _DEFAULT_RESOLVED_DIR
+    global _DEFAULT_RESOLVED_DIR, _DEFAULT_RESOLVED_CHECKED_MONO
     eff_max_len = max(8, min(int(max_length), 512))
     is_default_lookup = explicit_dir is None and not (os.environ.get("BRAIN_CROSS_ENCODER_DIR") or "").strip()
 
     if is_default_lookup:
+        expected_default_dir = os.path.normcase(
+            os.path.abspath(str(security_state_dir() / "models" / "cross-encoder"))
+        )
         with _ONNX_CACHE_LOCK:
             fast_dir = _DEFAULT_RESOLVED_DIR
-        if fast_dir is not None:
-            dir_str, exp_m_ns, exp_m_sz, exp_t_ns, exp_t_sz, exp_man_ns, exp_man_sz = fast_dir
-            try:
-                if not _is_reparse_or_link(dir_str):
-                    mst = os.lstat(os.path.join(dir_str, "model.onnx"))
-                    tst = os.lstat(os.path.join(dir_str, "tokenizer.json"))
-                    man_p = os.path.join(dir_str, "onnx-manifest.json")
-                    if os.path.lexists(man_p):
-                        man_st = os.lstat(man_p)
-                        man_sig = (man_st.st_mtime_ns, man_st.st_size)
-                    else:
-                        man_sig = (0, 0)
-                    if (
-                        mst.st_mtime_ns == exp_m_ns
-                        and mst.st_size == exp_m_sz
-                        and tst.st_mtime_ns == exp_t_ns
-                        and tst.st_size == exp_t_sz
-                        and man_sig == (exp_man_ns, exp_man_sz)
-                    ):
-                        with _ONNX_CACHE_LOCK:
-                            cached_fast = _CACHED_ONNX_ENCODERS.get((dir_str, eff_max_len))
+        if fast_dir is not None and os.path.normcase(fast_dir[0]) == expected_default_dir:
+            (
+                dir_str,
+                exp_m_ns,
+                exp_m_sz,
+                exp_t_ns,
+                exp_t_sz,
+                exp_man_ns,
+                exp_man_sz,
+                exp_cfg_ns,
+                exp_cfg_sz,
+            ) = fast_dir
+            dir_path = Path(dir_str)
+            if _ancestors_reparse_free(dir_path):
+                m_sig = _lstat_file_sig(dir_path / "model.onnx")
+                t_sig = _lstat_file_sig(dir_path / "tokenizer.json")
+                man_sig = _lstat_file_sig(dir_path / "onnx-manifest.json", allow_missing=True)
+                cfg_sig = _lstat_file_sig(dir_path / "config.json", allow_missing=True)
+                if (
+                    m_sig == (exp_m_ns, exp_m_sz)
+                    and t_sig == (exp_t_ns, exp_t_sz)
+                    and man_sig == (exp_man_ns, exp_man_sz)
+                    and cfg_sig == (exp_cfg_ns, exp_cfg_sz)
+                ):
+                    with _ONNX_CACHE_LOCK:
+                        cached_fast = _CACHED_ONNX_ENCODERS.get((dir_str, eff_max_len))
                         if cached_fast is not None:
+                            _DEFAULT_RESOLVED_CHECKED_MONO = time.monotonic()
                             return cached_fast[2]
-            except OSError:
-                pass
 
     resolved = resolve_cross_encoder_dir(explicit_dir)
     if resolved is None:
@@ -435,38 +509,35 @@ def get_onnx_cross_encoder(
         encoder = OnnxCrossEncoder(resolved, max_length=eff_max_len)
     except Exception:
         return None
-    man_file = resolved / "onnx-manifest.json"
-    try:
-        if os.path.lexists(str(man_file)):
-            man_st2 = os.lstat(str(man_file))
-            man_ns, man_sz = man_st2.st_mtime_ns, man_st2.st_size
-        else:
-            man_ns, man_sz = 0, 0
-    except OSError:
-        man_ns, man_sz = -1, -1
+    man_sig_full = _lstat_file_sig(resolved / "onnx-manifest.json", allow_missing=True)
+    cfg_sig_full = _lstat_file_sig(resolved / "config.json", allow_missing=True)
     with _ONNX_CACHE_LOCK:
         if len(_CACHED_ONNX_ENCODERS) >= 8:
             _CACHED_ONNX_ENCODERS.clear()
         _CACHED_ONNX_ENCODERS[cache_key] = (m_mtime, t_mtime, encoder)
-        if is_default_lookup and man_ns >= 0:
+        if is_default_lookup and man_sig_full is not None and cfg_sig_full is not None:
             _DEFAULT_RESOLVED_DIR = (
                 str(resolved),
                 mst_full.st_mtime_ns,
                 mst_full.st_size,
                 tst_full.st_mtime_ns,
                 tst_full.st_size,
-                man_ns,
-                man_sz,
+                man_sig_full[0],
+                man_sig_full[1],
+                cfg_sig_full[0],
+                cfg_sig_full[1],
             )
+            _DEFAULT_RESOLVED_CHECKED_MONO = time.monotonic()
     return encoder
 
 
 def clear_cross_encoder_cache() -> None:
     """Clear in-memory ONNX session and parsed document interaction caches."""
-    global _DEFAULT_RESOLVED_DIR
+    global _DEFAULT_RESOLVED_DIR, _DEFAULT_RESOLVED_CHECKED_MONO
     with _ONNX_CACHE_LOCK:
         _CACHED_ONNX_ENCODERS.clear()
         _DEFAULT_RESOLVED_DIR = None
+        _DEFAULT_RESOLVED_CHECKED_MONO = 0.0
         _VERIFIED_DIR_CACHE.clear()
         _ONNX_PAIR_SCORE_MEMO.clear()
     with _DOC_INTERACTION_LOCK:
@@ -495,40 +566,104 @@ def _content_tokens_and_stems(text: str) -> tuple[tuple[str, ...], tuple[str, ..
     return tuple(toks), tuple(stems)
 
 
-def _extract_doc_features(content: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...], frozenset[str]]:
+def _stem_positions_map(stems: Sequence[str]) -> dict[str, tuple[int, ...]]:
+    """Build an immutable mapping from stem to sorted token positions for O(1) bigram proximity lookups."""
+    pos_lists: dict[str, list[int]] = {}
+    for idx, st in enumerate(stems):
+        pos_lists.setdefault(st, []).append(idx)
+    return {st: tuple(idxs) for st, idxs in pos_lists.items()}
+
+
+def _extract_doc_features(
+    content: str,
+) -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    frozenset[str],
+    frozenset[str],
+    frozenset[str],
+    frozenset[str],
+    frozenset[str],
+    str,
+    frozenset[str],
+    dict[str, tuple[int, ...]],
+    dict[str, tuple[int, ...]],
+    str,
+]:
     cache_key = hash(content)
     with _DOC_INTERACTION_LOCK:
         cached = _DOC_INTERACTION_CACHE.get(cache_key)
     if cached is not None and cached[0] == content:
-        return cached[1], cached[2], cached[3], cached[4], cached[5]
+        return cached[1:]
 
     parsed = split_frontmatter(content or "")
     body = "\n".join(parsed[1]) if parsed else (content or "")
-    claim = section_text(body, "Claim") or body[:600]
-    evidence = section_text(body, "Evidence")
+    raw_claim = section_text(body, "Claim")
+    raw_ev = section_text(body, "Evidence")
+    compact_text = f"{raw_claim[:360]}\n{raw_ev[:280]}".strip() if (raw_claim or raw_ev) else body[:640]
+    claim = raw_claim or body[:600]
+    evidence = raw_ev
     claim_toks, claim_stems = _content_tokens_and_stems(claim)
     ev_toks, ev_stems = _content_tokens_and_stems(evidence)
     id_toks = tuple(m.casefold() for m in _IDENTIFIER_TOKEN_RE.findall(claim))
     trigrams = _char_trigrams(claim_toks + id_toks[:16])
+    claim_tok_set = frozenset(claim_toks)
+    claim_stem_set = frozenset(claim_stems)
+    ev_stem_set = frozenset(ev_stems)
+    all_tok_set = claim_tok_set | frozenset(ev_toks)
+    all_stem_set = claim_stem_set | ev_stem_set
+    claim_pos_by_stem = _stem_positions_map(claim_stems)
+    ev_pos_by_stem = _stem_positions_map(ev_stems)
+    content_casefold = (content or "").casefold()
 
+    features = (
+        claim_toks,
+        claim_stems,
+        ev_toks,
+        ev_stems,
+        trigrams,
+        claim_tok_set,
+        claim_stem_set,
+        all_tok_set,
+        all_stem_set,
+        compact_text,
+        ev_stem_set,
+        claim_pos_by_stem,
+        ev_pos_by_stem,
+        content_casefold,
+    )
     with _DOC_INTERACTION_LOCK:
         if len(_DOC_INTERACTION_CACHE) >= 8192:
             _DOC_INTERACTION_CACHE.clear()
-        _DOC_INTERACTION_CACHE[cache_key] = (content, claim_toks, claim_stems, ev_toks, ev_stems, trigrams)
-    return claim_toks, claim_stems, ev_toks, ev_stems, trigrams
+        _DOC_INTERACTION_CACHE[cache_key] = (content, *features)
+    return features
 
 
-def _ordered_bigram_proximity(q_stems: Sequence[str], doc_stems: Sequence[str], *, max_gap: int = 4) -> float:
+def _ordered_bigram_proximity(
+    q_stems: Sequence[str],
+    doc_stems: Sequence[str],
+    *,
+    max_gap: int = 4,
+    q_bigrams: tuple[tuple[str, str], ...] | None = None,
+    pos_by_stem: Mapping[str, Sequence[int]] | None = None,
+) -> float:
     if len(q_stems) < 2 or len(doc_stems) < 2:
         return 0.0
-    pos_by_stem: dict[str, list[int]] = {}
-    for idx, st in enumerate(doc_stems):
-        pos_by_stem.setdefault(st, []).append(idx)
+    pairs = q_bigrams if q_bigrams is not None else tuple((q_stems[i], q_stems[i + 1]) for i in range(len(q_stems) - 1))
+    if pos_by_stem is None:
+        pos_lists: dict[str, list[int]] = {}
+        for idx, st in enumerate(doc_stems):
+            pos_lists.setdefault(st, []).append(idx)
+        pos_lookup: Mapping[str, Sequence[int]] = pos_lists
+    else:
+        pos_lookup = pos_by_stem
     hits = 0
-    total = len(q_stems) - 1
-    for i in range(total):
-        left_positions = pos_by_stem.get(q_stems[i])
-        right_positions = pos_by_stem.get(q_stems[i + 1])
+    total = len(pairs)
+    for left_s, right_s in pairs:
+        left_positions = pos_lookup.get(left_s)
+        right_positions = pos_lookup.get(right_s)
         if not left_positions or not right_positions:
             continue
         if any(0 < (rp - lp) <= max_gap for lp in left_positions for rp in right_positions):
@@ -536,12 +671,47 @@ def _ordered_bigram_proximity(q_stems: Sequence[str], doc_stems: Sequence[str], 
     return hits / total
 
 
-def _min_span_density(q_stem_set: set[str], doc_stems: Sequence[str]) -> float:
+def _min_span_density(
+    q_stem_set: set[str],
+    doc_stems: Sequence[str],
+    *,
+    pos_by_stem: Mapping[str, Sequence[int]] | None = None,
+) -> float:
     if len(q_stem_set) < 2 or not doc_stems:
         return 0.0
+    if pos_by_stem is not None:
+        matched_lists = [pos_by_stem[st] for st in q_stem_set if st in pos_by_stem and pos_by_stem[st]]
+        k = len(matched_lists)
+        if k < 2:
+            return 0.0
+        if all(len(p) == 1 for p in matched_lists):
+            lo = min(p[0] for p in matched_lists)
+            hi = max(p[0] for p in matched_lists)
+            best_span = hi - lo + 1
+            return _clamp01((k - 1) / max(k - 1, best_span - 1))
+        if k == 2:
+            a, b = matched_lists[0], matched_lists[1]
+            ia = ib = 0
+            na, nb = len(a), len(b)
+            best_diff = len(doc_stems) + 1
+            while ia < na and ib < nb:
+                va, vb = a[ia], b[ib]
+                diff = abs(va - vb)
+                if diff < best_diff:
+                    best_diff = diff
+                    if best_diff <= 1:
+                        break
+                if va < vb:
+                    ia += 1
+                else:
+                    ib += 1
+            best_span = best_diff + 1
+            return _clamp01(1.0 / max(1, best_span - 1))
     matched_positions: list[tuple[int, str]] = [
         (idx, st) for idx, st in enumerate(doc_stems) if st in q_stem_set
     ]
+    if len(matched_positions) < 2:
+        return 0.0
     distinct_matched = {st for _, st in matched_positions}
     k = len(distinct_matched)
     if k < 2:
@@ -588,6 +758,7 @@ class InteractionCrossEncoder:
 
         q_tok_set = set(q_toks)
         q_stem_set = set(q_stems)
+        q_bigrams = tuple((q_stems[i], q_stems[i + 1]) for i in range(len(q_stems) - 1)) if len(q_stems) >= 2 else ()
         q_id_toks = tuple(m.casefold() for m in _IDENTIFIER_TOKEN_RE.findall(query or ""))
         q_compound_ids = frozenset(
             t for t in q_id_toks if ("_" in t or "-" in t or ":" in t or "." in t or any(ch.isdigit() for ch in t))
@@ -596,15 +767,32 @@ class InteractionCrossEncoder:
         denom = max(1, len(q_stem_set))
 
         scores: list[float] = []
-        for content in contents:
-            claim_toks, claim_stems, ev_toks, ev_stems, doc_trigrams = _extract_doc_features(content)
-            claim_tok_set = set(claim_toks)
-            claim_stem_set = set(claim_stems)
-            all_tok_set = claim_tok_set | set(ev_toks)
-            all_stem_set = claim_stem_set | set(ev_stems)
+        with _DOC_INTERACTION_LOCK:
+            batch_feats = [
+                c[1:] if (c := _DOC_INTERACTION_CACHE.get(hash(doc))) is not None and c[0] == doc else None
+                for doc in contents
+            ]
+        for content, pre_feat in zip(contents, batch_feats):
+            (
+                claim_toks,
+                claim_stems,
+                ev_toks,
+                ev_stems,
+                doc_trigrams,
+                claim_tok_set,
+                claim_stem_set,
+                all_tok_set,
+                all_stem_set,
+                _compact_text,
+                ev_stem_set,
+                claim_pos_by_stem,
+                ev_pos_by_stem,
+                content_low,
+            ) = pre_feat if pre_feat is not None else _extract_doc_features(content)
 
             exact_claim = len(q_tok_set & claim_tok_set) / max(1, len(q_tok_set))
-            stem_claim = len(q_stem_set & claim_stem_set) / denom
+            claim_stem_overlap_n = len(q_stem_set & claim_stem_set)
+            stem_claim = claim_stem_overlap_n / denom
             claim_cov = 0.55 * exact_claim + 0.45 * stem_claim
 
             exact_all = len(q_tok_set & all_tok_set) / max(1, len(q_tok_set))
@@ -612,12 +800,56 @@ class InteractionCrossEncoder:
             full_cov = 0.50 * exact_all + 0.50 * stem_all
 
             if len(q_stems) >= 2:
-                bg_claim = _ordered_bigram_proximity(q_stems, claim_stems)
-                bg_ev = _ordered_bigram_proximity(q_stems, ev_stems)
-                bigram_score = max(bg_claim, 0.70 * bg_ev)
-                sp_claim = _min_span_density(q_stem_set, claim_stems)
-                sp_ev = _min_span_density(q_stem_set, ev_stems)
-                span_score = max(sp_claim, 0.70 * sp_ev)
+                if q_stem_set.isdisjoint(all_stem_set):
+                    bigram_score = 0.0
+                    span_score = 0.0
+                else:
+                    claim_has_overlap = claim_stem_overlap_n > 0
+                    bg_claim = (
+                        _ordered_bigram_proximity(
+                            q_stems,
+                            claim_stems,
+                            q_bigrams=q_bigrams,
+                            pos_by_stem=claim_pos_by_stem,
+                        )
+                        if claim_has_overlap
+                        else 0.0
+                    )
+                    sp_claim = (
+                        _min_span_density(
+                            q_stem_set,
+                            claim_stems,
+                            pos_by_stem=claim_pos_by_stem,
+                        )
+                        if claim_stem_overlap_n >= 2
+                        else 0.0
+                    )
+                    if claim_stems == ev_stems:
+                        bigram_score = bg_claim
+                        span_score = sp_claim
+                    else:
+                        ev_stem_overlap_n = len(q_stem_set & ev_stem_set) if ev_stem_set else 0
+                        bg_ev = (
+                            _ordered_bigram_proximity(
+                                q_stems,
+                                ev_stems,
+                                q_bigrams=q_bigrams,
+                                pos_by_stem=ev_pos_by_stem,
+                            )
+                            if (ev_stem_overlap_n > 0 and bg_claim < 0.70)
+                            else 0.0
+                        )
+                        bigram_score = max(bg_claim, 0.70 * bg_ev)
+                        sp_ev = (
+                            _min_span_density(
+                                q_stem_set,
+                                ev_stems,
+                                pos_by_stem=ev_pos_by_stem,
+                            )
+                            if (ev_stem_overlap_n >= 2 and sp_claim < 0.70)
+                            else 0.0
+                        )
+                        span_score = max(sp_claim, 0.70 * sp_ev)
             else:
                 bigram_score = claim_cov
                 span_score = claim_cov
@@ -636,10 +868,9 @@ class InteractionCrossEncoder:
                 + 0.10 * trigram_dice
             )
             if q_compound_ids:
-                content_low = (content or "").casefold()
                 matched_ids = sum(1 for cid in q_compound_ids if cid in content_low)
                 raw_score = 0.80 * raw_score + 0.20 * (matched_ids / len(q_compound_ids))
-            scores.append(_clamp01(raw_score))
+            scores.append(0.0 if raw_score <= 0.0 else (1.0 if raw_score >= 1.0 else raw_score))
         return scores
 
 
@@ -647,13 +878,7 @@ _DEFAULT_INTERACTION_ENCODER = InteractionCrossEncoder()
 
 
 def _compact_onnx_doc_text(doc: str) -> str:
-    parsed = split_frontmatter(doc or "")
-    body = "\n".join(parsed[1]) if parsed else (doc or "")
-    claim = section_text(body, "Claim")
-    ev = section_text(body, "Evidence")
-    if claim or ev:
-        return f"{claim[:360]}\n{ev[:280]}".strip()
-    return body[:640]
+    return _extract_doc_features(doc or "")[9]
 
 
 def score_query_atom_pairs(
@@ -683,12 +908,14 @@ def rerank_recall_results(
     onnx_dir: str | Path | None = None,
     allow_onnx: bool = True,
 ) -> list[Any]:
-    """Rerank trusted ``RecallResult`` candidates with a fast two-stage Cross-Encoder cascade.
+    """Rerank trusted ``RecallResult`` candidates with a truthful two-stage Cross-Encoder cascade.
 
-    Stage 1 (`InteractionCrossEncoder`, <0.1 ms) scores all candidates. When `allow_onnx` is enabled
-    and an ONNX Cross-Encoder is verified locally, Stage 2 runs neural sequence classification over
-    ambiguous top contenders (when `len >= 2` and top-1 Stage-1 margin < 0.24), keeping 300-atom P95
-    strictly below the 15 ms Tier-0 SLO while adjudicating close semantic ties with neural precision.
+    Stage 1 (`InteractionCrossEncoder`, <0.1 ms) scores all candidates to shortlist up to 12 top
+    contenders. When `allow_onnx` is enabled and a local ONNX Cross-Encoder is verified, Stage 2
+    runs neural sequence classification (`onnx_enc.score_pairs`) over the shortlisted candidates on
+    every query. Only candidates genuinely scored by ONNX receive ``rerank:onnx_cross_encoder`` and
+    0.20/0.80 neural blending; any candidate not scored by ONNX receives ``rerank:cross_encoder``
+    and 0.82/0.18 heuristic blending.
     """
     items = list(results)
     if not items:
@@ -696,50 +923,60 @@ def rerank_recall_results(
     contents = [str(getattr(it, "content", "") or "") for it in items]
     stage1_scores = _DEFAULT_INTERACTION_ENCODER.score_pairs(query, contents)
     ce_scores = list(stage1_scores)
-    backend = _DEFAULT_INTERACTION_ENCODER.backend_name
+    onnx_scored_idxs: set[int] = set()
 
     onnx_enc = get_onnx_cross_encoder(onnx_dir) if allow_onnx else None
     if onnx_enc is not None:
-        backend = onnx_enc.backend_name
-        if len(items) >= 2:
-            ranked_idx = sorted(range(len(items)), key=lambda idx: stage1_scores[idx], reverse=True)
-            top_s1 = stage1_scores[ranked_idx[0]]
-            runner_up_s1 = stage1_scores[ranked_idx[1]]
-            if (top_s1 - runner_up_s1) < 0.03 and top_s1 < 0.65:
-                contender_idxs = ranked_idx[:2]
-                if len(contender_idxs) >= 2:
-                    try:
-                        onnx_sub = onnx_enc.score_pairs(
-                            query,
-                            [_compact_onnx_doc_text(contents[idx]) for idx in contender_idxs],
-                        )
-                        for idx, o_score in zip(contender_idxs, onnx_sub):
-                            ce_scores[idx] = o_score
-                    except Exception:
-                        backend = _DEFAULT_INTERACTION_ENCODER.backend_name
-    reranked: list[Any] = []
-    for item, ce in zip(items, ce_scores):
+        shortlist_cap = min(len(items), max((int(top_k) if top_k is not None else 5) + 3, 8), 12)
+        ranked_idx = sorted(range(len(items)), key=lambda idx: stage1_scores[idx], reverse=True)
+        contender_idxs = ranked_idx[:shortlist_cap]
+        if contender_idxs:
+            try:
+                onnx_sub = onnx_enc.score_pairs(
+                    query,
+                    [_compact_onnx_doc_text(contents[idx]) for idx in contender_idxs],
+                )
+                if len(onnx_sub) == len(contender_idxs):
+                    for idx, o_score in zip(contender_idxs, onnx_sub):
+                        ce_scores[idx] = o_score
+                        onnx_scored_idxs.add(idx)
+            except Exception:
+                onnx_scored_idxs.clear()
+
+    has_any_onnx = bool(onnx_scored_idxs)
+    scored_rows: list[tuple[int, float, str, int, str, float]] = []
+    for idx, (item, ce) in enumerate(zip(items, ce_scores)):
+        used_onnx = idx in onnx_scored_idxs
+        item_backend = (
+            str(getattr(onnx_enc, "backend_name", None) or "onnx_cross_encoder")
+            if (used_onnx and onnx_enc is not None)
+            else _DEFAULT_INTERACTION_ENCODER.backend_name
+        )
         base_score = float(getattr(item, "score", 0.0) or 0.0)
         if mode == "rrf":
-            rrf_w = 0.020 if backend == "onnx_cross_encoder" else 0.010
+            rrf_w = 0.020 if used_onnx else 0.010
             blended = round(base_score + rrf_w * ce, 6)
-        elif backend == "onnx_cross_encoder":
+        elif used_onnx:
             blended = round(_clamp01(0.20 * base_score + 0.80 * ce), 6)
         else:
             blended = round(_clamp01(0.82 * base_score + 0.18 * ce), 6)
+        tier = 1 if (used_onnx or not has_any_onnx) else 0
+        scored_rows.append((tier, blended, str(getattr(item, "filename", "")), idx, item_backend, ce))
+
+    scored_rows.sort(key=lambda row: (-row[0], -row[1], row[2], row[3]))
+    if top_k is not None:
+        scored_rows = scored_rows[: max(1, int(top_k))]
+    reranked: list[Any] = []
+    for _tier, blended, _fn, idx, item_backend, ce in scored_rows:
+        item = items[idx]
         prev_reasons = tuple(
             r for r in getattr(item, "match_reasons", ()) if not str(r).startswith("rerank:")
         )
-        reason_tag = f"rerank:{backend}:{ce:.3f}"
         reranked.append(
             replace(
                 item,
                 score=blended,
-                match_reasons=prev_reasons + (reason_tag,),
+                match_reasons=prev_reasons + (f"rerank:{item_backend}:{ce:.3f}",),
             )
         )
-    reranked.sort(key=lambda r: (float(getattr(r, "score", 0.0)), str(getattr(r, "filename", ""))), reverse=False)
-    reranked.sort(key=lambda r: float(getattr(r, "score", 0.0)), reverse=True)
-    if top_k is not None:
-        return reranked[: max(1, int(top_k))]
     return reranked

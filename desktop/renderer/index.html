@@ -112,9 +112,13 @@
             <option value="stream">Stream (Instant cards + SSE)</option>
             <option value="verified">Verified (Claim-ID grounded)</option>
             <option value="instant">Instant (&lt;20ms retrieval only)</option>
+            <option value="debate">Debate (Thesis vs Antithesis brief)</option>
           </select>
           <button class="btn primary" id="chatSendBtn" type="button">Ask</button>
           <button class="btn danger" id="chatStopBtn" type="button" disabled>Stop</button>
+          <button class="btn sm" id="chatVoiceTurnBtn" type="button" title="Push-to-talk spoken turn (Whisper STT + Kokoro TTS)">Mic</button>
+          <button class="btn sm" id="chatReadAloudBtn" type="button" title="Speak latest answer with offline Kokoro-82M TTS">Speak</button>
+          <button class="btn sm danger" id="chatStopVoiceBtn" type="button" title="Stop spoken playback" disabled>Mute</button>
           <button class="btn" id="chatWarmupBtn" type="button">Warmup</button>
           <button class="btn" id="chatExportMdBtn" type="button">Export Markdown</button>
           <button class="btn" id="chatClearHistoryBtn" type="button">Clear History</button>
@@ -157,9 +161,39 @@
           <button class="btn sm primary" id="chatNewThreadBtn" type="button">+ New Thread</button>
           <button class="btn sm good" id="chatPinTurnBtn" type="button">Pin Answer to Note</button>
           <button class="btn sm danger" id="chatDeleteThreadBtn" type="button">Delete Thread</button>
+          <div class="work-mode-toggle" style="margin-left:auto; display:inline-flex; gap:6px; align-items:center;">
+            <button class="btn sm primary" id="workModeChatBtn" type="button">Chat Mode</button>
+            <button class="btn sm" id="workModeBuildBtn" type="button">Build Mode (45/55)</button>
+            <select id="behaviorModeSelect" aria-label="Execution Posture">
+              <option value="autopilot">Autopilot</option>
+              <option value="interview">Interview First</option>
+            </select>
+            <button class="btn sm" id="toggleBuildRulesBtn" type="button">Project Rules &amp; DoD</button>
+          </div>
+        </div>
+        <div class="toolbar" style="gap:6px; flex-wrap:wrap;">
+          <span class="field-label">Persona:</span>
+          <button class="btn sm primary" id="personaChipGrounded" data-persona-id="grounded_default" type="button">Grounded Default</button>
+          <button class="btn sm" id="personaChipCoding" data-persona-id="coding" type="button">Coding</button>
+          <button class="btn sm" id="personaChipWebsite" data-persona-id="website_builder" type="button">Website Builder</button>
+          <button class="btn sm" id="personaChipApp" data-persona-id="app_builder" type="button">App Builder</button>
+          <button class="btn sm" id="personaChipGame" data-persona-id="game_builder" type="button">Game Builder</button>
+        </div>
+        <div class="card" id="buildRulesDrawer" style="display:none; padding:10px 12px; gap:8px;">
+          <div class="toolbar" style="gap:10px; align-items:stretch;">
+            <div class="field-col" style="flex:1; min-width:220px;">
+              <span class="field-label">Per-Chat Project Rules (stored in thread)</span>
+              <textarea id="chatCustomRulesInput" rows="2" placeholder="e.g., Use semantic HTML + CSS Grid, zero external CDNs, cite [V#] for vault architecture rules."></textarea>
+            </div>
+            <div class="field-col" style="flex:1; min-width:200px;">
+              <span class="field-label">Definition of Done Criteria</span>
+              <textarea id="chatDoneCriteriaInput" rows="2" placeholder="e.g., Responsive at 375px and 1280px, keyboard shortcuts work, passes static security checks."></textarea>
+            </div>
+            <button class="btn sm good" id="saveThreadRulesBtn" type="button" style="align-self:flex-end;">Save Rules</button>
+          </div>
         </div>
         <div class="status-banner" id="chatBanner">Multi-turn grounded chat: sub-20ms retrieval cards appear immediately before LLM tokens stream. Click any [V#]/[N#]/[P#]/[L#] badge to jump to its source card.</div>
-        <div class="chat-layout">
+        <div class="chat-layout" id="chatLayoutGrid">
           <div class="pane">
             <div class="chat-main-scroll" id="chatMainScroll">
               <div class="status-banner banner-warn" id="chatWarningBar" style="display:none;"></div>
@@ -170,9 +204,32 @@
               <div id="chatGroundingBar" style="display:none;"></div>
             </div>
           </div>
-          <div class="pane">
-            <div id="chatSourcesHeader" style="padding:10px 12px; border-bottom:1px solid var(--border); font-weight:600; font-size:12px;">Retrieved Sources (Click to Inspect)</div>
-            <div class="scroll-list" id="chatSources"></div>
+          <div class="pane" id="chatRightPane">
+            <div class="toolbar" style="padding:8px 10px; border-bottom:1px solid var(--border); gap:6px;">
+              <button class="btn sm primary" id="buildPaneTabsSourcesBtn" type="button">Sources</button>
+              <button class="btn sm" id="buildPaneTabsPreviewBtn" type="button">Live Preview</button>
+              <button class="btn sm" id="buildPaneTabsFilesBtn" type="button">Files</button>
+              <button class="btn sm" id="buildPaneTabsCritiqueBtn" type="button">5-Panel Critique</button>
+              <button class="btn sm good" id="buildExportFolderBtn" type="button" style="margin-left:auto;">Export Folder</button>
+            </div>
+            <div id="chatSourcesPane" style="display:flex; flex-direction:column; flex:1; min-height:0;">
+              <div id="chatSourcesHeader" style="padding:8px 12px; border-bottom:1px solid var(--border); font-weight:600; font-size:12px;">Retrieved Sources (Click to Inspect)</div>
+              <div class="scroll-list" id="chatSources"></div>
+            </div>
+            <div id="buildCanvasPane" style="display:none; flex-direction:column; flex:1; min-height:0;">
+              <div id="buildPreviewEmptyNote" class="note-item-meta" style="padding:6px 12px; border-bottom:1px solid var(--border);">Sandboxed preview (sandbox="allow-scripts", no allow-same-origin, offline connect-src 'none')</div>
+              <iframe id="buildPreviewFrame" sandbox="allow-scripts" title="Build Canvas Sandboxed Preview" style="flex:1; width:100%; border:0; background:#0f172a; min-height:240px;"></iframe>
+              <div id="buildFilesView" style="display:none; flex-direction:column; flex:1; min-height:0; padding:10px; gap:8px;">
+                <select id="buildFilesSelect" aria-label="Build Artifact File"></select>
+                <pre id="buildFileContentPre" class="scroll-list" style="flex:1; margin:0; padding:10px; font-family:var(--mono); font-size:12px; background:#090d13; border:1px solid var(--border); border-radius:6px; overflow:auto;"></pre>
+              </div>
+              <div id="buildCritiqueView" style="display:none; flex-direction:column; flex:1; min-height:0; padding:10px; gap:8px;">
+                <div class="toolbar">
+                  <button class="btn sm primary" id="buildCritiqueRunBtn" type="button">Run 5-Panel Design Critique</button>
+                </div>
+                <div class="scroll-list" id="buildCritiqueOutput"></div>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -306,9 +363,9 @@
             <select id="creativeBackendSelect" aria-label="Creative Media Backend">
               <option value="auto">auto (Local GPU or Procedural)</option>
               <option value="builtin_procedural_local">builtin_procedural_local (Offline CPU/GPU)</option>
-              <option value="sd_webui_local">sd_webui_local (127.0.0.1:7860)</option>
+              <option value="sd_webui_local">sd_webui_local (Image Only · 127.0.0.1:7860)</option>
               <option value="comfyui_local">comfyui_local (127.0.0.1:8188)</option>
-              <option value="diffusers_local">diffusers_local (Offline Cache)</option>
+              <option value="diffusers_local">diffusers_local (Image Only · Offline Cache)</option>
             </select>
             <input type="text" id="creativeScopeInput" placeholder="project_scope (optional)" style="width:155px;" />
             <label class="inline-check"><input type="checkbox" id="creativeGroundVaultCheck" checked /> Ground in Verified Vault</label>
@@ -362,6 +419,38 @@
         <div class="status-banner" id="ideBanner">One-click connect merges trusted-stdio MCP credentials (and Antigravity plugin rules/skills where supported) while backing up your existing host config.</div>
         <div class="cards-grid" id="ideGrid"></div>
 
+        <div class="card" id="ideCustomMcpCard" style="margin-top:12px;">
+          <strong>Add Custom MCP Host Connector</strong>
+          <div class="note-item-meta">Register any extra IDE or agent CLI (JSON, JSONC, TOML, or YAML config) beyond the 14 built-in host connectors.</div>
+          <div class="form-grid" style="margin-top:8px;">
+            <div class="field-col">
+              <span class="field-label">Host ID * (a-z, 0-9, -, _)</span>
+              <input type="text" id="customMcpHostIdInput" placeholder="e.g. my-agent-cli" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Display Label</span>
+              <input type="text" id="customMcpLabelInput" placeholder="e.g. My Agent CLI" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Config File Path *</span>
+              <input type="text" id="customMcpPathInput" placeholder="~/.myagent/mcp.json" />
+            </div>
+            <div class="field-col">
+              <span class="field-label">Servers Key &amp; Format</span>
+              <div class="toolbar" style="margin:0; gap:4px;">
+                <input type="text" id="customMcpKeyInput" value="mcpServers" placeholder="mcpServers" style="flex:1;" />
+                <select id="customMcpFormatSelect" style="width:95px;">
+                  <option value="json">json</option>
+                  <option value="jsonc">jsonc</option>
+                  <option value="toml">toml</option>
+                  <option value="yaml">yaml</option>
+                </select>
+                <button class="btn sm primary" id="addCustomMcpHostBtn" type="button">Register MCP Host</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div class="card" id="ideGitDistillerCard" style="margin-top:12px;">
           <div class="toolbar">
             <strong>Git Post-Commit Hook &amp; Coding Session Memory Distiller</strong>
@@ -403,6 +492,16 @@
           <div class="kpi-grid" id="systemHealthKpis"></div>
         </div>
 
+        <div class="card" id="systemUpdaterCard">
+          <div class="toolbar">
+            <strong>Desktop App Updates (Signed Differential Feed)</strong>
+            <button class="btn sm" id="updaterCheckBtn" type="button" style="margin-left:auto;">Check for Updates</button>
+            <button class="btn sm primary" id="updaterDownloadBtn" type="button" disabled>Download Update</button>
+            <button class="btn sm good" id="updaterInstallBtn" type="button" disabled>Restart &amp; Install</button>
+          </div>
+          <div class="status-banner" id="updaterStatusBanner">Manual local-first update checks only (autoDownload disabled).</div>
+        </div>
+
         <div class="card" id="systemHardwareCard">
           <strong>Hardware Tier &amp; Local Ollama Models</strong>
           <div class="status-banner">Loading hardware profile...</div>
@@ -424,6 +523,42 @@
           <strong>Host Sharing &amp; Outbound Redaction Policies</strong>
           <div class="note-item-meta">Control which local or remote model hosts are enabled, allowed project scopes, PII redaction, and preference sharing.</div>
           <div id="systemHostsWrap"></div>
+          <details style="margin-top:10px;">
+            <summary><strong>+ Add Custom AI Model Host Profile</strong></summary>
+            <div class="form-grid" style="margin-top:8px;">
+              <div class="field-col">
+                <span class="field-label">Host ID * (`a-z0-9_-`, 3-48 chars)</span>
+                <input type="text" id="customModelHostIdInput" placeholder="e.g. lm_studio_local" />
+              </div>
+              <div class="field-col">
+                <span class="field-label">Provider &amp; Transport</span>
+                <div class="toolbar" style="margin:0; gap:4px;">
+                  <select id="customModelProviderSelect" style="flex:1;">
+                    <option value="openai_compatible">openai_compatible</option>
+                    <option value="ollama">ollama</option>
+                    <option value="anthropic">anthropic</option>
+                    <option value="gemini">gemini</option>
+                  </select>
+                  <select id="customModelTransportSelect" style="width:100px;">
+                    <option value="local">local</option>
+                    <option value="online">online</option>
+                  </select>
+                </div>
+              </div>
+              <div class="field-col">
+                <span class="field-label">Endpoint URL *</span>
+                <input type="text" id="customModelEndpointInput" placeholder="http://127.0.0.1:1234/v1" />
+              </div>
+              <div class="field-col">
+                <span class="field-label">Default Model &amp; API Key Env</span>
+                <div class="toolbar" style="margin:0; gap:4px;">
+                  <input type="text" id="customModelNameInput" placeholder="qwen2.5-coder:7b" style="flex:1;" />
+                  <input type="text" id="customModelApiKeyEnvInput" placeholder="API_KEY_ENV" style="width:130px;" />
+                  <button class="btn sm primary" id="addCustomModelHostBtn" type="button">Add Host</button>
+                </div>
+              </div>
+            </div>
+          </details>
         </div>
 
         <div class="card">
@@ -499,12 +634,15 @@
             <div class="toolbar">
               <strong>Zero-Knowledge Mobile Inbox Drop (Static PWA &amp; iOS Shortcut)</strong>
               <button class="btn sm" id="inboxDropRefreshBtn" type="button" style="margin-left:auto;">Refresh Pairings</button>
+              <button class="btn sm" id="inboxDropExportRecallBtn" type="button">Export Recall Index (SBMR1)</button>
+              <button class="btn sm warn" id="inboxDropRotateRecallBtn" type="button">Rotate Recall Key</button>
               <button class="btn sm good" id="inboxDropPullBtn" type="button">Pull Mobile Drops Now</button>
             </div>
-            <div class="note-item-meta">Forward-secret ECDH P-256 + HKDF-SHA256 + AES-256-GCM (SBID1) + revocable per-device HMAC-SHA256. Mobile devices hold only the public P-256 key and drop ciphertext into inbox-drops/*.enc -> quarantined 0-raw/inbox/.</div>
+            <div class="note-item-meta">Forward-secret ECDH P-256 + HKDF-SHA256 + AES-256-GCM (SBID1) + revocable per-device HMAC-SHA256, plus optional E2EE Recall &amp; Review index (SBMR1). Mobile devices hold only public P-256 (and optional read-only SBMR1 recall key) -> quarantined 0-raw/inbox/.</div>
             <div class="toolbar" style="margin-top:6px;">
-              <input type="text" id="inboxDropDeviceLabelInput" value="Mobile Quick-Capture" placeholder="Device label (e.g. iPhone Safari PWA)" style="width:210px;" />
-              <input type="text" id="inboxDropPwaUrlInput" placeholder="Static PWA base URL (optional, e.g. https://pages.example/inbox-drop/)" style="flex:1; min-width:200px;" />
+              <input type="text" id="inboxDropDeviceLabelInput" value="Mobile Quick-Capture" placeholder="Device label (e.g. iPhone Safari PWA)" style="width:200px;" />
+              <input type="text" id="inboxDropPwaUrlInput" placeholder="Static PWA base URL (optional, e.g. https://pages.example/inbox-drop/)" style="flex:1; min-width:190px;" />
+              <label class="inline-check"><input type="checkbox" id="inboxDropIncludeRecallCheck" checked /> Include Recall &amp; Review Key (SBMR1)</label>
               <label class="inline-check"><input type="checkbox" id="inboxDropIncludeS3Check" /> Include S3 Write Keys in #pair</label>
               <button class="btn sm primary" id="inboxDropPairBtn" type="button">Pair Mobile Device</button>
             </div>
@@ -570,7 +708,7 @@
           <div class="form-grid" style="margin-top:8px;">
             <div class="field-col">
               <span class="field-label">Browser Extension Origin *</span>
-              <input type="text" id="clipperOriginInput" placeholder="chrome-extension://<32-char-id> or moz-extension://<uuid>" />
+              <input type="text" id="clipperOriginInput" placeholder="chrome-extension://<id>, moz-extension://<uuid>, or safari-web-extension://<uuid>" />
             </div>
             <div class="field-col">
               <span class="field-label">Browser Label</span>
@@ -820,6 +958,10 @@
             </div>
           </div>
           <div class="field-col" style="margin-top:6px;">
+            <span class="field-label">Optional Runtime Input Schema JSON (e.g. {"service":{"type":"string","required":true}})</span>
+            <textarea id="skillInputSchemaJsonInput" rows="2" placeholder='{"service":{"type":"string","required":true}}'></textarea>
+          </div>
+          <div class="field-col" style="margin-top:6px;">
             <span class="field-label">Sandboxed Step Actions JSON * (1:1 with Playbook steps: vault_recall | vault_audit | workspace_write | workspace_assert | sandbox_python)</span>
             <textarea id="skillActionsJsonInput" rows="3" placeholder='[{"action_type":"vault_audit","audit_kind":"sources","output_file":"audit.json"}]'></textarea>
           </div>
@@ -832,6 +974,87 @@
           <div class="status-banner" id="executableSkillsOutput">Select an active Playbook above to promote or execute a Stage 4 Executable Skill in the sandbox.</div>
           <div class="cards-grid" id="executableSkillsGrid" style="margin-top:8px;"></div>
           <div id="skillExecutionsWrap" class="sub-panel" style="margin-top:8px;">No sandboxed skill executions recorded yet.</div>
+        </div>
+
+        <!-- GEN-4 COGNITION WORKBENCH -->
+        <div class="card" id="gen4CognitionCard" style="margin-top:12px;">
+          <div class="toolbar">
+            <strong>Gen-4 Cognition Workbench — Fractal Zoom, Living Concepts, Principles &amp; Mental Models, Impact Simulator &amp; Curiosity</strong>
+            <button class="btn sm" id="gen4RefreshAllBtn" type="button" style="margin-left:auto;">Refresh Gen-4</button>
+          </div>
+          <div class="note-item-meta">Owner-verified Gen-4 cognitive memory projections: L0–L5 fractal narrowing, Living Concepts, CAS-promoted cross-project Principles &amp; Mental Models, downstream Impact Simulation, and Self-Model curiosity gaps.</div>
+
+          <!-- 1. Fractal Zoom (L0-L5) -->
+          <div class="sub-panel" style="margin-top:10px;">
+            <div class="toolbar">
+              <strong>1. Fractal Zoom (L0–L5)</strong>
+              <input type="text" id="gen4ZoomQueryInput" placeholder="Query across L0 Vault -> L5 Byte Quote..." style="flex:1; min-width:180px;" />
+              <select id="gen4ZoomLevelSelect" aria-label="Fractal Zoom Level">
+                <option value="L0">L0 (Vault)</option>
+                <option value="L1">L1 (Domain)</option>
+                <option value="L2">L2 (Project)</option>
+                <option value="L3">L3 (Concept)</option>
+                <option value="L4">L4 (Atom)</option>
+                <option value="L5" selected>L5 (Raw Byte Quote)</option>
+              </select>
+              <input type="text" id="gen4ZoomProjectInput" placeholder="project:scope (optional)" style="width:165px;" />
+              <button class="btn sm primary" id="gen4ZoomRunBtn" type="button">Zoom Recall</button>
+            </div>
+            <div id="gen4ZoomOutput" style="margin-top:6px;">Enter a query and choose L0–L5 to drill from high-level domains down to byte-anchored quotes.</div>
+          </div>
+
+          <!-- 2. Living Concepts Browser -->
+          <div class="sub-panel" style="margin-top:10px;">
+            <div class="toolbar">
+              <strong>2. Living Concepts Browser</strong>
+              <input type="text" id="gen4ConceptsProjectInput" placeholder="project:scope (optional)" style="width:175px; margin-left:auto;" />
+              <button class="btn sm" id="gen4ConceptsRefreshBtn" type="button">Load Concepts</button>
+            </div>
+            <div class="cards-grid" id="gen4ConceptsList" style="margin-top:6px;"></div>
+            <div id="gen4ConceptDetail" class="sub-panel" style="display:none; margin-top:8px;"></div>
+          </div>
+
+          <!-- 3. Principles & Mental Models Owner CAS Promoter -->
+          <div class="sub-panel" style="margin-top:10px;">
+            <div class="toolbar">
+              <strong>3. Principles &amp; Mental Models (Owner CAS Promoter)</strong>
+              <input type="text" id="gen4DistillActorInput" value="desktop_owner" placeholder="Owner actor" style="width:130px; margin-left:auto;" />
+              <input type="text" id="gen4DistillReasonInput" placeholder="Promotion / deprecation rationale..." style="width:210px;" />
+              <button class="btn sm" id="gen4DistillRunBtn" type="button">Distill Candidates</button>
+              <button class="btn sm" id="gen4DistillRefreshBtn" type="button">Refresh</button>
+            </div>
+            <div class="status-banner" id="gen4DistillOutput" style="margin-top:6px;">Principles (7-principles/) and Mental Models (8-mental-models/) require owner CAS promotion before becoming active.</div>
+            <div class="field-label" style="margin-top:6px;">Principles (7-principles/)</div>
+            <div class="cards-grid" id="gen4PrinciplesList" style="margin-top:4px;"></div>
+            <div class="field-label" style="margin-top:8px;">Mental Models (8-mental-models/)</div>
+            <div class="cards-grid" id="gen4MentalModelsList" style="margin-top:4px;"></div>
+          </div>
+
+          <!-- 4. World-Model Impact Simulator -->
+          <div class="sub-panel" style="margin-top:10px;">
+            <div class="toolbar">
+              <strong>4. World-Model Impact Simulator</strong>
+              <input type="text" id="gen4SimTargetInput" placeholder="Target concept or module (e.g. sqlite, auth)..." style="flex:1; min-width:180px;" />
+              <select id="gen4SimHopsSelect" aria-label="Simulation Max Hops">
+                <option value="1">1 hop</option>
+                <option value="2">2 hops</option>
+                <option value="3" selected>3 hops</option>
+                <option value="4">4 hops</option>
+              </select>
+              <input type="text" id="gen4SimProjectInput" placeholder="project:scope (optional)" style="width:165px;" />
+              <button class="btn sm primary" id="gen4SimRunBtn" type="button">Simulate Impact</button>
+            </div>
+            <div id="gen4SimOutput" style="margin-top:6px;">Simulate downstream blast radius across verified vault edges, code AST dependencies, and historical failure records.</div>
+          </div>
+
+          <!-- 5. Self-Model & Curiosity Gaps -->
+          <div class="sub-panel" style="margin-top:10px;">
+            <div class="toolbar">
+              <strong>5. Self-Model &amp; Directed Curiosity Gaps</strong>
+              <button class="btn sm" id="gen4CuriosityRefreshBtn" type="button" style="margin-left:auto;">Refresh Self-Model &amp; Gaps</button>
+            </div>
+            <div id="gen4CuriosityOutput" style="margin-top:6px;">Click Refresh Self-Model &amp; Gaps to inspect domain competence scores and coverage deficits.</div>
+          </div>
         </div>
       </section>
 
@@ -966,6 +1189,17 @@
           <button class="btn good sm" id="graphAutoLinkBtn" type="button">Auto-Link Graph</button>
           <button class="btn primary" id="refreshGraphBtn" type="button">Reload Graph</button>
         </div>
+        <div class="toolbar" style="margin-top:4px;">
+          <span class="field-label">Bi-Temporal Scrubber:</span>
+          <input type="date" id="graphAsOfInput" aria-label="As-Of Date" style="width:148px;" />
+          <input type="range" id="graphTimelineSlider" min="0" max="0" value="0" aria-label="Bi-Temporal Timeline Slider" style="width:180px;" />
+          <button class="btn sm" id="graphClearAsOfBtn" type="button">Live (Now)</button>
+          <label class="inline-check">
+            <input type="checkbox" id="graphIncludeExpiredCheck" checked />
+            Include Expired / Future
+          </label>
+          <span class="badge" id="graphTemporalMeta">Live (Now)</span>
+        </div>
         <div class="status-banner" id="graphBanner">Interactive 2D Knowledge Graph — drag to pan, scroll to zoom, and click any node to inspect its neighborhood and provenance.</div>
         <div class="graph-layout">
           <div class="pane">
@@ -1034,6 +1268,7 @@
   <script src="playbook_units.js"></script>
   <script src="pagination.js"></script>
   <script src="chat_state.js"></script>
+  <script src="build_canvas.js"></script>
   <script src="graph.js"></script>
   <script src="modal_helpers.js"></script>
   <script src="app.js"></script>

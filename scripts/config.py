@@ -14,8 +14,13 @@ import json
 from pathlib import Path
 import stat
 import sys
+from typing import Any
 
 # ─── Root Paths ──────────────────────────────────────────────────────────────
+if __name__ in ("config", "scripts.config"):
+    sys.modules.setdefault("config", sys.modules[__name__])
+    sys.modules.setdefault("scripts.config", sys.modules[__name__])
+
 SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR     = os.path.dirname(SCRIPTS_DIR)
 
@@ -38,6 +43,27 @@ def _is_reparse_or_link(path: str) -> bool:
     if os.name == "nt" and (getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
         return True
     return False
+
+
+_DARWIN_SYSTEM_SYMLINKS: dict[str, str] = {
+    "/var": "private/var",
+    "/tmp": "private/tmp",
+    "/etc": "private/etc",
+}
+
+
+def _is_immutable_darwin_root_symlink(path: Path | str) -> bool:
+    """Return True only for macOS SIP-protected root compatibility symlinks (/var, /tmp, /etc)."""
+    if sys.platform != "darwin":
+        return False
+    raw = str(path)
+    expected = _DARWIN_SYSTEM_SYMLINKS.get(raw)
+    if not expected:
+        return False
+    try:
+        return os.readlink(raw).lstrip("/") == expected
+    except OSError:
+        return False
 
 
 def _default_installed_vault() -> str | None:
@@ -156,15 +182,21 @@ def vault_paths_for(brain_dir: str | None = None) -> dict[str, str]:
         "experiences_dir": os.path.join(b, "4-experiences"),
         "playbooks_dir": os.path.join(b, "5-playbooks"),
         "skills_dir": os.path.join(b, "6-skills"),
+        "principles_dir": os.path.join(b, "7-principles"),
+        "mental_models_dir": os.path.join(b, "8-mental-models"),
         "sources_dir": os.path.join(b, "sources"),
         "briefings_dir": os.path.join(b, "briefings"),
         "notes_dir": os.path.join(b, "notes"),
         "note_snapshots_dir": os.path.join(raw_dir, "note-snapshots"),
+        "reading_list": os.path.join(raw_dir, "reading-list.md"),
+        "house_rules": os.path.join(b, "house-rules.md"),
         "chroma_path": os.path.join(b, ".chroma"),
         "sidecar_dir": sidecar_dir,
         "lexical_index_path": os.path.join(sidecar_dir, "lexical.sqlite3"),
         "notes_index_path": os.path.join(sidecar_dir, "notes.sqlite3"),
         "telemetry_db_path": os.path.join(sidecar_dir, "telemetry.sqlite3"),
+        "archive_manifest": os.path.join(raw_dir, "archive", "manifest.jsonl"),
+        "distillation_decisions": os.path.join(raw_dir, "archive", "distillation-decisions.jsonl"),
     }
 
 
@@ -179,6 +211,8 @@ THREADS_DIR  = os.path.join(BRAIN_DIR, "3-threads")
 EXPERIENCES_DIR = os.path.join(BRAIN_DIR, "4-experiences")
 PLAYBOOKS_DIR = os.path.join(BRAIN_DIR, "5-playbooks")
 SKILLS_DIR   = os.path.join(BRAIN_DIR, "6-skills")
+PRINCIPLES_DIR = os.path.join(BRAIN_DIR, "7-principles")
+MENTAL_MODELS_DIR = os.path.join(BRAIN_DIR, "8-mental-models")
 SOURCES_DIR  = os.path.join(BRAIN_DIR, "sources")
 BRIEFINGS_DIR= os.path.join(BRAIN_DIR, "briefings")
 # Owner knowledge base: zero-friction, immediately searchable, never treated as verified claims.
@@ -195,11 +229,195 @@ LEXICAL_INDEX_PATH = os.path.join(SIDECAR_DIR, "lexical.sqlite3")
 NOTES_INDEX_PATH   = os.path.join(SIDECAR_DIR, "notes.sqlite3")
 TELEMETRY_DB_PATH  = os.path.join(SIDECAR_DIR, "telemetry.sqlite3")
 ARCHIVE_MANIFEST = os.path.join(RAW_DIR, "archive", "manifest.jsonl")
+DISTILLATION_DECISIONS = os.path.join(RAW_DIR, "archive", "distillation-decisions.jsonl")
+
+_ATTR_TO_VAULT_KEY: dict[str, str] = {
+    "BRAIN_DIR": "brain_dir",
+    "RAW_DIR": "raw_dir",
+    "INBOX_DIR": "inbox_dir",
+    "DESK_DIR": "desk_dir",
+    "ATOMS_DIR": "atoms_dir",
+    "THREADS_DIR": "threads_dir",
+    "EXPERIENCES_DIR": "experiences_dir",
+    "PLAYBOOKS_DIR": "playbooks_dir",
+    "SKILLS_DIR": "skills_dir",
+    "PRINCIPLES_DIR": "principles_dir",
+    "MENTAL_MODELS_DIR": "mental_models_dir",
+    "SOURCES_DIR": "sources_dir",
+    "BRIEFINGS_DIR": "briefings_dir",
+    "NOTES_DIR": "notes_dir",
+    "NOTE_SNAPSHOTS_DIR": "note_snapshots_dir",
+    "READING_LIST": "reading_list",
+    "HOUSE_RULES": "house_rules",
+    "CHROMA_PATH": "chroma_path",
+    "SIDECAR_DIR": "sidecar_dir",
+    "LEXICAL_INDEX_PATH": "lexical_index_path",
+    "NOTES_INDEX_PATH": "notes_index_path",
+    "TELEMETRY_DB_PATH": "telemetry_db_path",
+    "ARCHIVE_MANIFEST": "archive_manifest",
+    "DISTILLATION_DECISIONS": "distillation_decisions",
+}
+
+_IMPORT_BRAIN_DIR = BRAIN_DIR
+_IMPORT_CONFIG_DEFAULTS: dict[str, str] = {
+    attr: str(globals()[attr]) for attr in _ATTR_TO_VAULT_KEY
+}
+
+
+def snapshot_module_defaults(mod_globals: dict[str, Any]) -> dict[str, str]:
+    """Capture a module's initial config path imports so `patch.object` overrides are honored."""
+    return {
+        attr: str(mod_globals[attr])
+        for attr in _ATTR_TO_VAULT_KEY
+        if attr in mod_globals and mod_globals[attr] is not None
+    }
+
+
+def resolve_module_vault_path(
+    mod_globals: dict[str, Any] | None,
+    attr_name: str,
+    explicit: str | os.PathLike[str] | None = None,
+    *,
+    brain_dir: str | os.PathLike[str] | None = None,
+) -> str:
+    """Resolve a vault path dynamically at call time, preserving `patch.object` overrides."""
+    if explicit is not None and str(explicit).strip():
+        return os.path.abspath(str(explicit))
+
+    clean_key = _ATTR_TO_VAULT_KEY[attr_name]
+    if brain_dir is not None and str(brain_dir).strip():
+        b_abs = os.path.abspath(str(brain_dir))
+        if clean_key == "brain_dir":
+            return b_abs
+        return os.path.abspath(vault_paths_for(b_abs)[clean_key])
+
+    mg = mod_globals or {}
+    mod_defaults = mg.get("_MOD_PATH_DEFAULTS")
+    if not isinstance(mod_defaults, dict):
+        mod_defaults = _IMPORT_CONFIG_DEFAULTS
+
+    if attr_name != "BRAIN_DIR" and attr_name in mg and attr_name in mod_defaults:
+        cur_attr = mg[attr_name]
+        if cur_attr is not None and str(cur_attr) != str(mod_defaults[attr_name]):
+            return os.path.abspath(str(cur_attr))
+
+    if "BRAIN_DIR" in mg and "BRAIN_DIR" in mod_defaults:
+        cur_mod_brain = mg["BRAIN_DIR"]
+        if cur_mod_brain is not None and str(cur_mod_brain) != str(mod_defaults["BRAIN_DIR"]):
+            b_abs = os.path.abspath(str(cur_mod_brain))
+            return b_abs if clean_key == "brain_dir" else os.path.abspath(vault_paths_for(b_abs)[clean_key])
+
+    cfg_globals = globals()
+    if attr_name != "BRAIN_DIR" and attr_name in cfg_globals:
+        cur_cfg_attr = cfg_globals[attr_name]
+        if cur_cfg_attr is not None and str(cur_cfg_attr) != str(_IMPORT_CONFIG_DEFAULTS[attr_name]):
+            return os.path.abspath(str(cur_cfg_attr))
+
+    if str(BRAIN_DIR) != str(_IMPORT_BRAIN_DIR):
+        b_abs = os.path.abspath(str(BRAIN_DIR))
+        return b_abs if clean_key == "brain_dir" else os.path.abspath(vault_paths_for(b_abs)[clean_key])
+
+    return os.path.abspath(vault_paths_for()[clean_key])
+
+
+def get_active_brain_dir() -> str:
+    return resolve_module_vault_path(None, "BRAIN_DIR")
+
+
+def get_active_raw_dir(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "RAW_DIR", brain_dir=brain_dir)
+
+
+def get_active_inbox_dir(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "INBOX_DIR", brain_dir=brain_dir)
+
+
+def get_active_atoms_dir(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "ATOMS_DIR", brain_dir=brain_dir)
+
+
+def get_active_experiences_dir(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "EXPERIENCES_DIR", brain_dir=brain_dir)
+
+
+def get_active_playbooks_dir(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "PLAYBOOKS_DIR", brain_dir=brain_dir)
+
+
+def get_active_sources_dir(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "SOURCES_DIR", brain_dir=brain_dir)
+
+
+def get_active_briefings_dir(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "BRIEFINGS_DIR", brain_dir=brain_dir)
+
+
+def get_active_threads_dir(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "THREADS_DIR", brain_dir=brain_dir)
+
+
+def get_active_chroma_path(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "CHROMA_PATH", brain_dir=brain_dir)
+
+
+def get_active_lexical_index_path(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "LEXICAL_INDEX_PATH", brain_dir=brain_dir)
+
+
+def get_active_telemetry_db_path(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "TELEMETRY_DB_PATH", brain_dir=brain_dir)
+
+
+def get_active_archive_manifest(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "ARCHIVE_MANIFEST", brain_dir=brain_dir)
+
+
+def get_active_reading_list(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "READING_LIST", brain_dir=brain_dir)
+
+
+def get_active_house_rules(brain_dir: str | os.PathLike[str] | None = None) -> str:
+    return resolve_module_vault_path(None, "HOUSE_RULES", brain_dir=brain_dir)
+
+
+def resolve_module_atoms_and_brain(
+    mod_globals: dict[str, Any] | None,
+    *,
+    atoms_dir: str | os.PathLike[str] | None = None,
+    brain_dir: str | os.PathLike[str] | None = None,
+) -> tuple[str, str]:
+    """Resolve ``(brain_dir, atoms_dir)`` dynamically with sibling derivation and `patch.object` support."""
+    b_set = brain_dir is not None and bool(str(brain_dir).strip())
+    a_set = atoms_dir is not None and bool(str(atoms_dir).strip())
+    if b_set and a_set:
+        return os.path.abspath(str(brain_dir)), os.path.abspath(str(atoms_dir))
+    if a_set:
+        resolved_atoms = os.path.abspath(str(atoms_dir))
+        return os.path.dirname(resolved_atoms), resolved_atoms
+    if b_set:
+        resolved_brain = os.path.abspath(str(brain_dir))
+        return resolved_brain, os.path.abspath(vault_paths_for(resolved_brain)["atoms_dir"])
+    mg = mod_globals or {}
+    mod_defaults = mg.get("_MOD_PATH_DEFAULTS")
+    if not isinstance(mod_defaults, dict):
+        mod_defaults = _IMPORT_CONFIG_DEFAULTS
+    cur_atoms = mg.get("ATOMS_DIR")
+    atoms_overridden = cur_atoms is not None and str(cur_atoms) != str(mod_defaults.get("ATOMS_DIR") or _IMPORT_CONFIG_DEFAULTS["ATOMS_DIR"])
+    cur_brain = mg.get("BRAIN_DIR")
+    brain_overridden = cur_brain is not None and str(cur_brain) != str(mod_defaults.get("BRAIN_DIR") or _IMPORT_CONFIG_DEFAULTS["BRAIN_DIR"])
+    if atoms_overridden and not brain_overridden:
+        resolved_atoms = os.path.abspath(str(cur_atoms))
+        return os.path.dirname(resolved_atoms), resolved_atoms
+    return (
+        resolve_module_vault_path(mod_globals, "BRAIN_DIR"),
+        resolve_module_vault_path(mod_globals, "ATOMS_DIR"),
+    )
+
 
 # ─── Archive ─────────────────────────────────────────────────────────────────
 def archive_dir():
     """Returns the current month's archive directory, creating it if needed."""
-    path = os.path.join(RAW_DIR, "archive", datetime.datetime.now().strftime("%Y-%m"))
+    path = os.path.join(get_active_raw_dir(), "archive", datetime.datetime.now().strftime("%Y-%m"))
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -211,6 +429,8 @@ WHISPER_SIZE = os.environ.get("BRAIN_WHISPER_SIZE","base")   # tiny/base/small/m
 
 # ─── Supported File Types ────────────────────────────────────────────────────
 AUDIO_EXTS   = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
+VIDEO_EXTS   = {".mp4", ".mov", ".mkv", ".webm"}
+VIDEO_ONLY_EXTS = {".mp4", ".mov", ".mkv"}
 IMAGE_EXTS   = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 TEXT_EXTS    = {".md", ".txt"}
 # Deterministic, model-free local document extractors (scripts/doc_extractors.py).
@@ -220,35 +440,32 @@ VAULT_README = "README.md"
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def ensure_dirs(brain_dir: str | None = None):
     """Create all vault directories if they don't exist."""
-    if brain_dir is not None:
-        vp = vault_paths_for(brain_dir)
-        for d in (
-            vp["raw_dir"],
-            vp["inbox_dir"],
-            vp["desk_dir"],
-            vp["atoms_dir"],
-            vp["threads_dir"],
-            vp["experiences_dir"],
-            vp["playbooks_dir"],
-            vp["skills_dir"],
-            vp["sources_dir"],
-            vp["briefings_dir"],
-            vp["notes_dir"],
-            vp["note_snapshots_dir"],
-            vp["chroma_path"],
-            vp["sidecar_dir"],
-            os.path.join(vp["raw_dir"], "archive"),
-        ):
-            os.makedirs(d, exist_ok=True)
-        return
-    for d in [RAW_DIR, INBOX_DIR, DESK_DIR, ATOMS_DIR, THREADS_DIR, EXPERIENCES_DIR, PLAYBOOKS_DIR, SKILLS_DIR, SOURCES_DIR, BRIEFINGS_DIR, NOTES_DIR, NOTE_SNAPSHOTS_DIR, CHROMA_PATH, SIDECAR_DIR]:
+    resolved_brain = brain_dir if brain_dir is not None else get_active_brain_dir()
+    vp = vault_paths_for(resolved_brain)
+    for d in (
+        vp["raw_dir"],
+        vp["inbox_dir"],
+        vp["desk_dir"],
+        vp["atoms_dir"],
+        vp["threads_dir"],
+        vp["experiences_dir"],
+        vp["playbooks_dir"],
+        vp["skills_dir"],
+        vp["sources_dir"],
+        vp["briefings_dir"],
+        vp["notes_dir"],
+        vp["note_snapshots_dir"],
+        vp["chroma_path"],
+        vp["sidecar_dir"],
+        os.path.join(vp["raw_dir"], "archive"),
+    ):
         os.makedirs(d, exist_ok=True)
-    os.makedirs(os.path.dirname(ARCHIVE_MANIFEST), exist_ok=True)
+
 
 def vault_relative_path(path: str, brain_dir: str | None = None) -> str:
     """Return a brain-relative path when possible, otherwise an absolute path."""
     absolute = os.path.abspath(path)
-    brain = os.path.abspath(brain_dir if brain_dir is not None else BRAIN_DIR)
+    brain = os.path.abspath(brain_dir if brain_dir is not None else get_active_brain_dir())
     try:
         if os.path.normcase(os.path.commonpath([brain, absolute])) == os.path.normcase(brain):
             return os.path.relpath(absolute, brain).replace("\\", "/")
@@ -292,9 +509,10 @@ def file_sha256(path: str) -> str | None:
         return None
     return digest.hexdigest()
 
-def append_archive_manifest_entry(entry: dict, manifest_path: str = ARCHIVE_MANIFEST):
+def append_archive_manifest_entry(entry: dict, manifest_path: str | None = None):
     """Append one JSONL archive manifest entry safely with O_APPEND + fsync."""
-    abs_manifest = os.path.abspath(manifest_path)
+    resolved_manifest = manifest_path if manifest_path is not None else get_active_archive_manifest()
+    abs_manifest = os.path.abspath(resolved_manifest)
     parent_dir = os.path.dirname(abs_manifest)
     os.makedirs(parent_dir, exist_ok=True)
     if _is_reparse_or_link(parent_dir) or (os.path.lexists(abs_manifest) and _is_reparse_or_link(abs_manifest)):
@@ -393,6 +611,8 @@ def safe_vault_reference(
     relative_path: str,
     allowed_exts: set[str] | None = None,
     must_exist: bool = True,
+    *,
+    brain_dir: str | None = None,
 ) -> str | None:
     """Resolve a relative vault reference under brain/."""
     rel_path = str(relative_path or "").strip()
@@ -400,14 +620,15 @@ def safe_vault_reference(
         allowed = {ext.lower() for ext in allowed_exts}
         if os.path.splitext(rel_path)[1].lower() not in allowed:
             return None
-    return resolve_under(BRAIN_DIR, rel_path, must_exist=must_exist)
+    base_brain = os.path.abspath(brain_dir) if (brain_dir is not None and str(brain_dir).strip()) else get_active_brain_dir()
+    return resolve_under(base_brain, rel_path, must_exist=must_exist)
 
 def is_content_markdown(filename: str) -> bool:
     """Return True for vault content notes, excluding directory documentation."""
     return filename.endswith(".md") and filename != VAULT_README
 
 def read_house_rules() -> str:
-    with open(HOUSE_RULES, "r", encoding="utf-8") as f:
+    with open(get_active_house_rules(), "r", encoding="utf-8") as f:
         return f.read()
 
 def today() -> str:

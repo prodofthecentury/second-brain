@@ -16,7 +16,8 @@ concurrency:
 jobs:
   build-and-test:
     name: ${{ matrix.os }} (Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
+    # Fork/PR builds always execute on GitHub-hosted runners; optional SB_*_RUNNER overrides apply only to trusted push/dispatch runs.
+    runs-on: ${{ (github.event_name != 'pull_request' && ((matrix.os == 'windows-latest' && vars.SB_WINDOWS_RUNNER) || (matrix.os == 'macos-latest' && vars.SB_MACOS_RUNNER) || (matrix.os == 'ubuntu-latest' && vars.SB_LINUX_RUNNER))) || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +33,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux headless GUI & Electron dependencies
         if: runner.os == 'Linux'
@@ -55,7 +56,7 @@ jobs:
             libcairo2
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
 
@@ -65,81 +66,83 @@ jobs:
           uv sync --locked --python ${{ matrix.python-version }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
       - name: Generate multi-platform icons
         run: uv run --frozen python scripts/make_icons.py
 
-      - name: Verify POSIX shell scripts use LF line endings
+      - name: Verify POSIX shell scripts & plugin templates use LF line endings
         shell: bash
         run: |
           uv run --frozen python -c '
           from pathlib import Path
           import sys
-          bad = [str(p) for p in [Path("setup.sh"), Path("run_daemon.sh"), Path("run_dashboard.sh"), Path("run_night_shift.sh"), Path("scripts/package_desktop.sh")] if p.exists() and b"\r" in p.read_bytes()]
+          targets = [
+              Path("setup.sh"),
+              Path("run_daemon.sh"),
+              Path("run_dashboard.sh"),
+              Path("run_night_shift.sh"),
+              Path("scripts/package_desktop.sh"),
+              *sorted(p for p in Path("plugins").rglob("*") if p.is_file()),
+          ]
+          bad = [str(p) for p in targets if p.exists() and b"\r" in p.read_bytes()]
           if bad:
-              print("CRLF detected in POSIX shell scripts:", bad, file=sys.stderr)
+              print("CRLF detected in LF-required files:", bad, file=sys.stderr)
               sys.exit(1)
           '
 
-      - name: Run Python unit, contract & dashboard AppTest suites
-        run: >
-          uv run --frozen python scripts/test_all.py --fail-fast
-          --only evaluation_dataset audit_sources system_safety_tests
-          phase2_safety_tests phase3_cognitive_tests phase4_product_tests
-          phase5_god_features_tests goal2_completion_tests
-          goal3_backend_contract_tests goal4_sync_and_ui_tests
-          goal5_clipper_and_workspaces_tests v040_sota_upgrades_tests
-          v050_sota_complete_tests v100_final_completion_tests
-          creative_media_tests stage4_executable_skills_tests
-          mobile_vault_client_tests
-          dashboard_apptest_tests chroma_rebuild_canary
-          archive_manifest_canary smoke_test
+      - name: Initialize isolated CI vault & run all Python unit, contract, doctor, scale & AppTest suites
+        shell: bash
+        env:
+          BRAIN_CI_CODE_ONLY: "1"
+        run: |
+          export BRAIN_VAULT_DIR="${RUNNER_TEMP}/sb-ci-vault"
+          uv run --frozen second-brain install
+          # --exclude skips only the separately-orchestrated GUI/VSIX/wheel steps below so all suites
+          # (including doctor, goal4_sync_and_ui_tests, bugfix_1a_regression_tests, parity_1c_tests,
+          # phase6_release_and_stores_tests, and scale_benchmark_1500) run automatically.
+          uv run --frozen python scripts/test_all.py --fail-fast \
+            --exclude desktop_ui_tests vscode_extension_tests wheel_packaging_tests
 
       - name: Build wheel & run isolated clean-wheel venv tests
         run: |
           uv build --out-dir dist
           uv run --frozen python -m unittest scripts.wheel_packaging_tests -v
 
-      - name: Build VS Code VSIX, Browser Web Clipper MV3 & Mobile PWA
+      - name: Build offline wheelhouse, VS Code VSIX, Browser Web Clipper MV3 & Mobile PWA
         run: |
+          uv run --frozen python scripts/build_wheelhouse.py --out-dir dist/wheelhouse --strict-lock-downloads
           uv run --frozen python scripts/build_vsix.py --out-dir dist
           uv run --frozen python scripts/build_clipper.py --out-dir dist
           uv run --frozen python scripts/build_distribution_manifests.py --pwa-only --out-dir dist
 
-      - name: Run VS Code extension tests
+      - name: Run VS Code extension tests (zero-dependency Node test runner)
         if: ${{ !matrix.skip_gui_pack }}
-        working-directory: extensions/vscode-second-brain
         shell: bash
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install --no-package-lock
+          if [ -f extensions/vscode-second-brain/package-lock.json ]; then
+            (cd extensions/vscode-second-brain && npm ci --ignore-scripts)
           fi
-          if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.test ? 0 : 1)'; then
-            if [ "${RUNNER_OS}" = "Linux" ]; then
-              xvfb-run -a npm test
-            else
-              npm test
-            fi
-          fi
+          uv run --frozen python scripts/run_vscode_tests.py
 
-      - name: Run Electron desktop tests & unpacked directory build
+      - name: Run Electron desktop tests, unpacked directory build & packaged --smoke-test
         if: ${{ !matrix.skip_gui_pack }}
-        working-directory: desktop
         shell: bash
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
-          npm ci
-          if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.test ? 0 : 1)'; then
-            if [ "${RUNNER_OS}" = "Linux" ]; then
-              xvfb-run -a npm test
-            else
-              npm test
+          (
+            cd desktop
+            npm ci
+            if node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.test ? 0 : 1)'; then
+              if [ "${RUNNER_OS}" = "Linux" ]; then
+                xvfb-run -a npm test
+              else
+                npm test
+              fi
             fi
-          fi
-          npx electron-builder --dir --publish never
+            npx electron-builder --dir --publish never
+          )
+          uv run --frozen python scripts/run_desktop_tests.py --require-packaged --skip-unit

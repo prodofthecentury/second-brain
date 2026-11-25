@@ -38,7 +38,7 @@ import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import _is_reparse_or_link, security_state_dir  # noqa: E402
+from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, security_state_dir  # noqa: E402
 from cross_encoder import (  # noqa: E402
     MAX_ONNX_MODEL_BYTES,
     OnnxCrossEncoder,
@@ -61,7 +61,8 @@ class OnnxModelSecurityError(OnnxModelError):
 
 
 ONNX_MANIFEST_FILENAME = "onnx-manifest.json"
-VALID_SLOTS = ("cross-encoder", "nli")
+CORE_SLOTS = ("cross-encoder", "nli")
+VALID_SLOTS = ("cross-encoder", "nli", "kokoro-tts")
 MAX_REDIRECT_HOPS = 5
 _MODELS_MUTATION_LOCK = threading.Lock()
 
@@ -177,13 +178,49 @@ PINNED_ONNX_CATALOG: dict[tuple[str, str], PinnedModelSpec] = {
             ),
         ),
     ),
+    ("kokoro-tts", "default"): PinnedModelSpec(
+        slot="kokoro-tts",
+        preset="default",
+        model_id="onnx-community/Kokoro-82M-v1.0-ONNX@int8",
+        repo_id="onnx-community/Kokoro-82M-v1.0-ONNX",
+        commit_sha="1939ad2a8e416c0acfeecc08a694d14ef25f2231",
+        description="Quantized Kokoro-82M v1.0 ONNX offline 24kHz CPU TTS (~92.9 MB total)",
+        artifacts=(
+            PinnedModelArtifact(
+                local_filename="config.json",
+                remote_rel_path="config.json",
+                size_bytes=44,
+                sha256="df34b4f930b23447cd4dc410fabfb42eb3f24e803e6c3f97d618fb359380a36f",
+            ),
+            PinnedModelArtifact(
+                local_filename="tokenizer.json",
+                remote_rel_path="tokenizer.json",
+                size_bytes=3_497,
+                sha256="77a02c8e164413299b4b4c403b14f8e0e1c1b727db4d46a09d6327b861060a34",
+            ),
+            PinnedModelArtifact(
+                local_filename="model.onnx",
+                remote_rel_path="onnx/model_quantized.onnx",
+                size_bytes=92_361_116,
+                sha256="fbae9257e1e05ffc727e951ef9b9c98418e6d79f1c9b6b13bd59f5c9028a1478",
+            ),
+            PinnedModelArtifact(
+                local_filename="af_heart.bin",
+                remote_rel_path="voices/af_heart.bin",
+                size_bytes=522_240,
+                sha256="d583ccff3cdca2f7fae535cb998ac07e9fcb90f09737b9a41fa2734ec44a8f0b",
+            ),
+        ),
+    ),
 }
 
 
 def resolve_pinned_spec(slot: str, preset: str = "default") -> PinnedModelSpec:
     clean_slot = (slot or "").strip().lower()
+    if clean_slot == "kokoro":
+        clean_slot = "kokoro-tts"
     if clean_slot not in VALID_SLOTS:
-        raise OnnxModelError(f"Unsupported ONNX model slot: {slot!r} (expected 'cross-encoder' or 'nli').")
+        raise OnnxModelError(f"Unsupported ONNX model slot: {slot!r} (expected one of {VALID_SLOTS}).")
     clean_preset = (preset or "default").strip().lower()
     if clean_slot == "nli" and clean_preset in {"deberta", "sota"}:
         clean_preset = "default"
@@ -205,9 +242,10 @@ def _models_root(state_dir: str | Path | None = None) -> Path:
 def _assert_no_symlink_ancestors(path: Path) -> None:
     for candidate in (path, *path.parents):
         if os.path.lexists(str(candidate)) and _is_reparse_or_link(str(candidate)):
-            raise OnnxModelSecurityError(
-                f"Refusing to access ONNX model directory via symlink or reparse point: {candidate}"
-            )
+            if not _is_immutable_darwin_root_symlink(candidate):
+                raise OnnxModelSecurityError(
+                    f"Refusing to access ONNX model directory via symlink or reparse point: {candidate}"
+                )
 
 
 def _is_allowed_hf_hostname(hostname: str) -> bool:
@@ -355,6 +393,10 @@ def _download_verified_artifact(
 
 
 def _smoke_test_staged_model(slot: str, staged_dir: Path) -> dict[str, Any]:
+    if slot == "kokoro-tts":
+        from tts_engine import smoke_test_kokoro_slot
+
+        return smoke_test_kokoro_slot(staged_dir)
     enc = OnnxCrossEncoder(staged_dir, max_length=256 if slot == "cross-encoder" else 384)
     try:
         if slot == "cross-encoder":
@@ -413,6 +455,8 @@ def verify_slot_installation(
     run_inference: bool = False,
 ) -> dict[str, Any]:
     clean_slot = (slot or "").strip().lower()
+    if clean_slot == "kokoro":
+        clean_slot = "kokoro-tts"
     if clean_slot not in VALID_SLOTS:
         raise OnnxModelError(f"Invalid ONNX slot: {slot!r}")
     target_slot_dir = (
@@ -420,12 +464,17 @@ def verify_slot_installation(
         if slot_dir is not None
         else (_models_root(state_dir) / clean_slot)
     )
+    default_backend = (
+        "kokoro_unavailable"
+        if clean_slot == "kokoro-tts"
+        else ("interaction_cross_encoder" if clean_slot == "cross-encoder" else "predicate_fast_nli")
+    )
     if not os.path.lexists(str(target_slot_dir)):
         return {
             "slot": clean_slot,
             "installed": False,
             "verified": False,
-            "active_backend": "interaction_cross_encoder" if clean_slot == "cross-encoder" else "predicate_fast_nli",
+            "active_backend": default_backend,
             "directory": str(target_slot_dir),
             "issues": [],
         }
@@ -464,7 +513,8 @@ def verify_slot_installation(
     file_hashes: dict[str, str] = {}
     file_sizes: dict[str, int] = {}
 
-    for req_name in ("model.onnx", "tokenizer.json"):
+    req_files = ("model.onnx", "tokenizer.json", "af_heart.bin") if clean_slot == "kokoro-tts" else ("model.onnx", "tokenizer.json")
+    for req_name in req_files:
         fp = slot_dir / req_name
         if not os.path.lexists(str(fp)) or _is_reparse_or_link(str(fp)):
             issues.append(f"Missing or symlinked required file: {req_name}")
@@ -512,7 +562,12 @@ def verify_slot_installation(
             if not isinstance(rec_arts, dict) or not rec_arts:
                 issues.append(f"Unrecognized preset {preset!r} and missing artifact digests in {ONNX_MANIFEST_FILENAME}")
             else:
-                for req_name in ("model.onnx", "tokenizer.json"):
+                req_manifest_files = (
+                    ("model.onnx", "tokenizer.json", "af_heart.bin")
+                    if clean_slot == "kokoro-tts"
+                    else ("model.onnx", "tokenizer.json")
+                )
+                for req_name in req_manifest_files:
                     entry = rec_arts.get(req_name)
                     exp_sha = str(entry.get("sha256") or "") if isinstance(entry, dict) else ""
                     got_sha = file_hashes.get(req_name, "")
@@ -544,7 +599,14 @@ def verify_slot_installation(
         except Exception as exc:
             issues.append(f"Runtime inference check failed: {exc}")
 
-    verified = len(issues) == 0 and "model.onnx" in file_hashes and "tokenizer.json" in file_hashes
+    has_required_extras = True if clean_slot != "kokoro-tts" else ("af_heart.bin" in file_hashes)
+    verified = len(issues) == 0 and "model.onnx" in file_hashes and "tokenizer.json" in file_hashes and has_required_extras
+    if clean_slot == "kokoro-tts":
+        active_backend = "kokoro_onnx_tts" if verified else "kokoro_unavailable"
+    elif clean_slot == "cross-encoder":
+        active_backend = "onnx_cross_encoder" if verified else "interaction_cross_encoder"
+    else:
+        active_backend = "onnx_nli" if verified else "predicate_fast_nli"
     return {
         "slot": clean_slot,
         "installed": True,
@@ -554,11 +616,7 @@ def verify_slot_installation(
         "preset": preset if manifest else None,
         "commit_sha": manifest.get("commit_sha"),
         "installed_at": manifest.get("installed_at"),
-        "active_backend": (
-            ("onnx_cross_encoder" if clean_slot == "cross-encoder" else "onnx_nli")
-            if verified
-            else ("interaction_cross_encoder" if clean_slot == "cross-encoder" else "predicate_fast_nli")
-        ),
+        "active_backend": active_backend,
         "directory": str(slot_dir),
         "sha256": file_hashes,
         "smoke": smoke_info,
@@ -573,6 +631,7 @@ def get_onnx_models_status(
 ) -> dict[str, Any]:
     cross = verify_slot_installation("cross-encoder", state_dir=state_dir, run_inference=run_inference)
     nli = verify_slot_installation("nli", state_dir=state_dir, run_inference=run_inference)
+    kokoro = verify_slot_installation("kokoro-tts", state_dir=state_dir, run_inference=run_inference)
     ort_ready = False
     ort_version: str | None = None
     try:
@@ -588,13 +647,16 @@ def get_onnx_models_status(
         "onnx_runtime_ready": ort_ready,
         "onnx_runtime_version": ort_version,
         "all_verified": bool(cross["verified"] and nli["verified"]),
+        "voice_verified": bool(kokoro["verified"]),
         "slots": {
             "cross-encoder": cross,
             "nli": nli,
+            "kokoro-tts": kokoro,
         },
         "available_presets": {
             "cross-encoder": ["default"],
             "nli": ["default", "compact"],
+            "kokoro-tts": ["default"],
         },
     }
 
@@ -611,12 +673,14 @@ def pull_onnx_models(
 ) -> dict[str, Any]:
     """Download, SHA-256 verify, smoke-test, and atomically activate local ONNX models."""
     clean_target = (target or "all").strip().lower()
+    if clean_target == "kokoro":
+        clean_target = "kokoro-tts"
     if clean_target == "all":
-        slots_to_pull = list(VALID_SLOTS)
+        slots_to_pull = list(CORE_SLOTS)
     elif clean_target in VALID_SLOTS:
         slots_to_pull = [clean_target]
     else:
-        raise OnnxModelError(f"Unsupported target {target!r}; expected 'all', 'cross-encoder', or 'nli'.")
+        raise OnnxModelError(f"Unsupported target {target!r}; expected 'all', 'cross-encoder', 'nli', or 'kokoro-tts'.")
 
     root = _models_root(state_dir)
     _assert_no_symlink_ancestors(root)
@@ -723,12 +787,14 @@ def remove_onnx_models(
     state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     clean_target = (target or "all").strip().lower()
+    if clean_target == "kokoro":
+        clean_target = "kokoro-tts"
     if clean_target == "all":
         slots_to_remove = list(VALID_SLOTS)
     elif clean_target in VALID_SLOTS:
         slots_to_remove = [clean_target]
     else:
-        raise OnnxModelError(f"Unsupported target {target!r}; expected 'all', 'cross-encoder', or 'nli'.")
+        raise OnnxModelError(f"Unsupported target {target!r}; expected 'all', 'cross-encoder', 'nli', or 'kokoro-tts'.")
 
     root = _models_root(state_dir)
     _assert_no_symlink_ancestors(root)
@@ -767,7 +833,7 @@ def main(argv: list[str] | None = None) -> int:
     p_st.add_argument("--json", action="store_true")
 
     p_pull = sub.add_parser("pull", help="Download and SHA-256 verify local quantized ONNX weights")
-    p_pull.add_argument("target", nargs="?", default="all", choices=("all", "cross-encoder", "nli"))
+    p_pull.add_argument("target", nargs="?", default="all", choices=("all", "cross-encoder", "nli", "kokoro-tts", "kokoro"))
     p_pull.add_argument("--preset", default="default", choices=("default", "compact", "deberta", "mobilebert"))
     p_pull.add_argument("--force", action="store_true", help="Re-download even if already verified")
     p_pull.add_argument("--json", action="store_true")
@@ -776,7 +842,7 @@ def main(argv: list[str] | None = None) -> int:
     p_ver.add_argument("--json", action="store_true")
 
     p_rm = sub.add_parser("remove", help="Remove local ONNX weights (reverts to <1ms deterministic engines)")
-    p_rm.add_argument("target", nargs="?", default="all", choices=("all", "cross-encoder", "nli"))
+    p_rm.add_argument("target", nargs="?", default="all", choices=("all", "cross-encoder", "nli", "kokoro-tts", "kokoro"))
     p_rm.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)

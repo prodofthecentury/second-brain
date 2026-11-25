@@ -17,11 +17,19 @@ test("manifest.json enforces MV3 loopback-only host_permissions and CSP", () => 
   assert.ok(manifest.content_security_policy.extension_pages.includes("connect-src http://127.0.0.1:*"));
   assert.ok(manifest.browser_specific_settings && manifest.browser_specific_settings.gecko.id);
   assert.equal(manifest.background.service_worker, "background.js");
-  assert.deepEqual(manifest.background.scripts, [
-    "lib/clipper-client.js",
-    "lib/readability-markdown.js",
-    "background.js",
-  ]);
+  assert.equal(
+    manifest.background.scripts,
+    undefined,
+    "Unpacked MV3 manifest must omit background.scripts to prevent Chrome dual-field warnings"
+  );
+  for (const sz of ["16", "32", "48", "128"]) {
+    assert.ok(manifest.icons && manifest.icons[sz], `Missing icons.${sz}`);
+    assert.ok(
+      manifest.action && manifest.action.default_icon && manifest.action.default_icon[sz],
+      `Missing action.default_icon.${sz}`
+    );
+    assert.equal(fs.existsSync(path.join(EXT_DIR, manifest.icons[sz])), true);
+  }
 });
 
 test("zero innerHTML usage across all browser clipper JS files", () => {
@@ -157,6 +165,54 @@ test("redeemPairingCode validates SBC-* codes and exchanges 1-click pairing over
   }
 });
 
+test("redeemPairingCode parses SBC-XXXX-XXXX-XXXX-<PORT> and targets Desktop ephemeral port automatically", async () => {
+  const parsed = clipper.parsePairingCode("sbc-2345-6789-abcd-54321");
+  assert.equal(parsed.code, "SBC-2345-6789-ABCD-54321");
+  assert.equal(parsed.baseCode, "SBC-2345-6789-ABCD");
+  assert.equal(parsed.port, 54321);
+  assert.throws(() => clipper.parsePairingCode("SBC-2345-6789-ABCD-0"));
+  assert.throws(() => clipper.parsePairingCode("SBC-2345-6789-ABCD-70000"));
+
+  let received = null;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => {
+      body += c;
+    });
+    req.on("end", () => {
+      received = { method: req.method, url: req.url, body: JSON.parse(body || "{}") };
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          pairing_id: "clip_ephemeral",
+          token: "clipper_abcdefghijklmnopqrstuvwxyz123456",
+          origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+        })
+      );
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const ephemeralPort = server.address().port;
+    assert.notEqual(ephemeralPort, 8765);
+    // Caller passes default port 8765, but pairing code embeds the real ephemeral port!
+    const res = await clipper.redeemPairingCode({
+      port: 8765,
+      code: `SBC-2345-6789-ABCD-${ephemeralPort}`,
+      origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+      label: "Desktop Ephemeral Browser",
+    });
+    assert.equal(res.pairing_id, "clip_ephemeral");
+    assert.equal(res.port, ephemeralPort);
+    assert.equal(received.method, "POST");
+    assert.equal(received.url, "/v1/clipper/redeem");
+    assert.equal(received.body.code, `SBC-2345-6789-ABCD-${ephemeralPort}`);
+  } finally {
+    server.close();
+  }
+});
+
 test("extractReadableMarkdownFromDom strips nav chrome and preserves Markdown headings, code, lists, and tables", () => {
   function el(tag, attrs, children) {
     const node = {
@@ -226,4 +282,81 @@ test("extractReadableMarkdownFromDom strips nav chrome and preserves Markdown he
   assert.ok(extracted.pageText.includes("- Ed25519 head signatures"));
   assert.ok(extracted.pageText.includes("| Layer | Primitive |"));
   assert.ok(extracted.pageText.includes("| Transport | SigV4 HTTPS |"));
+});
+
+test("manifest.json declares keyboard commands and sendClipperMedia posts screenshot_png/pdf_document to 127.0.0.1", async () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(EXT_DIR, "manifest.json"), "utf8"));
+  assert.ok(manifest.commands && manifest.commands["clip-page"]);
+  assert.ok(manifest.commands["capture-screenshot"]);
+  assert.ok(manifest.commands["capture-pdf"]);
+
+  assert.throws(() =>
+    clipper.buildMediaPayload({
+      url: "https://example.com",
+      kind: "executable_bin",
+      contentBase64: "AAAA",
+    })
+  );
+
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => {
+      body += c;
+    });
+    req.on("end", () => {
+      const parsed = JSON.parse(body || "{}");
+      requests.push({ url: req.url, auth: req.headers.authorization, body: parsed });
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          status: "saved",
+          kind: parsed.kind,
+          location: "notes/",
+          filename: "captured-media.md",
+          media_archive_path: parsed.kind === "pdf_document" ? "0-raw/archive/doc.pdf" : "0-raw/archive/shot.png",
+          media_sha256: "b".repeat(64),
+          quarantined: false,
+        })
+      );
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = server.address().port;
+    const token = "clipper_abcdefghijklmnopqrstuvwxyz123456";
+    const shotRes = await clipper.sendClipperMedia({
+      port,
+      token,
+      media: {
+        url: "https://example.com/view",
+        title: "Visible Screen",
+        kind: "screenshot_png",
+        contentBase64: "data:image/png;base64,iVBORw0KGgo=",
+        tags: "visual, web",
+        destination: "note",
+      },
+    });
+    assert.equal(shotRes.kind, "screenshot_png");
+
+    const b64 = clipper.arrayBufferToBase64(Buffer.from("%PDF-1.4\n%%EOF\n", "utf8"));
+    const pdfRes = await clipper.sendClipperMedia({
+      port,
+      token,
+      media: {
+        url: "https://example.com/paper.pdf",
+        title: "Whitepaper",
+        kind: "pdf_document",
+        contentBase64: b64,
+        destination: "inbox",
+      },
+    });
+    assert.equal(pdfRes.kind, "pdf_document");
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].url, "/v1/clipper/capture-media");
+    assert.equal(requests[1].body.destination, "inbox");
+  } finally {
+    server.close();
+  }
 });

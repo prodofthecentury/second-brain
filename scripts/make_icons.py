@@ -4,6 +4,9 @@ Outputs:
   - desktop/assets/icon.ico (Windows multi-size: 16, 24, 32, 48, 64, 128, 256)
   - desktop/assets/icon.icns (macOS ICNS bundle via Pillow)
   - extensions/vscode-second-brain/media/icon.png (128x128 VS Code Marketplace icon)
+  - mobile/inbox-drop/icons/ (icon-192.png, icon-512.png, apple-touch-icon.png)
+  - mobile/vault-client/www/icons/ (icon-192.png, icon-512.png, apple-touch-icon.png)
+  - extensions/browser-clipper/icons/ (icon-16.png, icon-32.png, icon-48.png, icon-128.png)
 """
 
 from __future__ import annotations
@@ -20,6 +23,21 @@ DEFAULT_SOURCE_PNG = REPO_ROOT / "desktop" / "assets" / "icon.png"
 DEFAULT_WIN_ICO = REPO_ROOT / "desktop" / "assets" / "icon.ico"
 DEFAULT_MAC_ICNS = REPO_ROOT / "desktop" / "assets" / "icon.icns"
 DEFAULT_VSCODE_PNG = REPO_ROOT / "extensions" / "vscode-second-brain" / "media" / "icon.png"
+DEFAULT_INBOX_DROP_ICONS_DIR = REPO_ROOT / "mobile" / "inbox-drop" / "icons"
+DEFAULT_VAULT_CLIENT_ICONS_DIR = REPO_ROOT / "mobile" / "vault-client" / "www" / "icons"
+DEFAULT_CLIPPER_ICONS_DIR = REPO_ROOT / "extensions" / "browser-clipper" / "icons"
+
+PWA_ICON_SPECS: tuple[tuple[str, int], ...] = (
+    ("icon-192.png", 192),
+    ("icon-512.png", 512),
+    ("apple-touch-icon.png", 180),
+)
+CLIPPER_ICON_SPECS: tuple[tuple[str, int], ...] = (
+    ("icon-16.png", 16),
+    ("icon-32.png", 32),
+    ("icon-48.png", 48),
+    ("icon-128.png", 128),
+)
 
 ICO_SIZES: tuple[tuple[int, int], ...] = (
     (16, 16),
@@ -39,11 +57,28 @@ def _write_bytes_atomic(target: Path, data: bytes) -> None:
     tmp.replace(target)
 
 
+def _save_deterministic_png(rgba: Image.Image, size: int, target: Path) -> Path:
+    resized = rgba.resize((size, size), Image.Resampling.LANCZOS)
+    png_buf = io.BytesIO()
+    resized.save(
+        png_buf,
+        format="PNG",
+        pnginfo=PngImagePlugin.PngInfo(),
+        optimize=False,
+        compress_level=9,
+    )
+    _write_bytes_atomic(target, png_buf.getvalue())
+    return target
+
+
 def generate_icons(
     source_png: Path = DEFAULT_SOURCE_PNG,
     win_ico: Path = DEFAULT_WIN_ICO,
     mac_icns: Path = DEFAULT_MAC_ICNS,
     vscode_png: Path = DEFAULT_VSCODE_PNG,
+    inbox_drop_icons_dir: Path = DEFAULT_INBOX_DROP_ICONS_DIR,
+    vault_client_icons_dir: Path = DEFAULT_VAULT_CLIENT_ICONS_DIR,
+    clipper_icons_dir: Path = DEFAULT_CLIPPER_ICONS_DIR,
 ) -> dict[str, Path]:
     if not source_png.is_file():
         raise FileNotFoundError(f"Source icon not found: {source_png}")
@@ -72,23 +107,20 @@ def generate_icons(
         raise RuntimeError("Generated ICNS file missing 'icns' magic header.")
     _write_bytes_atomic(mac_icns, icns_bytes)
 
-    # 3. VS Code extension 128x128 icon.png (deterministic PNG chunks, no volatile metadata)
-    vscode_img = rgba.resize((128, 128), Image.Resampling.LANCZOS)
-    png_buf = io.BytesIO()
-    vscode_img.save(
-        png_buf,
-        format="PNG",
-        pnginfo=PngImagePlugin.PngInfo(),
-        optimize=False,
-        compress_level=9,
-    )
-    _write_bytes_atomic(vscode_png, png_buf.getvalue())
-
-    return {
+    # 3. Deterministic PNGs for VS Code, Mobile PWAs, and Browser Clipper
+    _save_deterministic_png(rgba, 128, vscode_png)
+    outputs: dict[str, Path] = {
         "ico": win_ico,
         "icns": mac_icns,
         "vscode_png": vscode_png,
     }
+    for fname, sz in PWA_ICON_SPECS:
+        outputs[f"inbox_drop_{fname}"] = _save_deterministic_png(rgba, sz, inbox_drop_icons_dir / fname)
+        outputs[f"vault_client_{fname}"] = _save_deterministic_png(rgba, sz, vault_client_icons_dir / fname)
+    for fname, sz in CLIPPER_ICON_SPECS:
+        outputs[f"clipper_{fname}"] = _save_deterministic_png(rgba, sz, clipper_icons_dir / fname)
+
+    return outputs
 
 
 def main(argv: list[str] | None = None) -> int:

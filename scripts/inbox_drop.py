@@ -49,7 +49,13 @@ from filelock import FileLock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import content_sha256, review_lock  # noqa: E402
-from config import _is_reparse_or_link, resolve_active_brain_dir, safe_file_in_dir, security_state_dir  # noqa: E402
+from config import (  # noqa: E402
+    _is_immutable_darwin_root_symlink,
+    _is_reparse_or_link,
+    resolve_active_brain_dir,
+    safe_file_in_dir,
+    security_state_dir,
+)
 from host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions  # noqa: E402
 from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
 from memory_format import normalize_temporal_bound_str  # noqa: E402
@@ -103,7 +109,8 @@ def _assert_no_symlinks(path: Path, *, stop_at: Path | None = None) -> None:
     stop_resolved = stop_at.resolve() if stop_at is not None and stop_at.exists() else None
     for cur in (path, *path.parents):
         if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
-            raise InboxDropSecurityError(f"Refusing to access inbox-drop state via symlink/reparse point: {cur}")
+            if not _is_immutable_darwin_root_symlink(cur):
+                raise InboxDropSecurityError(f"Refusing to access inbox-drop state via symlink/reparse point: {cur}")
         if stop_resolved is not None and cur == stop_resolved:
             break
 
@@ -510,12 +517,18 @@ def export_static_pwa_bundle(dest_dir: str | Path) -> dict[str, Any]:
     _assert_no_symlinks(out)
     out.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
-    for item in sorted(repo_mobile.iterdir()):
-        if item.is_file() and not _is_reparse_or_link(str(item)):
-            dst = out / item.name
+    for item in sorted(repo_mobile.rglob("*")):
+        if _is_reparse_or_link(str(item)):
+            continue
+        rel = item.relative_to(repo_mobile)
+        if any(part.startswith(".") or part in {"node_modules", "__pycache__"} for part in rel.parts):
+            continue
+        if item.is_file():
+            dst = out / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
             _assert_no_symlinks(dst)
             shutil.copyfile(str(item), str(dst))
-            copied.append(item.name)
+            copied.append(rel.as_posix())
     return {"status": "exported", "destination": str(out), "files": copied}
 
 
@@ -1116,21 +1129,33 @@ def _derive_mobile_recall_aes_key(
 
 def rotate_mobile_recall_key(
     *,
-    vault_id: str,
+    vault_id: str | None = None,
     brain_dir: str | Path | None = None,
     state_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Rotate the per-vault mobile recall key so lost recall-enabled pairings lose future index decryption."""
-    if not _HEX32_RE.fullmatch(str(vault_id or "")):
-        raise InboxDropError(f"Invalid 32-char hex vault_id: {vault_id!r}")
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
+    resolved_vault_id = str(vault_id or "").strip().lower()
+    if not resolved_vault_id:
+        from vault_sync import _load_sync_config, sync_config_path
+
+        cfg_path = sync_config_path(active_brain, state_dir=state_dir)
+        if cfg_path.exists():
+            cfg = _load_sync_config(active_brain, state_dir=state_dir)
+            resolved_vault_id = str(cfg.get("vault_id") or "").strip().lower()
+        if not resolved_vault_id:
+            existing_state = _load_drop_state(active_brain, state_dir=state_dir)
+            if isinstance(existing_state, dict) and existing_state.get("vault_id"):
+                resolved_vault_id = str(existing_state["vault_id"]).strip().lower()
+    if not _HEX32_RE.fullmatch(resolved_vault_id):
+        raise InboxDropError(f"Invalid or uninitialized 32-char hex vault_id: {vault_id!r}")
     lock_file = _inbox_drop_lock_path(active_brain, state_dir=state_dir)
     _assert_no_symlinks(lock_file)
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     restrict_security_file_permissions(lock_file.parent)
     with _INBOX_DROP_STATE_LOCK, FileLock(str(lock_file), timeout=30):
         state = _ensure_inbox_drop_keypair_unlocked(
-            vault_id=vault_id,
+            vault_id=resolved_vault_id,
             active_brain=active_brain,
             state_dir=state_dir,
         )
@@ -1141,7 +1166,7 @@ def rotate_mobile_recall_key(
         _atomic_write_restricted_json(inbox_drop_state_path(active_brain, state_dir=state_dir), state)
     return {
         "status": "rotated",
-        "vault_id": vault_id,
+        "vault_id": resolved_vault_id,
         "recall_key_id": new_rk_id,
     }
 

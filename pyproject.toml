@@ -17,7 +17,7 @@ dependencies = [
     "beautifulsoup4>=4.13,<5",
     "pypdf>=5,<7",
     "PyYAML>=6.0,<7",
-    "cryptography>=42,<51",
+    "cryptography>=42,<49",
 ]
 
 [project.optional-dependencies]
@@ -28,10 +28,20 @@ mcp = ["mcp>=2.3,<3", "ollama>=0.6,<1"]
 scout = ["httpx>=0.28,<1", "httpcore>=1,<2", "trafilatura>=2,<3", "beautifulsoup4>=4.13,<5"]
 watchdog = ["watchdog>=6,<7"]
 evaluation = ["ollama>=0.6,<1", "chromadb>=1.0,<2"]
-multimodal = ["faster-whisper>=1.1,<2", "Pillow>=11,<13"]
+multimodal = ["av>=12,<19", "faster-whisper>=1.1,<2", "Pillow>=11,<13"]
 reranker = ["onnxruntime>=1.19,<2", "tokenizers>=0.20,<1", "numpy>=1.26,<3"]
+creative = [
+    "accelerate>=0.30,<2",
+    "av>=12,<19",
+    "diffusers>=0.30,<1",
+    "safetensors>=0.4,<1",
+    "torch>=2.2,<3",
+    "transformers>=4.40,<6",
+]
+math = ["sympy>=1.13,<2", "z3-solver>=4.13,<5"]
 dev = []
 all = [
+    "av>=12,<19",
     "chromadb>=1.0,<2",
     "onnxruntime>=1.19,<2",
     "tokenizers>=0.20,<1",
@@ -50,6 +60,7 @@ all = [
 
 [dependency-groups]
 dev = [
+    "av>=12,<19",
     "chromadb>=1.0,<2",
     "onnxruntime>=1.19,<2",
     "tokenizers>=0.20,<1",
@@ -77,12 +88,41 @@ exclude = [
     "**/*.pyo",
 ]
 
-[tool.hatch.build.targets.wheel.force-include]
-"scripts" = "second_brain/scripts"
-"dashboard" = "second_brain/dashboard"
-"plugins" = "second_brain/plugins"
-"mobile" = "second_brain/mobile"
-".streamlit/config.toml" = "second_brain/_streamlit/config.toml"
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "scripts/_hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "brain/**",
+    "dist/**",
+    "tmp/**",
+    "release-artifacts/**",
+    "merged-dist/**",
+    "pypi-dist/**",
+    "release-manifests/**",
+    ".venv/**",
+    ".agents/**",
+    "**/node_modules/**",
+    "**/__pycache__",
+    "**/*.pyc",
+    ".env*",
+    "**/.env*",
+    "*.pfx",
+    "*.p12",
+    "*.pem",
+    "*.key",
+    "*.jks",
+    "*.keystore",
+    "*.p8",
+    "*.sbvault",
+    "**/local.properties",
+    "**/google-services.json",
+    "**/play-key.json",
+    "**/.gradle/**",
+    "**/Pods/**",
+    "**/DerivedData/**",
+    "**/build/**",
+]
 
 [tool.uv]
 default-groups = ["dev"]

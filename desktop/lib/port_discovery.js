@@ -7,6 +7,7 @@ const crypto = require("crypto");
 
 const LOOPBACK_HOST = "127.0.0.1";
 const DEFAULT_API_PORT = 8765;
+const DEFAULT_PYTHON_VERSION = "3.11";
 
 function resolveSecurityDir({
   env = process.env,
@@ -378,26 +379,113 @@ function buildPackagedRuntimeConfig({
   };
 }
 
-function buildUvBootstrapArgs({ backendRoot, wheelhouseDir, hasWheelhouse = false } = {}) {
+function buildUvBootstrapSteps({
+  backendRoot,
+  wheelhouseDir,
+  venvDir,
+  venvPython,
+  hasWheelhouse = false,
+  pythonVersion = DEFAULT_PYTHON_VERSION,
+  strictOffline = false,
+} = {}) {
+  const pyVer = String(pythonVersion || DEFAULT_PYTHON_VERSION);
   const resolvedWheelhouse =
     wheelhouseDir || path.join(String(backendRoot || ""), "wheelhouse");
   if (hasWheelhouse) {
+    const resolvedVenvDir =
+      venvDir || path.join(String(backendRoot || ""), ".venv");
+    const resolvedVenvPython =
+      venvPython ||
+      (process.platform === "win32"
+        ? path.join(resolvedVenvDir, "Scripts", "python.exe")
+        : path.join(resolvedVenvDir, "bin", "python"));
+    const venvArgs = [
+      "venv",
+      String(resolvedVenvDir),
+      "--python",
+      pyVer,
+      "--clear",
+    ];
+    if (strictOffline) {
+      venvArgs.push("--offline");
+    }
     return [
-      "--directory",
-      String(backendRoot),
-      "sync",
-      "--frozen",
-      "--offline",
-      "--find-links",
-      resolvedWheelhouse,
+      {
+        label: "Creating isolated Python runtime",
+        args: venvArgs,
+      },
+      {
+        label: "Offline wheelhouse install",
+        args: [
+          "pip",
+          "install",
+          "--offline",
+          "--no-index",
+          "--find-links",
+          String(resolvedWheelhouse),
+          "--python",
+          String(resolvedVenvPython),
+          "second-brain",
+        ],
+      },
     ];
   }
-  return ["--directory", String(backendRoot), "sync", "--frozen"];
+  return [
+    {
+      label: "Python env sync",
+      args: [
+        "--directory",
+        String(backendRoot),
+        "sync",
+        "--frozen",
+        "--no-dev",
+        "--python",
+        pyVer,
+      ],
+    },
+  ];
+}
+
+function buildUvBootstrapArgs({
+  backendRoot,
+  wheelhouseDir,
+  venvPython,
+  hasWheelhouse = false,
+  pythonVersion = DEFAULT_PYTHON_VERSION,
+} = {}) {
+  const pyVer = String(pythonVersion || DEFAULT_PYTHON_VERSION);
+  const resolvedWheelhouse =
+    wheelhouseDir || path.join(String(backendRoot || ""), "wheelhouse");
+  if (hasWheelhouse) {
+    const args = [
+      "pip",
+      "install",
+      "--offline",
+      "--no-index",
+      "--find-links",
+      String(resolvedWheelhouse),
+    ];
+    if (venvPython) {
+      args.push("--python", String(venvPython));
+    }
+    args.push("second-brain");
+    return args;
+  }
+  return [
+    "--directory",
+    String(backendRoot),
+    "sync",
+    "--frozen",
+    "--no-dev",
+    "--python",
+    pyVer,
+  ];
 }
 
 module.exports = {
   LOOPBACK_HOST,
   DEFAULT_API_PORT,
+  DEFAULT_PYTHON_VERSION,
   resolveSecurityDir,
   resolvePortFilePath,
   readSafeSecurityFile,
@@ -411,5 +499,6 @@ module.exports = {
   modKeyLabel,
   formatShortcut,
   buildPackagedRuntimeConfig,
+  buildUvBootstrapSteps,
   buildUvBootstrapArgs,
 };

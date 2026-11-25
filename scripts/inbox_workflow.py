@@ -25,11 +25,15 @@ from config import (
     SIDECAR_DIR,
     _is_reparse_or_link,
     file_sha256,
+    resolve_module_vault_path,
     resolve_under,
     safe_file_in_dir,
     safe_vault_reference,
+    snapshot_module_defaults,
 )
-from host_adapters import restrict_security_file_permissions
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
+from security_fs import restrict_security_file_permissions
 from refinery_targets import intake_status
 from review_atom import review_lock
 
@@ -71,8 +75,9 @@ class QuarantinedInboxItem:
     preview: str
 
 
-def _inbox_audit_path(brain_dir: str = BRAIN_DIR) -> str:
-    return os.path.join(brain_dir, ".sidecar", INBOX_AUDIT_FILENAME)
+def _inbox_audit_path(brain_dir: str | None = None) -> str:
+    resolved_brain = resolve_module_vault_path(globals(), "BRAIN_DIR", brain_dir)
+    return os.path.join(resolved_brain, ".sidecar", INBOX_AUDIT_FILENAME)
 
 
 def _extract_origin_tag(text: str) -> str:
@@ -149,17 +154,18 @@ def _unique_archive_destination(inbox_dir: str, subdir: str, prefix_sha: str, ba
 
 
 def _resolve_raw_and_brain(
-    inbox_dir: str,
+    inbox_dir: str | None = None,
     raw_dir: str | None = None,
     brain_dir: str | None = None,
 ) -> tuple[str, str]:
-    abs_inbox = os.path.abspath(inbox_dir)
+    eff_inbox = resolve_module_vault_path(globals(), "INBOX_DIR", inbox_dir, brain_dir=brain_dir)
+    abs_inbox = os.path.abspath(eff_inbox)
     if raw_dir is not None:
         resolved_raw = os.path.abspath(raw_dir)
     elif os.path.basename(abs_inbox) == "inbox":
         resolved_raw = os.path.dirname(abs_inbox)
     else:
-        resolved_raw = os.path.abspath(RAW_DIR)
+        resolved_raw = resolve_module_vault_path(globals(), "RAW_DIR", None, brain_dir=brain_dir)
 
     if brain_dir is not None:
         resolved_brain = os.path.abspath(brain_dir)
@@ -188,7 +194,7 @@ def _resolve_intake_source(pointer_text: str, brain_dir: str) -> tuple[str | Non
     source_ref = source_match.group(1).strip()
     if os.path.splitext(source_ref)[1].lower() != ".md":
         return source_ref, None, ""
-    if os.path.abspath(brain_dir) == os.path.abspath(BRAIN_DIR):
+    if os.path.abspath(brain_dir) == os.path.abspath(resolve_module_vault_path(globals(), "BRAIN_DIR")):
         source_path = safe_vault_reference(source_ref, allowed_exts={".md"})
     else:
         source_path = resolve_under(brain_dir, source_ref, must_exist=True)
@@ -329,18 +335,19 @@ def sanitize_promoted_content(content: str, *, origin: str, promoted_by: str, or
 
 
 def list_inbox_items(
-    inbox_dir: str = INBOX_DIR,
+    inbox_dir: str | None = None,
     *,
     raw_dir: str | None = None,
     brain_dir: str | None = None,
 ) -> list[QuarantinedInboxItem]:
-    resolved_raw, resolved_brain = _resolve_raw_and_brain(inbox_dir, raw_dir=raw_dir, brain_dir=brain_dir)
+    eff_inbox = resolve_module_vault_path(globals(), "INBOX_DIR", inbox_dir, brain_dir=brain_dir)
+    resolved_raw, resolved_brain = _resolve_raw_and_brain(eff_inbox, raw_dir=raw_dir, brain_dir=brain_dir)
     items: list[QuarantinedInboxItem] = []
     seen_names: set[str] = set()
 
-    if os.path.isdir(inbox_dir):
-        for entry in sorted(os.listdir(inbox_dir)):
-            safe_path = safe_file_in_dir(inbox_dir, entry, allowed_exts={".md", ".txt", ".intake"}, must_exist=True)
+    if os.path.isdir(eff_inbox):
+        for entry in sorted(os.listdir(eff_inbox)):
+            safe_path = safe_file_in_dir(eff_inbox, entry, allowed_exts={".md", ".txt", ".intake"}, must_exist=True)
             if not safe_path or not os.path.isfile(safe_path) or _is_reparse_or_link(safe_path):
                 continue
             sha = file_sha256(safe_path)
@@ -420,12 +427,13 @@ def _locate_quarantined_file(filename: str, inbox_dir: str, raw_dir: str) -> tup
 def inspect_inbox_item(
     filename: str,
     *,
-    inbox_dir: str = INBOX_DIR,
+    inbox_dir: str | None = None,
     raw_dir: str | None = None,
     brain_dir: str | None = None,
 ) -> dict[str, object]:
-    resolved_raw, resolved_brain = _resolve_raw_and_brain(inbox_dir, raw_dir=raw_dir, brain_dir=brain_dir)
-    safe_path, _from_raw = _locate_quarantined_file(filename, inbox_dir, resolved_raw)
+    eff_inbox = resolve_module_vault_path(globals(), "INBOX_DIR", inbox_dir, brain_dir=brain_dir)
+    resolved_raw, resolved_brain = _resolve_raw_and_brain(eff_inbox, raw_dir=raw_dir, brain_dir=brain_dir)
+    safe_path, _from_raw = _locate_quarantined_file(filename, eff_inbox, resolved_raw)
     sha = file_sha256(safe_path)
     if not sha:
         raise OSError(f"Unable to hash quarantined inbox file: {filename}")
@@ -488,7 +496,7 @@ def promote_inbox_item(
     expected_sha256: str,
     actor: str,
     acknowledge_risks: bool = False,
-    inbox_dir: str = INBOX_DIR,
+    inbox_dir: str | None = None,
     raw_dir: str | None = None,
     brain_dir: str | None = None,
 ) -> dict[str, object]:
@@ -500,11 +508,12 @@ def promote_inbox_item(
     if len(expected) != 64:
         raise ValueError("A 64-character expected_sha256 is required for CAS inbox promotion.")
 
-    resolved_raw, resolved_brain = _resolve_raw_and_brain(inbox_dir, raw_dir=raw_dir, brain_dir=brain_dir)
+    eff_inbox = resolve_module_vault_path(globals(), "INBOX_DIR", inbox_dir, brain_dir=brain_dir)
+    resolved_raw, resolved_brain = _resolve_raw_and_brain(eff_inbox, raw_dir=raw_dir, brain_dir=brain_dir)
     lock_path = os.path.join(resolved_brain, ".sidecar", "writer.lock")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with review_lock(lock_path):
-        safe_src, from_raw = _locate_quarantined_file(filename, inbox_dir, resolved_raw)
+        safe_src, from_raw = _locate_quarantined_file(filename, eff_inbox, resolved_raw)
         current_sha = file_sha256(safe_src)
         if current_sha != expected:
             raise ReviewConflictError(
@@ -554,7 +563,7 @@ def promote_inbox_item(
             atomic_write_bytes(dest_path, approved_pointer.encode("utf-8"))
             if not from_raw:
                 archived_inbox_path = _unique_archive_destination(
-                    inbox_dir,
+                    eff_inbox,
                     "promoted",
                     current_sha[:12],
                     basename,
@@ -621,7 +630,7 @@ def promote_inbox_item(
                 suffix += 1
 
         archived_inbox_path = _unique_archive_destination(
-            inbox_dir,
+            eff_inbox,
             "promoted",
             current_sha[:12],
             basename,
@@ -655,7 +664,7 @@ def reject_inbox_item(
     expected_sha256: str,
     actor: str,
     rationale: str = "Rejected during inbox quarantine review",
-    inbox_dir: str = INBOX_DIR,
+    inbox_dir: str | None = None,
     raw_dir: str | None = None,
     brain_dir: str | None = None,
 ) -> dict[str, object]:
@@ -666,11 +675,12 @@ def reject_inbox_item(
     if len(expected) != 64:
         raise ValueError("A 64-character expected_sha256 is required for CAS inbox rejection.")
 
-    resolved_raw, resolved_brain = _resolve_raw_and_brain(inbox_dir, raw_dir=raw_dir, brain_dir=brain_dir)
+    eff_inbox = resolve_module_vault_path(globals(), "INBOX_DIR", inbox_dir, brain_dir=brain_dir)
+    resolved_raw, resolved_brain = _resolve_raw_and_brain(eff_inbox, raw_dir=raw_dir, brain_dir=brain_dir)
     lock_path = os.path.join(resolved_brain, ".sidecar", "writer.lock")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with review_lock(lock_path):
-        safe_src, _from_raw = _locate_quarantined_file(filename, inbox_dir, resolved_raw)
+        safe_src, _from_raw = _locate_quarantined_file(filename, eff_inbox, resolved_raw)
         current_sha = file_sha256(safe_src)
         if current_sha != expected:
             raise ReviewConflictError(
@@ -689,7 +699,7 @@ def reject_inbox_item(
                 timestamp=now_iso,
             )
             archived_rejected = _unique_archive_destination(
-                inbox_dir,
+                eff_inbox,
                 ".rejected",
                 current_sha[:12],
                 basename,
@@ -698,7 +708,7 @@ def reject_inbox_item(
             os.remove(safe_src)
         else:
             archived_rejected = _unique_archive_destination(
-                inbox_dir,
+                eff_inbox,
                 "rejected",
                 current_sha[:12],
                 basename,

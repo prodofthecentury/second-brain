@@ -47,7 +47,7 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import atomic_write_bytes, invalidate_decision_log_cache, review_lock  # noqa: E402
-from config import _is_reparse_or_link, resolve_active_brain_dir  # noqa: E402
+from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, resolve_active_brain_dir  # noqa: E402
 from host_adapters import restrict_security_file_permissions  # noqa: E402
 from index_manifest import invalidate_atom_revision_cache  # noqa: E402
 from lexical_store import rebuild_lexical_index  # noqa: E402
@@ -79,6 +79,8 @@ DURABLE_TOP_DIRS: tuple[str, ...] = (
     "4-experiences",
     "5-playbooks",
     "6-skills",
+    "7-principles",
+    "8-mental-models",
     "notes",
     "sources",
     "briefings",
@@ -123,7 +125,8 @@ def _assert_no_symlink_ancestors(path: Path, *, stop_at: Path | None = None) -> 
     stop_res = stop_at.resolve() if (stop_at is not None and stop_at.exists()) else None
     for cur in (path, *path.parents):
         if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
-            raise VaultBackupSecurityError(f"Refusing to access backup/vault path via symlink or reparse point: {cur}")
+            if not _is_immutable_darwin_root_symlink(cur):
+                raise VaultBackupSecurityError(f"Refusing to access backup/vault path via symlink or reparse point: {cur}")
         if stop_res is not None and cur == stop_res:
             break
 
@@ -341,6 +344,7 @@ def create_vault_backup(
         "merkle_root": merkle["merkle_root"],
         "approved_atoms": merkle["approved_atoms"],
         "accepted_playbooks": merkle["accepted_playbooks"],
+        "active_skills": merkle.get("active_skills", 0),
         "merkle_leaves": [
             {
                 "kind": str(leaf["kind"]),
@@ -407,6 +411,7 @@ def create_vault_backup(
         "merkle_root": merkle["merkle_root"],
         "approved_atoms": merkle["approved_atoms"],
         "accepted_playbooks": merkle["accepted_playbooks"],
+        "active_skills": merkle.get("active_skills", 0),
         "ledger_entry_count": int(ledger_rep["entry_count"]),
         "created_at": created_at,
     }
@@ -685,6 +690,9 @@ def restore_vault_backup(
             "3-threads",
             "4-experiences",
             "5-playbooks",
+            "6-skills",
+            "7-principles",
+            "8-mental-models",
             "notes",
             "sources",
             "briefings",

@@ -458,12 +458,15 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("skills", "Stage 4 Executable Skills: candidates, promote, list, verify, execute in sandbox, kill-switch & audit."),
         ("plan", "Assemble a grounded, citation-verified Executive Plan from Playbooks and approved Atoms."),
         ("notes", "Zero-friction notes: add, search, list, tasks, reindex, verify an excerpt."),
+        ("tasks", "Extract structured open/completed action items and tasks across working notes."),
         ("capture", "Quickly capture a working note or quarantined inbox item from the CLI."),
         ("import", "Bulk-import Markdown, Obsidian, PDF, DOCX, EPUB, HTML, or CSV files into notes."),
         ("chat", "Chat with instant, verified, streaming, or research answers over memory and notes."),
         ("connect", "One-click connect Claude Code/Desktop, Cursor, Windsurf, VS Code, or Antigravity."),
         ("benchmark", "Run the corpus-scale benchmark on a synthetic isolated vault."),
         ("sota-benchmark", "Run comparative SOTA benchmarks against external RAG/memory baselines."),
+        ("live-benchmark", "Run reproducible live third-party package benchmark against chromadb, rank-bm25, and flashrank."),
+        ("third-party-benchmark", "Alias for live-benchmark against installed third-party retrieval/memory packages."),
         ("ledger", "Cryptographic Vault Merkle proof and tamper-evident audit ledger."),
         ("graph", "Contradiction & Drift Radar + temporal knowledge graph."),
         ("snapshot", "Time-travel vault snapshots, semantic diff, and point-in-time recall."),
@@ -472,13 +475,24 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("media", "Local Creative Media Studio: hardware-gated offline image (.png/.webp) & video (.mp4/.gif) generation."),
         ("release", "Release signature verification, store credential checks, WinGet validation & registry publishing."),
         ("models", "Download, SHA-256 verify, inspect, or remove local ONNX Cross-Encoder & NLI weights."),
+        ("voice", "Inspect or synthesize offline Kokoro-82M ONNX Text-to-Speech."),
+        ("screen", "Opt-in Screen OCR ('Eyes'): configure, search, or prune captures."),
+        ("external", "Opt-in External Folder Indexer: allowlist, scan, or search code/docs in place."),
+        ("proxy", "Opt-in loopback OpenAI-compatible memory proxy configuration."),
+        ("tunnel", "Opt-in Zero-Trust remote tunnel (Tailscale / Cloudflare) configuration."),
+        ("jarvis", "Cross-app orchestrator (Open WebUI tool, n8n, OpenHands, AppFlowy board sync)."),
+        ("packs", "Import external skill/knowledge packs (agent-skills, pm-skills) into quarantine."),
+        ("runtime", "Inspect or control local runtime accelerators (e.g., speculative llama.cpp decoding)."),
         ("clipper", "Pair, manage, and capture via the local-first Browser Web Clipper."),
         ("vault", "Manage isolated Multi-Vault Workspaces and opt-in cross-vault federated recall."),
         ("backup", "Create, cryptographically verify, or restore portable Three-Store .sbvault backups."),
         ("hook", "Install/manage git post-commit hooks and distill commits into Second Brain."),
+        ("math", "Run DUP + ToRA sandboxed quantitative problem solving and 4D process rubric scoring."),
+        ("proof", "Verify SafeVerify formal/algorithmic specs, check Lean readiness, and run proof search."),
         ("recall", "Search owner-approved memory atoms via lexical, dense, or hybrid RRF recall."),
         ("answer", "Generate a citation-validated grounded answer (standard, preference, or research)."),
         ("review", "Inspect, approve, reject, quarantine, demote, edit, or merge memory atoms."),
+        ("gates", "Inspect human owner governance gates, dataset/candidate audits, and interactive sign-off."),
         ("audit", "Audit canonical memory atoms against anchored source files."),
         ("rebuild-lexical", "Rebuild the SQLite FTS5 lexical recall sidecar index."),
         ("rebuild-vectors", "Rebuild the Chroma dense vector index and active generation manifest."),
@@ -560,11 +574,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
 _PASSTHROUGH_COMMANDS = frozenset({
     "api",
     "inbox", "hosts", "cognitive", "playbooks", "playbook", "skills", "plan",
-    "notes", "capture", "import", "chat", "connect", "benchmark",
-    "sota-benchmark", "ledger", "graph", "snapshot", "sync", "mobile", "media", "release",
-    "models", "clipper", "vault",
-    "backup", "hook",
-    "recall", "answer", "review", "audit",
+    "notes", "tasks", "capture", "import", "chat", "connect", "benchmark",
+    "sota-benchmark", "live-benchmark", "third-party-benchmark", "ledger", "graph", "snapshot", "sync", "mobile", "media", "release",
+    "models", "voice", "screen", "external", "proxy", "tunnel", "jarvis", "packs", "runtime", "clipper", "vault",
+    "backup", "hook", "math", "proof",
+    "recall", "answer", "review", "gates", "audit",
     "rebuild-lexical", "rebuild-vectors",
     "refinery", "editor", "scout", "ingest", "daemon", "mcp",
     "eval-retrieval", "eval-answers",
@@ -587,6 +601,13 @@ def _invoke_entrypoint(fn, forwarded: list[str], *, prog: str, description: str)
 
 
 def _run_recall_cli(forwarded: list[str]) -> int:
+    if forwarded and forwarded[0] == "zoom":
+        from scripts import fractal_zoom as fz_mod
+
+        zoom_args = list(forwarded[1:])
+        if not zoom_args or zoom_args[0] in {"sync", "query", "--help", "-h"}:
+            return fz_mod.main(zoom_args)
+        return fz_mod.main(["query", *zoom_args])
     from scripts import recall as recall_mod
 
     mod_main = getattr(recall_mod, "main", None)
@@ -754,6 +775,10 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.notes_store import main as notes_main
 
         return notes_main(forwarded)
+    if command == "tasks":
+        from scripts.notes_store import main as notes_main
+
+        return notes_main(["tasks", *forwarded])
     if command == "capture":
         p = argparse.ArgumentParser(prog="second-brain capture", description="Quickly capture a working note.")
         p.add_argument("text", nargs="*", help="Note body text (or pass --stdin).")
@@ -805,6 +830,10 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.sota_benchmark import main as sota_main
 
         return sota_main(forwarded)
+    if command in ("live-benchmark", "third-party-benchmark"):
+        from scripts.live_third_party_benchmark import main as live_bench_main
+
+        return live_bench_main(forwarded)
     if command == "ledger":
         from scripts.vault_ledger import main as ledger_main
 
@@ -825,6 +854,55 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.onnx_models import main as models_main
 
         return models_main(forwarded)
+    if command == "voice":
+        from scripts.tts_engine import main as voice_main
+
+        return voice_main(forwarded)
+    if command == "screen":
+        from scripts.screen_memory import main as screen_main
+
+        return screen_main(forwarded)
+    if command == "external":
+        from scripts.external_indexer import main as external_main
+
+        return external_main(forwarded)
+    if command == "proxy":
+        from scripts.local_ai_proxy import main as proxy_main
+
+        return proxy_main(forwarded)
+    if command == "tunnel":
+        from scripts.zero_trust_tunnel import main as tunnel_main
+
+        return tunnel_main(forwarded)
+    if command == "jarvis":
+        from scripts.jarvis_orchestrator import main as jarvis_main
+
+        return jarvis_main(forwarded)
+    if command == "packs":
+        from scripts.skill_pack_importer import main as packs_main
+
+        return packs_main(forwarded)
+    if command == "math":
+        from scripts.cgv_reasoner import main as math_main
+
+        sub_fwd = forwarded[1:] if forwarded[:1] == ["solve"] else forwarded
+        return math_main(sub_fwd)
+    if command == "proof":
+        from scripts.formal_proof_search import main as proof_main
+
+        return proof_main(forwarded)
+    if command == "runtime":
+        if forwarded and forwarded[0] == "speculative":
+            from scripts.llama_cpp_runner import main as spec_main
+
+            return spec_main(forwarded[1:])
+        p = argparse.ArgumentParser(prog="second-brain runtime", description="Manage local acceleration runtimes.")
+        p.add_argument("target", choices=("speculative",), help="Runtime accelerator subsystem.")
+        p.add_argument("sub_argv", nargs=argparse.REMAINDER)
+        ns = p.parse_args(forwarded)
+        from scripts.llama_cpp_runner import main as spec_main
+
+        return spec_main(list(ns.sub_argv or []))
     if command == "clipper":
         from scripts.web_clipper import main as clipper_main
 
@@ -869,6 +947,10 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.review_atom import main as review_main
 
         return _invoke_entrypoint(review_main, forwarded, prog="second-brain review", description="Review and mutate canonical atoms.")
+    if command == "gates":
+        from scripts.owner_gates import main as gates_main
+
+        return gates_main(forwarded)
     if command == "audit":
         from scripts.audit_sources import main as audit_main
 

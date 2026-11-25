@@ -5,16 +5,15 @@ truth, approve claims, edit existing atoms, or delete source material.
 
 ## Before starting
 
-1. Run `uv run scripts/doctor.py` and read every warning. A stale or missing
+1. Run `uv run --locked python scripts/doctor.py` and read every warning. A stale or missing
    lexical index must be rebuilt before recall is used.
-2. Choose one specific file from `0-raw/`. Leave remote `.intake` pointers
-   quarantined unless the owner has explicitly promoted that exact pointer.
-3. Do not run parallel Refinery processes on the same capture.
+2. Choose one specific promoted file from `brain/0-raw/`. Leave quarantined `0-raw/inbox/` captures and `.intake` pointers untouched unless the owner has explicitly promoted that exact file (`uv run --locked second-brain inbox promote <capture> --expected-sha256 <64-char-sha256> --actor <owner>`).
+3. Do not run parallel Refinery processes (`brain/.sidecar/writer.lock` serializes canonical commits).
 
 ## Process one capture
 
 ```powershell
-uv run scripts/ollama_refinery.py --file brain/0-raw/<capture.md> --keep-source
+uv run --locked python scripts/ollama_refinery.py --file brain/0-raw/<capture.md> --keep-source
 ```
 
 The source stays in place with `--keep-source`. New atom files are created
@@ -32,9 +31,9 @@ exact excerpt that appears in one unambiguous location in that source. Then
 review the exact file revision:
 
 ```powershell
-uv run scripts/memory_review.py --status pending
+uv run --locked python scripts/memory_review.py --status pending
 Get-FileHash brain/2-atoms/<atom.md> -Algorithm SHA256
-uv run scripts/review_atom.py approve <atom.md> --expected-sha256 <sha256> --actor <owner>
+uv run --locked python scripts/review_atom.py transition approve <atom.md> --expected-sha256 <sha256> --actor <owner>
 ```
 
 Approval checks the source bytes and quote, records the atom revision hash, and

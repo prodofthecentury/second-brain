@@ -1,0 +1,8 @@
+.sb-obs-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+.sb-obs-ok { color: var(--text-success); }
+.sb-obs-err { color: var(--text-error); }

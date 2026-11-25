@@ -504,5 +504,443 @@ test("Static security audit of mobile/vault-client web & native shell configurat
   const infoPlist = fs.readFileSync(path.join(clientRoot, "ios", "App", "App", "Info.plist"), "utf8");
   assert.ok(infoPlist.includes("<key>UIFileSharingEnabled</key>"));
   assert.ok(infoPlist.includes("<key>NSAllowsArbitraryLoads</key>"));
+  assert.ok(infoPlist.includes("<key>NSAllowsLocalNetworking</key>"));
   assert.ok(infoPlist.includes("sbvault"));
+
+  const appDelegate = fs.readFileSync(path.join(clientRoot, "ios", "App", "App", "AppDelegate.swift"), "utf8");
+  assert.ok(appDelegate.includes("UIVisualEffectView"), "Missing iOS UIVisualEffectView privacy shield");
+  assert.equal(appDelegate.includes("window?.isHidden = false"), false, "No-op privacy shield still present");
+
+  const mainKt = fs.readFileSync(
+    path.join(clientRoot, "android", "app", "src", "main", "java", "com", "secondbrain", "vault", "MainActivity.kt"),
+    "utf8"
+  );
+  assert.ok(mainKt.includes("FLAG_SECURE"), "Android MainActivity.kt must enforce FLAG_SECURE");
+
+  const requiredNativePaths = [
+    ["android", "gradlew"],
+    ["android", "gradlew.bat"],
+    ["android", "gradle", "wrapper", "gradle-wrapper.jar"],
+    ["android", "gradle", "wrapper", "gradle-wrapper.properties"],
+    ["android", "build.gradle"],
+    ["android", "settings.gradle"],
+    ["android", "variables.gradle"],
+    ["android", "capacitor.settings.gradle"],
+    ["android", "app", "build.gradle"],
+    ["android", "app", "capacitor.build.gradle"],
+    ["android", "app", "proguard-rules.pro"],
+    ["android", "app", "src", "main", "res", "values", "styles.xml"],
+    ["ios", "App", "App.xcodeproj", "project.pbxproj"],
+    ["ios", "App", "App.xcworkspace", "contents.xcworkspacedata"],
+    ["ios", "App", "Podfile"],
+    ["ios", "App", "Package.swift"],
+    ["ios", "App", "App", "Base.lproj", "Main.storyboard"],
+  ];
+  for (const relParts of requiredNativePaths) {
+    assert.equal(fs.existsSync(path.join(clientRoot, ...relParts)), true, "Missing native project file: " + relParts.join("/"));
+  }
+});
+
+function createMinimalAppDomHarness() {
+  const indexHtml = fs.readFileSync(path.resolve(__dirname, "..", "www", "index.html"), "utf8");
+  const ids = [];
+  const idRegex = /\bid="([^"]+)"/g;
+  let match;
+  while ((match = idRegex.exec(indexHtml)) !== null) {
+    ids.push(match[1]);
+  }
+  const elements = new Map();
+  function makeNode(tagName, id) {
+    const classSet = new Set();
+    const listeners = {};
+    const attrs = {};
+    const node = {
+      tagName: String(tagName || "div").toUpperCase(),
+      id: id || "",
+      value: "",
+      textContent: "",
+      type: "",
+      disabled: false,
+      href: "",
+      download: "",
+      files: [],
+      children: [],
+      get firstChild() {
+        return this.children[0] || null;
+      },
+      classList: {
+        add: (...names) => names.forEach((n) => classSet.add(n)),
+        remove: (...names) => names.forEach((n) => classSet.delete(n)),
+        contains: (n) => classSet.has(n),
+        toggle: (n, force) => {
+          if (force === undefined) {
+            if (classSet.has(n)) {
+              classSet.delete(n);
+              return false;
+            }
+            classSet.add(n);
+            return true;
+          }
+          if (force) classSet.add(n);
+          else classSet.delete(n);
+          return Boolean(force);
+        },
+      },
+      set className(val) {
+        classSet.clear();
+        String(val || "")
+          .split(/\s+/)
+          .filter(Boolean)
+          .forEach((c) => classSet.add(c));
+      },
+      get className() {
+        return Array.from(classSet).join(" ");
+      },
+      appendChild(child) {
+        this.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = this.children.indexOf(child);
+        if (idx !== -1) this.children.splice(idx, 1);
+        return child;
+      },
+      remove() {},
+      click() {},
+      focus() {},
+      addEventListener(ev, fn) {
+        if (!listeners[ev]) listeners[ev] = [];
+        listeners[ev].push(fn);
+      },
+      dispatchEvent(ev) {
+        const fns = listeners[ev] || [];
+        for (const fn of fns) fn({ type: ev });
+      },
+      setAttribute(k, v) {
+        attrs[k] = String(v);
+      },
+      getAttribute(k) {
+        return attrs[k] || null;
+      },
+    };
+    return node;
+  }
+  for (const id of ids) {
+    elements.set(id, makeNode("div", id));
+  }
+  elements.get("syncAuthModeSelect").value = "none";
+  elements.get("searchCorpusVerifiedBtn").setAttribute("data-corpus", "verified");
+  elements.get("searchCorpusPrefBtn").setAttribute("data-corpus", "preference");
+  elements.get("searchCorpusNotesBtn").setAttribute("data-corpus", "notes");
+
+  const windowListeners = {};
+  const storageMap = new Map();
+  const prevNavDesc = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const prev = {
+    document: globalThis.document,
+    window: globalThis.window,
+    history: globalThis.history,
+    localStorage: globalThis.localStorage,
+    fetch: globalThis.fetch,
+    SecondBrainVaultCrypto: globalThis.SecondBrainVaultCrypto,
+    SecondBrainEpistemicEngine: globalThis.SecondBrainEpistemicEngine,
+    SecondBrainMobileVaultApp: globalThis.SecondBrainMobileVaultApp,
+  };
+
+  globalThis.SecondBrainVaultCrypto = VaultCrypto;
+  globalThis.SecondBrainEpistemicEngine = Epistemic;
+  globalThis.localStorage = {
+    getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+    setItem: (k, v) => storageMap.set(k, String(v)),
+    removeItem: (k) => storageMap.delete(k),
+  };
+  globalThis.history = {
+    replaceState: (_s, _t, _u) => {},
+  };
+  Object.defineProperty(globalThis, "navigator", {
+    value: { onLine: true },
+    configurable: true,
+    writable: true,
+  });
+  globalThis.window = {
+    location: { pathname: "/vault-client/", search: "", hash: "" },
+    addEventListener: (ev, fn) => {
+      if (!windowListeners[ev]) windowListeners[ev] = [];
+      windowListeners[ev].push(fn);
+    },
+    dispatchEvent: (ev) => {
+      for (const fn of windowListeners[ev] || []) fn({ type: ev });
+    },
+  };
+  globalThis.document = {
+    body: makeNode("body", "body"),
+    getElementById: (id) => elements.get(id) || null,
+    createElement: (tag) => makeNode(tag, ""),
+    querySelectorAll: () => [],
+  };
+
+  const appPath = path.resolve(__dirname, "..", "www", "app.js");
+  delete require.cache[appPath];
+  require(appPath);
+
+  return {
+    app: globalThis.SecondBrainMobileVaultApp,
+    elements,
+    restore() {
+      for (const [k, v] of Object.entries(prev)) {
+        if (v === undefined) delete globalThis[k];
+        else globalThis[k] = v;
+      }
+      if (prevNavDesc) {
+        Object.defineProperty(globalThis, "navigator", prevNavDesc);
+      } else {
+        delete globalThis.navigator;
+      }
+      delete require.cache[appPath];
+    },
+  };
+}
+
+test("app.js preserves new #vaultpair= links on unlock, persists S3/Bearer credentials across lock, renders full notes >320 chars, and queues/flushes offline SBID1 outbox", async () => {
+  const harness = createMinimalAppDomHarness();
+  try {
+    const { app, elements } = harness;
+    const kp1 = generateEd25519KeypairRaw();
+    const kp2 = generateEd25519KeypairRaw();
+
+    // 1. Initialize store with Vault A and typed S3 + Bearer credentials
+    elements.get("syncEndpointInput").value = "https://vault-a.example.com";
+    elements.get("syncVaultIdInput").value = "11".repeat(16);
+    elements.get("syncAuthModeSelect").value = "s3_sigv4";
+    elements.get("syncS3RegionInput").value = "us-west-2";
+    elements.get("syncS3AkInput").value = "AKIATYPEDACCESSKEY";
+    elements.get("syncS3SkInput").value = "SecretTypedS3Key999";
+    elements.get("syncBearerInput").value = "BearerTypedToken777";
+    elements.get("syncMasterKeyInput").value = Buffer.from(nodeCrypto.randomBytes(32)).toString("base64");
+
+    await app.unlockOrInitializeWithPin("123456");
+
+    // 2. Lock cleanly: inputs cleared from DOM, credentials preserved inside EncryptedDeviceStore
+    await app.persistCurrentInputsAndLock();
+    assert.equal(app.deviceStore.isLocked(), true);
+    assert.equal(elements.get("syncS3SkInput").value, "");
+    assert.equal(elements.get("syncBearerInput").value, "");
+
+    // Unlock again without a new #vaultpair= -> typed S3 & Bearer credentials MUST be restored
+    await app.unlockOrInitializeWithPin("123456");
+    await app.refreshLockUi();
+    assert.equal(elements.get("syncS3AkInput").value, "AKIATYPEDACCESSKEY");
+    assert.equal(elements.get("syncS3SkInput").value, "SecretTypedS3Key999");
+    assert.equal(elements.get("syncBearerInput").value, "BearerTypedToken777");
+
+    // 3. Lock again, then open a new #vaultpair= for Vault B BEFORE unlocking!
+    await app.persistCurrentInputsAndLock();
+    const newPairing = {
+      v: 1,
+      vault_id: "22".repeat(16),
+      endpoint_url: "https://vault-b.example.com",
+      auth_mode: "bearer",
+      bearer_token: "FreshPairingBearerToken",
+      trusted_peers: { "dev-b": kp2.pubB64 },
+    };
+    const tokB64Url = Buffer.from(JSON.stringify(newPairing), "utf8")
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    globalThis.window.location.hash = "#vaultpair=" + tokB64Url;
+    app.importHashPairingOnBoot();
+
+    const unlockedAfterPair = await app.unlockOrInitializeWithPin("123456");
+    assert.equal(
+      unlockedAfterPair.state.vaultId,
+      "22".repeat(16),
+      "New #vaultpair= was overwritten by old store state on unlock!"
+    );
+    assert.equal(unlockedAfterPair.state.pairingMeta.endpoint_url, "https://vault-b.example.com");
+    assert.equal(unlockedAfterPair.state.pairingMeta.bearer_token, "FreshPairingBearerToken");
+
+    // 4. Synced working note >320 chars renders full body text (zero hard truncation!)
+    const longBody = "# Long Field Note\n\n" + "0123456789abcdef".repeat(60) + "\nTAIL_MARKER_PRESERVED\n";
+    assert.ok(longBody.length > 900);
+    await app.deviceStore.saveState(null, {
+      vaultId: unlockedAfterPair.state.vaultId,
+      syncCursor: { epoch: 1, trusted_peers: { "dev-a": kp1.pubB64 } },
+      pairingMeta: unlockedAfterPair.state.pairingMeta,
+      files: { "notes/long-note.md": VaultCrypto.utf8Bytes(longBody) },
+    });
+    app.renderSyncedNotesList();
+    const renderedCards = elements.get("notesBrowseList").children;
+    assert.equal(renderedCards.length, 1);
+    const bodyPara = renderedCards[0].children[1];
+    assert.ok(bodyPara.textContent.includes("TAIL_MARKER_PRESERVED"), "Working note was hard-truncated at 320 chars!");
+    assert.equal(bodyPara.textContent.length, longBody.length);
+    assert.ok(renderedCards[0].children[2].textContent.includes("Expand full note"));
+
+    // 5. Offline SBID1 outbox queue & flush
+    const dropKeypair = await nodeCrypto.webcrypto.subtle.generateKey(
+      { name: "ECDH", namedCurve: "P-256" },
+      true,
+      ["deriveBits"]
+    );
+    const recipientPubRaw = new Uint8Array(
+      await nodeCrypto.webcrypto.subtle.exportKey("raw", dropKeypair.publicKey)
+    );
+    const keyIdHex = (await VaultCrypto.sha256Hex(recipientPubRaw)).slice(0, 16);
+    const dropPairing = {
+      v: 1,
+      vault_id: "22".repeat(16),
+      key_id: keyIdHex,
+      token_id: "a1b2c3d4e5f60708",
+      target_url: "https://relay.example.com",
+      recipient_pubkey_b64: VaultCrypto.bytesToBase64(recipientPubRaw),
+      drop_secret_b64: Buffer.from(nodeCrypto.randomBytes(32)).toString("base64"),
+      bearer_token: "drop-tok",
+    };
+    const dropFragTok = Buffer.from(JSON.stringify(dropPairing), "utf8")
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    globalThis.window.location.hash = "#pair=" + dropFragTok;
+    app.importHashPairingOnBoot();
+
+    // Go offline, capture a note -> must enqueue encrypted SBID1 envelope
+    globalThis.navigator.onLine = false;
+    elements.get("dropTitleInput").value = "Offline Train Idea";
+    elements.get("dropUrlInput").value = "";
+    elements.get("dropTextInput").value = "Queued while airplane mode is enabled.";
+    elements.get("dropTagsInput").value = "mobile, offline";
+    await app.handleSendDrop(false);
+
+    const queued = app.loadSbidOutbox();
+    assert.equal(queued.length, 1);
+    assert.ok(queued[0].objectKey.endsWith(".enc"));
+    assert.equal(queued[0].envelopeB64.includes("Queued while airplane mode"), false, "Plaintext leaked into outbox!");
+
+    // Come back online with mocked fetch -> flush delivers item and empties outbox
+    const uploaded = [];
+    globalThis.navigator.onLine = true;
+    globalThis.fetch = async (url, opts) => {
+      uploaded.push({ url, method: opts && opts.method, bytes: opts && opts.body ? opts.body.length : 0 });
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        text: async () => "",
+        arrayBuffer: async () => new ArrayBuffer(0),
+      };
+    };
+    const flushRes = await app.flushSbidOutbox(false);
+    assert.equal(flushRes.sent, 1);
+    assert.equal(flushRes.remaining, 0);
+    assert.equal(app.loadSbidOutbox().length, 0);
+    assert.equal(uploaded.length, 1);
+    assert.equal(uploaded[0].method, "PUT");
+    assert.ok(uploaded[0].url.startsWith("https://relay.example.com/inbox-drops/"));
+  } finally {
+    harness.restore();
+  }
+});
+
+test("VaultCrypto merges hash-chained 0-raw/archive/skill-executions.jsonl and rejects tampered chains", () => {
+  assert.equal(
+    VaultCrypto.APPEND_ONLY_JSONL_PATHS.has("0-raw/archive/skill-executions.jsonl"),
+    true
+  );
+  assert.equal(
+    VaultCrypto.APPEND_ONLY_JSONL_PATHS.has("0-raw/archive/creative-media-audit.jsonl"),
+    true
+  );
+
+  function buildChain(entries) {
+    let prev = "0".repeat(64);
+    const lines = [];
+    for (let i = 0; i < entries.length; i += 1) {
+      const rec = Object.assign({}, entries[i], {
+        execution_index: i + 1,
+        prev_execution_sha256: prev,
+      });
+      delete rec.execution_sha256;
+      const digest = VaultCrypto.sha256HexSync(
+        VaultCrypto.utf8Bytes(VaultCrypto.canonicalJsonString(rec))
+      );
+      rec.execution_sha256 = digest;
+      prev = digest;
+      lines.push(JSON.stringify(rec));
+    }
+    return VaultCrypto.utf8Bytes(lines.join("\n") + "\n");
+  }
+
+  const shared = {
+    schema_version: 1,
+    execution_id: "exec-001",
+    skill_id: "skill-audit",
+    started_at: "2026-11-20T10:00:00Z",
+    status: "completed",
+  };
+  const localOnly = {
+    schema_version: 1,
+    execution_id: "exec-002-local",
+    skill_id: "skill-audit",
+    started_at: "2026-11-20T10:05:00Z",
+    status: "completed",
+  };
+  const remoteOnly = {
+    schema_version: 1,
+    execution_id: "exec-003-remote",
+    skill_id: "skill-audit",
+    started_at: "2026-11-20T10:03:00Z",
+    status: "completed",
+  };
+
+  const localBytes = buildChain([shared, localOnly]);
+  const remoteBytes = buildChain([shared, remoteOnly]);
+  const mergedBytes = VaultCrypto.mergeAppendOnlyJsonl(
+    localBytes,
+    remoteBytes,
+    "0-raw/archive/skill-executions.jsonl"
+  );
+  const mergedLines = VaultCrypto.utf8DecodeStrict(mergedBytes)
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+
+  assert.equal(mergedLines.length, 3);
+  assert.deepEqual(
+    mergedLines.map((r) => r.execution_id),
+    ["exec-001", "exec-003-remote", "exec-002-local"]
+  );
+  assert.deepEqual(
+    mergedLines.map((r) => r.execution_index),
+    [1, 2, 3]
+  );
+
+  // Verify recomputed hash chain integrity
+  let expectedPrev = "0".repeat(64);
+  for (const rec of mergedLines) {
+    assert.equal(rec.prev_execution_sha256, expectedPrev);
+    const body = Object.assign({}, rec);
+    delete body.execution_sha256;
+    const expectedHash = VaultCrypto.sha256HexSync(
+      VaultCrypto.utf8Bytes(VaultCrypto.canonicalJsonString(body))
+    );
+    assert.equal(rec.execution_sha256, expectedHash);
+    expectedPrev = expectedHash;
+  }
+
+  // Tampered execution_sha256 must fail closed with SyncSecurityError
+  const tamperedLines = VaultCrypto.utf8DecodeStrict(remoteBytes).replace(
+    '"completed"',
+    '"tampered"'
+  );
+  assert.throws(
+    () =>
+      VaultCrypto.mergeAppendOnlyJsonl(
+        localBytes,
+        VaultCrypto.utf8Bytes(tamperedLines),
+        "0-raw/archive/skill-executions.jsonl"
+      ),
+    VaultCrypto.SyncSecurityError
+  );
 });

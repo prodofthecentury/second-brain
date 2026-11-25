@@ -118,6 +118,7 @@
     "0-raw/archive/playbook-decisions.jsonl",
     "0-raw/archive/skill-decisions.jsonl",
     "0-raw/archive/skill-executions.jsonl",
+    "0-raw/archive/creative-media-audit.jsonl",
   ]);
 
   class SyncError extends Error {
@@ -849,6 +850,100 @@
     );
   }
 
+  function bigintToLeBytes32(val) {
+    const out = new Uint8Array(32);
+    let cur = val;
+    for (let i = 0; i < 32; i += 1) {
+      out[i] = Number(cur & 0xffn);
+      cur >>= 8n;
+    }
+    return out;
+  }
+
+  function edEncodePoint(P) {
+    const invZ = edModInv(P[2], ED_P);
+    const x = edMod(P[0] * invZ, ED_P);
+    const y = edMod(P[1] * invZ, ED_P);
+    const encoded = bigintToLeBytes32(y);
+    if ((x & 1n) === 1n) {
+      encoded[31] |= 0x80;
+    }
+    return encoded;
+  }
+
+  const ED25519_PKCS8_PREFIX = hexToBytes("302e020100300506032b657004220420");
+
+  function clampEd25519Scalar(digestLower32) {
+    const c = new Uint8Array(digestLower32);
+    c[0] &= 248;
+    c[31] &= 127;
+    c[31] |= 64;
+    return leBytesToBigInt(c);
+  }
+
+  async function deriveEd25519PublicFromSeed(seedBytes32) {
+    const seed = toUint8Array(seedBytes32);
+    if (seed.length !== 32) {
+      throw new SyncSecurityError("Ed25519 seed must be 32 bytes.");
+    }
+    const h = await sha512Bytes(seed);
+    const a = clampEd25519Scalar(h.subarray(0, 32));
+    return edEncodePoint(edScalarMult(ED_B, a));
+  }
+
+  async function signEd25519PureJs(seedBytes32, messageBytes) {
+    const seed = toUint8Array(seedBytes32);
+    if (seed.length !== 32) {
+      throw new SyncSecurityError("Ed25519 seed must be 32 bytes.");
+    }
+    const msg = toUint8Array(messageBytes);
+    const h = await sha512Bytes(seed);
+    const a = clampEd25519Scalar(h.subarray(0, 32));
+    const prefix = h.subarray(32, 64);
+    const pubBytes = edEncodePoint(edScalarMult(ED_B, a));
+
+    const rHash = await sha512Bytes(concatBytes([prefix, msg]));
+    const r = edMod(leBytesToBigInt(rHash), ED_L);
+    const rBytes = edEncodePoint(edScalarMult(ED_B, r));
+
+    const kHash = await sha512Bytes(concatBytes([rBytes, pubBytes, msg]));
+    const k = edMod(leBytesToBigInt(kHash), ED_L);
+    const S = edMod(r + k * a, ED_L);
+    return concatBytes([rBytes, bigintToLeBytes32(S)]);
+  }
+
+  async function signEd25519Message(seedBytes32, messageBytes, options) {
+    const seed = toUint8Array(seedBytes32);
+    const msg = toUint8Array(messageBytes);
+    if (seed.length !== 32) {
+      throw new SyncSecurityError("Ed25519 private key seed must be 32 bytes.");
+    }
+    const opts = options || {};
+    if (!opts.forcePureJs) {
+      try {
+        const subtle = getWebCrypto().subtle;
+        const pkcs8 = concatBytes([ED25519_PKCS8_PREFIX, seed]);
+        const key = await subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false, ["sign"]);
+        const sigBuf = await subtle.sign({ name: "Ed25519" }, key, msg);
+        return new Uint8Array(sigBuf);
+      } catch (_unsupportedErr) {
+        // Fall back to pure-JS RFC 8032 scalar signing on WebViews lacking WebCrypto Ed25519 sign
+      }
+    }
+    return signEd25519PureJs(seed, msg);
+  }
+
+  async function generateEd25519Keypair() {
+    const seed = getWebCrypto().getRandomValues(new Uint8Array(32));
+    const pub = await deriveEd25519PublicFromSeed(seed);
+    const digestHex = await sha256Hex(pub);
+    return {
+      deviceId: "mob_" + digestHex.slice(0, 16),
+      seedB64: bytesToBase64(seed),
+      pubkeyB64: bytesToBase64(pub),
+    };
+  }
+
   async function verifyEd25519PureJs(pubKeyBytes32, messageBytes, sigBytes64) {
     if (pubKeyBytes32.length !== 32 || sigBytes64.length !== 64) {
       return false;
@@ -1226,7 +1321,140 @@
     return { rank: 0, num: null, raw: rawTs };
   }
 
-  function mergeAppendOnlyJsonl(localBytes, remoteBytes) {
+  function parseAndVerifySkillExecutionChain(rawBytes, label) {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let text = "";
+    try {
+      text = decoder.decode(toUint8Array(rawBytes));
+    } catch (_err) {
+      throw new SyncSecurityError("Invalid UTF-8 in " + label + " skill-executions.jsonl.");
+    }
+    const genesis = "0".repeat(64);
+    let expectedPrev = genesis;
+    const entries = [];
+    const lines = text.split(/\r?\n/);
+    for (let l = 0; l < lines.length; l += 1) {
+      const stripped = lines[l].trim();
+      if (!stripped) {
+        continue;
+      }
+      let obj = null;
+      try {
+        obj = JSON.parse(stripped);
+      } catch (_err) {
+        throw new SyncSecurityError("Malformed JSON in " + label + " skill-executions.jsonl line " + (l + 1) + ".");
+      }
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+        throw new SyncSecurityError("Non-object record in " + label + " skill-executions.jsonl line " + (l + 1) + ".");
+      }
+      if (typeof obj.execution_index !== "number" || !Number.isInteger(obj.execution_index) || obj.execution_index !== entries.length + 1) {
+        throw new SyncSecurityError("Broken execution_index in " + label + " skill-executions.jsonl line " + (l + 1) + ".");
+      }
+      const prevVal = String(obj.prev_execution_sha256 || "");
+      if (prevVal !== expectedPrev) {
+        throw new SyncSecurityError("Broken prev_execution_sha256 in " + label + " skill-executions.jsonl line " + (l + 1) + ".");
+      }
+      const recSha = String(obj.execution_sha256 || "");
+      const body = {};
+      const keys = Object.keys(obj);
+      for (let k = 0; k < keys.length; k += 1) {
+        if (keys[k] !== "execution_sha256") {
+          body[keys[k]] = obj[keys[k]];
+        }
+      }
+      const compSha = sha256HexSync(utf8Bytes(canonicalJson(body)));
+      if (recSha.length !== 64 || recSha !== compSha) {
+        throw new SyncSecurityError("Tampered execution_sha256 in " + label + " skill-executions.jsonl line " + (l + 1) + ".");
+      }
+      expectedPrev = recSha;
+      entries.push(obj);
+    }
+    return entries;
+  }
+
+  function mergeSkillExecutionsJsonl(localBytes, remoteBytes) {
+    const localEntries = parseAndVerifySkillExecutionChain(localBytes, "local");
+    const remoteEntries = parseAndVerifySkillExecutionChain(remoteBytes, "remote");
+    const byId = new Map();
+    let seqIdx = 0;
+    const groups = [localEntries, remoteEntries];
+    for (let g = 0; g < groups.length; g += 1) {
+      const arr = groups[g];
+      for (let i = 0; i < arr.length; i += 1) {
+        const entry = arr[i];
+        const payload = {};
+        const keys = Object.keys(entry);
+        for (let k = 0; k < keys.length; k += 1) {
+          const key = keys[k];
+          if (key !== "execution_index" && key !== "prev_execution_sha256" && key !== "execution_sha256") {
+            payload[key] = entry[key];
+          }
+        }
+        const payloadSha = sha256HexSync(utf8Bytes(canonicalJson(payload)));
+        const execId = (typeof entry.execution_id === "string" && entry.execution_id.trim()) ? entry.execution_id.trim() : payloadSha;
+        if (byId.has(execId)) {
+          if (byId.get(execId).payloadSha !== payloadSha) {
+            throw new SyncSecurityError("Conflicting skill-executions.jsonl records share execution_id=" + execId + ".");
+          }
+          continue;
+        }
+        let sortTs = "";
+        const tsKeys = ["started_at", "timestamp", "recorded_at", "created_at", "ts"];
+        for (let t = 0; t < tsKeys.length; t += 1) {
+          const val = payload[tsKeys[t]];
+          if (typeof val === "string" && val.trim()) {
+            sortTs = val.trim();
+            break;
+          }
+        }
+        byId.set(execId, {
+          execId: execId,
+          tsKey: parseSortTimestampKey(sortTs),
+          seqIdx: seqIdx,
+          payloadSha: payloadSha,
+          payload: payload,
+        });
+        seqIdx += 1;
+      }
+    }
+    if (byId.size === 0) {
+      return new Uint8Array(0);
+    }
+    const ordered = Array.from(byId.values());
+    ordered.sort(function (a, b) {
+      if (a.tsKey.rank !== b.tsKey.rank) {
+        return a.tsKey.rank - b.tsKey.rank;
+      }
+      if (a.tsKey.num !== null && b.tsKey.num !== null && a.tsKey.num !== b.tsKey.num) {
+        return a.tsKey.num - b.tsKey.num;
+      }
+      if (a.tsKey.raw !== b.tsKey.raw) {
+        return a.tsKey.raw < b.tsKey.raw ? -1 : 1;
+      }
+      if (a.seqIdx !== b.seqIdx) {
+        return a.seqIdx - b.seqIdx;
+      }
+      return a.execId < b.execId ? -1 : a.execId > b.execId ? 1 : 0;
+    });
+    let prevSha = "0".repeat(64);
+    const lines = [];
+    for (let idx = 0; idx < ordered.length; idx += 1) {
+      const recBody = Object.assign({}, ordered[idx].payload, {
+        execution_index: idx + 1,
+        prev_execution_sha256: prevSha,
+      });
+      const execSha = sha256HexSync(utf8Bytes(canonicalJson(recBody)));
+      const fullRec = Object.assign({}, recBody, { execution_sha256: execSha });
+      lines.push(canonicalJson(fullRec));
+      prevSha = execSha;
+    }
+    return utf8Bytes(lines.join("\n") + "\n");
+  }
+
+  function mergeAppendOnlyJsonl(localBytes, remoteBytes, relPath) {
+    if (relPath === "0-raw/archive/skill-executions.jsonl") {
+      return mergeSkillExecutionsJsonl(localBytes, remoteBytes);
+    }
     const decoder = new TextDecoder("utf-8", { fatal: false });
     const byHash = new Map();
     let seqIdx = 0;
@@ -1866,6 +2094,7 @@
     let updated = 0;
     let deleted = 0;
     let mergedJsonl = 0;
+    const conflicts = [];
 
     for (let i = 0; i < remotePaths.length; i += 1) {
       const cleanRel = validateSyncRelPath(remotePaths[i]);
@@ -1886,7 +2115,7 @@
       }
       if (!baseSha || baseSha === localSha) {
         if (!baseSha && isAppendOnlyMergeableJsonl(cleanRel, incoming.appendOnlyJsonl)) {
-          const merged = mergeAppendOnlyJsonl(existingBytes, incoming.bytes);
+          const merged = mergeAppendOnlyJsonl(existingBytes, incoming.bytes, cleanRel);
           nextFiles[cleanRel] = merged;
           nextBaseShas[cleanRel] = await sha256Hex(merged);
           mergedJsonl += 1;
@@ -1902,14 +2131,23 @@
         continue;
       }
       if (isAppendOnlyMergeableJsonl(cleanRel, incoming.appendOnlyJsonl)) {
-        const merged = mergeAppendOnlyJsonl(existingBytes, incoming.bytes);
+        const merged = mergeAppendOnlyJsonl(existingBytes, incoming.bytes, cleanRel);
         nextFiles[cleanRel] = merged;
         nextBaseShas[cleanRel] = await sha256Hex(merged);
         mergedJsonl += 1;
       } else {
-        // Mobile read-replica fast-forwards canonical files while preserving divergent local working copy in notes
-        nextFiles[cleanRel] = incoming.bytes;
-        nextBaseShas[cleanRel] = incoming.sha256;
+        conflicts.push({
+          relPath: cleanRel,
+          baseSha: baseSha,
+          localSha: localSha,
+          localBytes: existingBytes,
+          remoteSha: incoming.sha256,
+          remoteBytes: incoming.bytes,
+        });
+        if (!cfg.preserveConflicts) {
+          nextFiles[cleanRel] = incoming.bytes;
+          nextBaseShas[cleanRel] = incoming.sha256;
+        }
         updated += 1;
       }
     }
@@ -1940,9 +2178,177 @@
       updated: updated,
       deleted: deleted,
       mergedJsonl: mergedJsonl,
+      conflicts: conflicts,
       files: nextFiles,
       syncCursor: {
         epoch: headVerified.epoch,
+        manifest_id: manifestId,
+        trusted_peers: trustedPeers,
+        baseFileShas: nextBaseShas,
+      },
+    };
+  }
+
+  async function pushVaultToBackend(backend, syncConfig, localState, deviceIdentity) {
+    const cfg = syncConfig || {};
+    const state = localState || {};
+    const id = deviceIdentity || {};
+    const devId = String(id.deviceId || "").trim();
+    const seedB64 = String(id.seedB64 || "").trim();
+    const pubkeyB64 = String(id.pubkeyB64 || "").trim();
+    if (!DEVICE_ID_RE.test(devId) || !seedB64 || !pubkeyB64) {
+      throw new SyncSecurityError("Valid mobile Ed25519 device identity (deviceId, seedB64, pubkeyB64) required for push.");
+    }
+    const seedBytes = base64ToBytes(seedB64);
+    if (seedBytes.length !== 32) {
+      throw new SyncSecurityError("Device Ed25519 private seed must be 32 bytes.");
+    }
+
+    const rawHeader = await backend.getObject("vault-header.json", { maxBytes: MAX_SYNC_HEADER_BYTES });
+    if (!rawHeader) {
+      throw new SyncError("Remote vault-header.json missing; initialize vault sync on desktop first.");
+    }
+    let headerDoc;
+    try {
+      headerDoc = JSON.parse(utf8DecodeStrict(rawHeader));
+    } catch (_err) {
+      throw new SyncSecurityError("Malformed JSON in remote vault-header.json.");
+    }
+    const vaultId = String(headerDoc.vault_id || "").trim().toLowerCase();
+    if (!HEX_ID_RE.test(vaultId)) {
+      throw new SyncSecurityError("Invalid vault_id in remote vault-header.json.");
+    }
+    if (cfg.vaultId && vaultId !== String(cfg.vaultId).trim().toLowerCase()) {
+      throw new SyncSecurityError("Remote vault-header.json vault_id mismatch against paired vault.");
+    }
+
+    const masterKey = await resolveSyncMasterKey(headerDoc, cfg);
+    const prevCursor = state.syncCursor || {};
+    const localEpoch = Number(prevCursor.epoch || prevCursor.lastSeenEpoch || 0);
+    const trustedPeers = Object.assign({}, prevCursor.trusted_peers || cfg.trustedPeers || {});
+    trustedPeers[devId] = pubkeyB64;
+
+    const rawHead = await backend.getObject("head.json", { maxBytes: MAX_SYNC_HEADER_BYTES });
+    let remoteEpoch = 0;
+    let parentManifestId = prevCursor.manifest_id || null;
+    if (rawHead) {
+      let head;
+      try {
+        head = JSON.parse(utf8DecodeStrict(rawHead));
+      } catch (_err) {
+        throw new SyncSecurityError("Malformed JSON in remote head.json.");
+      }
+      const headVerified = await verifyRemoteSyncHead(head, masterKey, {
+        vaultId: vaultId,
+        trustedPeers: trustedPeers,
+        lastEpoch: 0,
+        pinMode: Object.keys(trustedPeers).length > 0 ? "strict" : "tofu",
+        trustNewPeers: cfg.trustNewPeers,
+        forcePureJsEd25519: cfg.forcePureJsEd25519,
+      });
+      remoteEpoch = headVerified.epoch;
+      parentManifestId = headVerified.manifestId;
+      if (remoteEpoch > localEpoch) {
+        throw new SyncError(
+          "Remote sync head (epoch " +
+            remoteEpoch +
+            ") is ahead of local epoch " +
+            localEpoch +
+            ". Pull & merge before pushing."
+        );
+      }
+    }
+
+    const prevFiles = normalizeFilesMap(state.files);
+    const prevBaseShas = Object.assign({}, prevCursor.baseFileShas || {});
+    const manifestFiles = {};
+    const nextBaseShas = {};
+    let uploadedBlobs = 0;
+    let reusedBlobs = 0;
+
+    const sortedPaths = Object.keys(prevFiles).sort();
+    for (let i = 0; i < sortedPaths.length; i += 1) {
+      const cleanRel = validateSyncRelPath(sortedPaths[i]);
+      const rawBytes = toUint8Array(prevFiles[sortedPaths[i]]);
+      const plainSha = await sha256Hex(rawBytes);
+      const blobId = await computeBlindBlobId(masterKey, vaultId, plainSha);
+      const objKey = "objects/" + blobId.slice(0, 2) + "/" + blobId + ".enc";
+
+      if (prevBaseShas[cleanRel] === plainSha) {
+        reusedBlobs += 1;
+      } else {
+        const encBlob = await encryptSyncObject(masterKey, {
+          vaultId: vaultId,
+          kind: "blob",
+          objectId: blobId,
+          plaintextBytes: rawBytes,
+        });
+        await backend.putObject(objKey, encBlob);
+        uploadedBlobs += 1;
+      }
+      manifestFiles[cleanRel] = {
+        blob_id: blobId,
+        sha256: plainSha,
+        size: rawBytes.length,
+        append_only_jsonl: APPEND_ONLY_JSONL_PATHS.has(cleanRel),
+      };
+      nextBaseShas[cleanRel] = plainSha;
+    }
+
+    const newEpoch = Math.max(localEpoch, remoteEpoch) + 1;
+    const createdAt = new Date().toISOString().replace(/\.\d{3}Z$/, "+00:00");
+    const manifestDoc = {
+      schema_version: SYNC_SCHEMA_VERSION,
+      vault_id: vaultId,
+      epoch: newEpoch,
+      parent_manifest_id: parentManifestId,
+      device_id: devId,
+      created_at: createdAt,
+      file_count: Object.keys(manifestFiles).length,
+      files: manifestFiles,
+    };
+    const manifestPlainStr = canonicalJson(manifestDoc);
+    const manifestPlainBytes = utf8Bytes(manifestPlainStr);
+    const manifestId = await sha256Hex(
+      utf8Bytes(vaultId + ":" + newEpoch + ":" + createdAt + ":" + manifestPlainStr)
+    );
+    const manifestCt = await encryptSyncObject(masterKey, {
+      vaultId: vaultId,
+      kind: "manifest",
+      objectId: manifestId,
+      plaintextBytes: manifestPlainBytes,
+    });
+    await backend.putObject("manifests/" + manifestId + ".enc", manifestCt);
+
+    const headDoc = {
+      schema_version: SYNC_SCHEMA_VERSION,
+      vault_id: vaultId,
+      epoch: newEpoch,
+      parent_manifest_id: parentManifestId,
+      manifest_id: manifestId,
+      manifest_ciphertext_sha256: await sha256Hex(manifestCt),
+      device_id: devId,
+      device_pubkey_b64: pubkeyB64,
+      created_at: createdAt,
+    };
+    const sigBytes = await signEd25519Message(seedBytes, headSigningBytes(headDoc), {
+      forcePureJs: Boolean(cfg.forcePureJsEd25519),
+    });
+    headDoc.signature_b64 = bytesToBase64(sigBytes);
+    headDoc.head_mac = await computeHeadMac(masterKey, vaultId, headDoc);
+    await backend.putObject("head.json", utf8Bytes(JSON.stringify(headDoc, null, 2) + "\n"));
+
+    return {
+      status: "pushed",
+      vaultId: vaultId,
+      epoch: newEpoch,
+      manifestId: manifestId,
+      deviceId: devId,
+      uploadedBlobs: uploadedBlobs,
+      reusedBlobs: reusedBlobs,
+      files: prevFiles,
+      syncCursor: {
+        epoch: newEpoch,
         manifest_id: manifestId,
         trusted_peers: trustedPeers,
         baseFileShas: nextBaseShas,
@@ -2738,6 +3144,22 @@
       captured_at: String(payload.captured_at || createdAt).slice(0, 64),
       client: String(payload.client || "mobile-vault").slice(0, 32),
     };
+    if (payload.attachment && typeof payload.attachment === "object") {
+      const att = payload.attachment;
+      const cleanAtt = {
+        filename: String(att.filename || "capture.bin").slice(0, 255),
+        mime_type: String(att.mime_type || "application/octet-stream").slice(0, 128),
+        size_bytes: Math.max(0, Number(att.size_bytes) || 0),
+        sha256: String(att.sha256 || "").slice(0, 64),
+      };
+      if (typeof att.data_b64 === "string" && att.data_b64.length > 0) {
+        if (att.data_b64.length > 180000) {
+          throw new SyncSecurityError("Media attachment payload exceeds SBID1 envelope limit.");
+        }
+        cleanAtt.data_b64 = att.data_b64;
+      }
+      cleanDoc.attachment = cleanAtt;
+    }
     const plaintextBytes = utf8Bytes(JSON.stringify(cleanDoc));
 
     const iv = webCrypto.getRandomValues(new Uint8Array(12));
@@ -2807,7 +3229,9 @@
     bytesToBase64Url: bytesToBase64Url,
     base64UrlToBytes: base64UrlToBytes,
     concatBytes: concatBytes,
+    APPEND_ONLY_JSONL_PATHS: new Set(APPEND_ONLY_JSONL_PATHS),
     canonicalJson: canonicalJson,
+    canonicalJsonString: canonicalJson,
     sha256BytesSync: sha256BytesSync,
     sha256HexSync: sha256HexSync,
     sha256Bytes: sha256Bytes,
@@ -2824,6 +3248,9 @@
     headSigningBytes: headSigningBytes,
     computeHeadMac: computeHeadMac,
     verifyEd25519Signature: verifyEd25519Signature,
+    signEd25519Message: signEd25519Message,
+    generateEd25519Keypair: generateEd25519Keypair,
+    deriveEd25519PublicFromSeed: deriveEd25519PublicFromSeed,
     verifyRemoteSyncHead: verifyRemoteSyncHead,
     validateSyncRelPath: validateSyncRelPath,
     validateBackupRelPath: validateBackupRelPath,
@@ -2834,6 +3261,7 @@
     InMemoryOrBundleBackend: InMemoryOrBundleBackend,
     InMemoryKvBackend: InMemoryKvBackend,
     pullVaultFromBackend: pullVaultFromBackend,
+    pushVaultToBackend: pushVaultToBackend,
     importSbVaultArchive: importSbVaultArchive,
     EncryptedDeviceStore: EncryptedDeviceStore,
     parseVaultPairingFragment: parseVaultPairingFragment,

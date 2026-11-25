@@ -35,7 +35,10 @@ from config import (
     _is_reparse_or_link,
     file_sha256,
     is_content_markdown,
+    resolve_module_atoms_and_brain,
+    resolve_module_vault_path,
     safe_file_in_dir,
+    snapshot_module_defaults,
 )
 from memory_format import (
     evaluate_temporal_validity,
@@ -48,6 +51,8 @@ from memory_format import (
 from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 from recall import normalize_project_tag, project_tags_match
 from review_atom import approved_revision_is_current
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
 PLAYBOOK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
 DISALLOWED_AUTOMATED_ACTORS = frozenset({"auto", "system", "llm", "model", "ollama", "assistant", "agent"})
@@ -304,14 +309,47 @@ def _step_is_grounded_in_atoms(step_text: str, allowed_corpora: list[tuple[str, 
     return False
 
 
+def _resolve_playbook_paths(
+    *,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
+    playbooks_dir: str | None = None,
+    telemetry_db_path: str | None = None,
+) -> tuple[str, str, str, str]:
+    resolved_brain, resolved_atoms = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
+    explicit_parent = resolved_brain if (brain_dir is not None or atoms_dir is not None) else None
+    if explicit_parent is None and playbooks_dir is not None and str(playbooks_dir).strip():
+        pb_abs = os.path.abspath(str(playbooks_dir))
+        explicit_parent = os.path.dirname(pb_abs)
+        resolved_brain = explicit_parent
+        resolved_atoms = resolve_module_vault_path(globals(), "ATOMS_DIR", None, brain_dir=explicit_parent)
+    resolved_pbs = resolve_module_vault_path(
+        globals(), "PLAYBOOKS_DIR", playbooks_dir, brain_dir=explicit_parent
+    )
+    resolved_tel = resolve_module_vault_path(
+        globals(), "TELEMETRY_DB_PATH", telemetry_db_path, brain_dir=explicit_parent
+    )
+    return resolved_brain, resolved_atoms, resolved_pbs, resolved_tel
+
+
 def inspect_skill_candidates(
     *,
-    atoms_dir: str = ATOMS_DIR,
-    brain_dir: str = BRAIN_DIR,
-    playbooks_dir: str = PLAYBOOKS_DIR,
-    telemetry_db_path: str = TELEMETRY_DB_PATH,
+    atoms_dir: str | None = None,
+    brain_dir: str | None = None,
+    playbooks_dir: str | None = None,
+    telemetry_db_path: str | None = None,
 ) -> list[dict[str, object]]:
     """Return approved procedural atoms and their promotion readiness."""
+    brain_dir, atoms_dir, playbooks_dir, telemetry_db_path = _resolve_playbook_paths(
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        playbooks_dir=playbooks_dir,
+        telemetry_db_path=telemetry_db_path,
+    )
     fitness = compute_memory_fitness_report(
         atoms_dir=atoms_dir,
         brain_dir=brain_dir,
@@ -362,12 +400,18 @@ def promote_skill_playbook(
     acknowledge_corrections: bool = False,
     expected_playbook_sha256: str | None = None,
     allow_multi_project: bool = False,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
-    playbooks_dir: str = PLAYBOOKS_DIR,
-    telemetry_db_path: str = TELEMETRY_DB_PATH,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
+    playbooks_dir: str | None = None,
+    telemetry_db_path: str | None = None,
 ) -> dict[str, object]:
     """CAS-locked owner promotion of one or more approved procedural atoms into a human-readable Playbook."""
+    brain_dir, atoms_dir, playbooks_dir, telemetry_db_path = _resolve_playbook_paths(
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        playbooks_dir=playbooks_dir,
+        telemetry_db_path=telemetry_db_path,
+    )
     norm_id = _normalize_playbook_id(playbook_id)
     clean_actor = _validate_human_actor(actor)
     clean_title = _sanitize_line(title, max_len=200)
@@ -623,12 +667,22 @@ def promote_skill_playbook(
 def verify_playbook_integrity(
     playbook_path: str,
     *,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
-    playbooks_dir: str = PLAYBOOKS_DIR,
-    telemetry_db_path: str = TELEMETRY_DB_PATH,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
+    playbooks_dir: str | None = None,
+    telemetry_db_path: str | None = None,
 ) -> PlaybookIntegrityReport:
     """Verify Playbook schema, backing procedural atom SHA-256 & owner approvals, and correction bounds."""
+    if playbooks_dir is None and brain_dir is None and os.path.isabs(playbook_path):
+        parent = os.path.dirname(os.path.abspath(playbook_path))
+        if os.path.basename(parent) == "5-playbooks":
+            playbooks_dir = parent
+    brain_dir, atoms_dir, playbooks_dir, telemetry_db_path = _resolve_playbook_paths(
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        playbooks_dir=playbooks_dir,
+        telemetry_db_path=telemetry_db_path,
+    )
     fname = os.path.basename(playbook_path)
     pb_id_fallback = os.path.splitext(fname)[0]
     if _is_reparse_or_link(playbooks_dir):
@@ -829,13 +883,19 @@ def verify_playbook_integrity(
 
 def list_playbooks(
     *,
-    playbooks_dir: str = PLAYBOOKS_DIR,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
-    telemetry_db_path: str = TELEMETRY_DB_PATH,
+    playbooks_dir: str | None = None,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
+    telemetry_db_path: str | None = None,
     active_only: bool = True,
 ) -> list[PlaybookIntegrityReport]:
     """List Playbooks in brain/5-playbooks/ with real-time cryptographic integrity verification."""
+    brain_dir, atoms_dir, playbooks_dir, telemetry_db_path = _resolve_playbook_paths(
+        brain_dir=brain_dir,
+        atoms_dir=atoms_dir,
+        playbooks_dir=playbooks_dir,
+        telemetry_db_path=telemetry_db_path,
+    )
     if not os.path.isdir(playbooks_dir) or _is_reparse_or_link(playbooks_dir):
         return []
     reports: list[PlaybookIntegrityReport] = []
@@ -861,10 +921,14 @@ def deprecate_skill_playbook(
     expected_sha256: str,
     actor: str,
     rationale: str,
-    brain_dir: str = BRAIN_DIR,
-    playbooks_dir: str = PLAYBOOKS_DIR,
+    brain_dir: str | None = None,
+    playbooks_dir: str | None = None,
 ) -> dict[str, object]:
     """CAS-locked owner deprecation of an existing Playbook."""
+    brain_dir, _atoms_dir, playbooks_dir, _tel = _resolve_playbook_paths(
+        brain_dir=brain_dir,
+        playbooks_dir=playbooks_dir,
+    )
     clean_actor = _validate_human_actor(actor)
     clean_rationale = _sanitize_line(rationale, max_len=500)
     if not clean_rationale:

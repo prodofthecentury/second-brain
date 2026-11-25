@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import warnings
 
 import httpx
 from PIL import Image, ImageDraw, ImageSequence, PngImagePlugin
@@ -32,6 +33,7 @@ from creative_media import (  # noqa: E402
     CreativeMediaPolicyError,
     CreativeMediaSecretBlockedError,
     CreativeMediaSecurityError,
+    CreativeMediaUnavailableError,
     PROCEDURAL_STYLES,
     enforce_creative_hardware_gate,
     generate_local_image,
@@ -198,6 +200,7 @@ class CreativeMediaProceduralAndContainerTests(unittest.TestCase):
         self.assertNotEqual(a1.sha256, a3.sha256)
 
     def test_offline_procedural_mp4_exact_isobmff_boxes_and_jpeg_frame_offsets(self) -> None:
+        # 1. Pure-Python ISO-BMFF H.264 Baseline (`avc1` + `avcC` + `stss`) without external ffmpeg or PyAV
         vid = generate_local_video(
             "Animated orbital knowledge graph evolution across memory epochs",
             brain_dir=self.brain_dir,
@@ -211,11 +214,11 @@ class CreativeMediaProceduralAndContainerTests(unittest.TestCase):
             seed=77,
             title="Orbital Memory Graph",
             hardware_profile=self.tier0,
-            ffmpeg_path_override="",  # Force zero-ffmpeg environment!
+            ffmpeg_path_override="",  # Force zero-ffmpeg & zero-PyAV pure-Python H.264 fallback!
         )
         self.assertEqual(vid.media_type, "video")
         self.assertEqual(vid.output_format, "mp4")
-        self.assertEqual(vid.encoder_used, "iso_bmff_mjpeg_pure_python")
+        self.assertEqual(vid.encoder_used, "iso_bmff_h264_avc1_pure_python")
         self.assertEqual(vid.frames, 8)
         self.assertEqual(vid.fps, 12)
         self.assertTrue(os.path.isfile(vid.file_path))
@@ -230,8 +233,11 @@ class CreativeMediaProceduralAndContainerTests(unittest.TestCase):
         self.assertIn("trak", info["moov_boxes"])
         self.assertIn("tkhd", info["trak_boxes"])
         self.assertIn("mdia", info["trak_boxes"])
-        self.assertEqual(set(info["stbl_boxes"]), {"stsd", "stts", "stsc", "stsz", "stco"})
-        self.assertEqual(info["codec_tag"], "jpeg")
+        self.assertEqual(set(info["stbl_boxes"]), {"stsd", "stts", "stsc", "stsz", "stss", "stco"})
+        self.assertEqual(info["codec_tag"], "avc1")
+        self.assertTrue(info["has_avcC"])
+        self.assertTrue(info["has_stss"])
+        self.assertTrue(info["browser_playable"])
         self.assertEqual(info["width"], 384)
         self.assertEqual(info["height"], 256)
         self.assertEqual(info["horiz_dpi"], 72)
@@ -243,31 +249,49 @@ class CreativeMediaProceduralAndContainerTests(unittest.TestCase):
         self.assertEqual(len(sizes), 8)
         self.assertEqual(len(offsets), 8)
 
-        frame_pixel_hashes: list[str] = []
-        for idx, (off, sz) in enumerate(zip(offsets, sizes)):
-            sample = mp4_bytes[off : off + sz]
-            self.assertEqual(
-                sample[:2],
-                b"\xff\xd8",
-                f"Frame {idx} at offset {off} missing JPEG SOI 0xFFD8",
-            )
-            self.assertEqual(
-                sample[-2:],
-                b"\xff\xd9",
-                f"Frame {idx} at offset {off} missing JPEG EOI 0xFFD9",
-            )
-            with Image.open(io.BytesIO(sample)) as jf:
-                self.assertEqual(jf.size, (384, 256))
-                frame_pixel_hashes.append(hashlib.sha256(jf.tobytes()).hexdigest())
+        # Decode with PyAV (FFmpeg libavcodec H.264) when available to prove 100% browser/decoder playability
+        try:
+            import av  # type: ignore[import-not-found]
+        except ImportError:
+            av = None
+        if av is not None:
+            with av.open(vid.file_path) as dec_c:
+                decoded = [f.to_image() for f in dec_c.decode(video=0)]
+            self.assertEqual(len(decoded), 8)
+            self.assertEqual(decoded[0].size, (384, 256))
+            self.assertEqual(len({hashlib.sha256(f.tobytes()).hexdigest() for f in decoded}), 8)
 
-        # Prove genuine multi-frame animation (not static duplicate frames)
-        self.assertEqual(len(set(frame_pixel_hashes)), 8)
+        # 2. Default PyAV libx264 H.264 (`avc1`) encoding without external ffmpeg CLI
+        if av is not None and "libx264" in getattr(av, "codecs_available", set()):
+            with mock.patch("shutil.which", return_value=None):
+                vid_pyav = generate_local_video(
+                    "Animated PyAV H.264 graph",
+                    brain_dir=self.brain_dir,
+                    backend="builtin_procedural_local",
+                    style="blueprint",
+                    output_format="mp4",
+                    width=320,
+                    height=240,
+                    frames=6,
+                    fps=12,
+                    seed=88,
+                    hardware_profile=self.tier0,
+                )
+            self.assertEqual(vid_pyav.encoder_used, "pyav_libx264")
+            pyav_info = inspect_mp4_container(Path(vid_pyav.file_path).read_bytes())
+            self.assertEqual(pyav_info["codec_tag"], "avc1")
+            self.assertTrue(pyav_info["has_avcC"])
+            self.assertTrue(pyav_info["browser_playable"])
+            with av.open(vid_pyav.file_path) as dec_c2:
+                dec2 = [f.to_image() for f in dec_c2.decode(video=0)]
+            self.assertEqual(len(dec2), 6)
 
     def test_offline_procedural_gif_animation_and_working_note_attachment(self) -> None:
         gif_art = generate_local_video(
             "Storyboard sequence of offline proof verification",
             brain_dir=self.brain_dir,
             backend="auto",
+            allow_procedural_fallback=True,
             style="storyboard",
             output_format="gif",
             width=320,
@@ -283,6 +307,8 @@ class CreativeMediaProceduralAndContainerTests(unittest.TestCase):
         )
         self.assertEqual(gif_art.output_format, "gif")
         self.assertEqual(gif_art.backend_used, "builtin_procedural_local")
+        self.assertTrue(gif_art.degraded_fallback)
+        self.assertTrue(bool(gif_art.warning))
         self.assertEqual(gif_art.project_scope, "project:alpha")
         self.assertIsNotNone(gif_art.attached_note_filename)
 
@@ -442,6 +468,9 @@ class CreativeMediaHardwareGateAndMockLoopbackTests(unittest.TestCase):
         dirty_png_3 = _png_bytes_with_untrusted_metadata(256, 256, (70, 200, 120), "EVIL_SECRET_METADATA_CHUNK_3")
         b64_dirty = base64.b64encode(dirty_png).decode("ascii")
 
+        submitted_workflows: list[dict[str, object]] = []
+        use_animatediff = False
+
         def mock_handler(request: httpx.Request) -> httpx.Response:
             path = request.url.path
             if request.url.port == 7860:
@@ -452,6 +481,17 @@ class CreativeMediaHardwareGateAndMockLoopbackTests(unittest.TestCase):
             if request.url.port == 8188:
                 if path == "/system_stats":
                     return httpx.Response(200, json={"devices": [{"name": "cuda:0 NVIDIA RTX 4070"}]})
+                if path == "/object_info":
+                    if use_animatediff:
+                        return httpx.Response(
+                            200,
+                            json={
+                                "ADE_AnimateDiffLoaderGen1": {
+                                    "input": {"required": {"model_name": [["mm_sd_v15_v2.ckpt"]]}}
+                                }
+                            },
+                        )
+                    return httpx.Response(200, json={})
                 if path == "/object_info/CheckpointLoaderSimple":
                     return httpx.Response(
                         200,
@@ -463,8 +503,11 @@ class CreativeMediaHardwareGateAndMockLoopbackTests(unittest.TestCase):
                     )
                 if path == "/prompt":
                     body = json.loads(request.content.decode("utf-8"))
-                    batch_sz = body["prompt"]["2"]["inputs"]["batch_size"]
-                    pid = "vid-prompt-01" if batch_sz > 1 else "img-prompt-01"
+                    wf = body["prompt"]
+                    submitted_workflows.append(wf)
+                    class_types = [v.get("class_type") for v in wf.values() if isinstance(v, dict)]
+                    is_vid = ("ADE_AnimateDiffLoaderGen1" in class_types) or ("LatentCrop" in class_types) or (len(wf) > 7)
+                    pid = "vid-prompt-01" if is_vid else "img-prompt-01"
                     return httpx.Response(200, json={"prompt_id": pid})
                 if path == "/history/img-prompt-01":
                     return httpx.Response(
@@ -546,7 +589,7 @@ class CreativeMediaHardwareGateAndMockLoopbackTests(unittest.TestCase):
         self.assertEqual(comfy_img.backend_used, "comfyui_local")
         self.assertNotIn(b"EVIL_SECRET_METADATA_CHUNK", Path(comfy_img.file_path).read_bytes())
 
-        # 3. ComfyUI Local Video -> sanitized frames muxed into valid ISO-BMFF MP4
+        # 3. ComfyUI Local Video (stock nodes -> progressive latent motion chain, NEVER EmptyLatentImage(batch_size=frames))
         comfy_vid = generate_local_video(
             "ComfyUI AnimateDiff motion synthesis",
             brain_dir=self.brain_dir,
@@ -563,8 +606,35 @@ class CreativeMediaHardwareGateAndMockLoopbackTests(unittest.TestCase):
         )
         self.assertEqual(comfy_vid.backend_used, "comfyui_local")
         self.assertEqual(comfy_vid.frames, 3)
+        self.assertIn("latent_motion_chain", comfy_vid.encoder_used)
+        vid_wf_stock = submitted_workflows[-1]
+        self.assertEqual(vid_wf_stock["2"]["inputs"]["batch_size"], 1)
+        self.assertTrue(any(n.get("class_type") == "LatentCrop" for n in vid_wf_stock.values() if isinstance(n, dict)))
         mp4_info = inspect_mp4_container(Path(comfy_vid.file_path).read_bytes())
         self.assertEqual(mp4_info["sample_count"], 3)
+        self.assertEqual(mp4_info["codec_tag"], "avc1")
+        self.assertTrue(mp4_info["browser_playable"])
+
+        # 4. ComfyUI AnimateDiff when ADE_AnimateDiffLoaderGen1 is advertised in /object_info
+        use_animatediff = True
+        comfy_vid_ad = generate_local_video(
+            "ComfyUI AnimateDiff dedicated loader test",
+            brain_dir=self.brain_dir,
+            backend="comfyui_local",
+            output_format="mp4",
+            width=256,
+            height=256,
+            frames=3,
+            fps=12,
+            hardware_profile=self.tier3_gpu,
+            comfyui_url="http://127.0.0.1:8188",
+            http_transport=transport,
+            comfy_poll_interval=0.0,
+        )
+        self.assertIn("animatediff", comfy_vid_ad.encoder_used)
+        self.assertTrue(
+            any(n.get("class_type") == "ADE_AnimateDiffLoaderGen1" for n in submitted_workflows[-1].values() if isinstance(n, dict))
+        )
 
 
 class CreativeMediaLoopbackSecurityTests(unittest.TestCase):
@@ -960,6 +1030,149 @@ class CreativeMediaDLPAndVaultGroundingTests(unittest.TestCase):
                 hardware_profile=self.tier0,
             )
 
+    def test_auto_mode_fail_closed_nominal_16gb_unlock_and_diffusers_image_video(self) -> None:
+        # 1. Nominal 16 GB machine (15.91 GiB usable RAM) MUST unlock neural backends!
+        win_1591 = _make_profile(
+            tier_id="tier_2_cpu_balanced",
+            tier_label="Tier 2 — Balanced CPU 7B Intelligence",
+            total_ram_gib=15.91,
+            ollama_reachable=True,
+        )
+        st_1591 = get_creative_media_status(
+            hardware_profile=win_1591,
+            sd_webui_url="http://127.0.0.1:1",
+            comfyui_url="http://127.0.0.1:1",
+            probe_timeout=0.05,
+        )
+        self.assertTrue(st_1591.neural_backends_unlocked)
+
+        # 2. Default backend="auto" MUST fail closed when no neural daemon/diffusers model is ready
+        with mock.patch.object(creative_media, "_is_diffusers_installed", return_value=False):
+            with self.assertRaises(CreativeMediaUnavailableError):
+                generate_local_image(
+                    "Should fail closed without neural daemon",
+                    brain_dir=self.brain_dir,
+                    backend="auto",
+                    width=256,
+                    height=256,
+                    hardware_profile=win_1591,
+                    sd_webui_url="http://127.0.0.1:1",
+                    comfyui_url="http://127.0.0.1:1",
+                )
+            with self.assertRaises(CreativeMediaUnavailableError):
+                generate_local_video(
+                    "Should fail closed without neural video daemon",
+                    brain_dir=self.brain_dir,
+                    backend="auto",
+                    width=256,
+                    height=256,
+                    frames=4,
+                    fps=8,
+                    hardware_profile=win_1591,
+                    comfyui_url="http://127.0.0.1:1",
+                )
+
+        # 3. Mocked diffusers_local image & video + automatic selection in backend="auto"
+        class _FakeGenerator:
+            def __init__(self, device: str = "cpu") -> None:
+                self.device = device
+
+            def manual_seed(self, seed: int) -> "_FakeGenerator":
+                return self
+
+        class _FakeTorch:
+            float16 = "fp16"
+            float32 = "fp32"
+
+            class cuda:
+                @staticmethod
+                def is_available() -> bool:
+                    return False
+
+            class backends:
+                class mps:
+                    @staticmethod
+                    def is_available() -> bool:
+                        return False
+
+            Generator = _FakeGenerator
+
+        class _FakeAutoT2I:
+            @classmethod
+            def from_pretrained(cls, model_id: str, **kwargs: object) -> "_FakeAutoT2I":
+                assert kwargs.get("local_files_only") is True
+                return cls()
+
+            def to(self, device: str) -> "_FakeAutoT2I":
+                return self
+
+            def __call__(self, **kwargs: object) -> object:
+                img = Image.new("RGB", (int(kwargs["width"]), int(kwargs["height"])), (32, 160, 210))
+                return type("Out", (), {"images": [img]})()
+
+        class _FakeT2V:
+            @classmethod
+            def from_pretrained(cls, model_id: str, **kwargs: object) -> "_FakeT2V":
+                return cls()
+
+            def to(self, device: str) -> "_FakeT2V":
+                return self
+
+            def __call__(self, **kwargs: object) -> object:
+                n = int(kwargs["num_frames"])
+                w, h = int(kwargs["width"]), int(kwargs["height"])
+                frames_list = [Image.new("RGB", (w, h), (40 + i * 25, 110, 200)) for i in range(n)]
+                return type("VOut", (), {"frames": [frames_list]})()
+
+        fake_diffusers = type(
+            "diffusers",
+            (),
+            {"AutoPipelineForText2Image": _FakeAutoT2I, "TextToVideoSDPipeline": _FakeT2V},
+        )
+        with (
+            mock.patch.dict(sys.modules, {"torch": _FakeTorch, "diffusers": fake_diffusers}),
+            mock.patch.object(creative_media, "_is_diffusers_installed", return_value=True),
+            mock.patch.dict(os.environ, {"BRAIN_DIFFUSERS_MODEL": "local/sd-turbo"}, clear=False),
+        ):
+            st_diff = get_creative_media_status(
+                hardware_profile=win_1591,
+                sd_webui_url="http://127.0.0.1:1",
+                comfyui_url="http://127.0.0.1:1",
+                probe_timeout=0.05,
+            )
+            self.assertEqual(st_diff.recommended_image_backend, "diffusers_local")
+            self.assertEqual(st_diff.recommended_video_backend, "diffusers_local")
+
+            d_img = generate_local_image(
+                "Local diffusers diagram",
+                brain_dir=self.brain_dir,
+                backend="auto",
+                width=256,
+                height=256,
+                hardware_profile=win_1591,
+                sd_webui_url="http://127.0.0.1:1",
+                comfyui_url="http://127.0.0.1:1",
+            )
+            self.assertEqual(d_img.backend_used, "diffusers_local")
+
+            d_vid = generate_local_video(
+                "Local diffusers temporal video",
+                brain_dir=self.brain_dir,
+                backend="auto",
+                output_format="mp4",
+                width=256,
+                height=256,
+                frames=4,
+                fps=8,
+                hardware_profile=win_1591,
+                comfyui_url="http://127.0.0.1:1",
+            )
+            self.assertEqual(d_vid.backend_used, "diffusers_local")
+            self.assertEqual(d_vid.frames, 4)
+            d_info = inspect_mp4_container(Path(d_vid.file_path).read_bytes())
+            self.assertEqual(d_info["codec_tag"], "avc1")
+            self.assertTrue(d_info["browser_playable"])
+
     def test_cli_status_image_video_and_list_commands(self) -> None:
         buf = io.StringIO()
         with mock.patch("sys.stdout", buf), mock.patch.object(
@@ -970,11 +1183,13 @@ class CreativeMediaDLPAndVaultGroundingTests(unittest.TestCase):
             status_json = json.loads(buf.getvalue())
             self.assertEqual(status_json["creative_tier"], "tier_0_lexical_only")
 
-        buf_img = io.StringIO()
-        with mock.patch("sys.stdout", buf_img), mock.patch.object(
-            creative_media, "detect_hardware_profile", return_value=self.tier0
+        # Default CLI auto fails closed when no neural backend is online
+        with (
+            mock.patch.object(creative_media, "detect_hardware_profile", return_value=self.tier0),
+            mock.patch.object(creative_media, "_is_diffusers_installed", return_value=False),
+            self.assertRaises(CreativeMediaUnavailableError),
         ):
-            rc_img = creative_media.main(
+            creative_media.main(
                 [
                     "image",
                     "--prompt",
@@ -987,9 +1202,32 @@ class CreativeMediaDLPAndVaultGroundingTests(unittest.TestCase):
                     self.brain_dir,
                 ]
             )
+
+        buf_img = io.StringIO()
+        with (
+            mock.patch("sys.stdout", buf_img),
+            mock.patch.object(creative_media, "detect_hardware_profile", return_value=self.tier0),
+            warnings.catch_warnings(record=True),
+        ):
+            warnings.simplefilter("always")
+            rc_img = creative_media.main(
+                [
+                    "image",
+                    "--prompt",
+                    "CLI concept diagram",
+                    "--width",
+                    "256",
+                    "--height",
+                    "256",
+                    "--allow-procedural-fallback",
+                    "--brain-dir",
+                    self.brain_dir,
+                ]
+            )
             self.assertEqual(rc_img, 0)
             img_out = json.loads(buf_img.getvalue())
             self.assertEqual(img_out["media_type"], "image")
+            self.assertTrue(img_out["degraded_fallback"])
 
         buf_list = io.StringIO()
         with mock.patch("sys.stdout", buf_list):

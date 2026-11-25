@@ -28,15 +28,64 @@ if __name__ in ("chat_threads", "scripts.chat_threads"):
     sys.modules.setdefault("chat_threads", sys.modules[__name__])
     sys.modules.setdefault("scripts.chat_threads", sys.modules[__name__])
 
-from config import BRAIN_DIR, _is_reparse_or_link
+from config import (
+    BRAIN_DIR,
+    _is_reparse_or_link,
+    resolve_module_vault_path,
+    snapshot_module_defaults,
+)
 from host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions
 from lexical_store import FTS_STOP_WORDS, TOKEN_PATTERN
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
 MAX_THREAD_TITLE_LEN = 160
 MAX_TURN_CONTENT_LEN = 24_000
 MAX_HISTORY_TURNS_IN_PROMPT = 4
 MAX_HISTORY_PROMPT_CHARS = 1400
+MAX_CUSTOM_RULES_LEN = 4000
+MAX_DONE_CRITERIA_LEN = 2000
 THREAD_ID_RE = re.compile(r"^thr-[a-z0-9]{8,32}$")
+
+WORK_MODES: tuple[str, ...] = ("chat", "build")
+BEHAVIOR_MODES: tuple[str, ...] = ("autopilot", "interview")
+PERSONA_PROFILES: dict[str, dict[str, str]] = {
+    "grounded_default": {
+        "id": "grounded_default",
+        "label": "Grounded Default",
+        "default_work_mode": "chat",
+        "description": "Strict source-grounded recall and synthesis over verified atoms and owner notes.",
+        "instruction": "Cite every factual sentence with [V#], [N#], or [P#] and keep answers concise.",
+    },
+    "coding": {
+        "id": "coding",
+        "label": "Coding",
+        "default_work_mode": "build",
+        "description": "Modular production engineering, clean diffs, edge-case guards, and unit tests.",
+        "instruction": "Output modular, well-typed code in labeled fenced blocks with edge-case checks and unit tests.",
+    },
+    "website_builder": {
+        "id": "website_builder",
+        "label": "Website Builder",
+        "default_work_mode": "build",
+        "description": "Responsive editorial/product landing pages and UI sections renderable in live Build Canvas.",
+        "instruction": "Provide self-contained responsive HTML, CSS, and vanilla JS in fenced ```html, ```css, and ```js blocks suitable for live browser preview.",
+    },
+    "app_builder": {
+        "id": "app_builder",
+        "label": "App Builder",
+        "default_work_mode": "build",
+        "description": "Interactive client-side productivity utilities and data visualizers with keyboard ergonomics.",
+        "instruction": "Build an interactive offline client-side web app in fenced ```html/```css/```js blocks with accessible state management.",
+    },
+    "game_builder": {
+        "id": "game_builder",
+        "label": "Game Builder",
+        "default_work_mode": "build",
+        "description": "Self-contained HTML5 Canvas/SVG 60fps mini-games with crisp controls, HUD, and instant restart.",
+        "instruction": "Build a self-contained playable HTML5 Canvas/SVG game in fenced ```html/```css/```js blocks with keyboard/mouse controls, score HUD, and reset.",
+    },
+}
 
 _PRONOUN_FOLLOWUP_RE = re.compile(
     r"(?i)\b(?:it|its|itself|that|this|those|these|they|them|their|theirs|he|him|his|she|her|hers|same|former|latter)\b"
@@ -65,8 +114,8 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
-def chat_threads_db_path(brain_dir: str | Path = BRAIN_DIR) -> str:
-    b = os.path.abspath(str(brain_dir))
+def chat_threads_db_path(brain_dir: str | Path | None = None) -> str:
+    b = resolve_module_vault_path(globals(), "BRAIN_DIR", str(brain_dir) if brain_dir is not None else None)
     if os.path.lexists(b) and _is_reparse_or_link(b):
         raise PermissionError(f"Refusing to open chat threads DB under symlinked vault: {b}")
     sidecar = os.path.join(b, ".sidecar")
@@ -79,7 +128,7 @@ def chat_threads_db_path(brain_dir: str | Path = BRAIN_DIR) -> str:
     return db_file
 
 
-def _connect_db(brain_dir: str | Path = BRAIN_DIR) -> sqlite3.Connection:
+def _connect_db(brain_dir: str | Path | None = None) -> sqlite3.Connection:
     db_file = chat_threads_db_path(brain_dir)
     existed = os.path.exists(db_file)
     conn = sqlite3.connect(db_file, timeout=10.0)
@@ -98,6 +147,11 @@ def _connect_db(brain_dir: str | Path = BRAIN_DIR) -> sqlite3.Connection:
             project_scope TEXT,
             host_id TEXT NOT NULL DEFAULT 'ollama_local',
             mode TEXT NOT NULL DEFAULT 'verified',
+            work_mode TEXT NOT NULL DEFAULT 'chat',
+            persona_id TEXT NOT NULL DEFAULT 'grounded_default',
+            behavior_mode TEXT NOT NULL DEFAULT 'autopilot',
+            custom_rules TEXT NOT NULL DEFAULT '',
+            done_criteria TEXT NOT NULL DEFAULT '',
             turn_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS chat_turns (
@@ -117,12 +171,99 @@ def _connect_db(brain_dir: str | Path = BRAIN_DIR) -> sqlite3.Connection:
             ON chat_turns(thread_id, turn_index);
         """
     )
+    existing_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(chat_threads)").fetchall()}
+    migrations = (
+        ("work_mode", "TEXT NOT NULL DEFAULT 'chat'"),
+        ("persona_id", "TEXT NOT NULL DEFAULT 'grounded_default'"),
+        ("behavior_mode", "TEXT NOT NULL DEFAULT 'autopilot'"),
+        ("custom_rules", "TEXT NOT NULL DEFAULT ''"),
+        ("done_criteria", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for col_name, col_def in migrations:
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE chat_threads ADD COLUMN {col_name} {col_def};")
     if not existed:
         try:
             restrict_security_file_permissions(Path(db_file))
         except Exception:
             pass
     return conn
+
+
+def normalize_work_mode(raw: object) -> str:
+    val = str(raw or "chat").strip().lower() or "chat"
+    if val not in WORK_MODES:
+        raise ChatThreadError(f"work_mode must be one of {WORK_MODES}")
+    return val
+
+
+def normalize_persona_id(raw: object) -> str:
+    val = str(raw or "grounded_default").strip().lower() or "grounded_default"
+    if val not in PERSONA_PROFILES:
+        raise ChatThreadError(f"persona_id must be one of {tuple(PERSONA_PROFILES.keys())}")
+    return val
+
+
+def normalize_behavior_mode(raw: object) -> str:
+    val = str(raw or "autopilot").strip().lower() or "autopilot"
+    if val not in BEHAVIOR_MODES:
+        raise ChatThreadError(f"behavior_mode must be one of {BEHAVIOR_MODES}")
+    return val
+
+
+def normalize_custom_rules(raw: object) -> str:
+    if raw is None:
+        return ""
+    return _scrub_stored_text(str(raw).strip(), max_len=MAX_CUSTOM_RULES_LEN)[:MAX_CUSTOM_RULES_LEN]
+
+
+def normalize_done_criteria(raw: object) -> str:
+    if raw is None:
+        return ""
+    return _scrub_stored_text(str(raw).strip(), max_len=MAX_DONE_CRITERIA_LEN)[:MAX_DONE_CRITERIA_LEN]
+
+
+def list_persona_profiles() -> list[dict[str, str]]:
+    return [dict(v) for v in PERSONA_PROFILES.values()]
+
+
+def build_workspace_guidance(
+    *,
+    work_mode: str = "chat",
+    persona_id: str = "grounded_default",
+    behavior_mode: str = "autopilot",
+    custom_rules: str = "",
+    done_criteria: str = "",
+) -> str:
+    """Format bounded Build/Persona/Interview guidance (never relaxes factual citation rules)."""
+    wm = normalize_work_mode(work_mode)
+    pid = normalize_persona_id(persona_id)
+    bm = normalize_behavior_mode(behavior_mode)
+    rules_clean = str(custom_rules or "").strip()[:MAX_CUSTOM_RULES_LEN]
+    done_clean = str(done_criteria or "").strip()[:MAX_DONE_CRITERIA_LEN]
+    if wm == "chat" and pid == "grounded_default" and bm == "autopilot" and not rules_clean and not done_clean:
+        return ""
+    persona = PERSONA_PROFILES[pid]
+    parts = [
+        f"Work mode: {wm} | Persona: {persona['label']} ({pid}) | Execution posture: {bm}.",
+        f"Persona guidance: {persona['instruction']}",
+    ]
+    if wm == "build":
+        parts.append(
+            "Build mode formatting: emit complete runnable code in explicitly tagged fenced blocks "
+            "(```html, ```css, ```js) so the sandboxed Build Canvas can live-preview it, while still citing "
+            "vault facts [V#]/[N#] in any explanatory prose."
+        )
+    if bm == "interview":
+        parts.append(
+            "Interview posture: if requirements, scope, or trade-offs are ambiguous, ask 2-4 crisp targeted clarifying "
+            "questions before generating full artifacts."
+        )
+    if rules_clean:
+        parts.append(f"Owner project rules (must not override safety/citations): {rules_clean}")
+    if done_clean:
+        parts.append(f"Definition of done: {done_clean}")
+    return "\n".join(parts)
 
 
 def validate_thread_id(thread_id: str) -> str:
@@ -158,7 +299,12 @@ def create_chat_thread(
     project_scope: str | None = None,
     host_id: str = "ollama_local",
     mode: str = "verified",
-    brain_dir: str | Path = BRAIN_DIR,
+    work_mode: str = "chat",
+    persona_id: str = "grounded_default",
+    behavior_mode: str = "autopilot",
+    custom_rules: str = "",
+    done_criteria: str = "",
+    brain_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     now = _now_iso()
     tid = f"thr-{secrets.token_hex(8)}"
@@ -166,13 +312,34 @@ def create_chat_thread(
     clean_proj = (project_scope or "").strip()[:120] or None
     clean_host = (host_id or "ollama_local").strip()[:64] or "ollama_local"
     clean_mode = (mode or "verified").strip()[:32] or "verified"
+    clean_work_mode = normalize_work_mode(work_mode)
+    clean_persona = normalize_persona_id(persona_id)
+    clean_behavior = normalize_behavior_mode(behavior_mode)
+    clean_rules = normalize_custom_rules(custom_rules)
+    clean_done = normalize_done_criteria(done_criteria)
     with closing(_connect_db(brain_dir)) as conn, conn:
         conn.execute(
             """
-            INSERT INTO chat_threads (thread_id, title, created_at, updated_at, project_scope, host_id, mode, turn_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            INSERT INTO chat_threads (
+                thread_id, title, created_at, updated_at, project_scope, host_id, mode,
+                work_mode, persona_id, behavior_mode, custom_rules, done_criteria, turn_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """,
-            (tid, clean_title, now, now, clean_proj, clean_host, clean_mode),
+            (
+                tid,
+                clean_title,
+                now,
+                now,
+                clean_proj,
+                clean_host,
+                clean_mode,
+                clean_work_mode,
+                clean_persona,
+                clean_behavior,
+                clean_rules,
+                clean_done,
+            ),
         )
     return {
         "thread_id": tid,
@@ -182,6 +349,11 @@ def create_chat_thread(
         "project_scope": clean_proj,
         "host_id": clean_host,
         "mode": clean_mode,
+        "work_mode": clean_work_mode,
+        "persona_id": clean_persona,
+        "behavior_mode": clean_behavior,
+        "custom_rules": clean_rules,
+        "done_criteria": clean_done,
         "turn_count": 0,
     }
 
@@ -191,7 +363,7 @@ def list_chat_threads(
     limit: int = 50,
     offset: int = 0,
     project_scope: str | None = None,
-    brain_dir: str | Path = BRAIN_DIR,
+    brain_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     lim = max(1, min(int(limit), 200))
     off = max(0, int(offset))
@@ -206,7 +378,8 @@ def list_chat_threads(
             )
             rows = conn.execute(
                 """
-                SELECT thread_id, title, created_at, updated_at, project_scope, host_id, mode, turn_count
+                SELECT thread_id, title, created_at, updated_at, project_scope, host_id, mode,
+                       work_mode, persona_id, behavior_mode, custom_rules, done_criteria, turn_count
                 FROM chat_threads
                 WHERE project_scope = ?
                 ORDER BY updated_at DESC, thread_id DESC
@@ -218,7 +391,8 @@ def list_chat_threads(
             total = int(conn.execute("SELECT COUNT(*) FROM chat_threads").fetchone()[0])
             rows = conn.execute(
                 """
-                SELECT thread_id, title, created_at, updated_at, project_scope, host_id, mode, turn_count
+                SELECT thread_id, title, created_at, updated_at, project_scope, host_id, mode,
+                       work_mode, persona_id, behavior_mode, custom_rules, done_criteria, turn_count
                 FROM chat_threads
                 ORDER BY updated_at DESC, thread_id DESC
                 LIMIT ? OFFSET ?
@@ -240,14 +414,15 @@ def get_chat_thread(
     thread_id: str,
     *,
     max_turns: int = 100,
-    brain_dir: str | Path = BRAIN_DIR,
+    brain_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     tid = validate_thread_id(thread_id)
     cap = max(1, min(int(max_turns), 500))
     with closing(_connect_db(brain_dir)) as conn:
         t_row = conn.execute(
             """
-            SELECT thread_id, title, created_at, updated_at, project_scope, host_id, mode, turn_count
+            SELECT thread_id, title, created_at, updated_at, project_scope, host_id, mode,
+                   work_mode, persona_id, behavior_mode, custom_rules, done_criteria, turn_count
             FROM chat_threads WHERE thread_id = ?
             """,
             (tid,),
@@ -299,7 +474,58 @@ def get_chat_thread(
     return out
 
 
-def delete_chat_thread(thread_id: str, *, brain_dir: str | Path = BRAIN_DIR) -> dict[str, Any]:
+def update_chat_thread_settings(
+    thread_id: str,
+    *,
+    title: str | None = None,
+    work_mode: str | None = None,
+    persona_id: str | None = None,
+    behavior_mode: str | None = None,
+    custom_rules: str | None = None,
+    done_criteria: str | None = None,
+    brain_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Update persisted Build/Persona/Rules settings on an existing thread."""
+    tid = validate_thread_id(thread_id)
+    now = _now_iso()
+    with closing(_connect_db(brain_dir)) as conn, conn:
+        row = conn.execute(
+            """
+            SELECT thread_id, title, created_at, updated_at, project_scope, host_id, mode,
+                   work_mode, persona_id, behavior_mode, custom_rules, done_criteria, turn_count
+            FROM chat_threads WHERE thread_id = ?
+            """,
+            (tid,),
+        ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"Chat thread not found: {tid}")
+        new_title = _derive_thread_title(title) if title is not None else str(row["title"])
+        new_wm = normalize_work_mode(work_mode if work_mode is not None else row["work_mode"])
+        new_pid = normalize_persona_id(persona_id if persona_id is not None else row["persona_id"])
+        new_bm = normalize_behavior_mode(behavior_mode if behavior_mode is not None else row["behavior_mode"])
+        new_rules = normalize_custom_rules(custom_rules if custom_rules is not None else row["custom_rules"])
+        new_done = normalize_done_criteria(done_criteria if done_criteria is not None else row["done_criteria"])
+        conn.execute(
+            """
+            UPDATE chat_threads
+            SET title = ?, updated_at = ?, work_mode = ?, persona_id = ?,
+                behavior_mode = ?, custom_rules = ?, done_criteria = ?
+            WHERE thread_id = ?
+            """,
+            (new_title, now, new_wm, new_pid, new_bm, new_rules, new_done, tid),
+        )
+        updated = conn.execute(
+            """
+            SELECT thread_id, title, created_at, updated_at, project_scope, host_id, mode,
+                   work_mode, persona_id, behavior_mode, custom_rules, done_criteria, turn_count
+            FROM chat_threads WHERE thread_id = ?
+            """,
+            (tid,),
+        ).fetchone()
+    return dict(updated)
+
+
+def delete_chat_thread(thread_id: str, *, brain_dir: str | Path | None = None) -> dict[str, Any]:
     tid = validate_thread_id(thread_id)
     with closing(_connect_db(brain_dir)) as conn, conn:
         cur = conn.execute("DELETE FROM chat_threads WHERE thread_id = ?", (tid,))
@@ -336,7 +562,7 @@ def append_chat_turn(
     cited_sources: Sequence[dict[str, Any]] | None = None,
     citations: Sequence[dict[str, Any]] | None = None,
     grounding: dict[str, Any] | None = None,
-    brain_dir: str | Path = BRAIN_DIR,
+    brain_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     tid = validate_thread_id(thread_id)
     clean_role = str(role or "").strip().lower()
@@ -423,12 +649,15 @@ def pin_turn_to_note(
     turn_id: int | None = None,
     title: str | None = None,
     tags: Sequence[str] = (),
-    brain_dir: str | Path = BRAIN_DIR,
+    brain_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Save an assistant chat turn (plus its preceding user question & citations) as a Working Note."""
     from notes_store import NotePaths, create_note
 
-    thread = get_chat_thread(thread_id, max_turns=200, brain_dir=brain_dir)
+    resolved_brain = resolve_module_vault_path(
+        globals(), "BRAIN_DIR", str(brain_dir) if brain_dir is not None else None
+    )
+    thread = get_chat_thread(thread_id, max_turns=200, brain_dir=resolved_brain)
     turns = list(thread.get("turns") or [])
     if not turns:
         raise ChatThreadError("Cannot pin an empty chat thread.")

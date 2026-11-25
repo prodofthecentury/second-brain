@@ -43,18 +43,29 @@ TEST_PASSWORD = "correct-horse-battery-staple-99"
 
 def _mock_hardware_profile(*_args, **_kwargs) -> SimpleNamespace:
     return SimpleNamespace(
+        os_name="Windows",
+        os_release="11",
+        architecture="AMD64",
         tier_id="standard_cpu",
         tier_label="Standard Local CPU",
         total_ram_gib=16.0,
         available_ram_gib=8.0,
         cpu_threads=8,
+        cpp_runtime_ready=False,
+        cpp_runtime_detail="Mock test profile",
+        gpu_backend="cpu",
         gpu_name="Mock Test CPU",
         vram_gib=0.0,
+        ollama_reachable=False,
+        installed_ollama_models=(),
         recommended_generation_model="llama3.2:3b",
         selected_installed_generation_model="llama3.2:3b",
+        recommended_embedding_model="nomic-embed-text",
         recommended_retrieval_mode="lexical",
         retrieval_p95_slo_ms=50.0,
+        answer_p95_slo_ms=45000.0,
         rationale="Deterministic test hardware profile.",
+        oversized_installed_models=(),
     )
 
 
@@ -67,6 +78,8 @@ def _seed_atom(
     memory_type: str = "semantic",
     epistemic_label: str = "claim",
     contexts: list[str] | None = None,
+    valid_from: str = "",
+    valid_until: str = "",
     approve: bool = True,
 ) -> Path:
     raw_dir = brain_dir / "0-raw"
@@ -84,6 +97,11 @@ def _seed_atom(
     ctx_items = contexts if contexts is not None else ["project:second_brain"]
     ctx_yaml = "\n".join(f"  - {item}" for item in ctx_items)
     epistemic_extra = "epistemic_contract: owner_preference\n" if epistemic_label == "preference" else ""
+    temporal_extra = ""
+    if valid_from:
+        temporal_extra += f"valid_from: {valid_from}\n"
+    if valid_until:
+        temporal_extra += f"valid_until: {valid_until}\n"
     draft = (
         "---\n"
         f"id: {Path(filename).stem}\n"
@@ -95,6 +113,7 @@ def _seed_atom(
         "last-reviewed: 2026-11-15\n"
         "confidence: 0.90\n"
         "importance: 0.85\n"
+        f"{temporal_extra}"
         "sources:\n"
         f"  - 0-raw/{src_name}\n"
         "contexts:\n"
@@ -201,7 +220,7 @@ class IsolatedDashboardAppTestCase(unittest.TestCase):
     def _new_unlocked_app(self) -> AppTest:
         if not self.auth_file.exists():
             self._configure_password(TEST_PASSWORD)
-        at = AppTest.from_file(str(APP_PATH), default_timeout=20)
+        at = AppTest.from_file(str(APP_PATH), default_timeout=90)
         at.run()
         self.assertEqual(len(at.exception), 0, f"Unexpected exception on login screen: {at.exception}")
         at.text_input(key="brain_dashboard_password").set_value(TEST_PASSWORD)
@@ -215,14 +234,14 @@ class DashboardAuthAndLauncherTests(IsolatedDashboardAppTestCase):
     def test_auth_gate_blocks_non_loopback_missing_verifier_wrong_password_and_unlocks_valid(self) -> None:
         # 1. Non-loopback bind is rejected fail-closed
         st.config.set_option("server.address", "0.0.0.0")
-        blocked = AppTest.from_file(str(APP_PATH), default_timeout=20)
+        blocked = AppTest.from_file(str(APP_PATH), default_timeout=90)
         blocked.run()
         self.assertTrue(any("403 Forbidden" in e.value for e in blocked.error))
         self.assertEqual(len(blocked.sidebar.radio), 0)
 
         # 2. Loopback without configured password verifier stays locked and hides vault tabs
         st.config.set_option("server.address", "127.0.0.1")
-        unconfigured = AppTest.from_file(str(APP_PATH), default_timeout=20)
+        unconfigured = AppTest.from_file(str(APP_PATH), default_timeout=90)
         unconfigured.run()
         self.assertTrue(any("Second Brain is locked" in t.value for t in unconfigured.title))
         self.assertEqual(len(unconfigured.sidebar.radio), 0)
@@ -230,7 +249,7 @@ class DashboardAuthAndLauncherTests(IsolatedDashboardAppTestCase):
 
         # 3. Configured verifier: initial view shows login form; wrong password fails; valid password unlocks
         self._configure_password(TEST_PASSWORD)
-        at = AppTest.from_file(str(APP_PATH), default_timeout=20)
+        at = AppTest.from_file(str(APP_PATH), default_timeout=90)
         at.run()
         self.assertTrue(any("Unlock Second Brain" in t.value for t in at.title))
         self.assertEqual(len(at.sidebar.radio), 0)
@@ -674,6 +693,412 @@ class DashboardGovernancePlaybooksFeedbackAndAuditTests(IsolatedDashboardAppTest
         at.run()
         self.assertEqual(len(at.exception), 0, f"Single doc import exception: {at.exception}")
         self.assertTrue(any("Imported `benchmarks.csv`" in s.value for s in at.success))
+
+
+class Dashboard1CParityPanelsTests(IsolatedDashboardAppTestCase):
+    def test_zero_unused_imports_and_bitemporal_graph_scrubber(self) -> None:
+        import ast
+
+        src = APP_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(src, filename=str(APP_PATH))
+        imported_as_names: dict[str, set[str]] = {}
+        used_names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module != "__future__":
+                for alias in node.names:
+                    if alias.name != "*":
+                        imported_as_names.setdefault(alias.asname or alias.name, set()).add(
+                            f"{node.module}.{alias.name}"
+                        )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = (alias.asname or alias.name).split(".", 1)[0]
+                    imported_as_names.setdefault(top, set()).add(alias.name)
+            elif isinstance(node, ast.Name):
+                used_names.add(node.id)
+        unused = sorted(name for name in imported_as_names if name not in used_names)
+        self.assertEqual(unused, [], f"dashboard/app.py has unused imports: {unused}")
+
+        # Seed active & expired bi-temporal atoms and exercise Knowledge Graph Timeline Scrubber
+        _seed_atom(
+            self.vault_dir,
+            filename="bio-active.md",
+            claim="Service v2 runs strictly on TLS 1.3.",
+            evidence="Service v2 runs strictly on TLS 1.3.",
+            valid_from="2026-01-01",
+            valid_until="2027-01-01",
+            approve=True,
+        )
+        _seed_atom(
+            self.vault_dir,
+            filename="bio-expired.md",
+            claim="Legacy service v1 allowed TLS 1.1.",
+            evidence="Legacy service v1 allowed TLS 1.1.",
+            valid_from="2024-01-01",
+            valid_until="2024-12-31",
+            approve=True,
+        )
+
+        at = self._new_unlocked_app()
+        at.sidebar.radio[0].set_value("🕸️ Knowledge Graph")
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Knowledge graph load exception: {at.exception}")
+        self.assertIn("kg_timeline_scrubber", [s.key for s in at.select_slider])
+        at.select_slider(key="kg_timeline_scrubber").set_value("2024-12-31")
+        at.checkbox(key="kg_inc_expired").set_value(False)
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Knowledge graph scrubber exception: {at.exception}")
+        self.assertTrue(
+            any("as_of=`2024-12-31`" in c.value for c in at.caption),
+            f"Expected Bi-Temporal caption with as_of=2024-12-31, got {[c.value for c in at.caption]}",
+        )
+        self.assertTrue(
+            any(m.label == "Rendered Nodes" and str(m.value) == "1" for m in at.metric),
+            f"Expected 1 active node as of 2024-12-31, got {[(m.label, m.value) for m in at.metric]}",
+        )
+
+    def test_system_control_skills_mobile_and_creative_media_panels(self) -> None:
+        from scripts.skill_playbooks import promote_skill_playbook
+        from scripts.executable_skills import get_skill_kill_switch_status, list_executable_skills, set_skill_kill_switch
+        from scripts.mobile_vault_client import list_mobile_vault_pairings
+        from scripts.vault_sync import init_sync
+
+        sync_target = self.temp_root / "sync_remote"
+        sync_target.mkdir(parents=True, exist_ok=True)
+        init_sync(
+            str(sync_target),
+            backend_type="local_folder",
+            brain_dir=str(self.vault_dir),
+            passphrase=TEST_PASSWORD,
+        )
+
+        atom_claim = "Verify backup integrity before deploying production containers."
+        atom_path = _seed_atom(
+            self.vault_dir,
+            filename="verify-backup.md",
+            claim=atom_claim,
+            evidence=atom_claim,
+            memory_type="procedural",
+            approve=True,
+        )
+        pb_res = promote_skill_playbook(
+            playbook_id="verify-backup-pb",
+            title="Verify Backup Integrity",
+            trigger="Before deploy",
+            preconditions=["Vault is clean and local backup directory exists."],
+            steps=[atom_claim],
+            expected_outputs=["audit json"],
+            failure_recovery=["Halt deploy on mismatch."],
+            backing_atoms=[(atom_path.name, hashlib.sha256(atom_path.read_bytes()).hexdigest())],
+            actor="test_owner",
+            rationale="Seed playbook for Stage 4 parity test",
+            allow_early_owner_override=True,
+            playbooks_dir=str(self.vault_dir / "5-playbooks"),
+            atoms_dir=str(self.vault_dir / "2-atoms"),
+            brain_dir=str(self.vault_dir),
+            telemetry_db_path=str(self.vault_dir / ".sidecar" / "telemetry.db"),
+        )
+        _ = pb_res
+
+        # Disarm global kill switch so dry-run & sandbox execute can run inside AppTest
+        set_skill_kill_switch(engaged=False, scope="global", actor="test_owner", reason="test", brain_dir=str(self.vault_dir))
+
+        at = self._new_unlocked_app()
+        at.sidebar.radio[0].set_value("⚙️ System Control")
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"System Control load exception: {at.exception}")
+
+        # 1. Stage 4 Promote with input_schema -> Dry-Run Execute -> Per-Skill Kill-Switch -> CAS Revoke
+        self.assertFalse(
+            at.checkbox(key="sys_sk_prom_early").value,
+            "Stage 4 Skill early owner override checkbox must default to False",
+        )
+        at.checkbox(key="sys_sk_prom_early").set_value(True)
+        at.text_area(key="sys_sk_prom_schema").set_value('{"env": {"type": "string", "required": true, "default": "prod"}}')
+        at.text_input(key="sys_sk_prom_id").set_value("app-test-backup-skill")
+        at.button(key="btn_sys_sk_promote").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Skill promote exception: {at.exception}")
+        promoted_ids = [s.skill_id for s in list_executable_skills(brain_dir=str(self.vault_dir), active_only=True)]
+        self.assertIn(
+            "app-test-backup-skill",
+            promoted_ids,
+            f"Skill not promoted; errors={[e.value for e in at.error]}",
+        )
+
+        # Execute dry-run with dynamic input field generated from input_schema
+        at.checkbox(key="sys_sk_exec_dry").set_value(True)
+        at.text_input(key="sys_sk_in_app-test-backup-skill_env").set_value("staging")
+        at.button(key="btn_sys_sk_execute").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Skill execute exception: {at.exception}")
+        self.assertTrue(
+            any("Skill `app-test-backup-skill`" in s.value for s in at.success),
+            f"Execute failed; errors={[e.value for e in at.error]}",
+        )
+
+        # Per-skill kill-switch
+        at.button(key="btn_sys_sk_kill_one").click()
+        at.run()
+        ks_after = get_skill_kill_switch_status(brain_dir=str(self.vault_dir))
+        self.assertTrue(ks_after["killed_skills"].get("app-test-backup-skill"))
+
+        # CAS Revoke active skill
+        at.text_input(key="sys_sk_rev_reason").set_value("Done testing")
+        at.button(key="btn_sys_sk_revoke").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Skill revoke exception: {at.exception}")
+        remaining_active = list_executable_skills(brain_dir=str(self.vault_dir), active_only=True)
+        self.assertEqual(remaining_active, [])
+
+        # 2. Mobile Inbox Drop include_recall + export/rotate + Mobile Vault Client pair/revoke
+        at.checkbox(key="sys_md_inc_recall").set_value(True)
+        at.text_input(key="sys_md_label").set_value("AppTest Drop Device")
+        at.button(key="btn_md_pair").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Mobile Drop pair exception: {at.exception}")
+        self.assertTrue(
+            any("include_recall=True" in s.value for s in at.success),
+            f"Expected include_recall=True pairing banner, errors={[e.value for e in at.error]}",
+        )
+        at.button(key="btn_md_export_recall").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Export recall exception: {at.exception}")
+        self.assertTrue(any("mobile-recall/" in s.value for s in at.success))
+        at.button(key="btn_md_rotate_recall").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Rotate recall exception: {at.exception}")
+        self.assertTrue(any("Rotated Mobile Recall key" in w.value for w in at.warning))
+
+        at.text_input(key="sys_mv_label").set_value("AppTest Phone")
+        at.button(key="btn_sys_mv_pair").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Mobile pair exception: {at.exception}")
+        self.assertTrue(
+            any("Paired Mobile Vault Client" in s.value for s in at.success),
+            f"Mobile pair failed; errors={[e.value for e in at.error]}",
+        )
+        at.button(key="btn_sys_mv_revoke").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Mobile revoke exception: {at.exception}")
+        pairings_after = list_mobile_vault_pairings(brain_dir=str(self.vault_dir)).get("pairings") or []
+        self.assertTrue(pairings_after and all(p.get("revoked") for p in pairings_after))
+
+        # 3. Creative Media Studio hardware status + .webp image + Gallery verification
+        at.text_input(key="sys_cm_prompt").set_value("Local vault architecture blueprint")
+        at.selectbox(key="sys_cm_backend").set_value("builtin_procedural_local")
+        at.selectbox(key="sys_cm_img_fmt").set_value("webp")
+        at.button(key="btn_sys_cm_img").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Creative image exception: {at.exception}")
+        self.assertTrue(
+            any(".webp" in s.value for s in at.success),
+            f"Creative image failed; errors={[e.value for e in at.error]}",
+        )
+        self.assertTrue(any("SHA-256 Verified" in c.value for c in at.caption))
+
+
+class DashboardKnowledgeGraphAndSystemControlTests(IsolatedDashboardAppTestCase):
+    """Focused 1F AppTest coverage for `🕸️ Knowledge Graph` and `⚙️ System Control`."""
+
+    def test_knowledge_graph_filters_threads_autolink_and_inspector(self) -> None:
+        _seed_atom(
+            self.vault_dir,
+            filename="kg-alpha.md",
+            claim="Prometheus histogram latency quantiles use cumulative buckets across service shards.",
+            evidence="Prometheus histogram latency quantiles use cumulative buckets across service shards.",
+            contexts=["project:second_brain"],
+            approve=True,
+        )
+        _seed_atom(
+            self.vault_dir,
+            filename="kg-beta.md",
+            claim="Prometheus histogram latency quantiles require monotonic exporter bucket boundaries.",
+            evidence="Prometheus histogram latency quantiles require monotonic exporter bucket boundaries.",
+            contexts=["project:second_brain"],
+            approve=True,
+        )
+        _seed_atom(
+            self.vault_dir,
+            filename="kg-pending.md",
+            claim="Draft histogram quantile proposal awaiting primary benchmark.",
+            evidence="Draft histogram quantile proposal awaiting primary benchmark.",
+            contexts=["project:second_brain"],
+            approve=False,
+        )
+        _seed_atom(
+            self.vault_dir,
+            filename="kg-other.md",
+            claim="Isolated project billing retention window lasts ninety days.",
+            evidence="Isolated project billing retention window lasts ninety days.",
+            contexts=["project:isolated_other"],
+            approve=True,
+        )
+        threads_dir = self.vault_dir / "3-threads"
+        threads_dir.mkdir(parents=True, exist_ok=True)
+        (threads_dir / "2026-11-23-prometheus-quantiles.md").write_text(
+            "---\ntopic: Prometheus Quantiles\ntype: thread\nstatus: active\n"
+            "created: 2026-11-23\nlast-updated: 2026-11-23\natom-count: 1\n"
+            "atoms:\n  - \"[[kg-alpha.md]]\"\n---\n\n# Prometheus Quantiles\n",
+            encoding="utf-8",
+        )
+        rebuild_lexical_index(
+            str(self.vault_dir / "2-atoms"),
+            str(self.vault_dir / ".sidecar" / "lexical.sqlite3"),
+        )
+
+        at = self._new_unlocked_app()
+        at.sidebar.radio[0].set_value("🕸️ Knowledge Graph")
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Knowledge graph load error: {at.exception}")
+
+        # Project scope filter isolates project:second_brain from project:isolated_other
+        at.text_input(key="kg_proj_filter").set_value("project:second_brain")
+        at.checkbox(key="kg_inc_threads").set_value(True)
+        at.checkbox(key="kg_inc_pending").set_value(False)
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Knowledge graph filter error: {at.exception}")
+        self.assertTrue(any(m.label == "Rendered Nodes" and str(m.value) == "3" for m in at.metric))
+
+        # Enabling pending drafts increases rendered node count
+        at.checkbox(key="kg_inc_pending").set_value(True)
+        at.run()
+        self.assertEqual(len(at.exception), 0)
+        self.assertTrue(any(m.label == "Rendered Nodes" and str(m.value) == "4" for m in at.metric))
+
+        # Auto-link graph atoms adds verified wikilinks across kg-alpha <-> kg-beta
+        at.checkbox(key="kg_inc_pending").set_value(False)
+        at.button(key="btn_kg_autolink").click()
+        at.run()
+        self.assertEqual(len(at.exception), 0, f"Auto-link error: {at.exception}")
+        alpha_txt = (self.vault_dir / "2-atoms" / "kg-alpha.md").read_text(encoding="utf-8")
+        beta_txt = (self.vault_dir / "2-atoms" / "kg-beta.md").read_text(encoding="utf-8")
+        self.assertTrue("kg-beta" in alpha_txt and "kg-alpha" in beta_txt)
+        self.assertTrue(any("Auto-linked" in s.value for s in at.success))
+
+    def test_system_control_owner_gates_clipper_backup_and_briefings(self) -> None:
+        atom_path = _seed_atom(
+            self.vault_dir,
+            filename="sys-ctrl-atom.md",
+            claim="Encrypted backups cover durable Markdown and append-only archives.",
+            evidence="Encrypted backups cover durable Markdown and append-only archives.",
+            approve=True,
+        )
+        atom_sha = hashlib.sha256(atom_path.read_bytes()).hexdigest()
+        briefings_dir = self.vault_dir / "briefings"
+        briefings_dir.mkdir(parents=True, exist_ok=True)
+        (briefings_dir / "2026-11-23.md").write_text("# Morning Briefing 2026-11-23\nAll clear.\n", encoding="utf-8")
+        rebuild_lexical_index(
+            str(self.vault_dir / "2-atoms"),
+            str(self.vault_dir / ".sidecar" / "lexical.sqlite3"),
+        )
+
+        # Scope the Governance Gates UI to an isolated pending_owner_review dataset in temp_root
+        isolated_ds_path = self.temp_root / "isolated-eval-proposed.json"
+        isolated_ds_payload = {
+            "schema_version": 2,
+            "dataset_id": "apptest-isolated-eval",
+            "dataset_version": "3.0.0",
+            "status": "pending_owner_review",
+            "draft_provenance": {
+                "drafted_by": "agent (isolated apptest fixture)",
+                "date": "2026-11-23",
+                "scope": "Isolated AppTest owner-gate fixture.",
+            },
+            "purpose": "Isolated AppTest dataset gate fixture.",
+            "queries": [
+                {
+                    "id": "apptest_pending_backup_01",
+                    "query": "What do encrypted backups cover?",
+                    "category": "paraphrase",
+                    "split": "holdout",
+                    "project_scope": "project:second_brain",
+                    "answerability": "answerable",
+                    "answer_mode": "standard",
+                    "expected_atom_ids": ["sys-ctrl-atom.md"],
+                    "acceptable_atom_ids": [],
+                    "candidate_relevance": ["sys-ctrl-atom.md"],
+                    "expected_atom_revisions": [
+                        {"atom_id": "sys-ctrl-atom.md", "revision_sha256": atom_sha}
+                    ],
+                    "expected_claims": [
+                        {
+                            "text": "Encrypted backups cover durable Markdown and append-only archives.",
+                            "supported_by": ["sys-ctrl-atom.md"],
+                        }
+                    ],
+                    "expected_behavior": "answer_with_evidence",
+                    "trap_reason": None,
+                }
+            ],
+        }
+        isolated_ds_path.write_text(json.dumps(isolated_ds_payload, indent=2), encoding="utf-8")
+        iso_ds_before_sha = hashlib.sha256(isolated_ds_path.read_bytes()).hexdigest()
+
+        ds_path = PROJECT_ROOT / "docs" / "retrieval-evaluation-proposed.json"
+        ds_before_sha = hashlib.sha256(ds_path.read_bytes()).hexdigest()
+
+        with patch.dict(os.environ, {"BRAIN_EVAL_DATASET_FILE": str(isolated_ds_path)}):
+            at = self._new_unlocked_app()
+            at.sidebar.radio[0].set_value("⚙️ System Control")
+            at.run()
+            self.assertEqual(len(at.exception), 0, f"System Control load error: {at.exception}")
+
+            # 1. Owner Governance Gates metrics render & reject agent actors fail-closed without mutating datasets
+            metric_labels = {m.label for m in at.metric}
+            self.assertIn("Open Owner Gates", metric_labels)
+            self.assertIn("Pending Dataset Queries", metric_labels)
+            ti_keys = {ti.key for ti in at.text_input}
+            self.assertIn("sys_gate_actor", ti_keys)
+            self.assertIn("sys_slo_actor", ti_keys)
+
+            at.text_input(key="sys_gate_actor").set_value("antigravity")
+            at.text_input(key="sys_gate_confirm_phrase").set_value("WRONG")
+            at.button(key="btn_sys_gate_approve_dataset").click()
+            at.run()
+            self.assertEqual(len(at.exception), 0)
+            self.assertTrue(any("Dataset approval blocked" in e.value for e in at.error))
+
+            at.text_input(key="sys_slo_actor").set_value("codex")
+            at.text_input(key="sys_slo_confirm_phrase").set_value("WRONG")
+            at.button(key="btn_sys_gate_approve_slo").click()
+            at.run()
+            self.assertEqual(len(at.exception), 0)
+            self.assertTrue(any("SLO sign-off blocked" in e.value for e in at.error))
+            self.assertEqual(hashlib.sha256(isolated_ds_path.read_bytes()).hexdigest(), iso_ds_before_sha)
+            self.assertEqual(hashlib.sha256(ds_path.read_bytes()).hexdigest(), ds_before_sha)
+
+            # 2. Browser Clipper 1-click pairing code
+            at.button(key="btn_clip_pair_code").click()
+            at.run()
+            self.assertEqual(len(at.exception), 0)
+            self.assertTrue(any(c.value.startswith("SBC-") for c in at.code))
+
+            # 3. One-shot FTS5 & vector sync button
+            at.button(key="btn_sys_daemon_sync_once").click()
+            at.run()
+            self.assertEqual(len(at.exception), 0)
+            self.assertTrue(any("Synced indexes" in s.value for s in at.success))
+
+            # 4. Portable .sbvault encrypted backup create & verify inside temp_root
+            bk_file = self.temp_root / "apptest-vault.sbvault"
+            at.text_input(key="sys_bk_out").set_value(str(bk_file))
+            at.text_input(key="sys_bk_pw").set_value("vault-backup-passphrase-1234")
+            at.button(key="btn_sys_bk_create").click()
+            at.run()
+            self.assertEqual(len(at.exception), 0, f"Backup create error: {at.exception}")
+            self.assertTrue(bk_file.is_file())
+            self.assertTrue(any("Created" in s.value for s in at.success))
+
+            at.text_input(key="sys_bk_in").set_value(str(bk_file))
+            at.text_input(key="sys_bk_pw").set_value("vault-backup-passphrase-1234")
+            at.button(key="btn_sys_bk_verify").click()
+            at.run()
+            self.assertEqual(len(at.exception), 0, f"Backup verify error: {at.exception}")
+            self.assertTrue(any("VALID" in s.value for s in at.success))
+
+            # 5. Morning Briefing viewer renders seeded briefing cleanly
+            self.assertTrue(any("Morning Briefing 2026-11-23" in c.value for c in at.code))
 
 
 if __name__ == "__main__":

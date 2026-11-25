@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "second-brain-mobile-vault-v1";
+const CACHE_NAME = "second-brain-mobile-vault-v2";
 const APP_SHELL_ASSETS = [
   "./",
   "./index.html",
@@ -8,6 +8,9 @@ const APP_SHELL_ASSETS = [
   "./app.js",
   "./manifest.webmanifest",
   "./icon.svg",
+  "./icons/icon-192.png",
+  "./icons/icon-512.png",
+  "./icons/apple-touch-icon.png",
   "./lib/vault-crypto.js",
   "./lib/vault-epistemic-engine.js",
 ];

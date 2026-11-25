@@ -47,7 +47,17 @@ from atom_mutator import (  # noqa: E402
     review_lock,
 )
 from audit_sources import _source_snapshot  # noqa: E402
-from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, is_content_markdown, normalize_markdown_filename, safe_file_in_dir, security_state_dir  # noqa: E402
+from config import (  # noqa: E402
+    ATOMS_DIR,
+    BRAIN_DIR,
+    _is_reparse_or_link,
+    is_content_markdown,
+    normalize_markdown_filename,
+    resolve_module_atoms_and_brain,
+    safe_file_in_dir,
+    security_state_dir,
+    snapshot_module_defaults,
+)
 from cross_encoder import get_onnx_cross_encoder, score_query_atom_pairs  # noqa: E402
 from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor  # noqa: E402
 from lexical_store import porter_stem  # noqa: E402
@@ -61,6 +71,8 @@ from memory_format import (  # noqa: E402
 )
 from memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list  # noqa: E402
 from recall import normalize_project_tag, project_tags_match, wikilinks  # noqa: E402
+
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
 _STOPWORDS = frozenset(
     {
@@ -920,8 +932,8 @@ def _inspect_drift_alert(
 
 def build_knowledge_graph(
     *,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
     project_scope: str | None = None,
     include_pending: bool = False,
     include_preferences: bool = True,
@@ -929,6 +941,11 @@ def build_knowledge_graph(
     include_expired: bool = True,
 ) -> dict[str, Any]:
     """Build deterministic nodes and edges across vault atoms (with optional point-in-time `as_of`)."""
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     clean_as_of = str(as_of).strip() if (as_of is not None and str(as_of).strip()) else None
     if clean_as_of is not None:
         if len(clean_as_of) > 64:
@@ -1138,6 +1155,34 @@ def build_knowledge_graph(
         "orphan_approved_atoms": orphans,
         "nodes": nodes,
         "edges": edges,
+    }
+
+
+def build_typed_concept_overlay(
+    *,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
+    project_scope: str | None = None,
+    seed_concepts: list[str] | tuple[str, ...] | None = None,
+    max_hops: int = 3,
+) -> dict[str, Any]:
+    """Overlay Living Concept Objects, typed causal edges, and <=3-hop spreading activation onto the KG."""
+    from concept_graph import list_concepts, spreading_activation
+
+    concepts = list_concepts(project=project_scope, limit=100, brain_dir=brain_dir, atoms_dir=atoms_dir)
+    activation = None
+    if seed_concepts:
+        activation = spreading_activation(
+            seed_concepts,
+            max_hops=max_hops,
+            project=project_scope,
+            brain_dir=brain_dir,
+            atoms_dir=atoms_dir,
+        )
+    return {
+        "concept_count": len(concepts),
+        "concepts": concepts,
+        "spreading_activation": activation,
     }
 
 
@@ -1405,8 +1450,8 @@ def _make_local_ollama_nli_adjudicator(
 
 def detect_contradictions(
     *,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
     project_scope: str | None = None,
     include_pending: bool = True,
     include_preferences: bool = False,
@@ -1421,6 +1466,11 @@ def detect_contradictions(
     skip_dns_check_for_mock_transport: bool = False,
 ) -> dict[str, Any]:
     """Detect polarity, antonym, aligned numeric, exclusive entity, optional NLI, contested_by & drift issues."""
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     if graph is None:
         graph = build_knowledge_graph(
             brain_dir=brain_dir,
@@ -1726,14 +1776,19 @@ def detect_contradictions(
 def graph_neighbors(
     atom_filename: str,
     *,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
     project_scope: str | None = None,
     include_pending: bool = False,
     include_preferences: bool = True,
     graph: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return 1-hop neighbors and contradictions involving a specific atom."""
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     clean_name = (atom_filename or "").strip()
     if graph is None:
         graph = build_knowledge_graph(
@@ -1799,13 +1854,18 @@ def suggest_atom_graph_links_for_claim(
     exclude_filename: str | None = None,
     contexts: Sequence[str] = (),
     project_scope: str | None = None,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
     include_pending: bool = False,
     top_k: int = 5,
     _prebuilt_nodes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Identify verified ``[[wikilink]]`` targets, duplicate candidates, and contradiction alerts for a claim."""
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     clean_claim = (claim_text or "").strip()
     if not clean_claim:
         return {"related_links": [], "duplicate_candidates": [], "contradiction_alerts": []}
@@ -1929,12 +1989,17 @@ def suggest_atom_graph_links(
     atom_filename: str,
     *,
     project_scope: str | None = None,
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
     include_pending: bool = False,
     top_k: int = 5,
 ) -> dict[str, Any]:
     """Suggest ``[[wikilink]]``, duplicate, and contradiction candidates for an existing atom file."""
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     norm_name = normalize_markdown_filename(str(atom_filename or "").strip())
     path = safe_file_in_dir(atoms_dir, norm_name, allowed_exts={".md"}, must_exist=True)
     if not path or _is_reparse_or_link(path):
@@ -1956,8 +2021,8 @@ def suggest_atom_graph_links(
 def auto_link_vault_atoms(
     *,
     actor: str = "owner",
-    brain_dir: str = BRAIN_DIR,
-    atoms_dir: str = ATOMS_DIR,
+    brain_dir: str | None = None,
+    atoms_dir: str | None = None,
     project_scope: str | None = None,
     include_pending: bool = False,
     dry_run: bool = False,
@@ -1972,6 +2037,11 @@ def auto_link_vault_atoms(
     - For already-approved atoms, re-verifies exact byte-offset evidence anchors and appends
       an attested owner ``approve`` decision record so ``approved_revision_is_current`` stays True.
     """
+    brain_dir, atoms_dir = resolve_module_atoms_and_brain(
+        globals(),
+        atoms_dir=atoms_dir,
+        brain_dir=brain_dir,
+    )
     clean_actor = str(actor or "").strip()[:120]
     if not dry_run and clean_actor.casefold() in _DISALLOWED_AUTOLINK_ACTORS:
         raise PermissionError("Auto-linking canonical atoms requires an explicit human owner actor.")

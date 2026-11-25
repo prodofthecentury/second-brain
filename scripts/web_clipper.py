@@ -11,7 +11,8 @@ Security invariants:
    A Clipper token is write-only capture (`/v1/clipper/{ping,status,clip}`) and can NEVER
    read private atoms/notes or invoke owner governance endpoints.
 3. Strict browser extension Origin binding: only explicitly owner-paired
-   `chrome-extension://<32-char-id>` or `moz-extension://<uuid>` origins are accepted.
+   `chrome-extension://<32-char-id>`, `moz-extension://<uuid>`, or
+   `safari-web-extension://<uuid>` origins are accepted.
 4. Verifiable web provenance: every clip writes an immutable UTF-8 source snapshot under
    `brain/0-raw/note-snapshots/` with exact SHA-256 digest, `source_url`, and `captured_at`.
 5. Server-side DLP & prompt-injection screening: clips containing secrets, credentials,
@@ -21,9 +22,12 @@ Security invariants:
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime
 import hashlib
 import hmac
+import io
 import json
 import os
 from pathlib import Path
@@ -51,15 +55,22 @@ MAX_CLIP_URL_CHARS = 2048
 MAX_CLIP_QUOTE_CHARS = 32_000
 MAX_CLIP_PAGE_TEXT_CHARS = 200_000
 MAX_CLIP_RAW_HTML_CHARS = 500_000
+MAX_CLIP_MEDIA_BYTES = 24 * 1024 * 1024
+MAX_CLIP_SCREENSHOT_PIXELS = 40_000_000
 MAX_PAIRINGS_FILE_BYTES = 262_144
 MAX_ACTIVE_PAIRINGS = 64
 MAX_PENDING_PAIRING_CODES = 8
 PAIRING_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-_PAIRING_CODE_RE = re.compile(r"^SBC-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
+_PAIRING_CODE_RE = re.compile(r"^(SBC-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})(?:-([0-9]{1,5}))?$")
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_PDF_MAGIC = b"%PDF-"
 
 _CHROME_EXT_ORIGIN_RE = re.compile(r"^chrome-extension://[a-p]{32}$")
 _MOZ_EXT_ORIGIN_RE = re.compile(
     r"^moz-extension://[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_SAFARI_EXT_ORIGIN_RE = re.compile(
+    r"^safari-web-extension://[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 _PAIRING_ID_RE = re.compile(r"^clip_[0-9a-f]{12,32}$")
 _CLIPPER_LOCK = threading.Lock()
@@ -84,22 +95,32 @@ def _clipper_pairings_path(security_dir: str | Path | None = None) -> Path:
 
 
 def is_valid_extension_origin(origin: str) -> bool:
-    """Return True iff origin is a syntactically valid Chrome/Edge or Firefox extension origin."""
+    """Return True iff origin is a syntactically valid Chrome/Edge, Firefox, or Safari extension origin."""
     cleaned = str(origin or "").strip().lower().rstrip("/")
-    return bool(_CHROME_EXT_ORIGIN_RE.fullmatch(cleaned) or _MOZ_EXT_ORIGIN_RE.fullmatch(cleaned))
+    return bool(
+        _CHROME_EXT_ORIGIN_RE.fullmatch(cleaned)
+        or _MOZ_EXT_ORIGIN_RE.fullmatch(cleaned)
+        or _SAFARI_EXT_ORIGIN_RE.fullmatch(cleaned)
+    )
 
 
 def validate_extension_origin(origin: str) -> str:
-    """Validate and normalize a Chrome/Edge or Firefox browser extension origin."""
+    """Validate and normalize a Chrome/Edge, Firefox, or Safari browser extension origin."""
     cleaned = str(origin or "").strip().lower().rstrip("/")
     if not cleaned or any(ch.isspace() for ch in cleaned):
         raise ClipperError(
-            "Extension origin must be a valid 'chrome-extension://<32-char-id>' or 'moz-extension://<uuid>' origin."
+            "Extension origin must be a valid 'chrome-extension://<32-char-id>', "
+            "'moz-extension://<uuid>', or 'safari-web-extension://<uuid>' origin."
         )
-    if _CHROME_EXT_ORIGIN_RE.fullmatch(cleaned) or _MOZ_EXT_ORIGIN_RE.fullmatch(cleaned):
+    if (
+        _CHROME_EXT_ORIGIN_RE.fullmatch(cleaned)
+        or _MOZ_EXT_ORIGIN_RE.fullmatch(cleaned)
+        or _SAFARI_EXT_ORIGIN_RE.fullmatch(cleaned)
+    ):
         return cleaned
     raise ClipperError(
-        f"Unsupported extension origin {origin!r}; expected 'chrome-extension://<32-char-id>' or 'moz-extension://<uuid>'."
+        f"Unsupported extension origin {origin!r}; expected 'chrome-extension://<32-char-id>', "
+        "'moz-extension://<uuid>', or 'safari-web-extension://<uuid>'."
     )
 
 
@@ -216,7 +237,7 @@ def create_clipper_pairing(
         "token_preview": record["token_preview"],
         "created_at": created_at,
         "scopes": list(record["scopes"]),
-        "allowed_endpoints": ["/v1/clipper/ping", "/v1/clipper/status", "/v1/clipper/clip"],
+        "allowed_endpoints": ["/v1/clipper/ping", "/v1/clipper/status", "/v1/clipper/clip", "/v1/clipper/capture-media"],
     }
 
 
@@ -238,14 +259,21 @@ def create_clipper_pairing_code(
     *,
     label: str = "Browser Clipper",
     ttl_seconds: int = 300,
+    port: int | None = None,
     security_dir: str | Path | None = None,
 ) -> dict[str, object]:
-    """Mint a short-lived, single-use 60-bit 1-click pairing code (SBC-XXXX-XXXX-XXXX) for the owner."""
+    """Mint a short-lived, single-use 60-bit 1-click pairing code (SBC-XXXX-XXXX-XXXX[-PORT]) for the owner."""
     clean_label = re.sub(r"\s+", " ", str(label or "Browser Clipper")).strip()[:80] or "Browser Clipper"
     ttl = max(30, min(int(ttl_seconds), 900))
+    valid_port: int | None = None
+    if port is not None:
+        if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+            raise ClipperError(f"Invalid loopback port for clipper pairing code: {port!r}")
+        valid_port = int(port)
     groups = ["".join(secrets.choice(PAIRING_CODE_ALPHABET) for _ in range(4)) for _ in range(3)]
-    raw_code = f"SBC-{groups[0]}-{groups[1]}-{groups[2]}"
-    code_sha = _sha256_str(raw_code)
+    base_code = f"SBC-{groups[0]}-{groups[1]}-{groups[2]}"
+    raw_code = f"{base_code}-{valid_port}" if valid_port is not None else base_code
+    code_sha = _sha256_str(base_code)
     now_dt = datetime.datetime.now(datetime.timezone.utc)
     now_epoch = now_dt.timestamp()
     exp_epoch = round(now_epoch + ttl, 3)
@@ -262,6 +290,7 @@ def create_clipper_pairing_code(
             {
                 "code_sha256": code_sha,
                 "label": clean_label,
+                "port": valid_port,
                 "created_at": now_dt.isoformat(timespec="seconds"),
                 "expires_at": expires_at,
                 "expires_epoch": exp_epoch,
@@ -269,12 +298,15 @@ def create_clipper_pairing_code(
         )
         _save_pairings_unlocked(path, {"schema_version": 1, "pairings": pairings, "pending_codes": pending})
 
-    return {
+    out: dict[str, object] = {
         "code": raw_code,
         "label": clean_label,
         "ttl_seconds": ttl,
         "expires_at": expires_at,
     }
+    if valid_port is not None:
+        out["port"] = valid_port
+    return out
 
 
 def redeem_clipper_pairing_code(
@@ -287,9 +319,16 @@ def redeem_clipper_pairing_code(
     """Consume a valid single-use pairing code and register the browser extension origin."""
     norm_origin = validate_extension_origin(origin)
     norm_code = str(code or "").strip().upper()
-    if not _PAIRING_CODE_RE.fullmatch(norm_code):
+    m = _PAIRING_CODE_RE.fullmatch(norm_code)
+    if not m:
         raise ClipperSecurityError("Invalid or expired 1-click pairing code.")
-    supplied_sha = _sha256_str(norm_code)
+    base_code = m.group(1)
+    port_part = m.group(2)
+    if port_part is not None:
+        port_num = int(port_part)
+        if not (1 <= port_num <= 65535):
+            raise ClipperSecurityError("Invalid or expired 1-click pairing code.")
+    supplied_sha = _sha256_str(base_code)
     now_epoch = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
     path = _clipper_pairings_path(security_dir)
@@ -358,7 +397,7 @@ def revoke_clipper_pairing(pairing_id: str, *, security_dir: str | Path | None =
 def is_paired_clipper_origin(origin: str, *, security_dir: str | Path | None = None) -> bool:
     """Return True iff origin is a valid, owner-paired browser extension origin."""
     cleaned = str(origin or "").strip().lower().rstrip("/")
-    if not (_CHROME_EXT_ORIGIN_RE.fullmatch(cleaned) or _MOZ_EXT_ORIGIN_RE.fullmatch(cleaned)):
+    if not is_valid_extension_origin(cleaned):
         return False
     path = _clipper_pairings_path(security_dir)
     try:
@@ -427,16 +466,16 @@ def _screen_clip_risks(url: str, title: str, quote: str, page_text: str) -> list
     return risks
 
 
-def _write_exclusive_snapshot(directory: Path, stem: str, payload: bytes) -> str:
+def _write_exclusive_binary_file(directory: Path, stem: str, ext: str, payload: bytes) -> str:
     directory.mkdir(parents=True, exist_ok=True)
     if _is_reparse_or_link(str(directory)):
-        raise ClipperSecurityError(f"Refusing to write clip snapshot into symlinked directory: {directory}")
+        raise ClipperSecurityError(f"Refusing to write clip artifact into symlinked directory: {directory}")
     suffix = 1
     while True:
-        name = f"{stem}.md" if suffix == 1 else f"{stem}-{suffix}.md"
+        name = f"{stem}{ext}" if suffix == 1 else f"{stem}-{suffix}{ext}"
         target = directory / name
         if os.path.lexists(str(target)) and _is_reparse_or_link(str(target)):
-            raise ClipperSecurityError(f"Refusing to overwrite symlinked snapshot: {name}")
+            raise ClipperSecurityError(f"Refusing to overwrite symlinked artifact: {name}")
         try:
             fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
         except FileExistsError:
@@ -444,11 +483,15 @@ def _write_exclusive_snapshot(directory: Path, stem: str, payload: bytes) -> str
             continue
         try:
             if os.write(fd, payload) != len(payload):
-                raise OSError("Incomplete clip snapshot write.")
+                raise OSError("Incomplete clip artifact write.")
             os.fsync(fd)
         finally:
             os.close(fd)
         return name
+
+
+def _write_exclusive_snapshot(directory: Path, stem: str, payload: bytes) -> str:
+    return _write_exclusive_binary_file(directory, stem, ".md", payload)
 
 
 def extract_clean_markdown_from_html(raw_html: str, *, source_url: str = "") -> str:
@@ -458,6 +501,12 @@ def extract_clean_markdown_from_html(raw_html: str, *, source_url: str = "") -> 
         return ""
     if len(markup) > MAX_CLIP_RAW_HTML_CHARS:
         raise ClipperError(f"Raw HTML exceeds maximum allowed length ({MAX_CLIP_RAW_HTML_CHARS} chars).")
+    try:
+        from math_equivalence import preserve_latex_in_html
+
+        markup = preserve_latex_in_html(markup)
+    except Exception:
+        pass
     try:
         import trafilatura
 
@@ -470,7 +519,14 @@ def extract_clean_markdown_from_html(raw_html: str, *, source_url: str = "") -> 
             no_fallback=False,
         )
         if isinstance(extracted, str) and extracted.strip():
-            return extracted.replace("\r\n", "\n").strip()[:MAX_CLIP_PAGE_TEXT_CHARS]
+            cleaned_md = extracted.replace("\r\n", "\n").strip()[:MAX_CLIP_PAGE_TEXT_CHARS]
+            try:
+                from math_equivalence import unescape_markdown_latex_spans
+
+                cleaned_md = unescape_markdown_latex_spans(cleaned_md)
+            except Exception:
+                pass
+            return cleaned_md
     except Exception:
         pass
     try:
@@ -675,6 +731,320 @@ def ingest_web_clip(
     }
 
 
+def _decode_clipper_media_bytes(
+    *,
+    content_base64: str | None = None,
+    raw_bytes: bytes | bytearray | None = None,
+) -> bytes:
+    """Decode validated clip media bytes from raw bytes or optional data-URI base64 text."""
+    if raw_bytes is not None:
+        if not isinstance(raw_bytes, (bytes, bytearray)):
+            raise ClipperError("raw_bytes must be a bytes or bytearray payload.")
+        decoded = bytes(raw_bytes)
+    else:
+        raw_str = str(content_base64 or "").strip()
+        if not raw_str:
+            raise ClipperError("Either 'content_base64' or 'raw_bytes' is required for media clip capture.")
+        if raw_str.lower().startswith("data:") and "," in raw_str[:128]:
+            raw_str = raw_str.split(",", 1)[1].strip()
+        try:
+            decoded = base64.b64decode(raw_str, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ClipperError(f"Invalid base64 media payload: {exc}") from exc
+    if not decoded:
+        raise ClipperError("Media clip payload is empty.")
+    if len(decoded) > MAX_CLIP_MEDIA_BYTES:
+        raise ClipperError(
+            f"Media clip payload ({len(decoded)} bytes) exceeds {MAX_CLIP_MEDIA_BYTES} bytes limit."
+        )
+    return decoded
+
+
+def _sanitize_png_screenshot(decoded: bytes) -> tuple[bytes, str, int, int]:
+    """Validate PNG signature, re-encode pixel data to strip metadata chunks, and try local OCR."""
+    if not decoded.startswith(_PNG_MAGIC):
+        raise ClipperError("Screenshot payload is not a valid PNG image.")
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError as exc:  # pragma: no cover - locked core dependency
+        raise ClipperError("Pillow is required to validate captured screenshots.") from exc
+
+    prev_limit = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = MAX_CLIP_SCREENSHOT_PIXELS
+    try:
+        with Image.open(io.BytesIO(decoded)) as img:
+            w, h = img.size
+            if w <= 0 or h <= 0 or (w * h) > MAX_CLIP_SCREENSHOT_PIXELS:
+                raise ClipperError(f"Screenshot pixel dimensions exceed {MAX_CLIP_SCREENSHOT_PIXELS} pixel safety cap.")
+            pixel_mode = "RGBA" if "A" in img.getbands() else "RGB"
+            converted = img.convert(pixel_mode)
+            clean_img = Image.new(pixel_mode, (w, h))
+            get_data = getattr(converted, "get_flattened_data", None) or converted.getdata
+            clean_img.putdata(list(get_data()))
+            out_buf = io.BytesIO()
+            clean_img.save(out_buf, format="PNG")
+            clean_png = out_buf.getvalue()
+    except ClipperError:
+        raise
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as exc:
+        raise ClipperError(f"Invalid or unsafe PNG screenshot payload: {exc}") from exc
+    finally:
+        Image.MAX_IMAGE_PIXELS = prev_limit
+
+    ocr_text = ""
+    try:
+        from doc_extractors import _run_local_ocr_on_png
+
+        ocr_res = _run_local_ocr_on_png(clean_png, allow_vision_ocr=False)
+        if isinstance(ocr_res, tuple) and ocr_res:
+            ocr_text = str(ocr_res[0] or "").strip()
+    except Exception:
+        ocr_text = ""
+    return clean_png, ocr_text, w, h
+
+
+def _validate_and_extract_pdf(decoded: bytes) -> tuple[bytes, str, int]:
+    """Verify PDF magic bytes and locally extract Markdown text via doc_extractors without network I/O."""
+    if not decoded.lstrip(b"\r\n\t \x00").startswith(_PDF_MAGIC):
+        raise ClipperError("Uploaded PDF payload is missing a valid %PDF- header.")
+    try:
+        from doc_extractors import DocumentExtractionError, extract_pdf
+    except ImportError:
+        return decoded, "", 0
+
+    fd, tmp_pdf = tempfile.mkstemp(prefix="sb_clip_", suffix=".pdf")
+    try:
+        try:
+            os.write(fd, decoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            extraction = extract_pdf(tmp_pdf, enable_ocr=True, allow_vision_ocr=False)
+            text = str(getattr(extraction, "markdown", "") or "").strip()[:MAX_CLIP_PAGE_TEXT_CHARS]
+            pages = int(getattr(extraction, "page_count", 0) or 0)
+            return decoded, text, pages
+        except DocumentExtractionError as exc:
+            msg = str(exc)
+            if "Encrypted" in msg:
+                raise ClipperError(msg) from exc
+            # Minimal or image-only PDFs may have zero parseable pages in synthetic tests; retain archive safely.
+            return decoded, "", 0
+    finally:
+        try:
+            os.unlink(tmp_pdf)
+        except OSError:
+            pass
+
+
+def _merge_clip_tags(host: str, raw_tags: list[str] | tuple[str, ...] | str, extra_tag: str) -> list[str]:
+    parsed = raw_tags.split(",") if isinstance(raw_tags, str) else list(raw_tags or ())
+    merged = ["web-clip", extra_tag, f"site:{host}"]
+    for item in parsed:
+        safe = re.sub(r"[^A-Za-z0-9_:/.-]", "", str(item or "").strip())[:64]
+        if safe and safe not in merged:
+            merged.append(safe)
+    return merged
+
+
+def ingest_clipper_media_bytes(
+    *,
+    url: str,
+    title: str = "",
+    kind: str,
+    content_base64: str | None = None,
+    raw_bytes: bytes | bytearray | None = None,
+    tags: list[str] | tuple[str, ...] | str = (),
+    destination: str = "note",
+    capture_source: str = "browser-clipper",
+    brain_dir: str | None = None,
+) -> dict[str, object]:
+    """Capture a visible-tab PNG screenshot or in-browser PDF into 0-raw/archive + note/inbox safely."""
+    clean_kind = str(kind or "").strip().lower()
+    if clean_kind not in {"screenshot_png", "pdf_document"}:
+        raise ClipperError("Media clip 'kind' must be 'screenshot_png' or 'pdf_document'.")
+
+    clean_url, host = validate_web_clip_url(url)
+    clean_title = re.sub(r"\s+", " ", str(title or "")).strip()[:MAX_CLIP_TITLE_CHARS] or host
+    dest_norm = str(destination or "note").strip().lower()
+    if dest_norm not in {"note", "inbox"}:
+        raise ClipperError("Destination must be 'note' or 'inbox'.")
+
+    decoded = _decode_clipper_media_bytes(content_base64=content_base64, raw_bytes=raw_bytes)
+    width = height = page_count = 0
+    if clean_kind == "screenshot_png":
+        clean_bytes, extracted_text, width, height = _sanitize_png_screenshot(decoded)
+        ext = ".png"
+        extra_tag = "media:screenshot"
+    else:
+        clean_bytes, extracted_text, page_count = _validate_and_extract_pdf(decoded)
+        ext = ".pdf"
+        extra_tag = "media:pdf"
+
+    merged_tags = _merge_clip_tags(host, tags, extra_tag)
+    resolved_brain = os.path.abspath(brain_dir) if brain_dir else resolve_active_brain_dir()
+    if os.path.lexists(resolved_brain) and _is_reparse_or_link(resolved_brain):
+        raise ClipperSecurityError("Refusing to clip into a symlinked vault directory.")
+    npaths = NotePaths.for_brain(resolved_brain)
+    captured_at = _now_iso()
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    slug = slugify(clean_title, max_len=48)
+    media_sha256 = content_sha256(clean_bytes)
+
+    risks = _screen_clip_risks(clean_url, clean_title, "", extracted_text)
+    quarantined = bool(risks) or dest_norm == "inbox"
+
+    media_archive_rel: str | None = None
+    snapshot_rel: str | None = None
+    snapshot_sha256: str | None = None
+
+    os.makedirs(os.path.dirname(npaths.lock_path), exist_ok=True)
+    if not risks:
+        archive_dir = Path(resolved_brain) / "0-raw" / "archive"
+        snap_dir = Path(resolved_brain) / "0-raw" / "note-snapshots"
+        with review_lock(npaths.lock_path):
+            arch_name = _write_exclusive_binary_file(archive_dir, f"clip-{stamp}-{slug}", ext, clean_bytes)
+            media_archive_rel = f"0-raw/archive/{arch_name}"
+            snap_sections = [
+                "---",
+                f"title: {json.dumps(clean_title, ensure_ascii=False)}",
+                f"type: web_clip_{clean_kind}",
+                f"source_url: {json.dumps(clean_url, ensure_ascii=False)}",
+                f"captured_at: {captured_at}",
+                f"capture_source: {json.dumps(str(capture_source or 'browser-clipper')[:64], ensure_ascii=False)}",
+                f"media_archive_path: {media_archive_rel}",
+                f"media_sha256: {media_sha256}",
+                "---",
+                "",
+                f"# {clean_title}",
+                "",
+                f"- Source URL: {clean_url}",
+                f"- Archived Media: `{media_archive_rel}` (`{media_sha256}`)",
+                f"- Captured At: {captured_at}",
+            ]
+            if clean_kind == "screenshot_png":
+                snap_sections.append(f"- Dimensions: {width}x{height} PNG")
+            elif page_count:
+                snap_sections.append(f"- Pages: {page_count}")
+            if extracted_text:
+                snap_sections.extend(["", "## Extracted Content", "", extracted_text])
+            snapshot_bytes = ("\n".join(snap_sections).rstrip() + "\n").encode("utf-8")
+            snapshot_sha256 = content_sha256(snapshot_bytes)
+            snap_name = _write_exclusive_snapshot(snap_dir, f"clip-{stamp}-{slug}-{clean_kind}", snapshot_bytes)
+            snapshot_rel = f"0-raw/note-snapshots/{snap_name}"
+
+    if quarantined:
+        inbox_dir = Path(npaths.inbox_dir)
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        if _is_reparse_or_link(str(inbox_dir)):
+            raise ClipperSecurityError("Refusing to write quarantined clip to symlinked inbox directory.")
+        safe_url = (
+            inspect_and_redact_outbound(clean_url, redact_pii=False, fail_on_secret_detection=False).sanitized_text
+            if risks and clean_url
+            else clean_url
+        )
+        safe_title = (
+            inspect_and_redact_outbound(clean_title, redact_pii=False, fail_on_secret_detection=False).sanitized_text
+            if risks and clean_title
+            else clean_title
+        )
+        safe_text = (
+            inspect_and_redact_outbound(extracted_text, redact_pii=False, fail_on_secret_detection=False).sanitized_text
+            if risks and extracted_text
+            else extracted_text
+        )
+        inbox_slug = slugify(safe_title, max_len=48) if risks else slug
+        safe_src = re.sub(r"-{2,}", "-", re.sub(r"[^A-Za-z0-9._:-]", "", str(capture_source or "browser-clipper")))[:64]
+        inbox_lines = [
+            "<!-- second_brain_origin: web_clipper -->",
+            f"<!-- capture_source: {safe_src} -->",
+            f"<!-- clip_media_kind: {clean_kind} -->",
+            f"<!-- source_url: {safe_url.replace('--', '—')} -->",
+        ]
+        if media_archive_rel:
+            inbox_lines.append(f"<!-- media_archive_path: {media_archive_rel} -->")
+        if snapshot_rel and snapshot_sha256:
+            inbox_lines.append(f"<!-- clip_snapshot: {snapshot_rel} -->")
+            inbox_lines.append(f"<!-- clip_snapshot_sha256: {snapshot_sha256} -->")
+        if risks:
+            inbox_lines.append(f"<!-- quarantine_risks: {', '.join(risks)} -->")
+        inbox_lines.extend(["", f"# {safe_title}", "", f"- Source: {safe_url}", f"- Media Kind: {clean_kind}"])
+        if media_archive_rel:
+            inbox_lines.append(f"- Archived Media: `{media_archive_rel}` (`{media_sha256}`)")
+        if snapshot_rel and snapshot_sha256:
+            inbox_lines.append(f"- Snapshot: `{snapshot_rel}` (`{snapshot_sha256}`)")
+        inbox_lines.append(f"- Tags: {', '.join(merged_tags)}")
+        if safe_text:
+            inbox_lines.extend(["", "## Extracted Content", "", safe_text])
+        inbox_bytes = ("\n".join(inbox_lines).rstrip() + "\n").encode("utf-8")
+        with review_lock(npaths.lock_path):
+            inbox_name = _write_exclusive_snapshot(inbox_dir, f"{stamp}-{inbox_slug}-{clean_kind}", inbox_bytes)
+        return {
+            "status": "quarantined" if risks else "queued_inbox",
+            "destination": "inbox",
+            "kind": clean_kind,
+            "filename": inbox_name,
+            "location": "0-raw/inbox/",
+            "media_archive_path": media_archive_rel,
+            "media_sha256": media_sha256,
+            "snapshot_path": snapshot_rel,
+            "snapshot_sha256": snapshot_sha256,
+            "extracted_chars": len(safe_text),
+            "quarantined": bool(risks),
+            "risk_flags": risks,
+            "quarantine_reason": (
+                "Captured media text matched DLP secret or prompt-injection patterns and was quarantined to 0-raw/inbox/."
+                if risks
+                else "Media clip captured directly to quarantined 0-raw/inbox/ as requested."
+            ),
+            "url": safe_url,
+            "title": safe_title,
+            "tags": merged_tags,
+            "captured_at": captured_at,
+        }
+
+    note_lines = [
+        f"Source: {clean_url}",
+        f"Captured: {captured_at}",
+        f"Media Archive: `{media_archive_rel}` (SHA-256 `{media_sha256}`)",
+        f"Snapshot: `{snapshot_rel}` (SHA-256 `{snapshot_sha256}`)",
+    ]
+    if clean_kind == "screenshot_png":
+        note_lines.append(f"Dimensions: {width}x{height} PNG")
+    elif page_count:
+        note_lines.append(f"Pages: {page_count}")
+    if extracted_text:
+        note_lines.extend(["", "## Extracted Content", "", extracted_text])
+    created = create_note(
+        title=clean_title,
+        body="\n".join(note_lines).strip(),
+        origin="owner_import",
+        tags=tuple(merged_tags),
+        source_path=snapshot_rel,
+        capture_source=capture_source,
+        paths=npaths,
+    )
+    return {
+        "status": str(created.get("status") or "saved"),
+        "destination": "note",
+        "kind": clean_kind,
+        "filename": str(created.get("filename") or ""),
+        "note_sha256": str(created.get("sha256") or ""),
+        "location": "notes/",
+        "media_archive_path": media_archive_rel,
+        "media_sha256": media_sha256,
+        "snapshot_path": snapshot_rel,
+        "snapshot_sha256": snapshot_sha256,
+        "extracted_chars": len(extracted_text),
+        "quarantined": False,
+        "risk_flags": [],
+        "url": clean_url,
+        "title": clean_title,
+        "tags": merged_tags,
+        "captured_at": captured_at,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="second-brain clipper",
@@ -683,7 +1053,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_pair = sub.add_parser("pair", help="Register a browser extension origin and mint a scoped Clipper token.")
-    p_pair.add_argument("--origin", required=True, help="Extension origin (chrome-extension://<32-char-id> or moz-extension://<uuid>).")
+    p_pair.add_argument(
+        "--origin",
+        required=True,
+        help="Extension origin (chrome-extension://<32-char-id>, moz-extension://<uuid>, or safari-web-extension://<uuid>).",
+    )
     p_pair.add_argument("--label", default="Browser Clipper", help="Human-friendly browser label.")
     p_pair.add_argument("--json", action="store_true", help="Output JSON.")
 
@@ -714,6 +1088,15 @@ def main(argv: list[str] | None = None) -> int:
     p_clip.add_argument("--tags", default="", help="Comma-separated tags.")
     p_clip.add_argument("--destination", choices=["note", "inbox"], default="note")
     p_clip.add_argument("--json", action="store_true", help="Output JSON.")
+
+    p_cmedia = sub.add_parser("clip-media", help="Ingest a captured screenshot PNG or browser PDF locally.")
+    p_cmedia.add_argument("--url", required=True, help="Source http(s) URL.")
+    p_cmedia.add_argument("--kind", required=True, choices=["screenshot_png", "pdf_document"])
+    p_cmedia.add_argument("--file", required=True, help="Local path to PNG or PDF bytes.")
+    p_cmedia.add_argument("--title", default="", help="Document or page title.")
+    p_cmedia.add_argument("--tags", default="", help="Comma-separated tags.")
+    p_cmedia.add_argument("--destination", choices=["note", "inbox"], default="note")
+    p_cmedia.add_argument("--json", action="store_true", help="Output JSON.")
 
     args = parser.parse_args(argv)
     try:
@@ -762,6 +1145,18 @@ def main(argv: list[str] | None = None) -> int:
                 destination=args.destination,
             )
             print(json.dumps(res, indent=2) if args.json else f"[{res['status']}] {res['location']}{res['filename']} (snapshot {res['snapshot_path']})")
+            return 0
+        if args.cmd == "clip-media":
+            raw_payload = Path(args.file).expanduser().read_bytes()
+            res = ingest_clipper_media_bytes(
+                url=args.url,
+                title=args.title,
+                kind=args.kind,
+                raw_bytes=raw_payload,
+                tags=args.tags,
+                destination=args.destination,
+            )
+            print(json.dumps(res, indent=2) if args.json else f"[{res['status']}] {res['location']}{res['filename']} (media {res['media_archive_path']})")
             return 0
     except (ClipperError, ClipperSecurityError, FileNotFoundError, PermissionError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

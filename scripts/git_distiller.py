@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from atom_mutator import content_sha256, review_lock  # noqa: E402
 import cognitive_core  # noqa: E402
 from config import (  # noqa: E402
+    _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     resolve_active_brain_dir,
     safe_file_in_dir,
@@ -65,7 +66,8 @@ def _assert_no_symlink_ancestors(path: Path, *, stop_at: Path | None = None) -> 
     stop_res = stop_at.resolve() if (stop_at is not None and stop_at.exists()) else None
     for cur in (path, *path.parents):
         if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
-            raise GitDistillerSecurityError(f"Refusing to access git/vault path via symlink or reparse point: {cur}")
+            if not _is_immutable_darwin_root_symlink(cur):
+                raise GitDistillerSecurityError(f"Refusing to access git/vault path via symlink or reparse point: {cur}")
         if stop_res is not None and cur == stop_res:
             break
 

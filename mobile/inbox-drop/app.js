@@ -4,6 +4,15 @@
   const STORAGE_PAIRING_KEY = "sb_inbox_drop_pairing_v1";
   const STORAGE_OUTBOX_KEY = "sb_inbox_drop_outbox_v1";
   const STORAGE_RECALL_CIPHER_KEY = "sb_mobile_recall_cipher_v1";
+  const IDB_NAME = "sb_inbox_drop_keystore_v1";
+  const IDB_STORE = "keys";
+  const IDB_WRAP_KEY_ID = "device_pairing_wrap_v1";
+  const SECRET_PAIRING_FIELDS = [
+    "recall_key_b64",
+    "drop_secret_b64",
+    "hmac_secret_b64",
+    "s3_secret_access_key",
+  ];
 
   const elBadge = document.getElementById("pairingBadge");
   const elBanner = document.getElementById("statusBanner");
@@ -44,6 +53,7 @@
   const elSavePairingBtn = document.getElementById("savePairingBtn");
   const elClearPairingBtn = document.getElementById("clearPairingBtn");
 
+  let activePairing = null;
   let decryptedCatalog = null;
   let activeRecallView = "verified";
 
@@ -63,18 +73,238 @@
     elPanelRecall.classList.toggle("hidden", !isRecall);
   }
 
-  function loadPairing() {
-    try {
-      const raw = localStorage.getItem(STORAGE_PAIRING_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch (_err) {
+  function openKeystoreDb() {
+    return new Promise(function (resolve, reject) {
+      if (typeof indexedDB === "undefined" || !indexedDB || typeof indexedDB.open !== "function") {
+        reject(new Error("IndexedDB unavailable"));
+        return;
+      }
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = function () {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+      req.onsuccess = function () {
+        resolve(req.result);
+      };
+      req.onerror = function () {
+        reject(req.error || new Error("IndexedDB open failed"));
+      };
+    });
+  }
+
+  async function getOrCreateDeviceWrapKey(createIfMissing) {
+    const c = typeof globalThis !== "undefined" ? globalThis.crypto : null;
+    if (!c || !c.subtle) {
       return null;
+    }
+    let db = null;
+    try {
+      db = await openKeystoreDb();
+      const existing = await new Promise(function (resolve, reject) {
+        const tx = db.transaction(IDB_STORE, "readonly");
+        const store = tx.objectStore(IDB_STORE);
+        const getReq = store.get(IDB_WRAP_KEY_ID);
+        getReq.onsuccess = function () {
+          resolve(getReq.result || null);
+        };
+        getReq.onerror = function () {
+          reject(getReq.error || new Error("Keystore read failed"));
+        };
+      });
+      if (existing) {
+        return existing;
+      }
+      if (!createIfMissing) {
+        return null;
+      }
+      // Non-extractable AES-256-GCM wrapping key: JS can use it to seal/unseal but can never export raw key bytes.
+      const wrapKey = await c.subtle.generateKey(
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["encrypt", "decrypt"]
+      );
+      await new Promise(function (resolve, reject) {
+        const tx = db.transaction(IDB_STORE, "readwrite");
+        tx.objectStore(IDB_STORE).put(wrapKey, IDB_WRAP_KEY_ID);
+        tx.oncomplete = function () {
+          resolve();
+        };
+        tx.onerror = function () {
+          reject(tx.error || new Error("Keystore write failed"));
+        };
+      });
+      return wrapKey;
+    } catch (_idbErr) {
+      return null;
+    } finally {
+      if (db && typeof db.close === "function") {
+        try {
+          db.close();
+        } catch (_closeErr) {
+          // Ignore close errors
+        }
+      }
     }
   }
 
-  function savePairing(bundle) {
-    localStorage.setItem(STORAGE_PAIRING_KEY, JSON.stringify(bundle));
+  async function deleteDeviceWrapKey() {
+    let db = null;
+    try {
+      db = await openKeystoreDb();
+      await new Promise(function (resolve, reject) {
+        const tx = db.transaction(IDB_STORE, "readwrite");
+        tx.objectStore(IDB_STORE).delete(IDB_WRAP_KEY_ID);
+        tx.oncomplete = function () {
+          resolve();
+        };
+        tx.onerror = function () {
+          reject(tx.error || new Error("Keystore delete failed"));
+        };
+      });
+    } catch (_err) {
+      // Ignore if IndexedDB unavailable
+    } finally {
+      if (db && typeof db.close === "function") {
+        try {
+          db.close();
+        } catch (_closeErr) {
+          // Ignore
+        }
+      }
+    }
+  }
+
+  function pairingSecretsAad(bundle) {
+    const vid = String((bundle && bundle.vault_id) || "");
+    const tid = String((bundle && bundle.token_id) || "");
+    return new TextEncoder().encode("SBDP-SECRETS-V1:" + vid + ":" + tid);
+  }
+
+  function splitPairingFields(bundle) {
+    const publicPart = {};
+    const secretPart = {};
+    const keys = Object.keys(bundle || {});
+    for (let i = 0; i < keys.length; i += 1) {
+      const k = keys[i];
+      if (k === "sealed_secrets_v1" || k === "secrets_sealed" || k === "secrets_ephemeral_ram_only") {
+        continue;
+      }
+      if (SECRET_PAIRING_FIELDS.indexOf(k) >= 0) {
+        if (bundle[k]) {
+          secretPart[k] = bundle[k];
+        }
+      } else {
+        publicPart[k] = bundle[k];
+      }
+    }
+    return { publicPart: publicPart, secretPart: secretPart };
+  }
+
+  function loadPairing() {
+    return activePairing;
+  }
+
+  async function savePairing(bundle) {
+    activePairing = bundle ? Object.assign({}, bundle) : null;
+    if (!bundle) {
+      localStorage.removeItem(STORAGE_PAIRING_KEY);
+      refreshPairingUi();
+      return;
+    }
+    const split = splitPairingFields(bundle);
+    const toStore = Object.assign({}, split.publicPart);
+    const hasSecrets = Object.keys(split.secretPart).length > 0;
+    if (hasSecrets) {
+      const wrapKey = await getOrCreateDeviceWrapKey(true);
+      const c = typeof globalThis !== "undefined" ? globalThis.crypto : null;
+      if (wrapKey && c && c.subtle) {
+        const iv = new Uint8Array(12);
+        c.getRandomValues(iv);
+        const plainBytes = new TextEncoder().encode(JSON.stringify(split.secretPart));
+        const ctBuf = await c.subtle.encrypt(
+          { name: "AES-GCM", iv: iv, additionalData: pairingSecretsAad(bundle) },
+          wrapKey,
+          plainBytes
+        );
+        toStore.secrets_sealed = true;
+        toStore.sealed_secrets_v1 = {
+          iv_b64: bytesToBase64Local(iv),
+          ct_b64: bytesToBase64Local(new Uint8Array(ctBuf)),
+        };
+      } else {
+        // Never fall back to plaintext localStorage for decryption/S3 secrets: keep secrets in RAM only.
+        toStore.secrets_sealed = false;
+        toStore.secrets_ephemeral_ram_only = true;
+      }
+    }
+    // Defense-in-depth scrub guaranteeing zero raw secret keys ever reach localStorage
+    for (let i = 0; i < SECRET_PAIRING_FIELDS.length; i += 1) {
+      delete toStore[SECRET_PAIRING_FIELDS[i]];
+    }
+    localStorage.setItem(STORAGE_PAIRING_KEY, JSON.stringify(toStore));
     refreshPairingUi();
+  }
+
+  async function hydratePairingFromStorage() {
+    let stored = null;
+    try {
+      const raw = localStorage.getItem(STORAGE_PAIRING_KEY);
+      stored = raw ? JSON.parse(raw) : null;
+    } catch (_err) {
+      stored = null;
+    }
+    if (!stored || typeof stored !== "object") {
+      activePairing = null;
+      refreshPairingUi();
+      return null;
+    }
+
+    // Migrate and scrub any legacy plaintext secret fields previously written to localStorage
+    const hasLegacyPlaintext = SECRET_PAIRING_FIELDS.some(function (f) {
+      return Boolean(stored[f]);
+    });
+    if (hasLegacyPlaintext) {
+      await savePairing(stored);
+      return activePairing;
+    }
+
+    const hydrated = Object.assign({}, stored);
+    delete hydrated.sealed_secrets_v1;
+    delete hydrated.secrets_sealed;
+    delete hydrated.secrets_ephemeral_ram_only;
+
+    if (stored.sealed_secrets_v1 && stored.sealed_secrets_v1.iv_b64 && stored.sealed_secrets_v1.ct_b64) {
+      const wrapKey = await getOrCreateDeviceWrapKey(false);
+      const c = typeof globalThis !== "undefined" ? globalThis.crypto : null;
+      if (wrapKey && c && c.subtle) {
+        try {
+          const iv = base64ToBytesLocal(stored.sealed_secrets_v1.iv_b64);
+          const ct = base64ToBytesLocal(stored.sealed_secrets_v1.ct_b64);
+          const plainBuf = await c.subtle.decrypt(
+            { name: "AES-GCM", iv: iv, additionalData: pairingSecretsAad(stored) },
+            wrapKey,
+            ct
+          );
+          const decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(plainBuf)));
+          if (decoded && typeof decoded === "object") {
+            for (let i = 0; i < SECRET_PAIRING_FIELDS.length; i += 1) {
+              const fk = SECRET_PAIRING_FIELDS[i];
+              if (typeof decoded[fk] === "string" && decoded[fk]) {
+                hydrated[fk] = decoded[fk];
+              }
+            }
+          }
+        } catch (_unsealErr) {
+          showStatus("Device wrapping key unavailable or changed — please re-import your #pair= URI.", true);
+        }
+      }
+    }
+    activePairing = hydrated;
+    refreshPairingUi();
+    return activePairing;
   }
 
   function loadOutbox() {
@@ -162,7 +392,7 @@
     return nextBundle;
   }
 
-  function importHashIfPresent() {
+  async function importHashIfPresent() {
     if (!window.location.hash || window.location.hash.indexOf("pair=") === -1) {
       return;
     }
@@ -173,7 +403,7 @@
         window.SecondBrainDropCrypto.parsePairingFragment(rawHash),
         prev
       );
-      savePairing(parsed);
+      await savePairing(parsed);
       showStatus("Paired zero-knowledge device keys and scrubbed URL hash.", false);
     } catch (err) {
       showStatus("Pairing import failed: " + err.message, true);
@@ -646,7 +876,7 @@
     showStatus("Flushed " + sent + " queued drop(s); " + remaining.length + " remaining.", remaining.length > 0);
   });
 
-  elSavePairingBtn.addEventListener("click", function () {
+  elSavePairingBtn.addEventListener("click", async function () {
     try {
       const prev = loadPairing();
       const rawPair = elPairInput.value.trim();
@@ -673,30 +903,35 @@
         base.s3_secret_access_key = elSkInput.value.trim();
       }
       mergePreservedS3Fields(base, prev);
-      savePairing(base);
+      await savePairing(base);
       elPairInput.value = "";
       elSkInput.value = "";
-      showStatus("Saved zero-knowledge pairing configuration.", false);
-      restoreCachedRecallIfAvailable();
+      showStatus("Saved zero-knowledge pairing configuration (secrets sealed outside plaintext localStorage).", false);
+      await restoreCachedRecallIfAvailable();
     } catch (err) {
       showStatus(err.message, true);
     }
   });
 
-  elClearPairingBtn.addEventListener("click", function () {
+  elClearPairingBtn.addEventListener("click", async function () {
+    activePairing = null;
     decryptedCatalog = null;
     localStorage.removeItem(STORAGE_PAIRING_KEY);
     localStorage.removeItem(STORAGE_RECALL_CIPHER_KEY);
+    await deleteDeviceWrapKey();
     refreshPairingUi();
     renderRecallResults();
-    showStatus("Cleared device pairing keys and cached recall ciphertext from browser storage.", false);
+    showStatus("Cleared device pairing keys, keystore handle, and cached recall ciphertext.", false);
   });
 
-  importHashIfPresent();
-  populateShareTargetParams();
-  refreshPairingUi();
-  refreshOutboxUi();
-  restoreCachedRecallIfAvailable();
+  window.__sbInboxDropAppReady = (async function initApp() {
+    await hydratePairingFromStorage();
+    await importHashIfPresent();
+    populateShareTargetParams();
+    refreshPairingUi();
+    refreshOutboxUi();
+    await restoreCachedRecallIfAvailable();
+  })();
 
   if ("serviceWorker" in navigator && window.location.protocol === "https:") {
     navigator.serviceWorker.register("sw.js").catch(function () {});

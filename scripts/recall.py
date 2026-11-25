@@ -18,6 +18,7 @@ from contextlib import closing
 import contextvars
 from dataclasses import dataclass, field, replace
 import datetime
+import functools
 import hashlib
 import math
 import os
@@ -45,7 +46,10 @@ from config import (
     _is_reparse_or_link,
     is_content_markdown,
     normalize_markdown_filename,
+    resolve_module_atoms_and_brain,
+    resolve_module_vault_path,
     safe_file_in_dir,
+    snapshot_module_defaults,
 )
 from index_manifest import cached_atom_hash_for_stat, index_manifest_is_current, load_index_manifest
 from lexical_store import (
@@ -60,6 +64,7 @@ from memory_review import REVIEW_STATUSES, parse_atom_record, parse_atom_record_
 from review_atom import approved_revision_is_current
 from vector_store import close_vector_collection, get_vector_collection
 
+_MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 _ORIG_APPROVED_REVISION_IS_CURRENT = approved_revision_is_current
 _ORIG_SEARCH_LEXICAL_INDEX = search_lexical_index
 
@@ -143,6 +148,9 @@ class RecallOptions:
     telemetry_db_path: str | None = None
     include_expired: bool = False
     as_of: str | None = None
+    use_l0_bus: bool = False
+    enable_gravity_boost: bool = False
+    enable_spreading_activation: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,6 +191,7 @@ def consume_last_degradation_warning() -> str | None:
     return warning
 
 
+@functools.lru_cache(maxsize=512)
 def normalize_project_tag(tag: str) -> str:
     cleaned = str(tag or "").strip().lower().replace("-", "_")
     if not cleaned:
@@ -271,6 +280,8 @@ def normalize_statuses(statuses: set[str] | None) -> set[str] | None:
 
 def metadata_contexts(record: dict) -> tuple[str, ...]:
     contexts = record.get("contexts", [])
+    if isinstance(contexts, tuple) and contexts:
+        return contexts
     if isinstance(contexts, str):
         contexts = parse_scalar_list(contexts)
     return tuple(str(item).strip() for item in contexts if str(item).strip())
@@ -280,9 +291,26 @@ def _resolve_canonical_atoms_root(atoms_dir: str) -> str | None:
     if not atoms_dir:
         return None
     abs_root = os.path.abspath(atoms_dir)
-    if not os.path.isdir(abs_root) or _is_reparse_or_link(abs_root):
+    try:
+        st = os.lstat(abs_root)
+    except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(st.st_mode)
+        or stat.S_ISLNK(st.st_mode)
+        or (os.name == "nt" and bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT))
+    ):
         return None
     return abs_root
+
+
+def _resolve_vault_dirs_for_atoms(atoms_dir: str) -> tuple[str, str]:
+    abs_atoms = os.path.abspath(atoms_dir)
+    parent_brain = os.path.abspath(os.path.join(abs_atoms, os.pardir))
+    if RAW_DIR != _MOD_PATH_DEFAULTS.get("RAW_DIR") and abs_atoms == os.path.abspath(str(ATOMS_DIR)):
+        eff_raw = os.path.abspath(str(RAW_DIR))
+        return parent_brain, os.path.join(eff_raw, "archive", "decision-record.jsonl")
+    return parent_brain, os.path.join(parent_brain, "0-raw", "archive", "decision-record.jsonl")
 
 
 def _read_verified_atom_bytes_fast(
@@ -349,12 +377,26 @@ def _read_verified_atom_bytes_fast(
     return path, raw_bytes, content
 
 
-def _record_passes_pre_anchor_filters(record: dict, options: RecallOptions) -> bool:
+def _record_passes_pre_anchor_filters(
+    record: dict,
+    options: RecallOptions,
+    *,
+    _include_statuses: set[str] | None = None,
+    _exclude_statuses: set[str] | None = None,
+    _memory_types: set[str] | None = None,
+    _filters_precomputed: bool = False,
+) -> bool:
     """Fast in-memory pre-check before opening anchored source files on disk."""
     status = str(record.get("review_status", "pending"))
     claim_state = str(record.get("claim_state", "candidate"))
-    include_statuses = normalize_statuses(options.include_statuses)
-    exclude_statuses = normalize_statuses(options.exclude_statuses) or set()
+    if _filters_precomputed:
+        include_statuses = _include_statuses
+        exclude_statuses = _exclude_statuses if _exclude_statuses is not None else set()
+        memory_types = _memory_types
+    else:
+        include_statuses = normalize_statuses(options.include_statuses)
+        exclude_statuses = normalize_statuses(options.exclude_statuses) or set()
+        memory_types = set(options.memory_types) if options.memory_types else None
 
     superseded_by = record.get("superseded_by", [])
     if isinstance(superseded_by, str):
@@ -369,29 +411,47 @@ def _record_passes_pre_anchor_filters(record: dict, options: RecallOptions) -> b
         return False
     if (not options.allow_unreviewed_exploratory or status == "accepted") and claim_state != "human_reviewed":
         return False
-    if options.memory_types:
+    if memory_types:
         memory_type = str(record.get("memory_type", "semantic"))
-        if memory_type not in set(options.memory_types):
+        if memory_type not in memory_types:
             return False
     if options.projects:
         record_contexts = metadata_contexts(record)
         if not project_tags_match(record_contexts, options.projects):
             return False
-    tv = evaluate_temporal_validity(
-        record.get("valid_from"),
-        record.get("valid_until"),
-        as_of=options.as_of,
-    )
-    if tv["status"] == "invalid_window":
-        return False
-    if not options.include_expired and not tv["active"]:
-        return False
+    valid_from = record.get("valid_from")
+    valid_until = record.get("valid_until")
+    if valid_from or valid_until or options.as_of is not None:
+        tv = evaluate_temporal_validity(
+            valid_from,
+            valid_until,
+            as_of=options.as_of,
+        )
+        if tv["status"] == "invalid_window":
+            return False
+        if not options.include_expired and not tv["active"]:
+            return False
     return True
+
+
+def _cached_record_for_candidate(filename: str, content_sha256: str, content: str, *, copy: bool = True) -> dict:
+    """Return parsed atom metadata using the immutable content-SHA cache (optionally shared read-only)."""
+    cache_key = (filename, content_sha256)
+    with _RECALL_PARSE_CACHE_LOCK:
+        cached_rec = _ATOM_RECORD_BY_SHA.get(cache_key)
+    if cached_rec is not None:
+        return dict(cached_rec) if copy else cached_rec
+    record = parse_atom_record_text(filename, content)
+    with _RECALL_PARSE_CACHE_LOCK:
+        if len(_ATOM_RECORD_BY_SHA) > 8192:
+            _ATOM_RECORD_BY_SHA.clear()
+        _ATOM_RECORD_BY_SHA[cache_key] = dict(record)
+    return dict(record) if copy else record
 
 
 def load_memory_metadata(
     filename: str,
-    atoms_dir: str = ATOMS_DIR,
+    atoms_dir: str | None = None,
     *,
     _preverified: tuple[str, bytes, str] | None = None,
     _known_sha256: str | None = None,
@@ -399,7 +459,17 @@ def load_memory_metadata(
     _decision_map: dict[str, dict] | None = None,
     _source_sha_memo: dict[str, str | None] | None = None,
     _filter_options: RecallOptions | None = None,
+    _effective_brain_dir: str | None = None,
+    _decision_log: str | None = None,
+    _preparsed_record: dict | None = None,
+    _skip_pre_anchor_check: bool = False,
+    _atoms_dir_resolved: bool = False,
+    _norm_brain_dir: str | None = None,
 ) -> dict:
+    if not _atoms_dir_resolved and not (
+        _canonical_atoms_root is not None and isinstance(atoms_dir, str) and os.path.isabs(atoms_dir) and ".." not in atoms_dir
+    ):
+        atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir, brain_dir=_effective_brain_dir)
     pre_content: str | None = None
     if _preverified is not None:
         path, raw_bytes, pre_content = _preverified
@@ -421,20 +491,23 @@ def load_memory_metadata(
             with open(path, "rb") as fh:
                 raw_bytes = fh.read()
         sha = _known_sha256 or hashlib.sha256(raw_bytes).hexdigest()
-        cache_key = (filename, sha)
-        with _RECALL_PARSE_CACHE_LOCK:
-            cached_rec = _ATOM_RECORD_BY_SHA.get(cache_key)
-        if cached_rec is not None:
-            record = dict(cached_rec)
+        if _preparsed_record is not None:
+            record = dict(_preparsed_record)
         else:
-            if pre_content is not None:
-                record = parse_atom_record_text(filename, pre_content)
-            else:
-                record = parse_atom_record(path)
+            cache_key = (filename, sha)
             with _RECALL_PARSE_CACHE_LOCK:
-                if len(_ATOM_RECORD_BY_SHA) > 8192:
-                    _ATOM_RECORD_BY_SHA.clear()
-                _ATOM_RECORD_BY_SHA[cache_key] = dict(record)
+                cached_rec = _ATOM_RECORD_BY_SHA.get(cache_key)
+            if cached_rec is not None:
+                record = dict(cached_rec)
+            else:
+                if pre_content is not None:
+                    record = parse_atom_record_text(filename, pre_content)
+                else:
+                    record = parse_atom_record(path)
+                with _RECALL_PARSE_CACHE_LOCK:
+                    if len(_ATOM_RECORD_BY_SHA) > 8192:
+                        _ATOM_RECORD_BY_SHA.clear()
+                    _ATOM_RECORD_BY_SHA[cache_key] = dict(record)
     except Exception:
         sha = ""
         record = {
@@ -446,14 +519,18 @@ def load_memory_metadata(
             "importance": "0.20",
             "contexts": [],
         }
-    if _filter_options is not None and not _record_passes_pre_anchor_filters(record, _filter_options):
+    if (
+        not _skip_pre_anchor_check
+        and _filter_options is not None
+        and not _record_passes_pre_anchor_filters(record, _filter_options)
+    ):
         record["approved_revision_current"] = False
         return record
-    effective_brain_dir = os.path.abspath(os.path.join(atoms_dir, os.pardir))
-    decision_log = os.path.join(effective_brain_dir, "0-raw", "archive", "decision-record.jsonl")
-    if os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR):
-        effective_brain_dir = BRAIN_DIR
-        decision_log = os.path.join(RAW_DIR, "archive", "decision-record.jsonl")
+    if _effective_brain_dir is not None and _decision_log is not None:
+        effective_brain_dir = _effective_brain_dir
+        decision_log = _decision_log
+    else:
+        effective_brain_dir, decision_log = _resolve_vault_dirs_for_atoms(atoms_dir)
     if (
         approved_revision_is_current is _ORIG_APPROVED_REVISION_IS_CURRENT
         and raw_bytes
@@ -470,6 +547,9 @@ def load_memory_metadata(
             known_decision_map=_decision_map,
             source_sha_memo=_source_sha_memo,
             canonical_atoms_root=_canonical_atoms_root,
+            known_atom_filename=filename,
+            known_brain_abs=_effective_brain_dir,
+            known_norm_brain_abs=_norm_brain_dir,
         )
     else:
         record["approved_revision_current"] = approved_revision_is_current(
@@ -546,8 +626,8 @@ def context_match_score(record_contexts: tuple[str, ...], requested_contexts: tu
     return len(matches) / len(requested_contexts), tuple(matches)
 
 
-def _load_single_atom_telemetry(filename: str, telemetry_db_path: str | None = None) -> dict[str, int]:
-    """Read-only lookup of disposable sidecar telemetry; stat-cached in memory so recall avoids N SQLite connects."""
+def _load_all_atom_telemetry_map(telemetry_db_path: str | None = None) -> dict[str, dict[str, int]]:
+    """Read-only cached load of disposable sidecar telemetry; stat-cached once per query/update."""
     db_path = telemetry_db_path or TELEMETRY_DB_PATH
     if not db_path:
         return {}
@@ -568,8 +648,7 @@ def _load_single_atom_telemetry(filename: str, telemetry_db_path: str | None = N
     with _RECALL_PARSE_CACHE_LOCK:
         cached = _TELEMETRY_MAP_CACHE.get(abs_db)
     if cached is not None and cached[0] == sig:
-        hit = cached[1].get(filename)
-        return dict(hit) if hit else {}
+        return cached[1]
 
     try:
         table_map: dict[str, dict[str, int]] = {}
@@ -592,39 +671,55 @@ def _load_single_atom_telemetry(filename: str, telemetry_db_path: str | None = N
             if len(_TELEMETRY_MAP_CACHE) > 64:
                 _TELEMETRY_MAP_CACHE.clear()
             _TELEMETRY_MAP_CACHE[abs_db] = (sig, table_map)
-        hit = table_map.get(filename)
-        return dict(hit) if hit else {}
+        return table_map
     except sqlite3.Error:
         return {}
+
+
+def _load_single_atom_telemetry(filename: str, telemetry_db_path: str | None = None) -> dict[str, int]:
+    """Read-only lookup of disposable sidecar telemetry; stat-cached in memory so recall avoids N SQLite connects."""
+    hit = _load_all_atom_telemetry_map(telemetry_db_path).get(filename)
+    return dict(hit) if hit else {}
 
 
 def _load_fitness_signals(
     filename: str,
     telemetry_db_path: str | None = None,
     brain_dir: str | None = None,
+    *,
+    _telemetry_map: dict[str, dict[str, int]] | None = None,
+    _durable_feedback_map: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, int]:
     """Merge disposable SQLite telemetry with durable 0-raw/archive/atom-corrections.jsonl."""
-    sidecar = _load_single_atom_telemetry(filename, telemetry_db_path)
-    resolved_brain = brain_dir
-    if resolved_brain is None:
-        db_candidate = telemetry_db_path or TELEMETRY_DB_PATH
-        if db_candidate:
-            abs_db = os.path.abspath(db_candidate)
-            parent = os.path.dirname(abs_db)
-            if os.path.basename(parent) == ".sidecar":
-                resolved_brain = os.path.dirname(parent)
+    if _telemetry_map is not None:
+        sidecar = _telemetry_map.get(filename) or {}
+    else:
+        sidecar = _load_single_atom_telemetry(filename, telemetry_db_path)
     durable_pos = 0
     durable_corr = 0
-    if resolved_brain:
-        try:
-            from cognitive_core import load_durable_feedback_counts
+    if _durable_feedback_map is not None:
+        dentry = _durable_feedback_map.get(filename) or {}
+        durable_pos = int(dentry.get("positive_feedback", 0) or 0)
+        durable_corr = int(dentry.get("corrections", 0) or 0)
+    else:
+        resolved_brain = brain_dir
+        if resolved_brain is None:
+            db_candidate = telemetry_db_path or TELEMETRY_DB_PATH
+            if db_candidate:
+                abs_db = os.path.abspath(db_candidate)
+                parent = os.path.dirname(abs_db)
+                if os.path.basename(parent) == ".sidecar":
+                    resolved_brain = os.path.dirname(parent)
+        if resolved_brain:
+            try:
+                from cognitive_core import load_durable_feedback_counts
 
-            dmap = load_durable_feedback_counts(resolved_brain)
-            dentry = dmap.get(filename) or {}
-            durable_pos = int(dentry.get("positive_feedback", 0) or 0)
-            durable_corr = int(dentry.get("corrections", 0) or 0)
-        except Exception:
-            pass
+                dmap = load_durable_feedback_counts(resolved_brain)
+                dentry = dmap.get(filename) or {}
+                durable_pos = int(dentry.get("positive_feedback", 0) or 0)
+                durable_corr = int(dentry.get("corrections", 0) or 0)
+            except Exception:
+                pass
     if not sidecar and durable_pos == 0 and durable_corr == 0:
         return {}
     return {
@@ -655,13 +750,22 @@ def result_from_candidate(
     distance: float | None,
     options: RecallOptions,
     source: str,
-    atoms_dir: str = ATOMS_DIR,
+    atoms_dir: str | None = None,
     similarity_override: float | None = None,
     *,
     _preloaded_record: dict | None = None,
+    _skip_include_check: bool = False,
+    _effective_brain_dir: str | None = None,
+    _telemetry_map: dict[str, dict[str, int]] | None = None,
+    _durable_feedback_map: dict[str, dict[str, object]] | None = None,
+    _atoms_dir_resolved: bool = False,
 ) -> RecallResult | None:
+    if not _atoms_dir_resolved and not (
+        _preloaded_record is not None and isinstance(atoms_dir, str) and os.path.isabs(atoms_dir) and ".." not in atoms_dir
+    ):
+        atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
     record = _preloaded_record if _preloaded_record is not None else load_memory_metadata(filename, atoms_dir=atoms_dir)
-    if not should_include_record(record, options):
+    if not _skip_include_check and not should_include_record(record, options):
         return None
 
     similarity = (
@@ -674,9 +778,9 @@ def result_from_candidate(
     status = str(record.get("review_status", "pending"))
     memory_type = str(record.get("memory_type", "semantic"))
     contexts = metadata_contexts(record)
-    context_score, matched_contexts = context_match_score(contexts, options.contexts)
-    profile_score, matched_profile = context_match_score(contexts, options.active_context_profile)
-    matched_projects = project_tags_match(contexts, options.projects)
+    context_score, matched_contexts = context_match_score(contexts, options.contexts) if options.contexts else (0.0, ())
+    profile_score, matched_profile = context_match_score(contexts, options.active_context_profile) if options.active_context_profile else (0.0, ())
+    matched_projects = project_tags_match(contexts, options.projects) if options.projects else ()
 
     score = (
         similarity * 0.70
@@ -698,15 +802,38 @@ def result_from_candidate(
         reasons.append("project:" + ",".join(matched_projects))
 
     if options.enable_fitness_boost:
-        effective_brain = (
-            BRAIN_DIR
-            if os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR)
-            else os.path.abspath(os.path.join(atoms_dir, os.pardir))
-        )
-        effective_db = options.telemetry_db_path
-        if effective_db is None and os.path.abspath(atoms_dir) != os.path.abspath(ATOMS_DIR):
-            effective_db = os.path.join(effective_brain, ".sidecar", "telemetry.sqlite3")
-        t_stats = _load_fitness_signals(filename, effective_db, brain_dir=effective_brain)
+        if _telemetry_map is not None and _durable_feedback_map is not None:
+            if filename in _telemetry_map or filename in _durable_feedback_map:
+                t_stats = _load_fitness_signals(
+                    filename,
+                    options.telemetry_db_path,
+                    brain_dir=_effective_brain_dir,
+                    _telemetry_map=_telemetry_map,
+                    _durable_feedback_map=_durable_feedback_map,
+                )
+            else:
+                t_stats = {}
+        elif _telemetry_map is not None or _durable_feedback_map is not None:
+            t_stats = _load_fitness_signals(
+                filename,
+                options.telemetry_db_path,
+                brain_dir=_effective_brain_dir,
+                _telemetry_map=_telemetry_map,
+                _durable_feedback_map=_durable_feedback_map,
+            )
+        else:
+            abs_atoms_local = os.path.abspath(atoms_dir)
+            default_brain, default_atoms = resolve_module_atoms_and_brain(globals())
+            same_default_atoms = abs_atoms_local == os.path.abspath(default_atoms)
+            effective_brain = (
+                _effective_brain_dir
+                if _effective_brain_dir is not None
+                else (default_brain if same_default_atoms else os.path.abspath(os.path.join(abs_atoms_local, os.pardir)))
+            )
+            effective_db = options.telemetry_db_path
+            if effective_db is None and not same_default_atoms:
+                effective_db = os.path.join(effective_brain, ".sidecar", "telemetry.sqlite3")
+            t_stats = _load_fitness_signals(filename, effective_db, brain_dir=effective_brain)
         if t_stats:
             # Retrieval hits are intentionally excluded: boosted results would otherwise accrue
             # hits and self-reinforce their own rank (feedback loop). Only grounded citations,
@@ -722,17 +849,21 @@ def result_from_candidate(
                 reasons.append(f"fitness:boost(+{fitness_delta:.4f})")
             elif fitness_delta < 0:
                 reasons.append(f"fitness:demote({fitness_delta:.4f};corrections={t_stats['corrections']})")
-        freshness = _compute_freshness_bonus(record)
-        if freshness > 0:
-            score += freshness
-            reasons.append(f"freshness:+{freshness:.4f}")
+        if record.get("last-reviewed") or record.get("created"):
+            freshness = _compute_freshness_bonus(record)
+            if freshness > 0:
+                score += freshness
+                reasons.append(f"freshness:+{freshness:.4f}")
 
     valid_from = str(record.get("valid_from") or "").strip()
     valid_until = str(record.get("valid_until") or "").strip()
-    tv = evaluate_temporal_validity(valid_from, valid_until, as_of=options.as_of)
-    temporal_status = str(tv["status"])
-    if valid_from or valid_until or temporal_status != "active":
-        reasons.append(f"temporal:{temporal_status}")
+    if not valid_from and not valid_until and options.as_of is None:
+        temporal_status = "active"
+    else:
+        tv = evaluate_temporal_validity(valid_from, valid_until, as_of=options.as_of)
+        temporal_status = str(tv["status"])
+        if valid_from or valid_until or temporal_status != "active":
+            reasons.append(f"temporal:{temporal_status}")
 
     return RecallResult(
         filename=filename,
@@ -780,12 +911,13 @@ def _corroborating_vocab(
     return terms, stems
 
 
-def _extract_query_terms(query: str) -> set[str]:
-    return {
+@functools.lru_cache(maxsize=512)
+def _extract_query_terms(query: str) -> frozenset[str]:
+    return frozenset(
         term.casefold()
         for term in TOKEN_PATTERN.findall(str(query or ""))
         if term.casefold() not in QUERY_STOP_WORDS and len(term) > 1
-    }
+    )
 
 
 def candidate_has_query_overlap(
@@ -793,13 +925,14 @@ def candidate_has_query_overlap(
     content: str,
     *,
     content_sha256: str | None = None,
+    _query_terms: frozenset[str] | None = None,
 ) -> bool:
     """Require literal or single-term stem claim/evidence corroboration before trusted recall injects a result."""
     vocab = _corroborating_vocab(content, content_sha256=content_sha256)
     if vocab is None:
         return False
     corroborating_terms, corroborating_stems = vocab
-    query_terms = _extract_query_terms(query)
+    query_terms = _query_terms if _query_terms is not None else _extract_query_terms(query)
     if not query_terms:
         return False
     required = min(2, len(query_terms))
@@ -846,7 +979,7 @@ def wikilinks(content: str) -> list[str]:
 def linked_neighbors(
     result: RecallResult,
     options: RecallOptions,
-    atoms_dir: str = ATOMS_DIR,
+    atoms_dir: str | None = None,
     *,
     query: str,
     _canonical_atoms_root: str | None = None,
@@ -854,7 +987,10 @@ def linked_neighbors(
     _source_sha_memo: dict[str, str | None] | None = None,
     _verified_rev_map: dict[str, str] | None = None,
     _indexed_content_map: dict[str, tuple[str, str]] | None = None,
+    _effective_brain_dir: str | None = None,
+    _decision_log: str | None = None,
 ) -> list[RecallResult]:
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
     neighbors = []
     neighbor_options = (
         replace(options, projects=())
@@ -871,19 +1007,7 @@ def linked_neighbors(
             known_sha = _verified_rev_map.get(target) if _verified_rev_map is not None else None
             idx_entry = _indexed_content_map.get(target) if _indexed_content_map is not None else None
             cand_txt = idx_entry[0] if (idx_entry is not None and idx_entry[1] == known_sha) else None
-            if known_sha and cand_txt is not None:
-                cand_b = cand_txt.encode("utf-8")
-                if hashlib.sha256(cand_b).hexdigest() == known_sha:
-                    bundle = (os.path.join(_canonical_atoms_root, target), cand_b, cand_txt)
-                else:
-                    bundle = _read_verified_atom_bytes_fast(
-                        target,
-                        known_sha,
-                        canonical_atoms_root=_canonical_atoms_root,
-                        atoms_dir=atoms_dir,
-                        candidate_content=cand_txt,
-                    )
-            elif known_sha:
+            if known_sha:
                 bundle = _read_verified_atom_bytes_fast(
                     target,
                     known_sha,
@@ -917,6 +1041,8 @@ def linked_neighbors(
                 _decision_map=_decision_map,
                 _source_sha_memo=_source_sha_memo,
                 _filter_options=neighbor_options,
+                _effective_brain_dir=_effective_brain_dir,
+                _decision_log=_decision_log,
             )
             neighbor = result_from_candidate(
                 content=content,
@@ -953,8 +1079,9 @@ def linked_neighbors(
     return neighbors
 
 
-def verified_atom_content(filename: str, expected_sha256: str, atoms_dir: str = ATOMS_DIR) -> str | None:
+def verified_atom_content(filename: str, expected_sha256: str, atoms_dir: str | None = None) -> str | None:
     """Load an atom only when the vector record proves it was derived from this exact revision."""
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
     if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
         return None
     path = safe_file_in_dir(atoms_dir, filename, allowed_exts={".md"})
@@ -975,16 +1102,7 @@ _ORIG_VERIFIED_ATOM_CONTENT = verified_atom_content
 
 
 def _preload_batch_decision_map(atoms_dir: str) -> dict[str, dict] | None:
-    effective_brain_dir = (
-        BRAIN_DIR
-        if os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR)
-        else os.path.abspath(os.path.join(atoms_dir, os.pardir))
-    )
-    decision_log = (
-        os.path.join(RAW_DIR, "archive", "decision-record.jsonl")
-        if os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR)
-        else os.path.join(effective_brain_dir, "0-raw", "archive", "decision-record.jsonl")
-    )
+    _effective_brain_dir, decision_log = _resolve_vault_dirs_for_atoms(atoms_dir)
     try:
         return latest_decisions_by_atom(decision_log)
     except Exception:
@@ -996,8 +1114,9 @@ def rerank_candidates(
     options: RecallOptions,
     *,
     query: str,
-    atoms_dir: str = ATOMS_DIR,
+    atoms_dir: str | None = None,
 ) -> list[RecallResult]:
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
     documents = (results.get("documents") or [[]])[0]
     metadatas = (results.get("metadatas") or [[]])[0]
     distances = (results.get("distances") or [[]])[0]
@@ -1083,6 +1202,103 @@ def rerank_candidates(
     return ranked_sorted[: options.n_results]
 
 
+def _apply_cognitive_boosts(
+    query: str,
+    results: list[RecallResult],
+    options: RecallOptions,
+    *,
+    atoms_dir: str,
+    brain_dir: str | None = None,
+) -> list[RecallResult]:
+    """Opt-in bounded boosts from Knowledge Gravity and <=2-hop Spreading Activation (fail-open)."""
+    if not results or (not options.enable_gravity_boost and not options.enable_spreading_activation):
+        return results
+
+    eff_brain = (
+        os.path.abspath(brain_dir)
+        if brain_dir is not None and str(brain_dir).strip()
+        else _resolve_vault_dirs_for_atoms(atoms_dir)[0]
+    )
+
+    gravity_map: dict[str, float] = {}
+    if options.enable_gravity_boost:
+        try:
+            from cognitive_core import compute_knowledge_gravity
+
+            eff_db = options.telemetry_db_path or os.path.join(eff_brain, ".sidecar", "telemetry.sqlite3")
+            gravity_map = compute_knowledge_gravity(
+                atoms_dir=atoms_dir,
+                brain_dir=eff_brain,
+                db_path=eff_db,
+                as_of=options.as_of,
+            )
+        except Exception:
+            gravity_map = {}
+
+    activation_map: dict[str, float] = {}
+    if options.enable_spreading_activation and len(options.projects) <= 1:
+        try:
+            from concept_graph import spreading_activation
+
+            seeds: list[str] = list(sorted(_extract_query_terms(query)))[:8]
+            for top_item in results[:2]:
+                for ctx in top_item.contexts:
+                    clean_ctx = str(ctx or "").strip()
+                    if clean_ctx and not clean_ctx.lower().startswith("project:") and clean_ctx not in seeds:
+                        seeds.append(clean_ctx)
+            if seeds:
+                spread_proj = options.projects[0] if len(options.projects) == 1 else None
+                act_res = spreading_activation(
+                    seeds[:12],
+                    max_hops=2,
+                    decay=0.55,
+                    limit=20,
+                    project=spread_proj,
+                    brain_dir=eff_brain,
+                    atoms_dir=atoms_dir,
+                )
+                for act_atom in act_res.get("activated_atoms") or ():
+                    fn = str(act_atom.get("filename") or "").strip()
+                    val = float(act_atom.get("activation", 0.0) or 0.0)
+                    if fn and val > activation_map.get(fn, 0.0):
+                        activation_map[fn] = val
+        except Exception:
+            activation_map = {}
+
+    if not gravity_map and not activation_map:
+        return results[: options.n_results]
+
+    boosted: list[RecallResult] = []
+    for item in results:
+        new_score = float(item.score)
+        extra_reasons: list[str] = []
+        g_val = float(gravity_map.get(item.filename, 0.0) or 0.0)
+        if g_val > 0.0:
+            g_delta = round(0.05 * math.tanh(g_val / 2.0), 6)
+            if g_delta > 0.0:
+                new_score += g_delta
+                extra_reasons.append(f"gravity:boost(+{g_delta:.4f})")
+        act_val = float(activation_map.get(item.filename, 0.0) or 0.0)
+        if act_val > 0.0:
+            s_delta = round(0.05 * min(1.0, act_val), 6)
+            if s_delta > 0.0:
+                new_score += s_delta
+                extra_reasons.append(f"spreading_activation:+{s_delta:.4f}")
+        if extra_reasons:
+            boosted.append(
+                replace(
+                    item,
+                    score=round(new_score, 6),
+                    match_reasons=item.match_reasons + tuple(extra_reasons),
+                )
+            )
+        else:
+            boosted.append(item)
+
+    boosted.sort(key=lambda item: (-item.score, item.filename))
+    return boosted[: options.n_results]
+
+
 def _validate_options_as_of(options: RecallOptions) -> None:
     if options.as_of and str(options.as_of).strip():
         try:
@@ -1095,11 +1311,13 @@ def search_semantic_memory(
     query: str,
     options: RecallOptions | None = None,
     *,
-    atoms_dir: str = ATOMS_DIR,
-    chroma_path: str = CHROMA_PATH,
+    atoms_dir: str | None = None,
+    chroma_path: str | None = None,
 ) -> tuple[list[RecallResult], list[RecallResult]]:
     from ollama_utils import EmbeddingUnavailableError, embed_text
 
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
+    chroma_path = resolve_module_vault_path(globals(), "CHROMA_PATH", chroma_path)
     options = options or RecallOptions()
     _validate_options_as_of(options)
     if not os.path.exists(chroma_path):
@@ -1141,6 +1359,8 @@ def search_semantic_memory(
     finally:
         close_vector_collection(collection)
     direct = rerank_candidates(results, options, query=query, atoms_dir=atoms_dir)
+    if options.enable_gravity_boost or options.enable_spreading_activation:
+        direct = _apply_cognitive_boosts(query, direct, options, atoms_dir=atoms_dir)
 
     neighbors = []
     seen = {item.filename for item in direct}
@@ -1174,11 +1394,13 @@ def search_lexical_memory(
     query: str,
     options: RecallOptions | None = None,
     *,
-    atoms_dir: str = ATOMS_DIR,
-    index_path: str = LEXICAL_INDEX_PATH,
+    atoms_dir: str | None = None,
+    index_path: str | None = None,
     _allow_neural_rerank: bool = False,
 ) -> tuple[list[RecallResult], list[RecallResult]]:
     """Retrieve through the model-free sidecar, then apply the canonical trust filter."""
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
+    index_path = resolve_module_vault_path(globals(), "LEXICAL_INDEX_PATH", index_path)
     options = options or RecallOptions()
     _validate_options_as_of(options)
     candidate_count = max(options.n_results, options.n_results * max(1, options.candidate_multiplier))
@@ -1186,22 +1408,92 @@ def search_lexical_memory(
         verified_atom_content is _ORIG_VERIFIED_ATOM_CONTENT
         and load_memory_metadata is _ORIG_LOAD_MEMORY_METADATA
     )
+    hoisted_brain_dir, hoisted_decision_log = _resolve_vault_dirs_for_atoms(atoms_dir)
+    if use_fast_verify:
+        try:
+            decision_map = latest_decisions_by_atom(hoisted_decision_log)
+        except Exception:
+            decision_map = None
+    else:
+        decision_map = None
+    prefiltered_records: dict[tuple[str, str], dict] = {}
+    require_approved_decision = (
+        use_fast_verify
+        and approved_revision_is_current is _ORIG_APPROVED_REVISION_IS_CURRENT
+        and not options.allow_unreviewed_exploratory
+        and options.include_statuses is None
+        and decision_map is not None
+    )
+
+    pre_include_statuses = normalize_statuses(options.include_statuses)
+    pre_exclude_statuses = normalize_statuses(options.exclude_statuses) or set()
+    pre_memory_types = set(options.memory_types) if options.memory_types else None
+    pre_query_terms = _extract_query_terms(query)
+
+    def _candidate_eligible(fn: str, txt: str, sha: str) -> bool:
+        if require_approved_decision:
+            latest = decision_map.get(fn)  # type: ignore[union-attr]
+            if not latest or latest.get("action") != "approve" or latest.get("content_sha256_after") != sha:
+                return False
+        with _RECALL_PARSE_CACHE_LOCK:
+            vocab = _CORROBORATING_TERMS_BY_SHA.get(sha)
+            rec = _ATOM_RECORD_BY_SHA.get((fn, sha))
+        if vocab is None:
+            vocab = _corroborating_vocab(txt, content_sha256=sha)
+            if vocab is None:
+                return False
+        corroborating_terms, corroborating_stems = vocab
+        if not pre_query_terms:
+            return False
+        required = min(2, len(pre_query_terms))
+        if len(pre_query_terms.intersection(corroborating_terms)) < required:
+            if required != 1:
+                return False
+            only_term = next(iter(pre_query_terms))
+            stem = porter_stem(only_term)
+            if len(stem) < 4 or stem not in corroborating_stems:
+                return False
+        if rec is None:
+            rec = _cached_record_for_candidate(fn, sha, txt, copy=False)
+        if not _record_passes_pre_anchor_filters(
+            rec,
+            options,
+            _include_statuses=pre_include_statuses,
+            _exclude_statuses=pre_exclude_statuses,
+            _memory_types=pre_memory_types,
+            _filters_precomputed=True,
+        ):
+            return False
+        prefiltered_records[(fn, sha)] = rec
+        return True
+
     verified_rev_map: dict[str, str] | None = None
+    overlap_pre_checked = False
     if use_fast_verify and search_lexical_index is _ORIG_SEARCH_LEXICAL_INDEX:
         candidates, verified_rev_map = _search_lexical_index_verified(
-            query, index_path, n_results=candidate_count, atoms_dir=atoms_dir
+            query,
+            index_path,
+            n_results=candidate_count,
+            atoms_dir=atoms_dir,
+            candidate_filter=_candidate_eligible,
         )
+        overlap_pre_checked = True
     else:
         candidates = search_lexical_index(query, index_path, n_results=candidate_count, atoms_dir=atoms_dir)
     if not candidates:
         return [], []
 
-    fitness_or_profile = bool(options.enable_fitness_boost or options.active_context_profile)
-    if verified_rev_map is not None:
-        canon_root: str | None = os.path.abspath(atoms_dir)
-    else:
-        canon_root = _resolve_canonical_atoms_root(atoms_dir) if use_fast_verify else None
-    decision_map = _preload_batch_decision_map(atoms_dir) if use_fast_verify else None
+    fitness_or_profile = bool(
+        options.enable_fitness_boost
+        or options.active_context_profile
+        or options.enable_gravity_boost
+        or options.enable_spreading_activation
+    )
+    canon_root = _resolve_canonical_atoms_root(atoms_dir) if use_fast_verify else None
+    abs_atoms = canon_root or atoms_dir
+    canon_prefix = (canon_root if canon_root.endswith(os.sep) else (canon_root + os.sep)) if canon_root else ""
+    hoisted_brain_abs = os.path.normpath(hoisted_brain_dir)
+    hoisted_norm_brain_dir = os.path.normcase(hoisted_brain_abs)
     source_sha_memo: dict[str, str | None] = {}
 
     # Apply the canonical content/overlap/trust gates once per candidate so untrusted
@@ -1209,14 +1501,19 @@ def search_lexical_memory(
     trusted_gated: list[tuple[object, str, dict]] = []
     for candidate in candidates:
         if use_fast_verify and canon_root is not None:
-            if not candidate_has_query_overlap(
+            if not overlap_pre_checked and not candidate_has_query_overlap(
                 query, candidate.content, content_sha256=candidate.content_sha256
             ):
                 continue
             verified_bundle: tuple[str, bytes, str] | None = None
+            cand_fn = candidate.filename
             if (
                 verified_rev_map is not None
-                and verified_rev_map.get(candidate.filename) == candidate.content_sha256
+                and verified_rev_map.get(cand_fn) == candidate.content_sha256
+                and "/" not in cand_fn
+                and "\\" not in cand_fn
+                and ":" not in cand_fn
+                and "\x00" not in cand_fn
             ):
                 try:
                     cand_bytes = candidate.content.encode("utf-8")
@@ -1224,13 +1521,13 @@ def search_lexical_memory(
                     cand_bytes = b""
                 if cand_bytes and hashlib.sha256(cand_bytes).hexdigest() == candidate.content_sha256:
                     verified_bundle = (
-                        os.path.join(canon_root, candidate.filename),
+                        canon_prefix + cand_fn,
                         cand_bytes,
                         candidate.content,
                     )
             if verified_bundle is None:
                 verified_bundle = _read_verified_atom_bytes_fast(
-                    candidate.filename,
+                    cand_fn,
                     candidate.content_sha256,
                     canonical_atoms_root=canon_root,
                     atoms_dir=atoms_dir,
@@ -1239,12 +1536,14 @@ def search_lexical_memory(
             if verified_bundle is None:
                 continue
             current_content = verified_bundle[2]
-            if current_content is not candidate.content and not candidate_has_query_overlap(
+            content_unchanged = current_content is candidate.content
+            if not content_unchanged and not candidate_has_query_overlap(
                 query, current_content, content_sha256=candidate.content_sha256
             ):
                 continue
+            pre_rec = prefiltered_records.get((cand_fn, candidate.content_sha256)) if content_unchanged else None
             rec = load_memory_metadata(
-                candidate.filename,
+                cand_fn,
                 atoms_dir=atoms_dir,
                 _preverified=verified_bundle,
                 _known_sha256=candidate.content_sha256,
@@ -1252,7 +1551,21 @@ def search_lexical_memory(
                 _decision_map=decision_map,
                 _source_sha_memo=source_sha_memo,
                 _filter_options=options,
+                _effective_brain_dir=hoisted_brain_abs,
+                _decision_log=hoisted_decision_log,
+                _preparsed_record=pre_rec,
+                _skip_pre_anchor_check=(pre_rec is not None),
+                _atoms_dir_resolved=True,
+                _norm_brain_dir=hoisted_norm_brain_dir,
             )
+            if pre_rec is not None:
+                if (
+                    (not options.allow_unreviewed_exploratory or str(rec.get("review_status", "pending")) == "accepted")
+                    and rec.get("approved_revision_current") is not True
+                ):
+                    continue
+            elif not should_include_record(rec, options):
+                continue
         else:
             current_content = verified_atom_content(
                 candidate.filename, candidate.content_sha256, atoms_dir=atoms_dir
@@ -1260,8 +1573,8 @@ def search_lexical_memory(
             if current_content is None or not candidate_has_query_overlap(query, current_content):
                 continue
             rec = load_memory_metadata(candidate.filename, atoms_dir=atoms_dir)
-        if not should_include_record(rec, options):
-            continue
+            if not should_include_record(rec, options):
+                continue
         trusted_gated.append((candidate, current_content, rec))
 
     best_bm25 = (
@@ -1270,6 +1583,24 @@ def search_lexical_memory(
         else 0.0
     )
     use_bm25_ratio = fitness_or_profile and best_bm25 > 0.0
+
+    hoisted_fitness_brain = hoisted_brain_dir
+    hoisted_telemetry_map: dict[str, dict[str, int]] | None = None
+    hoisted_durable_map: dict[str, dict[str, object]] | None = None
+    if options.enable_fitness_boost and trusted_gated:
+        default_brain, default_atoms = resolve_module_atoms_and_brain(globals())
+        same_default_atoms = os.path.abspath(abs_atoms) == os.path.abspath(default_atoms)
+        hoisted_fitness_brain = default_brain if same_default_atoms else hoisted_brain_dir
+        effective_db = options.telemetry_db_path
+        if effective_db is None and not same_default_atoms:
+            effective_db = os.path.join(hoisted_fitness_brain, ".sidecar", "telemetry.sqlite3")
+        hoisted_telemetry_map = _load_all_atom_telemetry_map(effective_db)
+        try:
+            from cognitive_core import load_durable_feedback_counts
+
+            hoisted_durable_map = load_durable_feedback_counts(hoisted_fitness_brain)
+        except Exception:
+            hoisted_durable_map = {}
 
     direct = []
     for trusted_position, (candidate, current_content, rec) in enumerate(trusted_gated):
@@ -1286,22 +1617,37 @@ def search_lexical_memory(
             atoms_dir=atoms_dir,
             similarity_override=lexical_similarity,
             _preloaded_record=rec,
+            _skip_include_check=True,
+            _effective_brain_dir=hoisted_fitness_brain,
+            _telemetry_map=hoisted_telemetry_map,
+            _durable_feedback_map=hoisted_durable_map,
+            _atoms_dir_resolved=True,
         )
         if result:
             direct.append(result)
 
     direct_sorted = sorted(direct, key=lambda item: item.score, reverse=True)
+    cog_boost_active = bool(options.enable_gravity_boost or options.enable_spreading_activation)
+    rerank_k = max(options.n_results * 2, options.n_results) if cog_boost_active else options.n_results
     if options.enable_reranker and direct_sorted:
         pool = direct_sorted[: max(options.n_results * 3, 15)]
         direct = rerank_recall_results(
             query,
             pool,
-            top_k=options.n_results,
+            top_k=rerank_k,
             mode="lexical",
             allow_onnx=_allow_neural_rerank,
         )
     else:
-        direct = direct_sorted[: options.n_results]
+        direct = direct_sorted[:rerank_k]
+    if cog_boost_active and direct:
+        direct = _apply_cognitive_boosts(
+            query,
+            direct,
+            options,
+            atoms_dir=atoms_dir,
+            brain_dir=hoisted_brain_dir,
+        )
     neighbors = []
     seen = {item.filename for item in direct}
     if options.follow_links and direct:
@@ -1329,6 +1675,8 @@ def search_lexical_memory(
                 _source_sha_memo=source_sha_memo,
                 _verified_rev_map=verified_rev_map,
                 _indexed_content_map=idx_content_map,
+                _effective_brain_dir=hoisted_brain_dir,
+                _decision_log=hoisted_decision_log,
             ):
                 if neighbor.filename not in seen:
                     seen.add(neighbor.filename)
@@ -1355,15 +1703,25 @@ def search_hybrid_rrf_memory(
     query: str,
     options: RecallOptions | None = None,
     *,
-    atoms_dir: str = ATOMS_DIR,
-    index_path: str = LEXICAL_INDEX_PATH,
-    chroma_path: str = CHROMA_PATH,
+    atoms_dir: str | None = None,
+    index_path: str | None = None,
+    chroma_path: str | None = None,
     k_constant: int = 60,
 ) -> tuple[list[RecallResult], list[RecallResult]]:
     """Reciprocal Rank Fusion (RRF) combining SQLite FTS5 (lexical) and Chroma (dense)."""
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
+    index_path = resolve_module_vault_path(globals(), "LEXICAL_INDEX_PATH", index_path)
+    chroma_path = resolve_module_vault_path(globals(), "CHROMA_PATH", chroma_path)
     options = options or RecallOptions()
     pool_size = max(options.n_results * 4, 20)
-    pool_options = replace(options, n_results=pool_size, follow_links=False, enable_reranker=False)
+    pool_options = replace(
+        options,
+        n_results=pool_size,
+        follow_links=False,
+        enable_reranker=False,
+        enable_gravity_boost=False,
+        enable_spreading_activation=False,
+    )
 
     lex_pool, _ = search_lexical_memory(
         query, pool_options, atoms_dir=atoms_dir, index_path=index_path
@@ -1383,6 +1741,8 @@ def search_hybrid_rrf_memory(
             )
         else:
             fallback_direct = lex_pool[: options.n_results]
+        if options.enable_gravity_boost or options.enable_spreading_activation:
+            fallback_direct = _apply_cognitive_boosts(query, fallback_direct, options, atoms_dir=atoms_dir)
         fallback_neighbors = []
         seen_fb = {item.filename for item in fallback_direct}
         if options.follow_links:
@@ -1433,6 +1793,8 @@ def search_hybrid_rrf_memory(
         fused = rerank_recall_results(query, fused, top_k=options.n_results, mode="rrf")
     else:
         fused = fused[: options.n_results]
+    if options.enable_gravity_boost or options.enable_spreading_activation:
+        fused = _apply_cognitive_boosts(query, fused, options, atoms_dir=atoms_dir)
 
     neighbors = []
     seen = {item.filename for item in fused}
@@ -1450,12 +1812,133 @@ def search_memory(
     query: str,
     options: RecallOptions | None = None,
     *,
-    atoms_dir: str = ATOMS_DIR,
-    index_path: str = LEXICAL_INDEX_PATH,
-    chroma_path: str = CHROMA_PATH,
+    atoms_dir: str | None = None,
+    index_path: str | None = None,
+    chroma_path: str | None = None,
 ) -> tuple[list[RecallResult], list[RecallResult]]:
     """Retrieve memories using configured mode ('auto', 'rrf', 'lexical', or 'dense')."""
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
+    index_path = resolve_module_vault_path(globals(), "LEXICAL_INDEX_PATH", index_path)
+    chroma_path = resolve_module_vault_path(globals(), "CHROMA_PATH", chroma_path)
     options = options or RecallOptions()
+
+    norm_inc_statuses = normalize_statuses(options.include_statuses)
+    l0_status_ok = norm_inc_statuses is None or norm_inc_statuses == {"accepted"}
+    l0_eligible = bool(
+        options.use_l0_bus
+        and len(options.projects) <= 1
+        and l0_status_ok
+        and not options.allow_unreviewed_exploratory
+        and not options.include_expired
+        and not options.as_of
+    )
+    eff_brain_dir = os.path.dirname(os.path.abspath(atoms_dir))
+    proj_one = options.projects[0] if len(options.projects) == 1 else None
+    l0_opt_fp = ""
+
+    if l0_eligible:
+        try:
+            from predictive_memory_bus import lookup_l0_hot, make_options_fingerprint
+
+            l0_opt_fp = make_options_fingerprint(
+                n_results=options.n_results,
+                follow_links=options.follow_links,
+                retrieval_mode=options.retrieval_mode,
+                include_expired=options.include_expired,
+                as_of=options.as_of,
+                memory_types=options.memory_types,
+                contexts=options.contexts,
+                active_context_profile=options.active_context_profile,
+                allow_cross_project=options.allow_cross_project,
+                enable_fitness_boost=options.enable_fitness_boost,
+                enable_reranker=options.enable_reranker,
+                enable_gravity_boost=options.enable_gravity_boost,
+                enable_spreading_activation=options.enable_spreading_activation,
+            )
+            allow_prewarm = not (
+                options.memory_types
+                or options.contexts
+                or options.active_context_profile
+                or options.enable_fitness_boost
+                or options.enable_gravity_boost
+                or options.enable_spreading_activation
+            )
+            hit_info = lookup_l0_hot(
+                query,
+                project_scope=proj_one,
+                options_fp=l0_opt_fp,
+                allow_prewarm_match=allow_prewarm,
+                brain_dir=eff_brain_dir,
+                atoms_dir=atoms_dir,
+            )
+            if isinstance(hit_info, dict) and hit_info.get("hit") and hit_info.get("direct"):
+                def _rehydrate(d_list: list[dict]) -> list[RecallResult]:
+                    return [
+                        RecallResult(
+                            filename=str(item["filename"]),
+                            content=str(item["content"]),
+                            source=f"{item.get('source', 'lexical')}+l0_bus",
+                            score=float(item.get("score", 0.0)),
+                            similarity=float(item.get("similarity", 0.0)),
+                            review_status=str(item.get("review_status", "accepted")),
+                            memory_type=str(item.get("memory_type", "semantic")),
+                            confidence=float(item["confidence"]) if item.get("confidence") is not None else 0.5,
+                            importance=float(item["importance"]) if item.get("importance") is not None else 0.5,
+                            contexts=tuple(item.get("contexts") or ()),
+                            match_reasons=tuple([*(item.get("match_reasons") or ()), "l0_bus_hit"]),
+                            valid_from=str(item.get("valid_from") or ""),
+                            valid_until=str(item.get("valid_until") or ""),
+                            temporal_status=str(item.get("temporal_status") or "active"),
+                        )
+                        for item in d_list
+                    ]
+                re_direct = _rehydrate(hit_info["direct"])[: options.n_results]
+                re_neighbors = _rehydrate(hit_info.get("neighbors") or []) if options.follow_links else []
+                return re_direct, re_neighbors
+        except Exception:
+            pass
+
+    def _maybe_store_l0(direct_res: list[RecallResult], neighbor_res: list[RecallResult]) -> None:
+        if not l0_eligible or not direct_res or options.retrieval_mode not in {"lexical", "auto"}:
+            return
+        try:
+            from predictive_memory_bus import (
+                _serialize_recall_item,
+                compute_vault_freshness_key,
+                make_options_fingerprint,
+                store_l0_entry,
+            )
+
+            eff_fp = l0_opt_fp or make_options_fingerprint(
+                n_results=options.n_results,
+                follow_links=options.follow_links,
+                retrieval_mode=options.retrieval_mode,
+                include_expired=options.include_expired,
+                as_of=options.as_of,
+                memory_types=options.memory_types,
+                contexts=options.contexts,
+                active_context_profile=options.active_context_profile,
+                allow_cross_project=options.allow_cross_project,
+                enable_fitness_boost=options.enable_fitness_boost,
+                enable_reranker=options.enable_reranker,
+                enable_gravity_boost=options.enable_gravity_boost,
+                enable_spreading_activation=options.enable_spreading_activation,
+            )
+            freshness = compute_vault_freshness_key(brain_dir=eff_brain_dir, atoms_dir=atoms_dir)
+            store_l0_entry(
+                query=query,
+                project_scope=proj_one,
+                direct_items=[_serialize_recall_item(r) for r in direct_res],
+                neighbor_items=[_serialize_recall_item(r) for r in neighbor_res],
+                freshness_key=freshness,
+                options_fp=eff_fp,
+                brain_dir=eff_brain_dir,
+                atoms_dir=atoms_dir,
+                entry_kind="exact",
+            )
+        except Exception:
+            pass
+
     if options.retrieval_mode == "rrf":
         return search_hybrid_rrf_memory(
             query, options, atoms_dir=atoms_dir, index_path=index_path, chroma_path=chroma_path
@@ -1472,22 +1955,32 @@ def search_memory(
                 return _tag_degraded_results(lex_direct, lex_neighbors)
             raise
     if options.retrieval_mode == "lexical":
-        return search_lexical_memory(query, options, atoms_dir=atoms_dir, index_path=index_path)
+        lex_direct, lex_neighbors = search_lexical_memory(
+            query, options, atoms_dir=atoms_dir, index_path=index_path
+        )
+        _maybe_store_l0(lex_direct, lex_neighbors)
+        return lex_direct, lex_neighbors
 
     # auto mode: use lexical candidate retrieval + neural cross-encoder rerank if sidecar exists, else dense
     if os.path.exists(index_path):
-        return search_lexical_memory(
+        auto_direct, auto_neighbors = search_lexical_memory(
             query,
             options,
             atoms_dir=atoms_dir,
             index_path=index_path,
             _allow_neural_rerank=True,
         )
-    return search_semantic_memory(query, options, atoms_dir=atoms_dir, chroma_path=chroma_path)
+        _maybe_store_l0(auto_direct, auto_neighbors)
+        return auto_direct, auto_neighbors
+    sem_direct, sem_neighbors = search_semantic_memory(
+        query, options, atoms_dir=atoms_dir, chroma_path=chroma_path
+    )
+    _maybe_store_l0(sem_direct, sem_neighbors)
+    return sem_direct, sem_neighbors
 
 
 def suggest_duplicate_atoms(
-    atoms_dir: str = ATOMS_DIR,
+    atoms_dir: str | None = None,
     min_jaccard: float = 0.35,
     *,
     require_current_approval: bool = False,
@@ -1495,14 +1988,13 @@ def suggest_duplicate_atoms(
     brain_dir: str | None = None,
 ) -> list[dict]:
     """Read-only review aid: identify candidate duplicate atoms without mutating files or trust."""
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir, brain_dir=brain_dir)
     if not os.path.isdir(atoms_dir):
         return []
     if brain_dir is not None:
         resolved_brain_dir = os.path.abspath(brain_dir)
-    elif os.path.abspath(atoms_dir) == os.path.abspath(ATOMS_DIR):
-        resolved_brain_dir = os.path.abspath(BRAIN_DIR)
     else:
-        resolved_brain_dir = os.path.abspath(os.path.join(atoms_dir, os.pardir))
+        resolved_brain_dir, _ = _resolve_vault_dirs_for_atoms(atoms_dir)
     requested_projects = tuple(str(p).strip() for p in (projects or ()) if str(p or "").strip())
 
     entries = []
@@ -1590,10 +2082,12 @@ def assemble_bounded_working_context(
     *,
     max_chars: int = 6000,
     max_atoms: int = 6,
-    atoms_dir: str = ATOMS_DIR,
-    chroma_path: str = CHROMA_PATH,
+    atoms_dir: str | None = None,
+    chroma_path: str | None = None,
 ) -> WorkingContextBundle:
     """Assemble a bounded, whole-atom working context bundle without truncating Claim or Evidence text."""
+    atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
+    chroma_path = resolve_module_vault_path(globals(), "CHROMA_PATH", chroma_path)
     effective_budget = max(256, int(max_chars))
     effective_cap = max(1, int(max_atoms))
 
@@ -1634,3 +2128,52 @@ def assemble_bounded_working_context(
         source_sha256_map=sha_map,
         formatted_context=format_context(included),
     )
+
+
+def chunk_text_preserving_latex(text: str, *, max_chars: int = 800) -> list[str]:
+    """Split prose into bounded chunks without bisecting $$...$$, \\[...\\], \\(...\\), or \\begin{equation|align} blocks."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    cap = max(128, int(max_chars))
+    if len(raw) <= cap:
+        return [raw]
+
+    from math_equivalence import _LATEX_SPAN_RE
+
+    protected_spans = [m.span() for m in _LATEX_SPAN_RE.finditer(raw)]
+
+    def _inside_protected(pos: int) -> tuple[int, int] | None:
+        for s, e in protected_spans:
+            if s < pos < e:
+                return (s, e)
+        return None
+
+    chunks: list[str] = []
+    start = 0
+    n = len(raw)
+    while start < n:
+        if n - start <= cap:
+            chunks.append(raw[start:].strip())
+            break
+        split_at = raw.rfind("\n\n", start, start + cap)
+        if split_at <= start:
+            split_at = raw.rfind("\n", start, start + cap)
+        if split_at <= start:
+            split_at = raw.rfind(" ", start, start + cap)
+        if split_at <= start:
+            split_at = start + cap
+        span = _inside_protected(split_at)
+        if span is not None:
+            # Keep the math block atomic: prefer breaking right before it if chunk isn't empty, else include the full block.
+            if span[0] > start + 32:
+                split_at = span[0]
+            else:
+                split_at = span[1]
+        piece = raw[start:split_at].strip()
+        if piece:
+            chunks.append(piece)
+        start = split_at
+        while start < n and raw[start].isspace():
+            start += 1
+    return chunks

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import copy
@@ -90,7 +91,14 @@ from vault_workspaces import verify_per_vault_token
 from web_clipper import CLIPPER_TOKEN_PREFIX, is_paired_clipper_origin, is_valid_extension_origin, verify_clipper_token
 import api_product
 
-CLIPPER_SCOPED_PATHS = frozenset({"/v1/clipper/ping", "/v1/clipper/status", "/v1/clipper/clip"})
+CLIPPER_SCOPED_PATHS = frozenset(
+    {
+        "/v1/clipper/ping",
+        "/v1/clipper/status",
+        "/v1/clipper/clip",
+        "/v1/clipper/capture-media",
+    }
+)
 CLIPPER_REDEEM_PATH = "/v1/clipper/redeem"
 
 
@@ -518,13 +526,26 @@ def _max_body_bytes_for_route(
 ) -> int:
     if method == "POST" and path == "/v1/clipper/clip" and (is_owner or is_clipper):
         return 650_000
+    if method == "POST" and path == "/v1/clipper/capture-media" and (is_owner or is_clipper):
+        return MAX_API_MEDIA_JSON_BYTES
     if method == "POST" and path in {"/v1/chat/stream", "/v1/answer"}:
         return 350_000
     if not is_owner:
         return MAX_API_BODY_BYTES
-    if method == "POST" and path in {"/v1/notes", "/v1/sync/conflicts/resolve"}:
+    if method == "POST" and path in {
+        "/v1/notes",
+        "/v1/sync/conflicts/resolve",
+        "/v1/proof/verify",
+        "/v1/proof/search",
+        "/v1/design/critique",
+    }:
         return MAX_API_LARGE_BODY_BYTES
-    if method == "POST" and path == "/v1/ingest/media":
+    if method == "POST" and path in {
+        "/v1/ingest/media",
+        "/v1/voice/conversation-turn",
+        "/v1/screen/capture",
+        "/v1/screen/ingest",
+    }:
         return MAX_API_MEDIA_JSON_BYTES
     if method == "PUT" and path.startswith("/v1/notes/") and not path.endswith(("/verify", "/backlinks")):
         return MAX_API_LARGE_BODY_BYTES
@@ -770,6 +791,7 @@ MemoryApiRuntime = MemoryApiRuntimeConfig
 class MemoryLoopbackHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = os.name != "nt"
     daemon_threads = True
+    request_queue_size = 128
 
     def server_bind(self) -> None:
         if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
@@ -1048,21 +1070,30 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
             return
 
+    def _reject_early(self, status_code: int, payload: dict[str, object]) -> bool:
+        """Close cleanly after draining any small unread body so Windows sockets do not TCP-RST."""
+        self.close_connection = True
+        clen_hdr = (self.headers.get("Content-Length") or "0").strip()
+        if self.command in ("POST", "PUT", "PATCH", "DELETE") and clen_hdr.isdigit() and len(clen_hdr) <= 9:
+            clen = int(clen_hdr)
+            if 0 < clen <= 65536:
+                self._drain_rejected_request_body(clen)
+        self._send_json(status_code, payload)
+        return False
+
     def _verify_security_envelope(self) -> bool:
         self._clipper_pairing = None
         self._clipper_cors_origin = None
         self._vault_token_id = None
         client_ip = self.client_address[0]
         if client_ip != ALLOWED_API_BIND_HOST:
-            self._send_json(403, {"error": "403 Forbidden: non-loopback client rejected."})
-            return False
+            return self._reject_early(403, {"error": "403 Forbidden: non-loopback client rejected."})
 
         bound_port = self.server.server_address[1]
         allowed_hosts = {ALLOWED_API_BIND_HOST, f"{ALLOWED_API_BIND_HOST}:{bound_port}"}
         host_hdr = (self.headers.get("Host") or "").strip().lower()
         if host_hdr not in allowed_hosts:
-            self._send_json(403, {"error": "403 Forbidden: invalid Host header (DNS-rebinding protection)."})
-            return False
+            return self._reject_early(403, {"error": "403 Forbidden: invalid Host header (DNS-rebinding protection)."})
 
         req_path = urlparse(self.path).path
         rt_snap = self.server.runtime.snapshot()
@@ -1079,8 +1110,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 paired_ext_origin = True
                 self._clipper_cors_origin = origin_hdr
             else:
-                self._send_json(403, {"error": "403 Forbidden: cross-origin browser request rejected."})
-                return False
+                return self._reject_early(403, {"error": "403 Forbidden: cross-origin browser request rejected."})
 
         sec_fetch_site = self.headers.get("Sec-Fetch-Site")
         allowed_fetch_sites = (
@@ -1089,14 +1119,12 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             else {"none", "same-origin"}
         )
         if sec_fetch_site is not None and sec_fetch_site.strip().lower() not in allowed_fetch_sites:
-            self._send_json(403, {"error": "403 Forbidden: cross-site browser request rejected."})
-            return False
+            return self._reject_early(403, {"error": "403 Forbidden: cross-site browser request rejected."})
 
         # One-click pairing code redemption endpoint (protected by 60-bit single-use code + per-origin lockout)
         if req_path == CLIPPER_REDEEM_PATH and self.command == "POST":
             if _is_clipper_redeem_locked_out(client_ip, origin_hdr):
-                self._send_json(429, {"error": "Too Many Requests: pairing code attempt limit exceeded."})
-                return False
+                return self._reject_early(429, {"error": "Too Many Requests: pairing code attempt limit exceeded."})
             return True
 
         auth_hdr = self.headers.get("Authorization")
@@ -1109,11 +1137,10 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
         # Scoped Browser Web Clipper token path (strictly write-only capture on /v1/clipper/*)
         if bearer_candidate.startswith(CLIPPER_TOKEN_PREFIX):
             if req_path not in CLIPPER_SCOPED_PATHS:
-                self._send_json(
+                return self._reject_early(
                     403,
                     {"error": "403 Forbidden: scoped browser clipper tokens may only access /v1/clipper/* endpoints."},
                 )
-                return False
             pairing = verify_clipper_token(
                 auth_hdr,
                 origin=origin_hdr or None,
@@ -1126,8 +1153,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     if fail_code == 429
                     else "Unauthorized: invalid or revoked browser clipper token."
                 )
-                self._send_json(fail_code, {"error": msg})
-                return False
+                return self._reject_early(fail_code, {"error": msg})
             self._clipper_pairing = pairing
             if paired_ext_origin:
                 self._clipper_cors_origin = origin_hdr
@@ -1135,11 +1161,10 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
 
         # Browser extension Origin requests must present a valid paired Clipper token (never full agent token)
         if paired_ext_origin:
-            self._send_json(
+            return self._reject_early(
                 401,
                 {"error": "Unauthorized: browser extension origin requires a paired scoped clipper_* token."},
             )
-            return False
 
         # Isolated per-vault token path (vb_* valid strictly against its own active vault)
         is_vtok, matched_vid, vtok_err = verify_per_vault_token(
@@ -1152,11 +1177,9 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 self._vault_token_id = matched_vid
                 return True
             if vtok_err and vtok_err.startswith("403"):
-                self._send_json(403, {"error": vtok_err})
-                return False
+                return self._reject_early(403, {"error": vtok_err})
             _, fail_code = _check_and_record_auth(client_ip, auth_hdr, "__vtok_invalid_sentinel__")
-            self._send_json(fail_code, {"error": vtok_err or "Unauthorized: invalid vault bearer token."})
-            return False
+            return self._reject_early(fail_code, {"error": vtok_err or "Unauthorized: invalid vault bearer token."})
 
         expected = get_configured_api_token(rt_snap.token_path)
         auth_ok, fail_code = _check_and_record_auth(
@@ -1170,8 +1193,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 if fail_code == 429
                 else "Unauthorized: invalid or missing bearer token."
             )
-            self._send_json(fail_code, {"error": msg})
-            return False
+            return self._reject_early(fail_code, {"error": msg})
         return True
 
     def _drain_rejected_request_body(self, clen: int) -> None:
@@ -1464,7 +1486,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             self, rt, path=path, method=method, audit_fn=_audit_api_event
         )
         if throttled_429:
-            self._send_json(429, {"error": "Too Many Requests: owner token authentication rate limit exceeded."})
+            self._reject_early(429, {"error": "Too Many Requests: owner token authentication rate limit exceeded."})
             return
         if (
             method == "DELETE"
@@ -1509,7 +1531,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
             self, rt, path=path, method="POST", audit_fn=_audit_api_event
         )
         if throttled_429:
-            self._send_json(429, {"error": "Too Many Requests: owner token authentication rate limit exceeded."})
+            self._reject_early(429, {"error": "Too Many Requests: owner token authentication rate limit exceeded."})
             return
         if path == "/v1/ingest/media":
             if not is_owner:
@@ -1996,6 +2018,19 @@ class MemoryApiClient:
             self._headers[api_product.OWNER_HEADER] = self._owner_token
         self._timeout = timeout
 
+    @property
+    def owner_token(self) -> str | None:
+        return self._owner_token
+
+    @owner_token.setter
+    def owner_token(self, value: str | None) -> None:
+        cleaned = value.strip() if isinstance(value, str) and value.strip() else None
+        self._owner_token = cleaned
+        if cleaned:
+            self._headers[api_product.OWNER_HEADER] = cleaned
+        else:
+            self._headers.pop(api_product.OWNER_HEADER, None)
+
     def _request(
         self,
         method: str,
@@ -2320,6 +2355,26 @@ class MemoryApiClient:
                 "overwrite_modified": bool(overwrite_modified),
             },
         )
+
+    def import_file(
+        self,
+        path: str,
+        *,
+        tags: list[str] | None = None,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/import/file",
+            {
+                "path": path,
+                "tags": list(tags or []),
+            },
+        )
+
+    def chat_warmup(self) -> dict[str, object]:
+        return self._request("POST", "/v1/chat/warmup", {})
+
+    warmup_chat = chat_warmup
 
     # ─── Inbox & Owner Review / Atom Governance ──────────────────────────────
 
@@ -2741,6 +2796,12 @@ class MemoryApiClient:
     def verify_ledger(self) -> dict[str, object]:
         return self._request("GET", "/v1/ledger/verify")
 
+    def ledger_history(self, *, limit: int = 100, offset: int = 0) -> dict[str, object]:
+        return self._request("GET", f"/v1/ledger/history?limit={int(limit)}&offset={int(offset)}")
+
+    def ledger_leaves(self, *, limit: int = 200, offset: int = 0) -> dict[str, object]:
+        return self._request("GET", f"/v1/ledger/leaves?limit={int(limit)}&offset={int(offset)}")
+
     def commit_ledger(self, *, actor: str = "owner", note: str = "") -> dict[str, object]:
         return self._request("POST", "/v1/ledger/commit", {"actor": actor, "note": note})
 
@@ -2805,10 +2866,42 @@ class MemoryApiClient:
             },
         )
 
-    def graph_summary(self, *, project_scope: str | None = None) -> dict[str, object]:
+    def graph_summary(
+        self,
+        *,
+        project_scope: str | None = None,
+        as_of: str | None = None,
+        include_expired: bool | None = None,
+    ) -> dict[str, object]:
+        params: list[str] = []
         if project_scope and project_scope.strip():
-            return self._request("GET", f"/v1/graph/summary?project={url_quote(project_scope.strip(), safe=':_/-')}")
-        return self._request("GET", "/v1/graph/summary")
+            params.append(f"project={url_quote(project_scope.strip(), safe=':_/-')}")
+        if as_of and as_of.strip():
+            params.append(f"as_of={url_quote(as_of.strip(), safe=':-TZ+')}")
+        if include_expired is not None:
+            params.append(f"include_expired={'1' if include_expired else '0'}")
+        suffix = f"?{'&'.join(params)}" if params else ""
+        return self._request("GET", f"/v1/graph/summary{suffix}")
+
+    def graph_full(
+        self,
+        *,
+        project_scope: str | None = None,
+        include_pending: bool = False,
+        limit: int = 300,
+        as_of: str | None = None,
+        include_expired: bool | None = None,
+    ) -> dict[str, object]:
+        params: list[str] = [f"limit={int(limit)}"]
+        if project_scope and project_scope.strip():
+            params.append(f"project={url_quote(project_scope.strip(), safe=':_/-')}")
+        if include_pending:
+            params.append("include_pending=1")
+        if as_of and as_of.strip():
+            params.append(f"as_of={url_quote(as_of.strip(), safe=':-TZ+')}")
+        if include_expired is not None:
+            params.append(f"include_expired={'1' if include_expired else '0'}")
+        return self._request("GET", f"/v1/graph/full?{'&'.join(params)}")
 
     def graph_neighbors(self, atom_filename: str, *, include_pending: bool = False) -> dict[str, object]:
         suffix = "?include_pending=1" if include_pending else ""
@@ -2857,6 +2950,52 @@ class MemoryApiClient:
 
     def verify_snapshot(self, snapshot_id: str) -> dict[str, object]:
         return self._request("POST", "/v1/snapshots/verify", {"snapshot_id": snapshot_id})
+
+    # ─── Vault Sections, Web Scout & Operator Jobs ───────────────────────────
+
+    def list_vault_section(
+        self,
+        section: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, object]:
+        sec = url_quote(str(section or "").strip(), safe="")
+        return self._request("GET", f"/v1/vault/{sec}?limit={int(limit)}&offset={int(offset)}")
+
+    vault_section = list_vault_section
+
+    def get_vault_item(self, section: str, filename: str) -> dict[str, object]:
+        sec = url_quote(str(section or "").strip(), safe="")
+        fname = url_quote(str(filename or "").strip(), safe="")
+        return self._request("GET", f"/v1/vault/{sec}/{fname}")
+
+    vault_item = get_vault_item
+
+    def scout_queue(self) -> dict[str, object]:
+        return self._request("GET", "/v1/scout/queue")
+
+    def enqueue_scout_url(self, url: str, *, is_feed: bool = False) -> dict[str, object]:
+        return self._request("POST", "/v1/scout/queue", {"url": url, "is_feed": bool(is_feed)})
+
+    scout_enqueue = enqueue_scout_url
+
+    def run_scout(self) -> dict[str, object]:
+        return self._request("POST", "/v1/scout/run", {})
+
+    scout_run = run_scout
+
+    def start_job(self, kind: str) -> dict[str, object]:
+        k = url_quote(str(kind or "").strip(), safe="")
+        return self._request("POST", f"/v1/jobs/{k}", {})
+
+    run_job = start_job
+
+    def get_job(self, job_id: str) -> dict[str, object]:
+        jid = url_quote(str(job_id or "").strip(), safe="")
+        return self._request("GET", f"/v1/jobs/{jid}")
+
+    job_status = get_job
 
     def sync_status(self) -> dict[str, object]:
         return self._request("GET", "/v1/sync/status")
@@ -3034,12 +3173,33 @@ class MemoryApiClient:
         pwa_base_url: str = "https://localhost/inbox-drop/",
         s3_access_key_id: str = "",
         s3_secret_access_key: str = "",
+        include_s3_credentials: bool = False,
+        include_recall: bool = False,
     ) -> dict[str, object]:
-        payload: dict[str, object] = {"label": label, "pwa_base_url": pwa_base_url}
+        payload: dict[str, object] = {
+            "label": label,
+            "pwa_base_url": pwa_base_url,
+            "include_s3_credentials": bool(include_s3_credentials),
+            "include_recall": bool(include_recall),
+        }
         if s3_access_key_id and s3_secret_access_key:
             payload["s3_access_key_id"] = s3_access_key_id
             payload["s3_secret_access_key"] = s3_secret_access_key
         return self._request("POST", "/v1/sync/inbox-drop/pair", payload)
+
+    def export_inbox_drop_recall(self, *, include_pending_review: bool = True) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/sync/inbox-drop/export-recall",
+            {"include_pending_review": bool(include_pending_review)},
+        )
+
+    def rotate_inbox_drop_recall(self, *, reexport: bool = True) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/sync/inbox-drop/rotate-recall",
+            {"reexport": bool(reexport)},
+        )
 
     def pull_inbox_drops(self) -> dict[str, object]:
         return self._request("POST", "/v1/sync/inbox-drop/pull", {})
@@ -3469,6 +3629,7 @@ class MemoryApiClient:
         project_scope: str | None = None,
         attach_to_note: bool = False,
         allow_hardware_override: bool = False,
+        allow_procedural_fallback: bool = False,
     ) -> dict[str, object]:
         payload: dict[str, object] = {
             "prompt": prompt,
@@ -3481,6 +3642,7 @@ class MemoryApiClient:
             "ground_in_vault": bool(ground_in_vault),
             "attach_to_note": bool(attach_to_note),
             "allow_hardware_override": bool(allow_hardware_override),
+            "allow_procedural_fallback": bool(allow_procedural_fallback),
         }
         if seed is not None:
             payload["seed"] = int(seed)
@@ -3505,6 +3667,7 @@ class MemoryApiClient:
         project_scope: str | None = None,
         attach_to_note: bool = False,
         allow_hardware_override: bool = False,
+        allow_procedural_fallback: bool = False,
     ) -> dict[str, object]:
         payload: dict[str, object] = {
             "prompt": prompt,
@@ -3519,12 +3682,425 @@ class MemoryApiClient:
             "ground_in_vault": bool(ground_in_vault),
             "attach_to_note": bool(attach_to_note),
             "allow_hardware_override": bool(allow_hardware_override),
+            "allow_procedural_fallback": bool(allow_procedural_fallback),
         }
         if seed is not None:
             payload["seed"] = int(seed)
         if project_scope:
             payload["project_scope"] = project_scope
         return self._request("POST", "/v1/media/video", payload)
+
+    # ─── Phase 8–10: Gen-4 Cognition, Math, Proof & Ecosystem SDK ────────────
+
+    def zoom_recall(
+        self,
+        query: str,
+        target_level: str = "L5",
+        parent_id: str | None = None,
+        project: str | None = None,
+        limit: int = 8,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "query": query,
+            "target_level": str(target_level or "L5").strip().upper(),
+            "limit": int(limit),
+        }
+        if parent_id is not None:
+            payload["parent_id"] = parent_id
+        if project:
+            payload["project"] = project
+        return self._request("POST", "/v1/recall/zoom", payload)
+
+    def list_concepts(
+        self,
+        project: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        params = [f"limit={int(limit)}"]
+        if project and project.strip():
+            params.append(f"project={url_quote(project.strip(), safe=':_/-')}")
+        return self._request("GET", f"/v1/concepts?{'&'.join(params)}")
+
+    def get_concept(
+        self,
+        concept_id: str,
+        project: str | None = None,
+    ) -> dict[str, object]:
+        suffix = f"?project={url_quote(project.strip(), safe=':_/-')}" if (project and project.strip()) else ""
+        return self._request("GET", f"/v1/concepts/{url_quote(concept_id.strip(), safe='')}{suffix}")
+
+    def list_principles(
+        self,
+        project: str | None = None,
+        active_only: bool = True,
+    ) -> dict[str, object]:
+        params = [f"active_only={'true' if active_only else 'false'}"]
+        if project and project.strip():
+            params.append(f"project={url_quote(project.strip(), safe=':_/-')}")
+        return self._request("GET", f"/v1/principles?{'&'.join(params)}")
+
+    def distill_principles(self, project: str | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        if project and project.strip():
+            payload["project"] = project.strip()
+        return self._request("POST", "/v1/principles/distill", payload)
+
+    def promote_principle(
+        self,
+        filename: str,
+        expected_sha256: str,
+        actor: str = "owner",
+        note: str = "",
+        *,
+        action: str = "promote",
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            f"/v1/principles/{url_quote(filename.strip(), safe='')}/promote",
+            {
+                "expected_sha256": expected_sha256,
+                "actor": actor,
+                "action": action,
+                "reason": note,
+                "note": note,
+            },
+        )
+
+    def list_mental_models(
+        self,
+        project: str | None = None,
+        active_only: bool = True,
+    ) -> dict[str, object]:
+        params = [f"active_only={'true' if active_only else 'false'}"]
+        if project and project.strip():
+            params.append(f"project={url_quote(project.strip(), safe=':_/-')}")
+        return self._request("GET", f"/v1/mental-models?{'&'.join(params)}")
+
+    def promote_mental_model(
+        self,
+        filename: str,
+        expected_sha256: str,
+        actor: str = "owner",
+        note: str = "",
+        *,
+        action: str = "promote",
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            f"/v1/mental-models/{url_quote(filename.strip(), safe='')}/promote",
+            {
+                "expected_sha256": expected_sha256,
+                "actor": actor,
+                "action": action,
+                "reason": note,
+                "note": note,
+            },
+        )
+
+    def run_swarm(
+        self,
+        query: str,
+        project: str | None = None,
+        max_atoms: int = 6,
+        *,
+        reasoning_profile: str = "auto",
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "goal": query,
+            "query": query,
+            "reasoning_profile": reasoning_profile,
+            "max_atoms": int(max_atoms),
+        }
+        if project and project.strip():
+            payload["project"] = project.strip()
+        return self._request("POST", "/v1/cognitive/swarm", payload)
+
+    def run_debate(
+        self,
+        topic: str,
+        project: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {"topic": topic}
+        if project and project.strip():
+            payload["project"] = project.strip()
+        return self._request("POST", "/v1/cognitive/debate", payload)
+
+    def simulate_impact(
+        self,
+        target: str,
+        max_hops: int = 3,
+        project: str | None = None,
+        repo_dir: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {"target": target, "max_hops": int(max_hops)}
+        if project and project.strip():
+            payload["project"] = project.strip()
+        if repo_dir is not None and str(repo_dir).strip():
+            payload["repo_dir"] = str(repo_dir).strip()
+        return self._request("POST", "/v1/cognitive/simulate", payload)
+
+    def get_curiosity(self, project: str | None = None) -> dict[str, object]:
+        suffix = f"?project={url_quote(project.strip(), safe=':_/-')}" if (project and project.strip()) else ""
+        return self._request("GET", f"/v1/cognitive/curiosity{suffix}")
+
+    def get_self_model(self) -> dict[str, object]:
+        return self._request("GET", "/v1/cognitive/self-model")
+
+    def send_context_signal(
+        self,
+        active_file: str = "",
+        git_branch: str = "",
+        project_scope: str | None = None,
+        open_symbols: Sequence[str] = (),
+        cursor_topic: str = "",
+        prewarm: bool = True,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "active_file": active_file,
+            "git_branch": git_branch,
+            "open_symbols": [str(s) for s in open_symbols],
+            "cursor_topic": cursor_topic,
+            "prewarm": bool(prewarm),
+        }
+        if project_scope and project_scope.strip():
+            payload["project_scope"] = project_scope.strip()
+        return self._request("POST", "/v1/cognitive/context-signal", payload)
+
+    def bus_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/cognitive/bus-status")
+
+    def adr_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/cognitive/adr-status")
+
+    def adr_enable(
+        self,
+        adr_id: str,
+        actor: str = "owner",
+        rationale: str = "",
+        *,
+        enabled: bool = True,
+        expires_on: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "adr_id": adr_id,
+            "enabled": bool(enabled),
+            "actor": actor,
+            "rationale": rationale,
+        }
+        if expires_on and expires_on.strip():
+            payload["expires_on"] = expires_on.strip()
+        return self._request("POST", "/v1/cognitive/adr-enable", payload)
+
+    def cold_archive_atom(
+        self,
+        filename: str,
+        expected_sha256: str,
+        actor: str = "owner",
+        *,
+        reason: str = "",
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            f"/v1/atoms/{url_quote(filename.strip(), safe='')}/cold-archive",
+            {
+                "expected_sha256": expected_sha256,
+                "actor": actor,
+                "reason": reason,
+            },
+        )
+
+    def restore_cold_archive(
+        self,
+        slug: str,
+        actor: str = "owner",
+        *,
+        expected_sha256: str = "",
+        reason: str = "",
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            f"/v1/atoms/cold-archive/{url_quote(slug.strip(), safe='')}/restore",
+            {
+                "expected_sha256": expected_sha256,
+                "actor": actor,
+                "reason": reason,
+            },
+        )
+
+    def run_episodic_replay(
+        self,
+        date_str: str | None = None,
+        write_inbox: bool = False,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {"write_inbox": bool(write_inbox)}
+        if date_str and date_str.strip():
+            payload["date_str"] = date_str.strip()
+        return self._request("POST", "/v1/cognitive/replay", payload)
+
+    def route_query(
+        self,
+        query: str,
+        *,
+        reasoning_profile: str = "auto",
+        has_cloud_consent: bool = False,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/cognitive/route",
+            {
+                "query": query,
+                "reasoning_profile": reasoning_profile,
+                "has_cloud_consent": bool(has_cloud_consent),
+            },
+        )
+
+    def solve_math(
+        self,
+        problem: str,
+        samples: int = 3,
+        use_local_llm: bool = False,
+        *,
+        visual_ocr_text: str = "",
+        max_tool_turns: int = 4,
+        expected_answer: str | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "problem": problem,
+            "k_samples": int(samples),
+            "samples": int(samples),
+            "use_local_llm": bool(use_local_llm),
+            "visual_ocr_text": visual_ocr_text,
+            "max_tool_turns": int(max_tool_turns),
+        }
+        if expected_answer is not None:
+            payload["expected_answer"] = expected_answer
+        return self._request("POST", "/v1/math/solve", payload)
+
+    def score_math_rubric(
+        self,
+        problem: str,
+        trace: str | Sequence[str],
+        expected_answer: str | None = None,
+        *,
+        final_answer: str = "",
+    ) -> dict[str, object]:
+        if isinstance(trace, str):
+            steps = [ln.strip() for ln in trace.splitlines() if ln.strip()]
+            payload: dict[str, object] = {
+                "problem": problem,
+                "trace": trace,
+                "steps": steps,
+                "final_answer": final_answer,
+            }
+        else:
+            steps = [str(s) for s in trace]
+            payload = {
+                "problem": problem,
+                "steps": steps,
+                "final_answer": final_answer,
+            }
+        if expected_answer is not None:
+            payload["expected_answer"] = expected_answer
+        return self._request("POST", "/v1/math/rubric", payload)
+
+    def proof_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/proof/status")
+
+    def proof_verify(
+        self,
+        baseline_source: str,
+        candidate_source: str,
+        test_lemmas: Sequence[str] = (),
+        *,
+        language: str = "auto",
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/proof/verify",
+            {
+                "baseline_source": baseline_source,
+                "candidate_source": candidate_source,
+                "test_lemmas": [str(x) for x in test_lemmas],
+                "language": language,
+            },
+        )
+
+    def proof_search(
+        self,
+        problem_id: str,
+        baseline_source: str,
+        candidates: Sequence[object] = (),
+        max_iterations: int = 4,
+        *,
+        search_mode: str = "auto",
+        language: str = "auto",
+        test_lemmas: Sequence[str] = (),
+        verification_tests: Sequence[str] = (),
+        record_candidate: bool = False,
+    ) -> dict[str, object]:
+        return self._request(
+            "POST",
+            "/v1/proof/search",
+            {
+                "problem_id": problem_id,
+                "baseline_source": baseline_source,
+                "candidates": list(candidates),
+                "max_iterations": int(max_iterations),
+                "search_mode": search_mode,
+                "language": language,
+                "test_lemmas": [str(x) for x in test_lemmas],
+                "verification_tests": [str(x) for x in verification_tests],
+                "record_candidate": bool(record_candidate),
+            },
+        )
+
+    def design_presets(self) -> dict[str, object]:
+        return self._request("GET", "/v1/design/presets")
+
+    def design_critique(
+        self,
+        artifact_text: str,
+        preset: str = "editorial_luxury",
+        *,
+        files: list[dict[str, object]] | None = None,
+        persona_id: str = "",
+        done_criteria: str = "",
+        brief: str = "",
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "preset": preset,
+            "persona_id": persona_id,
+            "done_criteria": done_criteria,
+            "brief": brief or f"Evaluate against preset '{preset}'.",
+        }
+        if files is not None:
+            payload["files"] = list(files)
+        else:
+            payload["artifact_text"] = artifact_text
+            payload["files"] = [{"filename": "artifact.html", "lang": "html", "content": artifact_text}]
+        return self._request("POST", "/v1/design/critique", payload)
+
+    def voice_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/voice/status")
+
+    def screen_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/screen/config")
+
+    def external_folders_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/external-folders/config")
+
+    def packs_list(self) -> dict[str, object]:
+        return self._request("GET", "/v1/packs")
+
+    def orchestrator_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/orchestrator/status")
+
+    def tunnel_status(self) -> dict[str, object]:
+        return self._request("GET", "/v1/tunnel/status")
+
+    def speculative_status(self, *, port: int | None = None) -> dict[str, object]:
+        suffix = f"?port={int(port)}" if port is not None else ""
+        return self._request("GET", f"/v1/runtime/speculative/status{suffix}")
 
     # Convenience SDK method aliases
     inbox_item = inspect_inbox_item
@@ -3601,6 +4177,7 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "GET /v1/notes/<filename>/backlinks",
                 "POST /v1/remember",
                 "POST /v1/import",
+                "POST /v1/import/file",
                 "GET /v1/chat/threads",
                 "POST /v1/chat/threads",
                 "GET /v1/chat/threads/<thread_id>",
@@ -3609,6 +4186,8 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "POST /v1/chat/stream",
                 "POST /v1/chat/warmup",
                 "GET /v1/ledger/verify",
+                "GET /v1/ledger/history",
+                "GET /v1/ledger/leaves",
                 "POST /v1/ledger/commit",
                 "POST /v1/ledger/verify-proof",
                 "GET /v1/ledger/prove/<leaf>",
@@ -3616,6 +4195,7 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "POST /v1/audit/sources/demote-stale",
                 "GET /v1/graph/contradictions",
                 "GET /v1/graph/summary",
+                "GET /v1/graph/full",
                 "GET /v1/graph/neighbors/<filename>",
                 "GET /v1/graph/suggestions/<filename>",
                 "POST /v1/graph/auto-link",
@@ -3624,6 +4204,13 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "POST /v1/snapshots/diff",
                 "POST /v1/snapshots/recall",
                 "POST /v1/snapshots/verify",
+                "GET /v1/vault/<section>",
+                "GET /v1/vault/<section>/<filename>",
+                "GET /v1/scout/queue",
+                "POST /v1/scout/queue",
+                "POST /v1/scout/run",
+                "POST /v1/jobs/<kind>",
+                "GET /v1/jobs/<id>",
                 "GET /v1/sync/status",
                 "GET /v1/sync/conflicts",
                 "GET /v1/sync/conflicts/<conflict_id>",
@@ -3639,6 +4226,8 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "POST /v1/sync/seal-keychain",
                 "GET /v1/sync/inbox-drop/pairings",
                 "POST /v1/sync/inbox-drop/pair",
+                "POST /v1/sync/inbox-drop/export-recall",
+                "POST /v1/sync/inbox-drop/rotate-recall",
                 "POST /v1/sync/inbox-drop/pull",
                 "DELETE /v1/sync/inbox-drop/<token_id>",
                 "GET /v1/clipper/ping",
@@ -3685,6 +4274,44 @@ def render_host_adapter_configs(*, port: int = DEFAULT_API_PORT) -> dict[str, ob
                 "GET /v1/media/file/<media_id>",
                 "POST /v1/media/image",
                 "POST /v1/media/video",
+                "GET /v1/design/presets",
+                "POST /v1/design/critique",
+                "GET /v1/orchestrator/status",
+                "GET /v1/orchestrator/open-webui-tool",
+                "GET /v1/packs",
+                "GET /v1/screen/config",
+                "GET /v1/external-folders/config",
+                "GET /v1/tunnel/status",
+                "GET /v1/voice/status",
+                "GET /v1/runtime/speculative/status",
+                "POST /v1/recall/zoom",
+                "GET /v1/concepts",
+                "GET /v1/concepts/<concept_id>",
+                "GET /v1/principles",
+                "POST /v1/principles/distill",
+                "POST /v1/principles/<filename>/promote",
+                "GET /v1/mental-models",
+                "POST /v1/mental-models/<filename>/promote",
+                "POST /v1/cognitive/context-signal",
+                "GET /v1/cognitive/bus-status",
+                "GET /v1/cognitive/review-due",
+                "POST /v1/cognitive/debate",
+                "POST /v1/cognitive/swarm",
+                "POST /v1/cognitive/simulate",
+                "GET /v1/cognitive/self-model",
+                "POST /v1/cognitive/self-model",
+                "GET /v1/cognitive/curiosity",
+                "GET /v1/cognitive/adr-status",
+                "POST /v1/cognitive/adr-enable",
+                "POST /v1/cognitive/replay",
+                "POST /v1/cognitive/route",
+                "POST /v1/atoms/<filename>/cold-archive",
+                "POST /v1/atoms/cold-archive/<slug>/restore",
+                "POST /v1/math/solve",
+                "POST /v1/math/rubric",
+                "GET /v1/proof/status",
+                "POST /v1/proof/verify",
+                "POST /v1/proof/search",
             ],
         },
         "local_ide_mcp_stdio": {
