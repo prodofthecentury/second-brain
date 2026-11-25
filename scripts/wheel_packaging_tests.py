@@ -1059,6 +1059,13 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         ):
             self.assertTrue(ide_connector._is_immutable_darwin_root_symlink(PurePosixPath("/tmp")))
             self.assertFalse(ide_connector._is_immutable_darwin_root_symlink(PurePosixPath("/tmp/evil")))
+        # Keychain fallback tests report linux while still walking the real /var symlink.
+        with (
+            mock.patch.object(cfg.sys, "platform", "linux"),
+            mock.patch.object(cfg.os, "readlink", return_value="private/var"),
+        ):
+            self.assertTrue(cfg._is_immutable_darwin_root_symlink("/var"))
+            self.assertFalse(cfg._is_immutable_darwin_root_symlink("/var/folders"))
 
         # End-to-end macOS /var/folders/x traversal allowed for build_distribution_manifests, inbox_drop, mobile_vault_client
         with (

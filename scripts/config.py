@@ -75,14 +75,18 @@ def _darwin_symlink_target_matches(link: str, expected_rel: str) -> bool:
 
 
 def _is_immutable_darwin_root_symlink(path: Path | str) -> bool:
-    """Return True only for macOS SIP-protected root compatibility symlinks (/var, /tmp, /etc)."""
-    if sys.platform != "darwin":
-        return False
-    raw = os.path.abspath(os.fspath(path)).rstrip("/") or "/"
-    expected = _DARWIN_SYSTEM_SYMLINKS.get(raw) or _DARWIN_SYSTEM_SYMLINKS.get(str(path).rstrip("/"))
+    """Return True for the macOS SIP roots /var, /tmp, and /etc.
+
+    The decision is the path spelling and the link target, not ``sys.platform``.
+    Headless keychain tests flip ``sys.platform`` to ``linux`` while the temp
+    directory still lives under the runner's real ``/var`` symlink.
+    """
+    raw = os.path.abspath(os.fspath(path)).replace("\\", "/").rstrip("/") or "/"
+    spelled = str(path).replace("\\", "/").rstrip("/") or "/"
+    expected = _DARWIN_SYSTEM_SYMLINKS.get(raw) or _DARWIN_SYSTEM_SYMLINKS.get(spelled)
     if not expected:
         return False
-    probe = raw if os.path.lexists(raw) else str(path)
+    probe = raw if os.path.lexists(raw) else spelled
     try:
         link = os.readlink(probe)
     except OSError:
@@ -94,8 +98,8 @@ def _is_immutable_darwin_root_symlink(path: Path | str) -> bool:
             return True
     except OSError:
         pass
-    # GitHub's macOS image firmlinks /var in a way readlink/realpath do not spell
-    # as private/var. These three roots are SIP-owned; a normal user cannot retarget them.
+    # These three roots are SIP-owned. A firmlink may not spell its target as
+    # private/var, and a normal user cannot retarget the root entry itself.
     try:
         return stat.S_ISLNK(os.lstat(probe).st_mode)
     except OSError:
