@@ -151,6 +151,8 @@ class RecallOptions:
     use_l0_bus: bool = False
     enable_gravity_boost: bool = False
     enable_spreading_activation: bool = False
+    lexical_rrf_weight: float = 1.0
+    dense_rrf_weight: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -1700,6 +1702,24 @@ def _tag_degraded_results(
     return tagged_direct, tagged_neighbors
 
 
+def _rrf_component_weight(explicit: float, env_name: str) -> float:
+    """Equal fusion stays 1.0 unless the caller or the environment sets a weight."""
+    try:
+        value = float(explicit)
+    except (TypeError, ValueError):
+        value = 1.0
+    if value != 1.0:
+        return value if value > 0 else 0.0
+    raw = (os.environ.get(env_name) or "").strip()
+    if not raw:
+        return 1.0
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return 1.0
+    return parsed if parsed > 0 else 0.0
+
+
 def search_hybrid_rrf_memory(
     query: str,
     options: RecallOptions | None = None,
@@ -1760,13 +1780,19 @@ def search_hybrid_rrf_memory(
     lex_ranks: dict[str, int] = {}
     dense_ranks: dict[str, int] = {}
 
+    lexical_weight = _rrf_component_weight(options.lexical_rrf_weight, "BRAIN_RRF_LEXICAL_WEIGHT")
+    dense_weight = _rrf_component_weight(options.dense_rrf_weight, "BRAIN_RRF_DENSE_WEIGHT")
     for rank, res in enumerate(lex_pool):
-        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
+        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (
+            lexical_weight / (k_constant + rank + 1)
+        )
         candidate_map[res.filename] = res
         lex_ranks[res.filename] = rank + 1
 
     for rank, res in enumerate(dense_pool):
-        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
+        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (
+            dense_weight / (k_constant + rank + 1)
+        )
         dense_ranks[res.filename] = rank + 1
         if res.filename not in candidate_map:
             candidate_map[res.filename] = res

@@ -1116,10 +1116,39 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Multimodal and document file ingestion.")
     parser.add_argument("--file", action="append", default=[], help="Process a single file (repeatable).")
     parser.add_argument("paths", nargs="*", help="Optional file(s) or folder(s) to ingest into 0-raw/.")
+    parser.add_argument("--background", action="store_true", help="Enqueue the files and return without ingesting them.")
     args = parser.parse_args(argv)
     _apply_env_vault_override()
 
     targets = [*args.file, *args.paths]
+    if args.background:
+        from scripts.job_queue import enqueue
+
+        if not targets:
+            print(enqueue("ingest", {"scan": True}))
+            return 0
+        for raw_target in targets:
+            abs_target = os.path.abspath(raw_target)
+            if _is_reparse_or_link(abs_target):
+                print(f"Error: Refusing to ingest symlink or reparse point: {abs_target}", file=sys.stderr)
+                return 1
+            files: list[str] = []
+            if os.path.isdir(abs_target):
+                for entry in sorted(os.listdir(abs_target)):
+                    if entry.startswith((".", "~")):
+                        continue
+                    sub = os.path.join(abs_target, entry)
+                    if os.path.isfile(sub) and not _is_reparse_or_link(sub) and os.path.splitext(entry)[1].lower() in SUPPORTED_INGEST_EXTS:
+                        files.append(sub)
+            else:
+                ext = os.path.splitext(abs_target)[1].lower()
+                if ext not in SUPPORTED_INGEST_EXTS:
+                    print(f"Error: Unsupported ingestion file extension: {ext}", file=sys.stderr)
+                    return 1
+                files.append(abs_target)
+            for path in files:
+                print(enqueue("ingest", {"path": path}))
+        return 0
     print("=== MULTIMODAL & DOCUMENT INGESTION ===")
     try:
         if targets:

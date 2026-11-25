@@ -60,4 +60,19 @@ def capability_checks() -> list[tuple[str, str, str]]:
         if display and (ffmpeg or sys.platform in {"win32", "darwin"})
         else _line("WARN", "screen capture", "no DISPLAY, Xvfb, or platform capturer was found")
     )
+    try:
+        from scripts.cross_encoder import get_onnx_cross_encoder
+
+        onnx_reranker = get_onnx_cross_encoder()
+    except Exception:
+        onnx_reranker = None
+    checks.append(
+        _line("OK", "rerank", "ONNX cross-encoder")
+        if onnx_reranker is not None
+        else _line(
+            "OK",
+            "rerank",
+            "interaction cross-encoder fallback; ONNX weights are optional",
+        )
+    )
     return checks

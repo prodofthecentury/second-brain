@@ -1,0 +1,12 @@
+{
+  "name": "personal-example",
+  "k": 5,
+  "allow_unreviewed_exploratory": false,
+  "queries": [
+    {
+      "id": "coffee",
+      "query": "pour-over coffee ratio",
+      "relevant": ["coffee-ratio.md"]
+    }
+  ]
+}

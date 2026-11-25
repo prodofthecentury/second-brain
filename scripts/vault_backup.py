@@ -825,6 +825,34 @@ def _peek_backup_is_encrypted(raw_backup_path: str) -> bool:
     return bool(outer_peek.get("encrypted", True))
 
 
+def auto_backup_now(*, brain_dir: str | Path | None = None) -> dict[str, Any]:
+    """Write today's vault backup outside the live vault.
+
+    Uses ``BRAIN_BACKUP_PASSPHRASE`` when it is set. Otherwise the archive is
+    unencrypted, which is explicit in the returned record.
+    A backup that already exists for the local date is left in place.
+    """
+    import time
+
+    from scripts.config import security_state_dir
+
+    root = Path(os.environ.get("BRAIN_AUTO_BACKUP_DIR") or (security_state_dir() / "auto-backups")).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    dest = root / f"vault-{time.strftime('%Y%m%d')}.sbvault"
+    if dest.is_file() and dest.stat().st_size > 0:
+        return {"skipped": True, "backup_path": str(dest), "reason": "already created today"}
+    passphrase = os.environ.get("BRAIN_BACKUP_PASSPHRASE") or None
+    created = create_vault_backup(
+        dest,
+        brain_dir=brain_dir,
+        passphrase=passphrase,
+        unencrypted=not bool(passphrase),
+    )
+    created["automatic"] = True
+    created["encrypted"] = bool(passphrase)
+    return created
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="second-brain backup",
@@ -856,8 +884,15 @@ def main(argv: list[str] | None = None) -> int:
     p_rs.add_argument("--force", action="store_true", help="Create a pre-restore safety backup and overwrite non-empty target.")
     p_rs.add_argument("--json", action="store_true")
 
+    sub.add_parser("auto", help="Write today's automatic backup if one does not already exist.")
+
     args = parser.parse_args(argv)
     try:
+        if args.subcmd == "auto":
+            res = auto_backup_now(brain_dir=None)
+            print(json.dumps(res, indent=2, default=str))
+            return 0
+
         if args.subcmd == "create":
             pw = _resolve_cli_passphrase(
                 passphrase_arg=args.passphrase,

@@ -501,6 +501,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("clipper", "Pair, manage, and capture via the local-first Browser Web Clipper."),
         ("vault", "Manage isolated Multi-Vault Workspaces and opt-in cross-vault federated recall."),
         ("backup", "Create, cryptographically verify, or restore portable Three-Store .sbvault backups."),
+        ("restore", "Restore a .sbvault backup into the active vault (or --target)."),
+        ("jobs", "Show or run the persistent ingest, distill, and backup queue."),
+        ("eval", "Score a personal retrieval set with recall@k and MRR."),
         ("hook", "Install/manage git post-commit hooks and distill commits into Second Brain."),
         ("math", "Run DUP + ToRA sandboxed quantitative problem solving and 4D process rubric scoring."),
         ("proof", "Verify SafeVerify formal/algorithmic specs, check Lean readiness, and run proof search."),
@@ -592,7 +595,7 @@ _PASSTHROUGH_COMMANDS = frozenset({
     "notes", "tasks", "capture", "import", "chat", "connect", "benchmark",
     "sota-benchmark", "live-benchmark", "third-party-benchmark", "ledger", "graph", "snapshot", "sync", "mobile", "media", "release",
     "models", "voice", "screen", "external", "proxy", "tunnel", "jarvis", "packs", "runtime", "clipper", "vault",
-    "backup", "hook", "math", "proof",
+    "backup", "restore", "jobs", "eval", "hook", "math", "proof",
     "recall", "answer", "review", "gates", "audit",
     "rebuild-lexical", "rebuild-vectors",
     "refinery", "editor", "scout", "ingest", "daemon", "mcp",
@@ -809,8 +812,32 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         p.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Optional tag or comma-separated tags (repeatable).")
         p.add_argument("--stdin", action="store_true", help="Read note body from stdin.")
         p.add_argument("--json", action="store_true", help="Emit JSON output.")
+        p.add_argument("--background", action="store_true", help="Enqueue the capture and return without waiting.")
         args = p.parse_args(forwarded)
         body_text = sys.stdin.read() if args.stdin else " ".join(args.text)
+        if args.background:
+            from scripts.job_queue import enqueue
+
+            if not body_text.strip():
+                p.error("Provide capture text or --stdin.")
+            vault_dir, _, _ = _resolve_active_vault_paths()
+            parsed_tags = [
+                part.strip()
+                for raw in (args.tags or [])
+                for part in str(raw).split(",")
+                if part.strip()
+            ]
+            job_id = enqueue(
+                "capture",
+                {
+                    "title": args.title,
+                    "body": body_text,
+                    "tags": parsed_tags,
+                    "brain_dir": vault_dir,
+                },
+            )
+            print(json.dumps({"job_id": job_id, "status": "queued"}))
+            return 0
         if not body_text.strip():
             p.error("Provide capture text or --stdin.")
         parsed_tags = [
@@ -938,6 +965,42 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.vault_backup import main as backup_main
 
         return backup_main(forwarded)
+    if command == "restore":
+        import argparse as _argparse
+
+        from scripts.config import resolve_active_brain_dir
+        from scripts.vault_backup import _resolve_cli_passphrase, restore_vault_backup
+
+        parser = _argparse.ArgumentParser(
+            prog="second-brain restore",
+            description="Verify a .sbvault archive and restore it in one command.",
+        )
+        parser.add_argument("backup", help="Path to the .sbvault archive.")
+        parser.add_argument("--target", default=None, help="Destination vault. Defaults to the active vault.")
+        parser.add_argument("--passphrase", default=None)
+        parser.add_argument("--passphrase-env", default=None)
+        parser.add_argument("--unencrypted", action="store_true")
+        parser.add_argument("--force", action="store_true", help="Overwrite a non-empty target after a safety backup.")
+        ns = parser.parse_args(forwarded)
+        passphrase = None
+        if not ns.unencrypted:
+            passphrase = _resolve_cli_passphrase(
+                passphrase_arg=ns.passphrase,
+                passphrase_env=ns.passphrase_env,
+                unencrypted=False,
+            )
+        target = ns.target or resolve_active_brain_dir()
+        result = restore_vault_backup(ns.backup, target, passphrase=passphrase, force=bool(ns.force))
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    if command == "jobs":
+        from scripts.job_queue import main as jobs_main
+
+        return jobs_main(forwarded)
+    if command == "eval":
+        from scripts.personal_eval import main as eval_main
+
+        return eval_main(forwarded)
     if command == "hook":
         from scripts.git_distiller import main as hook_main
 
