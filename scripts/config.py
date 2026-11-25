@@ -67,19 +67,29 @@ _DARWIN_SYSTEM_SYMLINKS: dict[str, str] = {
 }
 
 
+def _darwin_symlink_target_matches(link: str, expected_rel: str) -> bool:
+    """Accept ``private/var`` and firmlink targets that still end at ``/private/var``."""
+    norm = os.path.normpath(str(link)).replace("\\", "/").rstrip("/")
+    tail = "/" + expected_rel
+    return norm.lstrip("/") == expected_rel or norm == tail or norm.endswith(tail)
+
+
 def _is_immutable_darwin_root_symlink(path: Path | str) -> bool:
     """Return True only for macOS SIP-protected root compatibility symlinks (/var, /tmp, /etc)."""
     if sys.platform != "darwin":
         return False
     raw = os.path.abspath(os.fspath(path)).rstrip("/") or "/"
-    expected = _DARWIN_SYSTEM_SYMLINKS.get(raw)
+    expected = _DARWIN_SYSTEM_SYMLINKS.get(raw) or _DARWIN_SYSTEM_SYMLINKS.get(str(path).rstrip("/"))
     if not expected:
         return False
     try:
-        if not stat.S_ISLNK(os.lstat(raw).st_mode):
-            return False
-        # realpath follows the symlink. /var must land on /private/var, not an arbitrary target.
-        return os.path.realpath(raw).rstrip("/") == "/" + expected
+        link = os.readlink(raw if os.path.lexists(raw) else str(path))
+    except OSError:
+        link = ""
+    if link and _darwin_symlink_target_matches(link, expected):
+        return True
+    try:
+        return _darwin_symlink_target_matches(os.path.realpath(raw), expected)
     except OSError:
         return False
 

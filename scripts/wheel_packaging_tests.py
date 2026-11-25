@@ -174,7 +174,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         self.assertIn("second_brain/scripts/publish_registries.py", names)
         with zipfile.ZipFile(self._wheel_path, "r") as zf2:
             pub_src = zf2.read("second_brain/scripts/publish_registries.py").decode("utf-8")
-        self.assertIn("import re\n", pub_src)
+        self.assertIn("import re\n", pub_src.replace("\r\n", "\n"))
         self.assertIn("second-brain = second_brain.cli:main", entry_points_txt)
 
     def test_isolated_venv_wheel_doctor_serve_and_headless_dashboard(self) -> None:
