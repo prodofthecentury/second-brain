@@ -1167,7 +1167,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
             uv_bin = shutil.which("uv") or "uv"
             cold_env = {**os.environ, "UV_CACHE_DIR": str(tmp / "empty_uv_cache")}
             subprocess.run(
-                [uv_bin, "venv", str(cold_venv), "--python", "3.11", "--clear", "--offline"],
+                [uv_bin, "venv", str(cold_venv), "--python", sys.executable, "--clear", "--offline"],
                 env=cold_env,
                 check=True,
                 capture_output=True,

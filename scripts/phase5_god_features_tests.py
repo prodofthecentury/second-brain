@@ -1279,11 +1279,13 @@ class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
                 os.environ.pop("SECOND_BRAIN_PORT", None)
 
                 # 1. Unified vault-path.txt resolution across config, cli, mcp_server, ide_connector
-                self.assertEqual(Path(config.resolve_active_brain_dir()), switched_vault.resolve())
+                # macOS /var and Windows 8.3 names are the same directory with a different spelling.
+                expected_vault = switched_vault.resolve()
+                self.assertEqual(Path(config.resolve_active_brain_dir()).resolve(), expected_vault)
                 vdir, _, _ = cli._resolve_active_vault_paths()
-                self.assertEqual(Path(vdir), switched_vault.resolve())
+                self.assertEqual(Path(vdir).resolve(), expected_vault)
                 mcp_brain, _, _, _ = mcp_server._effective_mcp_paths()
-                self.assertEqual(Path(mcp_brain), switched_vault.resolve())
+                self.assertEqual(Path(mcp_brain).resolve(), expected_vault)
                 entry = ide_connector.server_entry("test-token-1234567890")
                 self.assertNotIn("BRAIN_VAULT_DIR", entry["env"])
 
