@@ -2302,6 +2302,49 @@ class MemoryApiClient:
             {"content": content, "title": title, "tags": tags or [], "source": source},
         )
 
+    def capture(
+        self,
+        content: str,
+        *,
+        title: str = "",
+        tags: list[str] | None = None,
+        source: str = "sdk_client",
+        inbox: bool = False,
+    ) -> dict[str, object]:
+        """Capture a working note or quarantined inbox item and return its memory receipt."""
+        return self._request(
+            "POST",
+            "/v1/capture",
+            {
+                "content": content,
+                "title": title,
+                "tags": tags or [],
+                "source": source,
+                "inbox": bool(inbox),
+            },
+        )
+
+    def search(
+        self,
+        query: str,
+        *,
+        lanes: list[str] | None = None,
+        limit: int = 8,
+        project: str | None = None,
+        include_quarantine: bool = False,
+    ) -> dict[str, object]:
+        """Search working notes and verified atoms. Quarantine requires the owner token."""
+        payload: dict[str, object] = {
+            "query": query,
+            "limit": int(limit),
+            "include_quarantine": bool(include_quarantine),
+        }
+        if lanes is not None:
+            payload["lanes"] = list(lanes)
+        if project and project.strip():
+            payload["project"] = project.strip()
+        return self._request("POST", "/v1/search", payload)
+
     def bulk_import(
         self,
         source_dir: str,

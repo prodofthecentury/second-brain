@@ -105,6 +105,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "v100_final_completion_tests.py")),
     ),
     (
+        "memory_desk_tests",
+        "Capture receipts and trust-lane search across working notes, verified atoms, quarantine, Memory API, CLI, and dashboard (scripts/memory_desk_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "memory_desk_tests.py")),
+    ),
+    (
         "creative_media_tests",
         "Creative media provenance, Pillow sanitization, CAS asset binding & security boundary suite (scripts/creative_media_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "creative_media_tests.py")),

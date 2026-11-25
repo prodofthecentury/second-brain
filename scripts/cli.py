@@ -458,7 +458,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("skills", "Stage 4 Executable Skills: candidates, promote, list, verify, execute in sandbox, kill-switch & audit."),
         ("plan", "Assemble a grounded, citation-verified Executive Plan from Playbooks and approved Atoms."),
         ("notes", "Zero-friction notes: add, search, list, tasks, reindex, verify an excerpt."),
-        ("capture", "Quickly capture a working note or quarantined inbox item from the CLI."),
+        ("capture", "Capture a working note or quarantined inbox item and print a memory receipt."),
+        ("search", "Search working notes and verified atoms together, with optional owner quarantine."),
         ("import", "Bulk-import Markdown, Obsidian, PDF, DOCX, EPUB, HTML, or CSV files into notes."),
         ("chat", "Chat with instant, verified, streaming, or research answers over memory and notes."),
         ("connect", "One-click connect Claude Code/Desktop, Cursor, Windsurf, VS Code, or Antigravity."),
@@ -560,7 +561,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
 _PASSTHROUGH_COMMANDS = frozenset({
     "api",
     "inbox", "hosts", "cognitive", "playbooks", "playbook", "skills", "plan",
-    "notes", "capture", "import", "chat", "connect", "benchmark",
+    "notes", "capture", "search", "import", "chat", "connect", "benchmark",
     "sota-benchmark", "ledger", "graph", "snapshot", "sync", "mobile", "media", "release",
     "models", "clipper", "vault",
     "backup", "hook",
@@ -584,6 +585,101 @@ def _invoke_entrypoint(fn, forwarded: list[str], *, prog: str, description: str)
     sub_parser.parse_args(forwarded)
     res = fn()
     return int(res) if isinstance(res, int) else 0
+
+
+def _run_capture_cli(forwarded: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="second-brain capture", description="Capture a working note or quarantined inbox item.")
+    p.add_argument("text", nargs="*", help="Capture body text (or pass --stdin).")
+    p.add_argument("--title", default="", help="Optional title.")
+    p.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Optional tag or comma-separated tags (repeatable).")
+    p.add_argument("--stdin", action="store_true", help="Read capture body from stdin.")
+    p.add_argument("--inbox", action="store_true", help="Store in the quarantined inbox instead of a working note.")
+    p.add_argument("--json", action="store_true", help="Emit the memory receipt as JSON.")
+    args = p.parse_args(forwarded)
+    body_text = sys.stdin.read() if args.stdin else " ".join(args.text)
+    if not body_text.strip() and not str(args.title or "").strip():
+        p.error("Provide capture text or --stdin.")
+    parsed_tags = [
+        part.strip()
+        for raw in (args.tags or [])
+        for part in str(raw).split(",")
+        if part.strip()
+    ]
+    vault_dir, atoms_dir, lexical_index_path = _resolve_active_vault_paths()
+    from scripts.memory_desk import capture_memory
+    from scripts.notes_store import NotePaths
+
+    receipt = capture_memory(
+        args.title,
+        body_text,
+        tags=parsed_tags,
+        inbox=bool(args.inbox),
+        capture_source="cli",
+        paths=NotePaths.for_brain(vault_dir),
+        atoms_dir=atoms_dir,
+        lexical_index_path=lexical_index_path,
+    )
+    if args.json:
+        print(json.dumps(receipt, indent=2, ensure_ascii=False))
+    else:
+        print(receipt["trust_label"])
+        print(f"File: {receipt['filename']} ({receipt['location']})")
+        if receipt.get("secret_warning"):
+            print(receipt["secret_warning"])
+        if receipt.get("find_again_query"):
+            print(f"Find again: second-brain search {receipt['find_again_query']}")
+        similar = receipt.get("similar") or []
+        if similar:
+            print(f"Similar memories: {len(similar)}")
+            for hit in similar:
+                print(f"  - [{hit['lane']}] {hit['filename']}: {hit['snippet']}")
+    return 0
+
+
+def _run_search_cli(forwarded: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="second-brain search",
+        description="Search working notes and verified atoms. Quarantine is owner-only and off by default.",
+    )
+    p.add_argument("query", help="Words to find across memory lanes.")
+    p.add_argument("--lane", dest="lanes", action="append", default=[], choices=("working_note", "verified_atom", "quarantine"))
+    p.add_argument("--limit", type=int, default=8, help="Maximum hits (1..25).")
+    p.add_argument("--project", default=None, help="Optional project:<slug> scope filter.")
+    p.add_argument("--include-quarantine", action="store_true", help="Include the quarantined inbox. This is the local owner CLI.")
+    p.add_argument("--json", action="store_true", help="Emit structured JSON output.")
+    args = p.parse_args(forwarded)
+    if not str(args.query or "").strip():
+        p.error("Search query is required.")
+    if not 1 <= int(args.limit) <= 25:
+        p.error("--limit must be between 1 and 25.")
+    vault_dir, atoms_dir, lexical_index_path = _resolve_active_vault_paths()
+    from scripts.memory_desk import search_memory_desk
+    from scripts.notes_store import NotePaths
+
+    lanes = tuple(args.lanes) if args.lanes else None
+    include_quarantine = bool(args.include_quarantine) or (lanes is not None and "quarantine" in lanes)
+    result = search_memory_desk(
+        args.query,
+        lanes=lanes,
+        limit=int(args.limit),
+        project=args.project,
+        include_quarantine=include_quarantine,
+        paths=NotePaths.for_brain(vault_dir),
+        atoms_dir=atoms_dir,
+        lexical_index_path=lexical_index_path,
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    if result.get("lane_warnings"):
+        for warning in result["lane_warnings"]:
+            print(f"[WARNING] {warning}", file=sys.stderr)
+    print(f"{result['count']} hit(s) for {result['query']!r}")
+    for hit in result["hits"]:
+        print(f"- [{hit['lane']}] {hit['filename']} ({hit['trust_label']})")
+        if hit.get("snippet"):
+            print(f"  {hit['snippet']}")
+    return 0
 
 
 def _run_recall_cli(forwarded: list[str]) -> int:
@@ -755,36 +851,9 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
 
         return notes_main(forwarded)
     if command == "capture":
-        p = argparse.ArgumentParser(prog="second-brain capture", description="Quickly capture a working note.")
-        p.add_argument("text", nargs="*", help="Note body text (or pass --stdin).")
-        p.add_argument("--title", default="", help="Optional note title.")
-        p.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Optional tag or comma-separated tags (repeatable).")
-        p.add_argument("--stdin", action="store_true", help="Read note body from stdin.")
-        p.add_argument("--json", action="store_true", help="Emit JSON output.")
-        args = p.parse_args(forwarded)
-        body_text = sys.stdin.read() if args.stdin else " ".join(args.text)
-        if not body_text.strip():
-            p.error("Provide capture text or --stdin.")
-        parsed_tags = [
-            part.strip()
-            for raw in (args.tags or [])
-            for part in str(raw).split(",")
-            if part.strip()
-        ]
-        vault_dir, _, _ = _resolve_active_vault_paths()
-        from scripts.notes_store import NotePaths, create_note
-
-        created = create_note(
-            args.title,
-            body_text,
-            tags=parsed_tags,
-            paths=NotePaths.for_brain(vault_dir),
-        )
-        if args.json:
-            print(json.dumps(created, indent=2, ensure_ascii=False))
-        else:
-            print(f"Captured note: {created.get('filename')} ({created.get('status')})")
-        return 0
+        return _run_capture_cli(forwarded)
+    if command == "search":
+        return _run_search_cli(forwarded)
     if command == "import":
         from scripts.bulk_import import main as import_main
 

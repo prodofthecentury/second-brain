@@ -108,6 +108,7 @@ uv run --locked second-brain dashboard
 
 # Zero-friction working notes, quick capture, bulk import & interactive chat
 uv run --locked second-brain capture "<thought or note>" --tags "project:second_brain"
+uv run --locked second-brain search "<words from a note or approved claim>" --project second_brain
 uv run --locked second-brain notes add --title "<title>" --body "<markdown>"
 uv run --locked second-brain notes list
 uv run --locked second-brain notes search "<query>"
