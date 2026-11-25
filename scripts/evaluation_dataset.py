@@ -40,6 +40,7 @@ def validate_dataset(
     *,
     atoms_dir: str | Path,
     approval_check: Callable[[Path], bool],
+    bind_files: bool = True,
 ) -> dict:
     """Validate labels and bind answerable cases to approved atom bytes.
 
@@ -117,7 +118,7 @@ def validate_dataset(
         elif len(relevance) != len(set(relevance)):
             errors.append(f"{label}.candidate_relevance must not contain duplicates.")
         for filename in relevance:
-            if _resolve_atom_path(atoms_root, filename) is None:
+            if bind_files and _resolve_atom_path(atoms_root, filename) is None:
                 errors.append(f"{label} candidate atom does not exist: {filename}.")
 
         answerability = case.get("answerability")
@@ -217,6 +218,8 @@ def validate_dataset(
                 errors.append(f"{label} has duplicate revision metadata for {atom_id}.")
                 continue
             revision_map[atom_id] = digest
+            if not bind_files:
+                continue
             atom_path = _resolve_atom_path(atoms_root, atom_id)
             if atom_path is None:
                 errors.append(f"{label} expected atom does not exist inside the atom directory: {atom_id}.")
@@ -264,13 +267,19 @@ def load_dataset(
     *,
     atoms_dir: str | Path,
     approval_check: Callable[[Path], bool],
+    bind_files: bool = True,
 ) -> dict:
     """Read JSON and validate it before any benchmark score is calculated."""
     try:
         dataset = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise EvaluationDatasetError(f"Could not read evaluation dataset: {exc}") from exc
-    return validate_dataset(dataset, atoms_dir=atoms_dir, approval_check=approval_check)
+    return validate_dataset(
+        dataset,
+        atoms_dir=atoms_dir,
+        approval_check=approval_check,
+        bind_files=bind_files,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -302,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    atoms_present = Path(args.atoms_dir).is_dir()
     try:
         validated = load_dataset(
             args.dataset,
@@ -309,6 +319,7 @@ def main(argv: list[str] | None = None) -> int:
             approval_check=lambda p: approved_revision_is_current(
                 str(p), brain_dir=args.brain_dir, atoms_dir=args.atoms_dir
             ),
+            bind_files=atoms_present,
         )
     except EvaluationDatasetError as exc:
         print(str(exc), file=sys.stderr)
@@ -331,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         "query_count": len(queries),
         "splits": dict(sorted(split_counts.items())),
         "answerability": dict(sorted(answerability_counts.items())),
+        "atom_binding": "checked" if atoms_present else "skipped_private_vault_absent",
     }
     print(json.dumps(summary, indent=2))
     return 0

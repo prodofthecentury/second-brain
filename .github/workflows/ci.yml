@@ -94,7 +94,7 @@ jobs:
           goal5_clipper_and_workspaces_tests v040_sota_upgrades_tests
           v050_sota_complete_tests v100_final_completion_tests
           creative_media_tests stage4_executable_skills_tests
-          mobile_vault_client_tests
+          agent_runtime_tests mobile_vault_client_tests
           dashboard_apptest_tests chroma_rebuild_canary
           archive_manifest_canary smoke_test
 
