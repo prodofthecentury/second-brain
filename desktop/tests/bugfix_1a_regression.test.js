@@ -522,7 +522,10 @@ describe("Defects #12 & #15: Desktop renderer schema parity, safe data_uri valid
       },
     };
 
-    const appJs = fs.readFileSync(path.join(DESKTOP_RENDERER_DIR, "app.js"), "utf8");
+    const appJs = [
+      fs.readFileSync(path.join(DESKTOP_RENDERER_DIR, "app.js"), "utf8"),
+      fs.readFileSync(path.join(DESKTOP_RENDERER_DIR, "chat_send.js"), "utf8"),
+    ].join("\n");
     const sandbox = {
       window: win,
       document: doc,
