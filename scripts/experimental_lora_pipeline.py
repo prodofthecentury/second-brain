@@ -270,6 +270,8 @@ def train_lora_adapter(
         pad_token_id=0,
     )
     base = GPT2LMHeadModel(config)
+    (target / "base").mkdir(parents=True, exist_ok=True)
+    base.save_pretrained(str(target / "base"))
     peft_config = LoraConfig(
         r=4,
         lora_alpha=8,
@@ -301,7 +303,6 @@ def train_lora_adapter(
         optimizer.step()
         losses.append(float(loss.detach().cpu()))
     model.save_pretrained(str(target))
-    config.save_pretrained(str(target / "base"))
     reloaded_base = GPT2LMHeadModel.from_pretrained(str(target / "base"))
     reloaded = PeftModel.from_pretrained(reloaded_base, str(target))
     reloaded.eval()
