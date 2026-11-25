@@ -678,13 +678,22 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
             self.assertNotIn("soupsieve-2.10-py3-none-any.whl", on_disk)
             self.assertNotIn("obsolete_pkg-0.1.0-py3-none-any.whl", on_disk)
 
-            # On single-arch host builds, every normalized package appears once
-            seen_dists: dict[str, list[str]] = {}
+            # One version per package. macOS host builds keep both arm64 and
+            # x86_64 wheels of that version; those are not duplicate versions.
+            versions_by_dist: dict[str, set[str]] = {}
+            files_by_dist_platform: dict[tuple[str, str], list[str]] = {}
             for fname in on_disk:
-                dist_part = fname.split("-", 1)[0].lower()
-                seen_dists.setdefault(dist_part, []).append(fname)
-            dups = {k: v for k, v in seen_dists.items() if len(v) > 1}
-            self.assertEqual(dups, {}, f"Duplicate wheel versions in host wheelhouse: {dups}")
+                stem = fname[:-4] if fname.endswith(".whl") else fname
+                parts = stem.split("-")
+                dist = parts[0].lower()
+                version = parts[1] if len(parts) > 1 else ""
+                platform_tag = parts[-1] if len(parts) >= 5 else stem
+                versions_by_dist.setdefault(dist, set()).add(version)
+                files_by_dist_platform.setdefault((dist, platform_tag), []).append(fname)
+            version_dups = {k: sorted(v) for k, v in versions_by_dist.items() if len(v) > 1}
+            platform_dups = {f"{k[0]}:{k[1]}": v for k, v in files_by_dist_platform.items() if len(v) > 1}
+            self.assertEqual(version_dups, {}, f"Duplicate wheel versions in host wheelhouse: {version_dups}")
+            self.assertEqual(platform_dups, {}, f"Duplicate platform tags in host wheelhouse: {platform_dups}")
 
             # Verify real uv.lock resolves BOTH arm64 and x86_64 wheels for every core dependency on macOS universal
             mac_plan = bw.resolve_wheelhouse_plan(
