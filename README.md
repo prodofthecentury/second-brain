@@ -113,7 +113,8 @@ uv run --locked second-brain notes list
 uv run --locked second-brain notes search "<query>"
 uv run --locked second-brain notes verify <note.md> --excerpt "<exact excerpt>" --actor <owner>
 uv run --locked second-brain import <obsidian_or_markdown_dir>
-uv run --locked second-brain chat "<question>" --mode stream   # modes: instant | stream | verified | research
+uv run --locked second-brain chat "<question>" --mode direct   # modes: direct | instant | stream | verified | research
+uv run --locked second-brain agent run --goal "<goal>"          # autonomous memory under brain/7-agent; owner atoms stay owner-signed
 
 # Loopback HTTP API, IDE/MCP connectors & host sharing policies
 uv run --locked second-brain serve --port 8765

@@ -109,6 +109,7 @@
         <div class="toolbar">
           <input type="text" id="chatQueryInput" placeholder="Ask your Second Brain..." style="flex:1; min-width:220px;" />
           <select id="chatModeSelect" aria-label="Chat Mode">
+            <option value="direct">Direct (one claim, otherwise claim selection)</option>
             <option value="stream">Stream (Instant cards + SSE)</option>
             <option value="verified">Verified (Claim-ID grounded)</option>
             <option value="instant">Instant (&lt;20ms retrieval only)</option>
@@ -159,6 +160,7 @@
           <button class="btn sm danger" id="chatDeleteThreadBtn" type="button">Delete Thread</button>
         </div>
         <div class="status-banner" id="chatBanner">Multi-turn grounded chat: sub-20ms retrieval cards appear immediately before LLM tokens stream. Click any [V#]/[N#]/[P#]/[L#] badge to jump to its source card.</div>
+        <div class="status-banner" id="agentStatusBanner">Agent runtime: checking…</div>
         <div class="chat-layout">
           <div class="pane">
             <div class="chat-main-scroll" id="chatMainScroll">

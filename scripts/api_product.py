@@ -1187,6 +1187,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(202 if res["status"] == "quarantined" else 201, res)
 
+        # ── Agent runtime status (read-only) ──
+        if path == "/v1/agent/status" and method == "GET":
+            from agent_runtime import agent_status
+
+            return send(200, agent_status(rt.brain_dir))
+
         # ── Multi-turn Chat Threads (owner-only) & Streaming Chat ──
         if path == "/v1/chat/threads" and method == "GET":
             if not owner_only():
@@ -1248,7 +1254,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if "mode" not in chat_payload or chat_payload.get("mode") is None or (
                 isinstance(chat_payload.get("mode"), str) and not str(chat_payload.get("mode")).strip()
             ):
-                chat_payload["mode"] = "stream"
+                chat_payload["mode"] = "direct"
             req = ChatStreamRequest.model_validate(chat_payload)
             if req.thread_id and not is_owner:
                 return send(

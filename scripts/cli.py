@@ -460,7 +460,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("notes", "Zero-friction notes: add, search, list, tasks, reindex, verify an excerpt."),
         ("capture", "Quickly capture a working note or quarantined inbox item from the CLI."),
         ("import", "Bulk-import Markdown, Obsidian, PDF, DOCX, EPUB, HTML, or CSV files into notes."),
-        ("chat", "Chat with instant, verified, streaming, or research answers over memory and notes."),
+        ("chat", "Chat over memory and notes. Default mode is direct; also instant, verified, stream, and research."),
+        ("agent", "Run, start, stop, or inspect the autonomous agent runtime."),
         ("connect", "One-click connect Claude Code/Desktop, Cursor, Windsurf, VS Code, or Antigravity."),
         ("benchmark", "Run the corpus-scale benchmark on a synthetic isolated vault."),
         ("sota-benchmark", "Run comparative SOTA benchmarks against external RAG/memory baselines."),
@@ -560,7 +561,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
 _PASSTHROUGH_COMMANDS = frozenset({
     "api",
     "inbox", "hosts", "cognitive", "playbooks", "playbook", "skills", "plan",
-    "notes", "capture", "import", "chat", "connect", "benchmark",
+    "notes", "capture", "import", "chat", "agent", "connect", "benchmark",
     "sota-benchmark", "ledger", "graph", "snapshot", "sync", "mobile", "media", "release",
     "models", "clipper", "vault",
     "backup", "hook",
@@ -793,6 +794,10 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.streaming_chat import main as chat_main
 
         return chat_main(forwarded)
+    if command == "agent":
+        from scripts.agent_runtime import main as agent_main
+
+        return agent_main(forwarded)
     if command == "connect":
         from scripts.ide_connector import main as connect_main
 

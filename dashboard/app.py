@@ -1286,8 +1286,16 @@ if "chat_history" not in st.session_state:
 if nav_selection == "💬 Chat with Memory":
     st.title("💬 Chat with Memory")
     st.subheader("Interactive Verifiable Recall & Grounded Synthesis")
+    try:
+        from scripts.agent_runtime import agent_status as _agent_status
+
+        _agent = _agent_status(BRAIN_DIR)
+        st.caption(f"Agent runtime: {_agent.get('summary', 'unavailable')}")
+    except Exception:
+        st.caption("Agent runtime status unavailable.")
 
     chat_mode_labels = {
+        "direct": "⚡ Direct (one verified claim with no model, otherwise claim selection)",
         "stream": "⚡ Stream Synthesis ([V#]/[N#]/[P#] + Grounding Audit)",
         "instant": "⚡ Instant Source Cards (<20 ms, No Model Call)",
         "verified": "🔒 Fast Verified Claim Selection",
@@ -1487,11 +1495,13 @@ if nav_selection == "💬 Chat with Memory":
         v_cnt = sum(1 for s in sources if s.get("tier") == "verified")
         p_cnt = sum(1 for s in sources if s.get("tier") == "preference")
         n_cnt = sum(1 for s in sources if s.get("tier") == "note")
+        a_cnt = sum(1 for s in sources if s.get("tier") == "agent")
         l_cnt = sum(1 for s in sources if s.get("tier") == "unverified_lead")
         timing_lbl = f" in {retrieval_ms} ms" if retrieval_ms is not None else ""
+        agent_lbl = f" · {a_cnt} Agent [A#]" if a_cnt else ""
         lead_lbl = f" · {l_cnt} Unverified Leads [L#]" if l_cnt else ""
         with st.expander(
-            f"📚 Retrieved Sources{timing_lbl}: {v_cnt} Verified [V#] · {n_cnt} Working Notes [N#] · {p_cnt} Preferences [P#]{lead_lbl}",
+            f"📚 Retrieved Sources{timing_lbl}: {v_cnt} Verified [V#] · {n_cnt} Working Notes [N#] · {p_cnt} Preferences [P#]{agent_lbl}{lead_lbl}",
             expanded=False,
         ):
             for src in sources:
@@ -1508,6 +1518,9 @@ if nav_selection == "💬 Chat with Memory":
                     st.code(str(src.get("claim", "")), language="text")
                 elif tier == "unverified_lead":
                     st.markdown(f"**`[{cid}]` ⚠️ Unverified Lead `{fname}`** *(NOT OWNER-APPROVED)*")
+                    st.code(str(src.get("claim") or src.get("excerpt") or ""), language="text")
+                elif tier == "agent":
+                    st.markdown(f"**`[{cid}]` 🤖 Agent memory `{fname}`** *(agent tier, not an owner-verified claim)*")
                     st.code(str(src.get("claim") or src.get("excerpt") or ""), language="text")
                 else:
                     st.markdown(f"**`[{cid}]` 📝 Working Note `{fname}`** *(unverified note)*")

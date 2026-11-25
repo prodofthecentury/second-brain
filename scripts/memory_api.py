@@ -923,6 +923,22 @@ def create_memory_api_server(
     return MemoryLoopbackHTTPServer(host, port, runtime_config, max_workers=max_workers)
 
 
+def schedule_startup_warmup(policy_path: Path | None = None) -> threading.Thread:
+    """Load the local chat model in the background. Ollama being down does not fail the API."""
+
+    def _run() -> None:
+        try:
+            from streaming_chat import warmup
+
+            warmup(policy_path)
+        except Exception:
+            return
+
+    thread = threading.Thread(target=_run, name="second-brain-chat-warmup", daemon=True)
+    thread.start()
+    return thread
+
+
 def serve_memory_api(
     host: str = ALLOWED_API_BIND_HOST,
     port: int = DEFAULT_API_PORT,
@@ -938,6 +954,8 @@ def serve_memory_api(
             port_file_path = None
         print(f"SECOND_BRAIN_API_READY http://{bound_host}:{actual_port} port={actual_port}", flush=True)
         print(f"Second Brain Loopback Memory API listening on http://{bound_host}:{actual_port}", flush=True)
+        policy_path = getattr(runtime_config, "policy_path", None) if runtime_config is not None else None
+        schedule_startup_warmup(policy_path if isinstance(policy_path, Path) else None)
         server.serve_forever()
     except KeyboardInterrupt:
         pass

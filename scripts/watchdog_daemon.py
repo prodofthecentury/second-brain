@@ -737,8 +737,19 @@ def run_daemon(*, once: bool = False, auto_sync: bool = False, sync_interval: in
 
     try:
         scan_unprocessed_raw_files(dispatcher, RAW_DIR)
+        agent_tick_at = 0.0
         while True:
             time.sleep(1.0)
+            now_m = time.monotonic()
+            if now_m < agent_tick_at:
+                continue
+            agent_tick_at = now_m + 30.0
+            try:
+                from agent_runtime import run_scheduled_goals
+
+                run_scheduled_goals()
+            except Exception as exc:
+                log.warning(f"Agent schedule tick failed: {exc}")
     except KeyboardInterrupt:
         log.info("Shutting down watchdog...")
     finally:

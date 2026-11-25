@@ -9,6 +9,8 @@
 Four modes, all yielding structured events so any UI (desktop app, VS Code webview,
 CLI) can render progressively:
 
+* ``direct``: default. One owner-verified claim is returned with no model call. Several
+  claims use the claim-id selector. Zero claims abstain. Long prose stays on ``stream``.
 * ``instant``: retrieval only. Verified claim cards and note cards arrive in tens of
   milliseconds with no model call.
 * ``verified``: fast grounded answer. The model sees only short claim strings tagged
@@ -97,7 +99,8 @@ from recall import (  # noqa: E402
     search_memory,
 )
 
-CHAT_MODES = ("instant", "verified", "stream", "research")
+DEFAULT_CHAT_MODE = "direct"
+CHAT_MODES = ("direct", "instant", "verified", "stream", "research")
 RETRIEVAL_MODES = ("lexical", "dense", "rrf", "auto")
 ANSWER_VIEWS = ("standard", "preference", "research")
 MAX_VERIFIED = 6
@@ -144,7 +147,7 @@ class ChatStreamRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(..., min_length=1, max_length=2000)
-    mode: str = "verified"
+    mode: str = DEFAULT_CHAT_MODE
     retrieval_mode: str = "lexical"
     host_id: str = "ollama_local"
     project_scope: str | None = None
@@ -194,7 +197,7 @@ class ChatStreamRequest(BaseModel):
     @classmethod
     def _coerce_mode(cls, v: object) -> str:
         if v is None or (isinstance(v, str) and not v.strip()):
-            return "verified"
+            return DEFAULT_CHAT_MODE
         if not isinstance(v, str):
             raise ValueError(f"mode must be one of {CHAT_MODES}")
         cleaned = v.strip()
@@ -562,6 +565,22 @@ def retrieve_context(
         }
         for n in notes
     ]
+    try:
+        from agent_runtime import search_agent_memory
+
+        for hit in search_agent_memory(query, brain_dir=paths.brain_dir, limit=4):
+            sources.append(
+                {
+                    "tier": "agent",
+                    "citation_id": f"A{len([s for s in sources if s.get('tier') == 'agent']) + 1}",
+                    "filename": hit["filename"],
+                    "title": hit["filename"],
+                    "claim": hit["claim"],
+                    "excerpt": hit["claim"],
+                }
+            )
+    except Exception:
+        pass
     return {
         "type": "context",
         "retrieval_mode": retrieval_mode,
@@ -901,6 +920,7 @@ def _filter_and_redact_context(ctx: dict[str, object], rule) -> dict[str, object
             }
             for n in scoped_notes
         ]
+        + [dict(s) for s in list(ctx.get("sources") or []) if isinstance(s, dict) and s.get("tier") == "agent"]
     )
 
     return {
@@ -959,7 +979,7 @@ def _prepare_outbound_prompt(
 def chat_events(
     query: str,
     *,
-    mode: str = "stream",
+    mode: str = DEFAULT_CHAT_MODE,
     paths: ChatPaths | None = None,
     project_scope: str | None = None,
     stream_fn: StreamFn | None = None,
@@ -1172,6 +1192,112 @@ def chat_events(
         yield _done_event(elapsed)
         return
 
+    if mode == "direct" and answer_view == "preference":
+        if not preferences:
+            msg = "No owner preference memory matches this question."
+            yield {"type": "verified_answer", "answerable": False, "text": msg, "answer": msg, "claims": [], "host_id": active_host_id}
+            _persist_completed_exchange(msg)
+        else:
+            pref_text = "\n".join(f"- [Preference] {p['claim']} [{p['id']}]" for p in preferences)
+            yield {
+                "type": "verified_answer",
+                "answerable": True,
+                "text": pref_text,
+                "answer": pref_text,
+                "model_ms": 0.0,
+                "host_id": active_host_id,
+                "claims": [
+                    {"text": str(p["claim"]), "is_preference": True, "evidence": [{"atom_id": p["atom_id"]}]}
+                    for p in preferences
+                ],
+            }
+            _persist_completed_exchange(pref_text, cited_ids=[str(p["id"]) for p in preferences])
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield _done_event(elapsed)
+        return
+
+    if mode == "direct" and len(verified) < 2:
+        if not verified:
+            msg = NO_APPROVED_MEMORY_RESPONSE if want_research else "No owner-verified claim matches this question."
+            if leads_block:
+                msg = f"{msg}\n\n{leads_block}"
+            empty_evt: dict[str, object] = {
+                "type": "verified_answer",
+                "answerable": False,
+                "text": msg,
+                "answer": msg,
+                "claims": [],
+                "model_ms": 0.0,
+                "host_id": active_host_id,
+            }
+            if want_research:
+                empty_evt["unverified_leads"] = leads_payload
+                empty_evt["leads"] = leads_payload
+            yield empty_evt
+            if leads_block:
+                yield {"type": "research_leads", "text": leads_block, "unverified_leads": leads_payload, "leads": leads_payload}
+            _persist_completed_exchange(msg, grounding_meta={"answerable": False})
+        else:
+            raw_claims_by_vid = dict(ctx.get("_raw_claims_by_vid") or {})
+            only = verified[0]
+            claim_text = str(raw_claims_by_vid.get(str(only["id"]), only["claim"]))
+            result = validate_standard_answer(
+                json.dumps({"claims": [claim_text]}),
+                list(ctx.get("_factual_records") or []),
+                atoms_dir=paths.atoms_dir,
+                mode="research" if want_research else "standard",
+                unverified_leads=research_leads if want_research else (),
+            )
+            if result.answerable:
+                try:
+                    record_grounded_answer_telemetry(
+                        sorted({e.atom_id for c in result.claims for e in c.evidence}),
+                        abstained=False,
+                        mode="chat_direct",
+                        latency_ms=0.0,
+                        db_path=paths.telemetry_db_path or os.path.join(paths.brain_dir, ".sidecar", "telemetry.sqlite3"),
+                    )
+                except Exception:
+                    pass
+            answer_evt: dict[str, object] = {
+                "type": "verified_answer",
+                "answerable": bool(result.answerable),
+                "text": result.text,
+                "answer": result.text,
+                "model_ms": 0.0,
+                "host_id": active_host_id,
+                "claims": [
+                    {
+                        "text": c.text,
+                        "evidence": [
+                            {
+                                "atom_id": e.atom_id,
+                                "quote": e.evidence_quote,
+                                "source": e.evidence_source,
+                                "source_sha256": e.evidence_sha256,
+                                "bytes": [e.evidence_start, e.evidence_end],
+                            }
+                            for e in c.evidence
+                        ],
+                    }
+                    for c in result.claims
+                ],
+            }
+            if want_research:
+                answer_evt["unverified_leads"] = leads_payload
+                answer_evt["leads"] = leads_payload
+            yield answer_evt
+            if leads_block:
+                yield {"type": "research_leads", "text": leads_block, "unverified_leads": leads_payload, "leads": leads_payload}
+            _persist_completed_exchange(
+                result.text,
+                cited_ids=[str(only["id"])] if result.answerable else [],
+                grounding_meta={"answerable": bool(result.answerable)},
+            )
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield _done_event(elapsed)
+        return
+
     try:
         rule, pinned_target = _resolve_chat_host_rule(
             active_host_id,
@@ -1217,7 +1343,7 @@ def chat_events(
         yield _done_event(elapsed)
         return
 
-    if mode in {"verified", "research"}:
+    if mode in {"verified", "research", "direct"}:
         if not model_verified:
             msg = NO_APPROVED_MEMORY_RESPONSE if want_research else "No owner-verified claim matches this question."
             if leads_block:
@@ -1444,7 +1570,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description="Chat with your Second Brain (streaming / verified / research).")
     parser.add_argument("query", nargs="?", default="", help="Chat question (optional when --list-threads is set).")
-    parser.add_argument("--mode", choices=CHAT_MODES, default="stream")
+    parser.add_argument("--mode", choices=CHAT_MODES, default=DEFAULT_CHAT_MODE)
     parser.add_argument("--retrieval-mode", "--retrieval", dest="retrieval_mode", choices=RETRIEVAL_MODES, default="lexical")
     parser.add_argument("--host-id", "--host", dest="host_id", default="ollama_local", help="Host policy id (default ollama_local).")
     parser.add_argument("--view", dest="answer_view", choices=ANSWER_VIEWS, default="standard", help="Answer view (standard/preference/research).")

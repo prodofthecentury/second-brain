@@ -115,6 +115,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "stage4_executable_skills_tests.py")),
     ),
     (
+        "agent_runtime_tests",
+        "Autonomous agent runtime: private 7-agent memory and skills, sandbox reuse, depth cap, and direct-answer separation (scripts/agent_runtime_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "agent_runtime_tests.py")),
+    ),
+    (
         "mobile_vault_client_tests",
         "Cross-runtime Python <-> Node WebCrypto on-device Mobile Vault Client E2EE sync, epistemic recall & offline drop suite (scripts/mobile_vault_client_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "mobile_vault_client_tests.py")),
