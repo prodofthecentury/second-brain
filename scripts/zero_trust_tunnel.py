@@ -182,6 +182,27 @@ def configure_tunnel(
     return cfg
 
 
+def probe_tunnel_binary(name: str, *, timeout_seconds: float = 8.0) -> dict[str, Any]:
+    """Run ``<name> --version`` when the binary is installed. Does not open a tunnel."""
+    binary = shutil.which(name)
+    if not binary:
+        return {"name": name, "available": False, "version": "", "error": f"{name} is not on PATH"}
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=max(2.0, float(timeout_seconds)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"name": name, "available": False, "version": "", "error": f"{name} --version timed out", "path": binary}
+    text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    if proc.returncode != 0:
+        return {"name": name, "available": False, "version": "", "error": text[:300] or f"exit {proc.returncode}", "path": binary}
+    return {"name": name, "available": True, "version": text.splitlines()[0][:200], "error": "", "path": binary}
+
+
 def probe_tunnel_providers() -> dict[str, str | None]:
     return {
         "tailscale": shutil.which("tailscale"),

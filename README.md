@@ -18,6 +18,26 @@ Approvals made from the CLI require a short-lived owner grant (`second-brain own
 
 This repository does not ship a personal daily-use vault. `brain/` is gitignored owner data. The tests build temporary vaults. Creative media, formal checks, and the other optional commands stay in the tree; they are extra surfaces on capture, approval, search, and MCP, and they are not deleted to make the core look smaller.
 
+## Advanced modules
+
+`second-brain doctor` reports these as OK or WARN. A missing tool is a warning, not a failure of the vault. The main CI job installs ffmpeg and espeak-ng on Linux and runs those tests for real. Windows OCR runs inside the Windows CI job. LoRA, Lean, Ollama, cloudflared, and tailscale run in `.github/workflows/advanced-runtime.yml`, which is separate from the five-job CI matrix.
+
+| Module | Status |
+| --- | --- |
+| ffmpeg keyframes | Verified for real in the Linux CI job. A generated MP4 is decoded to a PNG. |
+| espeak-ng speech | Verified for real in the Linux CI job. Kokoro ONNX weights are not downloaded there. |
+| Kokoro TTS | Needs the Kokoro weight files. Doctor stays on WARN until `second-brain models pull kokoro-tts`. |
+| Windows OCR | Verified for real on the windows-latest job. Other OS jobs skip it. |
+| Screen capture | Verified for real on Linux with Xvfb and ffmpeg. |
+| Code sandbox | Verified for real in the main suite. It runs a separate Python process with CPU and memory limits. |
+| n8n client | Verified for real as HTTP against a loopback server. The n8n product is not installed. |
+| Open WebUI tool | The generated tool module is compiled. Open WebUI itself is not booted. |
+| LoRA training | A real PEFT loop on a tiny random GPT-2 runs in the advanced workflow. The main suite only checks the missing-dependency error unless torch, transformers, and peft are installed. |
+| Lean | `lean` checks a real file in the advanced workflow. The main suite skips when `lean` is absent. |
+| Ollama swarm debate | The advanced workflow pulls `qwen2.5:0.5b` and runs cited turns. Uncited sentences are dropped. |
+| cloudflared and tailscale | The advanced workflow runs `--version`. It does not open an authenticated tunnel. That needs owner credentials. |
+| Code sandbox, ledger, creative media | Already covered by the main suite. A GPU diffusion backend is not installed. |
+
 ## Install
 
 Python 3.11, 3.12, or 3.13. From a source checkout, `./setup.sh` on Linux/macOS or `setup.ps1` on Windows installs `uv` when it can, syncs the lockfile, creates an empty vault, and builds the model-free SQLite index. Neither script installs Ollama. Pass `--pull-models` / `-PullModels` only when Ollama is already running. `./setup.sh --no-launch` and `setup.ps1 -NoLaunch` stop before opening the dashboard.

@@ -167,6 +167,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "advanced_module_behavior_tests.py")),
     ),
     (
+        "real_runtime_tests",
+        "Real ffmpeg frames, espeak WAV, screen PNG, n8n HTTP, LoRA loop, Lean, Ollama debate, and tunnel binaries when installed",
+        ("-m", "unittest", str(SCRIPTS_DIR / "real_runtime_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),

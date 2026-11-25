@@ -53,7 +53,9 @@ jobs:
             libxrandr2 \
             libgbm1 \
             libpango-1.0-0 \
-            libcairo2
+            libcairo2 \
+            ffmpeg \
+            espeak-ng
 
       - name: Set up uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5

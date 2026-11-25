@@ -39,6 +39,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Any
 
 if __name__ in ("experimental_lora_pipeline", "scripts.experimental_lora_pipeline"):
@@ -61,6 +62,10 @@ from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 _BASE_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+
+
+class LoraDependencyError(RuntimeError):
+    """torch, transformers, or peft is not installed, so a real training loop cannot start."""
 
 
 class LoraExperimentGateError(ValueError):
@@ -201,6 +206,119 @@ def export_lora_training_pairs(
         "pii_redactions": redacted_total,
         "dataset_path": str(dataset_p),
         "config_path": str(cfg_p),
+    }
+
+
+def lora_training_available() -> dict[str, Any]:
+    """Report whether a real PEFT training loop can run in this interpreter."""
+    import importlib.util
+
+    missing = [name for name in ("torch", "transformers", "peft") if importlib.util.find_spec(name) is None]
+    return {
+        "available": not missing,
+        "missing": missing,
+        "detail": (
+            "torch, transformers, and peft are importable"
+            if not missing
+            else "Install torch, transformers, and peft to train. Missing: " + ", ".join(missing)
+        ),
+    }
+
+
+def train_lora_adapter(
+    *,
+    out_dir: str | Path,
+    texts: list[str] | None = None,
+    steps: int = 2,
+    max_steps: int = 8,
+    timeout_seconds: float = 120.0,
+) -> dict[str, Any]:
+    """Train a real LoRA adapter on a tiny random GPT-2 and reload it.
+
+    No weights are downloaded. The base model is created from a small config,
+    LoRA is applied to ``c_attn``, and a few AdamW steps run on the supplied
+    texts. The base weights stay in memory only. The adapter files are the
+    only thing written under ``out_dir``.
+    """
+    info = lora_training_available()
+    if not info["available"]:
+        raise LoraDependencyError(str(info["detail"]))
+    step_count = max(1, min(int(steps), int(max_steps)))
+    deadline = time.monotonic() + max(5.0, float(timeout_seconds))
+    corpus = [str(item or "").strip() for item in (texts or ["approved atoms stay cited"]) if str(item or "").strip()]
+    if not corpus:
+        raise ValueError("LoRA training needs at least one non-empty text.")
+
+    import torch
+    from peft import LoraConfig, PeftModel, get_peft_model
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    target = Path(out_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_or_link(str(target)):
+        raise PermissionError(f"Refusing to write a LoRA adapter through a symlink: {target}")
+
+    config = GPT2Config(
+        vocab_size=128,
+        n_positions=32,
+        n_embd=32,
+        n_layer=2,
+        n_head=2,
+        n_inner=64,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+    base = GPT2LMHeadModel(config)
+    peft_config = LoraConfig(
+        r=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+        bias="none",
+        target_modules=["c_attn"],
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(base, peft_config)
+    trainable = [param for param in model.parameters() if param.requires_grad]
+    if not trainable:
+        raise LoraDependencyError("PEFT attached no trainable LoRA parameters.")
+    optimizer = torch.optim.AdamW(trainable, lr=1e-3)
+    encoded = []
+    for text in corpus:
+        ids = [1] + [min(127, max(3, ord(ch) % 128)) for ch in text[:24]] + [2]
+        encoded.append(torch.tensor(ids, dtype=torch.long))
+    losses: list[float] = []
+    model.train()
+    for step in range(step_count):
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"LoRA training exceeded {timeout_seconds:.0f}s at step {step}.")
+        batch = encoded[step % len(encoded)].unsqueeze(0)
+        optimizer.zero_grad(set_to_none=True)
+        loss = model(input_ids=batch, labels=batch).loss
+        if not torch.isfinite(loss):
+            raise LoraDependencyError(f"LoRA loss was not finite at step {step}.")
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach().cpu()))
+    model.save_pretrained(str(target))
+    config.save_pretrained(str(target / "base"))
+    reloaded_base = GPT2LMHeadModel.from_pretrained(str(target / "base"))
+    reloaded = PeftModel.from_pretrained(reloaded_base, str(target))
+    reloaded.eval()
+    with torch.no_grad():
+        logits = reloaded(input_ids=encoded[0].unsqueeze(0)).logits
+    adapter_file = target / "adapter_model.safetensors"
+    if not adapter_file.is_file():
+        adapter_file = target / "adapter_model.bin"
+    if not adapter_file.is_file():
+        raise LoraDependencyError("Training finished but no adapter weights were written.")
+    return {
+        "status": "trained",
+        "steps": step_count,
+        "losses": [round(value, 6) for value in losses],
+        "adapter_path": str(adapter_file),
+        "loaded_logits_vocab": int(logits.shape[-1]),
+        "trainable_parameters": sum(param.numel() for param in trainable),
     }
 
 

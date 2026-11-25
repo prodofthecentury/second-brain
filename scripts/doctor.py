@@ -502,6 +502,10 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     checks.append(ok("raw queue", f"{raw_count} queued capture(s), {inbox_count} quarantined in 0-raw/inbox"))
     checks.append(ok("reading list", f"{queued_reading_items(eff_reading_list)} queued URL(s)"))
 
+    from scripts.runtime_capabilities import capability_checks
+
+    checks.extend(capability_checks())
+
     dashboard = fetch_text("http://127.0.0.1:8501/_stcore/health", timeout=2.0)
     if dashboard is None:
         checks.append(warn("dashboard", "Streamlit dashboard is not reachable on 127.0.0.1:8501"))

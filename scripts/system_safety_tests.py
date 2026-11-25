@@ -2548,6 +2548,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
             "bugfix_1a_regression_tests",
             "honesty_regression_tests",
             "advanced_module_behavior_tests",
+            "real_runtime_tests",
             "desktop_ui_tests",
             "vscode_extension_tests",
             "dashboard_apptest_tests",

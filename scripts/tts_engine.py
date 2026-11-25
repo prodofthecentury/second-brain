@@ -38,6 +38,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -346,6 +348,25 @@ def _get_or_open_session(slot_dir: Path):
         return sess
 
 
+def _synthesize_espeak_wav(text: str, espeak_bin: str, *, timeout_seconds: float = 20.0) -> bytes:
+    """Write a real WAV with espeak-ng or espeak. Raises TtsError on failure."""
+    with tempfile.TemporaryDirectory(prefix="sb-espeak-") as temp:
+        out = Path(temp) / "speech.wav"
+        proc = subprocess.run(
+            [espeak_bin, "-w", str(out), "-s", "150", text],
+            capture_output=True,
+            timeout=max(2.0, float(timeout_seconds)),
+            check=False,
+        )
+        if proc.returncode != 0 or not out.is_file() or out.stat().st_size < 44:
+            detail = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace")[:400]
+            raise TtsError(f"{Path(espeak_bin).name} failed to write WAV: {detail or proc.returncode}")
+        data = out.read_bytes()
+    if not data.startswith(b"RIFF"):
+        raise TtsError(f"{Path(espeak_bin).name} did not write a RIFF WAV.")
+    return data
+
+
 def synthesize_wav_bytes(
     text: str,
     *,
@@ -385,9 +406,29 @@ def synthesize_wav_bytes(
     from scripts.onnx_models import verify_slot_installation
 
     info = verify_slot_installation("kokoro-tts", state_dir=state_dir, slot_dir=slot_dir, run_inference=False)
+    espeak_bin = shutil.which("espeak-ng") or shutil.which("espeak")
     if not info.get("verified"):
+        if espeak_bin:
+            wav_bytes = _synthesize_espeak_wav(clean_text, espeak_bin, timeout_seconds=20.0)
+            elapsed_s = max(0.001, time.perf_counter() - t0)
+            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+                n_frames = wf.getnframes()
+                sr = wf.getframerate() or 22050
+            dur_s = round(n_frames / float(sr), 3) if sr else 0.0
+            return {
+                "status": "ok",
+                "wav_bytes": wav_bytes,
+                "mime_type": "audio/wav",
+                "sample_rate": sr,
+                "duration_seconds": dur_s,
+                "rtf": round(elapsed_s / max(0.05, dur_s), 3),
+                "clean_text": clean_text,
+                "voice": clean_voice,
+                "model_id": f"espeak:{Path(espeak_bin).name}",
+            }
         raise TtsUnavailableError(
-            "Kokoro-82M ONNX weights are missing or unverified. Run 'second-brain models pull kokoro-tts'."
+            "No speech engine is available. Install Kokoro weights with "
+            "'second-brain models pull kokoro-tts', or install espeak-ng."
         )
     try:
         import numpy as np  # type: ignore

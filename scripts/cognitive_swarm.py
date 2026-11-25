@@ -481,6 +481,115 @@ def run_two_sided_debate(
     }
 
 
+class SwarmRuntimeError(RuntimeError):
+    """A real Ollama debate round could not be completed."""
+
+
+def enforce_cited_sentences(text: str, allowed_ids: set[str] | frozenset[str]) -> list[str]:
+    """Keep only sentences whose [V#] citations are in the approved set."""
+    allowed = {str(item) for item in allowed_ids}
+    kept: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", str(text or "").strip()):
+        found = set(re.findall(r"\[(V\d+)\]", sentence))
+        if found and found <= allowed:
+            kept.append(sentence.strip())
+    return kept
+
+
+def run_ollama_cited_debate(
+    topic: str,
+    citations: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    rounds: int = 2,
+    timeout_seconds: float = 60.0,
+) -> dict[str, Any]:
+    """Ask a local Ollama model for cited thesis and antithesis turns.
+
+    Sentences that do not carry an allowed ``[V#]`` citation are dropped.
+    If every sentence is dropped, the round abstains instead of inventing a claim.
+    """
+    import httpx
+
+    clean_topic = str(topic or "").strip()
+    if not clean_topic:
+        raise ValueError("Debate topic is required.")
+    allowed = {
+        str(item.get("citation_id") or "").strip()
+        for item in citations
+        if str(item.get("citation_id") or "").strip()
+    }
+    if not allowed:
+        return {
+            "status": "abstained",
+            "reason": "no approved citations were supplied",
+            "rounds": [],
+            "model": model or "",
+        }
+    host = (base_url or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
+    chosen = (model or os.environ.get("BRAIN_OLLAMA_DEBATE_MODEL") or "qwen2.5:0.5b").strip()
+    timeout = max(5.0, min(180.0, float(timeout_seconds)))
+    catalog = ""
+    for item in citations:
+        catalog += f"[{item.get('citation_id')}] {item.get('claim') or ''}\n"
+    turns = []
+    try:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            tags = client.get(f"{host}/api/tags")
+            tags.raise_for_status()
+            names = {
+                str(row.get("name") or "")
+                for row in (tags.json().get("models") or [])
+                if isinstance(row, dict)
+            }
+            if chosen not in names and not any(name.startswith(chosen) for name in names):
+                raise SwarmRuntimeError(
+                    f"Ollama at {host} does not have model {chosen!r}. Installed: {sorted(names) or 'none'}."
+                )
+            for role, stance in (
+                ("thesis", "Argue for the topic using only the citations."),
+                ("antithesis", "Argue against the topic using only the citations."),
+            )[: max(1, min(2, int(rounds)))]:
+                prompt = (
+                    f"{stance}\nTopic: {clean_topic}\n"
+                    "Every sentence must cite one of these ids in square brackets.\n"
+                    f"{catalog}"
+                )
+                response = client.post(
+                    f"{host}/api/chat",
+                    json={
+                        "model": chosen,
+                        "stream": False,
+                        "messages": [
+                            {"role": "system", "content": "You may only use the supplied citations."},
+                            {"role": "user", "content": prompt},
+                        ],
+                    },
+                )
+                response.raise_for_status()
+                content = str(((response.json().get("message") or {}).get("content")) or "")
+                accepted = enforce_cited_sentences(content, allowed)
+                turns.append(
+                    {
+                        "role": role,
+                        "raw": content[:2000],
+                        "accepted": accepted,
+                        "abstained": not accepted,
+                    }
+                )
+    except SwarmRuntimeError:
+        raise
+    except Exception as exc:
+        raise SwarmRuntimeError(f"Ollama debate failed against {host}: {exc}") from exc
+    return {
+        "status": "completed" if any(not turn["abstained"] for turn in turns) else "abstained",
+        "model": chosen,
+        "rounds": turns,
+        "uncited_claims_emitted": 0,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Second Brain Cognitive Swarm & Two-Sided Debate")
     sub = parser.add_subparsers(dest="cmd", required=True)

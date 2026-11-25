@@ -38,6 +38,7 @@ from collections.abc import Callable
 from contextlib import closing
 import datetime
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -47,6 +48,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 if __name__ in ("screen_memory", "scripts.screen_memory"):
@@ -250,6 +252,110 @@ def _connect_db(brain_dir: str | Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+class ScreenCaptureError(RuntimeError):
+    """A real framebuffer or OCR engine could not be used."""
+
+
+def capture_screen_png(*, timeout_seconds: float = 12.0) -> dict[str, Any]:
+    """Capture one real screen frame as PNG.
+
+    Linux uses ffmpeg x11grab, starting Xvfb when no display is set.
+    Windows uses Pillow ImageGrab. macOS uses ``screencapture``.
+    """
+    timeout = max(3.0, min(30.0, float(timeout_seconds)))
+    ffmpeg_bin = shutil.which("ffmpeg")
+    display = (os.environ.get("DISPLAY") or "").strip()
+    xvfb_proc: subprocess.Popen[bytes] | None = None
+    try:
+        if sys.platform.startswith("linux") and not display and shutil.which("Xvfb") and ffmpeg_bin:
+            display = ":95"
+            xvfb_proc = subprocess.Popen(
+                ["Xvfb", display, "-screen", "0", "320x240x24"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.4)
+        with tempfile.TemporaryDirectory(prefix="sb-screen-") as temp:
+            out = Path(temp) / "frame.png"
+            if display and ffmpeg_bin:
+                proc = subprocess.run(
+                    [ffmpeg_bin, "-y", "-f", "x11grab", "-video_size", "320x240", "-i", display, "-frames:v", "1", str(out)],
+                    capture_output=True,
+                    timeout=timeout,
+                    check=False,
+                    env={**os.environ, "DISPLAY": display},
+                )
+                if proc.returncode != 0 or not out.is_file():
+                    detail = (proc.stderr or b"").decode("utf-8", errors="replace")[-300:]
+                    raise ScreenCaptureError(f"x11grab failed: {detail or proc.returncode}")
+                data = out.read_bytes()
+                engine = "ffmpeg-x11grab"
+            elif sys.platform == "win32":
+                try:
+                    from PIL import ImageGrab
+                except ImportError as exc:
+                    raise ScreenCaptureError("Windows screen capture needs Pillow ImageGrab.") from exc
+                image = ImageGrab.grab()
+                buf = io.BytesIO()
+                image.save(buf, format="PNG")
+                data = buf.getvalue()
+                engine = "pillow-imagegrab"
+            elif sys.platform == "darwin" and shutil.which("screencapture"):
+                proc = subprocess.run(
+                    ["screencapture", "-x", str(out)],
+                    capture_output=True,
+                    timeout=timeout,
+                    check=False,
+                )
+                if proc.returncode != 0 or not out.is_file():
+                    raise ScreenCaptureError("screencapture failed.")
+                data = out.read_bytes()
+                engine = "screencapture"
+            else:
+                raise ScreenCaptureError(
+                    "No screen capturer is available. Linux needs ffmpeg and Xvfb or DISPLAY. "
+                    "Windows needs Pillow. macOS needs screencapture."
+                )
+        if not data.startswith(b"\x89PNG") or len(data) < 32:
+            raise ScreenCaptureError("The capturer did not return a PNG.")
+        return {"png_bytes": data, "engine": engine, "byte_count": len(data)}
+    finally:
+        if xvfb_proc is not None and xvfb_proc.poll() is None:
+            xvfb_proc.terminate()
+            try:
+                xvfb_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                xvfb_proc.kill()
+
+
+def recognize_image_text(png_bytes: bytes, *, timeout_seconds: float = 20.0) -> dict[str, Any]:
+    """Read text from a PNG with Windows OCR or tesseract. Does not invent text."""
+    if not png_bytes.startswith(b"\x89PNG"):
+        raise ScreenCaptureError("OCR input is not a PNG.")
+    if sys.platform == "win32":
+        text, engine, error = _windows_ocr_detail(png_bytes, timeout_seconds=timeout_seconds)
+        return {"text": text, "engine": engine or "windows-winrt-ocr", "error": error}
+    tess = shutil.which("tesseract")
+    if not tess:
+        return {
+            "text": "",
+            "engine": "",
+            "error": "No OCR engine on this OS. Windows uses WinRT OCR. Other systems need tesseract.",
+        }
+    with tempfile.TemporaryDirectory(prefix="sb-ocr-") as temp:
+        src = Path(temp) / "page.png"
+        src.write_bytes(png_bytes)
+        proc = subprocess.run(
+            [tess, str(src), "stdout", "-l", "eng"],
+            capture_output=True,
+            timeout=max(3.0, float(timeout_seconds)),
+            check=False,
+        )
+    text = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
+    error = "" if proc.returncode == 0 else (proc.stderr or b"").decode("utf-8", errors="replace")[:300]
+    return {"text": text, "engine": "tesseract", "error": error}
+
+
 def is_window_blocked(window_title: str, app_name: str = "", *, blocked_terms: list[str] | tuple[str, ...] = DEFAULT_SENSITIVE_WINDOW_TERMS) -> str | None:
     hay = f"{app_name or ''} {window_title or ''}".casefold()
     for term in blocked_terms:
@@ -290,6 +396,58 @@ def _run_windows_winrt_ocr(png_bytes: bytes) -> tuple[str, str | None]:
         return (txt, "windows-winrt-ocr") if txt else ("", None)
     except Exception:
         return "", None
+    finally:
+        if os.path.exists(tmp_png):
+            try:
+                os.unlink(tmp_png)
+            except OSError:
+                pass
+
+
+def _windows_ocr_detail(png_bytes: bytes, *, timeout_seconds: float = 20.0) -> tuple[str, str, str]:
+    """Return (text, engine, error). Error is empty when Windows OCR returned text."""
+    ps = shutil.which("powershell") or shutil.which("pwsh")
+    if not ps:
+        return "", "windows-winrt-ocr", "powershell is not on PATH"
+    fd, tmp_png = tempfile.mkstemp(prefix=".sb-winocr-", suffix=".png")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(png_bytes)
+        script = (
+            "$ErrorActionPreference='Stop';"
+            "Add-Type -AssemblyName System.Runtime.WindowsRuntime;"
+            "[Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime]|Out-Null;"
+            "[Windows.Graphics.Imaging.BitmapDecoder,Windows.Graphics.Imaging,ContentType=WindowsRuntime]|Out-Null;"
+            "[Windows.Media.Ocr.OcrEngine,Windows.Media.Ocr,ContentType=WindowsRuntime]|Out-Null;"
+            "$asTask=([System.WindowsRuntimeSystemExtensions].GetMethods()|Where-Object{$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethod})[0];"
+            "function Await($op,$t){$m=$asTask.MakeGenericMethod($t);$task=$m.Invoke($null,@($op));$task.Wait();return $task.Result};"
+            "$f=Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($env:SB_OCR_PNG)) ([Windows.Storage.StorageFile]);"
+            "$s=Await ($f.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream]);"
+            "$dec=Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($s)) ([Windows.Graphics.Imaging.BitmapDecoder]);"
+            "$bmp=Await ($dec.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]);"
+            "$eng=[Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages();"
+            "if(-not $eng){throw 'Windows OCR engine is not installed for this user profile'};"
+            "$res=Await ($eng.RecognizeAsync($bmp)) ([Windows.Media.Ocr.OcrResult]);"
+            "$res.Text"
+        )
+        env = {**os.environ, "SB_OCR_PNG": tmp_png}
+        proc = subprocess.run(
+            [ps, "-NoProfile", "-NonInteractive", "-Command", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=max(5.0, float(timeout_seconds)),
+            check=False,
+        )
+        text = (proc.stdout or "").strip()
+        if proc.returncode == 0 and text:
+            return text, "windows-winrt-ocr", ""
+        detail = (proc.stderr or proc.stdout or "").strip()[:500]
+        return "", "windows-winrt-ocr", detail or f"Windows OCR exited {proc.returncode}"
+    except subprocess.TimeoutExpired:
+        return "", "windows-winrt-ocr", "Windows OCR timed out"
+    except Exception as exc:
+        return "", "windows-winrt-ocr", str(exc)[:500]
     finally:
         if os.path.exists(tmp_png):
             try:
