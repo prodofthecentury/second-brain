@@ -1047,6 +1047,83 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         return True
 
     try:
+        # ── Capture receipts and trust-lane search ──
+        if path == "/v1/capture" and method == "POST":
+            client_ip = handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1"
+            if not check_capture_rate_limit(client_ip):
+                return send(429, {"error": "Too Many Requests: capture write rate limit exceeded (max 180 per minute)."})
+            from memory_desk import capture_memory
+
+            inbox_flag = body.get("inbox", False)
+            if not isinstance(inbox_flag, bool):
+                raise ValueError("'inbox' must be a boolean.")
+            content_cap = MAX_NOTE_BYTES if is_owner else 16_000
+            title = _str(body, "title", max_len=200, required=False)
+            content = _str(body, "content", max_len=content_cap, required=False)
+            if not content:
+                content = _str(body, "body", max_len=content_cap, required=False)
+            source = _str(body, "source", max_len=64, required=False, default="api")
+            receipt = capture_memory(
+                title,
+                content,
+                origin="owner_note" if is_owner else "agent_capture",
+                tags=_tags(body),
+                capture_source=source or ("owner" if is_owner else "agent"),
+                inbox=bool(inbox_flag),
+                hide_preference=not is_owner,
+                paths=paths,
+                atoms_dir=rt.atoms_dir,
+                lexical_index_path=rt.lexical_index_path,
+            )
+            return send(202 if receipt.get("trust_lane") == "quarantine" else 201, receipt)
+
+        if path == "/v1/search" and method in {"GET", "POST"}:
+            from memory_desk import search_memory_desk
+
+            if method == "GET":
+                text = (q.get("q") or q.get("query") or [""])[0]
+                raw_lanes = q.get("lane") or q.get("lanes")
+                limit = _parse_bounded_int(q, "limit", default=8, min_val=1, max_val=25)
+                project = ((q.get("project") or [""])[0] or "")
+                if len(project) > 120:
+                    raise ValueError("Invalid project query filter.")
+                include_q = (q.get("include_quarantine") or ["0"])[0].strip().lower() in {"1", "true", "yes"}
+            else:
+                text = _str(body, "query", max_len=500, required=False) or _str(body, "q", max_len=500, required=False)
+                raw_lanes = body.get("lanes")
+                if "limit" in body and body.get("limit") is not None:
+                    if isinstance(body.get("limit"), bool) or not isinstance(body.get("limit"), int):
+                        raise ValueError("'limit' must be an integer.")
+                    limit = int(body["limit"])
+                else:
+                    limit = 8
+                project = _str(body, "project", max_len=120, required=False)
+                include_q = body.get("include_quarantine", False)
+                if not isinstance(include_q, bool):
+                    raise ValueError("'include_quarantine' must be a boolean.")
+            lanes = None
+            if raw_lanes is not None:
+                if not isinstance(raw_lanes, list) or any(not isinstance(item, str) or len(item) > 40 for item in raw_lanes):
+                    raise ValueError("'lanes' must be a list of short strings.")
+                if len(raw_lanes) > 4:
+                    raise ValueError("'lanes' exceeds 4 entries.")
+                lanes = raw_lanes
+            wants_quarantine = bool(include_q) or bool(lanes and "quarantine" in lanes)
+            if wants_quarantine and not is_owner:
+                return send(403, {"error": "403 Forbidden: quarantine search requires the owner token."})
+            result = search_memory_desk(
+                text,
+                lanes=lanes,
+                limit=limit,
+                project=project or None,
+                include_quarantine=wants_quarantine,
+                hide_preference=not is_owner,
+                paths=paths,
+                atoms_dir=rt.atoms_dir,
+                lexical_index_path=rt.lexical_index_path,
+            )
+            return send(200, result)
+
         # ── Notes ──
         if path == "/v1/notes" and method == "GET":
             if (os.path.lexists(paths.brain_dir) and _is_reparse_or_link(paths.brain_dir)) or (
@@ -1096,11 +1173,19 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/notes" and method == "POST":
             if not owner_only():
                 return True
-            res = create_note(
-                _str(body, "title", max_len=200, required=False),
-                _str(body, "body", max_len=MAX_NOTE_BYTES, required=False),
-                tags=_tags(body),
+            from memory_desk import attach_receipt
+
+            title = _str(body, "title", max_len=200, required=False)
+            note_body = _str(body, "body", max_len=MAX_NOTE_BYTES, required=False)
+            res = create_note(title, note_body, tags=_tags(body), paths=paths)
+            res = attach_receipt(
+                res,
+                title=title,
+                body=note_body,
                 paths=paths,
+                atoms_dir=rt.atoms_dir,
+                lexical_index_path=rt.lexical_index_path,
+                hide_preference=False,
             )
             return send(201, res)
 
@@ -1177,13 +1262,27 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             client_ip = handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1"
             if not check_capture_rate_limit(client_ip):
                 return send(429, {"error": "Too Many Requests: capture write rate limit exceeded (max 180 per minute)."})
+            from memory_desk import attach_receipt
+
+            title = _str(body, "title", max_len=200, required=False)
+            content = _str(body, "content", max_len=16_000)
+            source = _str(body, "source", max_len=64, required=False, default="agent")
             res = create_note(
-                _str(body, "title", max_len=200, required=False),
-                _str(body, "content", max_len=16_000),
+                title,
+                content,
                 origin="agent_capture",
                 tags=_tags(body),
-                capture_source=_str(body, "source", max_len=64, required=False, default="agent"),
+                capture_source=source,
                 paths=paths,
+            )
+            res = attach_receipt(
+                res,
+                title=title,
+                body=content,
+                paths=paths,
+                atoms_dir=rt.atoms_dir,
+                lexical_index_path=rt.lexical_index_path,
+                hide_preference=not is_owner,
             )
             return send(202 if res["status"] == "quarantined" else 201, res)
 

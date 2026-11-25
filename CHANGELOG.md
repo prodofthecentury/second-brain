@@ -4,6 +4,15 @@ All notable changes to **Second Brain** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Capture receipts and trust-lane search (`scripts/memory_desk.py`, `second-brain capture`, `second-brain search`, `POST /v1/capture`, `POST /v1/search`):**
+  - A capture now returns a memory receipt: trust lane, whether it is searchable by default, an explicit "not a verified fact" label, a find-again query, and similar memories. Nothing in this path approves or promotes memory.
+  - `second-brain search` and the dashboard **Capture & Find** page search working notes and owner-approved atoms together. Quarantine stays out of default search and requires the owner token. Pending, expired, and (for agent tokens) preference atoms stay out of the verified lane.
+  - Secret-shaped text is redacted in search previews. Owner captures that match a secret or injection pattern stay working notes and carry a warning; agent captures with those patterns still go to the quarantined inbox.
+  - Desktop quick capture uses `POST /v1/capture` and keeps the window open when the receipt says the capture needs review.
+
 ## [1.0.0] — 2026-11-22
 
 Production `v1.0.0` completion release delivering **full core + gap-closure parity**: **Multimodal Voice Memo, Screenshot Paste & Media Upload (`/v1/ingest/media` + DLP Quarantine)**, **Git Post-Commit & Coding Session Memory Distiller (`second-brain hook`, `/v1/git/*`)**, **Bi-Temporal + Cross-Encoder Time-Travel Snapshot Recall & Plugin Schema Sync**, **Autonomous Watchdog Daemon (`--auto-sync` & Live Vector Upserts)**, **Portable Encrypted `.sbvault` Backup & Disaster-Recovery Restore (`second-brain backup`, `/v1/vault/backup/*`)**, **Bidirectional E2EE Mobile Drop & `SBMR1` Vault Recall/Search/Review PWA + On-Device Mobile Vault Client**, **Stage 4 Sandbox Executable Skills & Creative Media Provenance**, **Validated WinGet & Homebrew `Formula` Manifests**, and **90-Case Agent-Drafted (Pending Owner Review) + Live Third-Party Memory Benchmarks (`Mem0`, `FAISS`, `ChromaDB`, `rank-bm25`) + Sub-15ms 300-Atom ONNX Cross-Encoder Recall** across Python/CLI, Loopback API/SDK, 17-tool MCP, Electron Desktop, VS Code, and Streamlit Dashboard (`26/26` suites passing in `scripts/test_all.py`; see [v1.0.0 Independent Review](docs/independent-review-2026-11-22-v1.0.0.md) and [v1.0.0 Benchmark Report](docs/benchmark-report-v1.0.0.md)).

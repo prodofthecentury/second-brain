@@ -121,6 +121,14 @@ def scan_inbox_payload_risks(content: str) -> tuple[str, ...]:
     return tuple(flags)
 
 
+def redact_detected_secrets(content: str) -> str:
+    """Replace detected credential patterns with a fixed marker. Forged-trust text is left intact."""
+    redacted = str(content or "")
+    for _label, pattern in _SECRET_CREDENTIAL_PATTERNS:
+        redacted = pattern.sub("[redacted]", redacted)
+    return redacted
+
+
 def _unique_archive_destination(inbox_dir: str, subdir: str, prefix_sha: str, basename: str) -> str:
     if subdir not in {"promoted", "rejected", ".rejected"}:
         raise ValueError(f"Unsupported inbox archive subdirectory: {subdir}")

@@ -126,6 +126,7 @@ from scripts.notes_store import (
     update_note,
     verify_note_excerpt,
 )
+from scripts.memory_desk import MemoryDeskError, capture_memory, search_memory_desk
 import scripts.bulk_import as _bulk_import_mod
 from scripts.bulk_import import import_folder
 from scripts.doc_extractors import DOC_EXTRACTOR_EXTS, extract_document
@@ -1261,6 +1262,7 @@ nav_selection = st.sidebar.radio(
     "NAVIGATION",
     [
         "💬 Chat with Memory",
+        "⚡ Capture & Find",
         "📝 Working Notes & Import",
         "🕸️ Knowledge Graph",
         "🗄️ Vault Explorer",
@@ -1280,6 +1282,104 @@ if _flash_banner := st.session_state.pop("_dashboard_flash_success", None):
 # Initialize chat messages session state
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+
+
+# PAGE: CAPTURE & FIND
+if nav_selection == "⚡ Capture & Find":
+    st.title("⚡ Capture & Find")
+    st.caption(
+        "Save a thought and search it together with owner-approved memory. "
+        "A capture is searchable immediately and stays a working note until you verify an excerpt."
+    )
+    prefill = st.session_state.pop("_desk_prefill_query", None)
+    if prefill:
+        st.session_state["desk_query"] = prefill
+        st.session_state["desk_do_search"] = True
+
+    capture_col, search_col = st.columns(2)
+    with capture_col:
+        st.subheader("Capture")
+        desk_title = st.text_input("Title", key="desk_title", placeholder="Optional title")
+        desk_body = st.text_area(
+            "Capture",
+            key="desk_body",
+            height=160,
+            placeholder="A decision, observation, or quote worth finding later.",
+        )
+        desk_tags = st.text_input("Tags", key="desk_tags", placeholder="project:second_brain, kelp")
+        desk_inbox = st.checkbox("Send straight to quarantine instead of a working note", key="desk_inbox")
+        if st.button("Save capture", type="primary", key="desk_save"):
+            parsed_tags = [part.strip() for part in str(desk_tags or "").split(",") if part.strip()]
+            try:
+                st.session_state["desk_receipt"] = capture_memory(
+                    desk_title,
+                    desk_body,
+                    tags=parsed_tags,
+                    inbox=bool(desk_inbox),
+                    capture_source="dashboard",
+                    paths=_active_note_paths(),
+                    atoms_dir=ATOMS_DIR,
+                    lexical_index_path=LEXICAL_INDEX_PATH,
+                )
+            except (MemoryDeskError, NoteError, PermissionError) as exc:
+                st.error(str(exc))
+        receipt = st.session_state.get("desk_receipt")
+        if isinstance(receipt, dict):
+            st.success(str(receipt.get("trust_label") or "Captured"))
+            if receipt.get("secret_warning"):
+                st.warning(str(receipt["secret_warning"]))
+            st.text(f"File: {receipt.get('filename')} ({receipt.get('location')})")
+            if receipt.get("find_again_query") and st.button("Search for this capture", key="desk_find_again"):
+                st.session_state["_desk_prefill_query"] = str(receipt["find_again_query"])
+                st.rerun()
+            for hit in receipt.get("similar") or []:
+                st.code(f"Similar [{hit.get('lane')}]\n{hit.get('filename')}\n{hit.get('snippet')}", language="text")
+
+    with search_col:
+        st.subheader("Find")
+        desk_query = st.text_input("Search memory", key="desk_query", placeholder="Words from a note or approved claim")
+        desk_lanes = st.multiselect(
+            "Lanes",
+            options=["working_note", "verified_atom", "quarantine"],
+            default=["working_note", "verified_atom"],
+            key="desk_lanes",
+        )
+        desk_project = st.text_input("Project", key="desk_project", placeholder="project:alpha")
+        do_search = st.button("Search memory", key="desk_search_btn")
+        if do_search or st.session_state.get("desk_do_search"):
+            st.session_state["desk_do_search"] = False
+            if not str(desk_query or "").strip():
+                st.warning("Enter a search query.")
+            else:
+                try:
+                    st.session_state["desk_last_result"] = search_memory_desk(
+                        desk_query,
+                        lanes=tuple(desk_lanes) if desk_lanes else ("working_note", "verified_atom"),
+                        project=str(desk_project or "").strip() or None,
+                        include_quarantine="quarantine" in (desk_lanes or []),
+                        paths=_active_note_paths(),
+                        atoms_dir=ATOMS_DIR,
+                        lexical_index_path=LEXICAL_INDEX_PATH,
+                    )
+                except (MemoryDeskError, NoteError, PermissionError) as exc:
+                    st.error(str(exc))
+        result = st.session_state.get("desk_last_result")
+        if isinstance(result, dict):
+            st.text(f"{result.get('count', 0)} hit(s)")
+            for warning in result.get("lane_warnings") or []:
+                st.warning(str(warning))
+            for hit in result.get("hits") or []:
+                st.code(
+                    "\n".join(
+                        [
+                            str(hit.get("trust_label") or hit.get("lane")),
+                            str(hit.get("filename") or ""),
+                            str(hit.get("snippet") or ""),
+                            "why: " + ", ".join(str(item) for item in (hit.get("why") or [])),
+                        ]
+                    ),
+                    language="text",
+                )
 
 
 # PAGE 1: CHAT WITH MEMORY

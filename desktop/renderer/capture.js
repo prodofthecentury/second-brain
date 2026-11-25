@@ -271,34 +271,33 @@ async function save() {
     }
 
     if (body) {
-      if (dest === "inbox") {
-        const headerLines = [];
-        if (rawTitle) headerLines.push(`# ${rawTitle}`);
-        if (tags.length) headerLines.push(`Tags: ${tags.join(", ")}`);
-        const content = headerLines.length
-          ? `${headerLines.join("\n")}\n\n${body}`
-          : body;
-        res = await window.secondBrain.request("POST", "/v1/inbox", {
-          content,
-          source: "desktop_quick_capture",
-        });
-      } else {
-        res = await window.secondBrain.request("POST", "/v1/notes", {
-          title,
-          body,
-          tags,
-        });
-      }
+      res = await window.secondBrain.request("POST", "/v1/capture", {
+        title,
+        content: body,
+        tags,
+        inbox: dest === "inbox",
+        source: "desktop_quick_capture",
+      });
     }
 
     if (res && res.ok) {
+      const data = res.data && typeof res.data === "object" ? res.data : {};
+      const receipt = data.receipt && typeof data.receipt === "object" ? data.receipt : data;
+      const needsReview = receipt.trust_lane === "quarantine" || Boolean(receipt.secret_warning);
       if (titleEl) titleEl.value = "";
       if (bodyEl) bodyEl.value = "";
       if (tagsEl) tagsEl.value = "";
       pendingMedia = null;
       updateMediaBadge();
-      showStatus("");
       await window.secondBrain.notifyMainRefresh();
+      if (needsReview) {
+        showStatus(
+          receipt.secret_warning || receipt.trust_label || "Capture is quarantined and hidden from default search.",
+          "warn",
+        );
+        return;
+      }
+      showStatus("");
       await window.secondBrain.closeCapture();
     } else {
       const errMsg =
