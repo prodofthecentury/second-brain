@@ -28,6 +28,21 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
 
 
+def _configure_utf8_stdio() -> None:
+    """Child suites print ✓. The Windows cp1252 console must not hide their output."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+_configure_utf8_stdio()
+
+
 SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "doctor",

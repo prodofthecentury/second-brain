@@ -361,8 +361,17 @@ class V100FinalCompletionTests(unittest.TestCase):
                 hook_txt = hook_path.read_text(encoding="utf-8")
                 self.assertIn("# custom-user-hook-line", hook_txt)
                 self.assertIn("second-brain-post-commit", hook_txt)
-                # Spaces in path are single-quoted safely
-                self.assertIn("'repo with spaces'", hook_txt.replace(str(repo.as_posix()), "repo with spaces"))
+                # Spaces in path are single-quoted safely. Resolve first so macOS /var
+                # and Windows 8.3 names are not a suffix of the path the hook stored.
+                hook_view = hook_txt
+                spellings = sorted(
+                    {repo.as_posix(), repo.resolve().as_posix()},
+                    key=len,
+                    reverse=True,
+                )
+                for spelling in spellings:
+                    hook_view = hook_view.replace(spelling.replace("\\", "/"), "repo with spaces")
+                self.assertIn("'repo with spaces'", hook_view)
 
                 dist_res = owner.distill_git_commits(repo=str(repo), project_scope="project:space_repo", max_commits=5)
                 self.assertEqual(dist_res["distilled_count"], 2)
