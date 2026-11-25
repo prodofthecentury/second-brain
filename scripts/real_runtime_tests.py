@@ -146,11 +146,11 @@ class RealRuntimeTests(unittest.TestCase):
                 steps=2,
                 timeout_seconds=90,
             )
-        self.assertEqual(trained["status"], "trained")
-        self.assertEqual(trained["steps"], 2)
-        self.assertGreater(trained["trainable_parameters"], 0)
-        self.assertEqual(trained["loaded_logits_vocab"], 128)
-        self.assertTrue(Path(trained["adapter_path"]).is_file())
+            self.assertEqual(trained["status"], "trained")
+            self.assertEqual(trained["steps"], 2)
+            self.assertGreater(trained["trainable_parameters"], 0)
+            self.assertEqual(trained["loaded_logits_vocab"], 128)
+            self.assertTrue(Path(trained["adapter_path"]).is_file())
 
     def test_lean_checks_a_real_file_when_the_toolchain_is_installed(self) -> None:
         if not verify_lean_binary_available():
