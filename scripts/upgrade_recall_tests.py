@@ -362,6 +362,50 @@ class SecurityPathTests(unittest.TestCase):
         ):
             self.assertTrue(is_untrusted_reparse_or_link("/var/folders/xx"))
 
+    def test_vault_slug_matches_across_a_directory_alias(self) -> None:
+        import vault_sync
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "real-vault"
+            real.mkdir()
+            alias = root / "alias-vault"
+            alias.symlink_to(real, target_is_directory=True)
+            self.assertEqual(vault_sync._vault_key_slug(real), vault_sync._vault_key_slug(alias))
+            self.assertEqual(
+                vault_sync.sync_config_path(real, state_dir=root / "sec").name,
+                vault_sync.sync_config_path(alias, state_dir=root / "sec").name,
+            )
+
+    def test_interaction_encoder_name_matches_the_status_label(self) -> None:
+        from cross_encoder import InteractionCrossEncoder
+
+        self.assertEqual(InteractionCrossEncoder.backend_name, "interaction_cross_encoder")
+
+    def test_console_print_survives_a_cp1252_stream(self) -> None:
+        import ingest_multimodal
+
+        class _Cp1252:
+            encoding = "cp1252"
+
+            def __init__(self) -> None:
+                self.parts: list[str] = []
+
+            def write(self, text: str) -> int:
+                text.encode(self.encoding)
+                self.parts.append(text)
+                return len(text)
+
+            def flush(self) -> None:
+                return None
+
+        stream = _Cp1252()
+        with patch("sys.stdout", stream):
+            ingest_multimodal._console_print("  [✓] Transcript saved → note.md")
+        rendered = "".join(stream.parts)
+        self.assertIn("Transcript saved", rendered)
+        rendered.encode("cp1252")
+
 
 if __name__ == "__main__":
     unittest.main()

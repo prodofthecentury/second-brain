@@ -73,6 +73,7 @@ from config import (  # noqa: E402
     BRAIN_DIR,
     _WINDOWS_RESERVED_STEMS,
     _is_reparse_or_link,
+    is_untrusted_reparse_or_link,
     resolve_active_brain_dir,
     safe_file_in_dir,
     security_state_dir,
@@ -174,7 +175,9 @@ def _utc_now_iso() -> str:
 
 
 def _vault_key_slug(brain_dir: str | Path) -> str:
-    norm = os.path.normcase(os.path.abspath(str(brain_dir)))
+    # realpath folds macOS /var -> /private/var and Windows 8.3 short names
+    # so init and later lookups name the same config file.
+    norm = os.path.normcase(os.path.realpath(os.path.abspath(str(brain_dir))))
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
 
 
@@ -195,7 +198,7 @@ def _assert_no_symlink_chain(path: Path, *, stop_at: Path | None = None) -> None
     stop_norm = os.path.normcase(os.path.abspath(str(stop_at))) if stop_at is not None else None
     cur = Path(os.path.abspath(str(path)))
     while True:
-        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+        if is_untrusted_reparse_or_link(str(cur)):
             raise SyncSecurityError(f"Refusing to traverse symlink or reparse point: {cur}")
         if stop_norm is not None and os.path.normcase(str(cur)) == stop_norm:
             break
