@@ -15,7 +15,23 @@ Tracks open human-only decisions without ever fabricating owner approvals:
      recalibrated SLO awaiting explicit human owner sign-off).
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from collections import Counter
@@ -34,11 +50,9 @@ if __name__ in ("owner_gates", "scripts.owner_gates"):
     sys.modules.setdefault("scripts.owner_gates", sys.modules[__name__])
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_DIR)
 
-from atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
     _is_immutable_darwin_root_symlink,
@@ -47,17 +61,17 @@ from config import (  # noqa: E402
     resolve_module_atoms_and_brain,
     snapshot_module_defaults,
 )
-from evaluation_dataset import (  # noqa: E402
+from scripts.evaluation_dataset import (  # noqa: E402
     AGENT_ACTOR_BLOCKLIST,
     EvaluationDatasetError,
     is_disallowed_agent_actor,
     validate_dataset,
 )
-from evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
-from hardware_profile import HardwareCapabilityProfile  # noqa: E402
-from memory_format import split_frontmatter  # noqa: E402
-from memory_review import parse_frontmatter_values, parse_scalar_list, section_text  # noqa: E402
-from review_atom import approved_revision_is_current  # noqa: E402
+from scripts.evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
+from scripts.hardware_profile import HardwareCapabilityProfile  # noqa: E402
+from scripts.memory_format import split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list, section_text  # noqa: E402
+from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
@@ -452,7 +466,7 @@ def audit_latency_slos(
     brain_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Verify measured Tier-2 8-thread CPU answer P95 and 300-atom ONNX retrieval P95 against targets."""
-    import hardware_profile as hp_mod
+    import scripts.hardware_profile as hp_mod
 
     resolved_brain, _ = resolve_module_atoms_and_brain(
         globals(),

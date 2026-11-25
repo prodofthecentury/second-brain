@@ -23,7 +23,7 @@ import tempfile
 from typing import Any, Callable
 
 try:
-    from config import VIDEO_EXTS, _is_reparse_or_link
+    from scripts.config import VIDEO_EXTS, _is_reparse_or_link
 except ImportError:  # pragma: no cover
     VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
     _is_reparse_or_link = lambda p: os.path.islink(p)  # noqa: E731

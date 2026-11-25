@@ -9,8 +9,8 @@ from pathlib import Path
 import re
 import threading
 
-from memory_format import split_frontmatter
-from memory_review import parse_frontmatter_values, parse_scalar_list
+from scripts.memory_format import split_frontmatter
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list
 
 
 class EvidenceValidationError(ValueError):

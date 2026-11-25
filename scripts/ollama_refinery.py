@@ -5,6 +5,22 @@
 # ]
 # ///
 
+
+
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 import os
 import re
 import datetime
@@ -16,14 +32,13 @@ try:
 except ImportError:
     ollama = None  # type: ignore[assignment]
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
 except Exception:
     pass
 
-from config import (
+from scripts.config import (
     RAW_DIR,
     ATOMS_DIR,
     CHROMA_PATH as CHROMA_DB_PATH,
@@ -46,9 +61,9 @@ from config import (
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 _MOD_PATH_DEFAULTS["HOUSE_RULES_PATH"] = str(HOUSE_RULES_PATH)
 _MOD_PATH_DEFAULTS["CHROMA_DB_PATH"] = str(CHROMA_DB_PATH)
-from hardware_profile import strip_reasoning_think_blocks
-from ollama_utils import chat_with_fallback, embed_text, embedding_metadata
-from memory_format import (
+from scripts.hardware_profile import strip_reasoning_think_blocks
+from scripts.ollama_utils import chat_with_fallback, embed_text, embedding_metadata
+from scripts.memory_format import (
     MEMORY_BOUNDARY,
     capture_origin,
     extract_memory_documents,
@@ -57,11 +72,11 @@ from memory_format import (
     set_string_list_field,
     split_frontmatter,
 )
-from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
-from refinery_targets import intake_status, is_supported_refinery_target
-from vector_store import get_vector_collection
-from review_atom import review_lock
-from atom_mutator import atomic_write_bytes, refresh_lexical_index
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list, section_text
+from scripts.refinery_targets import intake_status, is_supported_refinery_target
+from scripts.vector_store import get_vector_collection
+from scripts.review_atom import review_lock
+from scripts.atom_mutator import atomic_write_bytes, refresh_lexical_index
 
 DEFAULT_MAX_CHUNK_CHARS = 7500
 DEFAULT_CHUNK_OVERLAP_CHARS = 500
@@ -565,8 +580,8 @@ def run_smart_critic(
     contexts = tuple(parse_scalar_list(fm_vals.get("contexts")))
     projects = tuple(c for c in contexts if str(c).lower().startswith("project:"))
 
-    from knowledge_graph import suggest_atom_graph_links_for_claim
-    from recall import MemoryRecallUnavailable, RecallOptions, search_memory
+    from scripts.knowledge_graph import suggest_atom_graph_links_for_claim
+    from scripts.recall import MemoryRecallUnavailable, RecallOptions, search_memory
 
     recall_hits = []
     if claim_text and os.path.isdir(eff_atoms) and (os.path.isfile(eff_index) or os.path.isdir(eff_chroma)):

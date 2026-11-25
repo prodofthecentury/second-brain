@@ -17,9 +17,8 @@ try:
 except ImportError:  # Clean minimal wheel without optional [online]/[dense] extra
     ollama = types.SimpleNamespace(chat=None, embed=None, Client=None)  # type: ignore[assignment]
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import EMBED_MODEL, GEN_MODEL
-from hardware_profile import (
+from scripts.config import EMBED_MODEL, GEN_MODEL
+from scripts.hardware_profile import (
     call_ollama_chat_maybe_no_think,
     detect_hardware_profile,
     fetch_loopback_json,
@@ -29,8 +28,8 @@ from hardware_profile import (
     resolve_active_local_generation_model,
     strip_reasoning_think_blocks,
 )
-import host_adapters as _host_adapters
-from host_adapters import (
+import scripts.host_adapters as _host_adapters
+from scripts.host_adapters import (
     HostConsentError,
     HostSharingRule,
     OutboundSecretBlockedError,
@@ -160,7 +159,7 @@ def _allow_heavy_qwen36_fallback(
 
 
 def generation_candidates(preferred: str | None = None) -> list[str]:
-    from hardware_profile import _model_fits_host_memory, detect_hardware_profile, probe_ollama_models_with_sizes
+    from scripts.hardware_profile import _model_fits_host_memory, detect_hardware_profile, probe_ollama_models_with_sizes
 
     installed = installed_model_names()
     try:

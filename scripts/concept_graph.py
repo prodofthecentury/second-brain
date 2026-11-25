@@ -15,7 +15,23 @@ atoms, active playbooks, active mental models, and ``4-experiences/`` incidents:
   ``part_of``, ``contradicts``, ``supersedes``) with ``<= 3``-hop spreading activation.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from contextlib import closing
@@ -29,13 +45,12 @@ import sqlite3
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("concept_graph", "scripts.concept_graph"):
     sys.modules.setdefault("concept_graph", sys.modules[__name__])
     sys.modules.setdefault("scripts.concept_graph", sys.modules[__name__])
 
-from atom_mutator import latest_decisions_by_atom  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import latest_decisions_by_atom  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
     _is_reparse_or_link,
@@ -43,10 +58,10 @@ from config import (  # noqa: E402
     resolve_module_atoms_and_brain,
     snapshot_module_defaults,
 )
-from memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
-from memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list, section_text  # noqa: E402
-from recall import normalize_project_tag, project_tags_match  # noqa: E402
-from review_atom import approved_revision_is_current  # noqa: E402
+from scripts.memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list, section_text  # noqa: E402
+from scripts.recall import normalize_project_tag, project_tags_match  # noqa: E402
+from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
@@ -475,7 +490,7 @@ def rebuild_concepts(
 
     # Fold active playbooks & 4-experiences failures into matching concepts
     try:
-        from skill_playbooks import list_playbooks
+        from scripts.skill_playbooks import list_playbooks
 
         for pb in list_playbooks(brain_dir=resolved_brain, atoms_dir=resolved_atoms, active_only=True):
             backing_list = [str(b).strip() for b in (getattr(pb, "backing_atoms", ()) or ()) if str(b).strip()]
@@ -647,7 +662,7 @@ def rebuild_concepts(
 
     # Pull active causal mental models into concept edges
     try:
-        from cognitive_distiller import list_distilled_artifacts
+        from scripts.cognitive_distiller import list_distilled_artifacts
 
         for mm in list_distilled_artifacts(kind="mental_model", active_only=True, brain_dir=resolved_brain, atoms_dir=resolved_atoms):
             mm_projs = [

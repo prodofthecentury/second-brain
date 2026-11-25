@@ -20,7 +20,23 @@ are risk-scanned, and anything suspicious (forged trust markers, prompt
 overrides, beacons, credentials) is diverted to the quarantined inbox.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 from dataclasses import asdict, dataclass, field
 import datetime
@@ -31,9 +47,8 @@ from pathlib import Path
 import re
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import (  # noqa: E402
+from scripts.atom_mutator import (  # noqa: E402
     ReviewConflictError,
     ReviewTransitionError,
     apply_review_transition,
@@ -41,7 +56,7 @@ from atom_mutator import (  # noqa: E402
     content_sha256,
     review_lock,
 )
-from config import (  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
     INBOX_DIR,
@@ -57,9 +72,9 @@ from config import (  # noqa: E402
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
-from memory_format import evaluate_temporal_validity, normalize_temporal_bound_str  # noqa: E402
-from lexical_store import (  # noqa: E402
+from scripts.evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
+from scripts.memory_format import evaluate_temporal_validity, normalize_temporal_bound_str  # noqa: E402
+from scripts.lexical_store import (  # noqa: E402
     LexicalIndexUnavailable,
     lexical_index_is_current,
     list_indexed_atoms_fast,
@@ -68,9 +83,9 @@ from lexical_store import (  # noqa: E402
     sync_lexical_index,
     upsert_lexical_atoms,
 )
-from memory_format import split_frontmatter  # noqa: E402
-from memory_review import parse_frontmatter_values, parse_scalar_list  # noqa: E402
-from recall import normalize_project_tag, project_tags_match  # noqa: E402
+from scripts.memory_format import split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list  # noqa: E402
+from scripts.recall import normalize_project_tag, project_tags_match  # noqa: E402
 
 NOTE_ORIGINS = frozenset({"owner_note", "owner_import", "agent_capture", "web_clipper"})
 AGENT_ORIGINS = frozenset({"agent_capture"})
@@ -377,7 +392,7 @@ def create_note(
     if origin in AGENT_ORIGINS:
         if len(text_body) > MAX_AGENT_CAPTURE_CHARS:
             raise NoteError(f"Agent capture exceeds {MAX_AGENT_CAPTURE_CHARS} characters.")
-        from inbox_workflow import scan_inbox_payload_risks
+        from scripts.inbox_workflow import scan_inbox_payload_risks
 
         risks = scan_inbox_payload_risks(f"{clean_title}\n{text_body}")
         if risks:
@@ -623,7 +638,7 @@ def verify_note_excerpt(
     flat_claim = re.sub(r"^(?:>+\s*|#{1,6}\s+|[-*]\s+)+", "", raw_claim).strip() or raw_claim
     if not flat_claim or len(flat_claim) > 2000:
         raise NoteError("Claim must be between 1 and 2,000 characters.")
-    from inbox_workflow import scan_inbox_payload_risks
+    from scripts.inbox_workflow import scan_inbox_payload_risks
 
     risks = scan_inbox_payload_risks(flat_claim + "\n" + "\n".join(candidates))
     if risks:
@@ -665,7 +680,7 @@ def verify_note_excerpt(
         dup_candidates: list[dict[str, object]] = []
         contra_alerts: list[dict[str, object]] = []
         try:
-            from knowledge_graph import suggest_atom_graph_links_for_claim
+            from scripts.knowledge_graph import suggest_atom_graph_links_for_claim
 
             graph_sug = suggest_atom_graph_links_for_claim(
                 flat_claim,

@@ -20,7 +20,23 @@ In-process library calls that omit an attestation are stored as
 the file change. The CLI, HTTP API, and dashboard do not use that path.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import base64
@@ -36,14 +52,13 @@ import secrets
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from config import security_state_dir
-from security_fs import restrict_security_file_permissions
+from scripts.config import security_state_dir
+from scripts.security_fs import restrict_security_file_permissions
 
 KEY_FILENAME = "owner-approval-key.json"
 GRANT_PREFIX = "sbg1"
@@ -332,11 +347,11 @@ def _verify_owner_bearer(attestation: dict) -> dict[str, str]:
     expected = str(attestation.get("expected_token") or "")
     if not expected:
         token_path = str(attestation.get("token_path") or "").strip()
-        from api_product import get_owner_token
+        from scripts.api_product import get_owner_token
 
         loaded = get_owner_token(Path(token_path) if token_path else None)
         expected = loaded or ""
-    from api_product import verify_owner_token
+    from scripts.api_product import verify_owner_token
 
     if not verify_owner_token(token, expected, record_failure=False):
         raise OwnerAttestationError("Owner token was not accepted.")
@@ -351,7 +366,7 @@ def _verify_owner_bearer(attestation: dict) -> dict[str, str]:
 
 
 def _verify_dashboard_session(attestation: dict, *, auth_path: str | Path | None) -> dict[str, str]:
-    from dashboard_auth import _record_fingerprint, load_password_record
+    from scripts.dashboard_auth import _record_fingerprint, load_password_record
 
     record = load_password_record(auth_path)
     if not isinstance(record, dict):

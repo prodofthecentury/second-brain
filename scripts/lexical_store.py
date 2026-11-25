@@ -27,9 +27,8 @@ import tempfile
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import _is_reparse_or_link, safe_file_in_dir
-from index_manifest import (
+from scripts.config import _is_reparse_or_link, safe_file_in_dir
+from scripts.index_manifest import (
     LARGE_VAULT_STAT_CACHE_THRESHOLD,
     atom_revisions,
     record_known_atom_hash,

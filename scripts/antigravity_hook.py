@@ -49,7 +49,23 @@ Security & Trust Invariants:
   blocked.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import hashlib
@@ -403,7 +419,7 @@ def _extract_contested_by_targets(raw_markdown: str) -> list[str]:
     if "contested_by" not in fm:
         return []
     try:
-        from memory_review import parse_frontmatter_values, parse_scalar_list
+        from scripts.memory_review import parse_frontmatter_values, parse_scalar_list
 
         vals = parse_frontmatter_values(fm.splitlines())
         raw_val = vals.get("contested_by")
@@ -420,8 +436,6 @@ def _extract_contested_by_targets(raw_markdown: str) -> list[str]:
 
 def _ensure_scripts_on_path() -> None:
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
 
 
 def _tags_allowed_for_workspace(tags: Any, project_tag: str | None, project_tags_match_fn: Any) -> bool:
@@ -524,7 +538,7 @@ def _load_visible_distilled_artifacts(
     if not has_p and not has_m:
         return []
     try:
-        from cognitive_distiller import list_distilled_artifacts
+        from scripts.cognitive_distiller import list_distilled_artifacts
     except Exception:
         return []
 
@@ -605,7 +619,7 @@ def _detect_workspace_contradictions(
     if not _dir_has_markdown(atoms_dir):
         return [], []
     try:
-        import knowledge_graph
+        import scripts.knowledge_graph as knowledge_graph
 
         if project_tag:
             # Project-scoped build avoids scanning unrelated projects for fast SessionStart latency.
@@ -679,8 +693,8 @@ def _detect_candidate_contradictions(
     if len(candidates) < 2:
         return []
     try:
-        import knowledge_graph
-        from memory_review import parse_frontmatter_values
+        import scripts.knowledge_graph as knowledge_graph
+        from scripts.memory_review import parse_frontmatter_values
 
         nodes: list[dict[str, Any]] = []
         by_key: dict[str, str] = {}
@@ -754,7 +768,7 @@ def _detect_candidate_contradictions(
 
 def _meta_router_tool_hint(raw_prompt: str) -> str | None:
     try:
-        from meta_router import classify_query
+        from scripts.meta_router import classify_query
 
         budget = classify_query(raw_prompt, reasoning_profile="local_compact")
     except Exception:
@@ -843,9 +857,9 @@ def _build_session_start_response(
     event_name: str = "SessionStart",
 ) -> dict[str, Any]:
     _ensure_scripts_on_path()
-    import config as _cfg
-    from recall import RecallOptions, project_tags_match, search_memory
-    from skill_playbooks import list_playbooks
+    import scripts.config as _cfg
+    from scripts.recall import RecallOptions, project_tags_match, search_memory
+    from scripts.skill_playbooks import list_playbooks
 
     resolved_brain = os.path.abspath(brain_dir or _cfg.resolve_active_brain_dir())
     if not os.path.isdir(resolved_brain) or _is_reparse_or_link_fast(resolved_brain):
@@ -888,7 +902,7 @@ def _build_session_start_response(
     # 2. Active Stage 4 Executable Skills in workspace + global scope.
     if _dir_has_markdown(skills_dir):
         try:
-            from executable_skills import list_executable_skills
+            from scripts.executable_skills import list_executable_skills
 
             all_skills = list_executable_skills(
                 brain_dir=resolved_brain,
@@ -954,9 +968,9 @@ def _build_session_start_response(
                 and _item_matches_project(r.contexts, project_tag, project_tags_match)
             ]
             if not proj_atoms:
-                from memory_format import evaluate_temporal_validity
-                from memory_review import parse_atom_record
-                from review_atom import approved_revision_is_current
+                from scripts.memory_format import evaluate_temporal_validity
+                from scripts.memory_review import parse_atom_record
+                from scripts.review_atom import approved_revision_is_current
 
                 fallback_rows: list[tuple[str, str]] = []
                 for fname in sorted(os.listdir(atoms_dir), reverse=True):
@@ -1034,7 +1048,7 @@ def _build_session_start_response(
     # 6. Open project-scoped action items from working notes (unverified).
     if project_tag:
         try:
-            from notes_store import NotePaths, extract_action_items
+            from scripts.notes_store import NotePaths, extract_action_items
 
             npaths = NotePaths.for_brain(resolved_brain)
             if os.path.isdir(npaths.notes_dir) and not _is_reparse_or_link_fast(npaths.notes_dir):
@@ -1100,9 +1114,9 @@ def _build_pre_invocation_response(
         _save_conv_state(conv_path, next_state, verify_unix_uid=is_unix_fb)
 
     _ensure_scripts_on_path()
-    import config as _cfg
-    from recall import RecallOptions, project_tags_match, search_memory
-    from skill_playbooks import list_playbooks
+    import scripts.config as _cfg
+    from scripts.recall import RecallOptions, project_tags_match, search_memory
+    from scripts.skill_playbooks import list_playbooks
 
     resolved_brain = os.path.abspath(brain_dir or _cfg.resolve_active_brain_dir())
     if not os.path.isdir(resolved_brain) or _is_reparse_or_link_fast(resolved_brain):
@@ -1148,7 +1162,7 @@ def _build_pre_invocation_response(
         # 1a. Fast L0 Predictive Memory Bus lookup (<0.5ms; skip cold import when L0 RAM cache is uninitialized).
         if "predictive_memory_bus" in sys.modules or "scripts.predictive_memory_bus" in sys.modules:
             try:
-                from predictive_memory_bus import lookup_l0_hot
+                from scripts.predictive_memory_bus import lookup_l0_hot
 
                 l0_hit = lookup_l0_hot(
                     raw_prompt,
@@ -1333,7 +1347,7 @@ def _build_pre_invocation_response(
 
     # 6. Relevant owner working notes (unverified, strictly scoped to workspace/global).
     try:
-        from notes_store import NotePaths, search_notes
+        from scripts.notes_store import NotePaths, search_notes
 
         npaths = NotePaths.for_brain(resolved_brain)
         if os.path.isdir(npaths.notes_dir) and not _is_reparse_or_link_fast(npaths.notes_dir):
@@ -1414,9 +1428,9 @@ def _handle_stop_event(
 
     _ensure_scripts_on_path()
     try:
-        import cognitive_core
-        import config as _cfg
-        from inbox_workflow import scan_inbox_payload_risks
+        import scripts.cognitive_core as cognitive_core
+        import scripts.config as _cfg
+        from scripts.inbox_workflow import scan_inbox_payload_risks
 
         resolved_brain = os.path.abspath(brain_dir or _cfg.resolve_active_brain_dir())
         if not os.path.isdir(resolved_brain) or _is_reparse_or_link_fast(resolved_brain):

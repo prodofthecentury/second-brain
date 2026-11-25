@@ -15,7 +15,23 @@ Run:
     uv run --locked python scripts/scale_benchmark.py --notes 5000
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import json
@@ -27,10 +43,9 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from index_manifest import invalidate_atom_revision_cache  # noqa: E402
-from lexical_store import (  # noqa: E402
+from scripts.index_manifest import invalidate_atom_revision_cache  # noqa: E402
+from scripts.lexical_store import (  # noqa: E402
     lexical_index_is_current,
     list_indexed_atoms_fast,
     rebuild_lexical_index,

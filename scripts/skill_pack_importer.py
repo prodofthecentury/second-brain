@@ -12,7 +12,23 @@ procedural atoms anchored to `sources/` + `status: draft` Playbooks in `5-playbo
 External packs NEVER self-promote to `accepted` or `active` without Owner CAS sign-off.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import datetime
@@ -24,22 +40,21 @@ import re
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("skill_pack_importer", "scripts.skill_pack_importer"):
     sys.modules.setdefault("skill_pack_importer", sys.modules[__name__])
     sys.modules.setdefault("scripts.skill_pack_importer", sys.modules[__name__])
 
-from atom_mutator import atomic_write_bytes, content_sha256, vault_writer_lock  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes, content_sha256, vault_writer_lock  # noqa: E402
+from scripts.config import (  # noqa: E402
     BRAIN_DIR,
     _is_reparse_or_link,
     resolve_module_vault_path,
     snapshot_module_defaults,
 )
-from evidence import find_evidence_anchor  # noqa: E402
-from host_adapters import inspect_and_redact_outbound  # noqa: E402
-from memory_format import render_memory_document, split_frontmatter  # noqa: E402
-from memory_review import parse_frontmatter_values  # noqa: E402
+from scripts.evidence import find_evidence_anchor  # noqa: E402
+from scripts.host_adapters import inspect_and_redact_outbound  # noqa: E402
+from scripts.memory_format import render_memory_document, split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_frontmatter_values  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 

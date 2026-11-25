@@ -9,7 +9,23 @@ Exercises real Python (`vault_sync`, `vault_backup`, `atom_mutator`, `skill_play
 `vault-epistemic-engine.js`, `mobile_vault.test.js`) interoperability and security gates.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,9 +45,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 MOBILE_CLIENT_DIR = ROOT_DIR / "mobile" / "vault-client"
 
-sys.path.insert(0, str(SCRIPTS_DIR))
 
-from atom_mutator import (  # noqa: E402
+from scripts.atom_mutator import (  # noqa: E402
     apply_atom_merge,
     apply_atom_mutation,
     atomic_write_bytes,
@@ -39,18 +54,18 @@ from atom_mutator import (  # noqa: E402
     invalidate_decision_log_cache,
     set_atom_temporal_bounds,
 )
-from inbox_drop import list_mobile_drop_pairings  # noqa: E402
-from mobile_vault_client import (  # noqa: E402
+from scripts.inbox_drop import list_mobile_drop_pairings  # noqa: E402
+from scripts.mobile_vault_client import (  # noqa: E402
     MobileVaultSecurityError,
     create_mobile_vault_pairing,
     export_mobile_vault_client_bundle,
     list_mobile_vault_pairings,
     revoke_mobile_vault_pairing,
 )
-from skill_playbooks import promote_skill_playbook  # noqa: E402
-from vault_backup import create_vault_backup  # noqa: E402
-from vault_ledger import commit_ledger_checkpoint, verify_merkle_proof, verify_vault_ledger  # noqa: E402
-from vault_sync import (  # noqa: E402
+from scripts.skill_playbooks import promote_skill_playbook  # noqa: E402
+from scripts.vault_backup import create_vault_backup  # noqa: E402
+from scripts.vault_ledger import commit_ledger_checkpoint, verify_merkle_proof, verify_vault_ledger  # noqa: E402
+from scripts.vault_sync import (  # noqa: E402
     _compute_head_mac,
     _sign_head,
     decrypt_object,
@@ -503,7 +518,7 @@ class MobileVaultClientEndToEndTests(unittest.TestCase):
         )
 
         # 9b. Active promoted Stage 4 Executable Skill in 6-skills/ backed by alpha-release-gate
-        from executable_skills import promote_playbook_to_executable_skill
+        from scripts.executable_skills import promote_playbook_to_executable_skill
 
         promote_playbook_to_executable_skill(
             skill_id="alpha-release-skill",

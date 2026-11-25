@@ -34,7 +34,23 @@ Run:
     uv run --frozen python scripts/sota_benchmark.py --atoms 300 --json
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from collections import Counter, defaultdict
@@ -58,32 +74,31 @@ import time
 from typing import Any
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from answer_policy import (  # noqa: E402
+from scripts.answer_policy import (  # noqa: E402
     ANSWER_DRAFT_SCHEMA,
     build_grounding_prompt,
     validate_standard_answer,
 )
-from atom_mutator import apply_review_transition, content_sha256  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import apply_review_transition, content_sha256  # noqa: E402
+from scripts.config import (  # noqa: E402
     EMBED_MODEL,
     GEN_MODEL,
     append_archive_manifest_entry,
     build_archive_manifest_entry,
     file_sha256,
 )
-from doc_extractors import EXTRACTION_BODY_MARKER, extract_document  # noqa: E402
-from doc_fixtures import write_text_pdf  # noqa: E402
-from hardware_profile import detect_hardware_profile  # noqa: E402
-from lexical_store import rebuild_lexical_index  # noqa: E402
-from memory_format import split_frontmatter  # noqa: E402
-from memory_review import section_text  # noqa: E402
-import ollama_utils  # noqa: E402
-import recall as _recall_mod  # noqa: E402
-from recall import QUERY_STOP_WORDS, RecallOptions, project_tags_match, search_memory  # noqa: E402
-import rebuild_vectors as _rv_mod  # noqa: E402
-from vector_store import _close_chroma_client, get_vector_collection  # noqa: E402
+from scripts.doc_extractors import EXTRACTION_BODY_MARKER, extract_document  # noqa: E402
+from scripts.doc_fixtures import write_text_pdf  # noqa: E402
+from scripts.hardware_profile import detect_hardware_profile  # noqa: E402
+from scripts.lexical_store import rebuild_lexical_index  # noqa: E402
+from scripts.memory_format import split_frontmatter  # noqa: E402
+from scripts.memory_review import section_text  # noqa: E402
+import scripts.ollama_utils as ollama_utils  # noqa: E402
+import scripts.recall as _recall_mod  # noqa: E402
+from scripts.recall import QUERY_STOP_WORDS, RecallOptions, project_tags_match, search_memory  # noqa: E402
+import scripts.rebuild_vectors as _rv_mod  # noqa: E402
+from scripts.vector_store import _close_chroma_client, get_vector_collection  # noqa: E402
 
 _TRAP_PREFIXES = ("trap-", "stale-", "tampered-", "drifted-", "distractor-", "expired-")
 _TOKEN_RE = re.compile(r"[a-z0-9_]{3,}")
@@ -1202,7 +1217,7 @@ class _Mem0LiveMemoryStore:
     ) -> None:
         os.environ["MEM0_TELEMETRY"] = "false"
         os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-        from hardware_profile import resolve_active_local_generation_model
+        from scripts.hardware_profile import resolve_active_local_generation_model
         from mem0 import Memory
 
         base_url = ollama_utils.ollama_base_url()
@@ -1339,7 +1354,7 @@ def _is_trap_hit(hit_filename: str, expected_trap_filename: str | None) -> bool:
 
 def _select_relevant_claims_from_hits(query: str, hits: list[Any]) -> list[str]:
     """Select relevant claims using Cross-Encoder scoring and 2-hop graph corroboration."""
-    from cross_encoder import score_query_atom_pairs
+    from scripts.cross_encoder import score_query_atom_pairs
 
     q_stems = _content_stems(query)
     if not q_stems or not hits:
@@ -1508,7 +1523,7 @@ def _run_optional_llm_eval(
     sb_trap_total = 0
     sb_trap_abstentions = 0
     naive_trap_leaks = 0
-    from hardware_profile import resolve_active_local_generation_model
+    from scripts.hardware_profile import resolve_active_local_generation_model
 
     chosen_model = llm_model or resolve_active_local_generation_model(fallback=GEN_MODEL)
 
@@ -1864,7 +1879,7 @@ def run_sota_benchmark(
                         bucket["cross_leaks"] += 1
 
             # Warm ONNX session and OS page cache before steady-state query latency measurement
-            from cross_encoder import get_onnx_cross_encoder
+            from scripts.cross_encoder import get_onnx_cross_encoder
 
             get_onnx_cross_encoder()
             for wq in queries:
@@ -2143,7 +2158,7 @@ def run_sota_benchmark(
                 "p99_latency_ms": _pct(s["latencies_ms"], 99),
             }
 
-        from cross_encoder import score_query_atom_pairs
+        from scripts.cross_encoder import score_query_atom_pairs
 
         _, active_rerank_backend = score_query_atom_pairs("latency probe", ["latency probe"], allow_onnx=True)
         return {

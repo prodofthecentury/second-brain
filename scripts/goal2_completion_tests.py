@@ -31,7 +31,23 @@ Covers:
    + safe Claude Code .mcp.json bootstrap, and real comparative SOTA benchmark invariants.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import asyncio
 import builtins
@@ -52,8 +68,6 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 def _init_temp_vault(root: Path) -> Path:
@@ -84,13 +98,13 @@ def _init_temp_vault(root: Path) -> Path:
 
 class DocumentIngestionAndChunkedVectorTests(unittest.TestCase):
     def test_pdf_docx_epub_html_csv_ingest_and_byte_offset_approval(self) -> None:
-        import bulk_import as bi
-        from doc_fixtures import write_docx, write_epub, write_text_pdf
-        from evidence import find_evidence_anchor
-        import ingest_multimodal as im
-        from memory_format import capture_origin, split_frontmatter
-        from notes_store import NotePaths, get_note, search_notes, verify_note_excerpt
-        from review_atom import apply_review_transition, approved_revision_is_current, content_sha256
+        import scripts.bulk_import as bi
+        from scripts.doc_fixtures import write_docx, write_epub, write_text_pdf
+        from scripts.evidence import find_evidence_anchor
+        import scripts.ingest_multimodal as im
+        from scripts.memory_format import capture_origin, split_frontmatter
+        from scripts.notes_store import NotePaths, get_note, search_notes, verify_note_excerpt
+        from scripts.review_atom import apply_review_transition, approved_revision_is_current, content_sha256
 
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp)
@@ -262,11 +276,11 @@ class DocumentIngestionAndChunkedVectorTests(unittest.TestCase):
             )
 
     def test_refinery_chunking_incremental_vectors_and_batched_json_store(self) -> None:
-        from evidence import find_evidence_anchor
-        from index_manifest import index_manifest_is_current, load_index_manifest
-        import ollama_refinery as ref
-        import rebuild_vectors as rv
-        from vector_store import JsonVectorCollection
+        from scripts.evidence import find_evidence_anchor
+        from scripts.index_manifest import index_manifest_is_current, load_index_manifest
+        import scripts.ollama_refinery as ref
+        import scripts.rebuild_vectors as rv
+        from scripts.vector_store import JsonVectorCollection
 
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp)
@@ -328,7 +342,7 @@ class DocumentIngestionAndChunkedVectorTests(unittest.TestCase):
                 anc = find_evidence_anchor(atom_doc, str(vault))
                 self.assertEqual(anc["evidence_source"], "0-raw/long-paper.md")
 
-            from vector_store import JsonVectorCollection, json_collection_path
+            from scripts.vector_store import JsonVectorCollection, json_collection_path
 
             # Verify batched JsonVectorCollection writes once per batch instead of O(N^2)
             json_store_dir = t / "json_vec"
@@ -403,8 +417,8 @@ class DocumentIngestionAndChunkedVectorTests(unittest.TestCase):
 
 class MultimodalDaemonEditorAndCognitiveTests(unittest.TestCase):
     def test_whisper_timestamps_pillow_fail_closed_and_provenance(self) -> None:
-        import ingest_multimodal as im
-        from memory_format import split_frontmatter
+        import scripts.ingest_multimodal as im
+        from scripts.memory_format import split_frontmatter
 
         segs = [
             SimpleNamespace(start=0.5, end=3.125, text=" First spoken observation. "),
@@ -453,8 +467,8 @@ class MultimodalDaemonEditorAndCognitiveTests(unittest.TestCase):
                 self.assertIn("Pillow (PIL) is required", str(ctx.exception))
 
     def test_watchdog_hardware_gate_and_debounced_watchers(self) -> None:
-        from notes_store import NotePaths, create_note, search_notes
-        import watchdog_daemon as wd
+        from scripts.notes_store import NotePaths, create_note, search_notes
+        import scripts.watchdog_daemon as wd
 
         with tempfile.TemporaryDirectory() as tmp:
             vault = _init_temp_vault(Path(tmp))
@@ -497,10 +511,10 @@ class MultimodalDaemonEditorAndCognitiveTests(unittest.TestCase):
             self.assertEqual(len(search_notes("xylophone", project="alpha", paths=npaths)), 1)
 
     def test_editor_honest_deferral_project_partitioning_experience_spec_and_tasks(self) -> None:
-        from cognitive_core import save_experience_record
-        from notes_store import NotePaths, create_note, extract_action_items
-        import ollama_editor as ed
-        from review_atom import apply_review_transition, content_sha256
+        from scripts.cognitive_core import save_experience_record
+        from scripts.notes_store import NotePaths, create_note, extract_action_items
+        import scripts.ollama_editor as ed
+        from scripts.review_atom import apply_review_transition, content_sha256
 
         with tempfile.TemporaryDirectory() as tmp:
             vault = _init_temp_vault(Path(tmp))
@@ -629,7 +643,7 @@ def _write_and_approve_atom(
     contested_by: list[str] | None = None,
     approve: bool = True,
 ) -> Path:
-    from review_atom import apply_review_transition, content_sha256
+    from scripts.review_atom import apply_review_transition, content_sha256
 
     atom_path = vault / "2-atoms" / filename
     atom_id = filename[:-3] if filename.endswith(".md") else filename
@@ -678,14 +692,14 @@ def _write_and_approve_atom(
 
 class ResearchViewAndMultiHostStreamingTests(unittest.TestCase):
     def test_research_mode_abstention_lead_isolation_and_api_parity(self) -> None:
-        from answer_policy import AnswerRequest, NO_APPROVED_MEMORY_RESPONSE
-        import api_product
-        from host_adapters import generate_grounded_answer_via_host
+        from scripts.answer_policy import AnswerRequest, NO_APPROVED_MEMORY_RESPONSE
+        import scripts.api_product as api_product
+        from scripts.host_adapters import generate_grounded_answer_via_host
         import httpx
-        from lexical_store import rebuild_lexical_index
-        import memory_api
-        from recall import RecallOptions, search_memory
-        from streaming_chat import ChatPaths, chat_events
+        from scripts.lexical_store import rebuild_lexical_index
+        import scripts.memory_api as memory_api
+        from scripts.recall import RecallOptions, search_memory
+        from scripts.streaming_chat import ChatPaths, chat_events
 
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp)
@@ -885,11 +899,11 @@ class ResearchViewAndMultiHostStreamingTests(unittest.TestCase):
                 thread.join(timeout=3.0)
 
     def test_multi_host_streaming_dlp_pii_rehydration_and_short_sentence_citation_enforcement(self) -> None:
-        from host_adapters import HostSharingRule, builtin_default_policies, save_host_policies
+        from scripts.host_adapters import HostSharingRule, builtin_default_policies, save_host_policies
         import httpx
-        from lexical_store import rebuild_lexical_index
-        from notes_store import NotePaths, create_note
-        from streaming_chat import ChatPaths, ChatStreamRequest, chat_events, check_citations
+        from scripts.lexical_store import rebuild_lexical_index
+        from scripts.notes_store import NotePaths, create_note
+        from scripts.streaming_chat import ChatPaths, ChatStreamRequest, chat_events, check_citations
 
         # 1) Sentence-level citation enforcement with NO len(s) >= 25 bypass!
         ver = [{"id": "V1", "claim": "TLS 1.3 is enabled."}]
@@ -1113,8 +1127,8 @@ class ResearchViewAndMultiHostStreamingTests(unittest.TestCase):
 
 class UpgradedContradictionRadarAndNliTests(unittest.TestCase):
     def test_numeric_subject_attribute_alignment_exclusive_entities_nli_and_scoped_neighbors(self) -> None:
-        from host_adapters import HostSharingRule, builtin_default_policies, save_host_policies
-        import knowledge_graph as kg
+        from scripts.host_adapters import HostSharingRule, builtin_default_policies, save_host_policies
+        import scripts.knowledge_graph as kg
 
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp)
@@ -1339,14 +1353,14 @@ class UpgradedContradictionRadarAndNliTests(unittest.TestCase):
 
 class ExpandedMcpAndConnectorParityTests(unittest.TestCase):
     def test_all_17_mcp_tools_scope_revocation_and_telemetry_safety(self) -> None:
-        from lexical_store import rebuild_lexical_index
+        from scripts.lexical_store import rebuild_lexical_index
         from mcp import types
-        import mcp_server
-        from notes_store import NotePaths, create_note
-        from review_atom import apply_review_transition, content_sha256
-        from skill_playbooks import promote_skill_playbook
-        import time_travel
-        import vault_ledger
+        import scripts.mcp_server as mcp_server
+        from scripts.notes_store import NotePaths, create_note
+        from scripts.review_atom import apply_review_transition, content_sha256
+        from scripts.skill_playbooks import promote_skill_playbook
+        import scripts.time_travel as time_travel
+        import scripts.vault_ledger as vault_ledger
 
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp)
@@ -1589,7 +1603,7 @@ class ExpandedMcpAndConnectorParityTests(unittest.TestCase):
                 asyncio.run(_run_all())
 
     def test_ide_connector_six_host_add_remove_symmetry_and_claude_plugin_mcp_json(self) -> None:
-        import ide_connector as ic
+        import scripts.ide_connector as ic
 
         with tempfile.TemporaryDirectory() as tmp:
             fake_home = Path(tmp) / "home"
@@ -1672,7 +1686,7 @@ class ExpandedMcpAndConnectorParityTests(unittest.TestCase):
 
 class SotaBenchmarkInvariantTests(unittest.TestCase):
     def test_sota_benchmark_no_tautology_pdf_multihop_and_chroma_mem0_baselines(self) -> None:
-        import sota_benchmark as sb
+        import scripts.sota_benchmark as sb
 
         src_text = (SCRIPTS_DIR / "sota_benchmark.py").read_text(encoding="utf-8")
         self.assertNotIn("or True", src_text)

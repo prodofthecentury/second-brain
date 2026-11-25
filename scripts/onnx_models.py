@@ -13,7 +13,23 @@ CPU-only ONNX Runtime, and atomically installs quantized local neural models int
   * `nli` (`compact` / `mobilebert`): `Xenova/mobilebert-uncased-mnli` (INT8 quantized, ~27.0 MB)
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from dataclasses import dataclass
@@ -36,15 +52,14 @@ import uuid
 from filelock import FileLock
 import httpx
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, security_state_dir  # noqa: E402
-from cross_encoder import (  # noqa: E402
+from scripts.config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, security_state_dir  # noqa: E402
+from scripts.cross_encoder import (  # noqa: E402
     MAX_ONNX_MODEL_BYTES,
     OnnxCrossEncoder,
     clear_cross_encoder_cache,
 )
-from host_adapters import (  # noqa: E402
+from scripts.host_adapters import (  # noqa: E402
     HostSharingRule,
     PinnedHTTPTransport,
     restrict_security_file_permissions,
@@ -394,7 +409,7 @@ def _download_verified_artifact(
 
 def _smoke_test_staged_model(slot: str, staged_dir: Path) -> dict[str, Any]:
     if slot == "kokoro-tts":
-        from tts_engine import smoke_test_kokoro_slot
+        from scripts.tts_engine import smoke_test_kokoro_slot
 
         return smoke_test_kokoro_slot(staged_dir)
     enc = OnnxCrossEncoder(staged_dir, max_length=256 if slot == "cross-encoder" else 384)

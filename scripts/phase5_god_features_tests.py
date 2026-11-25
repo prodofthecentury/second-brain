@@ -4,7 +4,23 @@
 # ///
 """Tests for OS-Signed Desktop Installers, SOTA Benchmark, Merkle Ledger, Contradiction Radar & Time-Travel."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 from contextlib import ExitStack
 import json
@@ -16,7 +32,6 @@ import threading
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 class Phase5IsolatedTestCase(unittest.TestCase):
@@ -65,7 +80,7 @@ def _seed_atom(
     approve: bool = True,
     links: list[str] | None = None,
 ) -> Path:
-    from atom_mutator import apply_review_transition, content_sha256
+    from scripts.atom_mutator import apply_review_transition, content_sha256
 
     raw_dir = brain / "0-raw"
     atoms_dir = brain / "2-atoms"
@@ -151,7 +166,7 @@ class DesktopInstallerAndTrayTests(Phase5IsolatedTestCase):
 
 class SotaBenchmarkTests(Phase5IsolatedTestCase):
     def test_sota_benchmark_outperforms_baselines_on_safety_and_grounding(self) -> None:
-        from sota_benchmark import run_sota_benchmark
+        from scripts.sota_benchmark import run_sota_benchmark
 
         res = run_sota_benchmark(atoms=100)
         self.assertIn("hardware_profile", res)
@@ -173,7 +188,7 @@ class SotaBenchmarkTests(Phase5IsolatedTestCase):
 
 class VaultMerkleLedgerTests(Phase5IsolatedTestCase):
     def test_merkle_proof_chain_and_tamper_detection(self) -> None:
-        from vault_ledger import (
+        from scripts.vault_ledger import (
             commit_ledger_checkpoint,
             prove_atom_membership,
             verify_merkle_proof,
@@ -213,9 +228,9 @@ class VaultMerkleLedgerTests(Phase5IsolatedTestCase):
             self.assertFalse(bad_ver["chain_valid"])
 
     def test_forged_atom_excluded_and_promoted_playbook_included(self) -> None:
-        from atom_mutator import content_sha256
-        from skill_playbooks import promote_skill_playbook
-        from vault_ledger import compute_vault_merkle, prove_atom_membership
+        from scripts.atom_mutator import content_sha256
+        from scripts.skill_playbooks import promote_skill_playbook
+        from scripts.vault_ledger import compute_vault_merkle, prove_atom_membership
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -268,7 +283,7 @@ class VaultMerkleLedgerTests(Phase5IsolatedTestCase):
                 prove_atom_membership("forged.md", brain_dir=str(brain), atoms_dir=str(atoms_dir), playbooks_dir=str(pb_dir))
 
     def test_three_leaf_merkle_proofs_and_odd_domain_separation(self) -> None:
-        from vault_ledger import _build_merkle_levels, compute_vault_merkle, prove_atom_membership, verify_merkle_proof
+        from scripts.vault_ledger import _build_merkle_levels, compute_vault_merkle, prove_atom_membership, verify_merkle_proof
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -298,7 +313,7 @@ class VaultMerkleLedgerTests(Phase5IsolatedTestCase):
 
 class KnowledgeGraphAndContradictionRadarTests(Phase5IsolatedTestCase):
     def test_detects_polarity_and_numeric_contradictions_with_scope_gate(self) -> None:
-        from knowledge_graph import detect_contradictions, graph_neighbors
+        from scripts.knowledge_graph import detect_contradictions, graph_neighbors
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -370,9 +385,9 @@ class KnowledgeGraphAndContradictionRadarTests(Phase5IsolatedTestCase):
 
 class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
     def test_snapshots_semantic_diff_point_in_time_recall_and_api_routes(self) -> None:
-        from api_product import ensure_owner_token
-        from memory_api import MemoryApiRuntimeConfig, MemoryLoopbackHTTPServer, generate_memory_api_token, reset_api_rate_limiter
-        from time_travel import create_snapshot, diff_snapshots, recall_at_snapshot
+        from scripts.api_product import ensure_owner_token
+        from scripts.memory_api import MemoryApiRuntimeConfig, MemoryLoopbackHTTPServer, generate_memory_api_token, reset_api_rate_limiter
+        from scripts.time_travel import create_snapshot, diff_snapshots, recall_at_snapshot
         import httpx
 
         reset_api_rate_limiter()
@@ -467,9 +482,9 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
                 server.server_close()
 
     def test_snapshot_excludes_forged_atom_and_includes_promoted_playbook(self) -> None:
-        from atom_mutator import content_sha256
-        from skill_playbooks import promote_skill_playbook
-        from time_travel import create_snapshot
+        from scripts.atom_mutator import content_sha256
+        from scripts.skill_playbooks import promote_skill_playbook
+        from scripts.time_travel import create_snapshot
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -520,9 +535,9 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
 
     def test_p2_p3_snapshot_collision_single_pass_radar_and_ledger_seq(self) -> None:
         from datetime import datetime, timezone
-        from knowledge_graph import build_knowledge_graph, detect_contradictions
-        from time_travel import create_snapshot, list_snapshots, recall_at_snapshot
-        from vault_ledger import GENESIS_HASH, _canonical_json, _sha256_text, compute_vault_merkle, verify_vault_ledger
+        from scripts.knowledge_graph import build_knowledge_graph, detect_contradictions
+        from scripts.time_travel import create_snapshot, list_snapshots, recall_at_snapshot
+        from scripts.vault_ledger import GENESIS_HASH, _canonical_json, _sha256_text, compute_vault_merkle, verify_vault_ledger
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -597,18 +612,18 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
             self.assertTrue(any("non-sequential seq=" in err for err in ver["errors"]))
 
     def test_audit_remediations_quarantined_graph_wikilinks_ledger_corrupt_stopword_and_sdk(self) -> None:
-        from api_product import ensure_owner_token
-        from atom_mutator import apply_atom_merge, apply_review_transition, content_sha256
-        from knowledge_graph import build_knowledge_graph, detect_contradictions
-        from memory_api import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.atom_mutator import apply_atom_merge, apply_review_transition, content_sha256
+        from scripts.knowledge_graph import build_knowledge_graph, detect_contradictions
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
             reset_api_rate_limiter,
         )
-        from time_travel import create_snapshot, recall_at_snapshot
-        from vault_ledger import prove_atom_membership, verify_merkle_proof, verify_vault_ledger
+        from scripts.time_travel import create_snapshot, recall_at_snapshot
+        from scripts.vault_ledger import prove_atom_membership, verify_merkle_proof, verify_vault_ledger
         import httpx
 
         root = Path(__file__).resolve().parents[1]
@@ -815,19 +830,19 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
     def test_sweep_radar_antonyms_units_drift_bm25_snapshots_and_sdk_parity(self) -> None:
         import threading
         import httpx
-        from api_product import ensure_owner_token
-        from atom_mutator import content_sha256
-        from executive_planner import ExecutivePlanRequest, assemble_executive_plan
-        from knowledge_graph import build_knowledge_graph, detect_contradictions
-        from lexical_store import rebuild_lexical_index
-        from memory_api import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.atom_mutator import content_sha256
+        from scripts.executive_planner import ExecutivePlanRequest, assemble_executive_plan
+        from scripts.knowledge_graph import build_knowledge_graph, detect_contradictions
+        from scripts.lexical_store import rebuild_lexical_index
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
         )
-        from skill_playbooks import promote_skill_playbook
-        from time_travel import create_snapshot, diff_snapshots, recall_at_snapshot
+        from scripts.skill_playbooks import promote_skill_playbook
+        from scripts.time_travel import create_snapshot, diff_snapshots, recall_at_snapshot
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -939,8 +954,8 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
             # Re-seed a real preference atom so non-owner snapshot diff/recall filters it out.
             pref_src = brain / "0-raw" / "pref-real.src.md"
             pref_src.write_text("Prefer Concise Mermaid Sequence Diagrams.", encoding="utf-8")
-            from evidence import find_evidence_anchor
-            from atom_mutator import apply_review_transition
+            from scripts.evidence import find_evidence_anchor
+            from scripts.atom_mutator import apply_review_transition
 
             pref_draft = (
                 "---\nid: pref-mermaid\ntype: atom\nmemory_type: semantic\nepistemic_label: preference\n"
@@ -1085,20 +1100,20 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
 
     def test_system_sweep_security_intake_revocation_offset_and_client_guards(self) -> None:
         import httpx
-        from api_product import ensure_owner_token
-        from atom_mutator import ReviewConflictError, apply_review_transition, content_sha256
-        from inbox_workflow import inspect_inbox_item, list_inbox_items, promote_inbox_item
-        from memory_api import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.atom_mutator import ReviewConflictError, apply_review_transition, content_sha256
+        from scripts.inbox_workflow import inspect_inbox_item, list_inbox_items, promote_inbox_item
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
             reset_api_rate_limiter,
         )
-        from ollama_scout import create_intake_pointer
-        from refinery_targets import intake_status
-        from sota_benchmark import run_sota_benchmark
-        from time_travel import create_snapshot, verify_snapshot
+        from scripts.ollama_scout import create_intake_pointer
+        from scripts.refinery_targets import intake_status
+        from scripts.sota_benchmark import run_sota_benchmark
+        from scripts.time_travel import create_snapshot, verify_snapshot
 
         root = Path(__file__).resolve().parents[1]
 
@@ -1248,7 +1263,7 @@ class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
         import shlex
         from contextlib import redirect_stdout
         from scripts import cli, config, ide_connector, mcp_server
-        from memory_api import (
+        from scripts.memory_api import (
             MemoryApiClient,
             discover_active_api_port,
             remove_active_api_port_file,
@@ -1361,7 +1376,7 @@ class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
                         )
                     ver_doc = json.loads(ver_buf.getvalue())
                     atom_fname = ver_doc.get("atom_filename") or ver_doc.get("filename")
-                    from memory_review import parse_atom_record
+                    from scripts.memory_review import parse_atom_record
 
                     atom_rec = parse_atom_record(switched_vault / "2-atoms" / str(atom_fname))
                     self.assertIn("project:alpha", atom_rec["contexts"])
@@ -1415,24 +1430,24 @@ class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
     def test_three_store_durability_yaml_frontmatter_feedback_redaction_and_sub15ms_scale(self) -> None:
         import time
         import httpx
-        from api_product import ensure_owner_token
-        from atom_mutator import apply_atom_edit, apply_review_transition, content_sha256
-        from cognitive_core import compute_memory_fitness_report, record_atom_feedback, record_retrieval_telemetry
-        from knowledge_graph import build_knowledge_graph
-        from lexical_store import _fts_query, porter_stem, rebuild_lexical_index
-        from memory_api import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.atom_mutator import apply_atom_edit, apply_review_transition, content_sha256
+        from scripts.cognitive_core import compute_memory_fitness_report, record_atom_feedback, record_retrieval_telemetry
+        from scripts.knowledge_graph import build_knowledge_graph
+        from scripts.lexical_store import _fts_query, porter_stem, rebuild_lexical_index
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
             reset_api_rate_limiter,
         )
-        from memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list
-        from ollama_utils import generation_candidates
-        from recall import RecallOptions, _load_fitness_signals, search_lexical_memory
-        from skill_playbooks import deprecate_skill_playbook, promote_skill_playbook
-        from time_travel import create_snapshot, export_snapshot, recall_at_snapshot, verify_snapshot
-        from vault_ledger import (
+        from scripts.memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list
+        from scripts.ollama_utils import generation_candidates
+        from scripts.recall import RecallOptions, _load_fitness_signals, search_lexical_memory
+        from scripts.skill_playbooks import deprecate_skill_playbook, promote_skill_playbook
+        from scripts.time_travel import create_snapshot, export_snapshot, recall_at_snapshot, verify_snapshot
+        from scripts.vault_ledger import (
             GENESIS_HASH,
             _canonical_json,
             _sha256_text,
@@ -1635,7 +1650,7 @@ class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
             bulk_src = brain / "0-raw" / "bulk-src.md"
             bulk_lines = [f"Synthetic rule {i:03d}: partition shard_{i:03d} uses deterministic quorum writes." for i in range(220)]
             bulk_src.write_text("\n".join(bulk_lines) + "\n", encoding="utf-8")
-            from evidence import find_evidence_anchor
+            from scripts.evidence import find_evidence_anchor
 
             dlog_path = brain / "0-raw" / "archive" / "decision-record.jsonl"
             dlog_records = []
@@ -1665,7 +1680,7 @@ class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
                 )
             with open(dlog_path, "a", encoding="utf-8") as fh:
                 fh.write("\n".join(dlog_records) + "\n")
-            from atom_mutator import invalidate_decision_log_cache
+            from scripts.atom_mutator import invalidate_decision_log_cache
 
             invalidate_decision_log_cache()
             rebuild_lexical_index(str(atoms_dir), lex_db)
@@ -1755,9 +1770,9 @@ class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
                 server.server_close()
 
     def test_migrate_legacy_sidecar_snapshots_and_hourly_sweep(self):
-        from time_travel import create_snapshot, list_snapshots, migrate_legacy_snapshots, verify_snapshot
-        from vault_backup import create_vault_backup, verify_vault_backup
-        import hourly_sweep
+        from scripts.time_travel import create_snapshot, list_snapshots, migrate_legacy_snapshots, verify_snapshot
+        from scripts.vault_backup import create_vault_backup, verify_vault_backup
+        import scripts.hourly_sweep as hourly_sweep
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"

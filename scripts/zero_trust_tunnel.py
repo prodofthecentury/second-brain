@@ -11,7 +11,23 @@ mutating, host-policy, backup, or skill-execution paths (`403 Forbidden`) with s
 rate limiting and append-only audit logs.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from collections import deque
@@ -27,14 +43,13 @@ import threading
 import time
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("zero_trust_tunnel", "scripts.zero_trust_tunnel"):
     sys.modules.setdefault("zero_trust_tunnel", sys.modules[__name__])
     sys.modules.setdefault("scripts.zero_trust_tunnel", sys.modules[__name__])
 
-from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import BRAIN_DIR, _is_reparse_or_link, resolve_module_vault_path, security_state_dir  # noqa: E402
-from security_fs import restrict_security_file_permissions  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes  # noqa: E402
+from scripts.config import BRAIN_DIR, _is_reparse_or_link, resolve_module_vault_path, security_state_dir  # noqa: E402
+from scripts.security_fs import restrict_security_file_permissions  # noqa: E402
 
 TUNNEL_CONFIG_FILENAME = "zero-trust-tunnel.json"
 DEFAULT_LOCAL_API_PORT = 8765

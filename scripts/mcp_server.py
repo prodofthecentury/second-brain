@@ -55,7 +55,23 @@ Run only from an explicitly trusted local process:
     uv run scripts/mcp_server.py
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 from collections.abc import Mapping
 from contextlib import closing
@@ -84,9 +100,8 @@ except ImportError:  # pragma: no cover - minimal core wheel without [mcp] extra
     stdio_server = None  # type: ignore[assignment]
     _MCP_AVAILABLE = False
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import config as _cfg
-from config import (
+import scripts.config as _cfg
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     BRIEFINGS_DIR,
@@ -104,17 +119,17 @@ from config import (
     today,
     vault_paths_for,
 )
-from security_fs import read_bounded_security_file, restrict_security_file_permissions
-from memory_format import evaluate_temporal_validity, split_frontmatter
-from memory_review import parse_atom_record, parse_frontmatter_values
-from recall import (
+from scripts.security_fs import read_bounded_security_file, restrict_security_file_permissions
+from scripts.memory_format import evaluate_temporal_validity, split_frontmatter
+from scripts.memory_review import parse_atom_record, parse_frontmatter_values
+from scripts.recall import (
     MemoryRecallUnavailable,
     RecallOptions,
     normalize_project_tag,
     project_tags_match,
     search_memory,
 )
-from review_atom import approved_revision_is_current
+from scripts.review_atom import approved_revision_is_current
 
 
 MAX_INBOX_CHARS = 100_000
@@ -1332,7 +1347,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
     elif name in {"search_notes", "get_note", "remember"}:
-        from notes_store import NoteError, NotePaths, create_note, get_note, search_notes
+        from scripts.notes_store import NoteError, NotePaths, create_note, get_note, search_notes
 
         npaths = NotePaths.for_brain(vdirs["brain_dir"])
         try:
@@ -1384,7 +1399,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
 
     elif name == "list_playbooks":
-        from skill_playbooks import list_playbooks as _list_playbooks, playbook_visible_in_scope
+        from scripts.skill_playbooks import list_playbooks as _list_playbooks, playbook_visible_in_scope
 
         project = str(arguments.get("project") or "").strip()
         pbs = _list_playbooks(
@@ -1427,7 +1442,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "get_playbook":
-        from skill_playbooks import (
+        from scripts.skill_playbooks import (
             PlaybookValidationError,
             _normalize_playbook_id,
             playbook_visible_in_scope,
@@ -1511,8 +1526,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "assemble_plan":
-        from executive_planner import ExecutivePlanRequest, assemble_executive_plan
-        from host_adapters import HostConsentError, OutboundSecretBlockedError
+        from scripts.executive_planner import ExecutivePlanRequest, assemble_executive_plan
+        from scripts.host_adapters import HostConsentError, OutboundSecretBlockedError
 
         goal = str(arguments.get("goal") or "").strip()[:4000]
         if not goal or "\x00" in goal:
@@ -1581,7 +1596,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "list_contradictions":
-        import knowledge_graph
+        import scripts.knowledge_graph as knowledge_graph
 
         project = str(arguments.get("project") or "").strip() or None
         raw_enable_nli = arguments.get("enable_nli")
@@ -1598,7 +1613,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
             )
         onnx_nli_verified = False
         try:
-            from onnx_models import get_onnx_models_status
+            from scripts.onnx_models import get_onnx_models_status
 
             onnx_st = get_onnx_models_status(run_inference=False)
             onnx_nli_verified = bool(((onnx_st.get("slots") or {}).get("nli") or {}).get("verified"))
@@ -1634,7 +1649,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "graph_neighbors":
-        import knowledge_graph
+        import scripts.knowledge_graph as knowledge_graph
 
         project = str(arguments.get("project") or "").strip() or None
         verified = _load_verified_non_preference_atom(
@@ -1734,7 +1749,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
 
     elif name == "list_snapshots":
         try:
-            import time_travel
+            import scripts.time_travel as time_travel
 
             snaps = time_travel.list_snapshots(brain_dir=vdirs["brain_dir"])
         except (ImportError, OSError, ValueError, RuntimeError) as exc:
@@ -1767,8 +1782,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "recall_at_snapshot":
-        from skill_playbooks import playbook_visible_in_scope, verify_playbook_integrity
-        import time_travel
+        from scripts.skill_playbooks import playbook_visible_in_scope, verify_playbook_integrity
+        import scripts.time_travel as time_travel
 
         query = str(arguments.get("query") or "").strip()[:2000]
         snapshot_id = str(arguments.get("snapshot_id") or "").strip()[:200]
@@ -1858,7 +1873,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "verify_ledger":
-        import vault_ledger
+        import scripts.vault_ledger as vault_ledger
 
         ledger_res = vault_ledger.verify_vault_ledger(
             brain_dir=vdirs["brain_dir"],
@@ -1870,9 +1885,9 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "prove_leaf":
-        from executable_skills import skill_visible_in_scope, verify_executable_skill_integrity
-        from skill_playbooks import playbook_visible_in_scope, verify_playbook_integrity
-        import vault_ledger
+        from scripts.executable_skills import skill_visible_in_scope, verify_executable_skill_integrity
+        from scripts.skill_playbooks import playbook_visible_in_scope, verify_playbook_integrity
+        import scripts.vault_ledger as vault_ledger
 
         leaf_id = str(arguments.get("leaf_id") or "").strip()
         kind = str(arguments.get("kind") or "auto").strip().lower()
@@ -1967,8 +1982,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "record_experience":
-        import cognitive_core
-        from inbox_workflow import scan_inbox_payload_risks
+        import scripts.cognitive_core as cognitive_core
+        from scripts.inbox_workflow import scan_inbox_payload_risks
 
         raw_success = arguments.get("success")
         if not isinstance(raw_success, bool):
@@ -2134,7 +2149,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "record_feedback":
-        import cognitive_core
+        import scripts.cognitive_core as cognitive_core
 
         raw_helpful = arguments.get("helpful")
         if not isinstance(raw_helpful, bool):
@@ -2184,8 +2199,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "extract_action_items":
-        from inbox_workflow import scan_inbox_payload_risks
-        from notes_store import NotePaths, extract_action_items
+        from scripts.inbox_workflow import scan_inbox_payload_risks
+        from scripts.notes_store import NotePaths, extract_action_items
 
         project = str(arguments.get("project") or "").strip() or None
         tag_val = str(arguments.get("tag") or "").strip() or None
@@ -2222,7 +2237,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "list_skills":
-        from executable_skills import (
+        from scripts.executable_skills import (
             get_skill_kill_switch_status,
             list_executable_skills,
             skill_visible_in_scope,
@@ -2275,7 +2290,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "get_skill":
-        from executable_skills import (
+        from scripts.executable_skills import (
             ExecutableSkillValidationError,
             _normalize_skill_id,
             skill_visible_in_scope,
@@ -2338,7 +2353,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "execute_skill":
-        from executable_skills import (
+        from scripts.executable_skills import (
             ExecutableSkillExecutionDeniedError,
             ExecutableSkillSecretBlockedError,
             ExecutableSkillValidationError,
@@ -2422,7 +2437,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "list_vaults":
-        from vault_workspaces import VaultWorkspaceError, VaultWorkspaceSecurityError, list_vaults
+        from scripts.vault_workspaces import VaultWorkspaceError, VaultWorkspaceSecurityError, list_vaults
 
         try:
             raw_listing = list_vaults(current_brain_dir=vdirs["brain_dir"])
@@ -2454,7 +2469,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "federated_recall":
-        from vault_workspaces import VaultWorkspaceError, VaultWorkspaceSecurityError, federated_recall
+        from scripts.vault_workspaces import VaultWorkspaceError, VaultWorkspaceSecurityError, federated_recall
 
         query = str(arguments.get("query") or "").strip()[:2000]
         if not query or "\x00" in query:
@@ -2500,7 +2515,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "media_status":
-        from creative_media import CreativeMediaError, get_creative_media_status
+        from scripts.creative_media import CreativeMediaError, get_creative_media_status
 
         try:
             st = get_creative_media_status()
@@ -2512,7 +2527,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "list_generated_media":
-        from creative_media import CreativeMediaError, list_generated_media
+        from scripts.creative_media import CreativeMediaError, list_generated_media
 
         mtype = str(arguments.get("media_type") or "").strip().lower() or None
         if mtype and mtype not in {"image", "video"}:
@@ -2560,7 +2575,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "git_hook_status":
-        from git_distiller import GitDistillerError, GitDistillerSecurityError, get_git_hook_status
+        from scripts.git_distiller import GitDistillerError, GitDistillerSecurityError, get_git_hook_status
 
         repo = str(arguments.get("repo") or ".").strip()
         if "\x00" in repo or len(repo) > 1000:
@@ -2577,7 +2592,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "distill_git_commits":
-        from git_distiller import GitDistillerError, GitDistillerSecurityError, distill_git_commits
+        from scripts.git_distiller import GitDistillerError, GitDistillerSecurityError, distill_git_commits
 
         repo = str(arguments.get("repo") or ".").strip()
         project = str(arguments.get("project") or "").strip() or None
@@ -2608,7 +2623,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "zoom_memory":
-        from fractal_zoom import zoom_retrieve
+        from scripts.fractal_zoom import zoom_retrieve
 
         q_zoom = str(arguments.get("query") or "").strip()
         if not q_zoom:
@@ -2640,7 +2655,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))])
 
     elif name == "get_concept":
-        from concept_graph import get_concept as fetch_concept
+        from scripts.concept_graph import get_concept as fetch_concept
 
         cname = str(arguments.get("concept") or "").strip()
         if not cname:
@@ -2654,7 +2669,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))])
 
     elif name == "simulate_impact":
-        from world_model_sim import simulate_change_impact
+        from scripts.world_model_sim import simulate_change_impact
 
         target_sim = str(arguments.get("target") or "").strip()
         if not target_sim:
@@ -2699,9 +2714,9 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))])
 
     elif name == "verify_symbolic":
-        from formal_proof_search import SafeVerifyError, verify_spec_integrity
-        from math_equivalence import are_math_equivalent, normalize_latex_expr
-        from symbolic_sandbox import SandboxSecurityError, run_sandboxed_python
+        from scripts.formal_proof_search import SafeVerifyError, verify_spec_integrity
+        from scripts.math_equivalence import are_math_equivalent, normalize_latex_expr
+        from scripts.symbolic_sandbox import SandboxSecurityError, run_sandboxed_python
 
         vmode = str(arguments.get("mode") or "equiv").strip().lower()
         if vmode == "equiv":
@@ -2733,7 +2748,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         return types.CallToolResult(content=[types.TextContent(type="text", text=f"Unsupported mode: {vmode}")], isError=True)
 
     elif name == "list_principles":
-        from cognitive_distiller import list_distilled_artifacts
+        from scripts.cognitive_distiller import list_distilled_artifacts
 
         project = str(arguments.get("project") or "").strip() or None
         if project and ("\x00" in project or len(project) > 120):
@@ -2795,7 +2810,7 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "run_debate":
-        from cognitive_swarm import run_two_sided_debate
+        from scripts.cognitive_swarm import run_two_sided_debate
 
         topic = str(arguments.get("topic") or "").strip()[:1000]
         if not topic or "\x00" in topic:
@@ -2824,8 +2839,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "curiosity_gaps":
-        from memory_review import parse_scalar_list
-        from self_model_curiosity import evaluate_self_model_and_curiosity
+        from scripts.memory_review import parse_scalar_list
+        from scripts.self_model_curiosity import evaluate_self_model_and_curiosity
 
         project = str(arguments.get("project") or "").strip() or None
         if project and ("\x00" in project or len(project) > 120):
@@ -2903,8 +2918,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "record_context_signal":
-        from inbox_workflow import scan_inbox_payload_risks
-        from predictive_memory_bus import record_context_signal as _record_context_signal
+        from scripts.inbox_workflow import scan_inbox_payload_risks
+        from scripts.predictive_memory_bus import record_context_signal as _record_context_signal
 
         active_file = str(arguments.get("active_file") or "")
         git_branch = str(arguments.get("git_branch") or "")

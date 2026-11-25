@@ -13,7 +13,23 @@ Covers offline without external servers or optional binaries:
   2E.5 Parameter perturbation invariance, benchmark n-gram decontamination, Three-Store safety & 31-tool MCP parity.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import ast
 import asyncio
@@ -31,17 +47,16 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
 
-import cgv_reasoner  # noqa: E402
-import doc_extractors  # noqa: E402
-import formal_proof_search  # noqa: E402
-import math_equivalence  # noqa: E402
-import mcp_server  # noqa: E402
-import process_evaluator  # noqa: E402
-import recall  # noqa: E402
-import symbolic_sandbox  # noqa: E402
-import web_clipper  # noqa: E402
+import scripts.cgv_reasoner as cgv_reasoner  # noqa: E402
+import scripts.doc_extractors as doc_extractors  # noqa: E402
+import scripts.formal_proof_search as formal_proof_search  # noqa: E402
+import scripts.math_equivalence as math_equivalence  # noqa: E402
+import scripts.mcp_server as mcp_server  # noqa: E402
+import scripts.process_evaluator as process_evaluator  # noqa: E402
+import scripts.recall as recall  # noqa: E402
+import scripts.symbolic_sandbox as symbolic_sandbox  # noqa: E402
+import scripts.web_clipper as web_clipper  # noqa: E402
 
 
 class Phase10MathAndFormalDiscoveryTests(unittest.TestCase):

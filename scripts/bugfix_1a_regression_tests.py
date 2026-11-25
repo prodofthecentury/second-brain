@@ -12,7 +12,23 @@ Run:
     uv run python -m unittest scripts/bugfix_1a_regression_tests.py
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 from contextlib import ExitStack, redirect_stdout
 import hashlib
@@ -33,9 +49,8 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(SCRIPTS_DIR))
 
-from stage4_executable_skills_tests import _seed_atom, _seed_mature_playbook
+from scripts.stage4_executable_skills_tests import _seed_atom, _seed_mature_playbook
 
 
 def _http_json(
@@ -109,7 +124,7 @@ class Bugfix1AIsolatedTestCase(unittest.TestCase):
         )
 
     def _start_api_server(self):
-        from memory_api import MemoryApiRuntime, create_memory_api_server
+        from scripts.memory_api import MemoryApiRuntime, create_memory_api_server
 
         tok_file = self.sec_dir / "api-token"
         own_file = self.sec_dir / "owner-token"
@@ -142,8 +157,8 @@ class Defect01MobileRecallRotateTests(Bugfix1AIsolatedTestCase):
     """Defect #1: rotate_mobile_recall_key() crashes with TypeError on CLI and HTTP API."""
 
     def test_rotate_recall_key_direct_cli_and_http_without_vault_id(self) -> None:
-        from inbox_drop import create_mobile_drop_pairing, rotate_mobile_recall_key
-        import vault_sync
+        from scripts.inbox_drop import create_mobile_drop_pairing, rotate_mobile_recall_key
+        import scripts.vault_sync as vault_sync
 
         remote_dir = self.root_tmp / "sync_remote"
         remote_dir.mkdir(parents=True, exist_ok=True)
@@ -203,7 +218,7 @@ class Defect02SandboxHardeningTests(Bugfix1AIsolatedTestCase):
     """Defect #2: Stage 4 sandbox_python escapes (sqlite3/_winapi/getattr/__builtins__/quota) & OS containment."""
 
     def test_ast_blocks_sqlite3_winapi_getattr_builtins_and_type_metaclass(self) -> None:
-        from executable_skills import ExecutableSkillValidationError, _validate_sandbox_python_ast
+        from scripts.executable_skills import ExecutableSkillValidationError, _validate_sandbox_python_ast
 
         forbidden_scripts = [
             "import sqlite3\nsqlite3.connect('host.db')\n",
@@ -222,7 +237,7 @@ class Defect02SandboxHardeningTests(Bugfix1AIsolatedTestCase):
                     _validate_sandbox_python_ast(script)
 
     def test_live_disk_quota_kills_runaway_writer_and_reports_os_containment(self) -> None:
-        from executable_skills import (
+        from scripts.executable_skills import (
             ExecutableSkillExecutionDeniedError,
             execute_promoted_skill,
             promote_playbook_to_executable_skill,
@@ -312,7 +327,7 @@ class Defect05KeychainStoreTests(Bugfix1AIsolatedTestCase):
 
     def test_macos_and_linux_native_keychain_invoked_even_with_custom_state_dir(self) -> None:
         import base64
-        import keychain_store as ks
+        import scripts.keychain_store as ks
 
         custom_state = self.root_tmp / "custom_state_dir"
         custom_state.mkdir(parents=True, exist_ok=True)
@@ -399,8 +414,8 @@ class Defect05KeychainStoreTests(Bugfix1AIsolatedTestCase):
                 )
 
     def test_fallback_keyfile_is_aead_encrypted_sbkf2_and_vault_sync_reports_keychain_sealed_false(self) -> None:
-        import keychain_store as ks
-        import vault_sync
+        import scripts.keychain_store as ks
+        import scripts.vault_sync as vault_sync
 
         fallback_state = self.root_tmp / "headless_linux_state"
         fallback_state.mkdir(parents=True, exist_ok=True)
@@ -452,9 +467,9 @@ class Defect06MerkleSnapshotParityTests(Bugfix1AIsolatedTestCase):
     """Defect #6: Merkle root split-brain between vault_ledger and time_travel on 6-skills/."""
 
     def test_snapshot_and_ledger_merkle_roots_match_with_promoted_skill_and_legacy_compat(self) -> None:
-        from executable_skills import promote_playbook_to_executable_skill
-        from time_travel import create_snapshot, diff_snapshots, verify_snapshot
-        from vault_ledger import compute_vault_merkle
+        from scripts.executable_skills import promote_playbook_to_executable_skill
+        from scripts.time_travel import create_snapshot, diff_snapshots, verify_snapshot
+        from scripts.vault_ledger import compute_vault_merkle
 
         _, _, pb_res = _seed_mature_playbook(
             self.brain,
@@ -522,8 +537,8 @@ class Defect07SkillExecutionsSyncMergeTests(Bugfix1AIsolatedTestCase):
     """Defect #7: 0-raw/archive/skill-executions.jsonl omitted from E2EE sync append-only merge."""
 
     def test_skill_executions_jsonl_merges_valid_hash_chain_and_rejects_tampering(self) -> None:
-        from executable_skills import skill_execution_log_path, verify_skill_execution_audit_chain
-        from vault_sync import _APPEND_ONLY_JSONL_PATHS, SyncSecurityError, _merge_append_only_jsonl
+        from scripts.executable_skills import skill_execution_log_path, verify_skill_execution_audit_chain
+        from scripts.vault_sync import _APPEND_ONLY_JSONL_PATHS, SyncSecurityError, _merge_append_only_jsonl
 
         self.assertIn("0-raw/archive/skill-executions.jsonl", _APPEND_ONLY_JSONL_PATHS)
 
@@ -837,7 +852,7 @@ print("NO_OLLAMA_PROBE_OK")
         self.assertIn("NO_OLLAMA_PROBE_OK", proc2.stdout)
 
         # Verify publish_registries._StdlibHttpClient works against a real loopback HTTP server
-        import publish_registries
+        import scripts.publish_registries as publish_registries
 
         class _EchoHandler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):

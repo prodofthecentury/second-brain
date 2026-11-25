@@ -8,6 +8,8 @@ The package version in `pyproject.toml` is 1.0.0. That is not a claim that every
 
 ## What is in the tree
 
+The Python modules live in the `scripts` package (`from scripts import recall`). They do not add that directory to `sys.path`. `python scripts/<tool>.py` still works: it re-enters as `python -m scripts.<tool>`. The `second-brain` command is unchanged.
+
 The checkout keeps the full surface: the `second-brain` CLI, a loopback HTTP API, a 35-tool MCP server (disabled until `BRAIN_ENABLE_LOCAL_MCP=1`), a Streamlit dashboard, an Electron desktop app, a VS Code extension, a Manifest V3 browser clipper, and mobile clients (an inbox PWA and a Capacitor vault client). Apple notarization, store publishing, live models, and ONNX downloads need accounts, hardware, or weights this repository does not ship. Those paths run as far as they can without those secrets and stop with an explicit skip or error.
 
 Captured web articles land in `sources/` and are not searchable until you approve the current file bytes (`second-brain sources`, the dashboard quarantine tab, or `POST /v1/sources/approve`). Approval makes the text searchable as an approved source capture. It does not create a citable atom. A later refinery run can draft atoms; those still need their own approval.

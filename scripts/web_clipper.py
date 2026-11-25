@@ -19,7 +19,23 @@ Security invariants:
    or forged trust markers are automatically quarantined to `brain/0-raw/inbox/`.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import base64
@@ -39,13 +55,12 @@ import tempfile
 import threading
 from urllib.parse import urlparse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import content_sha256, review_lock  # noqa: E402
-from config import _is_reparse_or_link, resolve_active_brain_dir, security_state_dir  # noqa: E402
-from host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions  # noqa: E402
-from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
-from notes_store import NotePaths, create_note, slugify  # noqa: E402
+from scripts.atom_mutator import content_sha256, review_lock  # noqa: E402
+from scripts.config import _is_reparse_or_link, resolve_active_brain_dir, security_state_dir  # noqa: E402
+from scripts.host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions  # noqa: E402
+from scripts.inbox_workflow import scan_inbox_payload_risks  # noqa: E402
+from scripts.notes_store import NotePaths, create_note, slugify  # noqa: E402
 
 
 CLIPPER_PAIRINGS_FILENAME = "clipper-pairings.json"
@@ -502,7 +517,7 @@ def extract_clean_markdown_from_html(raw_html: str, *, source_url: str = "") -> 
     if len(markup) > MAX_CLIP_RAW_HTML_CHARS:
         raise ClipperError(f"Raw HTML exceeds maximum allowed length ({MAX_CLIP_RAW_HTML_CHARS} chars).")
     try:
-        from math_equivalence import preserve_latex_in_html
+        from scripts.math_equivalence import preserve_latex_in_html
 
         markup = preserve_latex_in_html(markup)
     except Exception:
@@ -521,7 +536,7 @@ def extract_clean_markdown_from_html(raw_html: str, *, source_url: str = "") -> 
         if isinstance(extracted, str) and extracted.strip():
             cleaned_md = extracted.replace("\r\n", "\n").strip()[:MAX_CLIP_PAGE_TEXT_CHARS]
             try:
-                from math_equivalence import unescape_markdown_latex_spans
+                from scripts.math_equivalence import unescape_markdown_latex_spans
 
                 cleaned_md = unescape_markdown_latex_spans(cleaned_md)
             except Exception:
@@ -530,7 +545,7 @@ def extract_clean_markdown_from_html(raw_html: str, *, source_url: str = "") -> 
     except Exception:
         pass
     try:
-        from doc_extractors import _html_to_blocks
+        from scripts.doc_extractors import _html_to_blocks
 
         _title, blocks = _html_to_blocks(markup, heading_offset=1)
         if blocks:
@@ -793,7 +808,7 @@ def _sanitize_png_screenshot(decoded: bytes) -> tuple[bytes, str, int, int]:
 
     ocr_text = ""
     try:
-        from doc_extractors import _run_local_ocr_on_png
+        from scripts.doc_extractors import _run_local_ocr_on_png
 
         ocr_res = _run_local_ocr_on_png(clean_png, allow_vision_ocr=False)
         if isinstance(ocr_res, tuple) and ocr_res:
@@ -808,7 +823,7 @@ def _validate_and_extract_pdf(decoded: bytes) -> tuple[bytes, str, int]:
     if not decoded.lstrip(b"\r\n\t \x00").startswith(_PDF_MAGIC):
         raise ClipperError("Uploaded PDF payload is missing a valid %PDF- header.")
     try:
-        from doc_extractors import DocumentExtractionError, extract_pdf
+        from scripts.doc_extractors import DocumentExtractionError, extract_pdf
     except ImportError:
         return decoded, "", 0
 

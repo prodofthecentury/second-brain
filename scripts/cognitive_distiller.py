@@ -16,7 +16,23 @@ Enforces Three-Store & Owner-CAS invariants:
   distilled artifact stale (``valid=False``) so ungrounded abstractions never enter planning.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from dataclasses import dataclass
@@ -29,18 +45,17 @@ import re
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("cognitive_distiller", "scripts.cognitive_distiller"):
     sys.modules.setdefault("cognitive_distiller", sys.modules[__name__])
     sys.modules.setdefault("scripts.cognitive_distiller", sys.modules[__name__])
 
-from atom_mutator import (  # noqa: E402
+from scripts.atom_mutator import (  # noqa: E402
     atomic_write_bytes,
     content_sha256,
     validate_actor_name,
     vault_writer_lock,
 )
-from config import (  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
     _is_reparse_or_link,
@@ -48,10 +63,10 @@ from config import (  # noqa: E402
     resolve_module_atoms_and_brain,
     snapshot_module_defaults,
 )
-from memory_format import render_memory_document, set_scalar_field, split_frontmatter  # noqa: E402
-from memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list, section_text  # noqa: E402
-from recall import project_tags_match  # noqa: E402
-from review_atom import approved_revision_is_current  # noqa: E402
+from scripts.memory_format import render_memory_document, set_scalar_field, split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list, section_text  # noqa: E402
+from scripts.recall import project_tags_match  # noqa: E402
+from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 

@@ -4,7 +4,23 @@
 # ///
 """Behavioral verification suite for Goal 3 backend/API parity contracts."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import io
 import json
@@ -18,14 +34,13 @@ import zipfile
 
 import httpx
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import api_product  # noqa: E402
-from atom_mutator import apply_review_transition  # noqa: E402
-from cognitive_core import count_canonical_corrections, record_grounded_answer_telemetry  # noqa: E402
-from evidence import find_evidence_anchor  # noqa: E402
-from lexical_store import rebuild_lexical_index  # noqa: E402
-from memory_api import (  # noqa: E402
+import scripts.api_product as api_product  # noqa: E402
+from scripts.atom_mutator import apply_review_transition  # noqa: E402
+from scripts.cognitive_core import count_canonical_corrections, record_grounded_answer_telemetry  # noqa: E402
+from scripts.evidence import find_evidence_anchor  # noqa: E402
+from scripts.lexical_store import rebuild_lexical_index  # noqa: E402
+from scripts.memory_api import (  # noqa: E402
     MemoryApiClient,
     MemoryApiRuntimeConfig,
     MemoryLoopbackHTTPServer,
@@ -34,9 +49,9 @@ from memory_api import (  # noqa: E402
     remove_active_api_port_file,
     write_active_api_port_file,
 )
-from memory_format import render_memory_document, set_scalar_field  # noqa: E402
-from skill_playbooks import promote_skill_playbook  # noqa: E402
-from vault_ledger import verify_merkle_proof  # noqa: E402
+from scripts.memory_format import render_memory_document, set_scalar_field  # noqa: E402
+from scripts.skill_playbooks import promote_skill_playbook  # noqa: E402
+from scripts.vault_ledger import verify_merkle_proof  # noqa: E402
 
 
 def _make_minimal_docx(paragraphs: list[str]) -> bytes:

@@ -2,12 +2,28 @@
 # requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 """
 Second Brain health check.
 
 Run:
     uv run scripts/doctor.py
 """
+
+
 
 import ctypes
 import importlib.util
@@ -20,7 +36,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from config import (
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     BRIEFINGS_DIR,
@@ -42,17 +58,17 @@ from config import (
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from hardware_profile import (
+from scripts.hardware_profile import (
     _NoRedirectHandler,
     detect_hardware_profile,
     fetch_loopback_json,
     loopback_ollama_base_url,
     resolve_active_local_generation_model,
 )
-from index_manifest import index_manifest_is_current, load_index_manifest
-from lexical_store import lexical_index_is_current
-from review_atom import approved_revision_is_current
-from vector_store import JsonVectorCollection, close_vector_collection, get_vector_collection, json_collection_path
+from scripts.index_manifest import index_manifest_is_current, load_index_manifest
+from scripts.lexical_store import lexical_index_is_current
+from scripts.review_atom import approved_revision_is_current
+from scripts.vector_store import JsonVectorCollection, close_vector_collection, get_vector_collection, json_collection_path
 
 
 def ok(area: str, detail: str) -> tuple[str, str, str]:
@@ -373,7 +389,7 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     active_playbooks = 0
     if playbook_total:
         try:
-            from skill_playbooks import list_playbooks
+            from scripts.skill_playbooks import list_playbooks
 
             reports = list_playbooks(
                 playbooks_dir=eff_playbooks,
@@ -390,7 +406,7 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     active_skills = 0
     if skill_total:
         try:
-            from executable_skills import list_executable_skills
+            from scripts.executable_skills import list_executable_skills
 
             sk_reports = list_executable_skills(
                 skills_dir=skills_dir,
@@ -414,7 +430,7 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
         checks.append(warn("notes", "Working notes directory not yet initialized; run `second-brain install`"))
 
     try:
-        from vault_ledger import verify_vault_ledger
+        from scripts.vault_ledger import verify_vault_ledger
 
         ledger_status = verify_vault_ledger(
             brain_dir=eff_brain,
@@ -445,7 +461,7 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     )
 
     try:
-        from onnx_models import get_onnx_models_status
+        from scripts.onnx_models import get_onnx_models_status
 
         onnx_st = get_onnx_models_status(run_inference=False)
         ce_info = onnx_st["slots"]["cross-encoder"]

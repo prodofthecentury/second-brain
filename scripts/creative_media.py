@@ -24,7 +24,23 @@ Architectural invariants:
    and NEVER auto-creates `accepted` canonical atoms in `brain/2-atoms/`.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import base64
@@ -66,13 +82,12 @@ except ImportError:  # pragma: no cover - minimal non-[multimodal] wheel install
     ImageSequence = None  # type: ignore[assignment]
     _PILLOW_AVAILABLE = False
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("creative_media", "scripts.creative_media"):
     sys.modules.setdefault("creative_media", sys.modules[__name__])
     sys.modules.setdefault("scripts.creative_media", sys.modules[__name__])
 
-from atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
+from scripts.config import (  # noqa: E402
     _WINDOWS_RESERVED_STEMS,
     _is_reparse_or_link,
     file_sha256,
@@ -81,12 +96,12 @@ from config import (  # noqa: E402
     vault_paths_for,
     vault_relative_path,
 )
-from hardware_profile import (  # noqa: E402
+from scripts.hardware_profile import (  # noqa: E402
     NOMINAL_16GB_RAM_GIB,
     HardwareCapabilityProfile,
     detect_hardware_profile,
 )
-from host_adapters import (  # noqa: E402
+from scripts.host_adapters import (  # noqa: E402
     HostSharingRule,
     OutboundSecretBlockedError,
     filter_atoms_for_host,
@@ -94,17 +109,17 @@ from host_adapters import (  # noqa: E402
     load_host_policies,
     restrict_security_file_permissions,
 )
-from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
-from lexical_store import (  # noqa: E402
+from scripts.inbox_workflow import scan_inbox_payload_risks  # noqa: E402
+from scripts.lexical_store import (  # noqa: E402
     LexicalIndexUnavailable,
     TOKEN_PATTERN,
     lexical_index_is_current,
     sync_lexical_index,
 )
-from memory_format import split_frontmatter  # noqa: E402
-from memory_review import parse_frontmatter_values, section_text  # noqa: E402
-from notes_store import NotePaths, create_note  # noqa: E402
-from recall import (  # noqa: E402
+from scripts.memory_format import split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_frontmatter_values, section_text  # noqa: E402
+from scripts.notes_store import NotePaths, create_note  # noqa: E402
+from scripts.recall import (  # noqa: E402
     MemoryRecallUnavailable,
     QUERY_STOP_WORDS,
     RecallOptions,

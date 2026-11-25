@@ -4,7 +4,23 @@
 # ///
 """Regression suite verifying all 1C Cross-Layer & Client UI Parity Gaps."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import asyncio
 import hashlib
@@ -24,7 +40,6 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(SCRIPTS_DIR))
 
 from scripts.api_product import ensure_owner_token  # noqa: E402
 from scripts.atom_mutator import apply_review_transition  # noqa: E402
@@ -219,7 +234,7 @@ class GraphTemporalApiAndSdkTests(unittest.TestCase):
                     job_poll = sdk_owner.get_job(str(job_start["job_id"]))
                     self.assertEqual(job_poll["job_id"], job_start["job_id"])
 
-                    import streaming_chat as bare_streaming_chat
+                    import scripts.streaming_chat as bare_streaming_chat
 
                     with patch.object(
                         bare_streaming_chat,
@@ -371,8 +386,8 @@ class McpExpanded27ToolsAndNliTests(unittest.TestCase):
                     seen_calls.append(dict(kwargs))
                     return {"contradiction_count": 0, "nli_enabled": bool(kwargs.get("enable_nli")), "alerts": []}
 
-                import onnx_models as bare_onnx_mod
-                import knowledge_graph as bare_kg_mod
+                import scripts.onnx_models as bare_onnx_mod
+                import scripts.knowledge_graph as bare_kg_mod
 
                 with patch.object(bare_onnx_mod, "get_onnx_models_status", return_value={"slots": {"nli": {"verified": True}}}), \
                      patch("scripts.onnx_models.get_onnx_models_status", return_value={"slots": {"nli": {"verified": True}}}), \

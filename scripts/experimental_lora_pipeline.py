@@ -13,7 +13,23 @@ STRICTLY DISABLED by default unless ``ADR-LORA-EXPERIMENT`` is active in
   (``second-brain-lora-exp``). Never mutates base model weights or 2-atoms/.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import datetime
@@ -24,24 +40,23 @@ import re
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("experimental_lora_pipeline", "scripts.experimental_lora_pipeline"):
     sys.modules.setdefault("experimental_lora_pipeline", sys.modules[__name__])
     sys.modules.setdefault("scripts.experimental_lora_pipeline", sys.modules[__name__])
 
-from adr_gate import require_adr_active  # noqa: E402
-from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import (  # noqa: E402
+from scripts.adr_gate import require_adr_active  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes  # noqa: E402
+from scripts.config import (  # noqa: E402
     _is_reparse_or_link,
     is_content_markdown,
     resolve_module_atoms_and_brain,
     snapshot_module_defaults,
 )
-from hardware_profile import detect_hardware_profile  # noqa: E402
-from host_adapters import inspect_and_redact_outbound  # noqa: E402
-from memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
-from memory_review import parse_atom_record_text, parse_frontmatter_values  # noqa: E402
-from review_atom import approved_revision_is_current  # noqa: E402
+from scripts.hardware_profile import detect_hardware_profile  # noqa: E402
+from scripts.host_adapters import inspect_and_redact_outbound  # noqa: E402
+from scripts.memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_atom_record_text, parse_frontmatter_values  # noqa: E402
+from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 _BASE_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")

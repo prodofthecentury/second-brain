@@ -4,7 +4,23 @@
 # ///
 """End-to-End HTTP, MemoryApiClient SDK, Deliberative Chat & CLI Verification Suite (Phases 8-10)."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import base64
 from contextlib import redirect_stdout
@@ -22,8 +38,6 @@ import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -60,9 +74,9 @@ def _write_approved_atom(
     extra_tags: tuple[str, ...] = ("reliability",),
     links: tuple[str, ...] = (),
 ) -> str:
-    from atom_mutator import apply_review_transition, content_sha256
-    from evidence import find_evidence_anchor
-    from memory_format import render_memory_document
+    from scripts.atom_mutator import apply_review_transition, content_sha256
+    from scripts.evidence import find_evidence_anchor
+    from scripts.memory_format import render_memory_document
 
     src_rel = f"0-raw/src-{filename}"
     (brain / "0-raw" / f"src-{filename}").write_text(f"# Source\n{claim}\n", encoding="utf-8")
@@ -170,7 +184,7 @@ class QuantumLeapApiSdkTests(unittest.TestCase):
         )
 
         # Seed an episodic failure record referencing auth_service for replay & impact simulation
-        from cognitive_core import save_experience_record
+        from scripts.cognitive_core import save_experience_record
 
         save_experience_record(
             goal="Rotate auth_service signing key in staging",
@@ -183,7 +197,7 @@ class QuantumLeapApiSdkTests(unittest.TestCase):
         )
 
         # Seed a draft mental model for mental-model gating & promotion tests
-        from cognitive_distiller import propose_mental_model
+        from scripts.cognitive_distiller import propose_mental_model
 
         self.mm_draft = propose_mental_model(
             title="Auth Gateway Coupling",
@@ -202,7 +216,7 @@ class QuantumLeapApiSdkTests(unittest.TestCase):
         )
 
         # Rebuild lexical index so search_memory / swarm / zoom work offline
-        from lexical_store import rebuild_lexical_index
+        from scripts.lexical_store import rebuild_lexical_index
 
         rebuild_lexical_index(
             atoms_dir=str(self.brain / "2-atoms"),
@@ -210,8 +224,8 @@ class QuantumLeapApiSdkTests(unittest.TestCase):
         )
 
         # Start real MemoryLoopbackHTTPServer on an ephemeral loopback port
-        from api_product import ensure_owner_token, reset_owner_rate_limiter
-        from memory_api import (
+        from scripts.api_product import ensure_owner_token, reset_owner_rate_limiter
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
@@ -624,7 +638,7 @@ class QuantumLeapApiSdkTests(unittest.TestCase):
             self.assertEqual(r_oai_chat.status_code, 403, r_oai_chat.text)
 
             # Once explicitly enabled in security_dir, /v1/openai/v1/models returns 200
-            from local_ai_proxy import configure_proxy
+            from scripts.local_ai_proxy import configure_proxy
 
             configure_proxy(enabled=True, state_dir=self.sec_dir)
             r_oai_ok = client.get(f"{self.base}/v1/openai/v1/models", headers=self.agent_headers)
@@ -809,7 +823,7 @@ class QuantumLeapApiSdkTests(unittest.TestCase):
         self.assertEqual(cm.exception.response.status_code, 403)
 
     def test_03_deliberative_streaming_chat_meta_router_and_l0_bus(self) -> None:
-        import streaming_chat as sc
+        import scripts.streaming_chat as sc
 
         cp = sc.ChatPaths(
             brain_dir=str(self.brain),

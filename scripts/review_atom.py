@@ -4,14 +4,30 @@
 # ///
 """CLI and compatibility exports for the canonical atom mutator."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import json
 import os
 import sys
 
-from config import ATOMS_DIR, safe_file_in_dir
+from scripts.config import ATOMS_DIR, safe_file_in_dir
 
 try:  # Supports both `python scripts/review_atom.py` and `import scripts.review_atom`.
     from .atom_mutator import (
@@ -32,7 +48,7 @@ try:  # Supports both `python scripts/review_atom.py` and `import scripts.review
         set_atom_temporal_bounds,
     )
 except ImportError:
-    from atom_mutator import (
+    from scripts.atom_mutator import (
         ATOM_HISTORY_DIR,
         DECISION_LOG,
         TRANSITIONS,
@@ -89,7 +105,7 @@ def parse_args(argv=None):
 
 
 def main(argv=None) -> int:
-    from owner_attestation import OwnerAttestationError, attestation_from_grant, split_grant_args
+    from scripts.owner_attestation import OwnerAttestationError, attestation_from_grant, split_grant_args
 
     cleaned, grant = split_grant_args(argv)
     args = parse_args(cleaned)

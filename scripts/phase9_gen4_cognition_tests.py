@@ -14,7 +14,23 @@ Tests all 7 Gen-4 slices offline without external services:
   2D.7 Owner-ADR-gated LoRA & Notes-Only CRDT sandboxes + MCP/CLI/REST parity
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import asyncio
 from contextlib import redirect_stdout
@@ -30,31 +46,30 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
 
-import adr_gate  # noqa: E402
-import atom_mutator  # noqa: E402
-import cognitive_core  # noqa: E402
-import cognitive_distiller  # noqa: E402
-import cognitive_swarm  # noqa: E402
-import concept_graph  # noqa: E402
-import episodic_replay  # noqa: E402
-import experimental_crdt_notes  # noqa: E402
-import experimental_lora_pipeline  # noqa: E402
-import fractal_zoom  # noqa: E402
-import meta_router  # noqa: E402
-import mcp_server  # noqa: E402
-import predictive_memory_bus  # noqa: E402
-import recall  # noqa: E402
-import self_model_curiosity  # noqa: E402
-import streaming_chat  # noqa: E402
-import vault_backup  # noqa: E402
-import vault_ledger  # noqa: E402
-import world_model_sim  # noqa: E402
-from evidence import find_evidence_anchor  # noqa: E402
-from executive_planner import ExecutivePlanRequest, assemble_executive_plan  # noqa: E402
-from lexical_store import rebuild_lexical_index  # noqa: E402
-from memory_format import render_memory_document  # noqa: E402
+import scripts.adr_gate as adr_gate  # noqa: E402
+import scripts.atom_mutator as atom_mutator  # noqa: E402
+import scripts.cognitive_core as cognitive_core  # noqa: E402
+import scripts.cognitive_distiller as cognitive_distiller  # noqa: E402
+import scripts.cognitive_swarm as cognitive_swarm  # noqa: E402
+import scripts.concept_graph as concept_graph  # noqa: E402
+import scripts.episodic_replay as episodic_replay  # noqa: E402
+import scripts.experimental_crdt_notes as experimental_crdt_notes  # noqa: E402
+import scripts.experimental_lora_pipeline as experimental_lora_pipeline  # noqa: E402
+import scripts.fractal_zoom as fractal_zoom  # noqa: E402
+import scripts.meta_router as meta_router  # noqa: E402
+import scripts.mcp_server as mcp_server  # noqa: E402
+import scripts.predictive_memory_bus as predictive_memory_bus  # noqa: E402
+import scripts.recall as recall  # noqa: E402
+import scripts.self_model_curiosity as self_model_curiosity  # noqa: E402
+import scripts.streaming_chat as streaming_chat  # noqa: E402
+import scripts.vault_backup as vault_backup  # noqa: E402
+import scripts.vault_ledger as vault_ledger  # noqa: E402
+import scripts.world_model_sim as world_model_sim  # noqa: E402
+from scripts.evidence import find_evidence_anchor  # noqa: E402
+from scripts.executive_planner import ExecutivePlanRequest, assemble_executive_plan  # noqa: E402
+from scripts.lexical_store import rebuild_lexical_index  # noqa: E402
+from scripts.memory_format import render_memory_document  # noqa: E402
 
 
 def _seed_vault(root: Path) -> Path:

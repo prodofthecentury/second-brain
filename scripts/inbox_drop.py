@@ -46,19 +46,18 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from filelock import FileLock
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import content_sha256, review_lock  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import content_sha256, review_lock  # noqa: E402
+from scripts.config import (  # noqa: E402
     _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     resolve_active_brain_dir,
     safe_file_in_dir,
     security_state_dir,
 )
-from host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions  # noqa: E402
-from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
-from memory_format import normalize_temporal_bound_str  # noqa: E402
+from scripts.host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions  # noqa: E402
+from scripts.inbox_workflow import scan_inbox_payload_risks  # noqa: E402
+from scripts.memory_format import normalize_temporal_bound_str  # noqa: E402
 
 
 SBID_MAGIC = b"SBID1\x00"
@@ -1038,7 +1037,7 @@ def pull_inbox_drops_from_backend(
             if len(worklist) < MAX_DROPS_PER_CYCLE:
                 worklist.append((obj_key, drop_id))
 
-        from vault_sync import SyncSecurityError
+        from scripts.vault_sync import SyncSecurityError
 
         for obj_key, drop_id in worklist:
             try:
@@ -1137,7 +1136,7 @@ def rotate_mobile_recall_key(
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
     resolved_vault_id = str(vault_id or "").strip().lower()
     if not resolved_vault_id:
-        from vault_sync import _load_sync_config, sync_config_path
+        from scripts.vault_sync import _load_sync_config, sync_config_path
 
         cfg_path = sync_config_path(active_brain, state_dir=state_dir)
         if cfg_path.exists():
@@ -1177,10 +1176,10 @@ def build_mobile_recall_catalog(
     include_pending_review: bool = True,
 ) -> dict[str, Any]:
     """Build a DLP-screened, provenance-verified catalog of approved atoms and pending review items."""
-    from atom_mutator import approved_revision_is_current, latest_decisions_by_atom
-    from config import is_content_markdown
-    from memory_format import evaluate_temporal_validity, split_frontmatter
-    from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
+    from scripts.atom_mutator import approved_revision_is_current, latest_decisions_by_atom
+    from scripts.config import is_content_markdown
+    from scripts.memory_format import evaluate_temporal_validity, split_frontmatter
+    from scripts.memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
     atoms_dir = active_brain / "2-atoms"
@@ -1444,7 +1443,7 @@ def export_mobile_recall_index(
     skip_dns_check_for_mock_transport: bool = False,
 ) -> dict[str, Any]:
     """Build, encrypt (`SBMR1\\x00`), and publish `mobile-recall/<vault_id>.enc` to the sync target and/or file."""
-    from vault_sync import _backend_from_config, _load_sync_config, sync_config_path
+    from scripts.vault_sync import _backend_from_config, _load_sync_config, sync_config_path
 
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
     cfg_path = sync_config_path(active_brain, state_dir=state_dir)

@@ -7,7 +7,23 @@
 # ///
 """Per-host local, online, and owner-built AI model adapters with explicit consent and outbound redaction."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from collections.abc import Iterator, Sequence
@@ -28,15 +44,14 @@ from urllib.parse import quote as url_quote, urlsplit
 
 if TYPE_CHECKING:
     import httpx as _httpx_mod
-    from ollama_scout import PinnedHTTPTransport as _PinnedHTTPTransportType
-    from ollama_scout import ValidatedRemoteTarget
+    from scripts.ollama_scout import PinnedHTTPTransport as _PinnedHTTPTransportType
+    from scripts.ollama_scout import ValidatedRemoteTarget
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("host_adapters", "scripts.host_adapters"):
     sys.modules.setdefault("host_adapters", sys.modules[__name__])
     sys.modules.setdefault("scripts.host_adapters", sys.modules[__name__])
 
-from answer_policy import (
+from scripts.answer_policy import (
     ANSWER_DRAFT_SCHEMA,
     AnswerRequest,
     AnswerResult,
@@ -47,7 +62,7 @@ from answer_policy import (
     format_unverified_leads_section,
     validate_standard_answer,
 )
-from config import (
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     GEN_MODEL,
@@ -57,18 +72,18 @@ from config import (
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from evidence import ANCHOR_FIELDS
-from hardware_profile import (
+from scripts.evidence import ANCHOR_FIELDS
+from scripts.hardware_profile import (
     call_ollama_chat_maybe_no_think,
     is_reasoning_model_name,
     loopback_ollama_base_url,
     resolve_active_local_generation_model,
     strip_reasoning_think_blocks,
 )
-from memory_format import split_frontmatter
-from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
-from recall import normalize_project_tag, project_tags_match
-from security_fs import (
+from scripts.memory_format import split_frontmatter
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list, section_text
+from scripts.recall import normalize_project_tag, project_tags_match
+from scripts.security_fs import (
     MAX_POLICY_FILE_BYTES,
     _current_windows_principal,
     read_bounded_security_file,
@@ -93,7 +108,7 @@ def _get_httpx():
 def _get_pinned_http_transport():
     global PinnedHTTPTransport
     if PinnedHTTPTransport is None:
-        from ollama_scout import PinnedHTTPTransport as _PinnedHTTPTransport
+        from scripts.ollama_scout import PinnedHTTPTransport as _PinnedHTTPTransport
 
         PinnedHTTPTransport = _PinnedHTTPTransport
     return PinnedHTTPTransport
@@ -645,7 +660,7 @@ def validate_endpoint_network_boundary(
         return None
 
     # Online host: require HTTPS on port 443 and strictly public, DNS-pinned IP answers
-    from ollama_scout import ValidatedRemoteTarget, _normalized_hostname, is_public_ip_address
+    from scripts.ollama_scout import ValidatedRemoteTarget, _normalized_hostname, is_public_ip_address
 
     if parsed.scheme != "https":
         raise HostConsentError(
@@ -720,7 +735,7 @@ def filter_atoms_for_host(
     try:
         from .atom_mutator import approved_revision_is_current
     except ImportError:
-        from atom_mutator import approved_revision_is_current
+        from scripts.atom_mutator import approved_revision_is_current
 
     atoms_root = Path(atoms_dir).resolve() if atoms_dir is not None else None
     brain_root = (
@@ -1433,7 +1448,7 @@ def enforce_vault_online_policy(
     try:
         from .vault_workspaces import get_registered_vault_host_policy
     except ImportError:
-        from vault_workspaces import get_registered_vault_host_policy
+        from scripts.vault_workspaces import get_registered_vault_host_policy
 
     matched_vid, vault_policy = get_registered_vault_host_policy(
         brain_dir,

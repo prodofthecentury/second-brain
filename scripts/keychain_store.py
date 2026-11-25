@@ -33,10 +33,9 @@ import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, security_state_dir  # noqa: E402
-from host_adapters import restrict_security_file_permissions  # noqa: E402
+from scripts.config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, security_state_dir  # noqa: E402
+from scripts.host_adapters import restrict_security_file_permissions  # noqa: E402
 
 
 class KeychainError(RuntimeError):

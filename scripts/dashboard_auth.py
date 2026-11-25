@@ -4,7 +4,23 @@
 # ///
 """Local single-owner dashboard password gate and credential setup command."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import gc
@@ -21,7 +37,6 @@ import tempfile
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 PASSWORD_MIN_LENGTH = 12
 PASSWORD_MAX_LENGTH = 1024
@@ -96,15 +111,15 @@ def _session_store_path(auth_path: str | Path | None = None) -> Path:
     if auth_path is not None or os.environ.get("BRAIN_DASHBOARD_AUTH_FILE"):
         base_dir = Path(auth_path or default_auth_path()).expanduser().resolve().parent
         return base_dir / "dashboard-sessions.json"
-    from config import security_state_dir
+    from scripts.config import security_state_dir
 
     return Path(security_state_dir()) / "dashboard-sessions.json"
 
 
 def _persist_session_store(auth_path: str | Path | None = None) -> None:
     """Write non-secret session digests & expiry metadata to a 0600 security-state file."""
-    from config import _is_reparse_or_link
-    from host_adapters import restrict_security_file_permissions
+    from scripts.config import _is_reparse_or_link
+    from scripts.host_adapters import restrict_security_file_permissions
 
     store_path = _session_store_path(auth_path)
     try:
@@ -437,8 +452,8 @@ def verify_password(password: str, record: object) -> bool:
 
 
 def save_password_record(record: dict, auth_path: str | Path | None = None) -> Path:
-    from config import _is_reparse_or_link
-    from host_adapters import restrict_security_file_permissions
+    from scripts.config import _is_reparse_or_link
+    from scripts.host_adapters import restrict_security_file_permissions
 
     if not _valid_record(record):
         raise ValueError("Refusing to save an invalid dashboard password record.")
@@ -477,7 +492,7 @@ def save_password_record(record: dict, auth_path: str | Path | None = None) -> P
 
 
 def load_password_record(auth_path: str | Path | None = None) -> dict | None:
-    from config import _is_reparse_or_link
+    from scripts.config import _is_reparse_or_link
 
     path = Path(auth_path or default_auth_path())
     try:

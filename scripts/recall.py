@@ -32,9 +32,9 @@ if __name__ in ("recall", "scripts.recall"):
     sys.modules.setdefault("recall", sys.modules[__name__])
     sys.modules.setdefault("scripts.recall", sys.modules[__name__])
 
-from atom_mutator import latest_decisions_by_atom
-from cross_encoder import rerank_recall_results
-from config import (
+from scripts.atom_mutator import latest_decisions_by_atom
+from scripts.cross_encoder import rerank_recall_results
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     CHROMA_PATH,
@@ -51,18 +51,18 @@ from config import (
     safe_file_in_dir,
     snapshot_module_defaults,
 )
-from index_manifest import cached_atom_hash_for_stat, index_manifest_is_current, load_index_manifest
-from lexical_store import (
+from scripts.index_manifest import cached_atom_hash_for_stat, index_manifest_is_current, load_index_manifest
+from scripts.lexical_store import (
     FTS_STOP_WORDS,
     TOKEN_PATTERN,
     _search_lexical_index_verified,
     porter_stem,
     search_lexical_index,
 )
-from memory_format import evaluate_temporal_validity, normalize_temporal_bound_str, split_frontmatter
-from memory_review import REVIEW_STATUSES, parse_atom_record, parse_atom_record_text, parse_scalar_list, section_text
-from review_atom import approved_revision_is_current
-from vector_store import close_vector_collection, get_vector_collection
+from scripts.memory_format import evaluate_temporal_validity, normalize_temporal_bound_str, split_frontmatter
+from scripts.memory_review import REVIEW_STATUSES, parse_atom_record, parse_atom_record_text, parse_scalar_list, section_text
+from scripts.review_atom import approved_revision_is_current
+from scripts.vector_store import close_vector_collection, get_vector_collection
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 _ORIG_APPROVED_REVISION_IS_CURRENT = approved_revision_is_current
@@ -712,7 +712,7 @@ def _load_fitness_signals(
                     resolved_brain = os.path.dirname(parent)
         if resolved_brain:
             try:
-                from cognitive_core import load_durable_feedback_counts
+                from scripts.cognitive_core import load_durable_feedback_counts
 
                 dmap = load_durable_feedback_counts(resolved_brain)
                 dentry = dmap.get(filename) or {}
@@ -1224,7 +1224,7 @@ def _apply_cognitive_boosts(
     gravity_map: dict[str, float] = {}
     if options.enable_gravity_boost:
         try:
-            from cognitive_core import compute_knowledge_gravity
+            from scripts.cognitive_core import compute_knowledge_gravity
 
             eff_db = options.telemetry_db_path or os.path.join(eff_brain, ".sidecar", "telemetry.sqlite3")
             gravity_map = compute_knowledge_gravity(
@@ -1239,7 +1239,7 @@ def _apply_cognitive_boosts(
     activation_map: dict[str, float] = {}
     if options.enable_spreading_activation and len(options.projects) <= 1:
         try:
-            from concept_graph import spreading_activation
+            from scripts.concept_graph import spreading_activation
 
             seeds: list[str] = list(sorted(_extract_query_terms(query)))[:8]
             for top_item in results[:2]:
@@ -1315,7 +1315,7 @@ def search_semantic_memory(
     atoms_dir: str | None = None,
     chroma_path: str | None = None,
 ) -> tuple[list[RecallResult], list[RecallResult]]:
-    from ollama_utils import EmbeddingUnavailableError, embed_text
+    from scripts.ollama_utils import EmbeddingUnavailableError, embed_text
 
     atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
     chroma_path = resolve_module_vault_path(globals(), "CHROMA_PATH", chroma_path)
@@ -1597,7 +1597,7 @@ def search_lexical_memory(
             effective_db = os.path.join(hoisted_fitness_brain, ".sidecar", "telemetry.sqlite3")
         hoisted_telemetry_map = _load_all_atom_telemetry_map(effective_db)
         try:
-            from cognitive_core import load_durable_feedback_counts
+            from scripts.cognitive_core import load_durable_feedback_counts
 
             hoisted_durable_map = load_durable_feedback_counts(hoisted_fitness_brain)
         except Exception:
@@ -1652,7 +1652,7 @@ def search_lexical_memory(
     neighbors = []
     seen = {item.filename for item in direct}
     if options.follow_links and direct:
-        from lexical_store import load_indexed_contents_by_filenames
+        from scripts.lexical_store import load_indexed_contents_by_filenames
 
         all_link_targets = {
             target
@@ -1839,7 +1839,7 @@ def search_memory(
 
     if l0_eligible:
         try:
-            from predictive_memory_bus import lookup_l0_hot, make_options_fingerprint
+            from scripts.predictive_memory_bus import lookup_l0_hot, make_options_fingerprint
 
             l0_opt_fp = make_options_fingerprint(
                 n_results=options.n_results,
@@ -1903,7 +1903,7 @@ def search_memory(
         if not l0_eligible or not direct_res or options.retrieval_mode not in {"lexical", "auto"}:
             return
         try:
-            from predictive_memory_bus import (
+            from scripts.predictive_memory_bus import (
                 _serialize_recall_item,
                 compute_vault_freshness_key,
                 make_options_fingerprint,
@@ -2140,7 +2140,7 @@ def chunk_text_preserving_latex(text: str, *, max_chars: int = 800) -> list[str]
     if len(raw) <= cap:
         return [raw]
 
-    from math_equivalence import _LATEX_SPAN_RE
+    from scripts.math_equivalence import _LATEX_SPAN_RE
 
     protected_spans = [m.span() for m in _LATEX_SPAN_RE.finditer(raw)]
 

@@ -15,7 +15,23 @@ are labeled ``approved_source_capture``. Citation still requires a separate atom
 approval. Editing the file drops it out of search until it is approved again.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import datetime
@@ -24,18 +40,17 @@ import os
 from pathlib import Path
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import file_sha256, resolve_active_brain_dir
-from inbox_workflow import _rewrite_intake_pointer, scan_inbox_payload_risks
-from lexical_store import rebuild_lexical_index, search_lexical_index
-from owner_attestation import (
+from scripts.config import file_sha256, resolve_active_brain_dir
+from scripts.inbox_workflow import _rewrite_intake_pointer, scan_inbox_payload_risks
+from scripts.lexical_store import rebuild_lexical_index, search_lexical_index
+from scripts.owner_attestation import (
     OwnerAttestationError,
     require_attestation,
     split_grant_args,
 )
-from refinery_targets import intake_status
-from security_fs import restrict_security_file_permissions
+from scripts.refinery_targets import intake_status
+from scripts.security_fs import restrict_security_file_permissions
 
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 LEDGER_NAME = "source-approvals.jsonl"
@@ -376,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
             hits = search_approved_sources(args.query, limit=args.limit)
             print(json.dumps(hits, indent=2))
             return 0
-        from owner_attestation import attestation_from_grant
+        from scripts.owner_attestation import attestation_from_grant
 
         attestation = attestation_from_grant(grant)
         if args.command == "approve":

@@ -4,7 +4,23 @@
 # ///
 """Quarantined inbox inspection, adversarial risk scanning, and CAS-locked owner promotion."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from dataclasses import asdict, dataclass
@@ -15,10 +31,9 @@ import re
 import shutil
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import ReviewConflictError, atomic_write_bytes
-from config import (
+from scripts.atom_mutator import ReviewConflictError, atomic_write_bytes
+from scripts.config import (
     BRAIN_DIR,
     INBOX_DIR,
     RAW_DIR,
@@ -33,9 +48,9 @@ from config import (
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from security_fs import restrict_security_file_permissions
-from refinery_targets import intake_status
-from review_atom import review_lock
+from scripts.security_fs import restrict_security_file_permissions
+from scripts.refinery_targets import intake_status
+from scripts.review_atom import review_lock
 
 INBOX_AUDIT_FILENAME = "inbox-decisions.jsonl"
 MAX_PROMOTED_BYTES = 64 * 1024
@@ -491,7 +506,7 @@ def _append_inbox_decision(record: dict[str, object], *, brain_dir: str) -> None
 
 
 def _require_inbox_actor(actor: str, attestation: dict | None) -> tuple[str, dict]:
-    from owner_attestation import OwnerAttestationError, require_attestation, unattested_library_attestation
+    from scripts.owner_attestation import OwnerAttestationError, require_attestation, unattested_library_attestation
 
     try:
         if attestation is None:
@@ -749,7 +764,7 @@ def reject_inbox_item(
 
 
 def main(argv: list[str] | None = None) -> int:
-    from owner_attestation import OwnerAttestationError, attestation_from_grant, split_grant_args
+    from scripts.owner_attestation import OwnerAttestationError, attestation_from_grant, split_grant_args
 
     cleaned, grant = split_grant_args(argv)
     parser = argparse.ArgumentParser(description="Inspect, promote, or reject quarantined 0-raw/inbox captures.")

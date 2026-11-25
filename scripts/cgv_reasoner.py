@@ -15,7 +15,23 @@ Implements:
    - Aggregates `majority@k` via `math_equivalence.aggregate_majority_at_k`.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from collections.abc import Callable
@@ -29,19 +45,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("cgv_reasoner", "scripts.cgv_reasoner"):
     sys.modules.setdefault("cgv_reasoner", sys.modules[__name__])
     sys.modules.setdefault("scripts.cgv_reasoner", sys.modules[__name__])
 
-from math_equivalence import (  # noqa: E402
+from scripts.math_equivalence import (  # noqa: E402
     _UNIT_TABLE,
     aggregate_majority_at_k,
     are_math_equivalent,
     extract_final_answer,
 )
-from process_evaluator import score_reasoning_trace  # noqa: E402
-from symbolic_sandbox import SandboxSecurityError, run_sandboxed_python  # noqa: E402
+from scripts.process_evaluator import score_reasoning_trace  # noqa: E402
+from scripts.symbolic_sandbox import SandboxSecurityError, run_sandboxed_python  # noqa: E402
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _QUANTITY_RE = re.compile(

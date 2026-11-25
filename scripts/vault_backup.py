@@ -19,7 +19,23 @@ Three-Store invariants:
     symlinks/reparse points, and credential/key files (`*.pfx`, `*.p12`, `*.pem`, `*.key`, `.env*`).
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import base64
@@ -44,15 +60,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import atomic_write_bytes, invalidate_decision_log_cache, review_lock  # noqa: E402
-from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, resolve_active_brain_dir  # noqa: E402
-from host_adapters import restrict_security_file_permissions  # noqa: E402
-from index_manifest import invalidate_atom_revision_cache  # noqa: E402
-from lexical_store import rebuild_lexical_index  # noqa: E402
-from notes_store import NotePaths  # noqa: E402
-from vault_ledger import (  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes, invalidate_decision_log_cache, review_lock  # noqa: E402
+from scripts.config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, resolve_active_brain_dir  # noqa: E402
+from scripts.host_adapters import restrict_security_file_permissions  # noqa: E402
+from scripts.index_manifest import invalidate_atom_revision_cache  # noqa: E402
+from scripts.lexical_store import rebuild_lexical_index  # noqa: E402
+from scripts.notes_store import NotePaths  # noqa: E402
+from scripts.vault_ledger import (  # noqa: E402
     _build_merkle_levels,
     _leaf_digest,
     compute_vault_merkle,

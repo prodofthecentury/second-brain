@@ -27,7 +27,23 @@ latency. Model calls enforce per-host consent, network boundary validation, secr
 blocking, indexed PII redaction/rehydration, and outbound auditing.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
@@ -41,7 +57,6 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("streaming_chat", "scripts.streaming_chat"):
     sys.modules.setdefault("streaming_chat", sys.modules[__name__])
     sys.modules.setdefault("scripts.streaming_chat", sys.modules[__name__])
@@ -49,13 +64,13 @@ if __name__ in ("streaming_chat", "scripts.streaming_chat"):
     sys.modules.setdefault("streaming_chat", sys.modules[__name__])
     sys.modules.setdefault("scripts.streaming_chat", sys.modules[__name__])
 
-from answer_policy import (  # noqa: E402
+from scripts.answer_policy import (  # noqa: E402
     NO_APPROVED_MEMORY_RESPONSE,
     collect_unverified_leads,
     format_unverified_leads_section,
     validate_standard_answer,
 )
-from chat_threads import (  # noqa: E402
+from scripts.chat_threads import (  # noqa: E402
     BEHAVIOR_MODES,
     PERSONA_PROFILES,
     THREAD_ID_RE,
@@ -74,12 +89,12 @@ from chat_threads import (  # noqa: E402
     resolve_followup_query,
     update_chat_thread_settings,
 )
-from cognitive_core import (  # noqa: E402
+from scripts.cognitive_core import (  # noqa: E402
     peek_lexical_candidate_atom_ids,
     record_grounded_answer_telemetry,
     record_retrieval_telemetry,
 )
-from config import (  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
     CHROMA_PATH,
@@ -89,13 +104,13 @@ from config import (  # noqa: E402
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from hardware_profile import (  # noqa: E402
+from scripts.hardware_profile import (  # noqa: E402
     call_ollama_chat_maybe_no_think,
     detect_hardware_profile,
     is_reasoning_model_name,
     strip_reasoning_think_blocks,
 )
-from host_adapters import (  # noqa: E402
+from scripts.host_adapters import (  # noqa: E402
     HostConsentError,
     HostSharingRule,
     _audit_outbound_call,
@@ -111,10 +126,10 @@ from host_adapters import (  # noqa: E402
     validate_endpoint_network_boundary,
     validate_model_identifier,
 )
-from memory_format import split_frontmatter  # noqa: E402
-from memory_review import parse_frontmatter_values, section_text  # noqa: E402
-from notes_store import NotePaths, search_notes  # noqa: E402
-from recall import (  # noqa: E402
+from scripts.memory_format import split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_frontmatter_values, section_text  # noqa: E402
+from scripts.notes_store import NotePaths, search_notes  # noqa: E402
+from scripts.recall import (  # noqa: E402
     MemoryRecallUnavailable,
     RecallOptions,
     consume_last_degradation_warning,
@@ -585,7 +600,7 @@ def retrieve_context(
                 proj_tags = [t for t in clean_tags if t.lower().startswith("project:")]
                 if not proj_tags or not all(project_tags_match((t,), (scope_tag,)) for t in proj_tags):
                     continue
-            from notes_store import get_note
+            from scripts.notes_store import get_note
 
             full = get_note(rec.filename, paths=paths.notes)
             excerpt = _note_excerpt(full.body or "", query)
@@ -1334,7 +1349,7 @@ def chat_events(
     notes = ctx["notes"]
 
     if mode == "debate":
-        from cognitive_swarm import run_two_sided_debate
+        from scripts.cognitive_swarm import run_two_sided_debate
 
         proj_one = str(project_scope or "").strip() or None
         debate_res = run_two_sided_debate(
@@ -1357,7 +1372,7 @@ def chat_events(
         return
 
     if mode in {"deliberative", "cognitive"}:
-        from meta_router import classify_query, resolve_reasoning_profile
+        from scripts.meta_router import classify_query, resolve_reasoning_profile
 
         proj_one = str(project_scope or "").strip() or None
         has_cloud = bool(
@@ -1375,7 +1390,7 @@ def chat_events(
         enriched_signals: dict[str, object] = {}
 
         if budget.reasoning_mode == "causal_simulation":
-            from world_model_sim import simulate_change_impact
+            from scripts.world_model_sim import simulate_change_impact
 
             sim_target = _extract_causal_target(retrieval_query)
             enriched_signals["causal_simulation"] = simulate_change_impact(
@@ -1389,7 +1404,7 @@ def chat_events(
             )
 
         if budget.reasoning_mode == "quantitative_derivation":
-            from cgv_reasoner import solve_quantitative_problem
+            from scripts.cgv_reasoner import solve_quantitative_problem
 
             enriched_signals["quantitative_derivation"] = solve_quantitative_problem(
                 retrieval_query,
@@ -1404,7 +1419,7 @@ def chat_events(
             or budget.reasoning_mode == "formal_proof"
         )
         if run_swarm_needed:
-            from cognitive_swarm import run_cognitive_swarm
+            from scripts.cognitive_swarm import run_cognitive_swarm
 
             swarm_res = run_cognitive_swarm(
                 retrieval_query,
@@ -1948,7 +1963,7 @@ def _pin_chat_turn_result(
 ) -> dict[str, Any]:
     """Persist a chat turn into `brain/notes/` via thread pinning or direct working note creation."""
     if thread_id:
-        from chat_threads import pin_turn_to_note
+        from scripts.chat_threads import pin_turn_to_note
 
         pinned = pin_turn_to_note(
             thread_id,
@@ -1966,7 +1981,7 @@ def _pin_chat_turn_result(
     if not fallback_turn:
         raise ValueError("No grounded answer available to pin.")
 
-    from notes_store import NotePaths, create_note
+    from scripts.notes_store import NotePaths, create_note
 
     q_txt = str(fallback_turn.get("query") or "").strip()
     ans_txt = str(fallback_turn.get("answer") or "").strip()
@@ -2396,7 +2411,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     if standalone_pin_requested:
-        from chat_threads import pin_turn_to_note
+        from scripts.chat_threads import pin_turn_to_note
 
         pin_tid = ""
         if args.pin != "__ACTIVE__":

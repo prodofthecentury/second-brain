@@ -7,7 +7,23 @@
 # ///
 """Comprehensive unit and security test suite for `scripts/creative_media.py`."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import base64
 import hashlib
@@ -24,11 +40,10 @@ import warnings
 import httpx
 from PIL import Image, ImageDraw, ImageSequence, PngImagePlugin
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import apply_atom_edit, apply_atom_merge, apply_review_transition, content_sha256  # noqa: E402
-import creative_media  # noqa: E402
-from creative_media import (  # noqa: E402
+from scripts.atom_mutator import apply_atom_edit, apply_atom_merge, apply_review_transition, content_sha256  # noqa: E402
+import scripts.creative_media as creative_media  # noqa: E402
+from scripts.creative_media import (  # noqa: E402
     CreativeMediaHardwareGateError,
     CreativeMediaPolicyError,
     CreativeMediaSecretBlockedError,
@@ -44,16 +59,16 @@ from creative_media import (  # noqa: E402
     list_generated_media,
     validate_local_media_endpoint,
 )
-from hardware_profile import HardwareCapabilityProfile  # noqa: E402
-from host_adapters import (  # noqa: E402
+from scripts.hardware_profile import HardwareCapabilityProfile  # noqa: E402
+from scripts.host_adapters import (  # noqa: E402
     HostSharingRule,
     OutboundSecretBlockedError,
     builtin_default_policies,
     save_host_policies,
 )
-from lexical_store import sync_lexical_index  # noqa: E402
-from memory_format import set_scalar_field, set_string_list_field, split_frontmatter, render_memory_document  # noqa: E402
-from notes_store import NotePaths, create_note, verify_note_excerpt  # noqa: E402
+from scripts.lexical_store import sync_lexical_index  # noqa: E402
+from scripts.memory_format import set_scalar_field, set_string_list_field, split_frontmatter, render_memory_document  # noqa: E402
+from scripts.notes_store import NotePaths, create_note, verify_note_excerpt  # noqa: E402
 
 
 def _make_profile(

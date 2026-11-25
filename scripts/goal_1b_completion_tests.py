@@ -4,7 +4,23 @@
 # ///
 """Comprehensive regression tests covering all 8 tracks of 1B completion."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import ast
 from contextlib import ExitStack
@@ -27,8 +43,6 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 class Track1MobileVaultClientTests(unittest.TestCase):
@@ -86,8 +100,8 @@ class Track1MobileVaultClientTests(unittest.TestCase):
 
 class Track2CreativeMediaTests(unittest.TestCase):
     def test_fail_closed_auto_mode_and_15_91_gib_neural_unlock(self) -> None:
-        import creative_media
-        import hardware_profile
+        import scripts.creative_media as creative_media
+        import scripts.hardware_profile as hardware_profile
 
         profile_16g = hardware_profile.classify_hardware_tier(
             os_name="Windows",
@@ -129,7 +143,7 @@ class Track2CreativeMediaTests(unittest.TestCase):
 
     def test_pure_python_h264_mp4_muxer_and_comfyui_temporal_workflow(self) -> None:
         from PIL import Image
-        import creative_media
+        import scripts.creative_media as creative_media
 
         frames = [Image.new("RGB", (64, 48), (10 + i * 20, 40, 120)) for i in range(4)]
         mp4_bytes, enc = creative_media._encode_frames_to_mp4(
@@ -189,7 +203,7 @@ class Track2CreativeMediaTests(unittest.TestCase):
 class Track3OnnxCrossEncoderTests(unittest.TestCase):
     def test_unconditional_stage2_onnx_scoring_and_honest_tag(self) -> None:
         from dataclasses import dataclass
-        import cross_encoder
+        import scripts.cross_encoder as cross_encoder
 
         @dataclass
         class _Hit:
@@ -228,7 +242,7 @@ class Track4RegistryPublisherTests(unittest.TestCase):
     def test_status_subcommands_and_firefox_amo_polling_and_version_create(self) -> None:
         import io as _io
         from contextlib import redirect_stdout
-        import publish_registries
+        import scripts.publish_registries as publish_registries
 
         buf = _io.StringIO()
         with redirect_stdout(buf):
@@ -374,7 +388,7 @@ class Track5LinuxSignatureVerifierTests(unittest.TestCase):
     def test_appimage_and_deb_verification_with_ed25519_manifest(self) -> None:
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        import verify_release_signatures as vrs
+        import scripts.verify_release_signatures as vrs
 
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp)
@@ -416,7 +430,7 @@ class Track5LinuxSignatureVerifierTests(unittest.TestCase):
 
 class Track6BenchmarkFairnessTests(unittest.TestCase):
     def test_fair_svd_embeddings_chroma_mem0_and_cross_encoder_claim_selection(self) -> None:
-        import sota_benchmark
+        import scripts.sota_benchmark as sota_benchmark
 
         src = (SCRIPTS_DIR / "sota_benchmark.py").read_text(encoding="utf-8")
         self.assertNotIn("blake2b", src)
@@ -447,8 +461,8 @@ class Track6BenchmarkFairnessTests(unittest.TestCase):
 
 class Track7HardwareAndPdfOcrTests(unittest.TestCase):
     def test_macos_vm_stat_multivendor_gpu_and_pdf_rasterization_fail_closed(self) -> None:
-        import doc_extractors
-        import hardware_profile
+        import scripts.doc_extractors as doc_extractors
+        import scripts.hardware_profile as hardware_profile
 
         vm_stat_sample = (
             "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
@@ -534,10 +548,10 @@ class Track8UnfrozenPathsSessionCookieChatReplSmartCriticTests(unittest.TestCase
                             hits.append((path.name, node.lineno, node.name, default_node.id))
         self.assertEqual(hits, [], f"Found frozen path defaults: {hits}")
 
-        import config
-        import notes_store
-        import streaming_chat
-        import time_travel
+        import scripts.config as config
+        import scripts.notes_store as notes_store
+        import scripts.streaming_chat as streaming_chat
+        import scripts.time_travel as time_travel
 
         orig = os.environ.get("BRAIN_VAULT_DIR")
         try:
@@ -560,7 +574,7 @@ class Track8UnfrozenPathsSessionCookieChatReplSmartCriticTests(unittest.TestCase
                 os.environ["BRAIN_VAULT_DIR"] = orig
 
     def test_dashboard_auth_session_cookie_reload_and_logout(self) -> None:
-        import dashboard_auth
+        import scripts.dashboard_auth as dashboard_auth
 
         class _FakeSidebar:
             def __init__(self, lock_clicked: bool = False):
@@ -654,7 +668,7 @@ class Track8UnfrozenPathsSessionCookieChatReplSmartCriticTests(unittest.TestCase
 
     def test_chat_shim_delegation_and_streaming_chat_repl(self) -> None:
         import chat_with_memory
-        import streaming_chat
+        import scripts.streaming_chat as streaming_chat
 
         for sym in ("ATOMS_DIR", "BRAIN_DIR", "GEN_MODEL", "console", "_stream_local_ollama_chat", "search_memory", "chat_loop", "main"):
             self.assertTrue(hasattr(chat_with_memory, sym), f"Missing compatibility symbol {sym}")
@@ -694,10 +708,10 @@ class Track8UnfrozenPathsSessionCookieChatReplSmartCriticTests(unittest.TestCase
         self.assertTrue(any("Answered: What is WAL?" in line for line in outputs))
 
     def test_ollama_refinery_smart_critic_recall_graph_and_fail_closed(self) -> None:
-        from atom_mutator import refresh_lexical_index
-        from evidence import find_evidence_anchor
-        import ollama_refinery
-        from review_atom import apply_review_transition
+        from scripts.atom_mutator import refresh_lexical_index
+        from scripts.evidence import find_evidence_anchor
+        import scripts.ollama_refinery as ollama_refinery
+        from scripts.review_atom import apply_review_transition
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -800,8 +814,8 @@ class Track8UnfrozenPathsSessionCookieChatReplSmartCriticTests(unittest.TestCase
 
 class RemediationRegressionTests(unittest.TestCase):
     def test_bulk_import_respects_runtime_notes_store_default_paths_rebind(self) -> None:
-        import bulk_import
-        import notes_store
+        import scripts.bulk_import as bulk_import
+        import scripts.notes_store as notes_store
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -821,7 +835,7 @@ class RemediationRegressionTests(unittest.TestCase):
                 self.assertTrue((brain / "notes" / str(file_res["filename"])).is_file())
 
     def test_verify_release_signatures_fails_closed_on_missing_manifest_and_key_path(self) -> None:
-        import verify_release_signatures as vrs
+        import scripts.verify_release_signatures as vrs
 
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp) / "dist"
@@ -835,8 +849,8 @@ class RemediationRegressionTests(unittest.TestCase):
                 vrs._resolve_ed25519_key_bytes(str(Path(tmp) / "missing_key.pem"))
 
     def test_streaming_chat_pin_query_cli_and_strict_multihop_project_note_scope(self) -> None:
-        import notes_store
-        import streaming_chat
+        import scripts.notes_store as notes_store
+        import scripts.streaming_chat as streaming_chat
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"

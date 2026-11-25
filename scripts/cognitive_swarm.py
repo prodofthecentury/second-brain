@@ -11,7 +11,23 @@ active principles, and episodic experience records, plus Two-Sided Debate Mode
 Supersede, or Context-Partition). Never mutates canonical stores autonomously.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from collections.abc import Callable
@@ -23,12 +39,11 @@ import re
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("cognitive_swarm", "scripts.cognitive_swarm"):
     sys.modules.setdefault("cognitive_swarm", sys.modules[__name__])
     sys.modules.setdefault("scripts.cognitive_swarm", sys.modules[__name__])
 
-from config import (  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
     _is_reparse_or_link,
@@ -36,12 +51,12 @@ from config import (  # noqa: E402
     resolve_module_atoms_and_brain,
     snapshot_module_defaults,
 )
-from knowledge_graph import detect_contradictions  # noqa: E402
-from memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
-from memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list  # noqa: E402
-from meta_router import classify_query, route_and_retrieve  # noqa: E402
-from recall import normalize_project_tag, project_tags_match  # noqa: E402
-from review_atom import approved_revision_is_current  # noqa: E402
+from scripts.knowledge_graph import detect_contradictions  # noqa: E402
+from scripts.memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list  # noqa: E402
+from scripts.meta_router import classify_query, route_and_retrieve  # noqa: E402
+from scripts.recall import normalize_project_tag, project_tags_match  # noqa: E402
+from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
@@ -219,7 +234,7 @@ def run_cognitive_swarm(
 
     active_principles: list[dict[str, Any]] = []
     try:
-        from cognitive_distiller import list_distilled_artifacts
+        from scripts.cognitive_distiller import list_distilled_artifacts
 
         active_principles = list_distilled_artifacts(
             kind="principle",

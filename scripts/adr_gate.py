@@ -10,7 +10,23 @@ default and raise ``ADRRequiredError`` unless explicitly authorized by an
 owner-signed record in ``brain/0-raw/archive/owner-adrs.jsonl``.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import datetime
@@ -21,13 +37,12 @@ from pathlib import Path
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("adr_gate", "scripts.adr_gate"):
     sys.modules.setdefault("adr_gate", sys.modules[__name__])
     sys.modules.setdefault("scripts.adr_gate", sys.modules[__name__])
 
-from atom_mutator import atomic_write_bytes, validate_actor_name, vault_writer_lock  # noqa: E402
-from config import _is_reparse_or_link, resolve_module_atoms_and_brain, snapshot_module_defaults  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes, validate_actor_name, vault_writer_lock  # noqa: E402
+from scripts.config import _is_reparse_or_link, resolve_module_atoms_and_brain, snapshot_module_defaults  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 

@@ -18,7 +18,23 @@ configured Zero-Knowledge E2EE vault sync target (`scripts/vault_sync.py`):
     symlinks/reparse points fail-closed.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import base64
@@ -38,13 +54,12 @@ import zipfile
 
 from filelock import FileLock
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, resolve_active_brain_dir, security_state_dir  # noqa: E402
-from host_adapters import read_bounded_security_file, restrict_security_file_permissions  # noqa: E402
-from inbox_drop import create_mobile_drop_pairing, revoke_mobile_drop_pairing  # noqa: E402
-from vault_sync import _resolve_master_key, sync_config_path  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes  # noqa: E402
+from scripts.config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, resolve_active_brain_dir, security_state_dir  # noqa: E402
+from scripts.host_adapters import read_bounded_security_file, restrict_security_file_permissions  # noqa: E402
+from scripts.inbox_drop import create_mobile_drop_pairing, revoke_mobile_drop_pairing  # noqa: E402
+from scripts.vault_sync import _resolve_master_key, sync_config_path  # noqa: E402
 
 
 MOBILE_VAULT_PAIRING_VERSION = 1

@@ -33,7 +33,23 @@ Usage (called by watchdog_daemon.py or run manually):
     uv run scripts/ingest_multimodal.py path/to/paper.pdf other/notes.docx
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import base64
@@ -54,9 +70,8 @@ try:
 except ImportError:  # Clean minimal wheel without optional [online] extra
     ollama = types.SimpleNamespace(chat=None, embed=None, Client=None)  # type: ignore[assignment]
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from atom_mutator import atomic_write_bytes
-from config import (
+from scripts.atom_mutator import atomic_write_bytes
+from scripts.config import (
     AUDIO_EXTS,
     DOC_EXTS,
     IMAGE_EXTS,
@@ -77,28 +92,28 @@ from config import (
     now_slug,
     today,
 )
-from video_extractor import (
+from scripts.video_extractor import (
     MAX_VIDEO_BYTES,
     build_video_timeline_markdown,
     extract_video_keyframes_and_audio,
     is_video_container,
 )
-from doc_extractors import EXTRACTION_BODY_MARKER, MAX_DOC_BINARY_BYTES, extract_document
-from hardware_profile import (
+from scripts.doc_extractors import EXTRACTION_BODY_MARKER, MAX_DOC_BINARY_BYTES, extract_document
+from scripts.hardware_profile import (
     call_ollama_chat_maybe_no_think,
     fetch_loopback_json,
     strip_reasoning_think_blocks,
 )
-from host_adapters import (
+from scripts.host_adapters import (
     HostConsentError,
     OutboundSecretBlockedError,
     _redact_outbound_with_map,
     inspect_and_redact_outbound,
 )
-from inbox_workflow import scan_inbox_payload_risks
-from ollama_utils import _is_monkeypatched_ollama_fn, _resolve_local_ollama_rule_and_url
-from review_atom import review_lock
-from stable_file import wait_for_stable_file
+from scripts.inbox_workflow import scan_inbox_payload_risks
+from scripts.ollama_utils import _is_monkeypatched_ollama_fn, _resolve_local_ollama_rule_and_url
+from scripts.review_atom import review_lock
+from scripts.stable_file import wait_for_stable_file
 
 MAX_AUDIO_BYTES = 200 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
@@ -430,7 +445,7 @@ def transcribe_audio(filepath: str) -> str:
 
 
 def process_audio(filepath: str) -> str | None:
-    from config import configure_utf8_stdio
+    from scripts.config import configure_utf8_stdio
 
     configure_utf8_stdio()
     _validate_media_source(filepath, max_bytes=MAX_AUDIO_BYTES)
@@ -715,7 +730,7 @@ def extract_document_markdown(
 
 
 def process_document(filepath: str) -> str | None:
-    from config import configure_utf8_stdio
+    from scripts.config import configure_utf8_stdio
 
     configure_utf8_stdio()
     _validate_media_source(filepath, max_bytes=MAX_DOC_BINARY_BYTES)
@@ -1094,7 +1109,7 @@ def _apply_env_vault_override() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from config import configure_utf8_stdio
+    from scripts.config import configure_utf8_stdio
 
     configure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Multimodal and document file ingestion.")

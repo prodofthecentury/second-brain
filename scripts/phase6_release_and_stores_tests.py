@@ -6,7 +6,23 @@
 detached Ed25519 manifest signatures, and mobile Fastlane/CI pipeline tests.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import hashlib
 import json
@@ -61,13 +77,11 @@ const env = {
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 class Phase6ReleaseAndStoresTests(unittest.TestCase):
     def test_chrome_web_store_v2_and_v1_fallback_and_dry_run(self) -> None:
-        import publish_registries as pr
+        import scripts.publish_registries as pr
 
         with tempfile.TemporaryDirectory(prefix="sb_cws_test_") as td:
             zpath = Path(td) / "clipper.zip"
@@ -128,7 +142,7 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
                 self.assertTrue(any("/v1.1/items/ext-11/publish" in u for u in v1_calls))
 
     def test_firefox_amo_polling_and_version_create_and_edge_polling(self) -> None:
-        import publish_registries as pr
+        import scripts.publish_registries as pr
 
         with tempfile.TemporaryDirectory(prefix="sb_amo_edge_") as td:
             xpi = Path(td) / "clipper.xpi"
@@ -207,7 +221,7 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
                 self.assertEqual(edge_polls["n"], 2)
 
     def test_pypi_vsix_ovsx_publishers_and_setup_wizard_never_leak_secrets(self) -> None:
-        import publish_registries as pr
+        import scripts.publish_registries as pr
 
         with tempfile.TemporaryDirectory(prefix="sb_pypi_vsix_") as td:
             dist = Path(td)
@@ -263,7 +277,7 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
         self.assertTrue(any("PYPI_API_TOKEN" in r["secrets"] for r in wiz["registries"]))
 
     def test_ed25519_manifest_signature_roundtrip_and_tamper_rejection(self) -> None:
-        import verify_release_signatures as vrs
+        import scripts.verify_release_signatures as vrs
 
         priv = Ed25519PrivateKey.generate()
         priv_pem = priv.private_bytes(
@@ -298,7 +312,7 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
         self.assertIn("manifest_ed25519_configured", readiness)
 
     def test_sign_release_ps1_and_outer_dmg_after_all_artifact_build_hook(self) -> None:
-        from signing_plan import SigningPlanError, plan_authenticode
+        from scripts.signing_plan import SigningPlanError, plan_authenticode
 
         azure = plan_authenticode(
             file_path="Second Brain.exe",
@@ -386,7 +400,7 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
             self.assertIn("spctl", proc.stdout)
 
     def test_homebrew_cask_bundle_id_and_macos_only_manifest_decoupling(self) -> None:
-        from build_distribution_manifests import build_package_manager_manifests
+        from scripts.build_distribution_manifests import build_package_manager_manifests
 
         with tempfile.TemporaryDirectory(prefix="sb_mac_mf_") as td:
             dist = Path(td)

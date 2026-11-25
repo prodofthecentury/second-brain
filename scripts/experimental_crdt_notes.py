@@ -12,7 +12,23 @@ scratchpads inside ``brain/notes/``. Any path under ``2-atoms/``, ``5-playbooks/
 ``PermissionError`` immediately.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import hashlib
@@ -22,14 +38,13 @@ from pathlib import Path
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("experimental_crdt_notes", "scripts.experimental_crdt_notes"):
     sys.modules.setdefault("experimental_crdt_notes", sys.modules[__name__])
     sys.modules.setdefault("scripts.experimental_crdt_notes", sys.modules[__name__])
 
-from adr_gate import require_adr_active  # noqa: E402
-from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import _is_reparse_or_link, resolve_module_atoms_and_brain, snapshot_module_defaults  # noqa: E402
+from scripts.adr_gate import require_adr_active  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes  # noqa: E402
+from scripts.config import _is_reparse_or_link, resolve_module_atoms_and_brain, snapshot_module_defaults  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 

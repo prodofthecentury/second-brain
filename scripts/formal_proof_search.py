@@ -18,7 +18,23 @@ arXiv:2605.22763v2 + SM) into Second Brain's local-first Three-Store architectur
 - Clean degrade (`lean_toolchain_unavailable`) when external `lean` CLI is absent.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from collections.abc import Callable
@@ -38,15 +54,14 @@ import sys
 import tempfile
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("formal_proof_search", "scripts.formal_proof_search"):
     sys.modules.setdefault("formal_proof_search", sys.modules[__name__])
     sys.modules.setdefault("scripts.formal_proof_search", sys.modules[__name__])
 
-from atom_mutator import atomic_write_bytes  # noqa: E402
-from cognitive_core import save_experience_record  # noqa: E402
-from config import _is_reparse_or_link, resolve_module_atoms_and_brain  # noqa: E402
-from symbolic_sandbox import SandboxSecurityError, run_sandboxed_python, validate_sandbox_ast  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes  # noqa: E402
+from scripts.cognitive_core import save_experience_record  # noqa: E402
+from scripts.config import _is_reparse_or_link, resolve_module_atoms_and_brain  # noqa: E402
+from scripts.symbolic_sandbox import SandboxSecurityError, run_sandboxed_python, validate_sandbox_ast  # noqa: E402
 
 _PY_EVOLVE_RE = re.compile(
     r"(?P<start>^[ \t]*#[ \t]*EVOLVE-(?:BLOCK|VALUE)-START[^\n]*\n)(?P<body>[\s\S]*?)(?P<end>^[ \t]*#[ \t]*EVOLVE-(?:BLOCK|VALUE)-END[^\n]*$)",

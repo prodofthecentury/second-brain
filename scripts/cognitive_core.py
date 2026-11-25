@@ -4,7 +4,23 @@
 # ///
 """Cognitive Core layer: disposable sidecar telemetry, memory fitness reports, and experience records."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from contextlib import closing
@@ -17,10 +33,9 @@ import re
 import sqlite3
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import approved_revision_is_current
-from config import (
+from scripts.atom_mutator import approved_revision_is_current
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     EXPERIENCES_DIR,
@@ -37,10 +52,10 @@ from config import (
     safe_file_in_dir,
     snapshot_module_defaults,
 )
-from lexical_store import search_lexical_index
-from memory_format import split_frontmatter
-from memory_review import parse_frontmatter_values
-from review_atom import review_lock
+from scripts.lexical_store import search_lexical_index
+from scripts.memory_format import split_frontmatter
+from scripts.memory_review import parse_frontmatter_values
+from scripts.review_atom import review_lock
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
@@ -247,7 +262,7 @@ def atom_feedback_log_path(brain_dir: str) -> str:
 
 def _restrict_durable_log_permissions(log_path: str) -> None:
     try:
-        from host_adapters import restrict_security_file_permissions
+        from scripts.host_adapters import restrict_security_file_permissions
 
         restrict_security_file_permissions(Path(log_path))
     except Exception:
@@ -472,7 +487,7 @@ def record_atom_feedback(
 
     owning_brain = resolved_brain
     if owning_brain:
-        from atom_mutator import review_lock
+        from scripts.atom_mutator import review_lock
 
         lock_path = os.path.join(owning_brain, ".sidecar", "writer.lock")
         with review_lock(lock_path):
@@ -630,7 +645,7 @@ def compute_memory_fitness_report(
     skills_dir = os.path.join(brain_dir, "6-skills") if brain_dir else ""
     if procedure_maturity and skills_dir and os.path.isdir(skills_dir) and not _is_reparse_or_link(skills_dir):
         try:
-            from executable_skills import list_executable_skills
+            from scripts.executable_skills import list_executable_skills
 
             active_skills = list_executable_skills(
                 skills_dir=skills_dir,
@@ -824,8 +839,8 @@ def save_experience_record(
     skills_tuple = tuple(skills_list)
     effective_proc_title = cand_title or (skills_tuple[0] if skills_tuple else None)
 
-    from host_adapters import inspect_and_redact_outbound
-    from inbox_workflow import scan_inbox_payload_risks
+    from scripts.host_adapters import inspect_and_redact_outbound
+    from scripts.inbox_workflow import scan_inbox_payload_risks
 
     all_text_parts = [
         goal_clean,
@@ -1072,14 +1087,14 @@ def compute_knowledge_gravity_report(
     # Check active playbooks/principles dependencies so cold-archive never flags an active dependency
     protected_backing_atoms: set[str] = set()
     try:
-        from skill_playbooks import list_playbooks
+        from scripts.skill_playbooks import list_playbooks
 
         for pb in list_playbooks(brain_dir=brain_dir, atoms_dir=atoms_dir, telemetry_db_path=db_path, active_only=True):
             protected_backing_atoms.update(getattr(pb, "backing_atoms", ()) or ())
     except Exception:
         pass
     try:
-        from cognitive_distiller import list_distilled_artifacts
+        from scripts.cognitive_distiller import list_distilled_artifacts
 
         for pr in list_distilled_artifacts(kind="principle", active_only=True, brain_dir=brain_dir, atoms_dir=atoms_dir):
             protected_backing_atoms.update(pr.get("source_atoms") or ())

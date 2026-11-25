@@ -34,9 +34,8 @@ import threading
 import time
 from urllib.parse import parse_qs, unquote
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import (  # noqa: E402
+from scripts.atom_mutator import (  # noqa: E402
     ReviewConflictError,
     ReviewTransitionError,
     apply_atom_edit,
@@ -49,19 +48,19 @@ from atom_mutator import (  # noqa: E402
     restore_cold_archived_atom,
     set_atom_temporal_bounds,
 )
-import config as _config  # noqa: E402
-from config import (  # noqa: E402
+import scripts.config as _config  # noqa: E402
+from scripts.config import (  # noqa: E402
     _is_reparse_or_link,
     is_content_markdown,
     normalize_markdown_filename,
     safe_file_in_dir,
 )
-from host_adapters import (  # noqa: E402
+from scripts.host_adapters import (  # noqa: E402
     HostConsentError,
     read_bounded_security_file,
     restrict_security_file_permissions,
 )
-from git_distiller import (  # noqa: E402
+from scripts.git_distiller import (  # noqa: E402
     GitDistillerError,
     GitDistillerSecurityError,
     distill_git_commits,
@@ -69,7 +68,7 @@ from git_distiller import (  # noqa: E402
     install_git_post_commit_hook,
     uninstall_git_post_commit_hook,
 )
-from inbox_drop import (  # noqa: E402
+from scripts.inbox_drop import (  # noqa: E402
     InboxDropError,
     InboxDropSecurityError,
     create_mobile_drop_pairing,
@@ -77,8 +76,8 @@ from inbox_drop import (  # noqa: E402
     resolve_scoped_inbox_drop_s3_credentials,
     revoke_mobile_drop_pairing,
 )
-from lexical_store import LexicalIndexUnavailable  # noqa: E402
-from memory_format import (  # noqa: E402
+from scripts.lexical_store import LexicalIndexUnavailable  # noqa: E402
+from scripts.memory_format import (  # noqa: E402
     VALID_EPISTEMIC_LABELS,
     VALID_MEMORY_TYPES,
     evaluate_temporal_validity,
@@ -91,7 +90,7 @@ from memory_format import (  # noqa: E402
     set_string_list_field,
     split_frontmatter,
 )
-from memory_review import (  # noqa: E402
+from scripts.memory_review import (  # noqa: E402
     list_review_queue,
     normalize_status,
     parse_atom_record,
@@ -99,7 +98,7 @@ from memory_review import (  # noqa: E402
     parse_scalar_list,
     section_text,
 )
-from notes_store import (  # noqa: E402
+from scripts.notes_store import (  # noqa: E402
     MAX_NOTE_BYTES,
     NoteError,
     NotePaths,
@@ -111,23 +110,23 @@ from notes_store import (  # noqa: E402
     update_note,
     verify_note_excerpt,
 )
-from onnx_models import (  # noqa: E402
+from scripts.onnx_models import (  # noqa: E402
     OnnxModelError,
     OnnxModelSecurityError,
     get_onnx_models_status,
     pull_onnx_models,
     remove_onnx_models,
 )
-from recall import MemoryRecallUnavailable, normalize_project_tag, project_tags_match  # noqa: E402
-from skill_playbooks import PlaybookValidationError  # noqa: E402
-from vault_backup import (  # noqa: E402
+from scripts.recall import MemoryRecallUnavailable, normalize_project_tag, project_tags_match  # noqa: E402
+from scripts.skill_playbooks import PlaybookValidationError  # noqa: E402
+from scripts.vault_backup import (  # noqa: E402
     VaultBackupError,
     VaultBackupSecurityError,
     create_vault_backup,
     restore_vault_backup,
     verify_vault_backup,
 )
-from vault_sync import (  # noqa: E402
+from scripts.vault_sync import (  # noqa: E402
     SyncConflictError,
     SyncError,
     SyncSecurityError,
@@ -147,7 +146,7 @@ from vault_sync import (  # noqa: E402
     sync_status,
     sync_verify,
 )
-from vault_workspaces import (  # noqa: E402
+from scripts.vault_workspaces import (  # noqa: E402
     VaultWorkspaceError,
     VaultWorkspaceSecurityError,
     create_vault,
@@ -157,7 +156,7 @@ from vault_workspaces import (  # noqa: E402
     switch_vault,
     update_vault_policy,
 )
-from web_clipper import (  # noqa: E402
+from scripts.web_clipper import (  # noqa: E402
     ClipperError,
     ClipperSecurityError,
     create_clipper_pairing,
@@ -169,285 +168,26 @@ from web_clipper import (  # noqa: E402
     revoke_clipper_pairing,
 )
 
-OWNER_HEADER = "X-Owner-Token"
-MIN_OWNER_TOKEN_LEN = 32
-MAX_SSE_SECONDS = 180
-
-OWNER_MAX_AUTH_FAILURES = 10
-OWNER_LOCKOUT_SECONDS = 60.0
-CAPTURE_MAX_WRITES_PER_MIN = 180
-CAPTURE_WINDOW_SECONDS = 60.0
-
-_OWNER_RATE_LOCK = threading.Lock()
-_OWNER_AUTH_FAILURES: dict[str, list[float]] = {}
-_CAPTURE_WRITE_TIMESTAMPS: dict[str, list[float]] = {}
-_ENV_VAR_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
-_ATOM_SUMMARY_CACHE_MAX = 8192
-_ATOM_SUMMARY_CACHE_LOCK = threading.Lock()
-_ATOM_SUMMARY_BY_SHA: dict[str, dict[str, object]] = {}
-
-
-# ─── Owner credential & rate guards ──────────────────────────────────────────
-
-def default_owner_token_path() -> Path:
-    override = (os.environ.get("BRAIN_OWNER_TOKEN_FILE") or "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    sec_override = (
-        os.environ.get("BRAIN_SECURITY_STATE_DIR")
-        or os.environ.get("SECOND_BRAIN_SECURITY_DIR")
-        or ""
-    ).strip()
-    if sec_override:
-        return Path(sec_override).expanduser().resolve() / "owner-token"
-    cfg_sec = getattr(_config, "security_state_dir", None)
-    if callable(cfg_sec):
-        return Path(cfg_sec()).expanduser().resolve() / "owner-token"
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
-    elif os.environ.get("XDG_STATE_HOME"):
-        base = Path(os.environ["XDG_STATE_HOME"]).expanduser()
-    else:
-        base = Path.home() / ".local" / "state"
-    return base / "SecondBrain" / "security" / "owner-token"
-
-
-_JOBS_LOCK = threading.Lock()
-_JOBS: dict[str, dict[str, object]] = {}
-
-
-def _start_operator_job(kind: str, script_name: str, extra_args: list[str], *, brain_dir: str) -> dict[str, object]:
-    import subprocess
-    import tempfile
-
-    scripts_dir = Path(__file__).resolve().parent
-    script_path = scripts_dir / script_name
-    if not script_path.is_file():
-        raise FileNotFoundError(f"Operator script not found: {script_name}")
-    job_id = f"job-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
-    rec: dict[str, object] = {
-        "job_id": job_id,
-        "kind": kind,
-        "status": "running",
-        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "returncode": None,
-        "output_tail": "",
-    }
-    with _JOBS_LOCK:
-        if len(_JOBS) > 64:
-            oldest = next(iter(_JOBS))
-            _JOBS.pop(oldest, None)
-        _JOBS[job_id] = rec
-
-    writable_cwd = str(Path(brain_dir).resolve().parent) if os.access(str(Path(brain_dir).resolve().parent), os.W_OK) else tempfile.gettempdir()
-    env = dict(os.environ)
-    env["BRAIN_VAULT_DIR"] = str(brain_dir)
-
-    def _runner() -> None:
-        try:
-            proc = subprocess.run(
-                [sys.executable, str(script_path), *extra_args],
-                cwd=writable_cwd,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=900,
-                check=False,
-            )
-            combined = ((proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")).strip()
-            with _JOBS_LOCK:
-                rec["returncode"] = int(proc.returncode)
-                rec["status"] = "completed" if proc.returncode == 0 else "failed"
-                rec["output_tail"] = combined[-8000:]
-        except subprocess.TimeoutExpired:
-            with _JOBS_LOCK:
-                rec["returncode"] = -1
-                rec["status"] = "failed"
-                rec["output_tail"] = "Job timed out after 900 seconds."
-        except Exception as exc:
-            with _JOBS_LOCK:
-                rec["returncode"] = -1
-                rec["status"] = "failed"
-                rec["output_tail"] = f"Job error: {exc}"
-
-    t = threading.Thread(target=_runner, daemon=True)
-    t.start()
-    t.join(timeout=1.5)
-    with _JOBS_LOCK:
-        return dict(rec)
-
-
-def ensure_owner_token(path: Path | None = None) -> str:
-    """Return the owner token, creating it (owner-only ACL / 0600) on first use."""
-    target = (path or default_owner_token_path()).expanduser().resolve()
-    existing = get_owner_token(target)
-    if existing:
-        return existing
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if _is_reparse_or_link(str(target.parent)) or (os.path.lexists(target) and _is_reparse_or_link(str(target))):
-        raise PermissionError("Refusing to write owner token through a symlink or junction.")
-    token = secrets.token_urlsafe(32)
-    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".owner-token-", suffix=".tmp")
-    try:
-        os.write(fd, (token + "\n").encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, target)
-    restrict_security_file_permissions(target)
-    return token
-
-
-def get_owner_token(path: Path | None = None) -> str | None:
-    if path is None:
-        env_tok = (os.environ.get("BRAIN_OWNER_TOKEN") or "").strip()
-        if env_tok:
-            return env_tok if len(env_tok) >= MIN_OWNER_TOKEN_LEN else None
-    target = path or default_owner_token_path()
-    if not os.path.lexists(str(target)):
-        return None
-    if _is_reparse_or_link(str(target)) or (
-        os.path.lexists(str(Path(target).parent)) and _is_reparse_or_link(str(Path(target).parent))
-    ):
-        return None
-    try:
-        value = read_bounded_security_file(Path(target), max_bytes=4096).strip()
-    except OSError:
-        return None
-    return value if len(value) >= MIN_OWNER_TOKEN_LEN else None
-
-
-def reset_owner_rate_limiter() -> None:
-    with _OWNER_RATE_LOCK:
-        _OWNER_AUTH_FAILURES.clear()
-        _CAPTURE_WRITE_TIMESTAMPS.clear()
-
-
-def _record_owner_failure(client_key: str) -> bool:
-    """Record a failed non-empty X-Owner-Token attempt; return True when >10 failures occur within 60s."""
-    now = time.monotonic()
-    cutoff = now - OWNER_LOCKOUT_SECONDS
-    with _OWNER_RATE_LOCK:
-        recent = [ts for ts in _OWNER_AUTH_FAILURES.get(client_key, []) if ts > cutoff]
-        if len(recent) >= OWNER_MAX_AUTH_FAILURES:
-            _OWNER_AUTH_FAILURES[client_key] = recent
-            return True
-        recent.append(now)
-        _OWNER_AUTH_FAILURES[client_key] = recent
-        return False
-
-
-def _clear_owner_failures(client_key: str) -> None:
-    with _OWNER_RATE_LOCK:
-        _OWNER_AUTH_FAILURES.pop(client_key, None)
-
-
-def check_capture_rate_limit(client_key: str) -> bool:
-    """Allow up to CAPTURE_MAX_WRITES_PER_MIN writes per 60s window for agent-callable capture routes."""
-    now = time.monotonic()
-    cutoff = now - CAPTURE_WINDOW_SECONDS
-    with _OWNER_RATE_LOCK:
-        recent = [ts for ts in _CAPTURE_WRITE_TIMESTAMPS.get(client_key, []) if ts > cutoff]
-        if len(recent) >= CAPTURE_MAX_WRITES_PER_MIN:
-            _CAPTURE_WRITE_TIMESTAMPS[client_key] = recent
-            return False
-        recent.append(now)
-        _CAPTURE_WRITE_TIMESTAMPS[client_key] = recent
-        return True
-
-
-def verify_owner_token(
-    header_value: str | None,
-    expected_token: str | None,
-    *,
-    client_ip: str | None = None,
-    brain_dir: str | None = None,
-    endpoint: str = "/v1/owner-auth",
-    method: str = "AUTH",
-    record_failure: bool = True,
-    audit_fn: Callable[[str, str, str, int], None] | None = None,
-) -> bool:
-    """Constant-time X-Owner-Token verification with optional brute-force tracking & auditing."""
-    supplied = (header_value or "").strip() if isinstance(header_value, str) else ""
-    if not supplied:
-        return False
-    expected = (expected_token or "").strip() if isinstance(expected_token, str) else ""
-    matched = (
-        len(expected) >= MIN_OWNER_TOKEN_LEN
-        and hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
-    )
-    if matched:
-        if client_ip and record_failure:
-            _clear_owner_failures(client_ip)
-        return True
-    if record_failure:
-        throttled = _record_owner_failure(client_ip or "127.0.0.1")
-        if brain_dir and audit_fn is not None:
-            audit_fn(brain_dir, endpoint, method, 429 if throttled else 403)
-    return False
-
-
-def owner_authorized(header_value: str | None, token_path: Path | None = None) -> bool:
-    return verify_owner_token(header_value, get_owner_token(token_path), record_failure=False)
-
-
-def owner_bearer_attestation(handler, rt, actor: str) -> dict[str, str]:
-    """Bind an owner-token proof to an actor. The raw token is checked and then dropped from the audit log."""
-    raw = handler.headers.get(OWNER_HEADER)
-    supplied = raw.strip() if isinstance(raw, str) else ""
-    expected = getattr(rt, "owner_token", None)
-    if not expected:
-        expected = get_owner_token(getattr(rt, "owner_token_path", None)) or ""
-    token_path = getattr(rt, "owner_token_path", None)
-    return {
-        "method": "owner_bearer_token",
-        "actor": str(actor or "").strip(),
-        "token": supplied,
-        "expected_token": str(expected),
-        "token_path": str(token_path) if token_path else "",
-    }
-
-
-def evaluate_request_owner_auth(
-    handler,
-    rt,
-    *,
-    path: str,
-    method: str,
-    audit_fn: Callable[[str, str, str, int], None],
-) -> tuple[bool, bool, bool]:
-    """Evaluate X-Owner-Token once per HTTP request.
-
-    Returns (is_owner, throttled_429, had_failed_header).
-    Caches per request headers object so memory_api.py and api_product.py never double-count.
-    """
-    cache_key = id(handler.headers)
-    cached = getattr(handler, "_owner_auth_eval_cache", None)
-    if isinstance(cached, tuple) and len(cached) == 4 and cached[0] == cache_key:
-        return cached[1], cached[2], cached[3]
-
-    raw_hdr = handler.headers.get(OWNER_HEADER)
-    supplied = raw_hdr.strip() if isinstance(raw_hdr, str) else ""
-    expected = getattr(rt, "owner_token", None)
-    if expected is None:
-        expected = get_owner_token(getattr(rt, "owner_token_path", None))
-    client_ip = handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1"
-
-    if not supplied:
-        res = (False, False, False)
-    elif verify_owner_token(supplied, expected, record_failure=False):
-        _clear_owner_failures(client_ip)
-        res = (True, False, False)
-    else:
-        throttled = _record_owner_failure(client_ip)
-        res = (False, throttled, True)
-
-    handler._owner_auth_eval_cache = (cache_key, res[0], res[1], res[2])
-    if res[1]:
-        audit_fn(rt.brain_dir, path, method, 429)
-    return res
+from scripts.api_owner_auth import (
+    CAPTURE_MAX_WRITES_PER_MIN,
+    CAPTURE_WINDOW_SECONDS,
+    MIN_OWNER_TOKEN_LEN,
+    OWNER_HEADER,
+    OWNER_LOCKOUT_SECONDS,
+    OWNER_MAX_AUTH_FAILURES,
+    _JOBS,
+    _JOBS_LOCK,
+    _start_operator_job,
+    check_capture_rate_limit,
+    default_owner_token_path,
+    ensure_owner_token,
+    evaluate_request_owner_auth,
+    get_owner_token,
+    owner_authorized,
+    owner_bearer_attestation,
+    reset_owner_rate_limiter,
+    verify_owner_token,
+)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -723,8 +463,8 @@ def _sync_lexical_after_atom_mutation(rt, filenames: list[str]) -> None:
     if not idx_path or not os.path.isfile(idx_path):
         return
     try:
-        from atom_mutator import review_lock
-        from lexical_store import upsert_lexical_atoms
+        from scripts.atom_mutator import review_lock
+        from scripts.lexical_store import upsert_lexical_atoms
 
         lock_path = os.path.join(os.path.dirname(os.path.abspath(idx_path)), "writer.lock")
         with review_lock(lock_path):
@@ -986,7 +726,7 @@ def _is_live_preference_atom(fname: object, rt) -> bool:
 
 def _live_active_playbook_report(fname: object, rt):
     """Verify live Playbook integrity and return PlaybookIntegrityReport iff valid and active."""
-    from skill_playbooks import verify_playbook_integrity
+    from scripts.skill_playbooks import verify_playbook_integrity
 
     raw_name = str(fname or "").strip()
     if not raw_name:
@@ -1022,7 +762,7 @@ def _prove_leaf_fallback(
     atoms_dir: str,
     playbooks_dir: str,
 ) -> dict[str, object]:
-    import vault_ledger
+    import scripts.vault_ledger as vault_ledger
 
     parts = [p for p in leaf_ref.split("/") if p]
     candidates: list[str] = []
@@ -1163,7 +903,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
     _api_mod = sys.modules.get("memory_api") or sys.modules.get("scripts.memory_api") or sys.modules.get("__main__")
     _audit_fn = getattr(_api_mod, "_audit_api_event", None)
     if _audit_fn is None:
-        from memory_api import _audit_api_event as _audit_fn
+        from scripts.memory_api import _audit_api_event as _audit_fn
 
     is_owner, throttled_429, had_failed_owner_hdr = evaluate_request_owner_auth(
         handler, rt, path=path, method=method, audit_fn=_audit_fn
@@ -1246,7 +986,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(201, res)
 
         if path == "/v1/notes/tasks" and method == "GET":
-            from notes_store import extract_action_items
+            from scripts.notes_store import extract_action_items
 
             proj = ((q.get("project") or [None])[0] or None)
             if proj and len(proj) > 120:
@@ -1330,7 +1070,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Multi-turn Chat Threads (owner-only) & Streaming Chat ──
         if path == "/v1/chat/personas" and method == "GET":
-            from chat_threads import BEHAVIOR_MODES, WORK_MODES, list_persona_profiles
+            from scripts.chat_threads import BEHAVIOR_MODES, WORK_MODES, list_persona_profiles
 
             return send(
                 200,
@@ -1344,7 +1084,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/chat/threads" and method == "GET":
             if not owner_only():
                 return True
-            from chat_threads import list_chat_threads
+            from scripts.chat_threads import list_chat_threads
 
             limit = _parse_bounded_int(q, "limit", default=50, min_val=1, max_val=200)
             offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
@@ -1356,7 +1096,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/chat/threads" and method == "POST":
             if not owner_only():
                 return True
-            from chat_threads import create_chat_thread
+            from scripts.chat_threads import create_chat_thread
 
             created = create_chat_thread(
                 title=_str(body, "title", max_len=160, required=False),
@@ -1377,7 +1117,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path.startswith("/v1/chat/threads/"):
             if not owner_only():
                 return True
-            from chat_threads import (
+            from scripts.chat_threads import (
                 delete_chat_thread,
                 get_chat_thread,
                 pin_turn_to_note,
@@ -1418,8 +1158,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(405, {"error": "Method not allowed."})
 
         if path == "/v1/chat/stream" and method == "POST":
-            from chat_threads import get_chat_thread
-            from streaming_chat import ChatPaths, ChatStreamRequest, chat_events
+            from scripts.chat_threads import get_chat_thread
+            from scripts.streaming_chat import ChatPaths, ChatStreamRequest, chat_events
 
             chat_payload = dict(body)
             if "mode" not in chat_payload or chat_payload.get("mode") is None or (
@@ -1492,7 +1232,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     stream_sem.release()
 
         if path == "/v1/chat/warmup" and method == "POST":
-            from streaming_chat import warmup
+            from scripts.streaming_chat import warmup
 
             try:
                 return send(200, warmup(rt.policy_path))
@@ -1505,7 +1245,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/cognitive/feedback" and method == "POST":
             if not owner_only():
                 return True
-            from cognitive_core import record_atom_feedback
+            from scripts.cognitive_core import record_atom_feedback
 
             raw_atom = body.get("atom_filename") if "atom_filename" in body else body.get("atom_id")
             if not isinstance(raw_atom, str) or not raw_atom.strip() or len(raw_atom) > 200:
@@ -1611,14 +1351,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/atoms" and method == "GET":
-            from atom_mutator import review_lock
-            from lexical_store import (
+            from scripts.atom_mutator import review_lock
+            from scripts.lexical_store import (
                 lexical_index_is_current,
                 list_indexed_atoms_fast,
                 sync_lexical_index,
                 tokenize,
             )
-            from recall import project_tags_match
+            from scripts.recall import project_tags_match
 
             limit = _parse_bounded_int(q, "limit", default=200, min_val=1, max_val=500)
             offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
@@ -1653,7 +1393,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
             matching: list[dict[str, object]] = []
             if use_fast_index:
-                from atom_mutator import decision_log_path, latest_decisions_by_atom
+                from scripts.atom_mutator import decision_log_path, latest_decisions_by_atom
 
                 canon_atoms_dir = os.path.realpath(rt.atoms_dir)
                 try:
@@ -1764,7 +1504,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/atoms/duplicates" and method == "GET":
             if not owner_only():
                 return True
-            from recall import suggest_duplicate_atoms
+            from scripts.recall import suggest_duplicate_atoms
 
             raw_dups = suggest_duplicate_atoms(
                 rt.atoms_dir,
@@ -1867,7 +1607,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     },
                 )
 
-            from review_details import atom_review_details
+            from scripts.review_details import atom_review_details
 
             details = atom_review_details(
                 raw_text,
@@ -2010,7 +1750,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/inbox/queue" and method == "GET":
             if not owner_only():
                 return True
-            from inbox_workflow import list_inbox_items
+            from scripts.inbox_workflow import list_inbox_items
 
             items = [
                 {**asdict(i), "risk_flags": list(i.risk_flags)}
@@ -2025,7 +1765,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path in {"/v1/inbox/promote", "/v1/inbox/reject"} and method == "POST":
             if not owner_only():
                 return True
-            from inbox_workflow import promote_inbox_item, reject_inbox_item
+            from scripts.inbox_workflow import promote_inbox_item, reject_inbox_item
 
             fname = _str(body, "filename", max_len=200)
             sha = _str(body, "expected_sha256", max_len=64)
@@ -2059,7 +1799,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/sources/queue" and method == "GET":
             if not owner_only():
                 return True
-            from source_review import list_source_queue
+            from scripts.source_review import list_source_queue
 
             items = list_source_queue(rt.brain_dir)
             return send(200, {"total": len(items), "items": items})
@@ -2067,7 +1807,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/sources/approve" and method == "POST":
             if not owner_only():
                 return True
-            from source_review import approve_sources
+            from scripts.source_review import approve_sources
 
             actor = _str(body, "actor", max_len=120)
             selected = body.get("items")
@@ -2086,7 +1826,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/sources/approve-clean" and method == "POST":
             if not owner_only():
                 return True
-            from source_review import approve_clean_sources
+            from scripts.source_review import approve_clean_sources
 
             actor = _str(body, "actor", max_len=120)
             result = approve_clean_sources(
@@ -2099,7 +1839,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/sources/search" and method == "POST":
             if not owner_only():
                 return True
-            from source_review import search_approved_sources
+            from scripts.source_review import search_approved_sources
 
             hits = search_approved_sources(
                 _str(body, "query", max_len=500),
@@ -2114,7 +1854,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             fname = unquote(path[len("/v1/inbox/"):]).strip()
             if not fname or "/" in fname or "\\" in fname:
                 return send(404, {"error": "Inbox item not found."})
-            from inbox_workflow import inspect_inbox_item
+            from scripts.inbox_workflow import inspect_inbox_item
 
             item_doc = inspect_inbox_item(
                 fname,
@@ -2129,7 +1869,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/playbooks/candidates" and method == "GET":
             if not owner_only():
                 return True
-            from skill_playbooks import _claim_grounding_units, inspect_skill_candidates
+            from scripts.skill_playbooks import _claim_grounding_units, inspect_skill_candidates
 
             raw_cands = inspect_skill_candidates(
                 brain_dir=rt.brain_dir,
@@ -2155,7 +1895,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/playbooks/promote" and method == "POST":
             if not owner_only():
                 return True
-            from skill_playbooks import promote_skill_playbook
+            from scripts.skill_playbooks import promote_skill_playbook
 
             exp_pb_sha = body.get("expected_playbook_sha256")
             if exp_pb_sha is not None:
@@ -2189,7 +1929,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             pb_filename, _, pb_action = rest.rpartition("/")
             if pb_action != "deprecate" or not pb_filename:
                 return send(404, {"error": "Unknown playbook action."})
-            from skill_playbooks import deprecate_skill_playbook
+            from scripts.skill_playbooks import deprecate_skill_playbook
 
             res = deprecate_skill_playbook(
                 normalize_markdown_filename(pb_filename),
@@ -2205,7 +1945,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/hosts" and method == "GET":
             if not owner_only():
                 return True
-            import host_adapters
+            import scripts.host_adapters as host_adapters
 
             load_fn = getattr(host_adapters, "load_host_sharing_policy", None) or host_adapters.load_host_policies
             policies = load_fn(rt.policy_path)
@@ -2222,8 +1962,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/hosts" and method == "POST":
             if not owner_only():
                 return True
-            import host_adapters
-            from recall import normalize_project_tag
+            import scripts.host_adapters as host_adapters
+            from scripts.recall import normalize_project_tag
 
             hid = _str(body, "host_id", max_len=48, required=True).strip().lower()
             prov = _str(body, "provider", max_len=32, required=True).strip()
@@ -2267,7 +2007,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if not owner_only():
                 return True
             host_id = unquote(path[len("/v1/hosts/"):]).strip().lower()
-            import host_adapters
+            import scripts.host_adapters as host_adapters
 
             deleted = host_adapters.delete_custom_host_policy(host_id, policy_path=rt.policy_path)
             if not deleted:
@@ -2280,8 +2020,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             host_id = unquote(path[len("/v1/hosts/"):]).strip()
             if not host_id or "/" in host_id or "\\" in host_id or len(host_id) > 64:
                 return send(404, {"error": "Invalid host_id."})
-            import host_adapters
-            from recall import normalize_project_tag
+            import scripts.host_adapters as host_adapters
+            from scripts.recall import normalize_project_tag
 
             set_fn = getattr(host_adapters, "set_host_sharing_profile", None)
             if callable(set_fn):
@@ -2327,7 +2067,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 else cur.default_model
             )
             if cur.provider == "ollama" and cur.transport == "local" and raw_model.strip().lower() == "auto":
-                from hardware_profile import resolve_active_local_generation_model
+                from scripts.hardware_profile import resolve_active_local_generation_model
 
                 raw_model = resolve_active_local_generation_model(fallback=_config.GEN_MODEL)
             new_model = host_adapters.validate_model_identifier(raw_model, provider=cur.provider)
@@ -2381,7 +2121,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/import" and method == "POST":
             if not owner_only():
                 return True
-            from bulk_import import import_folder
+            from scripts.bulk_import import import_folder
 
             stats = import_folder(
                 _str(body, "source_dir", max_len=1000),
@@ -2395,7 +2135,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/import/file" and method == "POST":
             if not owner_only():
                 return True
-            from bulk_import import import_file
+            from scripts.bulk_import import import_file
 
             file_path = _str(body, "path", max_len=1000)
             res = import_file(file_path, tags=tuple(_tags(body)), paths=paths)
@@ -2403,12 +2143,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Cryptographic Vault Merkle Ledger ──
         if path == "/v1/ledger/verify" and method == "GET":
-            from vault_ledger import verify_vault_ledger
+            from scripts.vault_ledger import verify_vault_ledger
 
             return send(200, verify_vault_ledger(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir, playbooks_dir=rt.playbooks_dir))
 
         if path == "/v1/ledger/history" and method == "GET":
-            from vault_ledger import verify_vault_ledger
+            from scripts.vault_ledger import verify_vault_ledger
 
             limit = _parse_bounded_int(q, "limit", default=100, min_val=1, max_val=500)
             offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
@@ -2429,7 +2169,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/ledger/leaves" and method == "GET":
-            from vault_ledger import compute_vault_merkle
+            from scripts.vault_ledger import compute_vault_merkle
 
             limit = _parse_bounded_int(q, "limit", default=200, min_val=1, max_val=500)
             offset = _parse_bounded_int(q, "offset", default=0, min_val=0, max_val=1_000_000)
@@ -2463,7 +2203,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/ledger/commit" and method == "POST":
             if not owner_only():
                 return True
-            from vault_ledger import commit_ledger_checkpoint
+            from scripts.vault_ledger import commit_ledger_checkpoint
 
             entry = commit_ledger_checkpoint(
                 brain_dir=rt.brain_dir,
@@ -2475,7 +2215,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(201, entry)
 
         if path == "/v1/ledger/verify-proof" and method == "POST":
-            from vault_ledger import verify_merkle_proof
+            from scripts.vault_ledger import verify_merkle_proof
 
             proof_obj = body.get("proof") if isinstance(body.get("proof"), dict) else body
             if not isinstance(proof_obj, dict):
@@ -2483,7 +2223,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, {"valid": bool(verify_merkle_proof(proof_obj))})
 
         if path.startswith("/v1/ledger/prove/") and method == "GET":
-            import vault_ledger
+            import scripts.vault_ledger as vault_ledger
 
             raw_leaf = unquote(path[len("/v1/ledger/prove/"):]).strip().replace("\\", "/").lstrip("/")
             parts = [p for p in raw_leaf.split("/") if p]
@@ -2526,7 +2266,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     if pb_rep is None or pb_rep.sha256 != proof.get("file_sha256"):
                         return send(404, {"error": "Verified atom proof not found."})
                 elif rel_p.startswith("6-skills/"):
-                    from executable_skills import verify_executable_skill_integrity
+                    from scripts.executable_skills import verify_executable_skill_integrity
 
                     sk_fname = os.path.basename(rel_p)
                     sk_dir = getattr(rt, "skills_dir", None) or os.path.join(rt.brain_dir, "6-skills")
@@ -2545,7 +2285,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Contradiction & Drift Radar + Knowledge Graph ──
         if path == "/v1/graph/contradictions" and method == "GET":
-            from knowledge_graph import detect_contradictions
+            from scripts.knowledge_graph import detect_contradictions
 
             proj = ((q.get("project") or [None])[0] or None)
             if proj and len(proj) > 120:
@@ -2611,8 +2351,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, radar)
 
         if path == "/v1/graph/summary" and method == "GET":
-            from knowledge_graph import build_knowledge_graph
-            from memory_format import normalize_temporal_bound_str
+            from scripts.knowledge_graph import build_knowledge_graph
+            from scripts.memory_format import normalize_temporal_bound_str
 
             proj = ((q.get("project") or [None])[0] or None)
             if proj and len(proj) > 120:
@@ -2655,8 +2395,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, summary_payload)
 
         if path in {"/v1/graph/full", "/v1/graph"} and method == "GET":
-            from knowledge_graph import build_knowledge_graph
-            from memory_format import normalize_temporal_bound_str
+            from scripts.knowledge_graph import build_knowledge_graph
+            from scripts.memory_format import normalize_temporal_bound_str
 
             proj = ((q.get("project") or [None])[0] or None)
             if proj and len(proj) > 120:
@@ -2740,7 +2480,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path.startswith("/v1/graph/neighbors/") and method == "GET":
-            from knowledge_graph import graph_neighbors
+            from scripts.knowledge_graph import graph_neighbors
 
             raw_target = unquote(path[len("/v1/graph/neighbors/"):]).strip()
             if not raw_target or "/" in raw_target or "\\" in raw_target or len(raw_target) > 200:
@@ -2785,8 +2525,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, res)
 
         if path.startswith("/v1/graph/suggestions/") and method == "GET":
-            from knowledge_graph import suggest_atom_graph_links
-            from recall import project_tags_match
+            from scripts.knowledge_graph import suggest_atom_graph_links
+            from scripts.recall import project_tags_match
 
             raw_target = unquote(path[len("/v1/graph/suggestions/") :]).strip()
             if not raw_target or "/" in raw_target or "\\" in raw_target or len(raw_target) > 200:
@@ -2825,7 +2565,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/graph/auto-link" and method == "POST":
             if not owner_only():
                 return True
-            from knowledge_graph import auto_link_vault_atoms
+            from scripts.knowledge_graph import auto_link_vault_atoms
 
             actor = _str(body, "actor", default="owner", max_len=120, required=False).strip() or "owner"
             proj = _str(body, "project_scope", max_len=120, required=False).strip() or None
@@ -2855,7 +2595,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/audit/sources" and method == "GET":
             if not owner_only():
                 return True
-            from audit_sources import audit_sources
+            from scripts.audit_sources import audit_sources
 
             reports = audit_sources(atoms_dir=rt.atoms_dir, brain_dir=rt.brain_dir, demote_stale=False)
             stale = [
@@ -2878,7 +2618,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/audit/sources/demote-stale" and method == "POST":
             if not owner_only():
                 return True
-            from audit_sources import audit_sources
+            from scripts.audit_sources import audit_sources
 
             actor = _str(body, "actor", max_len=120, required=False) or "owner"
             reports = audit_sources(
@@ -2905,7 +2645,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Time-Travel Snapshots, Diff, Recall & Verify ──
         if path == "/v1/snapshots" and method == "GET":
-            from time_travel import list_snapshots
+            from scripts.time_travel import list_snapshots
 
             snaps = list_snapshots(brain_dir=rt.brain_dir)
             return send(200, {"total": len(snaps), "count": len(snaps), "snapshots": snaps, "items": snaps})
@@ -2913,7 +2653,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/snapshots" and method == "POST":
             if not owner_only():
                 return True
-            from time_travel import create_snapshot
+            from scripts.time_travel import create_snapshot
 
             doc = create_snapshot(
                 label=_str(body, "label", max_len=160, required=False),
@@ -2925,7 +2665,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(201, doc)
 
         if path == "/v1/snapshots/diff" and method == "POST":
-            from time_travel import diff_snapshots
+            from scripts.time_travel import diff_snapshots
 
             res = diff_snapshots(
                 _str(body, "from_snapshot", max_len=120),
@@ -3064,8 +2804,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, res)
 
         if path == "/v1/snapshots/recall" and method == "POST":
-            from skill_playbooks import playbook_visible_in_scope
-            from time_travel import recall_at_snapshot
+            from scripts.skill_playbooks import playbook_visible_in_scope
+            from scripts.time_travel import recall_at_snapshot
 
             limit_key = "top_k" if "top_k" in body else "limit"
             top_k = _parse_json_int(
@@ -3122,7 +2862,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, res)
 
         if path == "/v1/snapshots/verify" and method == "POST":
-            from time_travel import verify_snapshot
+            from scripts.time_travel import verify_snapshot
 
             sid = _str(body, "snapshot_id", max_len=120)
             return send(200, verify_snapshot(sid, brain_dir=rt.brain_dir))
@@ -3585,7 +3325,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/sync/inbox-drop/export-recall" and method == "POST":
             if not owner_only():
                 return True
-            from inbox_drop import export_mobile_recall_index
+            from scripts.inbox_drop import export_mobile_recall_index
 
             res = export_mobile_recall_index(
                 brain_dir=rt.brain_dir,
@@ -3599,7 +3339,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/sync/inbox-drop/rotate-recall" and method == "POST":
             if not owner_only():
                 return True
-            from inbox_drop import export_mobile_recall_index, rotate_mobile_recall_key
+            from scripts.inbox_drop import export_mobile_recall_index, rotate_mobile_recall_key
 
             opt_vid = _str(body, "vault_id", max_len=64, required=False).strip() or None
             rot = rotate_mobile_recall_key(
@@ -3950,7 +3690,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if not owner_only():
                 return True
             import base64 as _b64
-            from ingest_multimodal import MAX_API_MEDIA_UPLOAD_BYTES, ingest_uploaded_media_bytes
+            from scripts.ingest_multimodal import MAX_API_MEDIA_UPLOAD_BYTES, ingest_uploaded_media_bytes
 
             fname = _str(body, "filename", max_len=255, required=True).strip()
             raw_media = body.get("_raw_media_bytes")
@@ -3979,7 +3719,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/ingest/video-file" and method == "POST":
             if not owner_only():
                 return True
-            from ingest_multimodal import ingest_local_video_file
+            from scripts.ingest_multimodal import ingest_local_video_file
 
             video_fp = _str(body, "filepath", max_len=1000, required=True).strip()
             res = ingest_local_video_file(video_fp, brain_dir=rt.brain_dir)
@@ -4046,8 +3786,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path in {"/v1/daemon/status", "/v1/system"} and method == "GET":
             if not owner_only():
                 return True
-            from index_manifest import index_manifest_is_current, load_index_manifest
-            from lexical_store import lexical_index_is_current
+            from scripts.index_manifest import index_manifest_is_current, load_index_manifest
+            from scripts.lexical_store import lexical_index_is_current
 
             lex_ok = lexical_index_is_current(rt.atoms_dir, rt.lexical_index_path)
             manifest = load_index_manifest(rt.chroma_path) if os.path.isdir(rt.chroma_path) else None
@@ -4095,7 +3835,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/daemon/sync-once" and method == "POST":
             if not owner_only():
                 return True
-            from watchdog_daemon import sync_notes_and_atoms_once
+            from scripts.watchdog_daemon import sync_notes_and_atoms_once
 
             notes_d = os.path.join(rt.brain_dir, "notes")
             sync_res = sync_notes_and_atoms_once(
@@ -4156,7 +3896,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Stage 4 Executable Skills (Sandboxed Runtime, Kill-Switch & Audit Trail) ──
         if path == "/v1/skills" and method == "GET":
-            from executable_skills import (
+            from scripts.executable_skills import (
                 get_skill_kill_switch_status,
                 list_executable_skills,
                 skill_visible_in_scope,
@@ -4192,7 +3932,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/skills/candidates" and method == "GET":
             if not owner_only():
                 return True
-            from executable_skills import inspect_executable_skill_candidates
+            from scripts.executable_skills import inspect_executable_skill_candidates
 
             sk_dir = getattr(rt, "skills_dir", None) or os.path.join(rt.brain_dir, "6-skills")
             sec_dir = getattr(rt, "security_dir", None)
@@ -4210,7 +3950,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/skills/executions" and method == "GET":
             if not owner_only():
                 return True
-            from executable_skills import list_skill_executions, verify_skill_execution_audit_chain
+            from scripts.executable_skills import list_skill_executions, verify_skill_execution_audit_chain
 
             skill_filter = ((q.get("skill_id") or [None])[0] or None)
             limit_val = _parse_bounded_int(q, "limit", default=50, min_val=1, max_val=500)
@@ -4221,7 +3961,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/skills/promote" and method == "POST":
             if not owner_only():
                 return True
-            from executable_skills import promote_playbook_to_executable_skill
+            from scripts.executable_skills import promote_playbook_to_executable_skill
 
             sk_dir = getattr(rt, "skills_dir", None) or os.path.join(rt.brain_dir, "6-skills")
             sec_dir = getattr(rt, "security_dir", None)
@@ -4260,7 +4000,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/skills/kill-switch" and method == "POST":
             if not owner_only():
                 return True
-            from executable_skills import set_skill_kill_switch
+            from scripts.executable_skills import set_skill_kill_switch
 
             sec_dir = getattr(rt, "security_dir", None)
             res = set_skill_kill_switch(
@@ -4283,7 +4023,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 sk_dir = getattr(rt, "skills_dir", None) or os.path.join(rt.brain_dir, "6-skills")
                 sec_dir = getattr(rt, "security_dir", None)
                 if sk_parts[1] == "execute":
-                    from executable_skills import execute_promoted_skill
+                    from scripts.executable_skills import execute_promoted_skill
 
                     raw_inputs = body.get("inputs")
                     if raw_inputs is not None and not isinstance(raw_inputs, dict):
@@ -4305,7 +4045,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     )
                     return send(200, exec_res)
                 if sk_parts[1] == "revoke":
-                    from executable_skills import revoke_executable_skill
+                    from scripts.executable_skills import revoke_executable_skill
 
                     rev_res = revoke_executable_skill(
                         sk_id,
@@ -4321,7 +4061,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/mobile/status" and method == "GET":
             if not owner_only():
                 return True
-            from mobile_vault_client import list_mobile_vault_pairings
+            from scripts.mobile_vault_client import list_mobile_vault_pairings
 
             sec_dir = getattr(rt, "security_dir", None) or getattr(rt, "sync_state_dir", None)
             return send(200, list_mobile_vault_pairings(brain_dir=rt.brain_dir, state_dir=sec_dir))
@@ -4329,7 +4069,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/mobile/pair" and method == "POST":
             if not owner_only():
                 return True
-            from mobile_vault_client import create_mobile_vault_pairing
+            from scripts.mobile_vault_client import create_mobile_vault_pairing
 
             sec_dir = getattr(rt, "security_dir", None) or getattr(rt, "sync_state_dir", None)
             res = create_mobile_vault_pairing(
@@ -4349,7 +4089,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/mobile/revoke" and method == "POST":
             if not owner_only():
                 return True
-            from mobile_vault_client import revoke_mobile_vault_pairing
+            from scripts.mobile_vault_client import revoke_mobile_vault_pairing
 
             sec_dir = getattr(rt, "security_dir", None) or getattr(rt, "sync_state_dir", None)
             pid = _str(body, "pairing_id", max_len=64)
@@ -4358,7 +4098,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/mobile/export" and method == "POST":
             if not owner_only():
                 return True
-            from mobile_vault_client import export_mobile_vault_client_bundle
+            from scripts.mobile_vault_client import export_mobile_vault_client_bundle
 
             default_out = _default_mobile_export_dir(rt)
             out_d = _str(body, "out_dir", max_len=1000, required=False, default=default_out).strip() or default_out
@@ -4366,7 +4106,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Local Creative Media Generation Studio (Offline Image & Video) ──
         if path == "/v1/media/status" and method == "GET":
-            from creative_media import get_creative_media_status
+            from scripts.creative_media import get_creative_media_status
 
             st = get_creative_media_status()
             return send(200, st.as_dict())
@@ -4374,7 +4114,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/media/gallery" and method == "GET":
             if not owner_only():
                 return True
-            from creative_media import list_generated_media
+            from scripts.creative_media import list_generated_media
 
             mtype = ((q.get("media_type") or [None])[0] or None)
             proj = ((q.get("project") or [None])[0] or None)
@@ -4387,7 +4127,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path.startswith("/v1/media/file/") and method == "GET":
             if not owner_only():
                 return True
-            from creative_media import get_generated_media_file
+            from scripts.creative_media import get_generated_media_file
 
             media_id = unquote(path[len("/v1/media/file/") :]).strip()
             rec = get_generated_media_file(brain_dir=rt.brain_dir, media_id=media_id, verify_sha256=True)
@@ -4420,7 +4160,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/media/image" and method == "POST":
             if not owner_only():
                 return True
-            from creative_media import generate_local_image
+            from scripts.creative_media import generate_local_image
 
             seed_val = _parse_json_int(body, "seed", default=None, allow_none=True)
             width_val = _parse_json_int(body, "width", default=768)
@@ -4455,7 +4195,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/media/video" and method == "POST":
             if not owner_only():
                 return True
-            from creative_media import generate_local_video
+            from scripts.creative_media import generate_local_video
 
             seed_val = _parse_json_int(body, "seed", default=None, allow_none=True)
             width_val = _parse_json_int(body, "width", default=640)
@@ -4492,14 +4232,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Jarvis Orchestrator, 5-Panelist Design Critique & Skill Pack Importer (owner) ──
         if path == "/v1/design/presets" and method == "GET":
-            from design_critique import get_design_presets
+            from scripts.design_critique import get_design_presets
 
             return send(200, {"presets": get_design_presets()})
 
         if path == "/v1/design/critique" and method == "POST":
             if not owner_only():
                 return True
-            from design_critique import run_five_panel_critique
+            from scripts.design_critique import run_five_panel_critique
 
             files_raw = body.get("files") if isinstance(body.get("files"), list) else []
             artifact_txt = _str(body, "artifact_text", default="", max_len=250_000, required=False)
@@ -4523,14 +4263,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/orchestrator/status" and method == "GET":
             if not owner_only():
                 return True
-            from jarvis_orchestrator import orchestrator_status
+            from scripts.jarvis_orchestrator import orchestrator_status
 
             return send(200, orchestrator_status())
 
         if path == "/v1/orchestrator/open-webui-tool" and method == "GET":
             if not owner_only():
                 return True
-            from jarvis_orchestrator import export_open_webui_tool
+            from scripts.jarvis_orchestrator import export_open_webui_tool
 
             srv_addr = getattr(getattr(handler, "server", None), "server_address", None)
             live_port = (
@@ -4551,7 +4291,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/orchestrator/n8n/trigger" and method == "POST":
             if not owner_only():
                 return True
-            from jarvis_orchestrator import trigger_n8n_workflow
+            from scripts.jarvis_orchestrator import trigger_n8n_workflow
 
             wh_url = _str(body, "webhook_url", max_len=500, required=True)
             pl_val = body.get("payload") if isinstance(body.get("payload"), dict) else {}
@@ -4560,7 +4300,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/orchestrator/openhands/dispatch" and method == "POST":
             if not owner_only():
                 return True
-            from jarvis_orchestrator import dispatch_openhands_task
+            from scripts.jarvis_orchestrator import dispatch_openhands_task
 
             return send(
                 200,
@@ -4578,7 +4318,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/orchestrator/appflowy/sync" and method == "POST":
             if not owner_only():
                 return True
-            from jarvis_orchestrator import sync_appflowy_board_tasks
+            from scripts.jarvis_orchestrator import sync_appflowy_board_tasks
 
             bt_raw = body.get("tasks") if isinstance(body.get("tasks"), list) else None
             return send(
@@ -4593,14 +4333,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/packs" and method == "GET":
             if not owner_only():
                 return True
-            from skill_pack_importer import list_imported_packs
+            from scripts.skill_pack_importer import list_imported_packs
 
             return send(200, list_imported_packs(brain_dir=rt.brain_dir))
 
         if path == "/v1/packs/import" and method == "POST":
             if not owner_only():
                 return True
-            from skill_pack_importer import discover_default_skill_packs, import_skill_pack
+            from scripts.skill_pack_importer import discover_default_skill_packs, import_skill_pack
 
             pack_name = _str(body, "pack_name", max_len=64, required=True)
             src_dir = _str(body, "source_dir", max_len=1000, required=False).strip() or (
@@ -4615,14 +4355,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path in {"/v1/screen/config", "/v1/screen/status"} and method == "GET":
             if not owner_only():
                 return True
-            from screen_memory import load_screen_config
+            from scripts.screen_memory import load_screen_config
 
             return send(200, load_screen_config(state_dir=getattr(rt, "security_dir", None)))
 
         if path == "/v1/screen/config" and method == "POST":
             if not owner_only():
                 return True
-            from screen_memory import configure_screen_memory
+            from scripts.screen_memory import configure_screen_memory
 
             terms_raw = body.get("blocked_window_terms")
             terms_list = [str(t) for t in terms_raw] if isinstance(terms_raw, list) else None
@@ -4640,7 +4380,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/screen/search" and method == "GET":
             if not owner_only():
                 return True
-            from screen_memory import search_screen_memory
+            from scripts.screen_memory import search_screen_memory
 
             query_s = (q.get("query") or [""])[0]
             lim_s = _parse_bounded_int(q, "limit", default=12, min_val=1, max_val=50)
@@ -4649,7 +4389,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path in {"/v1/screen/capture", "/v1/screen/ingest"} and method == "POST":
             if not owner_only():
                 return True
-            from screen_memory import ingest_screen_frame
+            from scripts.screen_memory import ingest_screen_frame
 
             img_b64 = _str(body, "image_b64", max_len=16_000_000, required=True)
             try:
@@ -4671,7 +4411,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/screen/promote" and method == "POST":
             if not owner_only():
                 return True
-            from screen_memory import promote_capture_to_note
+            from scripts.screen_memory import promote_capture_to_note
 
             cid = _parse_json_int(body, "capture_id", default=None, allow_none=False)
             assert cid is not None
@@ -4680,14 +4420,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path in {"/v1/external-folders/config", "/v1/external-folders/status"} and method == "GET":
             if not owner_only():
                 return True
-            from external_indexer import load_external_config
+            from scripts.external_indexer import load_external_config
 
             return send(200, load_external_config(state_dir=getattr(rt, "security_dir", None)))
 
         if path == "/v1/external-folders/config" and method == "POST":
             if not owner_only():
                 return True
-            from external_indexer import configure_external_indexer
+            from scripts.external_indexer import configure_external_indexer
 
             return send(
                 200,
@@ -4703,7 +4443,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/external-folders/scan" and method == "POST":
             if not owner_only():
                 return True
-            from external_indexer import scan_external_folders
+            from scripts.external_indexer import scan_external_folders
 
             return send(
                 200,
@@ -4717,7 +4457,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/external-folders/search" and method == "GET":
             if not owner_only():
                 return True
-            from external_indexer import search_external_files
+            from scripts.external_indexer import search_external_files
 
             query_e = (q.get("query") or [""])[0]
             lim_e = _parse_bounded_int(q, "limit", default=12, min_val=1, max_val=50)
@@ -4734,7 +4474,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/openai/v1/models" and method == "GET":
-            from local_ai_proxy import handle_openai_models, load_proxy_config
+            from scripts.local_ai_proxy import handle_openai_models, load_proxy_config
 
             proxy_cfg = load_proxy_config(state_dir=getattr(rt, "security_dir", None))
             if not proxy_cfg.get("enabled"):
@@ -4747,7 +4487,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, handle_openai_models(policy_path=getattr(rt, "policy_path", None)))
 
         if path == "/v1/openai/v1/chat/completions" and method == "POST":
-            from local_ai_proxy import handle_openai_chat_completions, load_proxy_config
+            from scripts.local_ai_proxy import handle_openai_chat_completions, load_proxy_config
 
             proxy_cfg = load_proxy_config(state_dir=getattr(rt, "security_dir", None))
             if not proxy_cfg.get("enabled"):
@@ -4776,14 +4516,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/tunnel/status" and method == "GET":
             if not owner_only():
                 return True
-            from zero_trust_tunnel import tunnel_status
+            from scripts.zero_trust_tunnel import tunnel_status
 
             return send(200, tunnel_status(state_dir=getattr(rt, "security_dir", None)))
 
         if path == "/v1/tunnel/config" and method == "POST":
             if not owner_only():
                 return True
-            from zero_trust_tunnel import configure_tunnel
+            from scripts.zero_trust_tunnel import configure_tunnel
 
             return send(
                 200,
@@ -4804,8 +4544,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if not owner_only():
                 return True
             import importlib.util as _ilu
-            import ingest_multimodal as _im
-            from tts_engine import tts_status
+            import scripts.ingest_multimodal as _im
+            from scripts.tts_engine import tts_status
 
             probe_fn = getattr(_im, "probe_audio_transcription_backend", None)
             if callable(probe_fn):
@@ -4826,7 +4566,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/voice/speak" and method == "POST":
             if not owner_only():
                 return True
-            from tts_engine import TtsUnavailableError, synthesize_wav_bytes
+            from scripts.tts_engine import TtsUnavailableError, synthesize_wav_bytes
 
             raw_text = _str(body, "text", max_len=8000, required=True)
             voice_name = _str(body, "voice", default="af_heart", max_len=64, required=False) or "af_heart"
@@ -4862,7 +4602,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/voice/conversation-turn" and method == "POST":
             if not owner_only():
                 return True
-            from tts_engine import voice_conversation_turn
+            from scripts.tts_engine import voice_conversation_turn
 
             audio_b64 = _str(body, "audio_b64", max_len=24_000_000, required=True)
             try:
@@ -4896,7 +4636,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/runtime/speculative/status" and method == "GET":
             if not owner_only():
                 return True
-            from llama_cpp_runner import speculative_status
+            from scripts.llama_cpp_runner import speculative_status
 
             port_q = _parse_bounded_int(q, "port", default=0, min_val=0, max_val=65535)
             return send(
@@ -4910,7 +4650,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/runtime/speculative/start" and method == "POST":
             if not owner_only():
                 return True
-            from llama_cpp_runner import start_speculative_server
+            from scripts.llama_cpp_runner import start_speculative_server
 
             port_v = _parse_json_int(body, "port", default=8081) or 8081
             dmax = _parse_json_int(body, "draft_max", default=8) or 8
@@ -4933,14 +4673,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/runtime/speculative/stop" and method == "POST":
             if not owner_only():
                 return True
-            from llama_cpp_runner import stop_speculative_server
+            from scripts.llama_cpp_runner import stop_speculative_server
 
             return send(200, stop_speculative_server(state_dir=getattr(rt, "security_dir", None)))
 
         if path == "/v1/runtime/speculative/benchmark" and method == "POST":
             if not owner_only():
                 return True
-            from llama_cpp_runner import benchmark_speculative_server
+            from scripts.llama_cpp_runner import benchmark_speculative_server
 
             port_v = _parse_json_int(body, "port", default=None, allow_none=True)
             max_tok = _parse_json_int(body, "max_tokens", default=96) or 96
@@ -4965,7 +4705,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/cognitive/context-signal" and method == "POST":
             if not owner_only():
                 return True
-            from predictive_memory_bus import record_context_signal
+            from scripts.predictive_memory_bus import record_context_signal
 
             syms_raw = body.get("open_symbols")
             syms = [str(s) for s in syms_raw] if isinstance(syms_raw, list) else []
@@ -4987,12 +4727,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/cognitive/bus-status" and method == "GET":
             if not owner_only():
                 return True
-            from predictive_memory_bus import bus_status
+            from scripts.predictive_memory_bus import bus_status
 
             return send(200, bus_status(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir))
 
         if path == "/v1/recall/zoom" and method == "POST":
-            from fractal_zoom import zoom_retrieve
+            from scripts.fractal_zoom import zoom_retrieve
 
             query_z = _str(body, "query", max_len=1000, default="", required=False)
             lvl = _str(body, "target_level", max_len=8, default="L5", required=False).upper()
@@ -5015,7 +4755,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/cognitive/review-due" and method == "GET":
             if not owner_only():
                 return True
-            from cognitive_core import compute_knowledge_gravity_report
+            from scripts.cognitive_core import compute_knowledge_gravity_report
 
             as_of_v = (q.get("as_of") or [None])[0]
             return send(
@@ -5073,7 +4813,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/principles" and method == "GET":
-            from cognitive_distiller import list_distilled_artifacts
+            from scripts.cognitive_distiller import list_distilled_artifacts
 
             proj_p = _optional_project_scope((q.get("project") or [None])[0])
             req_active_only_p = ((q.get("active_only") or ["true"])[0]).strip().lower() not in {"false", "0", "no"}
@@ -5090,7 +4830,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, {"principles": rows_p})
 
         if path == "/v1/mental-models" and method == "GET":
-            from cognitive_distiller import list_distilled_artifacts
+            from scripts.cognitive_distiller import list_distilled_artifacts
 
             proj_m = _optional_project_scope((q.get("project") or [None])[0])
             req_active_only_m = ((q.get("active_only") or ["true"])[0]).strip().lower() not in {"false", "0", "no"}
@@ -5109,7 +4849,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/principles/distill" and method == "POST":
             if not owner_only():
                 return True
-            from cognitive_distiller import distill_cross_project_candidates
+            from scripts.cognitive_distiller import distill_cross_project_candidates
 
             _optional_project_scope(body.get("project"))
             return send(
@@ -5124,7 +4864,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         ):
             if not owner_only():
                 return True
-            from cognitive_distiller import promote_distilled_artifact
+            from scripts.cognitive_distiller import promote_distilled_artifact
 
             is_pr = path.startswith("/v1/principles/")
             prefix = "/v1/principles/" if is_pr else "/v1/mental-models/"
@@ -5151,7 +4891,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/concepts" and method == "GET":
-            from concept_graph import list_concepts
+            from scripts.concept_graph import list_concepts
 
             proj_c = _optional_project_scope((q.get("project") or [None])[0])
             lim_c = _parse_bounded_int(q, "limit", default=50, min_val=1, max_val=200)
@@ -5161,14 +4901,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path.startswith("/v1/concepts/") and method == "GET":
-            from concept_graph import get_concept
+            from scripts.concept_graph import get_concept
 
             cid_raw = unquote(path[len("/v1/concepts/") :]).strip()
             proj_c = _optional_project_scope((q.get("project") or [None])[0])
             return send(200, get_concept(cid_raw, project=proj_c, brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir))
 
         if path == "/v1/cognitive/debate" and method == "POST":
-            from cognitive_swarm import run_two_sided_debate
+            from scripts.cognitive_swarm import run_two_sided_debate
 
             topic_d = _str(body, "topic", max_len=1000, required=True)
             proj_d = _optional_project_scope(body.get("project"))
@@ -5178,7 +4918,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/cognitive/swarm" and method == "POST":
-            from cognitive_swarm import run_cognitive_swarm
+            from scripts.cognitive_swarm import run_cognitive_swarm
 
             goal_s = (
                 _str(body, "goal", max_len=1500, required=False).strip()
@@ -5205,7 +4945,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             return send(200, swarm_res)
 
         if path == "/v1/cognitive/simulate" and method == "POST":
-            from world_model_sim import simulate_change_impact
+            from scripts.world_model_sim import simulate_change_impact
 
             target_sim = _str(body, "target", max_len=260, required=True)
             hops_sim = _parse_json_int(body, "max_hops", default=3) or 3
@@ -5229,14 +4969,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/cognitive/self-model" and method == "GET":
             if not owner_only():
                 return True
-            from self_model_curiosity import evaluate_self_model_and_curiosity
+            from scripts.self_model_curiosity import evaluate_self_model_and_curiosity
 
             return send(200, evaluate_self_model_and_curiosity(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir))
 
         if path == "/v1/cognitive/self-model" and method == "POST":
             if not owner_only():
                 return True
-            from self_model_curiosity import upsert_learning_goals
+            from scripts.self_model_curiosity import upsert_learning_goals
 
             goals_raw = body.get("goals")
             if not isinstance(goals_raw, list):
@@ -5246,7 +4986,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/cognitive/curiosity" and method == "GET":
             if not owner_only():
                 return True
-            from self_model_curiosity import evaluate_self_model_and_curiosity
+            from scripts.self_model_curiosity import evaluate_self_model_and_curiosity
 
             _optional_project_scope((q.get("project") or [None])[0])
             res_sm = evaluate_self_model_and_curiosity(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir)
@@ -5255,14 +4995,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/cognitive/adr-status" and method == "GET":
             if not owner_only():
                 return True
-            from adr_gate import list_adr_states
+            from scripts.adr_gate import list_adr_states
 
             return send(200, {"adrs": list_adr_states(brain_dir=rt.brain_dir)})
 
         if path == "/v1/cognitive/adr-enable" and method == "POST":
             if not owner_only():
                 return True
-            from adr_gate import set_adr_status
+            from scripts.adr_gate import set_adr_status
 
             return send(
                 200,
@@ -5279,7 +5019,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/cognitive/replay" and method == "POST":
             if not owner_only():
                 return True
-            from episodic_replay import run_nightly_replay
+            from scripts.episodic_replay import run_nightly_replay
 
             date_val = _str(body, "date_str", default="", max_len=32, required=False).strip() or None
             if "write_inbox" in body:
@@ -5299,7 +5039,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/cognitive/route" and method == "POST":
-            from meta_router import classify_query, resolve_reasoning_profile
+            from scripts.meta_router import classify_query, resolve_reasoning_profile
 
             query_r = _str(body, "query", max_len=2000, required=True)
             req_prof = _str(body, "reasoning_profile", default="auto", max_len=32, required=False).strip() or "auto"
@@ -5320,7 +5060,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
 
         # ── Phase 5 / Epic 2E: Quantitative Reasoning, 4D Rubric & AlphaProof Nexus ──
         if path == "/v1/math/solve" and method == "POST":
-            from cgv_reasoner import solve_quantitative_problem
+            from scripts.cgv_reasoner import solve_quantitative_problem
 
             problem_m = _str(body, "problem", max_len=4000, required=True)
             vis_ocr = _str(body, "visual_ocr_text", default="", max_len=4000, required=False)
@@ -5343,8 +5083,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/math/rubric" and method == "POST":
-            from math_equivalence import extract_final_answer
-            from process_evaluator import score_reasoning_trace
+            from scripts.math_equivalence import extract_final_answer
+            from scripts.process_evaluator import score_reasoning_trace
 
             steps_r = body.get("steps")
             if steps_r is None and "trace" in body:
@@ -5369,7 +5109,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/proof/status" and method == "GET":
-            from formal_proof_search import _subgoal_cache_path, verify_lean_binary_available
+            from scripts.formal_proof_search import _subgoal_cache_path, verify_lean_binary_available
 
             lean_bin = verify_lean_binary_available()
             cache_p = _subgoal_cache_path(rt.brain_dir)
@@ -5387,7 +5127,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/proof/verify" and method == "POST":
             if not owner_only():
                 return True
-            from formal_proof_search import SafeVerifyError, run_test_lemmas, verify_spec_integrity
+            from scripts.formal_proof_search import SafeVerifyError, run_test_lemmas, verify_spec_integrity
 
             base_src = _str(body, "baseline_source", max_len=64000, required=True)
             cand_src = _str(body, "candidate_source", max_len=64000, required=True)
@@ -5405,7 +5145,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if not owner_only():
                 return True
             import hashlib as _hl
-            from formal_proof_search import (
+            from scripts.formal_proof_search import (
                 SafeVerifyError,
                 _detect_language,
                 _extract_skeleton_and_blocks,
@@ -5599,7 +5339,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         ValueError,
         NotADirectoryError,
     ) as exc:
-        from host_adapters import OutboundSecretBlockedError
+        from scripts.host_adapters import OutboundSecretBlockedError
 
         if isinstance(
             exc,

@@ -4,7 +4,23 @@
 # ///
 """Phase 3A tests: Context-profile & fitness ranking, owner-gated Playbooks, and grounded Executive Planner."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 from contextlib import ExitStack
 import hashlib
@@ -20,7 +36,6 @@ from unittest.mock import patch
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 class Phase3IsolatedTestCase(unittest.TestCase):
@@ -76,9 +91,9 @@ def _seed_atom(
     last_reviewed: str = "2026-11-14",
     approve: bool = True,
 ) -> tuple[Path, str]:
-    from atom_mutator import apply_review_transition
-    from evidence import find_evidence_anchor
-    from lexical_store import rebuild_lexical_index
+    from scripts.atom_mutator import apply_review_transition
+    from scripts.evidence import find_evidence_anchor
+    from scripts.lexical_store import rebuild_lexical_index
 
     raw_dir = brain_dir / "0-raw"
     atoms_dir = brain_dir / "2-atoms"
@@ -146,8 +161,8 @@ def _seed_atom(
 
 class ContextFitnessAndBoundedWorkingContextTests(Phase3IsolatedTestCase):
     def test_fitness_boost_correction_demotion_trust_invariance_and_bounded_assembler(self):
-        from cognitive_core import record_atom_feedback, record_grounded_answer_telemetry
-        from recall import RecallOptions, assemble_bounded_working_context, search_memory
+        from scripts.cognitive_core import record_atom_feedback, record_grounded_answer_telemetry
+        from scripts.recall import RecallOptions, assemble_bounded_working_context, search_memory
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -235,9 +250,9 @@ class ContextFitnessAndBoundedWorkingContextTests(Phase3IsolatedTestCase):
 
 class PlaybookPromotionAndStalenessTests(Phase3IsolatedTestCase):
     def test_cas_promotion_maturity_gate_symlink_defense_and_staleness_regating(self):
-        from atom_mutator import apply_atom_edit
-        from cognitive_core import record_atom_feedback, record_grounded_answer_telemetry
-        from skill_playbooks import (
+        from scripts.atom_mutator import apply_atom_edit
+        from scripts.cognitive_core import record_atom_feedback, record_grounded_answer_telemetry
+        from scripts.skill_playbooks import (
             PlaybookValidationError,
             deprecate_skill_playbook,
             inspect_skill_candidates,
@@ -455,18 +470,18 @@ class PlaybookPromotionAndStalenessTests(Phase3IsolatedTestCase):
 
 class GroundedExecutivePlannerAndApiTests(Phase3IsolatedTestCase):
     def test_deterministic_and_model_assisted_planning_excises_hallucinations_enforces_scope_and_serves_api(self):
-        from atom_mutator import apply_review_transition
-        from cognitive_core import record_grounded_answer_telemetry
-        from executive_planner import ExecutivePlanRequest, assemble_executive_plan
-        from host_adapters import HostSharingRule, save_host_policies
-        from memory_api import (
+        from scripts.atom_mutator import apply_review_transition
+        from scripts.cognitive_core import record_grounded_answer_telemetry
+        from scripts.executive_planner import ExecutivePlanRequest, assemble_executive_plan
+        from scripts.host_adapters import HostSharingRule, save_host_policies
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
             reset_api_rate_limiter,
         )
-        from skill_playbooks import promote_skill_playbook
+        from scripts.skill_playbooks import promote_skill_playbook
 
         reset_api_rate_limiter()
         with tempfile.TemporaryDirectory() as tmp:
@@ -770,8 +785,8 @@ class CliAndPlaybookCasUpdateTests(Phase3IsolatedTestCase):
         import io
         from contextlib import redirect_stdout
         import subprocess
-        from skill_playbooks import PlaybookValidationError, promote_skill_playbook
-        from cognitive_core import record_grounded_answer_telemetry
+        from scripts.skill_playbooks import PlaybookValidationError, promote_skill_playbook
+        from scripts.cognitive_core import record_grounded_answer_telemetry
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -909,7 +924,7 @@ class CliAndPlaybookCasUpdateTests(Phase3IsolatedTestCase):
 
 
 def _promote_for_test(brain: Path, telemetry_db: str, playbook_id: str, atoms: list[tuple[str, str]], steps: list[str], **extra):
-    from skill_playbooks import promote_skill_playbook
+    from scripts.skill_playbooks import promote_skill_playbook
 
     kwargs = dict(
         playbook_id=playbook_id,
@@ -936,7 +951,7 @@ class SecurityAuditRegressionTests(Phase3IsolatedTestCase):
     """Regression tests for the Phase 3A independent security audit findings (H1, H2, M1-M4, L5, L7)."""
 
     def _verify(self, brain: Path, telemetry_db: str, filename: str):
-        from skill_playbooks import verify_playbook_integrity
+        from scripts.skill_playbooks import verify_playbook_integrity
 
         return verify_playbook_integrity(
             str(brain / "5-playbooks" / filename),
@@ -948,7 +963,7 @@ class SecurityAuditRegressionTests(Phase3IsolatedTestCase):
 
     def test_h1_out_of_band_playbook_edits_fail_closed(self):
         import re as _re
-        from skill_playbooks import deprecate_skill_playbook
+        from scripts.skill_playbooks import deprecate_skill_playbook
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -1015,9 +1030,9 @@ class SecurityAuditRegressionTests(Phase3IsolatedTestCase):
             self.assertEqual(undep.reason, "playbook_deprecated_in_decision_log")
 
     def test_h2_m1_mixed_scope_playbooks_rejected_and_per_atom_scope_enforced(self):
-        from executive_planner import ExecutivePlanRequest, _playbook_allowed_for_host, assemble_executive_plan
-        from host_adapters import HostSharingRule
-        from skill_playbooks import PlaybookValidationError, list_playbooks, playbook_visible_in_scope
+        from scripts.executive_planner import ExecutivePlanRequest, _playbook_allowed_for_host, assemble_executive_plan
+        from scripts.host_adapters import HostSharingRule
+        from scripts.skill_playbooks import PlaybookValidationError, list_playbooks, playbook_visible_in_scope
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -1111,7 +1126,7 @@ class SecurityAuditRegressionTests(Phase3IsolatedTestCase):
             self.assertFalse(_playbook_allowed_for_host(mixed, _rule(True)))
 
     def test_m2_corrections_are_durable_and_fail_closed(self):
-        from cognitive_core import atom_correction_log_path, record_atom_feedback
+        from scripts.cognitive_core import atom_correction_log_path, record_atom_feedback
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -1157,7 +1172,7 @@ class SecurityAuditRegressionTests(Phase3IsolatedTestCase):
             self.assertTrue(locked.reason.startswith("correction_state_unverifiable"))
 
     def test_m3_substring_steps_cannot_strip_negation_or_use_evidence(self):
-        from skill_playbooks import PlaybookValidationError
+        from scripts.skill_playbooks import PlaybookValidationError
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -1183,8 +1198,8 @@ class SecurityAuditRegressionTests(Phase3IsolatedTestCase):
             self.assertEqual(ok["status"], "active")
 
     def test_m4_model_cannot_drop_or_reorder_playbook_steps(self):
-        from executive_planner import ExecutivePlanRequest, assemble_executive_plan
-        from host_adapters import HostSharingRule, save_host_policies
+        from scripts.executive_planner import ExecutivePlanRequest, assemble_executive_plan
+        from scripts.host_adapters import HostSharingRule, save_host_policies
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -1255,8 +1270,8 @@ class SecurityAuditRegressionTests(Phase3IsolatedTestCase):
             self.assertEqual([s.instruction for s in plan.steps][:2], [step_one, step_two])
 
     def test_l5_deprecation_edits_only_frontmatter_and_l7_pending_count_is_scoped(self):
-        from executive_planner import ExecutivePlanRequest, assemble_executive_plan
-        from skill_playbooks import deprecate_skill_playbook
+        from scripts.executive_planner import ExecutivePlanRequest, assemble_executive_plan
+        from scripts.skill_playbooks import deprecate_skill_playbook
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -1322,9 +1337,9 @@ class Phase3RemediationRegressionTests(Phase3IsolatedTestCase):
     """Regression coverage for Phase 3A hardening remediations."""
 
     def test_non_playbook_refusal_semantic_pref_integrity_and_duplicate_deprecate(self):
-        from atom_mutator import apply_review_transition
-        from evidence import find_evidence_anchor
-        from skill_playbooks import (
+        from scripts.atom_mutator import apply_review_transition
+        from scripts.evidence import find_evidence_anchor
+        from scripts.skill_playbooks import (
             PlaybookValidationError,
             deprecate_skill_playbook,
             promote_skill_playbook,
@@ -1477,15 +1492,15 @@ class Phase3RemediationRegressionTests(Phase3IsolatedTestCase):
             self.assertEqual(rep_pref.reason, "preference_backing_atom_forbidden:pref-rule.md")
 
     def test_empty_vault_abstention_superseded_count_host_atom_scope_and_transport_fallback(self):
-        from executive_planner import (
+        from scripts.executive_planner import (
             ExecutivePlanRequest,
             _count_unapproved_candidates,
             _playbook_allowed_for_host,
             assemble_executive_plan,
         )
-        from host_adapters import HostConsentError, HostSharingRule, builtin_default_policies, save_host_policies
-        from lexical_store import rebuild_lexical_index
-        from skill_playbooks import verify_playbook_integrity
+        from scripts.host_adapters import HostConsentError, HostSharingRule, builtin_default_policies, save_host_policies
+        from scripts.lexical_store import rebuild_lexical_index
+        from scripts.skill_playbooks import verify_playbook_integrity
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1641,8 +1656,8 @@ class Phase3RemediationRegressionTests(Phase3IsolatedTestCase):
             self.assertIn("planner_transport_fallback", audit_text)
 
     def test_lexical_recall_trusted_position_unaffected_by_unapproved_drafts(self):
-        from lexical_store import rebuild_lexical_index
-        from recall import RecallOptions, search_memory
+        from scripts.lexical_store import rebuild_lexical_index
+        from scripts.recall import RecallOptions, search_memory
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"

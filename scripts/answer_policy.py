@@ -15,9 +15,9 @@ try:
     from .memory_format import split_frontmatter
     from .memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 except ImportError:  # Support direct script execution with scripts/ on sys.path.
-    from evidence import ANCHOR_FIELDS, verify_evidence_anchor, verify_evidence_anchor_known_source
-    from memory_format import split_frontmatter
-    from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
+    from scripts.evidence import ANCHOR_FIELDS, verify_evidence_anchor, verify_evidence_anchor_known_source
+    from scripts.memory_format import split_frontmatter
+    from scripts.memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 
 NO_APPROVED_MEMORY_RESPONSE = (
     "I couldn't find relevant owner-approved memory for this question, "
@@ -224,10 +224,10 @@ def collect_unverified_leads(
             search_memory,
         )
     except ImportError:
-        from atom_mutator import approved_revision_is_current
-        from inbox_workflow import inspect_inbox_item, list_inbox_items, scan_inbox_payload_risks
-        from lexical_store import LexicalIndexUnavailable, TOKEN_PATTERN
-        from recall import (
+        from scripts.atom_mutator import approved_revision_is_current
+        from scripts.inbox_workflow import inspect_inbox_item, list_inbox_items, scan_inbox_payload_risks
+        from scripts.lexical_store import LexicalIndexUnavailable, TOKEN_PATTERN
+        from scripts.recall import (
             QUERY_STOP_WORDS,
             MemoryRecallUnavailable,
             RecallOptions,
@@ -510,8 +510,8 @@ def build_grounding_prompt(
             from .atom_mutator import approved_revision_is_current as _approved_rev_cur
             from .config import ATOMS_DIR as _DEFAULT_ATOMS_DIR
         except ImportError:
-            from atom_mutator import approved_revision_is_current as _approved_rev_cur
-            from config import ATOMS_DIR as _DEFAULT_ATOMS_DIR
+            from scripts.atom_mutator import approved_revision_is_current as _approved_rev_cur
+            from scripts.config import ATOMS_DIR as _DEFAULT_ATOMS_DIR
         approved_check_fn = _approved_rev_cur
         if atoms_dir is not None:
             eff_atoms_root = Path(atoms_dir).resolve()
@@ -640,8 +640,8 @@ def validate_standard_answer(
         from .atom_mutator import _lstat_regular_non_reparse, approved_revision_is_current, latest_decisions_by_atom, review_lock
         from .config import _is_reparse_or_link
     except ImportError:
-        from atom_mutator import _lstat_regular_non_reparse, approved_revision_is_current, latest_decisions_by_atom, review_lock
-        from config import _is_reparse_or_link
+        from scripts.atom_mutator import _lstat_regular_non_reparse, approved_revision_is_current, latest_decisions_by_atom, review_lock
+        from scripts.config import _is_reparse_or_link
     atoms_abs = os.path.abspath(str(atoms_dir))
     if _is_reparse_or_link(atoms_abs):
         raise PermissionError(f"Refusing symlinked or reparse-point atoms directory: {atoms_abs}")

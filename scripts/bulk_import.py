@@ -15,7 +15,23 @@ Run:
     uv run --locked python scripts/bulk_import.py "C:/path/to/ObsidianVault"
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from dataclasses import dataclass
@@ -26,10 +42,9 @@ from pathlib import Path
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
+from scripts.config import (  # noqa: E402
     DOC_EXTS,
     _is_reparse_or_link,
     append_archive_manifest_entry,
@@ -38,9 +53,9 @@ from config import (  # noqa: E402
     resolve_active_brain_dir,
     safe_file_in_dir,
 )
-from doc_extractors import DocumentExtractionError, MAX_DOC_BINARY_BYTES, extract_document  # noqa: E402
-from lexical_store import sync_lexical_index  # noqa: E402
-from notes_store import (  # noqa: E402
+from scripts.doc_extractors import DocumentExtractionError, MAX_DOC_BINARY_BYTES, extract_document  # noqa: E402
+from scripts.lexical_store import sync_lexical_index  # noqa: E402
+from scripts.notes_store import (  # noqa: E402
     DEFAULT_PATHS,
     MAX_NOTE_BYTES,
     NotePaths,
@@ -381,7 +396,7 @@ def import_file(
     tags: tuple[str, ...] = (),
 ) -> dict:
     """Import a single local Markdown/text/PDF/DOCX/EPUB/HTML/CSV document into working notes."""
-    from notes_store import create_note
+    from scripts.notes_store import create_note
 
     paths = _resolve_note_paths(paths)
 

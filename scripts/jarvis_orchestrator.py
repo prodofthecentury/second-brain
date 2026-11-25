@@ -14,7 +14,23 @@ Connects local-first Second Brain memory cleanly to loopback workflow engines:
 - **5-Panel Critique Theater:** Delegates to `design_critique.run_five_panel_critique()`.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import datetime
@@ -28,16 +44,15 @@ from urllib.parse import urlsplit
 
 import httpx
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("jarvis_orchestrator", "scripts.jarvis_orchestrator"):
     sys.modules.setdefault("jarvis_orchestrator", sys.modules[__name__])
     sys.modules.setdefault("scripts.jarvis_orchestrator", sys.modules[__name__])
 
-from cognitive_core import save_experience_record  # noqa: E402
-from config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, resolve_module_vault_path  # noqa: E402
-from design_critique import get_design_presets, run_five_panel_critique  # noqa: E402
-from host_adapters import inspect_and_redact_outbound  # noqa: E402
-from notes_store import NotePaths, create_note, extract_action_items  # noqa: E402
+from scripts.cognitive_core import save_experience_record  # noqa: E402
+from scripts.config import ATOMS_DIR, BRAIN_DIR, _is_reparse_or_link, resolve_module_vault_path  # noqa: E402
+from scripts.design_critique import get_design_presets, run_five_panel_critique  # noqa: E402
+from scripts.host_adapters import inspect_and_redact_outbound  # noqa: E402
+from scripts.notes_store import NotePaths, create_note, extract_action_items  # noqa: E402
 
 DEFAULT_N8N_URL = "http://127.0.0.1:5678"
 DEFAULT_OPENHANDS_URL = "http://127.0.0.1:3002"

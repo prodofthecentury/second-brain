@@ -46,7 +46,6 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(APP_DIR)
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, PROJECT_ROOT)
-sys.path.insert(0, str(SCRIPTS_DIR))
 
 from scripts.config import (
     BRAIN_DIR as _DEFAULT_BRAIN_DIR,

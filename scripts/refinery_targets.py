@@ -7,7 +7,7 @@
 import os
 import re
 
-from config import TEXT_EXTS
+from scripts.config import TEXT_EXTS
 
 
 def intake_status(content: str) -> str:

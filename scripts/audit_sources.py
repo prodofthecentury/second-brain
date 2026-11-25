@@ -4,7 +4,23 @@
 # ///
 """Audit atom source anchors and optionally demote stale approvals."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 import hashlib
@@ -14,16 +30,15 @@ from pathlib import Path
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import (
+from scripts.atom_mutator import (
     ReviewConflictError,
     ReviewTransitionError,
     apply_review_transition,
     approved_revision_is_current,
     review_lock,
 )
-from config import (
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     _is_reparse_or_link,
@@ -31,9 +46,9 @@ from config import (
     resolve_module_vault_path,
     snapshot_module_defaults,
 )
-from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor
-from memory_format import split_frontmatter
-from memory_review import parse_frontmatter_values
+from scripts.evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor
+from scripts.memory_format import split_frontmatter
+from scripts.memory_review import parse_frontmatter_values
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 

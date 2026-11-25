@@ -8,7 +8,23 @@ These tests exercise the functions. They do not pass by searching source files
 for a keyword.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import ast
 import os
@@ -20,19 +36,18 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
-sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT))
 
-from owner_attestation import (  # noqa: E402
+from scripts.owner_attestation import (  # noqa: E402
     OwnerAttestationError,
     enroll_owner,
     issue_grant,
     verify_grant,
 )
-from refinery_targets import intake_status  # noqa: E402
-from review_atom import main as review_main  # noqa: E402
-from security_fs import restrict_security_file_permissions  # noqa: E402
-from source_review import (  # noqa: E402
+from scripts.refinery_targets import intake_status  # noqa: E402
+from scripts.review_atom import main as review_main  # noqa: E402
+from scripts.security_fs import restrict_security_file_permissions  # noqa: E402
+from scripts.source_review import (  # noqa: E402
     approve_clean_sources,
     approve_sources,
     list_source_queue,
@@ -42,7 +57,7 @@ from source_review import (  # noqa: E402
 
 class DirectoryPermissionTests(unittest.TestCase):
     def test_restricting_a_directory_leaves_it_writable(self) -> None:
-        from mobile_vault_client import _save_registry_unlocked
+        from scripts.mobile_vault_client import _save_registry_unlocked
 
         with tempfile.TemporaryDirectory(prefix="sb-perm-") as temp:
             root = Path(temp) / "security"
@@ -82,7 +97,7 @@ class OwnerGrantTests(unittest.TestCase):
             with self.assertRaises(OwnerAttestationError):
                 issue_grant("not-the-passphrase", state_dir=temp)
             with self.assertRaises(OwnerAttestationError):
-                from owner_attestation import _clean_actor
+                from scripts.owner_attestation import _clean_actor
 
                 _clean_actor("owner-corpus-seed")
 
@@ -105,7 +120,7 @@ class OwnerGrantTests(unittest.TestCase):
         self.assertEqual(code, 1)
 
     def test_library_approval_is_labeled_unattested(self) -> None:
-        from atom_mutator import apply_review_transition, content_sha256
+        from scripts.atom_mutator import apply_review_transition, content_sha256
 
         with tempfile.TemporaryDirectory(prefix="sb-unattested-") as temp:
             brain = Path(temp) / "brain"

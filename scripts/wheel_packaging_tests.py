@@ -4,7 +4,23 @@ Run:
     uv run --frozen python -m unittest scripts.wheel_packaging_tests -v
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import json
 import os
@@ -29,8 +45,6 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 def _find_free_loopback_port() -> int:
@@ -270,7 +284,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
                     "-c",
                     (
                         "from second_brain.cli import bootstrap_runtime; bootstrap_runtime(); "
-                        "import config; print(config.BRAIN_DIR)"
+                        "from scripts import config; print(config.BRAIN_DIR)"
                     ),
                 ],
                 cwd=str(empty_cwd),
@@ -408,7 +422,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
                     "-c",
                     (
                         "from second_brain.cli import bootstrap_runtime; bootstrap_runtime(); "
-                        "from dashboard_auth import build_password_record, save_password_record; "
+                        "from scripts.dashboard_auth import build_password_record, save_password_record; "
                         "save_password_record(build_password_record('correct-horse-battery-staple'))"
                     ),
                 ],
@@ -461,8 +475,8 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
                 _terminate_process_tree(dash_proc)
 
     def test_icons_vsix_electron_config_wheelhouse_and_ci_yaml(self) -> None:
-        from build_vsix import build_vsix
-        from build_wheelhouse import build_wheelhouse
+        from scripts.build_vsix import build_vsix
+        from scripts.build_wheelhouse import build_wheelhouse
 
         # 1. Verify generated icons on disk
         ico_path = REPO_ROOT / "desktop" / "assets" / "icon.ico"
@@ -593,7 +607,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
 
     def test_plugin_skill_prove_leaf_kind_lf_normalization_and_no_bak_pollution(self) -> None:
         import hashlib
-        import ide_connector
+        import scripts.ide_connector as ide_connector
 
         ag_root = REPO_ROOT / "plugins" / "antigravity" / "second-brain"
         cc_root = REPO_ROOT / "plugins" / "claude-code" / "second-brain"
@@ -661,7 +675,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
     def test_wheelhouse_no_duplicate_versions_stale_pruning_and_macos_universal_wheels(self) -> None:
         import platform as py_platform
         from unittest import mock
-        import build_wheelhouse as bw
+        import scripts.build_wheelhouse as bw
 
         with tempfile.TemporaryDirectory(prefix="sb_wh_univ_") as td:
             wh_dir = Path(td) / "wheelhouse"
@@ -764,7 +778,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         self.assertIn("*.tar.gz", pkg_sh)
 
         # 3. _collect_homebrew_resources must resolve soupsieve 3.0.4 (not 2.10) and cryptography <49
-        from build_distribution_manifests import _collect_homebrew_resources, build_package_manager_manifests
+        from scripts.build_distribution_manifests import _collect_homebrew_resources, build_package_manager_manifests
         import hashlib
 
         brew_res = dict((name, (url, sha)) for name, url, sha in _collect_homebrew_resources())
@@ -824,7 +838,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
     def test_publish_registries_homebrew_formula_winget_pr_github_release_and_verify_assets(self) -> None:
         import hashlib
         import httpx
-        import publish_registries as pr
+        import scripts.publish_registries as pr
 
         with tempfile.TemporaryDirectory(prefix="sb_pub_reg_") as td:
             tmp = Path(td)
@@ -1018,14 +1032,14 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         import ast
         import hashlib
         from unittest import mock
-        import build_distribution_manifests as bdm
-        import build_wheelhouse as bw
-        import evaluation_dataset as eval_ds
-        import ide_connector
-        import memory_api
-        import publish_registries as pr
-        import run_desktop_tests as rdt
-        import _hatch_build as hb
+        import scripts.build_distribution_manifests as bdm
+        import scripts.build_wheelhouse as bw
+        import scripts.evaluation_dataset as eval_ds
+        import scripts.ide_connector as ide_connector
+        import scripts.memory_api as memory_api
+        import scripts.publish_registries as pr
+        import scripts.run_desktop_tests as rdt
+        import scripts._hatch_build as hb
 
         # 1. Wheel excludes scripts/*.ps1/*.sh, _hatch_build.py, mobile fastlane/, gradle-wrapper.jar & stale Capacitor public/
         with zipfile.ZipFile(self._wheel_path, "r") as zf:
@@ -1052,9 +1066,9 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
             self.assertIn(excl, res_by_to["backend/mobile"])
 
         # macOS root compatibility symlink (/var -> private/var) allowed on darwin; arbitrary symlinks still rejected
-        import config as cfg
-        import inbox_drop
-        import mobile_vault_client as mvc
+        import scripts.config as cfg
+        import scripts.inbox_drop as inbox_drop
+        import scripts.mobile_vault_client as mvc
 
         with (
             mock.patch.object(bw.sys, "platform", "darwin"),

@@ -17,8 +17,7 @@ import tempfile
 import time
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import _is_reparse_or_link
+from scripts.config import _is_reparse_or_link
 
 
 INDEX_MANIFEST_FILENAME = "index-manifest.json"

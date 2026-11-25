@@ -10,7 +10,23 @@ active playbooks, 4-experiences correction/failure rate), detects vault coverage
 imbalances relative to ambitions, and queues non-mutating Study / Scout targets.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from contextlib import closing
@@ -23,13 +39,12 @@ import sqlite3
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("self_model_curiosity", "scripts.self_model_curiosity"):
     sys.modules.setdefault("self_model_curiosity", sys.modules[__name__])
     sys.modules.setdefault("scripts.self_model_curiosity", sys.modules[__name__])
 
-from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
     _is_reparse_or_link,
@@ -37,9 +52,9 @@ from config import (  # noqa: E402
     resolve_module_atoms_and_brain,
     snapshot_module_defaults,
 )
-from memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
-from memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list  # noqa: E402
-from review_atom import approved_revision_is_current  # noqa: E402
+from scripts.memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list  # noqa: E402
+from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 _GOAL_LINE_RE = re.compile(
@@ -196,7 +211,7 @@ def evaluate_self_model_and_curiosity(
 
     domain_pbs: dict[str, int] = {}
     try:
-        from skill_playbooks import list_playbooks
+        from scripts.skill_playbooks import list_playbooks
 
         for pb in list_playbooks(brain_dir=resolved_brain, atoms_dir=resolved_atoms, active_only=True):
             tok = (pb.title or pb.filename).lower()

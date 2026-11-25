@@ -23,7 +23,23 @@ uses these tools. ``connect`` states this and requires ``--yes`` or interactive
 confirmation.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from dataclasses import dataclass
@@ -41,15 +57,14 @@ import tomllib
 
 import yaml
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import (  # noqa: E402
+from scripts.config import (  # noqa: E402
     BRAIN_DIR as _CONFIG_BRAIN_DIR,
     _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     resolve_active_brain_dir as _resolve_active_brain_dir,
 )
-from security_fs import restrict_security_file_permissions  # noqa: E402
+from scripts.security_fs import restrict_security_file_permissions  # noqa: E402
 
 SERVER_KEY = "second-brain"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -417,7 +432,7 @@ def server_entry(token: str, *, extra: dict | None = None, vault_dir: str | None
 
 
 def ensure_mcp_token() -> str:
-    from mcp_server import ensure_local_mcp_token
+    from scripts.mcp_server import ensure_local_mcp_token
 
     return ensure_local_mcp_token()
 

@@ -12,7 +12,23 @@ Markdown files in brain/2-atoms are the durable source of truth. This command
 resets the rebuildable vector collection and re-indexes those atom files.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    raise SystemExit(_sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__"))
+
 
 import argparse
 from collections.abc import Sequence
@@ -27,7 +43,7 @@ import sys
 import time
 import uuid
 
-from config import (
+from scripts.config import (
     ATOMS_DIR,
     CHROMA_PATH,
     EMBED_MODEL,
@@ -38,7 +54,7 @@ from config import (
     safe_file_in_dir,
     snapshot_module_defaults,
 )
-from index_manifest import (
+from scripts.index_manifest import (
     INDEX_SCHEMA_VERSION,
     VECTOR_DISTANCE_METRIC,
     atom_revisions,
@@ -46,10 +62,10 @@ from index_manifest import (
     load_index_manifest,
     write_index_manifest,
 )
-from memory_format import is_memory_document
-from ollama_utils import embed_text, embedding_metadata
-from vector_store import close_vector_collection, get_vector_collection, reset_vector_collection
-from review_atom import review_lock
+from scripts.memory_format import is_memory_document
+from scripts.ollama_utils import embed_text, embedding_metadata
+from scripts.vector_store import close_vector_collection, get_vector_collection, reset_vector_collection
+from scripts.review_atom import review_lock
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 UPSERT_BATCH_SIZE = 128
