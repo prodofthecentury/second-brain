@@ -794,7 +794,11 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
 
                 rem1 = sdk_owner.remember("Use uv sync --frozen for reproducible Python builds.", title="UV Rule", tags=["python", "ci"])
                 self.assertEqual(rem1["status"], "saved")
-                sdk_owner.remember("Frontend styles live in styles.css.", title="CSS Rule", tags=["frontend"])
+                sdk_owner.remember(
+                    "Frontend styles live in styles.css and are served from /static/styles.css.",
+                    title="CSS Rule",
+                    tags=["frontend"],
+                )
                 by_q_and_tag = sdk_owner.list_notes(query="reproducible", tag="python")
                 self.assertEqual(by_q_and_tag["total"], 1)
                 self.assertEqual(by_q_and_tag["items"][0]["title"], "UV Rule")

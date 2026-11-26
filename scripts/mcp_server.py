@@ -771,8 +771,9 @@ ALL_TOOLS = (
     types.Tool(
         name="remember",
         description=(
-            "Add a note only when it is specific to this owner's systems: a path, command, threshold, "
-            "config value, or local choice. Generic knowledge an AI already has is refused and not saved. "
+            "Add a note only when it is an operational rule for this system (a command, named threshold, "
+            "config value, or local tool choice) or two concrete details such as a path and a file. "
+            "A single filename or generic knowledge is refused and not saved. "
             "Agents can add notes and cannot edit or delete a note that already exists. "
             "Suspicious content is quarantined instead of being saved."
         ),

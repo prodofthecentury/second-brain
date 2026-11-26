@@ -347,9 +347,10 @@ def _quarantine_agent_capture(paths: NotePaths, title: str, body: str, risks: tu
 
 
 _GENERIC_NOTE_MESSAGE = (
-    "Not saved. This is general knowledge an AI already has. "
-    "Add a note only when it is specific to this system: a path, command, threshold, "
-    "config value, or a local choice such as which tool this project uses."
+    "Not saved. This is general knowledge, or it is too thin to teach the brain. "
+    "Add an operational rule for this system: a command, a named threshold, a config value, "
+    "or which tool this project uses. Otherwise include two concrete details, such as a path and a file. "
+    "A single filename is not enough."
 )
 _PATH_ANCHOR_RE = re.compile(r"(?:^|[\s\"'(])((?:\.\./|\./|/)[\w./-]{3,})", re.MULTILINE)
 _FILE_ANCHOR_RE = re.compile(
@@ -364,35 +365,65 @@ _CHOICE_ANCHOR_RE = re.compile(
     r"(?!best\b|proper\b|secure\b|good\b|https\b)[A-Za-z0-9_./+-]{2,}",
     re.IGNORECASE,
 )
-_ASSIGN_ANCHOR_RE = re.compile(r"\b[A-Za-z][\w.-]{1,40}\s*(?:=|:)\s*[^\s,]{1,48}")
+_ASSIGN_ANCHOR_RE = re.compile(r"\b[A-Za-z][\w.-]{1,40}[ \t]*(?:=|:)[ \t]*[^\s,]{1,48}")
 _TICK_ANCHOR_RE = re.compile(r"`([^`\n]{3,80})`")
 _GENERIC_TICK_RE = re.compile(r"^(?:https|http|input|password|user|data|token|secret|true|false|null|none)$", re.IGNORECASE)
+_THRESHOLD_RE = re.compile(
+    r"(?:`[^`\n]{2,40}`|\b[A-Za-z_][\w.-]{2,40})\s*(?:is\s+)?(?:>=|<=|==|>|<)\s*\d+(?:\.\d+)?"
+)
+_PROCEDURE_RE = re.compile(r"^\s*(?:\d+[.)]|[-*])\s+\S", re.MULTILINE)
+_STRONG_NOTE_SIGNALS = frozenset({"command", "choice", "threshold", "config"})
 
 
-def agent_capture_rejection(title: str, body: str) -> str | None:
-    """Refuse an agent note that is only knowledge a model already has.
+def note_spec_signals(title: str, body: str) -> set[str]:
+    """Concrete signals that make a note local to this system.
 
-    Owner-written notes are not checked. A keepable agent note names something
-    local: a path, filename, command, version, threshold, config value, or a project choice.
+    A command, named threshold, config value, or project tool choice is enough on
+    its own. A path, file, version, measurement, identifier, or procedure counts
+    only together with a second concrete detail.
     """
     text = f"{title}\n{body}"
-    if (
-        _PATH_ANCHOR_RE.search(text)
-        or _FILE_ANCHOR_RE.search(text)
-        or _FLAG_ANCHOR_RE.search(text)
-        or _UNIT_ANCHOR_RE.search(text)
-        or _VERSION_ANCHOR_RE.search(text)
-        or _CHOICE_ANCHOR_RE.search(text)
-    ):
-        return None
+    signals: set[str] = set()
+    if _PATH_ANCHOR_RE.search(text):
+        signals.add("path")
+    if _FILE_ANCHOR_RE.search(text):
+        signals.add("file")
+    if _FLAG_ANCHOR_RE.search(text):
+        signals.add("command")
+    if _UNIT_ANCHOR_RE.search(text):
+        signals.add("measure")
+    if _VERSION_ANCHOR_RE.search(text):
+        signals.add("version")
+    if _CHOICE_ANCHOR_RE.search(text):
+        signals.add("choice")
+    if _THRESHOLD_RE.search(text):
+        signals.add("threshold")
+    if len(_PROCEDURE_RE.findall(text)) >= 2:
+        signals.add("procedure")
     for match in _ASSIGN_ANCHOR_RE.finditer(text):
         value = match.group(0).split("=", 1)[-1].split(":", 1)[-1].strip()
         if re.search(r"[\d/._]", value) and value.casefold() not in {"true", "false", "null", "none", "https"}:
-            return None
+            signals.add("config")
+            break
     for match in _TICK_ANCHOR_RE.finditer(text):
         inner = match.group(1).strip()
         if re.search(r"[\d/._:]", inner) and not _GENERIC_TICK_RE.match(inner):
-            return None
+            signals.add("identifier")
+            break
+    return signals
+
+
+def agent_capture_rejection(title: str, body: str) -> str | None:
+    """Refuse an agent note that is general knowledge or only one thin detail.
+
+    Owner-written notes are not checked. One operational rule is enough. Two
+    different concrete details are enough. A filename by itself is not.
+    """
+    signals = note_spec_signals(title, body)
+    if signals & _STRONG_NOTE_SIGNALS:
+        return None
+    if len(signals) >= 2:
+        return None
     return _GENERIC_NOTE_MESSAGE
 
 

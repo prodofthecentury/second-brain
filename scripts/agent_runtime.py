@@ -61,6 +61,16 @@ MAX_AGENT_STEPS = 24
 DEFAULT_SCHEDULE_SECONDS = 900
 MEMORY_TYPES = frozenset({"semantic", "episodic", "procedural", "self"})
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
+_QUERY_STOP = frozenset(
+    {
+        "about", "after", "again", "also", "and", "any", "are", "ask", "been", "being",
+        "build", "but", "can", "could", "create", "for", "from", "give", "have", "help",
+        "how", "into", "its", "just", "let", "make", "need", "new", "not", "now", "old",
+        "our", "out", "over", "please", "should", "site", "system", "tell", "than",
+        "that", "the", "their", "them", "then", "they", "this", "use", "using", "want",
+        "was", "website", "were", "what", "when", "will", "with", "would", "you", "your",
+    }
+)
 _STEPS_RE = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
 _STEP_LINE_RE = re.compile(r"^\s*(?:\d+[.)]|[-*])\s+\S", re.MULTILINE)
 _LEARN_BATCH = 40
@@ -782,18 +792,45 @@ def owner_vault_roots(brain_dir: str, security_dir: str | None = None) -> list[t
     return roots
 
 
+def _stem_term(token: str) -> str:
+    word = token.casefold()
+    if len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _content_terms(text: str) -> set[str]:
+    """Distinctive words. Drop stopwords so 'the website' cannot select a skill."""
+    return {
+        _stem_term(token)
+        for token in _TOKEN_RE.findall(text or "")
+        if len(token) >= 4 and token.casefold() not in _QUERY_STOP
+    }
+
+
+def _term_overlap(query: str, text: str) -> int:
+    wanted = _content_terms(query)
+    if not wanted:
+        return 0
+    return len(wanted & _content_terms(text))
+
+
 def _matching_skill(goal: str, brain_dir: str, security_dir: str | None = None) -> tuple[str, str] | None:
-    terms = {token.casefold() for token in _TOKEN_RE.findall(goal)}
-    if not terms:
-        return None
+    """Pick the skill whose trigger shares the most distinctive words with the goal."""
+    best: tuple[int, str, str] | None = None
     for _label, root in owner_vault_roots(brain_dir, security_dir):
         for skill in list_agent_skills(brain_dir=root):
             if skill["status"] not in {"agent_trial", "agent_active"}:
                 continue
-            trigger_terms = {token.casefold() for token in _TOKEN_RE.findall(skill["trigger"])}
-            if terms.intersection(trigger_terms):
-                return skill["skill_id"], root
-    return None
+            score = _term_overlap(goal, skill["trigger"])
+            if score < 1:
+                continue
+            candidate = (score, skill["skill_id"], root)
+            if best is None or candidate[0] > best[0] or (candidate[0] == best[0] and candidate[1] < best[1]):
+                best = candidate
+    if best is None:
+        return None
+    return best[1], best[2]
 
 
 def run_agent(
@@ -1010,7 +1047,13 @@ def learn_from_notes(*, brain_dir: str = BRAIN_DIR) -> dict[str, int]:
         learned += 1
         changed = True
         procedural = len(_STEP_LINE_RE.findall(body)) >= 2 or "how to" in readable.casefold()
-        if procedural and scope != "mixed":
+        try:
+            from notes_store import agent_capture_rejection
+
+            high_spec = agent_capture_rejection(title, body) is None
+        except Exception:
+            high_spec = False
+        if procedural and scope != "mixed" and high_spec:
             try:
                 draft_agent_skill(
                     "learner",
@@ -1054,7 +1097,7 @@ def search_connected_knowledge(
     seen: set[tuple[str, str, str]] = set()
     terms = {token.casefold() for token in _TOKEN_RE.findall(query or "")}
 
-    def add(source: str, filename: str, title: str, text: str, vault: str, root: str) -> None:
+    def add(source: str, filename: str, title: str, text: str, vault: str, root: str, score: int = 0) -> None:
         key = (os.path.normcase(root), source, filename)
         if key in seen:
             return
@@ -1066,6 +1109,7 @@ def search_connected_knowledge(
                 "title": title,
                 "text": text[:_LEARN_CLAIM_CHARS],
                 "vault": vault,
+                "score": str(score),
             }
         )
 
@@ -1085,11 +1129,20 @@ def search_connected_knowledge(
                     project=vault_project or None,
                     paths=NotePaths.for_brain(root),
                 ):
-                    add("note", note.filename, note.title, note.snippet or note.title, label, root)
+                    blob = f"{note.title}\n{note.snippet or ''}"
+                    add("note", note.filename, note.title, note.snippet or note.title, label, root, _term_overlap(query, blob))
             except Exception:
                 pass
         for memory in search_agent_memory(query, brain_dir=root, project=vault_project, limit=cap):
-            add("agent_memory", memory["filename"], memory["filename"], memory["claim"], label, root)
+            add(
+                "agent_memory",
+                memory["filename"],
+                memory["filename"],
+                memory["claim"],
+                label,
+                root,
+                _term_overlap(query, memory["claim"]),
+            )
         skills_dir = os.path.join(agent_root(root), "skills")
         if not terms or not os.path.isdir(skills_dir):
             continue
@@ -1110,18 +1163,35 @@ def search_connected_knowledge(
             if not _scope_visible(str(frontmatter.get("project") or ""), vault_project):
                 continue
             trigger = str(frontmatter.get("trigger") or "")
-            if not terms.intersection({token.casefold() for token in _TOKEN_RE.findall(trigger)}):
+            try:
+                loaded = _load_skill(path)
+            except (AgentRuntimeError, json.JSONDecodeError, OSError):
+                loaded = {"steps": []}
+            step_lines = []
+            for step in loaded["steps"][:4]:
+                if not isinstance(step, dict):
+                    continue
+                action = str(step.get("action_type") or "step")
+                detail = str(step.get("query") or step.get("rel_path") or step.get("audit_kind") or "").strip()
+                step_lines.append(f"- {action} {detail}".rstrip())
+            brief = trigger + "\n" + "\n".join(step_lines)
+            score = _term_overlap(query, brief)
+            if score < 1:
                 continue
             add(
                 "agent_skill",
                 name,
                 str(frontmatter.get("skill_id") or name),
-                f"Use this skill for the request.\n{trigger}",
+                "Use this skill for the request.\n" + brief.strip(),
                 label,
                 root,
+                score,
             )
-    skills = [hit for hit in hits if hit["source"] == "agent_skill"][:3]
-    rest = [hit for hit in hits if hit["source"] != "agent_skill"]
+    def _rank(hit: dict[str, str]) -> tuple[int, str]:
+        return (-int(hit.get("score") or 0), hit.get("title") or "")
+
+    skills = sorted((hit for hit in hits if hit["source"] == "agent_skill"), key=_rank)[:3]
+    rest = sorted((hit for hit in hits if hit["source"] != "agent_skill"), key=_rank)
     return (skills + rest)[:cap]
 
 

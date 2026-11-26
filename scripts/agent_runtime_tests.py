@@ -542,7 +542,7 @@ class AgentRuntimeTests(unittest.TestCase):
         paths = NotePaths.for_brain(self._brain())
         saved = create_note(
             "Spare cable drawer",
-            "How to find the spare cables:\n1. Open the left drawer.\n2. Take the labeled bundle.",
+            "How to find the spare cables in /warehouse/drawers/left:\n1. Open the left drawer.\n2. Take the labeled bundle.",
             tags=("project:workshop",),
             paths=paths,
         )
@@ -569,6 +569,15 @@ class AgentRuntimeTests(unittest.TestCase):
         risky_hits = search_connected_knowledge("owner token", brain_dir=self._brain(), learn=False)
         self.assertTrue(any(hit["source"] == "note" and hit["filename"] == risky["filename"] for hit in risky_hits))
         self.assertFalse(any(hit["source"] == "agent_memory" and "owner token" in hit["text"] for hit in risky_hits))
+        generic_how = create_note(
+            "How to stay safe",
+            "How to stay safe:\n1. Use HTTPS.\n2. Validate user input.",
+            paths=paths,
+        )
+        self.assertEqual(generic_how["status"], "saved")
+        generic_hits = search_connected_knowledge("stay safe", brain_dir=self._brain(), learn=True)
+        self.assertTrue(any(hit["source"] == "note" for hit in generic_hits))
+        self.assertFalse(any(hit["source"] == "agent_skill" for hit in generic_hits))
 
     def test_agent_notes_must_be_specific_and_search_finds_other_vaults(self) -> None:
         from agent_runtime import draft_agent_skill, run_agent, search_connected_knowledge
@@ -594,9 +603,16 @@ class AgentRuntimeTests(unittest.TestCase):
             paths=paths,
         )
         self.assertEqual(specific["status"], "saved")
-        named_file = create_note(
+        thin_file = create_note(
             "CSS Rule",
             "Frontend styles live in styles.css.",
+            origin="agent_capture",
+            paths=paths,
+        )
+        self.assertEqual(thin_file["status"], "not_saved")
+        named_file = create_note(
+            "CSS Rule",
+            "Frontend styles live in styles.css and are served from /static/styles.css.",
             origin="agent_capture",
             paths=paths,
         )
@@ -618,6 +634,13 @@ class AgentRuntimeTests(unittest.TestCase):
             "antifraud-checkout",
             [{"action_type": "vault_recall", "query": "anti-fraud checkout", "output_file": "recall.json"}],
             trigger="anti-fraud checkout",
+            brain_dir=str(cyber),
+        )
+        draft_agent_skill(
+            "learner",
+            "fraud-review",
+            [{"action_type": "vault_recall", "query": "fraud review", "output_file": "recall.json"}],
+            trigger="fraud review",
             brain_dir=str(cyber),
         )
         registry = {
@@ -655,7 +678,8 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(any(hit["vault"] == "Cybersecurity" and hit["filename"] == saved["filename"] for hit in hits))
         self.assertTrue(any(hit["source"] == "agent_skill" and hit["title"] == "antifraud-checkout" for hit in hits))
-        self.assertTrue(hits and hits[0]["source"] == "agent_skill")
+        self.assertEqual(hits[0]["title"], "antifraud-checkout")
+        self.assertIn("vault_recall", hits[0]["text"])
         closed = federated_recall(
             "anti-fraud",
             security_dir=str(self.security),
