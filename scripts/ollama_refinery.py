@@ -23,6 +23,7 @@ if __name__ == "__main__" and not __package__:
     raise SystemExit(0)
 
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -399,61 +400,116 @@ def _normalized_claim_key(memory_doc: str) -> str:
     return re.sub(r"\s+", " ", claim).strip().rstrip(".;:").casefold()
 
 
-def deterministic_atom_slug(title: str, current_date: str) -> str:
-    """Build a filename stem from the title. The model does not choose the spelling."""
+SOURCE_SPAN_MIN_RATIO = 0.72
+MAX_ATOMS_PER_NOTE = 5
+
+
+def deterministic_atom_slug(
+    title: str,
+    current_date: str,
+    *,
+    source_filename: str = "",
+    claim: str = "",
+) -> str:
+    """Build a filename stem. The same note and claim always get the same id, and a different claim does not."""
     words = re.findall(r"[A-Za-z0-9]+", str(title or "").casefold())
     stem = "-".join(words[:8]) or "atom"
-    slug = f"{current_date}-{stem}".strip("-")
-    return slug[:96].strip("-") or f"{current_date}-atom"
+    source_stem = re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        os.path.splitext(os.path.basename(str(source_filename or "")))[0].casefold(),
+    ).strip("-")[:32]
+    digest = hashlib.sha256(f"{source_filename}\n{claim}".encode("utf-8")).hexdigest()[:8]
+    parts = [current_date]
+    if source_stem:
+        parts.append(source_stem)
+    parts.extend((stem, digest))
+    slug = "-".join(part for part in parts if part).strip("-")
+    return slug[:120].strip("-") or f"{current_date}-atom-{digest}"
+
+
+def _collapse_with_map(text: str) -> tuple[str, list[int]]:
+    """Collapse whitespace and remember which original index each collapsed character came from."""
+    collapsed: list[str] = []
+    origins: list[int] = []
+    in_space = False
+    for index, char in enumerate(text):
+        if char.isspace():
+            if in_space:
+                continue
+            collapsed.append(" ")
+            origins.append(index)
+            in_space = True
+        else:
+            collapsed.append(char)
+            origins.append(index)
+            in_space = False
+    return "".join(collapsed), origins
+
+
+def _span_from_collapsed(source: str, collapsed_source: str, origins: list[int], needle: str) -> str | None:
+    start = collapsed_source.find(needle)
+    if start < 0 or not origins:
+        return None
+    end = start + len(needle) - 1
+    if end >= len(origins):
+        return None
+    return source[origins[start] : origins[end] + 1]
 
 
 def exact_source_span(source: str, hint: str) -> str | None:
-    """Return the source substring that the model's evidence was trying to quote."""
+    """Return the source substring the evidence was quoting.
+
+    Match exact text, then whitespace-normalised text, then a case-insensitive
+    form of those, then the closest source sentence above SOURCE_SPAN_MIN_RATIO.
+    """
     cleaned = str(hint or "").strip().strip("\"'`").strip()
     if len(cleaned) < 8 or not source:
         return None
     if cleaned in source:
         return cleaned
-    collapsed = re.sub(r"\s+", " ", cleaned)
-    source_collapsed = re.sub(r"\s+", " ", source)
-    if collapsed in source_collapsed:
-        start = source_collapsed.find(collapsed)
-        # Map the collapsed span back by walking the original text.
-        compact_index = 0
-        raw_start = None
-        raw_end = None
-        in_space = False
-        for index, char in enumerate(source):
-            if char.isspace():
-                if in_space:
-                    continue
-                piece = " "
-                in_space = True
-            else:
-                piece = char
-                in_space = False
-            if compact_index == start and raw_start is None:
-                raw_start = index
-            compact_index += len(piece)
-            if raw_start is not None and compact_index >= start + len(collapsed):
-                raw_end = index + 1
-                break
-        if raw_start is not None and raw_end is not None:
-            return source[raw_start:raw_end]
+    collapsed, _hint_origins = _collapse_with_map(cleaned)
+    source_collapsed, source_origins = _collapse_with_map(source)
+    mapped = _span_from_collapsed(source, source_collapsed, source_origins, collapsed)
+    if mapped:
+        return mapped
+    folded = collapsed.casefold()
+    source_folded = source_collapsed.casefold()
+    fold_at = source_folded.find(folded)
+    if fold_at >= 0:
+        mapped = _span_from_collapsed(source, source_collapsed, source_origins, source_collapsed[fold_at : fold_at + len(collapsed)])
+        if mapped:
+            return mapped
+    direct = re.search(re.escape(collapsed), source, flags=re.IGNORECASE)
+    if direct:
+        return direct.group(0)
     sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", source) if part.strip()]
     best = None
     best_ratio = 0.0
-    hint_fold = collapsed.casefold()
     for index, sentence in enumerate(sentences):
         window = sentence if index + 1 >= len(sentences) else f"{sentence} {sentences[index + 1]}"
         for candidate in (sentence, window):
-            ratio = difflib.SequenceMatcher(None, hint_fold, candidate.casefold()).ratio()
+            if candidate not in source:
+                continue
+            ratio = difflib.SequenceMatcher(None, folded, re.sub(r"\s+", " ", candidate).casefold()).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best = candidate
-    if best is not None and best_ratio >= 0.72:
+    if best is not None and best_ratio >= SOURCE_SPAN_MIN_RATIO and best in source:
         return best
     return None
+
+
+def claim_grounded_in_source(claim: str, source: str) -> bool:
+    """Drop a claim whose content words are not substantially in this note."""
+    terms = _content_terms(claim)
+    if not terms:
+        return False
+    source_terms = _content_terms(source)
+    source_fold = source.casefold()
+    hits = sum(1 for term in terms if term in source_terms or term in source_fold)
+    needed = 1 if len(terms) <= 2 else max(2, (len(terms) + 1) // 2)
+    return hits >= min(needed, len(terms))
 
 
 def _memory_title(document: str) -> str:
@@ -467,7 +523,7 @@ def _memory_title(document: str) -> str:
     return claim.split(".")[0].strip() if claim else ""
 
 
-def _rewrite_memory_identity(document: str, source_text: str, current_date: str) -> str:
+def _rewrite_memory_identity(document: str, source_text: str, current_date: str, source_filename: str = "") -> str:
     from scripts.memory_format import render_memory_document, set_scalar_field, split_frontmatter
     from scripts.memory_review import section_text
 
@@ -488,7 +544,7 @@ def _rewrite_memory_identity(document: str, source_text: str, current_date: str)
     title = str(values.get("title") or "").strip().strip("\"'")
     if not title:
         title = claim.split(".")[0].strip() if claim else _memory_title(document)
-    slug = deterministic_atom_slug(title, current_date)
+    slug = deterministic_atom_slug(title, current_date, source_filename=source_filename, claim=claim)
     frontmatter = set_scalar_field(list(frontmatter), "id", slug, "type")
     return render_memory_document(frontmatter, body_lines)
 
@@ -504,7 +560,7 @@ def _documents_from_model_output(output: str, source_filename: str, current_date
     documents = _documents_from_json(output, source_filename, current_date)
     if not documents:
         documents = extract_memory_documents(output, source_filename=source_filename, current_date=current_date)
-    return [_rewrite_memory_identity(document, source_text, current_date) for document in documents]
+    return [_rewrite_memory_identity(document, source_text, current_date, source_filename) for document in documents]
 
 
 def _documents_from_json(output: str, source_filename: str, current_date: str) -> list[str]:
@@ -538,7 +594,7 @@ def _documents_from_json(output: str, source_filename: str, current_date: str) -
             memory_type = "semantic"
         if len(claim) < 5 or len(evidence) < 5:
             continue
-        slug = deterministic_atom_slug(title or claim, current_date)
+        slug = deterministic_atom_slug(title or claim, current_date, source_filename=source_filename, claim=claim)
         documents.append(
             "---\n"
             f"id: {slug}\n"
@@ -570,14 +626,16 @@ def _documents_from_json(output: str, source_filename: str, current_date: str) -
 ATOM_JSON_SCHEMA = {
     "type": "object",
     "properties": {
-        "atoms": {
-            "type": "array",
+                    "atoms": {
+                        "type": "array",
+                        "maxItems": MAX_ATOMS_PER_NOTE,
+                        "description": "Distinct facts from this note only. At most 5.",
             "items": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "minLength": 3},
-                    "claim": {"type": "string", "minLength": 12},
-                    "evidence": {"type": "string", "minLength": 8},
+                    "title": {"type": "string", "minLength": 3, "description": "Short name for this fact."},
+                    "claim": {"type": "string", "minLength": 12, "description": "One sentence stating the fact. Use words from the note."},
+                    "evidence": {"type": "string", "minLength": 8, "description": "Exact quote copied from the note, not a paraphrase."},
                     "why": {"type": "string"},
                     "memory_type": {"type": "string"},
                 },
@@ -675,13 +733,13 @@ def _rows_from_output(output: str) -> tuple[list[dict], list[str]]:
 
 def _schema_prompt(note: str) -> str:
     return (
-        "Extract 1 or 2 atoms from the note. Copy evidence verbatim from the note. "
-        "The claim must be a full sentence, not the title.\n\n"
-        "Example note: Pour-over coffee uses 1 g coffee per 16 g water.\n"
-        "Example JSON: {\"atoms\":[{\"title\":\"Pour-over ratio\","
-        "\"claim\":\"Pour-over coffee uses 1 gram of coffee per 16 grams of water.\","
-        "\"evidence\":\"Pour-over coffee uses 1 g coffee per 16 g water.\","
-        "\"why\":\"The brewing ratio.\",\"memory_type\":\"semantic\"}]}\n\n"
+        "Extract every distinct fact in the note, at most 5. "
+        "evidence must be an exact quote copied from the note. "
+        "claim must be one sentence about that quote, using words that appear in the note. "
+        "Do not add facts, names, or examples that are not in the note.\n\n"
+        "Shape example only. The words XQV7PLACEHOLDER and Z9SAMPLEVALUE are not content:\n"
+        '{"atoms":[{"title":"Placeholder shape","claim":"The item XQV7PLACEHOLDER has the value Z9SAMPLEVALUE.",'
+        '"evidence":"XQV7PLACEHOLDER has the value Z9SAMPLEVALUE.","why":"Shows the fields.","memory_type":"semantic"}]}\n\n'
         f"RAW CAPTURE:\n{note}"
     )
 
@@ -691,7 +749,7 @@ def _legacy_markdown_prompt(raw_filename: str, today_str: str, extra_instruction
 {rules}
 
 YOUR TASK:
-Read the following raw capture. Identify 1 to 2 distinct, standalone core ideas, architectural patterns, or procedures.
+Read the following raw capture. Identify at most 5 distinct, standalone facts.
 Extract each one into its own atomic memory using the exact Markdown template below. Keep them concise and focused.
 Do NOT generate redundant, trivial, or duplicate variations.
 Classify each memory with one of these memory_type values: semantic, episodic, procedural, self.
@@ -745,8 +803,10 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     if memory_type not in {"semantic", "episodic", "procedural", "self"}:
         memory_type = "semantic"
     exact = exact_source_span(source_text, evidence) if len(evidence) >= 8 else None
-    if exact:
-        evidence = exact
+    if not exact or exact not in source_text:
+        print(f"  [!] Dropped atom; evidence is not a span of this note: {evidence[:80]!r}")
+        return None, "unanchored"
+    evidence = exact
     path = "schema"
     title_key = re.sub(r"[^a-z0-9]+", " ", title.casefold()).strip()
     claim_key = re.sub(r"[^a-z0-9]+", " ", claim.casefold()).strip().rstrip(".")
@@ -760,6 +820,9 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
                 title = " ".join(claim.split()[:8]).rstrip(".")
     if len(claim) < 12 or len(evidence) < 8:
         return None, path
+    if not claim_grounded_in_source(claim, source_text):
+        print(f"  [!] Dropped atom; claim is not in this note: {claim[:80]!r}")
+        return None, "contamination"
     if not evidence_supports_claim(claim, evidence):
         print(f"  [!] Dropped atom; evidence does not overlap the claim: {claim[:80]!r}")
         return None, "unsupported"
@@ -782,7 +845,7 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     )
     if not document:
         return None, path
-    finished = _rewrite_memory_identity(document[0], source_text, current_date)
+    finished = _rewrite_memory_identity(document[0], source_text, current_date, source_filename)
     if model_support is None and not evidence_supports_claim(claim, evidence):
         return None, "unsupported"
     return finished, path
@@ -909,12 +972,12 @@ def draft_memory_atoms(
             elif legacy:
                 output = legacy
                 for document in extract_memory_documents(legacy, source_filename=raw_filename, current_date=today_str):
-                    rewritten = _rewrite_memory_identity(document, chunk_text, today_str)
+                    rewritten = _rewrite_memory_identity(document, chunk_text, today_str, raw_filename)
                     parsed = split_frontmatter(rewritten)
                     body = "\n".join(parsed[1]) if parsed else ""
                     claim = section_text(body, "Claim")
                     evidence = section_text(body, "Evidence")
-                    if claim and evidence and evidence_supports_claim(claim, evidence):
+                    if claim and evidence and evidence in chunk_text and claim_grounded_in_source(claim, chunk_text) and evidence_supports_claim(claim, evidence):
                         finished.append((rewritten, "legacy_markdown"))
                     elif claim and evidence:
                         print(f"  [!] Dropped legacy atom; evidence does not overlap the claim: {claim[:80]!r}")

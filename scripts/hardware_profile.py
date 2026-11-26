@@ -994,6 +994,7 @@ def detect_hardware_profile(*, ollama_timeout: float = 3.0, use_cache: bool = Fa
     env_key = (os.environ.get("OLLAMA_HOST") or "").strip()
     cache_identity = (
         env_key,
+        (os.environ.get("BRAIN_GEN_MODEL") or "").strip(),
         id(probe_ollama_models),
         id(probe_ollama_models_with_sizes),
         id(probe_gpu),

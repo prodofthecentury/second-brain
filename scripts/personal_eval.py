@@ -23,44 +23,67 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from scripts.recall import RecallOptions, search_lexical_memory
 
 
+def _label_text(value: str) -> str:
+    """Drop a leading date and a trailing content hash so ids still match a stable slug."""
+    text = value.casefold().strip()
+    text = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", text)
+    text = re.sub(r"-[0-9a-f]{8}$", "", text)
+    return text
+
+
 def _result_matches_relevant(result: object, wanted: set[str]) -> bool:
-    """Match a filename, its stem, a dated slug, an atom id, or a title."""
+    """Match a filename, its stem, a dated slug, an atom id, a title, or the same content words."""
     filename = str(getattr(result, "filename", "") or "")
     stem = Path(filename).stem
     labels = {filename, Path(filename).name, stem}
+    claim = ""
     content = str(getattr(result, "content", "") or "")
     if content:
         from scripts.memory_format import split_frontmatter
-        from scripts.memory_review import parse_frontmatter_values
+        from scripts.memory_review import parse_frontmatter_values, section_text
 
         parsed = split_frontmatter(content)
         if parsed is not None:
             values = parse_frontmatter_values(parsed[0])
+            claim = section_text("\n".join(parsed[1]), "Claim")
             for key in ("id", "title"):
                 raw = str(values.get(key) or "").strip().strip("\"'")
                 if raw:
                     labels.add(raw)
                     labels.add(Path(raw).stem)
+            raw_sources = values.get("sources") or []
+            if isinstance(raw_sources, str):
+                raw_sources = [raw_sources]
+            if isinstance(raw_sources, (list, tuple)):
+                for source in raw_sources:
+                    source_name = str(source).strip()
+                    if source_name:
+                        labels.add(source_name)
+                        labels.add(Path(source_name).stem)
     folded = {item.casefold() for item in labels if item}
-    stem_fold = stem.casefold()
+    stripped = {_label_text(item) for item in folded}
+    haystack = " ".join(sorted(stripped | {claim.casefold()}))
     for want in wanted:
         clean = want.strip()
         if not clean:
             continue
         if clean in labels or clean.casefold() in folded:
             return True
-        want_stem = Path(clean).stem.casefold()
-        if want_stem and (
-            stem_fold == want_stem
-            or stem_fold.endswith("-" + want_stem)
-            or want_stem.endswith("-" + stem_fold)
+        want_stem = _label_text(Path(clean).stem)
+        if want_stem and any(
+            item == want_stem or want_stem in item or item.endswith("-" + want_stem) or want_stem.endswith("-" + item)
+            for item in stripped
         ):
+            return True
+        want_terms = {word for word in re.findall(r"[a-z0-9]+", want_stem) if len(word) >= 4}
+        if want_terms and all(term in haystack for term in want_terms):
             return True
     return False
 

@@ -548,6 +548,14 @@ def print_checks(checks: list[tuple[str, str, str]]):
         print(f"[{status:<4}] {area:<{width}}  {detail}")
 
 
+def _configured_vault_has_structure(path: str) -> bool:
+    """True when the vault has been initialized, even if a later check finds it unhealthy."""
+    if not path or not os.path.isdir(path):
+        return False
+    markers = ("0-raw", "2-atoms", "3-threads", "4-experiences", "5-playbooks", "sources", "briefings")
+    return any(os.path.isdir(os.path.join(path, name)) for name in markers)
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import tempfile
@@ -559,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
 
     configured = get_active_brain_dir()
     owned_temp = None
-    check_root = configured if os.path.isdir(configured) else None
+    check_root = configured if _configured_vault_has_structure(configured) else None
     if check_root is None:
         owned_temp = tempfile.TemporaryDirectory(prefix="sb-doctor-")
         check_root = owned_temp.name
@@ -571,7 +579,8 @@ def main(argv: list[str] | None = None) -> int:
             os.path.join(check_root, "2-atoms"),
             os.path.join(check_root, ".sidecar", "lexical.sqlite3"),
         )
-        print(f"Configured vault is missing ({configured}). Checking a temporary vault at {check_root}.")
+        state = "missing" if not os.path.isdir(configured) else "not initialized"
+        print(f"Configured vault is {state} ({configured}). Checking a temporary vault at {check_root}.")
     try:
         checks = run_checks(check_root)
     finally:
