@@ -1,0 +1,66 @@
+{
+  "name": "distill-fixtures",
+  "notes": [
+    {
+      "id": "01-coffee",
+      "filename": "0-raw/01-coffee.md",
+      "text": "The pour-over coffee ratio is one gram of coffee to sixteen grams of water."
+    },
+    {
+      "id": "02-backups-hermes",
+      "filename": "0-raw/02-backups-hermes.md",
+      "text": "Daily backups run at 02:00. A 70B Hermes model needs a large GPU."
+    },
+    {
+      "id": "03-vault",
+      "filename": "0-raw/03-vault.md",
+      "text": "The vault stores approved claims as Markdown atoms."
+    },
+    {
+      "id": "04-pin",
+      "filename": "0-raw/04-pin.md",
+      "text": "A pinned generation model must not switch to another model after an abort."
+    },
+    {
+      "id": "05-lexical",
+      "filename": "0-raw/05-lexical.md",
+      "text": "Lexical search can rerank with the local cross-encoder."
+    },
+    {
+      "id": "06-no-source",
+      "filename": "0-raw/06-no-source.md",
+      "text": "No source, no claim. A memory needs an exact quote from this note."
+    },
+    {
+      "id": "07-queue",
+      "filename": "0-raw/07-queue.md",
+      "text": "SQLite is the job queue for background capture."
+    },
+    {
+      "id": "08-inbox",
+      "filename": "0-raw/08-inbox.md",
+      "text": "Daily notes land in the raw inbox before distillation."
+    }
+  ],
+  "eval": {
+    "k": 5,
+    "allow_unreviewed_exploratory": true,
+    "queries": [
+      {
+        "id": "coffee",
+        "query": "pour-over coffee ratio",
+        "relevant": ["pour-over-coffee-ratio", "01-coffee"]
+      },
+      {
+        "id": "backups",
+        "query": "daily backups",
+        "relevant": ["daily-backups", "02-backups-hermes"]
+      },
+      {
+        "id": "rule",
+        "query": "no source no claim",
+        "relevant": ["06-no-source", "exact quote"]
+      }
+    ]
+  }
+}

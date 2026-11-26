@@ -786,6 +786,70 @@ def build_synthesis_prompt(
     )
 
 
+def best_supporting_claims(query: str, verified: list[dict[str, object]], *, minimum: float = 0.34) -> list[dict[str, object]]:
+    """Rank verified claims by how many question words they contain."""
+    scored: list[tuple[float, dict[str, object]]] = []
+    for item in verified:
+        score = _query_claim_overlap(query, str(item.get("claim") or ""))
+        if score >= minimum:
+            scored.append((score, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _score, item in scored[:3]]
+
+
+def _query_claim_overlap(query: str, claim: str) -> float:
+    def terms(text: str) -> set[str]:
+        found = set()
+        for word in re.findall(r"[a-z0-9]+", text.casefold()):
+            if len(word) >= 4 or any(char.isdigit() for char in word):
+                found.add(word[:-1] if word.endswith("s") and len(word) > 4 else word)
+        return found
+
+    question = terms(query)
+    words = terms(claim)
+    if not question or not words:
+        return 0.0
+    return len(question & words) / len(question)
+
+
+_MODEL_ABSTENTION_RE = re.compile(
+    r"\b(?:no information|not enough information|do not have (?:enough )?information|"
+    r"don't have (?:enough )?information|cannot answer|can't answer|sources do not|"
+    r"nothing in (?:your|the) (?:verified )?memory)\b",
+    re.IGNORECASE,
+)
+
+
+def answer_with_citations(text: str, query: str, verified: list[dict[str, object]]) -> str:
+    """Replace a false abstention and attach [V#] tags the model left off."""
+    if not verified:
+        return text
+    supporting = best_supporting_claims(query, verified)
+    if supporting and (not (text or "").strip() or _MODEL_ABSTENTION_RE.search(text or "")):
+        top = supporting[0]
+        return f"{top['claim']} [{top['id']}]"
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if part.strip()]
+    if not parts:
+        return text
+    rewritten: list[str] = []
+    for part in parts:
+        if CITATION_RE.search(part):
+            rewritten.append(part)
+            continue
+        best_item = None
+        best_score = 0.0
+        for item in verified:
+            score = _query_claim_overlap(part, str(item.get("claim") or ""))
+            if score > best_score:
+                best_score = score
+                best_item = item
+        if best_item is not None and best_score >= 0.34:
+            rewritten.append(f"{part.rstrip()} [{best_item['id']}]")
+        else:
+            rewritten.append(part)
+    return " ".join(rewritten)
+
+
 def check_citations(
     text: str,
     verified: list[dict[str, object]],
@@ -1961,7 +2025,11 @@ def chat_events(
         elapsed = round((time.perf_counter() - started) * 1000, 1)
         yield _done_event(elapsed)
         return
-    full_text = "".join(pieces)
+    full_text = answer_with_citations("".join(pieces), query, model_verified)
+    if full_text != "".join(pieces):
+        extra = full_text[len("".join(pieces)) :] if full_text.startswith("".join(pieces)) else "\n" + full_text
+        if extra.strip():
+            yield {"type": "token", "text": extra, "token": extra}
     grounding = check_citations(full_text, model_verified, model_notes, model_preferences)
     grounding["first_token_ms"] = first_token_ms
     grounding["host_id"] = active_host_id

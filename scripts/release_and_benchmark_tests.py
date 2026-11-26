@@ -920,29 +920,26 @@ class OwnerGatesAndDocParityTests(unittest.TestCase):
     """Tests for `scripts/owner_gates.py`, `second-brain gates`, and live doc-to-code parity."""
 
     def test_owner_gates_audit_and_fail_closed_dataset_signoff(self) -> None:
-        report = owner_gates.collect_owner_gates_status()
-        self.assertEqual(report["dataset_gate"]["total_queries"], 90)
-        self.assertEqual(report["dataset_gate"]["v2_baseline_query_count"], 30)
-        self.assertEqual(report["dataset_gate"]["v3_expansion_query_count"], 60)
-        expected_pending = (
-            "sodium-ion-battery-cost-record.md",
-            "code-reviews-as-mentorship.md",
-            "continuous-integration-deployment.md",
-        )
-        if report["dataset_gate"].get("validation_mode") == "code_only_schema":
-            self.assertEqual(report["candidate_atoms_gate"]["unapproved_count"], 0)
-        else:
-            self.assertGreaterEqual(report["candidate_atoms_gate"]["unapproved_count"], 3)
-            cand_names = {c["filename"] for c in report["candidate_atoms_gate"]["candidates"]}
-            for name in expected_pending:
-                self.assertIn(name, cand_names)
+        with tempfile.TemporaryDirectory() as gate_tmp:
+            gate_vault = Path(gate_tmp) / "brain"
+            (gate_vault / "2-atoms").mkdir(parents=True)
+            with patch.dict(os.environ, {"BRAIN_CI_CODE_ONLY": "1"}, clear=False):
+                report = owner_gates.collect_owner_gates_status(brain_dir=str(gate_vault))
+                self.assertEqual(report["dataset_gate"]["total_queries"], 90)
+                self.assertEqual(report["dataset_gate"]["v2_baseline_query_count"], 30)
+                self.assertEqual(report["dataset_gate"]["v3_expansion_query_count"], 60)
+                self.assertEqual(report["dataset_gate"].get("validation_mode"), "code_only_schema")
+                self.assertEqual(report["candidate_atoms_gate"]["unapproved_count"], 0)
 
-        # CLI `second-brain gates status --json`
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            self.assertEqual(sb_cli.main(["gates", "status", "--json"]), 0)
-        cli_rep = json.loads(buf.getvalue())
-        self.assertEqual(cli_rep["dataset_gate"]["total_queries"], 90)
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    self.assertEqual(
+                        sb_cli.main(["gates", "status", "--json", "--brain-dir", str(gate_vault)]),
+                        0,
+                    )
+                cli_rep = json.loads(buf.getvalue())
+                self.assertEqual(cli_rep["dataset_gate"]["total_queries"], 90)
+                self.assertEqual(cli_rep["dataset_gate"].get("validation_mode"), "code_only_schema")
 
         # Isolated dataset approval tests (never modifies real docs/retrieval-evaluation-proposed.json)
         with tempfile.TemporaryDirectory() as tmp:

@@ -23,6 +23,7 @@ if __name__ == "__main__" and not __package__:
     raise SystemExit(0)
 
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -399,61 +400,231 @@ def _normalized_claim_key(memory_doc: str) -> str:
     return re.sub(r"\s+", " ", claim).strip().rstrip(".;:").casefold()
 
 
-def deterministic_atom_slug(title: str, current_date: str) -> str:
-    """Build a filename stem from the title. The model does not choose the spelling."""
+SOURCE_SPAN_MIN_RATIO = 0.72
+MAX_ATOMS_PER_NOTE = 5
+
+
+def deterministic_atom_slug(
+    title: str,
+    current_date: str,
+    *,
+    source_filename: str = "",
+    claim: str = "",
+) -> str:
+    """Build a filename stem. The same note and claim always get the same id, and a different claim does not."""
     words = re.findall(r"[A-Za-z0-9]+", str(title or "").casefold())
     stem = "-".join(words[:8]) or "atom"
-    slug = f"{current_date}-{stem}".strip("-")
-    return slug[:96].strip("-") or f"{current_date}-atom"
+    source_stem = re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        os.path.splitext(os.path.basename(str(source_filename or "")))[0].casefold(),
+    ).strip("-")[:32]
+    digest = hashlib.sha256(f"{source_filename}\n{claim}".encode("utf-8")).hexdigest()[:8]
+    parts = [current_date]
+    if source_stem:
+        parts.append(source_stem)
+    parts.extend((stem, digest))
+    slug = "-".join(part for part in parts if part).strip("-")
+    return slug[:120].strip("-") or f"{current_date}-atom-{digest}"
+
+
+def _collapse_with_map(text: str) -> tuple[str, list[int]]:
+    """Collapse whitespace and remember which original index each collapsed character came from."""
+    collapsed: list[str] = []
+    origins: list[int] = []
+    in_space = False
+    for index, char in enumerate(text):
+        if char.isspace():
+            if in_space:
+                continue
+            collapsed.append(" ")
+            origins.append(index)
+            in_space = True
+        else:
+            collapsed.append(char)
+            origins.append(index)
+            in_space = False
+    return "".join(collapsed), origins
+
+
+def _span_from_collapsed(source: str, collapsed_source: str, origins: list[int], needle: str) -> str | None:
+    start = collapsed_source.find(needle)
+    if start < 0 or not origins:
+        return None
+    end = start + len(needle) - 1
+    if end >= len(origins):
+        return None
+    return source[origins[start] : origins[end] + 1]
+
+
+def _clean_quote_hint(hint: str) -> str:
+    """Drop markdown, yaml, and heading junk around a quoted span."""
+    text = str(hint or "")
+    text = re.sub(r"```(?:yaml|markdown|json|sql)?", " ", text, flags=re.IGNORECASE)
+    text = text.replace("##", " ")
+    text = re.sub(r"(?m)^[ \t]*#+\s*", " ", text)
+    text = text.strip(" \t\r\n>`\"'`-*_")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _expand_to_sentence(source: str, span: str) -> str:
+    """Grow a source match out to the surrounding sentence so a clipped quote is not stored."""
+    idx = source.find(span)
+    if idx < 0:
+        return span
+    boundary = max(
+        source.rfind(".", 0, idx),
+        source.rfind("!", 0, idx),
+        source.rfind("?", 0, idx),
+        source.rfind("\n", 0, idx),
+    )
+    start = 0 if boundary < 0 else boundary + 1
+    ends = [source.find(mark, idx + max(len(span) - 1, 0)) for mark in ".!?\n"]
+    ends = [pos for pos in ends if pos >= 0]
+    end = (min(ends) + 1) if ends else len(source)
+    if end > start and source[end - 1] == "\n":
+        end -= 1
+    sentence = source[start:end].strip()
+    return sentence or span
+
+
+def _span_in_source(source: str, hint: str) -> str | None:
+    """Find hint in source, then the longest hint prefix that is actually present."""
+    cleaned = _clean_quote_hint(hint)
+    if len(cleaned) < 8:
+        return None
+    folded_source = source.casefold()
+    folded = cleaned.casefold()
+    if folded in folded_source:
+        start = folded_source.find(folded)
+        return source[start : start + len(cleaned)]
+    words = cleaned.split()
+    while len(words) >= 4:
+        candidate = " ".join(words)
+        folded_candidate = candidate.casefold()
+        if len(candidate) >= 12 and folded_candidate in folded_source:
+            start = folded_source.find(folded_candidate)
+            return source[start : start + len(candidate)]
+        words.pop()
+    return None
 
 
 def exact_source_span(source: str, hint: str) -> str | None:
-    """Return the source substring that the model's evidence was trying to quote."""
-    cleaned = str(hint or "").strip().strip("\"'`").strip()
-    if len(cleaned) < 8 or not source:
+    """Return the source sentence the evidence was quoting.
+
+    Match exact text, then whitespace-normalised text, then a case-insensitive
+    form of those, then a prefix after markdown junk is stripped, then the
+    closest source sentence above SOURCE_SPAN_MIN_RATIO. A match is extended
+    to the full sentence.
+    """
+    if not source:
         return None
-    if cleaned in source:
-        return cleaned
-    collapsed = re.sub(r"\s+", " ", cleaned)
-    source_collapsed = re.sub(r"\s+", " ", source)
-    if collapsed in source_collapsed:
-        start = source_collapsed.find(collapsed)
-        # Map the collapsed span back by walking the original text.
-        compact_index = 0
-        raw_start = None
-        raw_end = None
-        in_space = False
-        for index, char in enumerate(source):
-            if char.isspace():
-                if in_space:
-                    continue
-                piece = " "
-                in_space = True
-            else:
-                piece = char
-                in_space = False
-            if compact_index == start and raw_start is None:
-                raw_start = index
-            compact_index += len(piece)
-            if raw_start is not None and compact_index >= start + len(collapsed):
-                raw_end = index + 1
-                break
-        if raw_start is not None and raw_end is not None:
-            return source[raw_start:raw_end]
+    raw = str(hint or "").strip()
+    cleaned = _clean_quote_hint(raw)
+    if len(cleaned) < 8:
+        return None
+    for candidate in (raw, cleaned):
+        found = _span_in_source(source, candidate)
+        if found:
+            return _expand_to_sentence(source, found)
+    collapsed, _hint_origins = _collapse_with_map(cleaned)
+    source_collapsed, source_origins = _collapse_with_map(source)
+    mapped = _span_from_collapsed(source, source_collapsed, source_origins, collapsed)
+    if mapped:
+        return _expand_to_sentence(source, mapped)
+    folded = collapsed.casefold()
+    source_folded = source_collapsed.casefold()
+    fold_at = source_folded.find(folded)
+    if fold_at >= 0:
+        mapped = _span_from_collapsed(
+            source,
+            source_collapsed,
+            source_origins,
+            source_collapsed[fold_at : fold_at + len(collapsed)],
+        )
+        if mapped:
+            return _expand_to_sentence(source, mapped)
     sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", source) if part.strip()]
     best = None
     best_ratio = 0.0
-    hint_fold = collapsed.casefold()
-    for index, sentence in enumerate(sentences):
-        window = sentence if index + 1 >= len(sentences) else f"{sentence} {sentences[index + 1]}"
-        for candidate in (sentence, window):
-            ratio = difflib.SequenceMatcher(None, hint_fold, candidate.casefold()).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best = candidate
-    if best is not None and best_ratio >= 0.72:
-        return best
+    for sentence in sentences:
+        if sentence not in source:
+            continue
+        ratio = difflib.SequenceMatcher(None, folded, re.sub(r"\s+", " ", sentence).casefold()).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best = sentence
+    if best is not None and best_ratio >= SOURCE_SPAN_MIN_RATIO:
+        return _expand_to_sentence(source, best)
     return None
+
+
+_ARTIFACT_CLAIM_RE = re.compile(r"(##|```|\byaml\b|\bmemory_boundary\b)", re.IGNORECASE)
+_BOILERPLATE_RE = re.compile(r"synthetic test data", re.IGNORECASE)
+_DANGLING_END_RE = re.compile(
+    r"\b(a|an|the|of|to|in|for|and|or|is|are|was|were|with|by|from|that|this)$",
+    re.IGNORECASE,
+)
+
+
+def _is_boilerplate(text: str) -> bool:
+    return bool(_BOILERPLATE_RE.search(text or ""))
+
+
+def _claim_is_truncated(claim: str) -> bool:
+    text = str(claim or "").strip()
+    if len(text) < 12:
+        return True
+    if text.endswith(("##", "`", ":", "-", "…", "...")):
+        return True
+    if not text.endswith((".", "!", "?")) and _DANGLING_END_RE.search(text):
+        return True
+    return False
+
+
+def claim_supported_by_evidence(claim: str, evidence: str) -> bool:
+    """Most of the claim's content words must be in the cited evidence span."""
+    terms = _content_terms(claim)
+    if not terms:
+        return False
+    evidence_terms = _content_terms(evidence)
+    evidence_fold = evidence.casefold()
+    hits = sum(1 for term in terms if term in evidence_terms or term in evidence_fold)
+    needed = max(1, int(round(len(terms) * 0.7)))
+    return hits >= needed
+
+
+def salvage_claim(claim: str, evidence: str, source: str) -> str | None:
+    """Keep a claim that the evidence supports, or replace it with the evidence sentence."""
+    if _is_boilerplate(evidence) or evidence not in source:
+        return None
+    cleaned = _clean_quote_hint(claim)
+    unusable = (
+        not cleaned
+        or _is_boilerplate(cleaned)
+        or _ARTIFACT_CLAIM_RE.search(cleaned)
+        or _claim_is_truncated(cleaned)
+        or not claim_supported_by_evidence(cleaned, evidence)
+        or not claim_grounded_in_source(cleaned, source)
+    )
+    if not unusable:
+        return cleaned if cleaned.endswith((".", "!", "?")) else cleaned.rstrip(".") + "."
+    sentence = evidence if evidence.endswith((".", "!", "?")) else evidence.rstrip(".") + "."
+    if _is_boilerplate(sentence) or not claim_grounded_in_source(sentence, source):
+        return None
+    return sentence
+
+
+def claim_grounded_in_source(claim: str, source: str) -> bool:
+    """Drop a claim whose content words are not substantially in this note."""
+    terms = _content_terms(claim)
+    if not terms:
+        return False
+    source_terms = _content_terms(source)
+    source_fold = source.casefold()
+    hits = sum(1 for term in terms if term in source_terms or term in source_fold)
+    needed = 1 if len(terms) <= 2 else max(2, (len(terms) + 1) // 2)
+    return hits >= min(needed, len(terms))
 
 
 def _memory_title(document: str) -> str:
@@ -467,7 +638,7 @@ def _memory_title(document: str) -> str:
     return claim.split(".")[0].strip() if claim else ""
 
 
-def _rewrite_memory_identity(document: str, source_text: str, current_date: str) -> str:
+def _rewrite_memory_identity(document: str, source_text: str, current_date: str, source_filename: str = "") -> str:
     from scripts.memory_format import render_memory_document, set_scalar_field, split_frontmatter
     from scripts.memory_review import section_text
 
@@ -488,7 +659,7 @@ def _rewrite_memory_identity(document: str, source_text: str, current_date: str)
     title = str(values.get("title") or "").strip().strip("\"'")
     if not title:
         title = claim.split(".")[0].strip() if claim else _memory_title(document)
-    slug = deterministic_atom_slug(title, current_date)
+    slug = deterministic_atom_slug(title, current_date, source_filename=source_filename, claim=claim)
     frontmatter = set_scalar_field(list(frontmatter), "id", slug, "type")
     return render_memory_document(frontmatter, body_lines)
 
@@ -504,7 +675,7 @@ def _documents_from_model_output(output: str, source_filename: str, current_date
     documents = _documents_from_json(output, source_filename, current_date)
     if not documents:
         documents = extract_memory_documents(output, source_filename=source_filename, current_date=current_date)
-    return [_rewrite_memory_identity(document, source_text, current_date) for document in documents]
+    return [_rewrite_memory_identity(document, source_text, current_date, source_filename) for document in documents]
 
 
 def _documents_from_json(output: str, source_filename: str, current_date: str) -> list[str]:
@@ -516,7 +687,13 @@ def _documents_from_json(output: str, source_filename: str, current_date: str) -
         payload = json.loads(text)
     except json.JSONDecodeError:
         return []
-    rows = payload.get("memories") if isinstance(payload, dict) else payload
+    rows = None
+    if isinstance(payload, dict):
+        rows = payload.get("atoms")
+        if rows is None:
+            rows = payload.get("memories")
+    elif isinstance(payload, list):
+        rows = payload
     if not isinstance(rows, list):
         return []
     documents = []
@@ -532,7 +709,7 @@ def _documents_from_json(output: str, source_filename: str, current_date: str) -
             memory_type = "semantic"
         if len(claim) < 5 or len(evidence) < 5:
             continue
-        slug = deterministic_atom_slug(title or claim, current_date)
+        slug = deterministic_atom_slug(title or claim, current_date, source_filename=source_filename, claim=claim)
         documents.append(
             "---\n"
             f"id: {slug}\n"
@@ -561,6 +738,323 @@ def _documents_from_json(output: str, source_filename: str, current_date: str) -
     return documents
 
 
+ATOM_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+                    "atoms": {
+                        "type": "array",
+                        "maxItems": MAX_ATOMS_PER_NOTE,
+                        "description": "Distinct facts from this note only. At most 5.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "minLength": 3, "description": "Short name for this fact."},
+                    "claim": {"type": "string", "minLength": 12, "description": "One sentence stating the fact. Use words from the note."},
+                    "evidence": {"type": "string", "minLength": 8, "description": "Exact quote copied from the note, not a paraphrase."},
+                    "why": {"type": "string"},
+                    "memory_type": {"type": "string"},
+                },
+                "required": ["title", "claim", "evidence"],
+            },
+        }
+    },
+    "required": ["atoms"],
+}
+
+_DISTILL_STOP = frozenset({
+    "that", "this", "with", "from", "have", "been", "were", "they", "them", "your", "into", "about",
+    "when", "where", "what", "which", "their", "there", "would", "could", "should", "after", "before",
+})
+LAST_DISTILL_PATHS: list[str] = []
+
+
+def _content_terms(text: str) -> set[str]:
+    return {
+        word
+        for word in re.findall(r"[a-z0-9]+", str(text or "").casefold())
+        if len(word) >= 4 and word not in _DISTILL_STOP
+    }
+
+
+def evidence_supports_claim(claim: str, evidence: str) -> bool:
+    """Cheap lexical check that the evidence is about the same thing as the claim."""
+    claim_terms = _content_terms(claim)
+    evidence_terms = _content_terms(evidence)
+    if not claim_terms or not evidence_terms:
+        return False
+    overlap = claim_terms & evidence_terms
+    needed = 1 if len(claim_terms) < 3 else 2
+    return len(overlap) >= min(needed, len(claim_terms))
+
+
+def _optional_model_support_check(claim: str, evidence: str, model: str | None) -> bool | None:
+    if (os.environ.get("BRAIN_DISTILL_MODEL_SUPPORT_CHECK") or "").strip().lower() not in {"1", "true", "yes"}:
+        return None
+    prompt = (
+        "Does the evidence support the claim? Answer yes or no.\n"
+        f"Claim: {claim}\nEvidence: {evidence}"
+    )
+    try:
+        response = chat_with_fallback(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            allow_model_fallback=False,
+            options={"temperature": 0},
+        )
+        answer = str(response["message"]["content"]).strip().casefold()
+    except Exception:
+        return None
+    if answer.startswith("yes"):
+        return True
+    if answer.startswith("no"):
+        return False
+    return None
+
+
+def _json_object_text(text: str) -> str:
+    """Return the first JSON object or array, even when a model wraps it in prose."""
+    stripped = (text or "").strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json|yaml|markdown)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    start_obj = stripped.find("{")
+    start_arr = stripped.find("[")
+    if start_obj < 0 and start_arr < 0:
+        return stripped
+    start = start_obj if start_arr < 0 or (start_obj >= 0 and start_obj < start_arr) else start_arr
+    opener, closer = ("{", "}") if stripped[start] == "{" else ("[", "]")
+    depth = 0
+    for index in range(start, len(stripped)):
+        char = stripped[index]
+        if char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return stripped[start : index + 1]
+    return stripped[start:]
+
+
+def _rows_from_output(output: str) -> tuple[list[dict], list[str]]:
+    text = _json_object_text(output or "")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return [], ["output was not JSON"]
+    rows = payload.get("atoms") if isinstance(payload, dict) else None
+    if rows is None and isinstance(payload, dict):
+        rows = payload.get("memories")
+    if isinstance(payload, list):
+        rows = payload
+    if not isinstance(rows, list):
+        return [], ["JSON has no atoms array"]
+    problems: list[str] = []
+    clean: list[dict] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            problems.append(f"atom {index} is not an object")
+            continue
+        title = str(row.get("title") or "").strip()
+        claim = str(row.get("claim") or "").strip()
+        evidence = str(row.get("evidence") or "").strip()
+        if len(title) < 3:
+            problems.append(f"atom {index} title is empty")
+        if len(claim) < 12:
+            problems.append(f"atom {index} claim is empty")
+        if len(evidence) < 8:
+            problems.append(f"atom {index} evidence is empty")
+        clean.append(row)
+    return clean, problems
+
+
+def _schema_prompt(note: str) -> str:
+    return (
+        "Extract every distinct fact in the note, at most 5. "
+        "evidence must be an exact quote copied from the note. "
+        "claim must be one sentence about that quote, using words that appear in the note. "
+        "Do not add facts, names, or examples that are not in the note.\n\n"
+        f"RAW CAPTURE:\n{note}"
+    )
+
+
+def _rows_from_loose_markdown(output: str) -> list[dict]:
+    """Recover claim/evidence pairs when a model ignores JSON and writes loose headings."""
+    pattern = re.compile(
+        r"##\s*Claim\s*\n+(.*?)##\s*Evidence\s*\n+(.*?)(?=\n##\s|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    rows: list[dict] = []
+    for claim, evidence in pattern.findall(output or ""):
+        claim_text = re.sub(r"\s+", " ", claim).strip(" \n`>-")
+        evidence_text = re.split(r"##\s*Why", evidence, maxsplit=1, flags=re.IGNORECASE)[0]
+        evidence_text = re.sub(r"\s+", " ", evidence_text).strip(" \n`>-")
+        if len(claim_text) < 12 or len(evidence_text) < 8:
+            continue
+        rows.append({
+            "title": "",
+            "claim": claim_text,
+            "evidence": evidence_text,
+            "why": "",
+            "memory_type": "semantic",
+        })
+        if len(rows) >= MAX_ATOMS_PER_NOTE:
+            break
+    return rows
+
+
+def _legacy_markdown_prompt(raw_filename: str, today_str: str, extra_instructions: str, chunk_text: str, rules: str) -> str:
+    return f"""You are a dedicated local intelligence agent running the Second Brain.
+{rules}
+
+YOUR TASK:
+Read the following raw capture. Identify at most 5 distinct, standalone facts.
+Extract each one into its own atomic memory using the exact Markdown template below. Keep them concise and focused.
+Do NOT generate redundant, trivial, or duplicate variations.
+Classify each memory with one of these memory_type values: semantic, episodic, procedural, self.
+
+CRITICAL FORMAT RULES:
+1. Every atomic memory MUST be wrapped in its own fenced code block starting with ```markdown and ending with ```.
+2. Inside each fenced block, start with YAML frontmatter (between --- and ---), followed by these exact section headings:
+## Claim
+<One clear, falsifiable assertion sentence>
+
+## Evidence
+<Exact verbatim quote copied character-for-character from RAW CAPTURE so byte-offset provenance anchoring can verify it without manual repair>
+
+## Why It Matters
+<One or two sentences explaining why this matters or what question it answers>
+
+3. If you extract more than one memory, put this exact boundary line between fenced documents:
+{MEMORY_BOUNDARY}
+
+4. Output ONLY fenced Markdown memory documents. No introduction, no conversational filler, no summary, no headings outside the code blocks.
+
+Use today's date: {today_str}
+Use the source filename: {raw_filename}{extra_instructions}
+
+RAW CAPTURE:
+{chunk_text}
+"""
+
+
+def _call_model(prompt: str, model: str | None, *, schema: dict | str | None, temperature: float) -> tuple[str | None, str]:
+    def _once(fmt: dict | str | None) -> tuple[str | None, str]:
+        kwargs: dict = {
+            "model": model,
+            "allow_model_fallback": False,
+            "options": {"temperature": temperature, "num_predict": 512},
+        }
+        if fmt is not None:
+            kwargs["format"] = fmt
+        try:
+            response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], **kwargs)
+            return strip_reasoning_think_blocks(response["message"]["content"]), ""
+        except Exception as exc:
+            return None, str(exc)
+
+    text, err = _once(schema)
+    if err and "repeat" in err.casefold():
+        return text, err
+    if text or schema is None:
+        return text, err
+    # A complex schema can be rejected or ignored. One plain JSON retry stays on the same model.
+    plain, plain_err = _once("json")
+    if plain:
+        return plain, ""
+    return text, plain_err or err
+
+
+def _finish_row(row: dict, source_text: str, source_filename: str, current_date: str, model: str | None) -> tuple[str | None, str]:
+    title = str(row.get("title") or "").strip()
+    claim = str(row.get("claim") or "").strip()
+    evidence = str(row.get("evidence") or "").strip()
+    why = str(row.get("why") or row.get("why_it_matters") or "").strip() or "This is a durable note from the capture."
+    memory_type = str(row.get("memory_type") or "semantic").strip()
+    if memory_type not in {"semantic", "episodic", "procedural", "self"}:
+        memory_type = "semantic"
+    exact = exact_source_span(source_text, evidence) if len(evidence) >= 8 else None
+    if not exact or exact not in source_text:
+        print(f"  [!] Dropped atom; evidence is not a span of this note: {evidence[:80]!r}")
+        return None, "unanchored"
+    evidence = exact
+    path = "schema"
+    if title and claim.casefold().strip(" .") == title.casefold().strip(" ."):
+        claim = ""
+    kept_claim = salvage_claim(claim, evidence, source_text)
+    if not kept_claim:
+        print(f"  [!] Dropped atom; claim is not grounded in the evidence: {claim[:80]!r}")
+        return None, "ungrounded"
+    if kept_claim.casefold() != claim.casefold():
+        path = "derived_claim"
+        if not claim_supported_by_evidence(title, kept_claim):
+            title = " ".join(kept_claim.split()[:8]).rstrip(".")
+    claim = kept_claim
+    title_key = re.sub(r"[^a-z0-9]+", " ", title.casefold()).strip()
+    claim_key = re.sub(r"[^a-z0-9]+", " ", claim.casefold()).strip().rstrip(".")
+    if len(title) < 3 or (title_key and claim_key.startswith(title_key) and len(title_key.split()) < 3):
+        title = " ".join(claim.split()[:8]).rstrip(".")
+    if len(claim) < 12 or len(evidence) < 8:
+        return None, path
+    model_support = _optional_model_support_check(claim, evidence, model)
+    if model_support is False:
+        print(f"  [!] Dropped atom; model said the evidence does not support the claim: {claim[:80]!r}")
+        return None, "unsupported"
+    if len(title) < 3:
+        title = " ".join(claim.split()[:8]).rstrip(".")
+    document = _documents_from_json(
+        json.dumps({"atoms": [{
+            "title": title,
+            "claim": claim,
+            "evidence": evidence,
+            "why": why,
+            "memory_type": memory_type,
+        }]}),
+        source_filename,
+        current_date,
+    )
+    if not document:
+        return None, path
+    finished = _rewrite_memory_identity(document[0], source_text, current_date, source_filename)
+    if model_support is None and not evidence_supports_claim(claim, evidence):
+        return None, "unsupported"
+    return finished, path
+
+
+def _claims_are_near_duplicates(left: str, right: str) -> bool:
+    """True when two claims say the same thing. Different numbers stay distinct."""
+    if re.findall(r"\d+(?:\.\d+)?", left) != re.findall(r"\d+(?:\.\d+)?", right):
+        return False
+    ratio = difflib.SequenceMatcher(None, left.casefold(), right.casefold()).ratio()
+    if ratio >= 0.84:
+        return True
+    left_terms = _content_terms(left)
+    right_terms = _content_terms(right)
+    if not left_terms or not right_terms:
+        return False
+    return len(left_terms & right_terms) / len(left_terms | right_terms) >= 0.8
+
+
+def _existing_vault_claims(atoms_dir: str | None) -> list[str]:
+    if not atoms_dir or not os.path.isdir(atoms_dir):
+        return []
+    claims: list[str] = []
+    for name in sorted(os.listdir(atoms_dir)):
+        if not name.endswith(".md") or name == "README.md":
+            continue
+        try:
+            text = open(os.path.join(atoms_dir, name), encoding="utf-8").read()
+        except OSError:
+            continue
+        parsed = split_frontmatter(text)
+        body = "\n".join(parsed[1]) if parsed else text
+        claim = section_text(body, "Claim")
+        if claim:
+            claims.append(claim)
+        if len(claims) >= 400:
+            break
+    return claims
+
+
 def draft_memory_atoms(
     raw_content,
     raw_filename,
@@ -568,10 +1062,12 @@ def draft_memory_atoms(
     allow_fallback=False,
     model=None,
     *,
+    atoms_dir: str | None = None,
     max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
     overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS,
 ):
     print(f"[*] Drafting memory atoms from {raw_filename}...")
+    LAST_DISTILL_PATHS.clear()
     if allow_fallback:
         raise ValueError("Fallback atom generation is prohibited; defer this capture until the model is healthy.")
 
@@ -584,6 +1080,8 @@ def draft_memory_atoms(
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
     collected: list[str] = []
     seen_claims: set[str] = set()
+    seen_claim_texts: list[str] = []
+    existing_claims = _existing_vault_claims(atoms_dir)
     last_unparsed_output = ""
 
     for chunk in chunks:
@@ -609,118 +1107,118 @@ def draft_memory_atoms(
                 "(context label only — copy ## Evidence quotes strictly verbatim from RAW CAPTURE below)."
             )
         extra_instructions = ("\n" + "\n".join(chunk_context_lines)) if chunk_context_lines else ""
-
-        prompt = f"""You are a dedicated local intelligence agent running the Second Brain.
-{rules}
-
-YOUR TASK:
-Read the following raw capture. Identify 1 to 2 distinct, standalone core ideas, architectural patterns, or procedures.
-Extract each one into its own atomic memory using the exact Markdown template below. Keep them concise and focused.
-Do NOT generate redundant, trivial, or duplicate variations.
-Classify each memory with one of these memory_type values: semantic, episodic, procedural, self.
-
-CRITICAL FORMAT RULES:
-1. Every atomic memory MUST be wrapped in its own fenced code block starting with ```markdown and ending with ```.
-2. Inside each fenced block, start with YAML frontmatter (between --- and ---), followed by these exact section headings:
-## Claim
-<One clear, falsifiable assertion sentence>
-
-## Evidence
-<Exact verbatim quote copied character-for-character from RAW CAPTURE so byte-offset provenance anchoring can verify it without manual repair>
-
-## Why It Matters
-<One or two sentences explaining why this matters or what question it answers>
-
-3. If you extract more than one memory, put this exact boundary line between fenced documents:
-{MEMORY_BOUNDARY}
-
-4. Output ONLY fenced Markdown memory documents. No introduction, no conversational filler, no summary, no headings outside the code blocks.
-
-Use today's date: {today_str}
-Use the source filename: {raw_filename}{extra_instructions}
-
-EXAMPLE OUTPUT:
-```markdown
----
-id: {today_str}-slug-title
-type: atom
-memory_type: semantic
-certainty: tentative
-created: {today_str}
-last-reviewed: {today_str}
-importance: 0.50
-confidence: 0.50
-sources:
-  - {raw_filename}
-links: []
-tags: []
-contexts: []
-supersedes: []
-superseded_by: []
-contested_by: []
-review_status: pending
----
-
-## Claim
-A single clear asserting claim sentence.
-
-## Evidence
-Exact quote copied verbatim from raw capture.
-
-## Why It Matters
-Explanation of why this claim is important.
-```
-
-CRITICAL: Output ONLY fenced ```markdown blocks. Start each block immediately with --- and frontmatter. Do NOT write conversational filler or un-fenced text.
-
-RAW CAPTURE:
-{chunk_text}
-"""
-        try:
-            response = chat_with_fallback(
-                messages=[{"role": "user", "content": prompt}],
-                model=model,
-                format="json",
+        note = chunk_text if not extra_instructions else f"{extra_instructions.strip()}\n\n{chunk_text}"
+        errors: list[str] = []
+        output, err = _call_model(_schema_prompt(note), model, schema=ATOM_JSON_SCHEMA, temperature=0.1)
+        repeat_abort = bool(err and "repeat" in err.casefold())
+        if err:
+            errors.append(err)
+            output = ""
+        rows, problems = _rows_from_output(output or "")
+        finished: list[tuple[str, str]] = []
+        for row in rows:
+            doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+            if doc:
+                finished.append((doc, row_path))
+        if output:
+            for row in _rows_from_loose_markdown(output):
+                doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                if doc:
+                    finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
+        empty_fields = any("empty" in item for item in problems)
+        refusal = bool(re.search(r"unable to help|no information|i cannot|i can't", output or "", re.IGNORECASE))
+        already_headed = "##" in (output or "")
+        parsed_and_rejected = bool(rows) and not empty_fields and "not JSON" not in " ".join(problems)
+        if not finished and output and not repeat_abort and not refusal and not already_headed and not parsed_and_rejected:
+            gap_text = "; ".join(problems) if problems else "the claim or title was empty"
+            repair_prompt = (
+                "Your last JSON was incomplete: "
+                f"{gap_text}. Fill title, claim, and evidence. "
+                "The claim must be one full sentence. Copy evidence from the note.\n\n"
+                f"RAW CAPTURE:\n{note}\n\nPREVIOUS:\n{output[:1200]}"
             )
-            output = strip_reasoning_think_blocks(response["message"]["content"])
-        except Exception as exc:
-            raise RuntimeError(f"LLM drafting unavailable; capture deferred: {exc}") from exc
+            repaired, repair_err = _call_model(repair_prompt, model, schema=ATOM_JSON_SCHEMA, temperature=0)
+            if repair_err:
+                errors.append(repair_err)
+            else:
+                rows, problems = _rows_from_output(repaired or "")
+                for row in rows:
+                    doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                    if doc:
+                        finished.append((doc, "repair" if row_path == "schema" else row_path))
+                output = repaired or output
+        if not finished and output:
+            for row in _rows_from_loose_markdown(output):
+                doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                if doc:
+                    finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
+        if not finished and not repeat_abort:
+            for row in rows:
+                evidence = str(row.get("evidence") or "").strip()
+                if len(str(row.get("claim") or "").strip()) >= 12 or len(evidence) < 12:
+                    continue
+                follow, follow_err = _call_model(
+                    "State one full sentence that this evidence supports. Output the sentence only.\n"
+                    f"Evidence: {evidence}",
+                    model,
+                    schema=None,
+                    temperature=0,
+                )
+                if follow_err:
+                    errors.append(follow_err)
+                    continue
+                sentence = ""
+                for line in (follow or "").splitlines():
+                    sentence = line.strip().strip('"')
+                    if len(sentence) >= 12:
+                        break
+                if len(sentence) < 12:
+                    continue
+                followed = {
+                    "title": str(row.get("title") or ""),
+                    "claim": sentence,
+                    "evidence": evidence,
+                    "why": str(row.get("why") or ""),
+                    "memory_type": str(row.get("memory_type") or "semantic"),
+                }
+                doc, _row_path = _finish_row(followed, chunk_text, raw_filename, today_str, model)
+                if doc:
+                    finished.append((doc, "claim_followup"))
+        if not finished and not repeat_abort:
+            legacy_prompt = _legacy_markdown_prompt(raw_filename, today_str, extra_instructions, chunk_text, rules)
+            legacy, legacy_err = _call_model(legacy_prompt, model, schema=None, temperature=0.2)
+            if legacy_err:
+                errors.append(legacy_err)
+            elif legacy:
+                output = legacy
+                for document in extract_memory_documents(legacy, source_filename=raw_filename, current_date=today_str):
+                    rewritten = _rewrite_memory_identity(document, chunk_text, today_str, raw_filename)
+                    parsed = split_frontmatter(rewritten)
+                    body = "\n".join(parsed[1]) if parsed else ""
+                    claim = section_text(body, "Claim")
+                    evidence = section_text(body, "Evidence")
+                    if claim and evidence and evidence in chunk_text and claim_grounded_in_source(claim, chunk_text) and evidence_supports_claim(claim, evidence):
+                        finished.append((rewritten, "legacy_markdown"))
+                    elif claim and evidence:
+                        print(f"  [!] Dropped legacy atom; evidence does not overlap the claim: {claim[:80]!r}")
+                if not finished:
+                    for row in _rows_from_loose_markdown(legacy):
+                        doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                        if doc:
+                            finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
+        if not finished and errors and not output:
+            raise RuntimeError(f"LLM drafting unavailable; capture deferred: {errors[-1]}")
 
         stripped_out = (output or "").strip()
         if multi_chunk and stripped_out.upper() in {"NONE", "NO_CLAIMS", "EMPTY"}:
             print(f"  [*] Chunk {chunk_idx + 1}/{chunk_total}: boilerplate/no durable claims; skipping chunk.")
             continue
 
-        chunk_memories = _documents_from_model_output(
-            output,
-            source_filename=raw_filename,
-            current_date=today_str,
-            source_text=chunk_text,
-        )
-        if not chunk_memories and not (multi_chunk and stripped_out.upper() in {"NONE", "NO_CLAIMS", "EMPTY"}):
-            repair_prompt = (
-                "The previous output could not be parsed. Return only JSON with this shape: "
-                '{"memories":[{"title":"","claim":"","evidence":"","why":"","memory_type":"semantic"}]}. '
-                "Copy evidence from the capture. Use an empty memories list when there is no durable claim.\n\n"
-                f"CAPTURE:\n{chunk_text}"
-            )
-            try:
-                repaired = chat_with_fallback(
-                    messages=[{"role": "user", "content": repair_prompt}],
-                    model=model,
-                    format="json",
-                )
-                repaired_output = strip_reasoning_think_blocks(repaired["message"]["content"])
-            except Exception:
-                repaired_output = ""
-            if repaired_output:
-                output = repaired_output
-                chunk_memories = _documents_from_model_output(
-                    output,
-                    source_filename=raw_filename,
-                    current_date=today_str,
-                    source_text=chunk_text,
-                )
+        chunk_memories = [doc for doc, _row_path in finished]
+        if chunk_memories:
+            used = ",".join(dict.fromkeys(row_path for _doc, row_path in finished))
+            LAST_DISTILL_PATHS.append(used)
+            print(f"  [*] Distill path: {used}")
         if not chunk_memories:
             last_unparsed_output = output or ""
             if multi_chunk:
@@ -730,11 +1228,17 @@ RAW CAPTURE:
             break
 
         for mem in chunk_memories:
+            claim_text = section_text(mem, "Claim") or _normalized_claim_key(mem)
+            if any(_claims_are_near_duplicates(claim_text, prior) for prior in (*seen_claim_texts, *existing_claims)):
+                print(f"  [!] Dropped near-duplicate atom: {claim_text[:80]!r}")
+                continue
             claim_key = _normalized_claim_key(mem)
             if claim_key and claim_key in seen_claims:
                 continue
             if claim_key:
                 seen_claims.add(claim_key)
+            if claim_text:
+                seen_claim_texts.append(claim_text)
             collected.append(mem)
             if len(collected) >= MAX_ATOMS_PER_DOCUMENT:
                 break
@@ -1110,6 +1614,7 @@ def _process_single_file(
         rules,
         allow_fallback=allow_fallback,
         model=model,
+        atoms_dir=eff_atoms,
     )
 
     brain_root = os.path.dirname(os.path.abspath(eff_atoms))

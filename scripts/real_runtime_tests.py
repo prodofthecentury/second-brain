@@ -19,6 +19,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -34,6 +35,25 @@ from scripts.zero_trust_tunnel import probe_tunnel_binary
 
 def _require(flag: str) -> bool:
     return os.environ.get(flag) == "1"
+
+
+def _unload_ollama_model(model: str) -> None:
+    """Ask Ollama to drop a model immediately so the next test does not wait on keep-alive."""
+    import urllib.request
+
+    body = json.dumps({"model": model, "keep_alive": 0, "prompt": ""}).encode("utf-8")
+    request = urllib.request.Request(
+        "http://127.0.0.1:11434/api/generate",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read()
+        print(f"OLLAMA_UNLOAD {model}")
+    except Exception as exc:
+        print(f"OLLAMA_UNLOAD {model} failed: {exc}")
 
 
 class RealRuntimeTests(unittest.TestCase):
@@ -175,6 +195,132 @@ class RealRuntimeTests(unittest.TestCase):
         self.assertEqual(result["uncited_claims_emitted"], 0)
         self.assertIn(result["status"], {"completed", "abstained"})
         self.assertTrue(result["rounds"])
+
+    def test_llama32_distills_eight_short_notes(self) -> None:
+        """Live small-model distill of the shared fixture notes.
+
+        The model name comes from the caller. llama3.2:3b is the CI stress
+        model. A Hermes run uses the same notes and the same guards.
+        """
+        self._distill_shared_fixtures(
+            model=os.environ.get("BRAIN_DISTILL_FIXTURE_MODEL") or "llama3.2:3b",
+            require_flag="BRAIN_REQUIRE_DISTILL",
+        )
+
+    def test_hermes_distills_the_same_fixtures(self) -> None:
+        self._distill_shared_fixtures(
+            model=os.environ.get("BRAIN_HERMES_DISTILL_MODEL") or "hermes3:3b",
+            require_flag="BRAIN_REQUIRE_HERMES",
+        )
+
+    def _distill_shared_fixtures(self, *, model: str, require_flag: str) -> None:
+        import urllib.error
+        import urllib.request
+
+        from scripts.evidence import find_evidence_anchor
+        from scripts.lexical_store import rebuild_lexical_index
+        from scripts.ollama_refinery import draft_memory_atoms
+        from scripts.personal_eval import evaluate_file
+
+        fixture_path = Path(__file__).resolve().parents[1] / "docs" / "distill-fixtures.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        notes = fixture["notes"]
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            if _require("BRAIN_REQUIRE_OLLAMA") or _require(require_flag):
+                self.fail(f"Ollama is required but not reachable: {exc}")
+            self.skipTest(f"Ollama is not reachable: {exc}")
+        installed = [str(item.get("name") or "") for item in payload.get("models") or []]
+        if not any(name == model or name.startswith(model + ":") for name in installed):
+            if _require(require_flag):
+                self.fail(f"{model} is required but not installed; tags={installed}")
+            self.skipTest(f"{model} is not installed")
+
+        previous = os.environ.get("BRAIN_GEN_MODEL")
+        previous_timeout = os.environ.get("BRAIN_OLLAMA_TIMEOUT")
+        os.environ["BRAIN_GEN_MODEL"] = model
+        os.environ["BRAIN_OLLAMA_TIMEOUT"] = "60"
+        notes_with_atoms = 0
+        atoms_total = 0
+        gate_pass = 0
+        contaminated = False
+        started = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory(prefix="sb-distill-") as tmp:
+                vault = Path(tmp) / "brain"
+                raw = vault / "0-raw"
+                atoms = vault / "2-atoms"
+                raw.mkdir(parents=True)
+                atoms.mkdir()
+                for note in notes:
+                    if time.monotonic() - started > 480:
+                        print(f"DISTILL_NOTE {note['id']} atoms=0 path=timeout verbatim=0 gate=0")
+                        continue
+                    (vault / note["filename"]).parent.mkdir(parents=True, exist_ok=True)
+                    (vault / note["filename"]).write_text(note["text"] + "\n", encoding="utf-8")
+                    try:
+                        drafted = draft_memory_atoms(note["text"], note["filename"], "Copy evidence verbatim.")
+                    except Exception as exc:
+                        print(f"DISTILL_NOTE {note['id']} atoms=0 path=deferred verbatim=0 gate=0 detail={exc}")
+                        continue
+                    verbatim = 0
+                    anchored = 0
+                    for document in drafted:
+                        if note["id"] == "06-no-source" and "coffee" in document.casefold():
+                            contaminated = True
+                        evidence = ""
+                        for block in document.split("## Evidence\n", 1)[1:]:
+                            evidence = block.split("\n## ", 1)[0].strip()
+                            break
+                        if evidence and evidence in note["text"]:
+                            verbatim += 1
+                        atom_path = atoms / f"{note['id']}-{anchored}.md"
+                        atom_path.write_text(document, encoding="utf-8")
+                        try:
+                            find_evidence_anchor(document, str(vault))
+                            anchored += 1
+                        except Exception:
+                            pass
+                    if drafted:
+                        notes_with_atoms += 1
+                        atoms_total += len(drafted)
+                    gate_pass += anchored
+                    print(
+                        f"DISTILL_NOTE {note['id']} atoms={len(drafted)} "
+                        f"verbatim={verbatim} gate={anchored}"
+                    )
+                print(f"DISTILL_SUCCESS {notes_with_atoms}/{len(notes)} model={model} atoms={atoms_total} gate={gate_pass}")
+                if contaminated:
+                    self.fail(f"{model} kept a coffee atom for the coffee-free note")
+                if any(atoms.glob("*.md")):
+                    index = vault / "lexical.sqlite3"
+                    rebuild_lexical_index(str(atoms), str(index))
+                    spec = {
+                        "name": fixture["name"],
+                        "k": fixture["eval"]["k"],
+                        "allow_unreviewed_exploratory": True,
+                        "queries": fixture["eval"]["queries"],
+                    }
+                    spec_path = vault / "eval.json"
+                    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+                    report = evaluate_file(str(spec_path), atoms_dir=str(atoms), index_path=str(index))
+                    print(f"EVAL_RECALL {report['recall_at_k']} EVAL_MRR {report['mrr']} model={model}")
+                else:
+                    print(f"EVAL_RECALL 0.0 EVAL_MRR 0.0 model={model}")
+        finally:
+            _unload_ollama_model(model)
+            if previous is None:
+                os.environ.pop("BRAIN_GEN_MODEL", None)
+            else:
+                os.environ["BRAIN_GEN_MODEL"] = previous
+            if previous_timeout is None:
+                os.environ.pop("BRAIN_OLLAMA_TIMEOUT", None)
+            else:
+                os.environ["BRAIN_OLLAMA_TIMEOUT"] = previous_timeout
+        if _require(require_flag) and notes_with_atoms == 0:
+            self.fail(f"{model} distilled 0/{len(notes)} notes")
 
     def test_tunnel_binaries_report_their_real_version_when_installed(self) -> None:
         for name, flag in (("cloudflared", "BRAIN_REQUIRE_CLOUDFLARED"), ("tailscale", "BRAIN_REQUIRE_TAILSCALE")):

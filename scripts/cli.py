@@ -152,10 +152,9 @@ def doctor() -> int:
         from scripts.hardware_profile import detect_hardware_profile
 
         hw = detect_hardware_profile(ollama_timeout=2.0)
-        print(
-            f"Capability tier: {hw.tier_label} "
-            f"(recommended={hw.recommended_generation_model}, selected={hw.selected_installed_generation_model or 'none'})"
-        )
+        from scripts.doctor import capability_tier_detail
+
+        print(f"Capability tier: {capability_tier_detail(hw)}")
     except Exception:
         pass
     capabilities = {

@@ -35,9 +35,11 @@ if __name__ == "__main__" and not __package__:
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -274,8 +276,27 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 
-def run_suite(suite_id: str, description: str, cmd_args: tuple[str, ...]) -> dict:
+def _prepare_doctor_vault(root: Path) -> None:
+    """Build a healthy throwaway vault so doctor does not read the worktree brain/."""
+    from scripts.config import ensure_dirs, ensure_house_rules_file
+    from scripts.lexical_store import rebuild_lexical_index
+
+    ensure_dirs(str(root))
+    ensure_house_rules_file(str(root))
+    rebuild_lexical_index(str(root / "2-atoms"), str(root / ".sidecar" / "lexical.sqlite3"))
+
+
+def run_suite(
+    suite_id: str,
+    description: str,
+    cmd_args: tuple[str, ...],
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> dict:
     command = [sys.executable, *cmd_args]
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     started = time.perf_counter()
     completed = subprocess.run(
         command,
@@ -285,6 +306,7 @@ def run_suite(suite_id: str, description: str, cmd_args: tuple[str, ...]) -> dic
         encoding="utf-8",
         errors="replace",
         check=False,
+        env=env,
     )
     elapsed_s = round(time.perf_counter() - started, 3)
     passed = completed.returncode == 0
@@ -350,25 +372,36 @@ def main(argv: list[str] | None = None) -> int:
 
     overall_start = time.perf_counter()
     results: list[dict] = []
+    doctor_vault = tempfile.TemporaryDirectory(prefix="sb-doctor-suite-")
+    try:
+        _prepare_doctor_vault(Path(doctor_vault.name))
+        doctor_env = {"BRAIN_VAULT_DIR": doctor_vault.name}
+    except Exception:
+        doctor_vault.cleanup()
+        raise
 
-    for index, (suite_id, description, cmd_args) in enumerate(selected, start=1):
-        print(f"[{index}/{len(selected)}] Running {suite_id:<23} ... ", end="", flush=True)
-        outcome = run_suite(suite_id, description, cmd_args)
-        results.append(outcome)
-        status_label = "PASS" if outcome["passed"] else "FAIL"
-        print(f"{status_label} ({outcome['elapsed_seconds']:.2f}s)")
-        if not outcome["passed"]:
-            print("-" * 84)
-            print(f"FAILURE DETAILS [{suite_id}] (exit code {outcome['returncode']}):")
-            if outcome["stdout"].strip():
-                print("--- STDOUT ---")
-                print(outcome["stdout"].rstrip())
-            if outcome["stderr"].strip():
-                print("--- STDERR ---")
-                print(outcome["stderr"].rstrip())
-            print("-" * 84)
-            if args.fail_fast:
-                break
+    try:
+        for index, (suite_id, description, cmd_args) in enumerate(selected, start=1):
+            print(f"[{index}/{len(selected)}] Running {suite_id:<23} ... ", end="", flush=True)
+            extra_env = doctor_env if suite_id == "doctor" else None
+            outcome = run_suite(suite_id, description, cmd_args, extra_env=extra_env)
+            results.append(outcome)
+            status_label = "PASS" if outcome["passed"] else "FAIL"
+            print(f"{status_label} ({outcome['elapsed_seconds']:.2f}s)")
+            if not outcome["passed"]:
+                print("-" * 84)
+                print(f"FAILURE DETAILS [{suite_id}] (exit code {outcome['returncode']}):")
+                if outcome["stdout"].strip():
+                    print("--- STDOUT ---")
+                    print(outcome["stdout"].rstrip())
+                if outcome["stderr"].strip():
+                    print("--- STDERR ---")
+                    print(outcome["stderr"].rstrip())
+                print("-" * 84)
+                if args.fail_fast:
+                    break
+    finally:
+        doctor_vault.cleanup()
 
     total_elapsed = round(time.perf_counter() - overall_start, 3)
     passed_count = sum(1 for item in results if item["passed"])

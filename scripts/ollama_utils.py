@@ -218,6 +218,8 @@ def generation_candidates(preferred: str | None = None) -> list[str]:
     from scripts.hardware_profile import explicit_generation_model
 
     explicit_env = explicit_generation_model()
+    if explicit_env:
+        return [explicit_env]
     pref_clean = (preferred or "").strip()
     has_explicit_pin = bool(
         (pref_clean and pref_clean.lower() != "auto")
@@ -284,34 +286,49 @@ def _sanitize_messages_for_rule(messages: list[dict], rule: HostSharingRule) -> 
 
 
 def chat_with_fallback(messages: list[dict], model: str | None = None, **kwargs):
+    from scripts.hardware_profile import explicit_generation_model
+
     rule, base_url = _resolve_local_ollama_rule_and_url()
     outbound_messages = _sanitize_messages_for_rule(messages, rule)
     errors = []
+    allow_model_fallback = kwargs.pop("allow_model_fallback", None)
     effective_target = (model or "").strip()
     if not effective_target or effective_target.lower() == "auto":
         effective_target = resolve_active_local_generation_model(fallback=rule.default_model or GEN_MODEL)
-    for candidate in generation_candidates(model):
+    pinned = explicit_generation_model()
+    if pinned:
+        effective_target = pinned
+        candidates = [pinned]
+    elif allow_model_fallback is False:
+        candidates = [effective_target]
+    else:
+        candidates = generation_candidates(model or effective_target)
+    for candidate in candidates:
         try:
             if candidate != effective_target:
                 print(f"[*] Trying fallback generation model: {candidate}")
             call_kwargs = {k: v for k, v in kwargs.items() if k != "timeout"}
-            if "options" not in call_kwargs:
+            requested_options = call_kwargs.get("options") if isinstance(call_kwargs.get("options"), dict) else None
+            try:
+                hw_cached = detect_hardware_profile(use_cache=True)
+            except Exception:
+                hw_cached = None
+            runtime_opts = recommended_ollama_runtime_options(hw_cached, model_name=candidate)
+            if requested_options:
+                runtime_opts.update(requested_options)
+            if not _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
+                call_kwargs["options"] = runtime_opts
+            else:
                 try:
-                    hw_cached = detect_hardware_profile(use_cache=True)
-                except Exception:
-                    hw_cached = None
-                runtime_opts = recommended_ollama_runtime_options(hw_cached, model_name=candidate)
-                if not _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
-                    call_kwargs["options"] = runtime_opts
-                else:
-                    try:
-                        sig = inspect.signature(ollama.chat)
-                        if "options" in sig.parameters or any(
-                            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-                        ):
-                            call_kwargs["options"] = runtime_opts
-                    except (TypeError, ValueError):
-                        pass
+                    sig = inspect.signature(ollama.chat)
+                    if "options" in sig.parameters or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                    ):
+                        call_kwargs["options"] = runtime_opts
+                    elif "options" in call_kwargs and "options" not in sig.parameters:
+                        call_kwargs.pop("options", None)
+                except (TypeError, ValueError):
+                    pass
             if _is_monkeypatched_ollama_fn(ollama.chat, _DEFAULT_OLLAMA_CHAT):
                 resp = call_ollama_chat_maybe_no_think(
                     ollama.chat, model=candidate, messages=outbound_messages, **call_kwargs

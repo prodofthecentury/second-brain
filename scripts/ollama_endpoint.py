@@ -16,7 +16,7 @@ import os
 import re
 from urllib.parse import urlsplit
 
-_KEEP_ALIVE_RE = re.compile(r"^(?:-1|\d+[smh])$")
+_KEEP_ALIVE_RE = re.compile(r"^(?:-1|0|\d+[smh])$")
 
 
 def ollama_keep_alive() -> str:
