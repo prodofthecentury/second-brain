@@ -425,22 +425,24 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      PYPI_TOKEN_PRESENT: ${{ secrets.PYPI_API_TOKEN != '' }}
     steps:
       - name: Download Python packages
-        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true') }}
+        if: ${{ vars.PUBLISH_PYPI == 'true' || env.PYPI_TOKEN_PRESENT == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true') }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: dist-packages
           path: dist-packages
 
       - name: Stage Python wheel & sdist for PyPI
-        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true') }}
+        if: ${{ vars.PUBLISH_PYPI == 'true' || env.PYPI_TOKEN_PRESENT == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true') }}
         run: |
           mkdir -p pypi-dist
           cp dist-packages/*.whl dist-packages/*.tar.gz pypi-dist/
 
       - name: Publish Python wheel to PyPI
-        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true') }}
+        if: ${{ vars.PUBLISH_PYPI == 'true' || env.PYPI_TOKEN_PRESENT == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true') }}
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: pypi-dist
@@ -454,6 +456,10 @@ jobs:
     environment: release
     permissions:
       contents: read
+    env:
+      HAS_VSCE_PAT: ${{ secrets.VSCE_PAT != '' }}
+      HAS_OVSX_PAT: ${{ secrets.OVSX_PAT != '' }}
+      HAS_STORE_KEYS: ${{ secrets.CWS_CLIENT_ID != '' || secrets.EDGE_API_KEY != '' || secrets.AMO_JWT_SECRET != '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -480,7 +486,7 @@ jobs:
           path: dist-packages
 
       - name: Publish VSIX to VS Code Marketplace (env-scoped VSCE_PAT, never argv)
-        if: ${{ secrets.VSCE_PAT != '' }}
+        if: ${{ env.HAS_VSCE_PAT == 'true' }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
@@ -489,7 +495,7 @@ jobs:
             publish-vsix --vsix "${VSIX_FILE}" --target vscode
 
       - name: Publish VSIX to Open VSX (env-scoped OVSX_PAT, never argv)
-        if: ${{ secrets.OVSX_PAT != '' }}
+        if: ${{ env.HAS_OVSX_PAT == 'true' }}
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
@@ -498,7 +504,7 @@ jobs:
             publish-vsix --vsix "${VSIX_FILE}" --target ovsx
 
       - name: Publish Browser Web Clipper to Chrome Web Store, Edge Add-ons & Firefox AMO
-        if: ${{ secrets.CWS_CLIENT_ID != '' || secrets.EDGE_API_KEY != '' || secrets.AMO_JWT_SECRET != '' }}
+        if: ${{ env.HAS_STORE_KEYS == 'true' }}
         env:
           CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
           CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
@@ -528,6 +534,9 @@ jobs:
     environment: release
     permissions:
       contents: read
+    env:
+      HAS_HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+      HAS_WINGET_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN != '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -549,7 +558,7 @@ jobs:
           path: release-manifests/manifests
 
       - name: Update Live Homebrew Tap (when HOMEBREW_TAP_TOKEN is configured)
-        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HAS_HOMEBREW_TAP_TOKEN == 'true' }}
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO != '' && vars.HOMEBREW_TAP_REPO || format('{0}/homebrew-second-brain', github.repository_owner) }}
@@ -565,7 +574,7 @@ jobs:
             --version "${RELEASE_TAG#v}"
 
       - name: Publish WinGet Community Manifests PR (when WINGET_GITHUB_TOKEN is configured)
-        if: ${{ secrets.WINGET_GITHUB_TOKEN != '' }}
+        if: ${{ env.HAS_WINGET_TOKEN == 'true' }}
         env:
           WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
           WINGET_PKGS_REPO: ${{ vars.WINGET_PKGS_REPO != '' && vars.WINGET_PKGS_REPO || 'microsoft/winget-pkgs' }}
