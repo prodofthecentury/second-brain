@@ -406,6 +406,21 @@ class SecurityPathTests(unittest.TestCase):
         self.assertIn("Transcript saved", rendered)
         rendered.encode("cp1252")
 
+    def test_cross_encoder_dir_rejects_a_symlinked_parent(self) -> None:
+        from cross_encoder import resolve_cross_encoder_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real = root / "models"
+            slot = real / "cross-encoder"
+            slot.mkdir(parents=True)
+            (slot / "model.onnx").write_bytes(b"onnx")
+            (slot / "tokenizer.json").write_bytes(b"{}")
+            self.assertEqual(resolve_cross_encoder_dir(slot), slot)
+            alias = root / "alias-models"
+            alias.symlink_to(real, target_is_directory=True)
+            self.assertIsNone(resolve_cross_encoder_dir(alias / "cross-encoder"))
+
 
 if __name__ == "__main__":
     unittest.main()

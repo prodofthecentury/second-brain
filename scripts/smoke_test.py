@@ -1155,7 +1155,8 @@ Structured JSON logs contain request IDs for tracing and avoid logging PII.
                     "filename": "accepted.md",
                     "content_sha256": hashlib.sha256(accepted_atom.encode("utf-8")).hexdigest(),
                 }]],
-                "distances": [[0.05]],
+                # Similarity 0.80 sits under the 0.86 corroboration gate.
+                "distances": [[0.40]],
             }
             check(
                 rerank_candidates(
