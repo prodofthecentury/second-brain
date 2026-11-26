@@ -177,6 +177,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "speed_restore_tests.py")),
     ),
     (
+        "fifth_pass_tests",
+        "House rules, explicit generation model, lexical rerank, personal eval labels, and distill repair",
+        ("-m", "unittest", str(SCRIPTS_DIR / "fifth_pass_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),

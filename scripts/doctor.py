@@ -479,8 +479,8 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     checks.append(
         ok(
             "capability tier",
-            f"{hw_profile.tier_label} (recommended={hw_profile.recommended_generation_model}, "
-            f"installed={hw_profile.selected_installed_generation_model or 'none'})",
+            f"{hw_profile.tier_label} (active={active_gen_model}, "
+            f"auto={hw_profile.selected_installed_generation_model or 'none'})",
         )
     )
 

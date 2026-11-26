@@ -195,10 +195,11 @@ def generation_candidates(preferred: str | None = None) -> list[str]:
         hw = detect_hardware_profile(use_cache=True)
         _, _, model_sizes = probe_ollama_models_with_sizes(timeout=0.8)
         total_ram = float(getattr(hw, "total_ram_gib", 0.0) or 0.0)
+        available_ram = float(getattr(hw, "available_ram_gib", 0.0) or 0.0)
         gpu_backend = str(getattr(hw, "gpu_backend", "cpu") or "cpu")
         vram_gib = float(getattr(hw, "vram_gib", 0.0) or 0.0)
     except Exception:
-        total_ram, gpu_backend, vram_gib, model_sizes = 0.0, "cpu", 0.0, {}
+        total_ram, available_ram, gpu_backend, vram_gib, model_sizes = 0.0, 0.0, "cpu", 0.0, {}
 
     def _fits(m_name: str) -> bool:
         return _model_fits_host_memory(
@@ -207,19 +208,24 @@ def generation_candidates(preferred: str | None = None) -> list[str]:
             gpu_backend=gpu_backend,
             vram_gib=vram_gib,
             model_sizes_bytes=model_sizes,
+            available_ram_gib=available_ram,
         )
 
     installed_by_base: dict[str, list[str]] = {}
     for m_name in installed:
         installed_by_base.setdefault(m_name.split(":", 1)[0], []).append(m_name)
 
-    explicit_env = (os.environ.get("BRAIN_GEN_MODEL") or "").strip()
+    from scripts.hardware_profile import explicit_generation_model
+
+    explicit_env = explicit_generation_model()
     pref_clean = (preferred or "").strip()
     has_explicit_pin = bool(
         (pref_clean and pref_clean.lower() != "auto")
-        or (explicit_env and explicit_env.lower() != "auto")
+        or explicit_env
     )
-    if pref_clean and pref_clean.lower() != "auto":
+    if explicit_env:
+        configured = explicit_env
+    elif pref_clean and pref_clean.lower() != "auto":
         configured = pref_clean
     else:
         configured = resolve_active_local_generation_model(fallback=GEN_MODEL)

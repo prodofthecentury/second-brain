@@ -54,7 +54,7 @@ Embeddings are cached in SQLite by the model name and the SHA-256 of the text ac
 
 Hybrid retrieval still uses reciprocal rank fusion. `BRAIN_RRF_LEXICAL_WEIGHT` and `BRAIN_RRF_DENSE_WEIGHT` default to `1`, which is the previous equal blend. The reranker is the in-process interaction cross-encoder. If ONNX weights are present, doctor reports that backend; otherwise it reports the interaction fallback. Recall still requires the same literal overlap as before.
 
-`second-brain eval PATH` scores a personal set and prints recall@k and MRR. The file format is in `docs/personal-eval.example.json`. `second-brain eval-retrieval` and `second-brain eval-answers` are still there. A personal set is not the 90-query code-only dataset.
+`second-brain eval PATH` scores a personal set and prints recall@k and MRR. A relevant label matches a filename, its slug, an atom id, or a title. The example is `docs/personal-eval.example.json`. `second-brain eval-retrieval` and `second-brain eval-answers` are still there. A personal set is not the 90-query code-only dataset. `second-brain install` writes `house-rules.md` when it is missing, and distillation still runs if that file is later removed.
 
 The dashboard graph drawing lives in `dashboard/graph_view.py` and is bound before the sidebar runs. The product route function lives in `scripts/api_dispatch.py` and is rebound onto `api_product` so existing patches see the same function body. SSE writing lives in `scripts/api_sse.py`. Desktop chat send lives in `desktop/renderer/chat_send.js`, loaded immediately after `app.js`.
 

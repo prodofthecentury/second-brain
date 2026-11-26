@@ -182,14 +182,31 @@ class HardwareProfileTests(Phase2IsolatedTestCase):
         self.assertEqual(t1.tier_id, "tier_1_cpu_compact")
         self.assertEqual(t1.selected_installed_generation_model, "llama3.2:3b")
 
-        # Tier 2: Balanced CPU (15.9 GiB RAM) selects qwen2.5-coder:7b over 3b
+        # Tier 2: Balanced CPU with enough free RAM selects qwen2.5-coder:7b over 3b.
+        # About 9 GiB free is not enough; that case stays on llama3.2:3b.
+        tight = classify_hardware_tier(
+            os_name="Windows",
+            os_release="11",
+            architecture="AMD64",
+            cpu_threads=8,
+            total_ram_gib=15.9,
+            available_ram_gib=9.0,
+            cpp_runtime_ready=True,
+            cpp_runtime_detail="ok",
+            gpu_backend="cpu",
+            gpu_name="CPU",
+            vram_gib=0.0,
+            ollama_reachable=True,
+            installed_ollama_models=("llama3.2:3b", "nomic-embed-text:latest", "qwen2.5-coder:7b"),
+        )
+        self.assertEqual(tight.selected_installed_generation_model, "llama3.2:3b")
         t2 = classify_hardware_tier(
             os_name="Windows",
             os_release="11",
             architecture="AMD64",
             cpu_threads=8,
             total_ram_gib=15.9,
-            available_ram_gib=10.0,
+            available_ram_gib=14.0,
             cpp_runtime_ready=True,
             cpp_runtime_detail="ok",
             gpu_backend="cpu",

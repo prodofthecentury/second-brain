@@ -29,6 +29,42 @@ from typing import Any
 from scripts.recall import RecallOptions, search_lexical_memory
 
 
+def _result_matches_relevant(result: object, wanted: set[str]) -> bool:
+    """Match a filename, its stem, a dated slug, an atom id, or a title."""
+    filename = str(getattr(result, "filename", "") or "")
+    stem = Path(filename).stem
+    labels = {filename, Path(filename).name, stem}
+    content = str(getattr(result, "content", "") or "")
+    if content:
+        from scripts.memory_format import split_frontmatter
+        from scripts.memory_review import parse_frontmatter_values
+
+        parsed = split_frontmatter(content)
+        if parsed is not None:
+            values = parse_frontmatter_values(parsed[0])
+            for key in ("id", "title"):
+                raw = str(values.get(key) or "").strip().strip("\"'")
+                if raw:
+                    labels.add(raw)
+                    labels.add(Path(raw).stem)
+    folded = {item.casefold() for item in labels if item}
+    stem_fold = stem.casefold()
+    for want in wanted:
+        clean = want.strip()
+        if not clean:
+            continue
+        if clean in labels or clean.casefold() in folded:
+            return True
+        want_stem = Path(clean).stem.casefold()
+        if want_stem and (
+            stem_fold == want_stem
+            or stem_fold.endswith("-" + want_stem)
+            or want_stem.endswith("-" + stem_fold)
+        ):
+            return True
+    return False
+
+
 def load_eval_set(path: str | Path) -> dict[str, Any]:
     raw = Path(path).read_text(encoding="utf-8")
     data = json.loads(raw)
@@ -79,12 +115,13 @@ def evaluate_file(
             atoms_dir=atoms_dir,
             index_path=index_path,
         )
-        ranked = [result.filename for result in direct[:limit]]
-        relevant = {name.strip() for name in item["relevant"]}
-        hit = 1.0 if any(name in relevant for name in ranked) else 0.0
+        ranked_results = list(direct[:limit])
+        relevant = {name.strip() for name in item["relevant"] if str(name).strip()}
+        hit = 1.0 if any(_result_matches_relevant(result, relevant) for result in ranked_results) else 0.0
         reciprocal = 0.0
-        for position, name in enumerate(ranked, start=1):
-            if name in relevant:
+        ranked = [result.filename for result in ranked_results]
+        for position, result in enumerate(ranked_results, start=1):
+            if _result_matches_relevant(result, relevant):
                 reciprocal = 1.0 / position
                 break
         rows.append(

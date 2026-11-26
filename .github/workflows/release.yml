@@ -65,7 +65,7 @@ jobs:
       - name: Sync locked environment, verify release tag & run core test suites
         env:
           BRAIN_CI_CODE_ONLY: "1"
-          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           uv python install 3.11
@@ -344,7 +344,7 @@ jobs:
       - name: Generate unified SHA256SUMS.txt & WinGet / Homebrew Cask + Formula manifests
         working-directory: merged-dist
         env:
-          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
           RELEASE_ED25519_PRIVATE_KEY: ${{ secrets.RELEASE_ED25519_PRIVATE_KEY }}
         run: |
           set -euo pipefail
@@ -408,10 +408,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
-          name: "Second Brain ${{ inputs.tag != '' && inputs.tag || github.ref_name }}"
+          tag_name: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+          name: "Second Brain ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}"
           body_path: CHANGELOG.md
-          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.draft == 'true' }}
           generate_release_notes: true
           files: |
             merged-dist/*
@@ -419,7 +419,7 @@ jobs:
   publish-pypi:
     name: Publish Python Wheel & sdist to PyPI
     needs: [publish-release]
-    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && !inputs.draft && inputs.publish_pypi) }}
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.draft != 'true' && github.event.inputs.publish_pypi == 'true') }}
     runs-on: ${{ vars.SB_RELEASE_LINUX_RUNNER || 'ubuntu-latest' }}
     environment: release
     permissions:
@@ -427,20 +427,20 @@ jobs:
       id-token: write
     steps:
       - name: Download Python packages
-        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
+        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true') }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: dist-packages
           path: dist-packages
 
       - name: Stage Python wheel & sdist for PyPI
-        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
+        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true') }}
         run: |
           mkdir -p pypi-dist
           cp dist-packages/*.whl dist-packages/*.tar.gz pypi-dist/
 
       - name: Publish Python wheel to PyPI
-        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
+        if: ${{ vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true') }}
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: pypi-dist
@@ -449,7 +449,7 @@ jobs:
   publish-extensions:
     name: Publish VS Code VSIX & Browser Web Clippers
     needs: [publish-release]
-    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && !inputs.draft && inputs.publish_extensions) }}
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.draft != 'true' && github.event.inputs.publish_extensions == 'true') }}
     runs-on: ${{ vars.SB_RELEASE_LINUX_RUNNER || 'ubuntu-latest' }}
     environment: release
     permissions:
@@ -523,7 +523,7 @@ jobs:
   publish-package-managers:
     name: Update Live Homebrew Tap & Open WinGet Community PR
     needs: [publish-release]
-    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && !inputs.draft && inputs.publish_registries) }}
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.draft != 'true' && github.event.inputs.publish_registries == 'true') }}
     runs-on: ${{ vars.SB_RELEASE_LINUX_RUNNER || 'ubuntu-latest' }}
     environment: release
     permissions:
@@ -553,7 +553,7 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO != '' && vars.HOMEBREW_TAP_REPO || format('{0}/homebrew-second-brain', github.repository_owner) }}
-          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
         run: |
           TAP_DIR="$GITHUB_WORKSPACE/release-manifests/manifests/homebrew-tap"
           uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python scripts/publish_registries.py \
@@ -569,7 +569,7 @@ jobs:
         env:
           WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
           WINGET_PKGS_REPO: ${{ vars.WINGET_PKGS_REPO != '' && vars.WINGET_PKGS_REPO || 'microsoft/winget-pkgs' }}
-          RELEASE_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
         run: |
           uv run --directory "$GITHUB_WORKSPACE" --no-dev --frozen python scripts/publish_registries.py \
             publish-winget-pkgs \

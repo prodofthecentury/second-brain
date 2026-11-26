@@ -6,7 +6,7 @@
     {
       "id": "coffee",
       "query": "pour-over coffee ratio",
-      "relevant": ["coffee-ratio.md"]
+      "relevant": ["pour-over-coffee-ratio", "Pour-over coffee ratio"]
     }
   ]
 }

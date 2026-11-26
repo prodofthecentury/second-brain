@@ -76,11 +76,11 @@ jobs:
           ./gradlew bundleRelease assembleRelease --no-daemon
 
       - name: Upload to Google Play Console via Fastlane supply (when configured)
-        if: ${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 != '' && (github.event_name == 'push' || inputs.upload_play_store) }}
+        if: ${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 != '' && (github.event_name == 'push' || github.event.inputs.upload_play_store == 'true') }}
         working-directory: mobile/vault-client
         env:
           GOOGLE_PLAY_JSON_KEY_BASE64: ${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 }}
-          GOOGLE_PLAY_TRACK: ${{ inputs.track || 'internal' }}
+          GOOGLE_PLAY_TRACK: ${{ github.event.inputs.track || 'internal' }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
@@ -125,7 +125,7 @@ jobs:
         run: npx cap copy ios
 
       - name: Upload signed iOS build to TestFlight via Fastlane (when App Store Connect API Key configured)
-        if: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 != '' && (github.event_name == 'push' || inputs.upload_testflight) }}
+        if: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 != '' && (github.event_name == 'push' || github.event.inputs.upload_testflight == 'true') }}
         working-directory: mobile/vault-client
         env:
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}

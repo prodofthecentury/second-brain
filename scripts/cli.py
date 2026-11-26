@@ -325,6 +325,9 @@ def _resolve_active_vault_paths() -> tuple[str, str, str]:
 
 def install(args: argparse.Namespace | None = None) -> int:
     vault_dir, atoms_dir, lexical_index_path = _resolve_active_vault_paths()
+    from scripts.config import ensure_house_rules_file
+
+    ensure_house_rules_file(vault_dir)
     print(f"Created/verified vault at {vault_dir}")
     if getattr(args, "no_index", False) and os.path.isfile(lexical_index_path):
         return 0

@@ -492,7 +492,9 @@ def _provider_stream_fn(rule: HostSharingRule, *, http_transport: Any = None, pi
 def warmup(policy_path: Path | None = None) -> dict[str, object]:
     """Load the local model into memory so the first chat avoids cold-start latency."""
     rule = _ollama_rule(policy_path)
-    model = validate_model_identifier(rule.default_model, provider=rule.provider)
+    from scripts.hardware_profile import model_for_local_rule
+
+    model = validate_model_identifier(model_for_local_rule(rule.default_model), provider=rule.provider)
     import ollama
 
     t0 = time.perf_counter()
@@ -1512,7 +1514,12 @@ def chat_events(
                     http_transport=paths.http_transport,
                     skip_dns_check_for_mock_transport=paths.skip_dns_check_for_mock_transport,
                 )
-                model = validate_model_identifier((model_override or "").strip() or rule.default_model, provider=rule.provider)
+                from scripts.hardware_profile import model_for_local_rule
+
+                model = validate_model_identifier(
+                    model_for_local_rule(rule.default_model, model_override),
+                    provider=rule.provider,
+                )
             except (HostConsentError, ValueError, OSError) as exc:
                 yield {"type": "error", "error": str(exc)}
                 elapsed = round((time.perf_counter() - started) * 1000, 1)
@@ -1698,7 +1705,12 @@ def chat_events(
             http_transport=paths.http_transport,
             skip_dns_check_for_mock_transport=paths.skip_dns_check_for_mock_transport,
         )
-        model = validate_model_identifier((model_override or "").strip() or rule.default_model, provider=rule.provider)
+        from scripts.hardware_profile import model_for_local_rule
+
+        model = validate_model_identifier(
+            model_for_local_rule(rule.default_model, model_override),
+            provider=rule.provider,
+        )
     except (HostConsentError, ValueError, OSError) as exc:
         yield {"type": "error", "error": str(exc)}
         elapsed = round((time.perf_counter() - started) * 1000, 1)

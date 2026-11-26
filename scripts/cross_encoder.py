@@ -955,6 +955,8 @@ def rerank_recall_results(
         if mode == "rrf":
             rrf_w = 0.020 if used_onnx else 0.010
             blended = round(base_score + rrf_w * ce, 6)
+        elif mode == "lexical" and not used_onnx:
+            blended = round(_clamp01(0.35 * base_score + 0.65 * ce), 6)
         elif used_onnx:
             blended = round(_clamp01(0.20 * base_score + 0.80 * ce), 6)
         else:

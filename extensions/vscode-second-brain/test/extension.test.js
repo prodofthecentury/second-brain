@@ -620,6 +620,17 @@ function sha256Hex(text) {
 }
 
 async function createLoopbackFixture() {
+  const savedEnv = {
+    BRAIN_MEMORY_API_TOKEN: process.env.BRAIN_MEMORY_API_TOKEN,
+    BRAIN_OWNER_TOKEN: process.env.BRAIN_OWNER_TOKEN,
+    BRAIN_OWNER_API_TOKEN: process.env.BRAIN_OWNER_API_TOKEN,
+    BRAIN_API_PORT_FILE: process.env.BRAIN_API_PORT_FILE,
+    BRAIN_MEMORY_API_TOKEN_FILE: process.env.BRAIN_MEMORY_API_TOKEN_FILE,
+    BRAIN_OWNER_TOKEN_FILE: process.env.BRAIN_OWNER_TOKEN_FILE,
+  };
+  for (const key of Object.keys(savedEnv)) {
+    delete process.env[key];
+  }
   const tempSecDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-vscode-goal3-"));
   const apiToken = "api-tok-" + crypto.randomBytes(20).toString("hex");
   const ownerToken = "owner-tok-" + crypto.randomBytes(24).toString("hex");
@@ -1628,6 +1639,10 @@ async function createLoopbackFixture() {
       }
       await new Promise((resolve) => server.close(resolve));
       fs.rmSync(tempSecDir, { recursive: true, force: true });
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     },
   };
 }

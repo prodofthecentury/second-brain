@@ -22,6 +22,8 @@ if __name__ == "__main__" and not __package__:
     _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
     raise SystemExit(0)
 
+import difflib
+import json
 import os
 import re
 import datetime
@@ -361,8 +363,13 @@ def chunk_raw_document(
 
 def get_house_rules():
     rules_path = resolve_module_vault_path(globals(), "HOUSE_RULES", HOUSE_RULES_PATH if str(HOUSE_RULES_PATH) != _MOD_PATH_DEFAULTS.get("HOUSE_RULES_PATH") else None)
-    with open(rules_path, "r", encoding="utf-8") as f:
-        return f.read()
+    try:
+        with open(rules_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        from scripts.config import DEFAULT_HOUSE_RULES
+
+        return DEFAULT_HOUSE_RULES
 
 def init_chroma():
     chroma_dir = resolve_module_vault_path(globals(), "CHROMA_PATH", CHROMA_DB_PATH if str(CHROMA_DB_PATH) != _MOD_PATH_DEFAULTS.get("CHROMA_DB_PATH") else None)
@@ -390,6 +397,168 @@ def _normalized_claim_key(memory_doc: str) -> str:
     body = "\n".join(parsed[1]) if parsed is not None else memory_doc
     claim = section_text(body, "Claim")
     return re.sub(r"\s+", " ", claim).strip().rstrip(".;:").casefold()
+
+
+def deterministic_atom_slug(title: str, current_date: str) -> str:
+    """Build a filename stem from the title. The model does not choose the spelling."""
+    words = re.findall(r"[A-Za-z0-9]+", str(title or "").casefold())
+    stem = "-".join(words[:8]) or "atom"
+    slug = f"{current_date}-{stem}".strip("-")
+    return slug[:96].strip("-") or f"{current_date}-atom"
+
+
+def exact_source_span(source: str, hint: str) -> str | None:
+    """Return the source substring that the model's evidence was trying to quote."""
+    cleaned = str(hint or "").strip().strip("\"'`").strip()
+    if len(cleaned) < 8 or not source:
+        return None
+    if cleaned in source:
+        return cleaned
+    collapsed = re.sub(r"\s+", " ", cleaned)
+    source_collapsed = re.sub(r"\s+", " ", source)
+    if collapsed in source_collapsed:
+        start = source_collapsed.find(collapsed)
+        # Map the collapsed span back by walking the original text.
+        compact_index = 0
+        raw_start = None
+        raw_end = None
+        in_space = False
+        for index, char in enumerate(source):
+            if char.isspace():
+                if in_space:
+                    continue
+                piece = " "
+                in_space = True
+            else:
+                piece = char
+                in_space = False
+            if compact_index == start and raw_start is None:
+                raw_start = index
+            compact_index += len(piece)
+            if raw_start is not None and compact_index >= start + len(collapsed):
+                raw_end = index + 1
+                break
+        if raw_start is not None and raw_end is not None:
+            return source[raw_start:raw_end]
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", source) if part.strip()]
+    best = None
+    best_ratio = 0.0
+    hint_fold = collapsed.casefold()
+    for index, sentence in enumerate(sentences):
+        window = sentence if index + 1 >= len(sentences) else f"{sentence} {sentences[index + 1]}"
+        for candidate in (sentence, window):
+            ratio = difflib.SequenceMatcher(None, hint_fold, candidate.casefold()).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best = candidate
+    if best is not None and best_ratio >= 0.72:
+        return best
+    return None
+
+
+def _memory_title(document: str) -> str:
+    from scripts.memory_format import split_frontmatter
+    from scripts.memory_review import section_text
+
+    parsed = split_frontmatter(document)
+    if parsed is None:
+        return ""
+    claim = section_text("\n".join(parsed[1]), "Claim")
+    return claim.split(".")[0].strip() if claim else ""
+
+
+def _rewrite_memory_identity(document: str, source_text: str, current_date: str) -> str:
+    from scripts.memory_format import render_memory_document, set_scalar_field, split_frontmatter
+    from scripts.memory_review import section_text
+
+    parsed = split_frontmatter(document)
+    if parsed is None:
+        return document
+    frontmatter, body_lines = parsed
+    body = "\n".join(body_lines)
+    from scripts.memory_review import parse_frontmatter_values
+
+    claim = section_text(body, "Claim")
+    evidence = section_text(body, "Evidence")
+    exact = exact_source_span(source_text, evidence)
+    if exact:
+        body = _replace_section(body, "Evidence", exact)
+        body_lines = body.splitlines()
+    values = parse_frontmatter_values(frontmatter)
+    title = str(values.get("title") or "").strip().strip("\"'")
+    if not title:
+        title = claim.split(".")[0].strip() if claim else _memory_title(document)
+    slug = deterministic_atom_slug(title, current_date)
+    frontmatter = set_scalar_field(list(frontmatter), "id", slug, "type")
+    return render_memory_document(frontmatter, body_lines)
+
+
+def _replace_section(body: str, heading: str, new_text: str) -> str:
+    pattern = re.compile(rf"(^## {re.escape(heading)}\s*\n)(.*?)(?=^## |\Z)", re.MULTILINE | re.DOTALL)
+    replacement = rf"\1{new_text.strip()}\n\n"
+    updated, count = pattern.subn(replacement, body, count=1)
+    return updated if count else body
+
+
+def _documents_from_model_output(output: str, source_filename: str, current_date: str, source_text: str) -> list[str]:
+    documents = _documents_from_json(output, source_filename, current_date)
+    if not documents:
+        documents = extract_memory_documents(output, source_filename=source_filename, current_date=current_date)
+    return [_rewrite_memory_identity(document, source_text, current_date) for document in documents]
+
+
+def _documents_from_json(output: str, source_filename: str, current_date: str) -> list[str]:
+    text = (output or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    rows = payload.get("memories") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    documents = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        claim = str(row.get("claim") or "").strip()
+        evidence = str(row.get("evidence") or "").strip()
+        why = str(row.get("why") or row.get("why_it_matters") or "").strip() or "This is a durable note from the capture."
+        title = str(row.get("title") or claim).strip()
+        memory_type = str(row.get("memory_type") or "semantic").strip()
+        if memory_type not in {"semantic", "episodic", "procedural", "self"}:
+            memory_type = "semantic"
+        if len(claim) < 5 or len(evidence) < 5:
+            continue
+        slug = deterministic_atom_slug(title or claim, current_date)
+        documents.append(
+            "---\n"
+            f"id: {slug}\n"
+            "type: atom\n"
+            f"title: {title or claim}\n"
+            f"memory_type: {memory_type}\n"
+            "certainty: tentative\n"
+            f"created: {current_date}\n"
+            f"last-reviewed: {current_date}\n"
+            "importance: 0.50\n"
+            "confidence: 0.50\n"
+            "sources:\n"
+            f"  - {source_filename}\n"
+            "links: []\n"
+            "tags: []\n"
+            "contexts: []\n"
+            "supersedes: []\n"
+            "superseded_by: []\n"
+            "contested_by: []\n"
+            "review_status: pending\n"
+            "---\n\n"
+            f"## Claim\n{claim}\n\n"
+            f"## Evidence\n{evidence}\n\n"
+            f"## Why It Matters\n{why}\n"
+        )
+    return documents
 
 
 def draft_memory_atoms(
@@ -508,7 +677,11 @@ RAW CAPTURE:
 {chunk_text}
 """
         try:
-            response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], model=model)
+            response = chat_with_fallback(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+                format="json",
+            )
             output = strip_reasoning_think_blocks(response["message"]["content"])
         except Exception as exc:
             raise RuntimeError(f"LLM drafting unavailable; capture deferred: {exc}") from exc
@@ -518,11 +691,36 @@ RAW CAPTURE:
             print(f"  [*] Chunk {chunk_idx + 1}/{chunk_total}: boilerplate/no durable claims; skipping chunk.")
             continue
 
-        chunk_memories = extract_memory_documents(
+        chunk_memories = _documents_from_model_output(
             output,
             source_filename=raw_filename,
             current_date=today_str,
+            source_text=chunk_text,
         )
+        if not chunk_memories and not (multi_chunk and stripped_out.upper() in {"NONE", "NO_CLAIMS", "EMPTY"}):
+            repair_prompt = (
+                "The previous output could not be parsed. Return only JSON with this shape: "
+                '{"memories":[{"title":"","claim":"","evidence":"","why":"","memory_type":"semantic"}]}. '
+                "Copy evidence from the capture. Use an empty memories list when there is no durable claim.\n\n"
+                f"CAPTURE:\n{chunk_text}"
+            )
+            try:
+                repaired = chat_with_fallback(
+                    messages=[{"role": "user", "content": repair_prompt}],
+                    model=model,
+                    format="json",
+                )
+                repaired_output = strip_reasoning_think_blocks(repaired["message"]["content"])
+            except Exception:
+                repaired_output = ""
+            if repaired_output:
+                output = repaired_output
+                chunk_memories = _documents_from_model_output(
+                    output,
+                    source_filename=raw_filename,
+                    current_date=today_str,
+                    source_text=chunk_text,
+                )
         if not chunk_memories:
             last_unparsed_output = output or ""
             if multi_chunk:

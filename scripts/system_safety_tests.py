@@ -2550,6 +2550,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
             "advanced_module_behavior_tests",
             "real_runtime_tests",
             "speed_restore_tests",
+            "fifth_pass_tests",
             "desktop_ui_tests",
             "vscode_extension_tests",
             "dashboard_apptest_tests",

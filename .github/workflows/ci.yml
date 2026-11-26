@@ -125,6 +125,7 @@ jobs:
           uv run --frozen python scripts/build_distribution_manifests.py --pwa-only --out-dir dist
 
       - name: Run VS Code extension tests (zero-dependency Node test runner)
+        # Windows, macOS, and Linux Python 3.11 do not set skip_gui_pack, so this step runs there.
         if: ${{ !matrix.skip_gui_pack }}
         shell: bash
         run: |

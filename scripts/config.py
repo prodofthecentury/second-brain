@@ -263,6 +263,13 @@ NOTE_SNAPSHOTS_DIR = os.path.join(RAW_DIR, "note-snapshots")
 # ─── Special Files ───────────────────────────────────────────────────────────
 READING_LIST = os.path.join(RAW_DIR, "reading-list.md")
 HOUSE_RULES  = os.path.join(BRAIN_DIR, "house-rules.md")
+DEFAULT_HOUSE_RULES = """# House rules
+
+- A claim is citable only after you approve that exact revision.
+- Evidence must be copied verbatim from a named source file.
+- Do not invent sources, dates, or numbers.
+- Keep one idea in each atom.
+"""
 CHROMA_PATH  = os.path.join(BRAIN_DIR, ".chroma")
 SIDECAR_DIR  = os.path.join(BRAIN_DIR, ".sidecar")
 LEXICAL_INDEX_PATH = os.path.join(SIDECAR_DIR, "lexical.sqlite3")
@@ -668,8 +675,24 @@ def is_content_markdown(filename: str) -> bool:
     return filename.endswith(".md") and filename != VAULT_README
 
 def read_house_rules() -> str:
-    with open(get_active_house_rules(), "r", encoding="utf-8") as f:
-        return f.read()
+    path = get_active_house_rules()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return DEFAULT_HOUSE_RULES
+
+
+def ensure_house_rules_file(brain_dir: str) -> str:
+    """Create house-rules.md when a new vault does not have one yet."""
+    path = os.path.join(os.path.abspath(brain_dir), "house-rules.md")
+    if os.path.isfile(path):
+        return path
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(DEFAULT_HOUSE_RULES)
+    return path
 
 def today() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d")

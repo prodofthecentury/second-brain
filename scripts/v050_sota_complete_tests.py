@@ -547,7 +547,7 @@ class V050SotaCompleteTests(unittest.TestCase):
         from scripts.streaming_chat import _iter_strip_think_stream
 
         GiB = 1024 ** 3
-        # 2.1 16 GiB CPU host with 22.3 GiB qwen3.6:latest + 4.7 GiB qwen2.5-coder:7b -> skips oversized qwen3.6!
+        # 2.1 16 GiB CPU host with 9 GiB free skips a 7B model and the oversized qwen3.6.
         p_16gb_cpu = classify_hardware_tier(
             os_name="Windows",
             os_release="11",
@@ -568,7 +568,7 @@ class V050SotaCompleteTests(unittest.TestCase):
                 "llama3.2:3b": int(2.0 * GiB),
             },
         )
-        self.assertEqual(p_16gb_cpu.selected_installed_generation_model, "qwen2.5-coder:7b")
+        self.assertEqual(p_16gb_cpu.selected_installed_generation_model, "llama3.2:3b")
         self.assertIn("qwen3.6:latest", p_16gb_cpu.oversized_installed_models)
 
         # Same 16 GiB CPU host WITH fitted `qwen3:8b` (`5.2 GiB`) -> selects `qwen3:8b`!
@@ -578,7 +578,7 @@ class V050SotaCompleteTests(unittest.TestCase):
             architecture="AMD64",
             cpu_threads=16,
             total_ram_gib=15.9,
-            available_ram_gib=9.5,
+            available_ram_gib=14.0,
             cpp_runtime_ready=True,
             cpp_runtime_detail="MSVC ready",
             gpu_backend="cpu_only",

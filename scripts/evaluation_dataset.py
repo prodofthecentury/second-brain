@@ -422,6 +422,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # A bare `evaluation_dataset.py` run is the test suite. It must not read the
+    # owner's active vault. Pass --brain-dir when the check should use a vault.
+    isolated_fixture = args.brain_dir is None and args.atoms_dir is None
+    if isolated_fixture:
+        import tempfile
+
+        args.allow_code_only = True
+        args.brain_dir = tempfile.mkdtemp(prefix="sb-eval-fixture-")
+        Path(args.brain_dir, "2-atoms").mkdir(parents=True, exist_ok=True)
+
     eff_brain_dir = args.brain_dir if args.brain_dir is not None else BRAIN_DIR
     if args.atoms_dir is not None:
         eff_atoms_dir = args.atoms_dir
