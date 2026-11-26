@@ -1185,6 +1185,19 @@ def _is_skill_killed(ks_status: dict[str, object], skill_id: str) -> tuple[bool,
     return False, ""
 
 
+def _replace_file_retrying_share(src: str, dst: str) -> None:
+    """Replace a file. Windows denies the replace while a reader still has it open."""
+    attempts = 10 if os.name == "nt" else 1
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(0.05)
+
+
 def set_skill_kill_switch(
     *,
     engaged: bool,
@@ -1272,7 +1285,7 @@ def set_skill_kill_switch(
         os.fsync(fd)
         os.close(fd)
         closed = True
-        os.replace(tmp_path, ks_path)
+        _replace_file_retrying_share(tmp_path, str(ks_path))
         restrict_security_file_permissions(ks_path)
     finally:
         if not closed:
