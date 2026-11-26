@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 import sys
 import tempfile
@@ -343,23 +344,27 @@ class SecurityPathTests(unittest.TestCase):
             plain.mkdir()
             mcp_server._assert_no_symlink_ancestors(plain / "mcp-token")
 
-        with (
-            patch("config.sys.platform", "darwin"),
-            patch("config._is_reparse_or_link", return_value=True),
-            patch("config.os.path.realpath", return_value="/private/var"),
-        ):
+        def _posix(path: str) -> str:
+            return str(path).replace("\\", "/")
+
+        @contextmanager
+        def _darwin_alias(realpath_value: str):
+            # Windows abspath("/var") becomes "<drive>\\var", so the simulated
+            # macOS check keeps the POSIX path it was given.
+            with (
+                patch("config.sys.platform", "darwin"),
+                patch("config._is_reparse_or_link", return_value=True),
+                patch("config.os.path.realpath", return_value=realpath_value),
+                patch("config.os.path.abspath", side_effect=_posix),
+                patch("config.os.path.normpath", side_effect=_posix),
+            ):
+                yield
+
+        with _darwin_alias("/private/var"):
             self.assertFalse(is_untrusted_reparse_or_link("/var"))
-        with (
-            patch("config.sys.platform", "darwin"),
-            patch("config._is_reparse_or_link", return_value=True),
-            patch("config.os.path.realpath", return_value="/tmp/elsewhere"),
-        ):
+        with _darwin_alias("/tmp/elsewhere"):
             self.assertTrue(is_untrusted_reparse_or_link("/var"))
-        with (
-            patch("config.sys.platform", "darwin"),
-            patch("config._is_reparse_or_link", return_value=True),
-            patch("config.os.path.realpath", return_value="/private/var/folders/xx"),
-        ):
+        with _darwin_alias("/private/var/folders/xx"):
             self.assertTrue(is_untrusted_reparse_or_link("/var/folders/xx"))
 
     def test_vault_slug_matches_across_a_directory_alias(self) -> None:
