@@ -1703,6 +1703,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                         brain_dir=rt.brain_dir,
                         limit=req.n_results,
                         project=req.project_scope.strip() if req.project_scope else "",
+                        security_dir=str(rt.security_dir) if getattr(rt, "security_dir", None) else None,
                     )
                 except Exception:
                     shared_knowledge = []

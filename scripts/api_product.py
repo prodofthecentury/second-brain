@@ -1119,6 +1119,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 capture_source="api-agent",
                 paths=paths,
             )
+            if res.get("status") == "not_saved":
+                return send(422, res)
             return send(202 if res.get("status") == "quarantined" else 201, res)
 
         if path == "/v1/notes/tasks" and method == "GET":
@@ -1202,6 +1204,8 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 capture_source=_str(body, "source", max_len=64, required=False, default="agent"),
                 paths=paths,
             )
+            if res.get("status") == "not_saved":
+                return send(422, res)
             return send(202 if res["status"] == "quarantined" else 201, res)
 
         # ── Agent runtime status (owner-only; skill triggers stay off the agent bearer) ──

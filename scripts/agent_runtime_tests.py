@@ -570,6 +570,99 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(any(hit["source"] == "note" and hit["filename"] == risky["filename"] for hit in risky_hits))
         self.assertFalse(any(hit["source"] == "agent_memory" and "owner token" in hit["text"] for hit in risky_hits))
 
+    def test_agent_notes_must_be_specific_and_search_finds_other_vaults(self) -> None:
+        from agent_runtime import draft_agent_skill, run_agent, search_connected_knowledge
+        from notes_store import NotePaths, create_note
+        from vault_workspaces import federated_recall
+
+        paths = NotePaths.for_brain(self._brain())
+        generic = create_note(
+            "Security tip",
+            "Always use HTTPS and validate user input.",
+            origin="agent_capture",
+            paths=paths,
+        )
+        self.assertEqual(generic["status"], "not_saved")
+        self.assertEqual(generic["reason"], "generic")
+        self.assertEqual(list((self.brain / "notes").glob("*.md")), [])
+        owner = create_note("Plain tip", "Always use HTTPS and validate user input.", paths=paths)
+        self.assertEqual(owner["status"], "saved")
+        specific = create_note(
+            "Checkout gate",
+            "This checkout rejects when `risk_score` from `/v1/payments/assess` is >= 0.82.",
+            origin="agent_capture",
+            paths=paths,
+        )
+        self.assertEqual(specific["status"], "saved")
+
+        cyber = self.root / "cyber"
+        for relative in ("notes", "2-atoms", "0-raw/inbox", ".sidecar", "4-experiences"):
+            (cyber / relative).mkdir(parents=True)
+        cyber_paths = NotePaths.for_brain(str(cyber))
+        saved = create_note(
+            "Checkout anti-fraud gate",
+            "How to install the anti-fraud gate on this site:\n"
+            "1. Call `/v1/payments/assess` and read `risk_score`.\n"
+            "2. Reject the payment when `risk_score` >= 0.82 and the BIN is outside `allow_bins`.",
+            paths=cyber_paths,
+        )
+        draft_agent_skill(
+            "learner",
+            "antifraud-checkout",
+            [{"action_type": "vault_recall", "query": "anti-fraud checkout", "output_file": "recall.json"}],
+            trigger="anti-fraud checkout",
+            brain_dir=str(cyber),
+        )
+        registry = {
+            "schema_version": 1,
+            "active_vault_id": "main",
+            "vaults": [
+                {
+                    "vault_id": "main",
+                    "label": "Main",
+                    "path": str(self.brain),
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "default_host_policy": "local_only",
+                    "federated_searchable": False,
+                    "isolated_token_sha256": None,
+                    "isolated_token_file": None,
+                },
+                {
+                    "vault_id": "cyber",
+                    "label": "Cybersecurity",
+                    "path": str(cyber),
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "default_host_policy": "local_only",
+                    "federated_searchable": False,
+                    "isolated_token_sha256": None,
+                    "isolated_token_file": None,
+                },
+            ],
+        }
+        (self.security / "vaults.json").write_text(json.dumps(registry), encoding="utf-8")
+        hits = search_connected_knowledge(
+            "make an anti-fraud system for my website",
+            brain_dir=self._brain(),
+            security_dir=str(self.security),
+            project="other",
+        )
+        self.assertTrue(any(hit["vault"] == "Cybersecurity" and hit["filename"] == saved["filename"] for hit in hits))
+        self.assertTrue(any(hit["source"] == "agent_skill" and hit["title"] == "antifraud-checkout" for hit in hits))
+        self.assertTrue(hits and hits[0]["source"] == "agent_skill")
+        closed = federated_recall(
+            "anti-fraud",
+            security_dir=str(self.security),
+            current_brain_dir=self._brain(),
+        )
+        self.assertEqual(closed.get("results"), [])
+        result = run_agent(
+            "build an anti-fraud system for the website",
+            brain_dir=self._brain(),
+            security_dir=str(self.security),
+        )
+        self.assertEqual(result["skill_id"], "antifraud-checkout")
+        self.assertEqual(result["status"], "done")
+
 
 if __name__ == "__main__":
     unittest.main()

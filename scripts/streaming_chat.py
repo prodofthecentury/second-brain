@@ -583,18 +583,28 @@ def retrieve_context(
         for n in notes
     ]
     try:
-        from agent_runtime import learn_from_notes, search_agent_memory
+        from agent_runtime import search_connected_knowledge
 
-        learn_from_notes(brain_dir=paths.brain_dir)
-        for hit in search_agent_memory(query, brain_dir=paths.brain_dir, project=scope_raw, limit=4):
+        known_notes = {n["filename"] for n in notes}
+        security_dir = str(paths.security_dir) if getattr(paths, "security_dir", None) else None
+        for hit in search_connected_knowledge(
+            query,
+            brain_dir=paths.brain_dir,
+            project=scope_raw,
+            limit=6,
+            security_dir=security_dir,
+        ):
+            if hit.get("source") == "note" and hit.get("filename") in known_notes:
+                continue
+            text = hit.get("text") or ""
             sources.append(
                 {
                     "tier": "agent",
                     "citation_id": f"A{len([s for s in sources if s.get('tier') == 'agent']) + 1}",
-                    "filename": hit["filename"],
-                    "title": hit["filename"],
-                    "claim": hit["claim"],
-                    "excerpt": hit["claim"],
+                    "filename": hit.get("filename") or "",
+                    "title": hit.get("title") or hit.get("filename") or "",
+                    "claim": text,
+                    "excerpt": text,
                 }
             )
     except Exception:

@@ -489,9 +489,23 @@ class ProductApiTests(IsolatedVaultCase):
         return r if raw else (r.status_code, r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text)
 
     def test_agent_can_add_notes_but_not_change_or_delete(self) -> None:
-        status, added = self.req("POST", "/v1/notes", {"title": "Agent note", "body": "Keep the rollback plan with the deploy."})
+        status, added = self.req(
+            "POST",
+            "/v1/notes",
+            {
+                "title": "Agent note",
+                "body": "This checkout rejects when `risk_score` from `/v1/payments/assess` is >= 0.82.",
+            },
+        )
         self.assertEqual(status, 201)
         self.assertEqual(added["status"], "saved")
+        status, rejected = self.req(
+            "POST",
+            "/v1/notes",
+            {"title": "Generic tip", "body": "Always use HTTPS and validate user input."},
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(rejected["reason"], "generic")
         for method, path, body in (
             ("PUT", f"/v1/notes/{added['filename']}", {"body": "hijack", "expected_sha256": added["sha256"]}),
             ("DELETE", f"/v1/notes/{added['filename']}", {"expected_sha256": added["sha256"]}),
@@ -888,7 +902,15 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
             return resp.status, data
 
         # Agents may add a note. Changing one that already exists stays forbidden.
-        st_added, raw_added = req("POST", "/v1/notes", {"title": "Agent note", "body": "Agents may add a note."}, owner=False)
+        st_added, raw_added = req(
+            "POST",
+            "/v1/notes",
+            {
+                "title": "Agent note",
+                "body": "This checkout rejects when `risk_score` from `/v1/payments/assess` is >= 0.82.",
+            },
+            owner=False,
+        )
         self.assertEqual(st_added, 201)
         added = json.loads(raw_added)
         st_denied, _ = req(

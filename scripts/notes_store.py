@@ -346,6 +346,51 @@ def _quarantine_agent_capture(paths: NotePaths, title: str, body: str, risks: tu
     }
 
 
+_GENERIC_NOTE_MESSAGE = (
+    "Not saved. This is general knowledge an AI already has. "
+    "Add a note only when it is specific to this system: a path, command, threshold, "
+    "config value, or a local choice such as which tool this project uses."
+)
+_PATH_ANCHOR_RE = re.compile(r"(?:^|[\s\"'(])((?:\.\./|\./|/)[\w./-]{3,})", re.MULTILINE)
+_FLAG_ANCHOR_RE = re.compile(r"\b[\w.-]+\s+--[\w-]+")
+_UNIT_ANCHOR_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:%|ms|s|px|mb|gb)\b", re.IGNORECASE)
+_VERSION_ANCHOR_RE = re.compile(r"\bv?\d+\.\d+\.\d+\b")
+_CHOICE_ANCHOR_RE = re.compile(
+    r"\b(?:this |our |the )?(?:repo|project|site|vault|app|service|checkout|codebase) uses "
+    r"(?!best\b|proper\b|secure\b|good\b|https\b)[A-Za-z0-9_./+-]{2,}",
+    re.IGNORECASE,
+)
+_ASSIGN_ANCHOR_RE = re.compile(r"\b[A-Za-z][\w.-]{1,40}\s*(?:=|:)\s*[^\s,]{1,48}")
+_TICK_ANCHOR_RE = re.compile(r"`([^`\n]{3,80})`")
+_GENERIC_TICK_RE = re.compile(r"^(?:https|http|input|password|user|data|token|secret|true|false|null|none)$", re.IGNORECASE)
+
+
+def agent_capture_rejection(title: str, body: str) -> str | None:
+    """Refuse an agent note that is only knowledge a model already has.
+
+    Owner-written notes are not checked. A keepable agent note names something
+    local: a path, command, version, threshold, config value, or a project choice.
+    """
+    text = f"{title}\n{body}"
+    if (
+        _PATH_ANCHOR_RE.search(text)
+        or _FLAG_ANCHOR_RE.search(text)
+        or _UNIT_ANCHOR_RE.search(text)
+        or _VERSION_ANCHOR_RE.search(text)
+        or _CHOICE_ANCHOR_RE.search(text)
+    ):
+        return None
+    for match in _ASSIGN_ANCHOR_RE.finditer(text):
+        value = match.group(0).split("=", 1)[-1].split(":", 1)[-1].strip()
+        if re.search(r"[\d/._]", value) and value.casefold() not in {"true", "false", "null", "none", "https"}:
+            return None
+    for match in _TICK_ANCHOR_RE.finditer(text):
+        inner = match.group(1).strip()
+        if re.search(r"[\d/._:]", inner) and not _GENERIC_TICK_RE.match(inner):
+            return None
+    return _GENERIC_NOTE_MESSAGE
+
+
 def _learn_saved_notes(paths: NotePaths) -> None:
     """Best-effort: a saved note becomes shared memory without blocking the save."""
     try:
@@ -378,6 +423,9 @@ def create_note(
         risks = scan_inbox_payload_risks(f"{clean_title}\n{text_body}")
         if risks:
             return _quarantine_agent_capture(paths, clean_title, text_body, risks, capture_source)
+        generic = agent_capture_rejection(clean_title, text_body)
+        if generic:
+            return {"status": "not_saved", "reason": "generic", "message": generic}
     now = _now_iso()
     rendered = render_note(
         title=clean_title,

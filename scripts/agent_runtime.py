@@ -28,7 +28,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cognitive_core import save_experience_record
-from config import BRAIN_DIR, safe_file_in_dir
+from config import BRAIN_DIR, _is_reparse_or_link, safe_file_in_dir
 from executable_skills import (
     ALLOWED_ACTION_TYPES,
     ALLOWED_ASSERT_OPS,
@@ -478,7 +478,7 @@ def _run_agent_step(
         if action == "vault_recall":
             query = str(inputs.get("query") if inputs and inputs.get("query") else step.get("query") or "")
             _scan_text_for_secrets_and_risks(query, context_label="vault_recall.query")
-            found = _recall(query, brain_dir)
+            found = _recall(query, brain_dir, security_dir)
             payload = json.dumps({"query": query, "count": len(found), "filenames": found}, sort_keys=True) + "\n"
             out_file = str(step.get("output_file") or "recall.json")
             _write_workspace_file_safe(
@@ -563,9 +563,10 @@ def _run_vault_audit(kind: str, brain_dir: str) -> object:
     raise AgentRuntimeError(f"Unsupported audit_kind: {kind}")
 
 
-def _recall(query: str, brain_dir: str) -> list[str]:
+def _recall(query: str, brain_dir: str, security_dir: str | None = None) -> list[str]:
     atoms = os.path.join(brain_dir, "2-atoms")
     index = os.path.join(brain_dir, ".sidecar", "lexical.sqlite3")
+    names: list[str] = []
     try:
         direct, _neighbors = search_memory(
             query,
@@ -574,11 +575,19 @@ def _recall(query: str, brain_dir: str) -> list[str]:
             index_path=index,
             chroma_path=os.path.join(brain_dir, ".chroma"),
         )
+        names = [item.filename for item in direct]
     except Exception:
-        return []
-    names = [item.filename for item in direct]
+        names = []
     try:
-        for hit in search_connected_knowledge(query, brain_dir=brain_dir, limit=5, learn=False):
+        for hit in search_connected_knowledge(
+            query,
+            brain_dir=brain_dir,
+            limit=5,
+            learn=False,
+            security_dir=security_dir,
+        ):
+            if hit.get("source") == "agent_skill":
+                continue
             label = hit["filename"]
             if label not in names:
                 names.append(label)
@@ -714,14 +723,76 @@ def list_agent_skills(*, brain_dir: str = BRAIN_DIR, project: str = "") -> list[
     return found
 
 
-def _matching_skill(goal: str, brain_dir: str) -> str | None:
+def _same_vault(left: str, right: str) -> bool:
+    try:
+        return os.path.normcase(os.path.realpath(left)) == os.path.normcase(os.path.realpath(right))
+    except OSError:
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def owner_vault_roots(brain_dir: str, security_dir: str | None = None) -> list[tuple[str, str]]:
+    """Every vault this owner registered, plus the vault the agent is already in.
+
+    A project tag stays inside the active vault. Other vaults are still searched:
+    the agent is not asked to name them. Vaults the owner did not register are skipped.
+    """
+    explicit = security_dir is not None
+    sec = security_dir
+    if sec is None:
+        try:
+            from config import security_state_dir
+
+            candidate = security_state_dir()
+            if (Path(candidate) / "vaults.json").is_file():
+                sec = str(candidate)
+        except Exception:
+            sec = None
+    roots: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(label: str, path: str) -> None:
+        if not path:
+            return
+        try:
+            if _is_reparse_or_link(path) or not os.path.isdir(path):
+                return
+            key = os.path.normcase(os.path.realpath(path))
+        except OSError:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(((label or "vault").strip() or "vault", os.path.abspath(path)))
+
+    add("active", brain_dir)
+    if not sec:
+        return roots
+    try:
+        from vault_workspaces import list_vaults
+
+        listing = list_vaults(security_dir=sec, current_brain_dir=brain_dir)
+    except Exception:
+        return roots
+    vaults = [item for item in (listing.get("vaults") or []) if isinstance(item, dict)]
+    listed = any(_same_vault(str(item.get("path") or ""), brain_dir) for item in vaults)
+    if not explicit and not listed:
+        return roots
+    for item in vaults:
+        add(str(item.get("label") or item.get("vault_id") or "vault"), str(item.get("path") or ""))
+    return roots
+
+
+def _matching_skill(goal: str, brain_dir: str, security_dir: str | None = None) -> tuple[str, str] | None:
     terms = {token.casefold() for token in _TOKEN_RE.findall(goal)}
-    for skill in list_agent_skills(brain_dir=brain_dir):
-        if skill["status"] not in {"agent_trial", "agent_active"}:
-            continue
-        trigger_terms = {token.casefold() for token in _TOKEN_RE.findall(skill["trigger"])}
-        if terms and terms.intersection(trigger_terms):
-            return skill["skill_id"]
+    if not terms:
+        return None
+    for _label, root in owner_vault_roots(brain_dir, security_dir):
+        for skill in list_agent_skills(brain_dir=root):
+            if skill["status"] not in {"agent_trial", "agent_active"}:
+                continue
+            trigger_terms = {token.casefold() for token in _TOKEN_RE.findall(skill["trigger"])}
+            if terms.intersection(trigger_terms):
+                return skill["skill_id"], root
     return None
 
 
@@ -754,9 +825,10 @@ def run_agent(
         own_goal, child_goal = clean_goal.split(" and ", 1)
         own_goal, child_goal = own_goal.strip(), child_goal.strip()
     _mark_run(dirs, run_id, "running", depth=depth, goal=own_goal)
-    skill_id = _matching_skill(own_goal, brain_dir)
-    if skill_id is None:
+    matched = _matching_skill(own_goal, brain_dir, security_dir)
+    if matched is None:
         skill_id = _normalize_skill_id(f"recall-{_slug(own_goal, 24)}")
+        skill_brain = brain_dir
         draft_agent_skill(
             author,
             skill_id,
@@ -764,12 +836,14 @@ def run_agent(
             trigger=own_goal,
             brain_dir=brain_dir,
         )
+    else:
+        skill_id, skill_brain = matched
     executed = execute_agent_skill(
         skill_id,
         {"query": own_goal},
         agent_id=author,
         run_id=run_id,
-        brain_dir=brain_dir,
+        brain_dir=skill_brain,
         security_dir=security_dir,
     )
     if executed["status"] == "stopped":
@@ -962,8 +1036,14 @@ def search_connected_knowledge(
     limit: int = 8,
     project: str = "",
     learn: bool = True,
+    security_dir: str | None = None,
 ) -> list[dict[str, str]]:
-    """Search notes, learned memories, and skills for any connected agent."""
+    """Search notes, memories, and skills across every vault this owner connected.
+
+    A project filter applies only inside the active vault, so a note in another
+    vault is found without anyone naming that vault. Approved-atom federation
+    stays opt-in and is not used here.
+    """
     if learn:
         try:
             learn_from_notes(brain_dir=brain_dir)
@@ -971,30 +1051,53 @@ def search_connected_knowledge(
             pass
     cap = max(1, min(int(limit), 20))
     hits: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
+    terms = {token.casefold() for token in _TOKEN_RE.findall(query or "")}
 
-    def add(source: str, filename: str, title: str, text: str) -> None:
-        key = (source, filename)
-        if key in seen or len(hits) >= cap:
+    def add(source: str, filename: str, title: str, text: str, vault: str, root: str) -> None:
+        key = (os.path.normcase(root), source, filename)
+        if key in seen:
             return
         seen.add(key)
-        hits.append({"source": source, "filename": filename, "title": title, "text": text[:_LEARN_CLAIM_CHARS]})
+        hits.append(
+            {
+                "source": source,
+                "filename": filename,
+                "title": title,
+                "text": text[:_LEARN_CLAIM_CHARS],
+                "vault": vault,
+            }
+        )
 
     try:
         from notes_store import NotePaths, search_notes
-
-        for note in search_notes(query, limit=cap, project=project or None, paths=NotePaths.for_brain(brain_dir)):
-            add("note", note.filename, note.title, note.snippet or note.title)
     except Exception:
-        pass
-    for memory in search_agent_memory(query, brain_dir=brain_dir, project=project, limit=cap):
-        add("agent_memory", memory["filename"], memory["filename"], memory["claim"])
-    terms = {token.casefold() for token in _TOKEN_RE.findall(query or "")}
-    skills_dir = os.path.join(agent_root(brain_dir), "skills")
-    if terms and os.path.isdir(skills_dir):
+        search_notes = None  # type: ignore[assignment]
+        NotePaths = None  # type: ignore[assignment]
+
+    for label, root in owner_vault_roots(brain_dir, security_dir):
+        vault_project = project if _same_vault(root, brain_dir) else ""
+        if search_notes is not None and NotePaths is not None:
+            try:
+                for note in search_notes(
+                    query,
+                    limit=cap,
+                    project=vault_project or None,
+                    paths=NotePaths.for_brain(root),
+                ):
+                    add("note", note.filename, note.title, note.snippet or note.title, label, root)
+            except Exception:
+                pass
+        for memory in search_agent_memory(query, brain_dir=root, project=vault_project, limit=cap):
+            add("agent_memory", memory["filename"], memory["filename"], memory["claim"], label, root)
+        skills_dir = os.path.join(agent_root(root), "skills")
+        if not terms or not os.path.isdir(skills_dir):
+            continue
+        scanned = 0
         for name in sorted(os.listdir(skills_dir)):
-            if len(hits) >= cap:
+            if scanned >= 200:
                 break
+            scanned += 1
             path = safe_file_in_dir(skills_dir, name, allowed_exts={".md"}, must_exist=True)
             if not path:
                 continue
@@ -1004,13 +1107,22 @@ def search_connected_knowledge(
                 continue
             if str(frontmatter.get("status") or "") not in {"agent_trial", "agent_active"}:
                 continue
-            if not _scope_visible(str(frontmatter.get("project") or ""), project):
+            if not _scope_visible(str(frontmatter.get("project") or ""), vault_project):
                 continue
             trigger = str(frontmatter.get("trigger") or "")
             if not terms.intersection({token.casefold() for token in _TOKEN_RE.findall(trigger)}):
                 continue
-            add("agent_skill", name, str(frontmatter.get("skill_id") or name), trigger)
-    return hits
+            add(
+                "agent_skill",
+                name,
+                str(frontmatter.get("skill_id") or name),
+                f"Use this skill for the request.\n{trigger}",
+                label,
+                root,
+            )
+    skills = [hit for hit in hits if hit["source"] == "agent_skill"][:3]
+    rest = [hit for hit in hits if hit["source"] != "agent_skill"]
+    return (skills + rest)[:cap]
 
 
 def run_scheduled_goals(*, brain_dir: str = BRAIN_DIR, force: bool = False) -> list[dict[str, Any]]:
