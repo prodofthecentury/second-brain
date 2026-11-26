@@ -737,11 +737,33 @@ def _schema_prompt(note: str) -> str:
         "evidence must be an exact quote copied from the note. "
         "claim must be one sentence about that quote, using words that appear in the note. "
         "Do not add facts, names, or examples that are not in the note.\n\n"
-        "Shape example only. The words XQV7PLACEHOLDER and Z9SAMPLEVALUE are not content:\n"
-        '{"atoms":[{"title":"Placeholder shape","claim":"The item XQV7PLACEHOLDER has the value Z9SAMPLEVALUE.",'
-        '"evidence":"XQV7PLACEHOLDER has the value Z9SAMPLEVALUE.","why":"Shows the fields.","memory_type":"semantic"}]}\n\n'
         f"RAW CAPTURE:\n{note}"
     )
+
+
+def _rows_from_loose_markdown(output: str) -> list[dict]:
+    """Recover claim/evidence pairs when a model ignores JSON and writes loose headings."""
+    pattern = re.compile(
+        r"##\s*Claim\s*\n+(.*?)##\s*Evidence\s*\n+(.*?)(?=\n##\s|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    rows: list[dict] = []
+    for claim, evidence in pattern.findall(output or ""):
+        claim_text = re.sub(r"\s+", " ", claim).strip(" \n`>-")
+        evidence_text = re.split(r"##\s*Why", evidence, maxsplit=1, flags=re.IGNORECASE)[0]
+        evidence_text = re.sub(r"\s+", " ", evidence_text).strip(" \n`>-")
+        if len(claim_text) < 12 or len(evidence_text) < 8:
+            continue
+        rows.append({
+            "title": "",
+            "claim": claim_text,
+            "evidence": evidence_text,
+            "why": "",
+            "memory_type": "semantic",
+        })
+        if len(rows) >= MAX_ATOMS_PER_NOTE:
+            break
+    return rows
 
 
 def _legacy_markdown_prompt(raw_filename: str, today_str: str, extra_instructions: str, chunk_text: str, rules: str) -> str:
@@ -932,6 +954,11 @@ def draft_memory_atoms(
                     if doc:
                         finished.append((doc, "repair" if row_path == "schema" else row_path))
                 output = repaired or output
+        if not finished and output:
+            for row in _rows_from_loose_markdown(output):
+                doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                if doc:
+                    finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
         if not finished:
             for row in rows:
                 evidence = str(row.get("evidence") or "").strip()
@@ -981,6 +1008,11 @@ def draft_memory_atoms(
                         finished.append((rewritten, "legacy_markdown"))
                     elif claim and evidence:
                         print(f"  [!] Dropped legacy atom; evidence does not overlap the claim: {claim[:80]!r}")
+                if not finished:
+                    for row in _rows_from_loose_markdown(legacy):
+                        doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                        if doc:
+                            finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
         if not finished and errors and not output:
             raise RuntimeError(f"LLM drafting unavailable; capture deferred: {errors[-1]}")
 

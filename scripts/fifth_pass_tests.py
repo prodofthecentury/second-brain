@@ -287,15 +287,33 @@ class DistillRepairTests(unittest.TestCase):
 
 
 class DistillGroundingTests(unittest.TestCase):
-    def test_prompt_example_cannot_be_mistaken_for_note_content(self) -> None:
+    def test_prompt_does_not_include_a_copyable_example(self) -> None:
         from scripts.ollama_refinery import ATOM_JSON_SCHEMA, _schema_prompt
 
         prompt = _schema_prompt("No source, no claim. A memory needs an exact quote from this note.")
         folded = prompt.casefold()
         self.assertNotIn("coffee", folded)
         self.assertNotIn("llama", folded)
-        self.assertIn("XQV7PLACEHOLDER", prompt)
+        self.assertNotIn("placeholder", folded)
         self.assertEqual(ATOM_JSON_SCHEMA["properties"]["atoms"]["maxItems"], 5)
+
+    def test_loose_markdown_keeps_a_real_quote_and_drops_an_invention(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "The pour-over coffee ratio is one gram of coffee to sixteen grams of water."
+        loose = (
+            "```markdown --- ## Claim\n"
+            "The optimal pour-over coffee ratio is one gram of coffee to sixteen grams of water.\n"
+            "## Evidence\nThe pour-over coffee ratio is one gram of coffee to sixteen grams of water.\n"
+            "## Why It Matters\nIt is the brewing ratio.\n"
+            "## Claim\nA secret inventor named Zephyr created this ratio.\n"
+            "## Evidence\nZephyr invented the ratio in a hidden lab.\n"
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": loose}}):
+            drafted = draft_memory_atoms(source, "0-raw/01-coffee.md", "House rules")
+        self.assertEqual(len(drafted), 1)
+        self.assertIn(source, drafted[0])
+        self.assertNotIn("Zephyr", drafted[0])
 
     def test_coffee_example_is_dropped_from_a_coffee_free_note(self) -> None:
         from scripts.ollama_refinery import draft_memory_atoms
