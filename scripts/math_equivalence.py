@@ -465,7 +465,11 @@ def _safe_ast_eval(node: ast.AST, env: dict[str, complex | Fraction]) -> complex
             return left / right
         if isinstance(node.op, ast.Pow):
             # Guard absurd exponents
-            if isinstance(right, (int, float, Fraction)) and abs(float(right)) > 200:
+            try:
+                exp_mag = abs(complex(right))
+            except OverflowError as exc:
+                raise ValueError("Exponent too large") from exc
+            if exp_mag > 200:
                 raise ValueError("Exponent too large")
             if isinstance(left, Fraction) and isinstance(right, Fraction) and right.denominator == 1:
                 return left ** int(right.numerator)
@@ -488,10 +492,29 @@ def _extract_variables(tree: ast.AST) -> list[str]:
     return sorted(names)
 
 
-def _ast_to_sympy(node: ast.AST, sp: Any) -> Any:
+_MAX_SYMPY_FACTORIAL = 170
+_MAX_SYMPY_EXPONENT = 1000
+_MAX_SYMPY_POW_DEPTH = 3
+
+
+def _const_numeric_value(node: ast.AST) -> int | float | None:
+    """Return literal numeric value for constant or unary +/- constant AST nodes, else None."""
+    if isinstance(node, ast.Constant):
+        if not isinstance(node.value, bool) and isinstance(node.value, (int, float)):
+            return node.value
+        return None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        inner = _const_numeric_value(node.operand)
+        if inner is None:
+            return None
+        return inner if isinstance(node.op, ast.UAdd) else -inner
+    return None
+
+
+def _ast_to_sympy(node: ast.AST, sp: Any, *, _pow_depth: int = 0) -> Any:
     """Convert an already-validated math AST directly into a SymPy expression (zero eval/sympify)."""
     if isinstance(node, ast.Expression):
-        return _ast_to_sympy(node.body, sp)
+        return _ast_to_sympy(node.body, sp, _pow_depth=_pow_depth)
     if isinstance(node, ast.Constant):
         if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
             raise ValueError(f"Unsupported constant for SymPy conversion: {node.value!r}")
@@ -507,15 +530,40 @@ def _ast_to_sympy(node: ast.AST, sp: Any) -> Any:
             return sp.I
         return sp.Symbol(node.id)
     if isinstance(node, ast.UnaryOp):
-        operand = _ast_to_sympy(node.operand, sp)
+        operand = _ast_to_sympy(node.operand, sp, _pow_depth=_pow_depth)
         if isinstance(node.op, ast.UAdd):
             return +operand
         if isinstance(node.op, ast.USub):
             return -operand
         raise ValueError(f"Unsupported unary op: {type(node.op).__name__}")
     if isinstance(node, ast.BinOp):
-        left = _ast_to_sympy(node.left, sp)
-        right = _ast_to_sympy(node.right, sp)
+        if isinstance(node.op, ast.Pow):
+            next_pow_depth = _pow_depth + 1
+            if next_pow_depth > _MAX_SYMPY_POW_DEPTH:
+                raise ValueError(f"Nested power depth exceeds limit ({_MAX_SYMPY_POW_DEPTH})")
+            const_exp = _const_numeric_value(node.right)
+            if const_exp is not None and abs(float(const_exp)) > _MAX_SYMPY_EXPONENT:
+                raise ValueError(f"Exponent magnitude exceeds limit ({_MAX_SYMPY_EXPONENT})")
+            if not _extract_variables(node.right):
+                try:
+                    eval_exp = _safe_ast_eval(node.right, {})
+                    if abs(complex(eval_exp)) > _MAX_SYMPY_EXPONENT:
+                        raise ValueError(f"Exponent magnitude exceeds limit ({_MAX_SYMPY_EXPONENT})")
+                except ZeroDivisionError:
+                    pass
+                except (OverflowError, ValueError) as exc:
+                    raise ValueError(f"Exponent magnitude exceeds limit ({_MAX_SYMPY_EXPONENT})") from exc
+            left = _ast_to_sympy(node.left, sp, _pow_depth=next_pow_depth)
+            right = _ast_to_sympy(node.right, sp, _pow_depth=next_pow_depth)
+            if getattr(right, "is_Number", False) or (isinstance(right, (int, float)) and not isinstance(right, bool)):
+                try:
+                    if abs(float(right)) > _MAX_SYMPY_EXPONENT:
+                        raise ValueError(f"Exponent magnitude exceeds limit ({_MAX_SYMPY_EXPONENT})")
+                except OverflowError as exc:
+                    raise ValueError(f"Exponent magnitude exceeds limit ({_MAX_SYMPY_EXPONENT})") from exc
+            return left ** right
+        left = _ast_to_sympy(node.left, sp, _pow_depth=_pow_depth)
+        right = _ast_to_sympy(node.right, sp, _pow_depth=_pow_depth)
         if isinstance(node.op, ast.Add):
             return left + right
         if isinstance(node.op, ast.Sub):
@@ -524,16 +572,19 @@ def _ast_to_sympy(node: ast.AST, sp: Any) -> Any:
             return left * right
         if isinstance(node.op, ast.Div):
             return left / right
-        if isinstance(node.op, ast.Pow):
-            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)) and abs(float(node.right.value)) > 200:
-                raise ValueError("Exponent too large")
-            return left ** right
         raise ValueError(f"Unsupported binary op: {type(node.op).__name__}")
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name) or node.func.id not in _ALLOWED_FUNCTIONS or node.keywords:
             raise ValueError("Unsupported function call for SymPy conversion")
         fn = node.func.id
-        args = [_ast_to_sympy(a, sp) for a in node.args]
+        if fn == "factorial":
+            if len(node.args) != 1:
+                raise ValueError("factorial requires exactly 1 argument")
+            const_n = _const_numeric_value(node.args[0])
+            if type(const_n) is not int or not (0 <= const_n <= _MAX_SYMPY_FACTORIAL):
+                raise ValueError(f"factorial requires a constant integer 0 <= n <= {_MAX_SYMPY_FACTORIAL}")
+            return sp.factorial(sp.Integer(const_n))
+        args = [_ast_to_sympy(a, sp, _pow_depth=_pow_depth) for a in node.args]
         if fn == "ln":
             return sp.log(args[0])
         if fn == "log":
@@ -550,8 +601,6 @@ def _ast_to_sympy(node: ast.AST, sp: Any) -> Any:
             return sp.exp(args[0])
         if fn == "abs":
             return sp.Abs(args[0])
-        if fn == "factorial":
-            return sp.factorial(args[0])
     raise ValueError(f"Disallowed AST node for SymPy conversion: {type(node).__name__}")
 
 

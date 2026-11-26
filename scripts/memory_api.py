@@ -1639,6 +1639,14 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                         "403 Forbidden: unscoped include_duplicates requires owner authorization or an explicit project_scope."
                     )
 
+                clean_as_of = req.as_of.strip() if req.as_of and req.as_of.strip() else None
+                use_l0_bus = bool(
+                    not req.include_expired
+                    and not clean_as_of
+                    and not req.allow_cross_project
+                    and req.retrieval_mode in {"lexical", "auto"}
+                    and len(projects) <= 1
+                )
                 fetch_n = min(25, req.n_results * 2) if not effective_include_prefs else req.n_results
                 recall_kwargs: dict[str, object] = {
                     "n_results": fetch_n,
@@ -1651,7 +1659,8 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     "active_context_profile": tuple(req.active_context_profile),
                     "telemetry_db_path": rt.telemetry_db_path,
                     "include_expired": bool(req.include_expired),
-                    "as_of": req.as_of.strip() if req.as_of and req.as_of.strip() else None,
+                    "as_of": clean_as_of,
+                    "use_l0_bus": use_l0_bus,
                 }
                 if "include_preferences" in inspect.signature(RecallOptions).parameters:
                     recall_kwargs["include_preferences"] = effective_include_prefs

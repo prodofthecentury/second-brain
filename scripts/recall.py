@@ -1882,19 +1882,25 @@ def search_memory(
                 enable_gravity_boost=options.enable_gravity_boost,
                 enable_spreading_activation=options.enable_spreading_activation,
             )
-            allow_prewarm = not (
-                options.memory_types
-                or options.contexts
-                or options.active_context_profile
-                or options.enable_fitness_boost
-                or options.enable_gravity_boost
-                or options.enable_spreading_activation
+            allow_prewarm = bool(
+                options.retrieval_mode in {"lexical", "auto"}
+                and not options.allow_cross_project
+                and int(options.n_results) <= 5
+                and not (
+                    options.memory_types
+                    or options.contexts
+                    or options.active_context_profile
+                    or options.enable_fitness_boost
+                    or options.enable_gravity_boost
+                    or options.enable_spreading_activation
+                )
             )
             hit_info = lookup_l0_hot(
                 query,
                 project_scope=proj_one,
                 options_fp=l0_opt_fp,
                 allow_prewarm_match=allow_prewarm,
+                min_results=int(options.n_results),
                 brain_dir=eff_brain_dir,
                 atoms_dir=atoms_dir,
             )
@@ -1962,6 +1968,7 @@ def search_memory(
                 brain_dir=eff_brain_dir,
                 atoms_dir=atoms_dir,
                 entry_kind="exact",
+                n_results=int(options.n_results),
             )
         except Exception:
             pass

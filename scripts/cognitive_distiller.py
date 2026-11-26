@@ -66,7 +66,7 @@ from scripts.config import (  # noqa: E402
 )
 from scripts.memory_format import render_memory_document, set_scalar_field, split_frontmatter  # noqa: E402
 from scripts.memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list, section_text  # noqa: E402
-from scripts.recall import project_tags_match  # noqa: E402
+from scripts.recall import normalize_project_tag, project_tags_match  # noqa: E402
 from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
@@ -446,6 +446,8 @@ def promote_distilled_artifact(
     """Owner CAS transition for 7-principles/*.md and 8-mental-models/*.md."""
     clean_actor = validate_actor_name(actor)
     clean_action = (action or "").strip().lower()
+    if clean_action == "deprecate":
+        clean_action = "revoke"
     if clean_action not in {"promote", "revoke"}:
         raise DistillationError("action must be 'promote' or 'revoke'.")
     resolved_brain, resolved_atoms = resolve_module_atoms_and_brain(
@@ -667,6 +669,7 @@ def list_distilled_artifacts(
 
 def distill_cross_project_candidates(
     *,
+    project: str | None = None,
     brain_dir: str | Path | None = None,
     atoms_dir: str | Path | None = None,
     min_atoms_per_cluster: int = MIN_PRINCIPLE_BACKING_ATOMS,
@@ -681,6 +684,7 @@ def distill_cross_project_candidates(
     if not apath.is_dir() or _is_reparse_or_link(str(apath)):
         return {"principles_created": [], "mental_models_created": []}
 
+    scope_tag = normalize_project_tag(project) if (project and str(project).strip()) else ""
     clusters: dict[str, list[dict[str, Any]]] = {}
     for entry in sorted(os.scandir(apath), key=lambda e: e.name):
         if not is_content_markdown(entry.name):
@@ -704,6 +708,14 @@ def distill_cross_project_candidates(
         parsed = split_frontmatter(raw)
         fm_vals = parse_frontmatter_values(parsed[0]) if parsed else {}
         tags = parse_scalar_list(fm_vals.get("tags", [])) if isinstance(fm_vals.get("tags"), str) else list(fm_vals.get("tags") or [])
+        if scope_tag:
+            atom_proj_tags = [
+                str(c).strip()
+                for c in [*(rec.get("contexts") or ()), *tags]
+                if str(c).strip().lower().startswith("project:")
+            ]
+            if not atom_proj_tags or not all(bool(project_tags_match((pt,), (scope_tag,))) for pt in atom_proj_tags):
+                continue
         topic_keys = [str(t).strip().lower() for t in tags if str(t).strip() and not str(t).lower().startswith("project:")]
         if not topic_keys:
             topic_keys = [str(c).strip().lower() for c in (rec.get("contexts") or []) if not str(c).lower().startswith("project:")]
@@ -716,7 +728,11 @@ def distill_cross_project_candidates(
             continue
         projs = {c for r in recs for c in (r.get("contexts") or []) if str(c).lower().startswith("project:")}
         if len(projs) >= 1:
-            fn = f"principle-{_slugify(topic)}.md"
+            fn = (
+                f"principle-{_slugify(scope_tag.removeprefix('project:'))}-{_slugify(topic)}.md"
+                if scope_tag
+                else f"principle-{_slugify(topic)}.md"
+            )
             if not (Path(resolved_brain) / "7-principles" / fn).exists():
                 stmt = " Across projects, verified evidence indicates: " + "; ".join(
                     str(r.get("claim") or "").strip().rstrip(".") for r in recs[:4] if r.get("claim")
@@ -738,6 +754,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Second Brain Higher-Order Distillation (Principles & Mental Models)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_dist = sub.add_parser("distill", help="Propose draft Principles from verified atoms")
+    p_dist.add_argument("--project", default=None)
     p_dist.add_argument("--json", action="store_true")
 
     p_ls = sub.add_parser("list", help="List Principles or Mental Models")
@@ -749,14 +766,14 @@ def main(argv: list[str] | None = None) -> int:
     p_prom = sub.add_parser("promote", help="Owner CAS promote or revoke a draft Principle/Mental Model")
     p_prom.add_argument("path")
     p_prom.add_argument("--expected-sha256", required=True)
-    p_prom.add_argument("--action", choices=("promote", "revoke"), default="promote")
+    p_prom.add_argument("--action", choices=("promote", "revoke", "deprecate"), default="promote")
     p_prom.add_argument("--actor", default="owner")
     p_prom.add_argument("--reason", default="")
     p_prom.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
     if args.cmd == "distill":
-        out = distill_cross_project_candidates()
+        out = distill_cross_project_candidates(project=args.project)
         print(json.dumps(out, indent=2) if args.json else f"principles={len(out['principles_created'])}")
         return 0
     if args.cmd == "list":

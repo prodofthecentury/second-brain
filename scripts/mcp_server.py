@@ -539,6 +539,7 @@ def semantic_search(
             projects=projects,
             include_expired=bool(include_expired),
             as_of=clean_as_of,
+            use_l0_bus=bool(not include_expired and not clean_as_of),
         ),
         atoms_dir=vdirs["atoms_dir"],
         index_path=vdirs["lexical_index_path"],
@@ -2840,7 +2841,6 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         )
 
     elif name == "curiosity_gaps":
-        from scripts.memory_review import parse_scalar_list
         from scripts.self_model_curiosity import evaluate_self_model_and_curiosity
 
         project = str(arguments.get("project") or "").strip() or None
@@ -2849,9 +2849,12 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                 content=[types.TextContent(type="text", text="Invalid 'project' scope filter.")],
                 isError=True,
             )
+        scope_tag = normalize_project_tag(project) if project else None
         eff_atoms = vdirs.get("atoms_dir") or os.path.join(vdirs["brain_dir"], "2-atoms")
         try:
             raw_rep = evaluate_self_model_and_curiosity(
+                project=scope_tag,
+                include_private_goals=False,
                 brain_dir=vdirs["brain_dir"],
                 atoms_dir=eff_atoms,
             )
@@ -2862,51 +2865,8 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
         domains = list(raw_rep.get("domains") or ())
         curiosity_targets = list(raw_rep.get("curiosity_targets") or ())
 
-        if project:
-            norm_proj = normalize_project_tag(project)
-            proj_slug = norm_proj.removeprefix("project:").lower() if norm_proj else project.lower()
-            proj_domains: set[str] = {proj_slug} if proj_slug else set()
-            if os.path.isdir(eff_atoms) and not _is_reparse_or_link(eff_atoms):
-                for fname in sorted(os.listdir(eff_atoms)):
-                    if not is_content_markdown(fname):
-                        continue
-                    loaded = _load_verified_non_preference_atom(fname, vdirs=vdirs, project=project)
-                    if loaded is None:
-                        continue
-                    _aid, apath, rec = loaded
-                    raw_txt = read_file_safe(apath)
-                    parsed = split_frontmatter(raw_txt)
-                    fm_vals = parse_frontmatter_values(parsed[0]) if parsed else {}
-                    raw_tags = fm_vals.get("tags", [])
-                    tags = parse_scalar_list(raw_tags) if isinstance(raw_tags, str) else list(raw_tags or [])
-                    for c in [*(rec.get("contexts") or ()), *tags]:
-                        sc = str(c).strip().lower()
-                        if sc and not sc.startswith("project:"):
-                            proj_domains.add(sc)
-            domains = [d for d in domains if isinstance(d, dict) and str(d.get("domain") or "").lower() in proj_domains]
-            goals = [
-                g
-                for g in goals
-                if isinstance(g, dict)
-                and (
-                    str(g.get("domain") or "").lower() in proj_domains
-                    or (proj_slug and proj_slug in str(g.get("id") or "").lower())
-                    or (proj_slug and proj_slug in str(g.get("title") or "").lower())
-                )
-            ]
-            curiosity_targets = [
-                c
-                for c in curiosity_targets
-                if isinstance(c, dict)
-                and (
-                    str(c.get("domain") or "").lower() in proj_domains
-                    or (proj_slug and proj_slug in str(c.get("goal_id") or "").lower())
-                    or (proj_slug and proj_slug in str(c.get("goal_title") or "").lower())
-                )
-            ]
-
         sanitized = {
-            "project": project,
+            "project": scope_tag,
             "goal_count": len(goals),
             "domain_count": len(domains),
             "curiosity_gap_count": len(curiosity_targets),

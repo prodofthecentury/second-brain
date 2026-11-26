@@ -213,8 +213,34 @@ def _loopback_ollama_chat_url() -> str | None:
         return None
     if not (1 <= port <= 65535):
         return None
+    if host == "localhost":
+        host = "127.0.0.1"
     netloc_host = "[::1]" if host == "::1" else host
     return f"http://{netloc_host}:{port}/api/chat"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail closed on any HTTP redirect from the loopback Ollama endpoint."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"Redirects are disallowed for local Ollama requests (HTTP {code})",
+            headers,
+            fp,
+        )
+
+    def http_error_302(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"Redirects are disallowed for local Ollama requests (HTTP {code})",
+            headers,
+            fp,
+        )
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
 def _local_ollama_tora_solver(
@@ -263,7 +289,7 @@ def _local_ollama_tora_solver(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
     eff_timeout = max(0.5, min(20.0, float(timeout_seconds)))
     try:
         with opener.open(req, timeout=eff_timeout) as resp:

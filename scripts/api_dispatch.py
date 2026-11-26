@@ -3732,6 +3732,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
         if path == "/v1/voice/conversation-turn" and method == "POST":
             if not owner_only():
                 return True
+            from scripts.chat_threads import THREAD_ID_RE, get_chat_thread
             from scripts.tts_engine import voice_conversation_turn
 
             audio_b64 = _str(body, "audio_b64", max_len=24_000_000, required=True)
@@ -3744,6 +3745,18 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             host_val = _str(body, "host_id", default="ollama_local", max_len=64, required=False) or "ollama_local"
             scope_val = _str(body, "project_scope", max_len=120, required=False).strip() or None
             voice_name = _str(body, "voice", default="af_heart", max_len=64, required=False) or "af_heart"
+            raw_tid = body.get("thread_id")
+            thread_val: str | None = None
+            if raw_tid is not None:
+                if not isinstance(raw_tid, str):
+                    raise ValueError("'thread_id' must be a string or null.")
+                cleaned_tid = raw_tid.strip().lower()
+                if cleaned_tid:
+                    if cleaned_tid != "new" and not THREAD_ID_RE.fullmatch(cleaned_tid):
+                        raise ValueError(f"Invalid thread_id: {raw_tid!r}")
+                    if cleaned_tid != "new":
+                        get_chat_thread(cleaned_tid, max_turns=1, brain_dir=rt.brain_dir)
+                    thread_val = cleaned_tid
             try:
                 spd_val = float(body.get("speed", 1.0))
             except (TypeError, ValueError) as exc:
@@ -3757,6 +3770,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 mode=mode_val,
                 host_id=host_val,
                 project_scope=scope_val,
+                thread_id=thread_val,
                 voice=voice_name,
                 speed=spd_val,
             )
@@ -3981,10 +3995,14 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 return True
             from scripts.cognitive_distiller import distill_cross_project_candidates
 
-            _optional_project_scope(body.get("project"))
+            proj_dist = _optional_project_scope(body.get("project"))
             return send(
                 201,
-                distill_cross_project_candidates(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir),
+                distill_cross_project_candidates(
+                    project=proj_dist,
+                    brain_dir=rt.brain_dir,
+                    atoms_dir=rt.atoms_dir,
+                ),
             )
 
         if (
@@ -4118,8 +4136,12 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 return True
             from scripts.self_model_curiosity import evaluate_self_model_and_curiosity
 
-            _optional_project_scope((q.get("project") or [None])[0])
-            res_sm = evaluate_self_model_and_curiosity(brain_dir=rt.brain_dir, atoms_dir=rt.atoms_dir)
+            proj_cur = _optional_project_scope((q.get("project") or [None])[0])
+            res_sm = evaluate_self_model_and_curiosity(
+                project=proj_cur,
+                brain_dir=rt.brain_dir,
+                atoms_dir=rt.atoms_dir,
+            )
             return send(200, {"curiosity_targets": res_sm["curiosity_targets"], "domains": res_sm["domains"]})
 
         if path == "/v1/cognitive/adr-status" and method == "GET":

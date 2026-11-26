@@ -1251,12 +1251,14 @@ class ConnectorAndMcpTests(IsolatedVaultCase):
         self.assertFalse(zed_rules.exists())
         self.assertFalse(zed_rules.parent.exists())
 
-        # 4. Windows cmd.exe metacharacter injection rejected in _host_hook_command + explicit path quoting
+        # 4. Windows cmd.exe/PowerShell metacharacter injection rejected in _host_hook_command + explicit path quoting
+        self.assertIn("$", ide_connector._WIN_CMD_METACHARS)
+        self.assertIn("`", ide_connector._WIN_CMD_METACHARS)
         if os.name == "nt":
             good_cmd = ide_connector._host_hook_command("antigravity", "SessionStart", vault_dir=str(self.brain))
             self.assertTrue(good_cmd.startswith('"'))
             self.assertTrue(good_cmd.endswith("--event SessionStart"))
-            for bad_char in ("&", "|", "<", ">", "^", "%", "!", "\r", "\n", '"'):
+            for bad_char in ("&", "|", "<", ">", "^", "%", "!", "$", "`", "\r", "\n", '"'):
                 with self.assertRaises(ValueError):
                     ide_connector._host_hook_command(
                         "antigravity",
@@ -2303,6 +2305,259 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
         self.assertEqual(rc_cap, 0)
         cap_payload = json.loads(cap_out.getvalue())
         self.assertEqual(cap_payload["status"], "saved")
+
+    def test_w2_hook_prewrite_dlp_stop_pii_redaction_and_mcp_curiosity_isolation(self) -> None:
+        import asyncio
+        from types import SimpleNamespace
+        import antigravity_hook
+        import atom_mutator
+        import cognitive_core
+        import lexical_store
+        import mcp_server
+        import security_fs
+        import self_model_curiosity
+        from mcp import types
+
+        brain = self.brain
+        atoms_dir = brain / "2-atoms"
+        exp_dir = brain / "4-experiences"
+        for sub in ("2-atoms", "4-experiences", "5-playbooks", "6-skills"):
+            (brain / sub).mkdir(parents=True, exist_ok=True)
+
+        def _seed_atom(fname: str, claim: str, project: str, tags: list[str]) -> None:
+            src_name = f"src-{fname}"
+            (brain / "0-raw" / src_name).write_text(claim + "\n", encoding="utf-8")
+            src_sha = hashlib.sha256((claim + "\n").encode("utf-8")).hexdigest()
+            q_sha = hashlib.sha256(claim.encode("utf-8")).hexdigest()
+            p = atoms_dir / fname
+            p.write_text(
+                "---\n"
+                f"id: {Path(fname).stem}\n"
+                "type: atom\n"
+                "memory_type: semantic\n"
+                "created: 2026-11-24\n"
+                "importance: 0.85\n"
+                "confidence: 0.90\n"
+                f"sources:\n  - {src_name}\n"
+                "links: []\n"
+                f"tags: [{', '.join(tags)}]\n"
+                f"contexts: [{project}]\n"
+                "supersedes: []\n"
+                "superseded_by: []\n"
+                "contested_by: []\n"
+                "origin: user_local\n"
+                "citation_integrity: anchored\n"
+                "claim_state: draft\n"
+                "epistemic_label: observation\n"
+                "review_status: pending\n"
+                f"evidence_source: 0-raw/{src_name}\n"
+                f"evidence_sha256: {src_sha}\n"
+                "evidence_start: 0\n"
+                f"evidence_end: {len(claim.encode('utf-8'))}\n"
+                f"evidence_quote_sha256: {q_sha}\n"
+                "---\n\n"
+                f"## Claim\n{claim}\n\n"
+                f"## Evidence\n{claim}\n",
+                encoding="utf-8",
+            )
+            atom_mutator.apply_review_transition(
+                atom_path=str(p),
+                action="approve",
+                expected_sha256=atom_mutator.content_sha256(p.read_bytes()),
+                actor="owner",
+                brain_dir=str(brain),
+                atoms_dir=str(atoms_dir),
+            )
+
+        _seed_atom("alpha-rel.md", "Alpha worker retries enforce exponential backoff jitter.", "project:alpha", ["reliability"])
+        _seed_atom("beta-rel-1.md", "Beta worker retries enforce linear timeout backoff.", "project:beta", ["reliability"])
+        _seed_atom("beta-rel-2.md", "Beta queue isolates dead letters for reliability.", "project:beta", ["reliability"])
+        lexical_store.rebuild_lexical_index(str(atoms_dir), str(brain / ".sidecar" / "lexical.sqlite3"))
+
+        # 1. Pre-write DLP: secret-bearing prompts NEVER persist to conv-*.json; conv-*.json is hardened on write
+        state_dir = self.root / "w2-hook-state"
+        ws_alpha = str(self.root / "alpha")
+        secret_samples = [
+            ("conv-sk", "Debug alpha worker with sk-ant-api03-1234567890abcdef1234567890 please."),
+            ("conv-ghp", "Check alpha worker with ghp_1234567890abcdefghij1234567890abcdef token."),
+            ("conv-glpat", "Inspect alpha worker using glpat-abcdefghijklmnopqrst1234."),
+            ("conv-akia", "Audit alpha worker credentials AKIAIOSFODNN7EXAMPLE immediately."),
+            ("conv-aiza", "Validate alpha worker key AIzaSyD1234567890abcdefghij1234567890."),
+            ("conv-pem", "Rotate -----BEGIN RSA PRIVATE KEY----- in alpha worker."),
+            ("conv-bearer", "Call alpha worker with Bearer eyJhbGciOiJIUzI1NiJ9SuperSecretToken."),
+            ("conv-pw", "Connect alpha worker using password=UltraSecretPassword99! right now."),
+            ("conv-apikey", "Configure alpha worker with api_key=my_super_secret_key_12345."),
+        ]
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "BRAIN_HOOK_STATE_DIR": str(state_dir),
+                    "BRAIN_HOOK_AUTO_RECALL": "1",
+                    "BRAIN_HOOK_AUTO_EXPERIENCE": "1",
+                },
+            ),
+            patch.object(
+                security_fs,
+                "restrict_security_file_permissions",
+                wraps=security_fs.restrict_security_file_permissions,
+            ) as spy_perm,
+        ):
+            for cid, secret_prompt in secret_samples:
+                antigravity_hook.handle_hook_payload(
+                    {
+                        "hookEventName": "PreInvocation",
+                        "conversationId": cid,
+                        "workspacePaths": [ws_alpha],
+                        "lastUserInput": secret_prompt,
+                    },
+                    brain_dir=str(brain),
+                )
+                digest = hashlib.sha256(cid.encode("utf-8")).hexdigest()[:16]
+                cfile = state_dir / f"conv-{digest}.json"
+                self.assertTrue(cfile.is_file())
+                raw_state_txt = cfile.read_text(encoding="utf-8")
+                parsed_state = json.loads(raw_state_txt)
+                self.assertEqual(parsed_state["last_prompt"], "")
+                self.assertTrue(parsed_state["skip_stop_log"])
+                for marker in (
+                    "sk-ant-api03",
+                    "ghp_123456",
+                    "glpat-abcdef",
+                    "AKIAIOSFODNN7EXAMPLE",
+                    "AIzaSyD123456",
+                    "PRIVATE KEY",
+                    "SuperSecretToken",
+                    "UltraSecretPassword99",
+                    "my_super_secret_key_12345",
+                ):
+                    self.assertNotIn(marker, raw_state_txt)
+
+                # Stop on secret-flagged turn MUST NOT log experience and MUST keep last_prompt empty
+                antigravity_hook.handle_hook_payload(
+                    {"hookEventName": "Stop", "conversationId": cid, "terminationReason": "NO_TOOL_CALL"},
+                    brain_dir=str(brain),
+                )
+            self.assertEqual(list(exp_dir.glob("*.md")), [])
+            self.assertGreaterEqual(spy_perm.call_count, len(secret_samples))
+
+            # 2. Stop redacts PII before writing to 4-experiences/ AND clears state["last_prompt"]
+            pii_cid = "conv-pii-clean"
+            antigravity_hook.handle_hook_payload(
+                {
+                    "hookEventName": "PreInvocation",
+                    "conversationId": pii_cid,
+                    "workspacePaths": [ws_alpha],
+                    "lastUserInput": "Investigate alpha worker backoff retries reported by alice@example.com from 192.168.10.22.",
+                },
+                brain_dir=str(brain),
+            )
+            pii_digest = hashlib.sha256(pii_cid.encode("utf-8")).hexdigest()[:16]
+            pii_cfile = state_dir / f"conv-{pii_digest}.json"
+            self.assertNotEqual(json.loads(pii_cfile.read_text(encoding="utf-8"))["last_prompt"], "")
+
+            antigravity_hook.handle_hook_payload(
+                {"hookEventName": "Stop", "conversationId": pii_cid, "terminationReason": "NO_TOOL_CALL"},
+                brain_dir=str(brain),
+            )
+            # last_prompt MUST be unconditionally cleared after Stop
+            self.assertEqual(json.loads(pii_cfile.read_text(encoding="utf-8"))["last_prompt"], "")
+            logged_exps = list(exp_dir.glob("*.md"))
+            self.assertEqual(len(logged_exps), 1)
+            logged_text = logged_exps[0].read_text(encoding="utf-8")
+            self.assertNotIn("alice@example.com", logged_text)
+            self.assertNotIn("192.168.10.22", logged_text)
+            self.assertIn("[REDACTED_PII:", logged_text)
+
+            # Rejection path on Stop (manually injected risky prompt) ALSO clears last_prompt
+            rej_cid = "conv-stop-rej"
+            rej_digest = hashlib.sha256(rej_cid.encode("utf-8")).hexdigest()[:16]
+            rej_cfile = state_dir / f"conv-{rej_digest}.json"
+            rej_cfile.write_text(
+                json.dumps(
+                    {
+                        "prompt_hash": "deadbeef0000111122223333",
+                        "last_prompt": "Leaked prompt with AKIAIOSFODNN7EXAMPLE token inside state",
+                        "skip_stop_log": False,
+                        "project_tag": "project:alpha",
+                        "referenced_atoms": [],
+                        "last_stop_prompt_hash": "",
+                        "ts": 1.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            antigravity_hook.handle_hook_payload(
+                {"hookEventName": "Stop", "conversationId": rej_cid, "terminationReason": "NO_TOOL_CALL"},
+                brain_dir=str(brain),
+            )
+            self.assertEqual(json.loads(rej_cfile.read_text(encoding="utf-8"))["last_prompt"], "")
+            self.assertEqual(len(list(exp_dir.glob("*.md"))), 1)
+
+        # 3. MCP curiosity_gaps(project="project:alpha") excludes project:beta atom/failure counts & private unscoped goals
+        cognitive_core.save_experience_record(
+            goal="Beta reliability outage during shard failover",
+            result_summary="Beta reliability failed due to shard quorum loss",
+            success=False,
+            context=["project:beta", "reliability"],
+            experiences_dir=str(exp_dir),
+            brain_dir=str(brain),
+        )
+        self_model_curiosity.upsert_learning_goals(
+            [
+                {"id": "priv-rel", "title": "Private Owner Reliability Career Plan", "domain": "reliability", "target_atoms": 10},
+                {"id": "priv-health", "title": "Private Personal Medical Checklist", "domain": "health", "target_atoms": 5},
+            ],
+            brain_dir=brain,
+        )
+
+        token = "mcp-w2-curiosity-token-0123456789"
+        ctx = SimpleNamespace(meta={"authorization": f"Bearer {token}"})
+        with (
+            patch.object(mcp_server, "BRAIN_DIR", str(brain)),
+            patch.object(mcp_server, "ATOMS_DIR", str(atoms_dir)),
+            patch.object(mcp_server, "RAW_DIR", str(brain / "0-raw")),
+            patch.object(mcp_server, "INBOX_DIR", str(brain / "0-raw" / "inbox")),
+            patch.object(mcp_server, "BRIEFINGS_DIR", str(brain / "briefings")),
+            patch.object(mcp_server, "THREADS_DIR", str(brain / "3-threads")),
+            patch.object(mcp_server, "MCP_AUDIT_PATH", str(brain / "0-raw" / "archive" / "mcp-audit.jsonl")),
+            patch.dict(os.environ, {"BRAIN_MCP_BEARER_TOKEN": token}, clear=False),
+        ):
+            cg_res = asyncio.run(
+                mcp_server.handle_call_tool(
+                    ctx,
+                    types.CallToolRequestParams(
+                        name="curiosity_gaps",
+                        arguments={"project": "project:alpha"},
+                        _meta={"authorization": f"Bearer {token}"},
+                    ),
+                )
+            )
+            self.assertFalse(cg_res.is_error)
+            cg_text = cg_res.content[0].text
+            cg_data = json.loads(cg_text)
+            rel_dom = next(d for d in cg_data["domains"] if d["domain"] == "reliability")
+            # Strictly 1 alpha atom & 0 alpha failures (NOT 3 atoms or 1 beta failure!)
+            self.assertEqual(rel_dom["atom_count"], 1)
+            self.assertEqual(rel_dom["failure_count"], 0)
+            # Private unscoped self-model.md goal titles MUST NOT leak over MCP
+            self.assertEqual(cg_data["goals"], [])
+            self.assertNotIn("Private Owner Reliability Career Plan", cg_text)
+            self.assertNotIn("Private Personal Medical Checklist", cg_text)
+
+            # 4. Verify mcp_server.semantic_search wires use_l0_bus=True for standard queries, False for expired/as_of
+            seen_l0: list[bool] = []
+            orig_sm = mcp_server.search_memory
+
+            def _spy_mcp_search(query, opts, **kwargs):
+                seen_l0.append(bool(opts.use_l0_bus))
+                return orig_sm(query, opts, **kwargs)
+
+            with patch.object(mcp_server, "search_memory", side_effect=_spy_mcp_search):
+                mcp_server.semantic_search("alpha worker retries", n_results=3, project="project:alpha")
+                mcp_server.semantic_search("alpha worker retries", n_results=3, project="project:alpha", include_expired=True)
+                mcp_server.semantic_search("alpha worker retries", n_results=3, project="project:alpha", as_of="2026-11-24")
+            self.assertEqual(seen_l0, [True, False, False])
 
 
 if __name__ == "__main__":

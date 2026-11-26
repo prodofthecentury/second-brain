@@ -145,6 +145,32 @@ _STOP_WORDS: frozenset[str] = frozenset(
 )
 _OPEN_TAG_RE = re.compile(r"<\s*second_brain_auto_context\b", re.IGNORECASE)
 _CLOSE_TAG_RE = re.compile(r"<\s*/\s*second_brain_auto_context\s*>", re.IGNORECASE)
+_FAST_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bsk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\b(?:sk|rk)_live_[0-9A-Za-z]{20,}\b"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
+    re.compile(r"https?://[^/\s:@\"']+:[^/\s@\"']+@"),
+    re.compile(
+        r"(?i)\b(?:password|passwd|pwd|api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|private[_-]?token|token)\s*[:=]\s*['\"]?[^\s'\",;]{4,}"
+    ),
+)
+
+
+def _contains_likely_secret_fast(text: str) -> bool:
+    """Fast stdlib-only credential/secret detector used before any state or experience persistence."""
+    raw = str(text or "")
+    if not raw:
+        return False
+    return any(pat.search(raw) for pat in _FAST_SECRET_PATTERNS)
 
 
 def _auto_recall_enabled() -> bool:
@@ -304,6 +330,13 @@ def _save_conv_state(path: Path | None, data: dict[str, Any], *, verify_unix_uid
                 pass
             return
         tmp = None
+        try:
+            _ensure_scripts_on_path()
+            from security_fs import restrict_security_file_permissions
+
+            restrict_security_file_permissions(path)
+        except Exception:
+            pass
         _prune_conv_state_files(parent)
     except Exception:
         if tmp is not None:
@@ -1102,10 +1135,24 @@ def _build_pre_invocation_response(
         return {}
 
     project_tag = _normalize_workspace_project_tag(payload)
+    _ensure_scripts_on_path()
+    prompt_excerpt = raw_prompt[:500]
+    prompt_flagged = _contains_likely_secret_fast(raw_prompt)
+    try:
+        from inbox_workflow import scan_inbox_payload_risks
+
+        if scan_inbox_payload_risks(prompt_excerpt):
+            prompt_flagged = True
+    except Exception:
+        # Fail-closed for prompt persistence if DLP risk scanner is unavailable.
+        prompt_flagged = True
+
     # Record prompt hash immediately so subsequent tool-loop invocations skip cleanly.
+    # Never persist unredacted secret/risky prompts into %TEMP% or PLUGIN_DATA.
     next_state: dict[str, Any] = {
         "prompt_hash": prompt_hash,
-        "last_prompt": raw_prompt[:500],
+        "last_prompt": "" if prompt_flagged else prompt_excerpt,
+        "skip_stop_log": bool(prompt_flagged),
         "project_tag": project_tag or "",
         "referenced_atoms": [],
         "last_stop_prompt_hash": str(prev_state.get("last_stop_prompt_hash") or ""),
@@ -1133,7 +1180,7 @@ def _build_pre_invocation_response(
     recalled_items: list[tuple[str, str, float, list[str]]] = []
     all_candidates: list[tuple[str, str, float, list[str]]] = []
 
-    # 1. Fast Predictive Memory Bus check (lookup_l0_hot) + workspace-starvation-proof scoped/global lexical recall.
+    # 1. Workspace-starvation-proof scoped + global lexical recall over verified atoms.
     try:
         merged_by_file: dict[str, tuple[str, str, float, list[str]]] = {}
 
@@ -1419,34 +1466,59 @@ def _handle_stop_event(
     prompt_hash = str(state.get("prompt_hash") or "").strip()
     last_stop_hash = str(state.get("last_stop_prompt_hash") or "").strip()
     last_prompt = str(state.get("last_prompt") or "").strip()
+    skip_stop_log = bool(state.get("skip_stop_log"))
     ref_atoms = [str(a).strip() for a in (state.get("referenced_atoms") or []) if str(a).strip()]
     project_tag = str(state.get("project_tag") or "").strip() or _normalize_workspace_project_tag(payload) or ""
 
+    def _clear_and_save_stop_state(*, mark_stopped: bool = True) -> None:
+        state["last_prompt"] = ""
+        if mark_stopped and prompt_hash:
+            state["last_stop_prompt_hash"] = prompt_hash
+        state["ts"] = time.time()
+        _save_conv_state(conv_path, state, verify_unix_uid=is_unix_fb)
+
     if not prompt_hash or prompt_hash == last_stop_hash:
+        if state.get("last_prompt"):
+            _clear_and_save_stop_state(mark_stopped=False)
+        return {}
+    if skip_stop_log or _contains_likely_secret_fast(last_prompt):
+        _clear_and_save_stop_state(mark_stopped=True)
         return {}
     if len(last_prompt) < MIN_STOP_PROMPT_CHARS and not ref_atoms:
+        _clear_and_save_stop_state(mark_stopped=True)
         return {}
 
     _ensure_scripts_on_path()
     try:
         import scripts.cognitive_core as cognitive_core
         import scripts.config as _cfg
+        from scripts.host_adapters import OutboundSecretBlockedError, inspect_and_redact_outbound
         from scripts.inbox_workflow import scan_inbox_payload_risks
 
         resolved_brain = os.path.abspath(brain_dir or _cfg.resolve_active_brain_dir())
         if not os.path.isdir(resolved_brain) or _is_reparse_or_link_fast(resolved_brain):
-            return {}
-
-        goal_text = _sanitize_untrusted_text(last_prompt, max_chars=240)
-        if not goal_text:
+            _clear_and_save_stop_state(mark_stopped=True)
             return {}
 
         # DLP & risk scan strictly before persisting; skip risky/secret turns cleanly.
         risk_flags = scan_inbox_payload_risks(last_prompt)
         if risk_flags:
-            state["last_stop_prompt_hash"] = prompt_hash
-            state["ts"] = time.time()
-            _save_conv_state(conv_path, state, verify_unix_uid=is_unix_fb)
+            _clear_and_save_stop_state(mark_stopped=True)
+            return {}
+
+        try:
+            redacted = inspect_and_redact_outbound(
+                last_prompt,
+                redact_pii=True,
+                fail_on_secret_detection=True,
+            )
+        except OutboundSecretBlockedError:
+            _clear_and_save_stop_state(mark_stopped=True)
+            return {}
+
+        goal_text = _sanitize_untrusted_text(redacted.sanitized_text, max_chars=240)
+        if not goal_text:
+            _clear_and_save_stop_state(mark_stopped=True)
             return {}
 
         clean_host = (host or "antigravity").strip().lower()
@@ -1470,12 +1542,13 @@ def _handle_stop_event(
             inbox_dir=os.path.join(resolved_brain, "0-raw", "inbox"),
             brain_dir=resolved_brain,
         )
-        state["last_stop_prompt_hash"] = prompt_hash
-        state["ts"] = time.time()
-        _save_conv_state(conv_path, state, verify_unix_uid=is_unix_fb)
+        _clear_and_save_stop_state(mark_stopped=True)
     except Exception:
         # Never block host shutdown / turn completion on logging errors or DLP rejection.
-        pass
+        try:
+            _clear_and_save_stop_state(mark_stopped=True)
+        except Exception:
+            pass
     return {}
 
 

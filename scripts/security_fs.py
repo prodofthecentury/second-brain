@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 import stat
@@ -163,13 +164,41 @@ def restrict_security_file_permissions(path: Path | str) -> None:
 
 
 def read_bounded_security_file(path: Path | str, *, max_bytes: int = MAX_POLICY_FILE_BYTES) -> str:
-    """Read a security config/token file safely, rejecting symlinks/reparse points and oversized files."""
-    path = Path(path)
-    if os.path.lexists(str(path)) and _is_reparse_or_link(str(path)):
-        raise PermissionError(f"Refusing to read security file via symlink or reparse point: {path}")
-    if os.path.lexists(str(path.parent)) and _is_reparse_or_link(str(path.parent)):
-        raise PermissionError(f"Refusing to read security file under symlinked directory: {path.parent}")
-    stat_info = path.stat()
-    if stat_info.st_size > max_bytes:
-        raise PermissionError(f"Security file exceeds maximum allowed size ({max_bytes} bytes): {path}")
-    return path.read_text(encoding="utf-8")
+    """Read a security config/token file safely via O_NOFOLLOW + fstat(fd), rejecting symlinks/reparse points and oversized files."""
+    p = Path(path)
+    eff_max = max(0, int(max_bytes))
+    if os.path.lexists(str(p)) and _is_reparse_or_link(str(p)):
+        raise PermissionError(f"Refusing to read security file via symlink or reparse point: {p}")
+    seen_ancestors: set[Path] = {p}
+    for anc in (p.parent, p.parent.parent):
+        if anc in seen_ancestors:
+            continue
+        seen_ancestors.add(anc)
+        if os.path.lexists(str(anc)) and _is_reparse_or_link(str(anc)):
+            raise PermissionError(f"Refusing to read security file under symlinked directory: {anc}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(str(p), flags)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise PermissionError(f"Refusing to read security file via symlink or reparse point: {p}") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"Refusing to read non-regular security file: {p}")
+        if st.st_size > eff_max:
+            raise PermissionError(f"Security file exceeds maximum allowed size ({eff_max} bytes): {p}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(8192, (eff_max + 1) - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > eff_max:
+                raise PermissionError(f"Security file exceeds maximum allowed size ({eff_max} bytes): {p}")
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")
