@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -285,6 +286,73 @@ class DistillRepairTests(unittest.TestCase):
         self.assertNotIn("qwen2.5-coder:7b", seen)
 
 
+class DistillGroundingTests(unittest.TestCase):
+    def test_prompt_example_cannot_be_mistaken_for_note_content(self) -> None:
+        from scripts.ollama_refinery import ATOM_JSON_SCHEMA, _schema_prompt
+
+        prompt = _schema_prompt("No source, no claim. A memory needs an exact quote from this note.")
+        folded = prompt.casefold()
+        self.assertNotIn("coffee", folded)
+        self.assertNotIn("llama", folded)
+        self.assertIn("XQV7PLACEHOLDER", prompt)
+        self.assertEqual(ATOM_JSON_SCHEMA["properties"]["atoms"]["maxItems"], 5)
+
+    def test_coffee_example_is_dropped_from_a_coffee_free_note(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "No source, no claim. A memory needs an exact quote from this note."
+        leaked = (
+            '{"atoms":[{"title":"Pour-over ratio","claim":"Pour-over coffee uses one gram of coffee per sixteen grams of water.",'
+            '"evidence":"Pour-over coffee uses one gram of coffee per sixteen grams of water.",'
+            '"why":"Leaked example.","memory_type":"semantic"}]}'
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": leaked}}):
+            with self.assertRaises(RuntimeError):
+                draft_memory_atoms(source, "0-raw/06-no-source.md", "House rules")
+
+    def test_paraphrased_evidence_is_replaced_by_the_source_span(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "The pour-over ratio is one gram of coffee to sixteen grams of water."
+        recorded = (
+            '{"atoms":[{"title":"Pour-over ratio","claim":"The pour-over ratio is one gram of coffee to sixteen grams of water.",'
+            '"evidence":"pour over RATIO is one gram of coffee to sixteen grams of water",'
+            '"why":"Brewing.","memory_type":"semantic"}]}'
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/01-coffee.md", "House rules")
+        self.assertIn("## Evidence\n" + source, drafted[0])
+        self.assertNotIn("RATIO", drafted[0])
+
+    def test_one_note_keeps_multiple_facts_with_unique_ids(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "Daily backups run at 02:00. A 70B Hermes model needs a large GPU."
+        recorded = (
+            '{"atoms":['
+            '{"title":"Daily backups","claim":"Daily backups run at 02:00.","evidence":"Daily backups run at 02:00.",'
+            '"why":"Operations.","memory_type":"semantic"},'
+            '{"title":"Daily backups","claim":"A 70B Hermes model needs a large GPU.","evidence":"A 70B Hermes model needs a large GPU.",'
+            '"why":"Hardware.","memory_type":"semantic"}'
+            ']}'
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/02-backups-hermes.md", "House rules")
+        self.assertEqual(len(drafted), 2)
+        ids = []
+        for document in drafted:
+            for line in document.splitlines():
+                if line.startswith("id: "):
+                    ids.append(line.split(": ", 1)[1])
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2)
+        self.assertIn("02-backups-hermes", ids[0])
+        self.assertTrue(all(len(item.split("-")[-1]) == 8 for item in ids))
+        joined = "\n".join(drafted)
+        self.assertIn("Daily backups run at 02:00.", joined)
+        self.assertIn("A 70B Hermes model needs a large GPU.", joined)
+
+
 class PinnedModelFallbackTests(unittest.TestCase):
     def test_chat_does_not_try_a_second_model_after_token_repeat(self) -> None:
         from scripts.ollama_utils import chat_with_fallback
@@ -343,6 +411,41 @@ class DoctorVaultTests(unittest.TestCase):
         self.assertIn("selected=llama3.2:3b", detail)
         self.assertIn("auto=qwen2.5-coder:7b", detail)
 
+    def test_dated_hash_id_still_matches_a_stable_eval_label(self) -> None:
+        from scripts.lexical_store import rebuild_lexical_index
+        from scripts.personal_eval import evaluate_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atoms = Path(tmp) / "2-atoms"
+            atoms.mkdir()
+            (atoms / "2026-11-26-coffee-pour-over-coffee-ratio-ab12cd34.md").write_text(
+                "---\nid: 2026-11-26-coffee-pour-over-coffee-ratio-ab12cd34\n"
+                "title: Pour-over coffee ratio\nreview_status: pending\n"
+                "sources:\n  - 0-raw/01-coffee.md\n---\n\n"
+                "## Claim\nThe pour-over coffee ratio is one gram of coffee to sixteen grams of water.\n\n"
+                "## Evidence\nThe pour-over coffee ratio is one gram of coffee to sixteen grams of water.\n",
+                encoding="utf-8",
+            )
+            index = Path(tmp) / "lexical.sqlite3"
+            rebuild_lexical_index(str(atoms), str(index))
+            spec = {
+                "name": "personal-example",
+                "k": 5,
+                "allow_unreviewed_exploratory": True,
+                "queries": [
+                    {
+                        "id": "coffee",
+                        "query": "pour-over coffee ratio",
+                        "relevant": ["pour-over-coffee-ratio", "Pour-over coffee ratio"],
+                    }
+                ],
+            }
+            path = Path(tmp) / "eval.json"
+            path.write_text(json.dumps(spec), encoding="utf-8")
+            report = evaluate_file(str(path), atoms_dir=str(atoms), index_path=str(index))
+        self.assertEqual(report["recall_at_k"], 1.0)
+        self.assertEqual(report["mrr"], 1.0)
+
     def test_doctor_uses_a_temporary_vault_when_the_configured_one_is_missing(self) -> None:
         import io
 
@@ -357,6 +460,42 @@ class DoctorVaultTests(unittest.TestCase):
         self.assertIn("temporary vault", text)
         self.assertNotIn("Missing directories", text)
         self.assertEqual(code, 0)
+
+    def test_empty_directory_is_treated_as_an_unconfigured_vault(self) -> None:
+        import io
+
+        from scripts.doctor import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            with patch.dict(os.environ, {"BRAIN_VAULT_DIR": tmp}, clear=False):
+                with patch("sys.stdout", buf):
+                    code = main([])
+        self.assertIn("not initialized", buf.getvalue())
+        self.assertIn("temporary vault", buf.getvalue())
+        self.assertEqual(code, 0)
+
+    def test_cli_doctor_reports_the_pinned_model_as_selected(self) -> None:
+        import io
+        from types import SimpleNamespace
+
+        from scripts.cli import doctor
+
+        profile = SimpleNamespace(
+            tier_label="Tier 2 — Balanced CPU 7B Intelligence",
+            recommended_generation_model="qwen2.5-coder:7b",
+            selected_installed_generation_model="qwen2.5-coder:7b",
+        )
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"BRAIN_VAULT_DIR": tmp, "BRAIN_GEN_MODEL": "llama3.2:3b"}):
+                with patch("scripts.hardware_profile.detect_hardware_profile", return_value=profile):
+                    with patch("sys.stdout", buf):
+                        doctor()
+        text = buf.getvalue()
+        self.assertIn("selected=llama3.2:3b", text)
+        self.assertNotIn("selected=qwen2.5-coder:7b", text)
+        self.assertIn("auto=qwen2.5-coder:7b", text)
 
 
 if __name__ == "__main__":
