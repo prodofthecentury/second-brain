@@ -315,9 +315,14 @@ def _render_skill(
     successes: int,
     failures: int,
     project: str = "",
+    procedure: str = "",
 ) -> str:
     payload = json.dumps(steps, indent=2, sort_keys=True)
     project_line = f"project: {json.dumps(project)}\n" if project else ""
+    procedure_block = ""
+    clean_procedure = str(procedure or "").strip()
+    if clean_procedure:
+        procedure_block = f"\n## Procedure\n\n{clean_procedure[:_LEARN_CLAIM_CHARS]}\n"
     return (
         "---\n"
         f"skill_id: {skill_id}\n"
@@ -330,7 +335,15 @@ def _render_skill(
         "---\n\n"
         "## Ordered Sandboxed Steps\n\n"
         f"```json\n{payload}\n```\n"
+        f"{procedure_block}"
     )
+
+
+def _procedure_text(skill_text: str) -> str:
+    marker = "## Procedure"
+    if marker not in (skill_text or ""):
+        return ""
+    return skill_text.split(marker, 1)[1].strip()[:_LEARN_CLAIM_CHARS]
 
 
 def _load_skill(path: str) -> dict[str, Any]:
@@ -381,6 +394,7 @@ def draft_agent_skill(
     trigger: str,
     brain_dir: str = BRAIN_DIR,
     project: str = "",
+    procedure: str = "",
 ) -> str:
     dirs = _dirs(brain_dir)
     author = _agent_id(agent_id)
@@ -399,6 +413,7 @@ def draft_agent_skill(
         successes=0,
         failures=0,
         project=project,
+        procedure=procedure,
     )
     if os.path.exists(target):
         os.remove(target)
@@ -673,6 +688,7 @@ def execute_agent_skill(
         status=skill_status,
         successes=successes,
         failures=failures,
+        procedure=_procedure_text(loaded.get("text") or ""),
     )
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(body)
@@ -903,6 +919,28 @@ def run_agent(
         project=project,
         brain_dir=brain_dir,
     )
+    materials: list[dict[str, str]] = []
+    try:
+        for hit in search_connected_knowledge(
+            own_goal,
+            brain_dir=skill_brain,
+            security_dir=security_dir,
+            learn=False,
+            limit=6,
+        ):
+            if hit.get("source") not in {"note", "agent_skill"}:
+                continue
+            materials.append(
+                {
+                    "source": hit.get("source") or "",
+                    "filename": hit.get("filename") or "",
+                    "title": hit.get("title") or "",
+                    "text": hit.get("text") or "",
+                    "vault": hit.get("vault") or "",
+                }
+            )
+    except Exception:
+        materials = []
     child_id = None
     if child_goal and steps >= 2:
         child = run_agent(
@@ -925,6 +963,7 @@ def run_agent(
         "memory_ids": [memory_name],
         "child_run_id": child_id,
         "experience_id": experience["experience_id"],
+        "materials": materials,
     }
 
 
@@ -1062,6 +1101,7 @@ def learn_from_notes(*, brain_dir: str = BRAIN_DIR) -> dict[str, int]:
                     trigger=title[:200],
                     project=scope,
                     brain_dir=brain_dir,
+                    procedure=body.strip()[:_LEARN_CLAIM_CHARS],
                 )
                 skills += 1
             except (AgentRuntimeError, ExecutableSkillValidationError):
@@ -1114,7 +1154,7 @@ def search_connected_knowledge(
         )
 
     try:
-        from notes_store import NotePaths, search_notes
+        from notes_store import NotePaths, get_note, search_notes
     except Exception:
         search_notes = None  # type: ignore[assignment]
         NotePaths = None  # type: ignore[assignment]
@@ -1129,8 +1169,22 @@ def search_connected_knowledge(
                     project=vault_project or None,
                     paths=NotePaths.for_brain(root),
                 ):
-                    blob = f"{note.title}\n{note.snippet or ''}"
-                    add("note", note.filename, note.title, note.snippet or note.title, label, root, _term_overlap(query, blob))
+                    note_text = (note.snippet or note.title or "").strip()
+                    try:
+                        full = get_note(note.filename, paths=NotePaths.for_brain(root))
+                        if full.body and full.body.strip():
+                            note_text = full.body.strip()
+                    except Exception:
+                        pass
+                    add(
+                        "note",
+                        note.filename,
+                        note.title,
+                        note_text,
+                        label,
+                        root,
+                        _term_overlap(query, f"{note.title}\n{note_text}"),
+                    )
             except Exception:
                 pass
         for memory in search_agent_memory(query, brain_dir=root, project=vault_project, limit=cap):
@@ -1175,6 +1229,9 @@ def search_connected_knowledge(
                 detail = str(step.get("query") or step.get("rel_path") or step.get("audit_kind") or "").strip()
                 step_lines.append(f"- {action} {detail}".rstrip())
             brief = trigger + "\n" + "\n".join(step_lines)
+            procedure = _procedure_text(str(loaded.get("text") or ""))
+            if procedure:
+                brief = f"{brief}\n{procedure}"
             score = _term_overlap(query, brief)
             if score < 1:
                 continue

@@ -680,6 +680,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(any(hit["source"] == "agent_skill" and hit["title"] == "antifraud-checkout" for hit in hits))
         self.assertEqual(hits[0]["title"], "antifraud-checkout")
         self.assertIn("vault_recall", hits[0]["text"])
+        self.assertTrue(any("allow_bins" in hit["text"] for hit in hits))
         closed = federated_recall(
             "anti-fraud",
             security_dir=str(self.security),
@@ -693,6 +694,7 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(result["skill_id"], "antifraud-checkout")
         self.assertEqual(result["status"], "done")
+        self.assertTrue(any("allow_bins" in item.get("text", "") for item in result["materials"]))
 
 
 if __name__ == "__main__":
