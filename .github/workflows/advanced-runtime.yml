@@ -63,7 +63,7 @@ jobs:
   ollama-debate:
     name: Linux Ollama cited debate
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -85,6 +85,7 @@ jobs:
             sleep 2
           done
           ollama pull qwen2.5:0.5b
+          ollama pull llama3.2:3b
 
       - name: Run a cited debate against the live model
         env:
@@ -93,3 +94,13 @@ jobs:
         run: |
           uv run --locked --python 3.11 python -m unittest \
             scripts.real_runtime_tests.RealRuntimeTests.test_ollama_debate_uses_a_live_model_and_drops_uncited_claims
+
+      - name: Distill eight short notes with llama3.2:3b
+        env:
+          BRAIN_REQUIRE_OLLAMA: "1"
+          BRAIN_REQUIRE_DISTILL: "1"
+          BRAIN_GEN_MODEL: "llama3.2:3b"
+          BRAIN_OLLAMA_TIMEOUT: "120"
+        run: |
+          uv run --locked --python 3.11 python -m unittest \
+            scripts.real_runtime_tests.RealRuntimeTests.test_llama32_distills_eight_short_notes

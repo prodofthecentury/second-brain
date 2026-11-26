@@ -176,6 +176,64 @@ class RealRuntimeTests(unittest.TestCase):
         self.assertIn(result["status"], {"completed", "abstained"})
         self.assertTrue(result["rounds"])
 
+    def test_llama32_distills_eight_short_notes(self) -> None:
+        """Live llama3.2:3b distill. Skips unless Ollama has that model.
+
+        The advanced workflow sets BRAIN_REQUIRE_DISTILL=1 after pulling the model.
+        A total miss (0/8) fails that job. Partial success is printed and kept.
+        """
+        import urllib.error
+        import urllib.request
+
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        model = "llama3.2:3b"
+        notes = (
+            "Pour-over coffee uses 1 g of coffee per 16 g of water.",
+            "The vault stores approved claims as Markdown atoms.",
+            "House rules require evidence copied from the source note.",
+            "A pinned BRAIN_GEN_MODEL must not switch after an abort.",
+            "Lexical search can rerank with the local cross-encoder.",
+            "SQLite is the job queue for background capture.",
+            "The owner token header is X-Owner-Token.",
+            "Daily notes land in the 0-raw inbox before distillation.",
+        )
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            if _require("BRAIN_REQUIRE_OLLAMA") or _require("BRAIN_REQUIRE_DISTILL"):
+                self.fail(f"Ollama is required but not reachable: {exc}")
+            self.skipTest(f"Ollama is not reachable: {exc}")
+        installed = [str(item.get("name") or "") for item in payload.get("models") or []]
+        if not any(name == model or name.startswith(model + ":") for name in installed):
+            if _require("BRAIN_REQUIRE_DISTILL"):
+                self.fail(f"{model} is required but not installed; tags={installed}")
+            self.skipTest(f"{model} is not installed")
+        successes = 0
+        previous = os.environ.get("BRAIN_GEN_MODEL")
+        os.environ["BRAIN_GEN_MODEL"] = model
+        try:
+            for index, note in enumerate(notes, start=1):
+                try:
+                    drafted = draft_memory_atoms(note, f"0-raw/note-{index}.md", "Copy evidence verbatim.")
+                except Exception as exc:
+                    print(f"DISTILL_NOTE {index} FAIL {exc}")
+                    continue
+                if drafted and note in drafted[0]:
+                    successes += 1
+                    print(f"DISTILL_NOTE {index} OK")
+                else:
+                    print(f"DISTILL_NOTE {index} EMPTY")
+        finally:
+            if previous is None:
+                os.environ.pop("BRAIN_GEN_MODEL", None)
+            else:
+                os.environ["BRAIN_GEN_MODEL"] = previous
+        print(f"DISTILL_SUCCESS {successes}/{len(notes)}")
+        if _require("BRAIN_REQUIRE_DISTILL") and successes == 0:
+            self.fail(f"llama3.2:3b distilled 0/{len(notes)} notes")
+
     def test_tunnel_binaries_report_their_real_version_when_installed(self) -> None:
         for name, flag in (("cloudflared", "BRAIN_REQUIRE_CLOUDFLARED"), ("tailscale", "BRAIN_REQUIRE_TAILSCALE")):
             probed = probe_tunnel_binary(name)

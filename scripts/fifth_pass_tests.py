@@ -60,7 +60,7 @@ class GenerationModelTests(unittest.TestCase):
         with patch.dict(os.environ, {"BRAIN_GEN_MODEL": "llama3.2:3b"}):
             self.assertEqual(model_for_local_rule("qwen2.5-coder:7b"), "llama3.2:3b")
             with patch("scripts.ollama_utils.installed_model_names", return_value=["llama3.2:3b", "qwen2.5-coder:7b"]):
-                self.assertEqual(generation_candidates("qwen2.5-coder:7b")[0], "llama3.2:3b")
+                self.assertEqual(generation_candidates("qwen2.5-coder:7b"), ["llama3.2:3b"])
 
 
 class LexicalRerankTests(unittest.TestCase):
@@ -162,6 +162,201 @@ class DistillRepairTests(unittest.TestCase):
         self.assertIn("id: ", text)
         self.assertIn("pour-over-ratio", text)
         self.assertNotIn("ratioo", text)
+
+    def test_empty_claim_json_derives_a_claim_from_the_evidence(self) -> None:
+        from scripts.ollama_refinery import LAST_DISTILL_PATHS, draft_memory_atoms
+
+        source = "The pour-over ratio is one gram of coffee to sixteen grams of water."
+        recorded = (
+            '{"atoms":[{"title":"","claim":"","evidence":'
+            '"The pour-over ratio is one gram of coffee to sixteen grams of water.",'
+            '"why":"","memory_type":"semantic"}]}'
+        )
+        seen: dict[str, object] = {}
+
+        def _chat(*, messages, model=None, **kwargs):
+            seen["format"] = kwargs.get("format")
+            seen["options"] = kwargs.get("options")
+            return {"message": {"content": recorded}}
+
+        with patch("scripts.ollama_refinery.chat_with_fallback", side_effect=_chat):
+            drafted = draft_memory_atoms(source, "0-raw/coffee.md", "House rules")
+        self.assertEqual(len(drafted), 1)
+        self.assertIn(source, drafted[0])
+        self.assertIn("derived_claim", LAST_DISTILL_PATHS[-1])
+        self.assertIsInstance(seen["format"], dict)
+        self.assertIn("atoms", seen["format"]["properties"])
+        self.assertGreaterEqual(seen["format"]["properties"]["atoms"]["items"]["properties"]["claim"]["minLength"], 5)
+        self.assertEqual(seen["options"]["temperature"], 0.1)
+
+    def test_title_copied_into_the_claim_is_replaced_by_the_evidence_sentence(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "The pour-over ratio is one gram of coffee to sixteen grams of water."
+        recorded = (
+            '{"atoms":[{"title":"Pour-over ratio","claim":"Pour-over ratio","evidence":'
+            '"The pour-over ratio is one gram of coffee to sixteen grams of water.",'
+            '"why":"Brewing.","memory_type":"semantic"}]}'
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/coffee.md", "House rules")
+        self.assertIn("## Claim\n" + source, drafted[0])
+        self.assertNotIn("## Claim\nPour-over ratio\n", drafted[0])
+
+    def test_prose_falls_through_to_the_legacy_markdown_parser(self) -> None:
+        from scripts.ollama_refinery import LAST_DISTILL_PATHS, draft_memory_atoms
+
+        source = "The pour-over ratio is one gram of coffee to sixteen grams of water."
+        legacy = (
+            "```markdown\n---\nid: pour-over-ratio\ntype: atom\nmemory_type: semantic\n"
+            "sources:\n  - 0-raw/coffee.md\n---\n\n"
+            f"## Claim\n{source}\n\n## Evidence\n{source}\n\n"
+            "## Why It Matters\nIt is the brewing ratio.\n```"
+        )
+        calls = {"n": 0}
+
+        def _chat(*, messages, model=None, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return {"message": {"content": "I think the ratio is about one to sixteen."}}
+            return {"message": {"content": legacy}}
+
+        with patch("scripts.ollama_refinery.chat_with_fallback", side_effect=_chat):
+            drafted = draft_memory_atoms(source, "0-raw/coffee.md", "House rules")
+        self.assertEqual(len(drafted), 1)
+        self.assertIn("legacy_markdown", LAST_DISTILL_PATHS[-1])
+        self.assertIn(source, drafted[0])
+
+    def test_evidence_that_does_not_support_the_claim_is_dropped(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "The pour-over ratio is one gram of coffee to sixteen grams of water."
+        recorded = (
+            '{"atoms":[{"title":"Bananas","claim":"Bananas are blue today.",'
+            '"evidence":"The pour-over ratio is one gram of coffee to sixteen grams of water.",'
+            '"why":"No.","memory_type":"semantic"}]}'
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            with self.assertRaises(RuntimeError) as caught:
+                draft_memory_atoms(source, "0-raw/coffee.md", "House rules")
+        self.assertIn("Could not parse model memories", str(caught.exception))
+
+    def test_optional_model_support_check_can_drop_a_lexical_match(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "The pour-over ratio is one gram of coffee to sixteen grams of water."
+        recorded = (
+            '{"atoms":[{"title":"Pour-over ratio","claim":"The pour-over ratio is one gram of coffee to sixteen grams of water.",'
+            '"evidence":"The pour-over ratio is one gram of coffee to sixteen grams of water.",'
+            '"why":"Brewing.","memory_type":"semantic"}]}'
+        )
+
+        def _chat(*, messages, model=None, **_kwargs):
+            if "Does the evidence support" in messages[0]["content"]:
+                return {"message": {"content": "no"}}
+            return {"message": {"content": recorded}}
+
+        with patch.dict(os.environ, {"BRAIN_DISTILL_MODEL_SUPPORT_CHECK": "1"}):
+            with patch("scripts.ollama_refinery.chat_with_fallback", side_effect=_chat):
+                with self.assertRaises(RuntimeError) as caught:
+                    draft_memory_atoms(source, "0-raw/coffee.md", "House rules")
+        self.assertIn("Could not parse model memories", str(caught.exception))
+
+    def test_token_repeat_abort_stays_on_the_pinned_model(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        seen: list[str] = []
+
+        def boom(*_args, **kwargs):
+            seen.append(str(kwargs.get("model")))
+            raise RuntimeError("token repeat limit")
+
+        with patch.dict(os.environ, {"BRAIN_GEN_MODEL": "llama3.2:3b"}):
+            with patch("scripts.ollama_utils.ollama.chat", boom):
+                with self.assertRaises(RuntimeError) as caught:
+                    draft_memory_atoms(
+                        "The pour-over ratio is one gram of coffee to sixteen grams of water.",
+                        "0-raw/coffee.md",
+                        "House rules",
+                        model="qwen2.5-coder:7b",
+                    )
+        self.assertEqual(seen, ["llama3.2:3b"])
+        self.assertIn("token repeat", str(caught.exception).lower())
+        self.assertNotIn("qwen2.5-coder:7b", seen)
+
+
+class PinnedModelFallbackTests(unittest.TestCase):
+    def test_chat_does_not_try_a_second_model_after_token_repeat(self) -> None:
+        from scripts.ollama_utils import chat_with_fallback
+
+        seen: list[str] = []
+
+        def boom(*_args, **kwargs):
+            seen.append(str(kwargs.get("model")))
+            raise RuntimeError("token repeat limit")
+
+        with patch.dict(os.environ, {"BRAIN_GEN_MODEL": "llama3.2:3b"}):
+            with patch("scripts.ollama_utils.ollama.chat", boom):
+                with self.assertRaises(RuntimeError):
+                    chat_with_fallback(
+                        [{"role": "user", "content": "hi"}],
+                        model="qwen2.5-coder:7b",
+                    )
+        self.assertEqual(seen, ["llama3.2:3b"])
+
+    def test_allow_model_fallback_false_stops_after_one_model(self) -> None:
+        from scripts.ollama_utils import chat_with_fallback
+
+        seen: list[str] = []
+
+        def boom(*_args, **kwargs):
+            seen.append(str(kwargs.get("model")))
+            raise RuntimeError("token repeat limit")
+
+        with patch.dict(os.environ, {"BRAIN_GEN_MODEL": ""}, clear=False):
+            with patch("scripts.ollama_utils.ollama.chat", boom):
+                with patch(
+                    "scripts.ollama_utils.installed_model_names",
+                    return_value=["llama3.2:3b", "qwen2.5-coder:7b"],
+                ):
+                    with self.assertRaises(RuntimeError):
+                        chat_with_fallback(
+                            [{"role": "user", "content": "hi"}],
+                            model="llama3.2:3b",
+                            allow_model_fallback=False,
+                        )
+        self.assertEqual(seen, ["llama3.2:3b"])
+
+
+class DoctorVaultTests(unittest.TestCase):
+    def test_capability_line_reports_the_pinned_model_as_selected(self) -> None:
+        from types import SimpleNamespace
+
+        from scripts.doctor import capability_tier_detail
+
+        profile = SimpleNamespace(
+            tier_label="cpu-small",
+            selected_installed_generation_model="qwen2.5-coder:7b",
+        )
+        with patch.dict(os.environ, {"BRAIN_GEN_MODEL": "llama3.2:3b"}):
+            detail = capability_tier_detail(profile)
+        self.assertIn("selected=llama3.2:3b", detail)
+        self.assertIn("auto=qwen2.5-coder:7b", detail)
+
+    def test_doctor_uses_a_temporary_vault_when_the_configured_one_is_missing(self) -> None:
+        import io
+
+        from scripts.doctor import main
+
+        missing = Path(tempfile.mkdtemp()) / "no-such-brain"
+        buf = io.StringIO()
+        with patch.dict(os.environ, {"BRAIN_VAULT_DIR": str(missing)}, clear=False):
+            with patch("sys.stdout", buf):
+                code = main([])
+        text = buf.getvalue()
+        self.assertIn("temporary vault", text)
+        self.assertNotIn("Missing directories", text)
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
