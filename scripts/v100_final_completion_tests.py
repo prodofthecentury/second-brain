@@ -364,10 +364,15 @@ class V100FinalCompletionTests(unittest.TestCase):
                 # Spaces in path are single-quoted safely. Git's toplevel and
                 # Python's temp path can differ by a Windows 8.3 alias.
                 hook_cmp = hook_txt
-                for variant in {
-                    repo.as_posix(),
-                    Path(os.path.realpath(repo)).as_posix(),
-                }:
+                # Replace the longer real path first. On macOS the /var form is
+                # a suffix of /private/var, and a short-path replace would
+                # splice the quote.
+                variants = sorted(
+                    {repo.as_posix(), Path(os.path.realpath(repo)).as_posix()},
+                    key=len,
+                    reverse=True,
+                )
+                for variant in variants:
                     hook_cmp = hook_cmp.replace(variant, "repo with spaces")
                 self.assertIn("'repo with spaces'", hook_cmp)
 
