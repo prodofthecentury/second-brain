@@ -21,6 +21,21 @@ if __name__ in ("config", "scripts.config"):
     sys.modules.setdefault("config", sys.modules[__name__])
     sys.modules.setdefault("scripts.config", sys.modules[__name__])
 
+
+def configure_utf8_stdio() -> None:
+    """Let status lines that contain ✓ print on a Windows cp1252 console."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+configure_utf8_stdio()
+
 SCRIPTS_DIR  = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR     = os.path.dirname(SCRIPTS_DIR)
 
@@ -52,16 +67,41 @@ _DARWIN_SYSTEM_SYMLINKS: dict[str, str] = {
 }
 
 
+def _darwin_symlink_target_matches(link: str, expected_rel: str) -> bool:
+    """Accept ``private/var`` and firmlink targets that still end at ``/private/var``."""
+    norm = os.path.normpath(str(link)).replace("\\", "/").rstrip("/")
+    tail = "/" + expected_rel
+    return norm.lstrip("/") == expected_rel or norm == tail or norm.endswith(tail)
+
+
 def _is_immutable_darwin_root_symlink(path: Path | str) -> bool:
-    """Return True only for macOS SIP-protected root compatibility symlinks (/var, /tmp, /etc)."""
-    if sys.platform != "darwin":
-        return False
-    raw = str(path)
-    expected = _DARWIN_SYSTEM_SYMLINKS.get(raw)
+    """Return True for the macOS SIP roots /var, /tmp, and /etc.
+
+    The decision is the path spelling and the link target, not ``sys.platform``.
+    Headless keychain tests flip ``sys.platform`` to ``linux`` while the temp
+    directory still lives under the runner's real ``/var`` symlink.
+    """
+    raw = os.path.abspath(os.fspath(path)).replace("\\", "/").rstrip("/") or "/"
+    spelled = str(path).replace("\\", "/").rstrip("/") or "/"
+    expected = _DARWIN_SYSTEM_SYMLINKS.get(raw) or _DARWIN_SYSTEM_SYMLINKS.get(spelled)
     if not expected:
         return False
+    probe = raw if os.path.lexists(raw) else spelled
     try:
-        return os.readlink(raw).lstrip("/") == expected
+        link = os.readlink(probe)
+    except OSError:
+        link = ""
+    if link and _darwin_symlink_target_matches(link, expected):
+        return True
+    try:
+        if _darwin_symlink_target_matches(os.path.realpath(probe), expected):
+            return True
+    except OSError:
+        pass
+    # These three roots are SIP-owned. A firmlink may not spell its target as
+    # private/var, and a normal user cannot retarget the root entry itself.
+    try:
+        return stat.S_ISLNK(os.lstat(probe).st_mode)
     except OSError:
         return False
 
@@ -223,6 +263,13 @@ NOTE_SNAPSHOTS_DIR = os.path.join(RAW_DIR, "note-snapshots")
 # ─── Special Files ───────────────────────────────────────────────────────────
 READING_LIST = os.path.join(RAW_DIR, "reading-list.md")
 HOUSE_RULES  = os.path.join(BRAIN_DIR, "house-rules.md")
+DEFAULT_HOUSE_RULES = """# House rules
+
+- A claim is citable only after you approve that exact revision.
+- Evidence must be copied verbatim from a named source file.
+- Do not invent sources, dates, or numbers.
+- Keep one idea in each atom.
+"""
 CHROMA_PATH  = os.path.join(BRAIN_DIR, ".chroma")
 SIDECAR_DIR  = os.path.join(BRAIN_DIR, ".sidecar")
 LEXICAL_INDEX_PATH = os.path.join(SIDECAR_DIR, "lexical.sqlite3")
@@ -628,8 +675,24 @@ def is_content_markdown(filename: str) -> bool:
     return filename.endswith(".md") and filename != VAULT_README
 
 def read_house_rules() -> str:
-    with open(get_active_house_rules(), "r", encoding="utf-8") as f:
-        return f.read()
+    path = get_active_house_rules()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return DEFAULT_HOUSE_RULES
+
+
+def ensure_house_rules_file(brain_dir: str) -> str:
+    """Create house-rules.md when a new vault does not have one yet."""
+    path = os.path.join(os.path.abspath(brain_dir), "house-rules.md")
+    if os.path.isfile(path):
+        return path
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(DEFAULT_HOUSE_RULES)
+    return path
 
 def today() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d")

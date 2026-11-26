@@ -15,7 +15,24 @@ Tracks open human-only decisions without ever fabricating owner approvals:
      recalibrated SLO awaiting explicit human owner sign-off).
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from collections import Counter
@@ -34,29 +51,28 @@ if __name__ in ("owner_gates", "scripts.owner_gates"):
     sys.modules.setdefault("scripts.owner_gates", sys.modules[__name__])
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_DIR)
 
-from atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes, review_lock  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
+    _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     is_content_markdown,
     resolve_module_atoms_and_brain,
     snapshot_module_defaults,
 )
-from evaluation_dataset import (  # noqa: E402
+from scripts.evaluation_dataset import (  # noqa: E402
     AGENT_ACTOR_BLOCKLIST,
     EvaluationDatasetError,
     is_disallowed_agent_actor,
     validate_dataset,
 )
-from evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
-from hardware_profile import HardwareCapabilityProfile  # noqa: E402
-from memory_format import split_frontmatter  # noqa: E402
-from memory_review import parse_frontmatter_values, parse_scalar_list, section_text  # noqa: E402
-from review_atom import approved_revision_is_current  # noqa: E402
+from scripts.evidence import EvidenceValidationError, find_evidence_anchor  # noqa: E402
+from scripts.hardware_profile import HardwareCapabilityProfile  # noqa: E402
+from scripts.memory_format import split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list, section_text  # noqa: E402
+from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
@@ -109,7 +125,11 @@ def _assert_safe_regular_path(path: Path, label: str) -> Path:
     abs_path = Path(os.path.abspath(str(path)))
     cur = abs_path
     while True:
-        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+        if (
+            os.path.lexists(str(cur))
+            and _is_reparse_or_link(str(cur))
+            and not _is_immutable_darwin_root_symlink(cur)
+        ):
             raise PermissionError(f"Refusing {label} through symlink or reparse point: {cur}")
         if cur.parent == cur:
             break
@@ -217,6 +237,7 @@ def audit_evaluation_dataset(
     raw_bytes = ds_file.read_bytes()
     ds_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     raw_obj = json.loads(raw_bytes.decode("utf-8"))
+    code_only = _code_only_checkout(atoms_root, brain_root)
     validated = validate_dataset(
         raw_obj,
         atoms_dir=str(atoms_root),
@@ -226,6 +247,7 @@ def audit_evaluation_dataset(
             atoms_dir=str(atoms_root),
             brain_dir=str(brain_root),
         ),
+        check_vault_files=not code_only,
     )
 
     status = str(validated.get("status") or "pending_owner_review")
@@ -276,8 +298,19 @@ def audit_evaluation_dataset(
         "draft_provenance": validated.get("draft_provenance"),
         "owner_approval": validated.get("owner_approval"),
         "required_confirmation_phrase": _expected_confirmation_phrase(dataset_id, ds_sha256),
+        "validation_mode": "code_only_schema" if code_only else "vault_bound",
         "queries": query_rows,
     }
+
+
+def _code_only_checkout(atoms_root: Path, brain_root: Path) -> bool:
+    """True when CI asked for a code-only run and this vault has no atoms or decision log."""
+    flag = (os.environ.get("BRAIN_CI_CODE_ONLY") or "").strip().lower()
+    if flag not in {"1", "true", "yes"}:
+        return False
+    has_atoms = atoms_root.is_dir() and any(atoms_root.glob("*.md"))
+    has_log = (brain_root / "0-raw" / "archive" / "decision-record.jsonl").is_file()
+    return not has_atoms and not has_log
 
 
 def _diagnose_candidate_evidence(
@@ -434,7 +467,7 @@ def audit_latency_slos(
     brain_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Verify measured Tier-2 8-thread CPU answer P95 and 300-atom ONNX retrieval P95 against targets."""
-    import hardware_profile as hp_mod
+    import scripts.hardware_profile as hp_mod
 
     resolved_brain, _ = resolve_module_atoms_and_brain(
         globals(),

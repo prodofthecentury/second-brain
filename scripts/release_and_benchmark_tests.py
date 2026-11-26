@@ -9,7 +9,24 @@
 # ///
 """Comprehensive unit, integration & doc-parity test suite for release tooling, benchmarks, diffusers/PyAV media & owner gates."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import base64
 from contextlib import ExitStack, redirect_stdout
@@ -36,21 +53,20 @@ from PIL import Image, PngImagePlugin
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(SCRIPTS_DIR))
 
-from atom_mutator import apply_review_transition  # noqa: E402
-import cli as sb_cli  # noqa: E402
-import creative_media  # noqa: E402
-from evaluation_dataset import EvaluationDatasetError, load_dataset, validate_dataset  # noqa: E402
-from evidence import find_evidence_anchor  # noqa: E402
-from hardware_profile import HardwareCapabilityProfile  # noqa: E402
-from lexical_store import rebuild_lexical_index  # noqa: E402
-import live_third_party_benchmark as ltb  # noqa: E402
-import mcp_server  # noqa: E402
-import owner_gates  # noqa: E402
-import publish_registries as pub_reg  # noqa: E402
-from review_atom import approved_revision_is_current  # noqa: E402
-import verify_release_signatures as ver_sig  # noqa: E402
+from scripts.atom_mutator import apply_review_transition  # noqa: E402
+import scripts.cli as sb_cli  # noqa: E402
+import scripts.creative_media as creative_media  # noqa: E402
+from scripts.evaluation_dataset import EvaluationDatasetError, load_dataset, validate_dataset  # noqa: E402
+from scripts.evidence import find_evidence_anchor  # noqa: E402
+from scripts.hardware_profile import HardwareCapabilityProfile  # noqa: E402
+from scripts.lexical_store import rebuild_lexical_index  # noqa: E402
+import scripts.live_third_party_benchmark as ltb  # noqa: E402
+import scripts.mcp_server as mcp_server  # noqa: E402
+import scripts.owner_gates as owner_gates  # noqa: E402
+import scripts.publish_registries as pub_reg  # noqa: E402
+from scripts.review_atom import approved_revision_is_current  # noqa: E402
+import scripts.verify_release_signatures as ver_sig  # noqa: E402
 
 
 def _make_profile(*, tier_id: str = "tier_3_gpu_accelerated", gpu_backend: str = "cuda", vram_gib: float = 12.0, total_ram_gib: float = 32.0) -> HardwareCapabilityProfile:
@@ -466,31 +482,37 @@ class VerifyReleaseSignaturesTests(unittest.TestCase):
             def _mock_ps(payload: dict) -> subprocess.CompletedProcess:
                 return subprocess.CompletedProcess(["powershell"], 0, json.dumps(payload), "")
 
-            with patch.object(
-                ver_sig.subprocess,
-                "run",
-                return_value=_mock_ps({
-                    "status": "Valid",
-                    "status_message": "Signature verified.",
-                    "subject": "CN=Second Brain Publisher",
-                    "issuer": "CN=DigiCert Trusted G4 Code Signing",
-                    "timestamper": "CN=DigiCert Timestamp Responder",
-                }),
+            with (
+                patch.object(ver_sig.shutil, "which", return_value="pwsh"),
+                patch.object(
+                    ver_sig.subprocess,
+                    "run",
+                    return_value=_mock_ps({
+                        "status": "Valid",
+                        "status_message": "Signature verified.",
+                        "subject": "CN=Second Brain Publisher",
+                        "issuer": "CN=DigiCert Trusted G4 Code Signing",
+                        "timestamper": "CN=DigiCert Timestamp Responder",
+                    }),
+                ),
             ):
                 trusted = ver_sig.verify_windows_authenticode(exe_file, require_trusted_ca=True)
                 self.assertTrue(trusted["ok"])
                 self.assertEqual(trusted["reason"], "trusted_authenticode_valid")
 
-            with patch.object(
-                ver_sig.subprocess,
-                "run",
-                return_value=_mock_ps({
-                    "status": "Valid",
-                    "status_message": "Signature verified.",
-                    "subject": "CN=Second Brain Publisher",
-                    "issuer": "CN=DigiCert Trusted G4 Code Signing",
-                    "timestamper": "",
-                }),
+            with (
+                patch.object(ver_sig.shutil, "which", return_value="pwsh"),
+                patch.object(
+                    ver_sig.subprocess,
+                    "run",
+                    return_value=_mock_ps({
+                        "status": "Valid",
+                        "status_message": "Signature verified.",
+                        "subject": "CN=Second Brain Publisher",
+                        "issuer": "CN=DigiCert Trusted G4 Code Signing",
+                        "timestamper": "",
+                    }),
+                ),
             ):
                 no_ts = ver_sig.verify_windows_authenticode(exe_file, require_trusted_ca=True)
                 self.assertFalse(no_ts["ok"])
@@ -664,15 +686,15 @@ class LiveThirdPartyBenchmarkTests(unittest.TestCase):
             ds_path.write_text(json.dumps(mini_ds), encoding="utf-8")
             out_path = tpath / "out" / "mini_bench.json"
 
-            import recall as recall_mod
-            import ollama_utils as ou_mod
+            import scripts.recall as recall_mod
+            import scripts.ollama_utils as ou_mod
 
             def _det_embed(text: str, model: str | None = None) -> list[float]:
                 digest = hashlib.sha256(str(text).encode("utf-8")).digest()
                 return [round((b - 128) / 128.0, 4) for b in digest[:8]]
 
             # Build real Chroma collection so rebuild_vectors/search_hybrid_rrf execute cleanly
-            import vector_store as vs_mod
+            import scripts.vector_store as vs_mod
             col = vs_mod.get_vector_collection(str(chroma_dir), name="atoms", create=True)
             vs_mod.close_vector_collection(col)
 
@@ -902,14 +924,18 @@ class OwnerGatesAndDocParityTests(unittest.TestCase):
         self.assertEqual(report["dataset_gate"]["total_queries"], 90)
         self.assertEqual(report["dataset_gate"]["v2_baseline_query_count"], 30)
         self.assertEqual(report["dataset_gate"]["v3_expansion_query_count"], 60)
-        self.assertGreaterEqual(report["candidate_atoms_gate"]["unapproved_count"], 3)
-        cand_names = {c["filename"] for c in report["candidate_atoms_gate"]["candidates"]}
-        for expected_pending in (
+        expected_pending = (
             "sodium-ion-battery-cost-record.md",
             "code-reviews-as-mentorship.md",
             "continuous-integration-deployment.md",
-        ):
-            self.assertIn(expected_pending, cand_names)
+        )
+        if report["dataset_gate"].get("validation_mode") == "code_only_schema":
+            self.assertEqual(report["candidate_atoms_gate"]["unapproved_count"], 0)
+        else:
+            self.assertGreaterEqual(report["candidate_atoms_gate"]["unapproved_count"], 3)
+            cand_names = {c["filename"] for c in report["candidate_atoms_gate"]["candidates"]}
+            for name in expected_pending:
+                self.assertIn(name, cand_names)
 
         # CLI `second-brain gates status --json`
         buf = io.StringIO()
@@ -1108,14 +1134,15 @@ class OwnerGatesAndDocParityTests(unittest.TestCase):
             self.assertEqual(cm.exception.code, 0, f"`second-brain {' '.join(tokens)} --help` exited {cm.exception.code}")
 
         # 2. Benchmark report SHA-256 & retrieval metrics match JSON artifacts verbatim
-        ds_sha = hashlib.sha256((ROOT / "docs" / "retrieval-evaluation-proposed.json").read_bytes()).hexdigest()
+        dataset_bytes = (ROOT / "docs" / "retrieval-evaluation-proposed.json").read_bytes().replace(b"\r\n", b"\n")
+        ds_sha = hashlib.sha256(dataset_bytes).hexdigest()
         bench_md = (ROOT / "docs" / "benchmark-report-v1.0.0.md").read_text(encoding="utf-8")
         self.assertIn(ds_sha, bench_md)
         ret_res = json.loads((ROOT / "docs" / "retrieval-evaluation-results-2026-11-22.json").read_text(encoding="utf-8"))
         self.assertIn(f"{ret_res['candidate_lexical_mean_mrr']:.4f}", bench_md)
         self.assertIn(f"{ret_res['candidate_rrf_hybrid_mean_mrr']:.4f}", bench_md)
 
-        # 3. MCP policy docs cover all 31 tools in mcp_server.TOOL_NAMES
+        # 3. MCP policy docs cover every tool in mcp_server.TOOL_NAMES (35)
         tracked_mcp = (ROOT / "docs" / "mcp-local-policy.md").read_text(encoding="utf-8")
         for tool_name in sorted(mcp_server.TOOL_NAMES):
             self.assertIn(tool_name, tracked_mcp, f"docs/mcp-local-policy.md missing MCP tool {tool_name}")

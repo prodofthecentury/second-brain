@@ -14,7 +14,24 @@ Tests all 7 Gen-4 slices offline without external services:
   2D.7 Owner-ADR-gated LoRA & Notes-Only CRDT sandboxes + MCP/CLI/REST parity
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import asyncio
 from contextlib import redirect_stdout
@@ -30,31 +47,30 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
 
-import adr_gate  # noqa: E402
-import atom_mutator  # noqa: E402
-import cognitive_core  # noqa: E402
-import cognitive_distiller  # noqa: E402
-import cognitive_swarm  # noqa: E402
-import concept_graph  # noqa: E402
-import episodic_replay  # noqa: E402
-import experimental_crdt_notes  # noqa: E402
-import experimental_lora_pipeline  # noqa: E402
-import fractal_zoom  # noqa: E402
-import meta_router  # noqa: E402
-import mcp_server  # noqa: E402
-import predictive_memory_bus  # noqa: E402
-import recall  # noqa: E402
-import self_model_curiosity  # noqa: E402
-import streaming_chat  # noqa: E402
-import vault_backup  # noqa: E402
-import vault_ledger  # noqa: E402
-import world_model_sim  # noqa: E402
-from evidence import find_evidence_anchor  # noqa: E402
-from executive_planner import ExecutivePlanRequest, assemble_executive_plan  # noqa: E402
-from lexical_store import rebuild_lexical_index  # noqa: E402
-from memory_format import render_memory_document  # noqa: E402
+import scripts.adr_gate as adr_gate  # noqa: E402
+import scripts.atom_mutator as atom_mutator  # noqa: E402
+import scripts.cognitive_core as cognitive_core  # noqa: E402
+import scripts.cognitive_distiller as cognitive_distiller  # noqa: E402
+import scripts.cognitive_swarm as cognitive_swarm  # noqa: E402
+import scripts.concept_graph as concept_graph  # noqa: E402
+import scripts.episodic_replay as episodic_replay  # noqa: E402
+import scripts.experimental_crdt_notes as experimental_crdt_notes  # noqa: E402
+import scripts.experimental_lora_pipeline as experimental_lora_pipeline  # noqa: E402
+import scripts.fractal_zoom as fractal_zoom  # noqa: E402
+import scripts.meta_router as meta_router  # noqa: E402
+import scripts.mcp_server as mcp_server  # noqa: E402
+import scripts.predictive_memory_bus as predictive_memory_bus  # noqa: E402
+import scripts.recall as recall  # noqa: E402
+import scripts.self_model_curiosity as self_model_curiosity  # noqa: E402
+import scripts.streaming_chat as streaming_chat  # noqa: E402
+import scripts.vault_backup as vault_backup  # noqa: E402
+import scripts.vault_ledger as vault_ledger  # noqa: E402
+import scripts.world_model_sim as world_model_sim  # noqa: E402
+from scripts.evidence import find_evidence_anchor  # noqa: E402
+from scripts.executive_planner import ExecutivePlanRequest, assemble_executive_plan  # noqa: E402
+from scripts.lexical_store import rebuild_lexical_index  # noqa: E402
+from scripts.memory_format import render_memory_document  # noqa: E402
 
 
 def _seed_vault(root: Path) -> Path:
@@ -1270,7 +1286,7 @@ class Phase9Gen4CognitionTests(unittest.TestCase):
             self.assertIn("l0_bus_hit", second_d[0].match_reasons)
             self.assertIn("+l0_bus", second_d[0].source)
 
-            # Signal prewarm overlap (>=2 tokens) hits L0 even when query differs from synthetic predicted_query
+            # Signal prewarm overlap hits L0 ONLY when user query tokens are genuinely covered by prewarmed entry
             predictive_memory_bus.invalidate_bus_cache()
             predictive_memory_bus.record_context_signal(
                 active_file="src/quantum_ledger.py",
@@ -1282,7 +1298,7 @@ class Phase9Gen4CognitionTests(unittest.TestCase):
                 lexical_index_path=brain_a / ".sidecar" / "lexical.sqlite3",
             )
             overlap_hit = predictive_memory_bus.lookup_l0_hot(
-                "How does quantum checkpointing behave?",
+                "How does quantum ledger checkpointing verify?",
                 project_scope="project:alpha",
                 brain_dir=brain_a,
                 atoms_dir=brain_a / "2-atoms",
@@ -1291,6 +1307,17 @@ class Phase9Gen4CognitionTests(unittest.TestCase):
             assert overlap_hit is not None
             self.assertTrue(overlap_hit["hit"])
             self.assertEqual(overlap_hit["match_kind"], "prewarm_overlap")
+
+            # Adding uncovered topic terms MUST NOT hijack the prewarmed entry
+            uncovered_miss = predictive_memory_bus.lookup_l0_hot(
+                "How does quantum checkpointing behave under network partitions?",
+                project_scope="project:alpha",
+                brain_dir=brain_a,
+                atoms_dir=brain_a / "2-atoms",
+            )
+            self.assertIsNotNone(uncovered_miss)
+            assert uncovered_miss is not None
+            self.assertFalse(uncovered_miss["hit"])
 
             # 3) enable_gravity_boost & enable_spreading_activation in recall.py
             db_a = str(brain_a / ".sidecar" / "telemetry.sqlite3")
@@ -1329,6 +1356,217 @@ class Phase9Gen4CognitionTests(unittest.TestCase):
             )
             self.assertGreaterEqual(len(spread_d), 1)
             self.assertTrue(any(r.startswith("spreading_activation:") for item in spread_d for r in item.match_reasons))
+
+    def test_reg7_l0_prewarm_non_hijacking_min_results_and_native_project_scoping(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sb_reg7_w2_") as td:
+            brain = _seed_vault(Path(td))
+            _write_atom(
+                brain,
+                "memory-api-core.md",
+                claim="The memory_api server exposes loopback memory api JSON endpoints.",
+                project="project:alpha",
+                context_domain="reliability",
+                tags=["reliability", "memory_api"],
+            )
+            _write_atom(
+                brain,
+                "memory-api-ratelimit.md",
+                claim="The memory api rate limiting enforces 5 invalid auth attempts before 60 second lockout.",
+                project="project:alpha",
+                context_domain="reliability",
+                tags=["reliability", "rate_limiting"],
+            )
+            _write_atom(
+                brain,
+                "alpha-extra-rel.md",
+                claim="Alpha reliability monitors memory api latency percentiles.",
+                project="project:alpha",
+                context_domain="reliability",
+                tags=["reliability"],
+            )
+            _write_atom(
+                brain,
+                "beta-rel-atom.md",
+                claim="Beta service reliability uses independent retry queues.",
+                project="project:beta",
+                context_domain="reliability",
+                tags=["reliability"],
+            )
+            rebuild_lexical_index(
+                atoms_dir=str(brain / "2-atoms"),
+                index_path=str(brain / ".sidecar" / "lexical.sqlite3"),
+            )
+
+            # 1. Prewarm "memory_api memory api" with n_results=3
+            predictive_memory_bus.invalidate_bus_cache()
+            warm = predictive_memory_bus.record_context_signal(
+                active_file="scripts/memory_api.py",
+                project_scope="project:alpha",
+                cursor_topic="memory_api",
+                n_results=3,
+                brain_dir=brain,
+                atoms_dir=brain / "2-atoms",
+                lexical_index_path=brain / ".sidecar" / "lexical.sqlite3",
+            )
+            self.assertEqual(warm["status"], "warmed")
+
+            # Covered subset query hits L0 prewarm when min_results <= 3
+            covered = predictive_memory_bus.lookup_l0_hot(
+                "memory api",
+                project_scope="project:alpha",
+                min_results=3,
+                brain_dir=brain,
+                atoms_dir=brain / "2-atoms",
+            )
+            self.assertIsNotNone(covered)
+            assert covered is not None
+            self.assertTrue(covered["hit"])
+            self.assertEqual(covered["match_kind"], "prewarm_overlap")
+
+            # Query introducing extra terms ("rate", "limiting", "work") MUST NOT hijack prewarm!
+            for hijack_q in (
+                "How does memory api rate limiting work?",
+                "memory api rate limiting",
+            ):
+                miss = predictive_memory_bus.lookup_l0_hot(
+                    hijack_q,
+                    project_scope="project:alpha",
+                    brain_dir=brain,
+                    atoms_dir=brain / "2-atoms",
+                )
+                self.assertIsNotNone(miss)
+                assert miss is not None
+                self.assertFalse(miss["hit"], f"Query {hijack_q!r} must NOT hit memory_api prewarm")
+
+            # Requesting more results than prewarmed capacity (min_results=5 > n_results=3) MUST miss!
+            cap_miss = predictive_memory_bus.lookup_l0_hot(
+                "memory api",
+                project_scope="project:alpha",
+                min_results=5,
+                brain_dir=brain,
+                atoms_dir=brain / "2-atoms",
+            )
+            self.assertIsNotNone(cap_miss)
+            assert cap_miss is not None
+            self.assertFalse(cap_miss["hit"])
+
+            # recall.search_memory guards allow_prewarm: n_results=5 (>3), allow_cross_project=True, and n_results>5 miss prewarm
+            d_cap, _ = recall.search_memory(
+                "memory api",
+                recall.RecallOptions(
+                    n_results=5,
+                    retrieval_mode="lexical",
+                    projects=("project:alpha",),
+                    use_l0_bus=True,
+                ),
+                atoms_dir=str(brain / "2-atoms"),
+                index_path=str(brain / ".sidecar" / "lexical.sqlite3"),
+            )
+            self.assertTrue(d_cap)
+            self.assertNotIn("l0_bus_hit", d_cap[0].match_reasons)
+
+            d_xproj, _ = recall.search_memory(
+                "memory api",
+                recall.RecallOptions(
+                    n_results=3,
+                    retrieval_mode="lexical",
+                    projects=("project:alpha",),
+                    allow_cross_project=True,
+                    use_l0_bus=True,
+                ),
+                atoms_dir=str(brain / "2-atoms"),
+                index_path=str(brain / ".sidecar" / "lexical.sqlite3"),
+            )
+            self.assertTrue(d_xproj)
+            self.assertNotIn("l0_bus_hit", d_xproj[0].match_reasons)
+
+            # 2. Native project scoping in self_model_curiosity (atoms, experiences with context/contexts, goals, DB safety)
+            cognitive_core.save_experience_record(
+                goal="Alpha reliability regression",
+                result_summary="Alpha reliability check failed",
+                success=False,
+                context=["project:alpha", "reliability"],
+                experiences_dir=str(brain / "4-experiences"),
+                brain_dir=str(brain),
+            )
+            # Also seed a project:beta failure using plural 'contexts:' frontmatter
+            (brain / "4-experiences" / "2026-11-24-beta-contexts-fail.md").write_text(
+                "---\n"
+                'type: "experience"\n'
+                "success: false\n"
+                'contexts: ["project:beta", "reliability"]\n'
+                "---\n\n"
+                "## Goal\nBeta reliability failure\n",
+                encoding="utf-8",
+            )
+            self_model_curiosity.upsert_learning_goals(
+                [
+                    {"id": "priv-rel", "title": "Secret Owner Reliability Goal", "domain": "reliability", "target_atoms": 10},
+                    {"id": "priv-fin", "title": "Secret Owner Finance Goal", "domain": "finance", "target_atoms": 5},
+                ],
+                brain_dir=brain,
+            )
+            # First run global evaluation -> writes global self_model.sqlite3 (4 reliability atoms, 2 failures)
+            global_rep = self_model_curiosity.evaluate_self_model_and_curiosity(brain_dir=brain, atoms_dir=brain / "2-atoms")
+            global_rel = next(d for d in global_rep["domains"] if d["domain"] == "reliability")
+            self.assertEqual(global_rel["atom_count"], 4)
+            self.assertEqual(global_rel["failure_count"], 2)
+
+            # Scoped evaluation with include_private_goals=False: strictly 3 alpha atoms, 1 alpha failure, 0 private goals
+            alpha_rep = self_model_curiosity.evaluate_self_model_and_curiosity(
+                project="project:alpha",
+                include_private_goals=False,
+                brain_dir=brain,
+                atoms_dir=brain / "2-atoms",
+            )
+            alpha_rel = next(d for d in alpha_rep["domains"] if d["domain"] == "reliability")
+            self.assertEqual(alpha_rel["atom_count"], 3)
+            self.assertEqual(alpha_rel["failure_count"], 1)
+            self.assertEqual(alpha_rep["goals"], [])
+            self.assertNotIn("finance", [d["domain"] for d in alpha_rep["domains"]])
+
+            # Verify global self_model.sqlite3 was NOT overwritten by the project-scoped evaluation!
+            from contextlib import closing
+            import sqlite3
+            with closing(sqlite3.connect(str(self_model_curiosity.self_model_db_path(brain)))) as conn:
+                row = conn.execute("SELECT atom_count, failure_count FROM domain_competence WHERE domain = 'reliability'").fetchone()
+            self.assertEqual(tuple(row), (4, 2))
+
+            # 3. Cognitive Distiller native project scoping & 'deprecate' alias for 'revoke'
+            beta_dist = cognitive_distiller.distill_cross_project_candidates(
+                project="project:beta",
+                brain_dir=brain,
+                atoms_dir=brain / "2-atoms",
+            )
+            self.assertEqual(beta_dist["principles_created"], [])
+            alpha_dist = cognitive_distiller.distill_cross_project_candidates(
+                project="project:alpha",
+                brain_dir=brain,
+                atoms_dir=brain / "2-atoms",
+            )
+            self.assertEqual(len(alpha_dist["principles_created"]), 1)
+            created_p = alpha_dist["principles_created"][0]
+            self.assertEqual(created_p["projects"], ["project:alpha"])
+            self.assertNotIn("beta-rel-atom.md", created_p["backing_atoms"])
+            prom = cognitive_distiller.promote_distilled_artifact(
+                created_p["path"],
+                expected_sha256=created_p["sha256"],
+                actor="camer",
+                action="promote",
+                brain_dir=brain,
+                atoms_dir=brain / "2-atoms",
+            )
+            self.assertEqual(prom["status"], "active")
+            depr = cognitive_distiller.promote_distilled_artifact(
+                created_p["path"],
+                expected_sha256=prom["sha256"],
+                actor="camer",
+                action="deprecate",
+                reason="superseded by new policy",
+                brain_dir=brain,
+                atoms_dir=brain / "2-atoms",
+            )
+            self.assertEqual(depr["status"], "revoked")
 
 
 if __name__ == "__main__":

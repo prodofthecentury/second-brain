@@ -28,15 +28,14 @@ import threading
 import time
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("cross_encoder", "scripts.cross_encoder"):
     sys.modules.setdefault("cross_encoder", sys.modules[__name__])
     sys.modules.setdefault("scripts.cross_encoder", sys.modules[__name__])
 
-from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, security_state_dir
-from lexical_store import FTS_STOP_WORDS, TOKEN_PATTERN, porter_stem
-from memory_format import split_frontmatter
-from memory_review import section_text
+from scripts.config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, security_state_dir
+from scripts.lexical_store import FTS_STOP_WORDS, TOKEN_PATTERN, porter_stem
+from scripts.memory_format import split_frontmatter
+from scripts.memory_review import section_text
 
 MAX_ONNX_MODEL_BYTES = 600 * 1024 * 1024
 MAX_TOKENIZER_BYTES = 32 * 1024 * 1024
@@ -95,7 +94,7 @@ def _ancestors_reparse_free(cand: Path) -> bool:
             continue
         except OSError:
             return False
-        if _stat_is_reparse(ast):
+        if _stat_is_reparse(ast) and not _is_immutable_darwin_root_symlink(ancestor):
             return False
     return True
 
@@ -189,7 +188,7 @@ def resolve_cross_encoder_dir(explicit_dir: str | Path | None = None) -> Path | 
             cached_ok = _VERIFIED_DIR_CACHE.get(ver_key)
         if cached_ok is None:
             try:
-                from onnx_models import verify_slot_installation
+                from scripts.onnx_models import verify_slot_installation
 
                 slot_name = resolved_cand.name if resolved_cand.name in {"cross-encoder", "nli"} else ""
                 if not slot_name and has_manifest:
@@ -956,6 +955,8 @@ def rerank_recall_results(
         if mode == "rrf":
             rrf_w = 0.020 if used_onnx else 0.010
             blended = round(base_score + rrf_w * ce, 6)
+        elif mode == "lexical" and not used_onnx:
+            blended = round(_clamp01(0.35 * base_score + 0.65 * ce), 6)
         elif used_onnx:
             blended = round(_clamp01(0.20 * base_score + 0.80 * ce), 6)
         else:

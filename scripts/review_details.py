@@ -10,10 +10,10 @@ import hashlib
 import os
 from pathlib import Path, PurePosixPath
 
-from config import safe_file_in_dir
-from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor
-from memory_format import split_frontmatter
-from memory_review import parse_atom_record, parse_frontmatter_values
+from scripts.config import safe_file_in_dir
+from scripts.evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor
+from scripts.memory_format import split_frontmatter
+from scripts.memory_review import parse_atom_record, parse_frontmatter_values
 
 
 def atom_review_details(content: str, *, atom_path: str, atoms_dir: str, brain_dir: str) -> dict:

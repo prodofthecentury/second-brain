@@ -13,7 +13,24 @@ Executes quantitative PAL / PoT / ToRA code blocks safely:
 - Runs in a separate subprocess with strict wall-clock timeout and bounded stdout.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import ast
@@ -29,7 +46,6 @@ import threading
 import time
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("symbolic_sandbox", "scripts.symbolic_sandbox"):
     sys.modules.setdefault("symbolic_sandbox", sys.modules[__name__])
     sys.modules.setdefault("scripts.symbolic_sandbox", sys.modules[__name__])
@@ -110,7 +126,7 @@ FORBIDDEN_BUILTINS_OR_CALLS = frozenset(
     }
 )
 
-FORBIDDEN_ATTRS = frozenset(
+FORBIDDEN_ATTRS = FORBIDDEN_BUILTINS_OR_CALLS | frozenset(
     {
         # Generator / coroutine / async-generator / traceback / frame introspection
         "gi_frame",
@@ -139,6 +155,24 @@ FORBIDDEN_ATTRS = frozenset(
         "co_consts",
         "co_names",
         "co_freevars",
+        # Operator / stdlib internal attribute traversal & frame/closure escapes
+        "operator",
+        "attrgetter",
+        "methodcaller",
+        "itemgetter",
+        "enum",
+        "bltns",
+        "copyreg",
+        "decoder",
+        "encoder",
+        "scanner",
+        "meta_path",
+        "cell_contents",
+        "closure",
+        "code",
+        "frame",
+        "current_frames",
+        "getframe",
         # Format-string attribute traversal
         "format",
         "format_map",
@@ -182,18 +216,6 @@ FORBIDDEN_ATTRS = frozenset(
         "nt",
         "posix",
         # Dynamic introspection / reflection builtins & dunder-stripped names
-        "getattr",
-        "setattr",
-        "delattr",
-        "globals",
-        "locals",
-        "vars",
-        "dir",
-        "eval",
-        "exec",
-        "breakpoint",
-        "input",
-        "memoryview",
         "import_module",
         "load_module",
         "find_spec",
@@ -235,7 +257,6 @@ FORBIDDEN_ATTRS = frozenset(
         "forkpty",
         "kill",
         "killpg",
-        "open",
         "remove",
         "unlink",
         "rmdir",
@@ -429,13 +450,19 @@ def _requested_optional_modules(tree: ast.Module) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                top = (alias.name or "").split(".", 1)[0]
+                raw_name = (alias.name or "").strip()
+                top = raw_name.split(".", 1)[0]
                 if top in optional:
                     found.add(top)
+                    if raw_name != top:
+                        found.add(raw_name)
         elif isinstance(node, ast.ImportFrom):
-            top = (node.module or "").split(".", 1)[0]
+            raw_mod = (node.module or "").strip()
+            top = raw_mod.split(".", 1)[0]
             if top in optional:
                 found.add(top)
+                if raw_mod != top:
+                    found.add(raw_mod)
     return sorted(found)
 
 
@@ -634,24 +661,82 @@ def _read_pipe_capped(stream: Any, limit_bytes: int, sink: bytearray) -> None:
 
 
 def _build_runner_harness(code: str, preimport_optional: list[str]) -> str:
-    """Build an anonymous-closure runner script that leaves ZERO harness internals in __main__."""
+    """Build a bootstrap-isolated runner leaving ZERO harness internals in any frame or __main__."""
+    deny_exact_lit = (
+        "{"
+        + ", ".join(
+            repr(evt)
+            for evt in (
+                "os.system",
+                "os.popen",
+                "os.startfile",
+                "os.posix_spawn",
+                "os.kill",
+                "os.remove",
+                "os.unlink",
+                "os.rename",
+                "os.replace",
+                "os.chmod",
+                "os.mkdir",
+                "os.rmdir",
+                "os.symlink",
+                "os.link",
+                "os.truncate",
+                "os.chdir",
+                "os.listdir",
+                "os.scandir",
+                "gc.get_objects",
+                "gc.get_referrers",
+                "pickle.find_class",
+                "sys._current_frames",
+                "sys._getframe",
+            )
+        )
+        + "}"
+    )
+    deny_prefixes_lit = repr(
+        (
+            "socket.",
+            "subprocess.",
+            "ctypes.",
+            "winreg.",
+            "_winapi.",
+            "webbrowser.",
+            "urllib.",
+            "http.",
+            "ftplib.",
+            "smtplib.",
+            "os.spawn",
+            "os.exec",
+            "os.fork",
+            "sqlite3.",
+            "shutil.",
+            "mmap.",
+        )
+    )
     return (
-        "def _sb_run():\n"
+        "def _sb_bootstrap():\n"
+        "    import atexit as _atexit\n"
+        "    import bisect as _bisect\n"
         "    import builtins as _b\n"
         "    import cmath as _cmath\n"
         "    import collections as _collections\n"
-        "    import contextlib as _ctx\n"
+        "    import collections.abc as _collections_abc\n"
         "    import decimal as _decimal\n"
         "    import fractions as _fractions\n"
         "    import functools as _functools\n"
+        "    import heapq as _heapq\n"
         "    import io as _io\n"
         "    import itertools as _itertools\n"
         "    import json as _json\n"
         "    import math as _math\n"
+        "    import numbers as _numbers\n"
+        "    import operator as _operator\n"
         "    import os as _os\n"
         "    import re as _re\n"
         "    import statistics as _statistics\n"
         "    import sys as _sys\n"
+        "    _re.compile(r'\\d+')\n"
         f"    _PREIMPORT_OPT = {preimport_optional!r}\n"
         f"    _USER_ALLOWED = frozenset({sorted(ALLOWED_SANDBOX_MODULES)!r})\n"
         f"    _META_ALLOWED = frozenset({sorted(_META_PATH_ALLOWED_MODULES)!r})\n"
@@ -669,6 +754,8 @@ def _build_runner_harness(code: str, preimport_optional: list[str]) -> str:
         "    _raw_compile = _b.compile\n"
         "    _dumps = _json.dumps\n"
         "    _orig_stdout = _sys.stdout\n"
+        "    _orig_stderr = _sys.stderr\n"
+        "    _orig_str = _b.str\n"
         "    _runner_dir = _os.path.normcase(_os.path.realpath(_os.path.dirname(_os.path.abspath(__file__))))\n"
         "    _allowed_read_roots = []\n"
         "    for _cand in (\n"
@@ -701,63 +788,80 @@ def _build_runner_harness(code: str, preimport_optional: list[str]) -> str:
         "        | getattr(_os, 'O_TRUNC', 0)\n"
         "        | getattr(_os, 'O_APPEND', 0)\n"
         "    )\n"
-        "    def _is_allowed_stdlib_read(_target):\n"
-        "        if isinstance(_target, int):\n"
-        "            return False\n"
-        "        try:\n"
-        "            _p = _os.fsdecode(_target)\n"
-        "        except Exception:\n"
-        "            return False\n"
-        "        if not _p or '\\x00' in _p:\n"
-        "            return False\n"
-        "        if _p in ('/dev/null', '/dev/urandom', 'NUL', 'nul'):\n"
-        "            return True\n"
-        "        try:\n"
-        "            _rp = _os.path.realpath(_os.path.abspath(_p))\n"
-        "            _np = _os.path.normcase(_rp)\n"
-        "        except Exception:\n"
-        "            return False\n"
-        "        try:\n"
-        "            if _os.path.normcase(_os.path.commonpath([_runner_dir, _np])) == _runner_dir:\n"
-        "                return False\n"
-        "        except Exception:\n"
-        "            pass\n"
-        "        for _root in _allowed_read_roots:\n"
-        "            try:\n"
-        "                if _os.path.normcase(_os.path.commonpath([_root, _np])) == _root:\n"
-        "                    return True\n"
-        "            except Exception:\n"
-        "                continue\n"
-        "        return False\n"
-        "    _DENY_PREFIXES = (\n"
-        "        'socket.', 'subprocess.', 'ctypes.', 'winreg.', '_winapi.',\n"
-        "        'webbrowser.', 'urllib.', 'http.', 'ftplib.', 'smtplib.',\n"
-        "        'os.spawn', 'os.exec', 'os.fork', 'sqlite3.', 'shutil.',\n"
+        "    _hook_src = (\n"
+        "        'def _audit_hook(_event, _args):\\n'\n"
+        f"        '    if _event in ' + {deny_exact_lit!r} + ':\\n'\n"
+        "        '        raise PermissionError(f\"Blocked runtime event {_event!r} in symbolic sandbox\")\\n'\n"
+        f"        '    for _pfx in ' + {deny_prefixes_lit!r} + ':\\n'\n"
+        "        '        if _event.startswith(_pfx):\\n'\n"
+        "        '            raise PermissionError(f\"Blocked runtime event {_event!r} in symbolic sandbox\")\\n'\n"
+        "        '    if _event == \"open\":\\n'\n"
+        "        '        _p = _args[0] if len(_args) > 0 else None\\n'\n"
+        "        '        _m = str(_args[1] or \"\") if len(_args) > 1 else \"\"\\n'\n"
+        "        '        _fl = int(_args[2] or 0) if len(_args) > 2 and isinstance(_args[2], int) else 0\\n'\n"
+        "        '        for _c in (\"w\", \"a\", \"x\", \"+\"):\\n'\n"
+        "        '            if _c in _m:\\n'\n"
+        "        '                raise PermissionError(\"Write/append/create file open is blocked in symbolic sandbox\")\\n'\n"
+        "        '        if bool(_fl & ' + repr(_write_flags) + '):\\n'\n"
+        "        '            raise PermissionError(\"Write/append/create file open is blocked in symbolic sandbox\")\\n'\n"
+        "        '        if isinstance(_p, int):\\n'\n"
+        "        '            raise PermissionError(\"Filesystem read outside stdlib/venv is blocked in symbolic sandbox\")\\n'\n"
+        "        '        try:\\n'\n"
+        "        '            _ps = _fsdecode(_p)\\n'\n"
+        "        '        except Exception:\\n'\n"
+        "        '            raise PermissionError(\"Filesystem read outside stdlib/venv is blocked in symbolic sandbox\")\\n'\n"
+        "        '        if not _ps or \"\\\\x00\" in _ps:\\n'\n"
+        "        '            raise PermissionError(\"Filesystem read outside stdlib/venv is blocked in symbolic sandbox\")\\n'\n"
+        "        '        if _ps not in (\"/dev/null\", \"/dev/urandom\", \"NUL\", \"nul\"):\\n'\n"
+        "        '            try:\\n'\n"
+        "        '                _rp = _realpath(_abspath(_ps))\\n'\n"
+        "        '                _np = _normcase(_rp)\\n'\n"
+        "        '            except Exception:\\n'\n"
+        "        '                raise PermissionError(\"Filesystem read outside stdlib/venv is blocked in symbolic sandbox\")\\n'\n"
+        "        '            try:\\n'\n"
+        "        '                if _normcase(_commonpath([' + repr(_runner_dir) + ', _np])) == ' + repr(_runner_dir) + ':\\n'\n"
+        "        '                    raise PermissionError(\"Filesystem read outside stdlib/venv is blocked in symbolic sandbox\")\\n'\n"
+        "        '            except PermissionError:\\n'\n"
+        "        '                raise\\n'\n"
+        "        '            except Exception:\\n'\n"
+        "        '                pass\\n'\n"
+        "        '            _ok = False\\n'\n"
+        "        '            for _root in ' + repr(tuple(_allowed_read_roots)) + ':\\n'\n"
+        "        '                try:\\n'\n"
+        "        '                    if _normcase(_commonpath([_root, _np])) == _root:\\n'\n"
+        "        '                        _ok = True\\n'\n"
+        "        '                        break\\n'\n"
+        "        '                except Exception:\\n'\n"
+        "        '                    continue\\n'\n"
+        "        '            if not _ok:\\n'\n"
+        "        '                raise PermissionError(\"Filesystem read outside stdlib/venv is blocked in symbolic sandbox\")\\n'\n"
         "    )\n"
-        "    _DENY_EXACT = frozenset({\n"
-        "        'os.system', 'os.popen', 'os.startfile', 'os.posix_spawn',\n"
-        "        'os.kill', 'os.remove', 'os.unlink', 'os.rename', 'os.replace',\n"
-        "        'os.chmod', 'os.mkdir', 'os.rmdir', 'os.symlink', 'os.link',\n"
-        "        'os.truncate', 'os.chdir', 'os.listdir', 'os.scandir',\n"
-        "        'gc.get_objects', 'gc.get_referrers', 'pickle.find_class',\n"
-        "    })\n"
-        "    def _audit_hook(_event, _args):\n"
-        "        if _event in _DENY_EXACT or any(_event.startswith(_pfx) for _pfx in _DENY_PREFIXES):\n"
-        "            raise PermissionError(f'Blocked runtime event {_event!r} in symbolic sandbox')\n"
-        "        if _event == 'open':\n"
-        "            _p = _args[0] if len(_args) > 0 else None\n"
-        "            _m = str(_args[1] or '') if len(_args) > 1 else ''\n"
-        "            _fl = int(_args[2] or 0) if len(_args) > 2 and isinstance(_args[2], int) else 0\n"
-        "            if any(_c in _m for _c in ('w', 'a', 'x', '+')) or bool(_fl & _write_flags):\n"
-        "                raise PermissionError('Write/append/create file open is blocked in symbolic sandbox')\n"
-        "            if not _is_allowed_stdlib_read(_p):\n"
-        "                raise PermissionError('Filesystem read outside stdlib/venv is blocked in symbolic sandbox')\n"
+        "    _hook_ns = {\n"
+        "        '__builtins__': {},\n"
+        "        '_fsdecode': _os.fsdecode,\n"
+        "        '_realpath': _os.path.realpath,\n"
+        "        '_abspath': _os.path.abspath,\n"
+        "        '_normcase': _os.path.normcase,\n"
+        "        '_commonpath': _os.path.commonpath,\n"
+        "        'PermissionError': _b.PermissionError,\n"
+        "        'isinstance': _b.isinstance,\n"
+        "        'int': _b.int,\n"
+        "        'str': _b.str,\n"
+        "        'len': _b.len,\n"
+        "        'bool': _b.bool,\n"
+        "        'Exception': _b.Exception,\n"
+        "    }\n"
+        "    _raw_exec(_raw_compile(_hook_src, '<sandbox-audit>', 'exec'), _hook_ns, _hook_ns)\n"
+        "    _audit_hook = _hook_ns['_audit_hook']\n"
+        "    assert _audit_hook.__closure__ is None\n"
         "    class _AllowlistFinder:\n"
+        "        _ALLOWED = _META_ALLOWED\n"
         "        def find_spec(self, fullname, path=None, target=None):\n"
         "            _top = str(fullname or '').split('.', 1)[0]\n"
-        "            if _top not in _META_ALLOWED:\n"
+        "            if _top not in self._ALLOWED:\n"
         "                raise ImportError(f'Blocked non-allowlisted import in symbolic sandbox: {fullname!r}')\n"
         "            return None\n"
+        "    assert _AllowlistFinder.find_spec.__closure__ is None\n"
         "    def _user_import(name, globals=None, locals=None, fromlist=(), level=0):\n"
         "        if level and int(level) != 0:\n"
         "            raise ImportError('Relative imports are blocked in symbolic sandbox')\n"
@@ -786,24 +890,13 @@ def _build_runner_harness(code: str, preimport_optional: list[str]) -> str:
         "    }\n"
         "    _safe_builtins['__import__'] = _user_import\n"
         "    _compiled = _raw_compile(_USER_CODE, '<sandbox>', 'exec')\n"
-        "    _sys.meta_path.insert(0, _AllowlistFinder())\n"
-        "    _b.__import__ = _builtins_guarded_import\n"
-        "    for _bad in ('open', 'eval', 'exec', 'compile', 'input', 'breakpoint'):\n"
-        "        if hasattr(_b, _bad):\n"
-        "            delattr(_b, _bad)\n"
-        "    if hasattr(_sys, 'addaudithook'):\n"
-        "        _sys.addaudithook(_audit_hook)\n"
-        "    _main_mod = _sys.modules.get('__main__')\n"
-        "    if _main_mod is not None:\n"
-        "        _main_mod.__dict__.clear()\n"
-        "        _main_mod.__dict__['__name__'] = '__main__'\n"
         "    class _BoundedStringIO(_io.StringIO):\n"
         "        def __init__(self, limit):\n"
         "            super().__init__()\n"
         "            self._limit = limit\n"
         "            self._written = 0\n"
         "        def write(self, s):\n"
-        "            _txt = str(s)\n"
+        "            _txt = _orig_str(s)\n"
         "            _rem = self._limit - self._written\n"
         "            if _rem <= 0:\n"
         "                return len(_txt)\n"
@@ -819,16 +912,42 @@ def _build_runner_harness(code: str, preimport_optional: list[str]) -> str:
         "        'Fraction': _fractions.Fraction,\n"
         "        'Decimal': _decimal.Decimal,\n"
         "    }\n"
-        "    with _ctx.redirect_stdout(_buf):\n"
-        "        _raw_exec(_compiled, _user_ns, _user_ns)\n"
-        "    _res_val = _user_ns.get('result', _user_ns.get('answer', None))\n"
-        "    _out_json = _dumps(\n"
-        "        {'stdout': _buf.getvalue(), 'result': None if _res_val is None else str(_res_val)},\n"
-        "        ensure_ascii=False,\n"
-        "    )\n"
-        "    _orig_stdout.write(_out_json + '\\n')\n"
-        "    _orig_stdout.flush()\n"
-        "_sb_run()\n"
+        "    _failed = [False]\n"
+        "    def _sb_excepthook(exc_type, exc_value, exc_tb):\n"
+        "        _failed[0] = True\n"
+        "        _orig_stderr.write(f'{exc_type.__name__}: {exc_value}\\n')\n"
+        "        _orig_stderr.flush()\n"
+        "    _sys.excepthook = _sb_excepthook\n"
+        "    def _emit_result():\n"
+        "        if _failed[0]:\n"
+        "            return\n"
+        "        _res_val = _user_ns.get('result', _user_ns.get('answer', None))\n"
+        "        _out_json = _dumps(\n"
+        "            {'stdout': _buf.getvalue(), 'result': None if _res_val is None else _orig_str(_res_val)},\n"
+        "            ensure_ascii=False,\n"
+        "        )\n"
+        "        _orig_stdout.write(_out_json + '\\n')\n"
+        "        _orig_stdout.flush()\n"
+        "    _atexit.register(_emit_result)\n"
+        "    _sys.meta_path.insert(0, _AllowlistFinder())\n"
+        "    if hasattr(_sys, 'addaudithook'):\n"
+        "        _sys.addaudithook(_audit_hook)\n"
+        "    _sys.stdout = _buf\n"
+        "    _keep_builtins = frozenset(_SAFE_BUILTIN_NAMES) | frozenset({\n"
+        "        '__name__', '__import__',\n"
+        "        'super', 'type', 'object',\n"
+        "        'OSError', 'Warning', 'UserWarning', 'DeprecationWarning', 'RuntimeWarning',\n"
+        "    })\n"
+        "    _b.__dict__['__import__'] = _builtins_guarded_import\n"
+        "    for _k in list(_b.__dict__.keys()):\n"
+        "        if _k not in _keep_builtins:\n"
+        "            del _b.__dict__[_k]\n"
+        "    _main_mod = _sys.modules.get('__main__')\n"
+        "    if _main_mod is not None:\n"
+        "        _main_mod.__dict__.clear()\n"
+        "        _main_mod.__dict__['__name__'] = '__main__'\n"
+        "    return _functools.partial(_raw_exec, _compiled, _user_ns, _user_ns)\n"
+        "_sb_bootstrap()()\n"
     )
 
 

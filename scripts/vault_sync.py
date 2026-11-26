@@ -29,7 +29,24 @@ Synchronizes ONLY durable canonical vault state across devices while preserving 
     and HttpObjectSyncBackend (DNS-pinned HTTPS object store / WebDAV / S3-compatible).
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import base64
@@ -59,17 +76,16 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import httpx
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import (  # noqa: E402
+from scripts.atom_mutator import (  # noqa: E402
     approved_revision_is_current,
     atomic_write_bytes,
     content_sha256,
     invalidate_decision_log_cache,
     review_lock,
 )
-from index_manifest import invalidate_atom_revision_cache, load_index_manifest  # noqa: E402
-from config import (  # noqa: E402
+from scripts.index_manifest import invalidate_atom_revision_cache, load_index_manifest  # noqa: E402
+from scripts.config import (  # noqa: E402
     BRAIN_DIR,
     _WINDOWS_RESERVED_STEMS,
     _is_immutable_darwin_root_symlink,
@@ -78,23 +94,23 @@ from config import (  # noqa: E402
     safe_file_in_dir,
     security_state_dir,
 )
-from host_adapters import (  # noqa: E402
+from scripts.host_adapters import (  # noqa: E402
     HostSharingRule,
     PinnedHTTPTransport,
     read_bounded_security_file,
     restrict_security_file_permissions,
     validate_endpoint_network_boundary,
 )
-from keychain_store import (  # noqa: E402
+from scripts.keychain_store import (  # noqa: E402
     KeychainError,
     is_native_keychain_backend,
     keychain_backend_name,
     load_secret,
     store_secret,
 )
-from lexical_store import rebuild_lexical_index  # noqa: E402
-from memory_format import normalize_memory_document, render_memory_document, set_scalar_field, split_frontmatter  # noqa: E402
-from notes_store import NotePaths, ensure_notes_index  # noqa: E402
+from scripts.lexical_store import rebuild_lexical_index  # noqa: E402
+from scripts.memory_format import normalize_memory_document, render_memory_document, set_scalar_field, split_frontmatter  # noqa: E402
+from scripts.notes_store import NotePaths, ensure_notes_index  # noqa: E402
 
 
 SYNC_SCHEMA_VERSION = 1
@@ -179,9 +195,24 @@ def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
+def _vault_identity_paths(brain_dir: str | Path) -> tuple[str, str]:
+    """Return (resolved, absolute) spellings of a vault path.
+
+    macOS ``/var`` and Windows 8.3 short names are the same directory as the
+    resolved path. The sync config filename is a hash of that spelling, so both
+    callers must hash the same bytes.
+    """
+    raw = os.path.normcase(os.path.abspath(os.path.expanduser(str(brain_dir))))
+    try:
+        resolved = os.path.normcase(str(Path(brain_dir).expanduser().resolve()))
+    except OSError:
+        resolved = raw
+    return resolved, raw
+
+
 def _vault_key_slug(brain_dir: str | Path) -> str:
-    norm = os.path.normcase(os.path.abspath(str(brain_dir)))
-    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+    resolved, _raw = _vault_identity_paths(brain_dir)
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
 
 
 def sync_key_dir(state_dir: Path | None = None) -> Path:
@@ -190,7 +221,15 @@ def sync_key_dir(state_dir: Path | None = None) -> Path:
 
 
 def sync_config_path(brain_dir: str | Path, *, state_dir: Path | None = None) -> Path:
-    return sync_key_dir(state_dir) / f"vault-{_vault_key_slug(brain_dir)}.json"
+    base = sync_key_dir(state_dir)
+    resolved, raw = _vault_identity_paths(brain_dir)
+    primary = base / f"vault-{hashlib.sha256(resolved.encode('utf-8')).hexdigest()[:16]}.json"
+    if raw == resolved or primary.exists():
+        return primary
+    legacy = base / f"vault-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}.json"
+    if legacy.exists():
+        return legacy
+    return primary
 
 
 def sync_state_path(brain_dir: str | Path) -> Path:
@@ -1473,7 +1512,7 @@ def _sync_dense_vectors_incremental(
         manifest = load_index_manifest(str(chroma_dir))
         if not manifest or manifest.get("distance_metric") != "cosine":
             return False
-        import rebuild_vectors as _rv_mod
+        import scripts.rebuild_vectors as _rv_mod
 
         inc_fn = getattr(_rv_mod, "upsert_changed_vectors", None)
         if callable(inc_fn):
@@ -2076,7 +2115,7 @@ def sync_push(
 
         mobile_recall_exported = False
         try:
-            from inbox_drop import build_mobile_recall_catalog, encrypt_mobile_recall_envelope, list_mobile_drop_pairings, _load_drop_state
+            from scripts.inbox_drop import build_mobile_recall_catalog, encrypt_mobile_recall_envelope, list_mobile_drop_pairings, _load_drop_state
 
             cand_drop_dirs = [state_dir, sync_key_dir(state_dir)] if state_dir is not None else [None]
             for d_dir in cand_drop_dirs:
@@ -2145,7 +2184,7 @@ def sync_pull(
             trust_new_peers=trust_new_peers,
         )
         if remote_head is None:
-            from inbox_drop import pull_inbox_drops_from_backend
+            from scripts.inbox_drop import pull_inbox_drops_from_backend
 
             drops_res = pull_inbox_drops_from_backend(
                 backend,
@@ -2379,7 +2418,7 @@ def sync_pull(
         if decision_log_touched:
             invalidate_decision_log_cache()
 
-        from inbox_drop import pull_inbox_drops_from_backend
+        from scripts.inbox_drop import pull_inbox_drops_from_backend
 
         drops_res = pull_inbox_drops_from_backend(
             backend,
@@ -2432,7 +2471,7 @@ def pull_mobile_inbox_drops(
     skip_dns_check_for_mock_transport: bool = False,
 ) -> dict[str, Any]:
     """Standalone pull of E2EE mobile `inbox-drops/*.enc` into quarantined `0-raw/inbox/`."""
-    from inbox_drop import pull_inbox_drops_from_backend
+    from scripts.inbox_drop import pull_inbox_drops_from_backend
 
     active_brain = Path(brain_dir or resolve_active_brain_dir()).resolve()
     cfg = _load_sync_config(active_brain, state_dir=state_dir)
@@ -2782,7 +2821,7 @@ def _demote_unapproved_canonical_merge(
     if clean_rel.startswith("5-playbooks/") and clean_rel.count("/") == 1 and clean_rel.endswith(".md"):
         if not force_demote:
             try:
-                from skill_playbooks import _latest_playbook_decision
+                from scripts.skill_playbooks import _latest_playbook_decision
 
                 pb_fname = Path(clean_rel).name
                 log_ok, latest_pb_dec = _latest_playbook_decision(str(active_brain), pb_fname)
@@ -3514,7 +3553,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2) if args.json else f"Resolved {res['rel_path']} ({res['resolution']}) remaining={res['remaining_conflicts']}")
         return 0
     if args.cmd == "drop-pair":
-        from inbox_drop import create_mobile_drop_pairing
+        from scripts.inbox_drop import create_mobile_drop_pairing
 
         cfg = _load_sync_config(Path(brain_dir).resolve())
         ak = os.environ.get(args.s3_access_key_env, "") if args.s3_access_key_env else ""
@@ -3533,7 +3572,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2) if args.json else f"Paired mobile drop token_id={res['token_id']} include_recall={res['include_recall']} pwa_url={res['pwa_pairing_url']}")
         return 0
     if args.cmd == "export-mobile-recall":
-        from inbox_drop import export_mobile_recall_index
+        from scripts.inbox_drop import export_mobile_recall_index
 
         res = export_mobile_recall_index(
             brain_dir=brain_dir,
@@ -3543,7 +3582,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2) if args.json else f"Exported mobile recall index {res['object_key']} (atoms={res['atom_count']}, review_queue={res['review_count']}, bytes={res['envelope_bytes']})")
         return 0
     if args.cmd == "drop-list":
-        from inbox_drop import list_mobile_drop_pairings
+        from scripts.inbox_drop import list_mobile_drop_pairings
 
         vid = None
         cfg_p = sync_config_path(Path(brain_dir).resolve())
@@ -3553,13 +3592,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2) if args.json else f"active_pairings={res['count']} key_id={res.get('key_id')}")
         return 0
     if args.cmd == "drop-revoke":
-        from inbox_drop import revoke_mobile_drop_pairing
+        from scripts.inbox_drop import revoke_mobile_drop_pairing
 
         res = revoke_mobile_drop_pairing(args.token_id, brain_dir=brain_dir)
         print(json.dumps(res, indent=2) if args.json else f"Revoked mobile drop pairing {res['token_id']}")
         return 0
     if args.cmd == "rotate-recall":
-        from inbox_drop import export_mobile_recall_index, rotate_mobile_recall_key
+        from scripts.inbox_drop import export_mobile_recall_index, rotate_mobile_recall_key
 
         res = rotate_mobile_recall_key(brain_dir=brain_dir)
         if not bool(args.no_export):
@@ -3572,7 +3611,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2) if args.json else f"Ingested {res['ingested_count']} mobile inbox drop(s)")
         return 0
     if args.cmd == "export-pwa":
-        from inbox_drop import export_static_pwa_bundle
+        from scripts.inbox_drop import export_static_pwa_bundle
 
         res = export_static_pwa_bundle(args.dest_dir)
         print(json.dumps(res, indent=2) if args.json else f"Exported static PWA ({len(res['files'])} files) to {res['destination']}")

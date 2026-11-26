@@ -36,7 +36,24 @@ Covers all 4 v0.5.0 tracks end-to-end:
        `drop_id` / wrong `vault_id` rejection, prompt-injection risk flagging, `export_static_pwa_bundle`, and 3-surface UI + 12-manifest `0.5.0` parity
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import asyncio
 import datetime
@@ -59,8 +76,6 @@ import httpx
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -77,8 +92,8 @@ def _seed_verified_atom(
     valid_until: str | None = None,
     approve: bool = True,
 ) -> Path:
-    from atom_mutator import apply_review_transition, content_sha256
-    from evidence import find_evidence_anchor
+    from scripts.atom_mutator import apply_review_transition, content_sha256
+    from scripts.evidence import find_evidence_anchor
 
     raw_dir = brain_dir / "0-raw"
     atoms_dir = brain_dir / "2-atoms"
@@ -250,19 +265,19 @@ def _minimal_tokenizer_bytes() -> bytes:
 
 class V050SotaCompleteTests(unittest.TestCase):
     def test_track1_verified_onnx_downloader_reranker_extra_and_clause_nli(self) -> None:
-        from api_product import ensure_owner_token
-        from cross_encoder import OnnxCrossEncoder, clear_cross_encoder_cache, get_onnx_cross_encoder
-        from doctor import run_checks
-        from knowledge_graph import detect_contradictions
-        from lexical_store import rebuild_lexical_index
-        from memory_api import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.cross_encoder import OnnxCrossEncoder, clear_cross_encoder_cache, get_onnx_cross_encoder
+        from scripts.doctor import run_checks
+        from scripts.knowledge_graph import detect_contradictions
+        from scripts.lexical_store import rebuild_lexical_index
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
             reset_api_rate_limiter,
         )
-        import onnx_models as om
+        import scripts.onnx_models as om
 
         # 1.1 Explicit `[reranker]` optional dependency extra in pyproject.toml
         pyproj = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -521,7 +536,7 @@ class V050SotaCompleteTests(unittest.TestCase):
             self.assertGreaterEqual(radar_true["contradiction_count"], 1)
 
     def test_track2_qwen3_hardware_tier_ram_fit_and_think_stripping(self) -> None:
-        from hardware_profile import (
+        from scripts.hardware_profile import (
             call_ollama_chat_maybe_no_think,
             classify_hardware_tier,
             invalidate_hardware_profile_cache,
@@ -529,10 +544,10 @@ class V050SotaCompleteTests(unittest.TestCase):
             resolve_active_local_generation_model,
             strip_reasoning_think_blocks,
         )
-        from streaming_chat import _iter_strip_think_stream
+        from scripts.streaming_chat import _iter_strip_think_stream
 
         GiB = 1024 ** 3
-        # 2.1 16 GiB CPU host with 22.3 GiB qwen3.6:latest + 4.7 GiB qwen2.5-coder:7b -> skips oversized qwen3.6!
+        # 2.1 16 GiB CPU host with 9 GiB free skips a 7B model and the oversized qwen3.6.
         p_16gb_cpu = classify_hardware_tier(
             os_name="Windows",
             os_release="11",
@@ -553,7 +568,7 @@ class V050SotaCompleteTests(unittest.TestCase):
                 "llama3.2:3b": int(2.0 * GiB),
             },
         )
-        self.assertEqual(p_16gb_cpu.selected_installed_generation_model, "qwen2.5-coder:7b")
+        self.assertEqual(p_16gb_cpu.selected_installed_generation_model, "llama3.2:3b")
         self.assertIn("qwen3.6:latest", p_16gb_cpu.oversized_installed_models)
 
         # Same 16 GiB CPU host WITH fitted `qwen3:8b` (`5.2 GiB`) -> selects `qwen3:8b`!
@@ -563,7 +578,7 @@ class V050SotaCompleteTests(unittest.TestCase):
             architecture="AMD64",
             cpu_threads=16,
             total_ram_gib=15.9,
-            available_ram_gib=9.5,
+            available_ram_gib=14.0,
             cpp_runtime_ready=True,
             cpp_runtime_detail="MSVC ready",
             gpu_backend="cpu_only",
@@ -655,24 +670,24 @@ class V050SotaCompleteTests(unittest.TestCase):
         self.assertNotIn("think", seen_calls[1])
 
     def test_track3_bitemporal_fact_validity_across_recall_graph_mcp_and_api(self) -> None:
-        from api_product import ensure_owner_token
-        from atom_mutator import ReviewTransitionError, content_sha256, set_atom_temporal_bounds
-        from knowledge_graph import detect_contradictions
-        from lexical_store import rebuild_lexical_index
-        import mcp_server
-        from memory_api import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.atom_mutator import ReviewTransitionError, content_sha256, set_atom_temporal_bounds
+        from scripts.knowledge_graph import detect_contradictions
+        from scripts.lexical_store import rebuild_lexical_index
+        import scripts.mcp_server as mcp_server
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
             reset_api_rate_limiter,
         )
-        from memory_format import evaluate_temporal_validity
-        from notes_store import NotePaths, create_note, verify_note_excerpt
-        import rebuild_vectors as rv_mod
-        from recall import RecallOptions, search_memory as recall_search
-        from review_atom import approved_revision_is_current
-        from vault_workspaces import create_vault, federated_recall
+        from scripts.memory_format import evaluate_temporal_validity
+        from scripts.notes_store import NotePaths, create_note, verify_note_excerpt
+        import scripts.rebuild_vectors as rv_mod
+        from scripts.recall import RecallOptions, search_memory as recall_search
+        from scripts.review_atom import approved_revision_is_current
+        from scripts.vault_workspaces import create_vault, federated_recall
 
         # 3.1 Pure temporal boundary evaluation (inclusive end-of-day YYYY-MM-DD + ISO timestamps)
         self.assertEqual(
@@ -1083,8 +1098,8 @@ class V050SotaCompleteTests(unittest.TestCase):
             _ = q1_atom
 
     def test_track4_mobile_inbox_drop_pwa_webcrypto_s3_sigv4_and_release_parity(self) -> None:
-        from api_product import ensure_owner_token
-        from inbox_drop import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.inbox_drop import (
             InboxDropSecurityError,
             create_mobile_drop_pairing,
             decrypt_inbox_drop_envelope,
@@ -1092,15 +1107,15 @@ class V050SotaCompleteTests(unittest.TestCase):
             export_static_pwa_bundle,
             revoke_mobile_drop_pairing,
         )
-        from inbox_workflow import list_inbox_items
-        from memory_api import (
+        from scripts.inbox_workflow import list_inbox_items
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
             reset_api_rate_limiter,
         )
-        from vault_sync import (
+        from scripts.vault_sync import (
             init_sync,
             pull_mobile_inbox_drops,
             run_auto_sync_cycle,

@@ -19,7 +19,24 @@ Contradiction & Drift Radar to surface:
 Read-only advisory radar: never mutates or auto-approves vault memory.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from collections import Counter, defaultdict
@@ -34,9 +51,8 @@ import re
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import (  # noqa: E402
+from scripts.atom_mutator import (  # noqa: E402
     append_decision_record,
     append_decision_records,
     approved_revision_is_current,
@@ -46,8 +62,8 @@ from atom_mutator import (  # noqa: E402
     refresh_lexical_index,
     review_lock,
 )
-from audit_sources import _source_snapshot  # noqa: E402
-from config import (  # noqa: E402
+from scripts.audit_sources import _source_snapshot  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
     _is_reparse_or_link,
@@ -58,10 +74,10 @@ from config import (  # noqa: E402
     security_state_dir,
     snapshot_module_defaults,
 )
-from cross_encoder import get_onnx_cross_encoder, score_query_atom_pairs  # noqa: E402
-from evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor  # noqa: E402
-from lexical_store import porter_stem  # noqa: E402
-from memory_format import (  # noqa: E402
+from scripts.cross_encoder import get_onnx_cross_encoder, score_query_atom_pairs  # noqa: E402
+from scripts.evidence import ANCHOR_FIELDS, EvidenceValidationError, find_evidence_anchor  # noqa: E402
+from scripts.lexical_store import porter_stem  # noqa: E402
+from scripts.memory_format import (  # noqa: E402
     evaluate_temporal_validity,
     normalize_temporal_bound_str,
     render_memory_document,
@@ -69,8 +85,8 @@ from memory_format import (  # noqa: E402
     split_frontmatter,
     temporal_windows_overlap,
 )
-from memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list  # noqa: E402
-from recall import normalize_project_tag, project_tags_match, wikilinks  # noqa: E402
+from scripts.memory_review import parse_atom_record, parse_frontmatter_values, parse_scalar_list  # noqa: E402
+from scripts.recall import normalize_project_tag, project_tags_match, wikilinks  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
@@ -1167,7 +1183,7 @@ def build_typed_concept_overlay(
     max_hops: int = 3,
 ) -> dict[str, Any]:
     """Overlay Living Concept Objects, typed causal edges, and <=3-hop spreading activation onto the KG."""
-    from concept_graph import list_concepts, spreading_activation
+    from scripts.concept_graph import list_concepts, spreading_activation
 
     concepts = list_concepts(project=project_scope, limit=100, brain_dir=brain_dir, atoms_dir=atoms_dir)
     activation = None
@@ -1200,7 +1216,7 @@ def _build_nli_prompt(claim_a: str, claim_b: str) -> str:
 
 def _normalize_nli_verdict(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, str):
-        from hardware_profile import strip_reasoning_think_blocks
+        from scripts.hardware_profile import strip_reasoning_think_blocks
 
         cleaned_raw = strip_reasoning_think_blocks(raw)
         try:
@@ -1389,7 +1405,7 @@ def _make_local_ollama_nli_adjudicator(
     skip_dns_check_for_mock_transport: bool = False,
 ) -> tuple[Callable[[str, str, list[str]], dict[str, Any] | None] | None, str]:
     """Return (adjudicator_fn, initial_status). Degrades cleanly when local Ollama is disabled."""
-    import host_adapters
+    import scripts.host_adapters as host_adapters
 
     policies = host_adapters.load_host_policies(policy_path)
     rule = policies.get("ollama_local")
@@ -2224,7 +2240,7 @@ def auto_link_vault_atoms(
     updated_files: list[str] = []
 
     with review_lock(lock_path):
-        from index_manifest import index_manifest_is_current, load_index_manifest
+        from scripts.index_manifest import index_manifest_is_current, load_index_manifest
 
         chroma_dir = os.path.join(brain_dir, ".chroma")
         dense_manifest = load_index_manifest(chroma_dir)
@@ -2329,7 +2345,7 @@ def auto_link_vault_atoms(
                 dense_err: str | None = None
                 if dense_was_current and isinstance(dense_manifest, dict):
                     try:
-                        from rebuild_vectors import upsert_changed_vectors
+                        from scripts.rebuild_vectors import upsert_changed_vectors
 
                         d_res = upsert_changed_vectors(
                             atoms_dir=atoms_dir,

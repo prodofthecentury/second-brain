@@ -6,7 +6,24 @@
 14 IDE/AI host connectors + custom profiles, Safari/media browser clipper, and live third-party benchmarks.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import base64
 import hashlib
@@ -30,8 +47,6 @@ import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 def _make_solid_png_bytes(color: tuple[int, int, int], *, width: int = 16, height: int = 16, add_text_chunk: bool = False) -> bytes:
@@ -120,11 +135,11 @@ def _seed_clean_vault(root: Path) -> Path:
 
 class Phase7PlatformAndConnectorsTests(unittest.TestCase):
     def test_2b1_video_extraction_dhash_dedup_webm_routing_and_api(self) -> None:
-        from api_product import ensure_owner_token
-        import config
-        import ingest_multimodal as im
-        from memory_api import MemoryApiRuntimeConfig, MemoryLoopbackHTTPServer, generate_memory_api_token
-        import video_extractor as ve
+        from scripts.api_product import ensure_owner_token
+        import scripts.config as config
+        import scripts.ingest_multimodal as im
+        from scripts.memory_api import MemoryApiRuntimeConfig, MemoryLoopbackHTTPServer, generate_memory_api_token
+        import scripts.video_extractor as ve
 
         self.assertTrue({".mp4", ".mov", ".mkv", ".webm"}.issubset(config.VIDEO_EXTS))
         self.assertIn(".mp4", im.SUPPORTED_INGEST_EXTS)
@@ -302,9 +317,9 @@ class Phase7PlatformAndConnectorsTests(unittest.TestCase):
     def test_2b3_mobile_e2ee_bidirectional_cross_runtime_notes_atoms_and_ios_shortcut(self) -> None:
         node_bin = shutil.which("node")
         self.assertIsNotNone(node_bin, "Node.js is required for cross-runtime mobile E2EE verification.")
-        import build_ios_shortcut as bis
-        import mobile_vault_client as mvc
-        import vault_sync as vs
+        import scripts.build_ios_shortcut as bis
+        import scripts.mobile_vault_client as mvc
+        import scripts.vault_sync as vs
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
         with tempfile.TemporaryDirectory(prefix="sb_2b3_mob_") as td:
@@ -317,7 +332,7 @@ class Phase7PlatformAndConnectorsTests(unittest.TestCase):
             sync_target.mkdir(parents=True)
 
             # Seed an anchored canonical atom on Desktop BEFORE initial push
-            from evidence import find_evidence_anchor
+            from scripts.evidence import find_evidence_anchor
 
             src_rel = "0-raw/source-spec.md"
             src_txt = "# Spec\nExact verifiable quote: Zero-knowledge sync uses AES-256-GCM.\n"
@@ -493,11 +508,11 @@ const backend = {{
             self.assertTrue(any(q.get("ParameterKey") == "WFURLActionURL" for q in raw_plist["WFWorkflowImportQuestions"]))
 
     def test_2b4_all_14_ide_hosts_custom_profiles_and_plugin_bundles(self) -> None:
-        from api_product import ensure_owner_token
-        import build_obsidian_plugin as bop
-        import host_adapters as ha
-        import ide_connector as ic
-        from memory_api import MemoryApiRuntimeConfig, MemoryLoopbackHTTPServer, generate_memory_api_token
+        from scripts.api_product import ensure_owner_token
+        import scripts.build_obsidian_plugin as bop
+        import scripts.host_adapters as ha
+        import scripts.ide_connector as ic
+        from scripts.memory_api import MemoryApiRuntimeConfig, MemoryLoopbackHTTPServer, generate_memory_api_token
 
         with tempfile.TemporaryDirectory(prefix="sb_2b4_hosts_") as td:
             tpath = Path(td)
@@ -631,10 +646,10 @@ const backend = {{
                 self.assertIn("second-brain-obsidian/main.js", names)
 
     def test_2b5_safari_clipper_media_capture_commands_and_bundle(self) -> None:
-        from api_product import ensure_owner_token
-        import build_clipper as bc
-        from memory_api import MemoryApiRuntimeConfig, MemoryLoopbackHTTPServer, generate_memory_api_token
-        import web_clipper as wc
+        from scripts.api_product import ensure_owner_token
+        import scripts.build_clipper as bc
+        from scripts.memory_api import MemoryApiRuntimeConfig, MemoryLoopbackHTTPServer, generate_memory_api_token
+        import scripts.web_clipper as wc
         from PIL import Image
 
         SAFARI_ORIGIN = "safari-web-extension://12345678-1234-4123-8123-123456789abc"
@@ -766,7 +781,7 @@ const backend = {{
             self.assertIn("safari-web-extension-converter", conv_calls[0])
 
     def test_2b6_live_third_party_adapters_and_graceful_skip(self) -> None:
-        import live_third_party_benchmark as ltb
+        import scripts.live_third_party_benchmark as ltb
 
         # 1. Availability checks fail gracefully without env keys or uninstalled optional libs
         zep = ltb.ZepLiveAdapter()
@@ -788,12 +803,12 @@ const backend = {{
             src = brain / "0-raw" / "s.md"
             src.write_text("Structured JSON logs aid debugging.", encoding="utf-8")
             sha_s = hashlib.sha256(src.read_bytes()).hexdigest()
-            from atom_mutator import apply_review_transition, approved_revision_is_current
-            from evidence import find_evidence_anchor
-            import lexical_store as ls
-            import ollama_utils as ou
-            import recall as recall_mod
-            import vector_store as vs
+            from scripts.atom_mutator import apply_review_transition, approved_revision_is_current
+            from scripts.evidence import find_evidence_anchor
+            import scripts.lexical_store as ls
+            import scripts.ollama_utils as ou
+            import scripts.recall as recall_mod
+            import scripts.vector_store as vs
 
             draft_atom = (
                 "---\n"

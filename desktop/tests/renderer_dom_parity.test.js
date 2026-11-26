@@ -33,7 +33,10 @@ describe("Renderer HTML <-> JS Element ID Parity", () => {
       path.join(RENDERER_DIR, "index.html"),
       "utf8"
     );
-    const appJs = fs.readFileSync(path.join(RENDERER_DIR, "app.js"), "utf8");
+    const appJs = [
+      fs.readFileSync(path.join(RENDERER_DIR, "app.js"), "utf8"),
+      fs.readFileSync(path.join(RENDERER_DIR, "chat_send.js"), "utf8"),
+    ].join("\n");
 
     const htmlIds = extractHtmlIds(indexHtml);
     const jsIds = extractGetElementByIds(appJs);

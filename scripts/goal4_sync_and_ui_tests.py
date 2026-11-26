@@ -4,7 +4,24 @@
 # ///
 """Goal 4 verification suite: Zero-Knowledge E2EE Vault Sync, UI parity & CI/release hygiene."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import json
 import os
@@ -22,11 +39,10 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(SCRIPTS_DIR))
 
-import api_product  # noqa: E402
-import memory_api  # noqa: E402
-import vault_sync  # noqa: E402
+import scripts.api_product as api_product  # noqa: E402
+import scripts.memory_api as memory_api  # noqa: E402
+import scripts.vault_sync as vault_sync  # noqa: E402
 
 
 def _seed_sample_vault(brain_dir: Path, *, note_body: str = "- [ ] Ship E2EE sync #project:alpha\n") -> None:

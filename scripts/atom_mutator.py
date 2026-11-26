@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 
-from config import (
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     RAW_DIR,
@@ -27,7 +27,7 @@ from config import (
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from evidence import (
+from scripts.evidence import (
     ANCHOR_FIELDS,
     EvidenceValidationError,
     extract_evidence_from_body_lines,
@@ -36,8 +36,8 @@ from evidence import (
     verify_evidence_anchor,
     verify_evidence_anchor_known_source,
 )
-from index_manifest import LARGE_VAULT_STAT_CACHE_THRESHOLD, record_known_atom_hash
-from memory_format import (
+from scripts.index_manifest import LARGE_VAULT_STAT_CACHE_THRESHOLD, record_known_atom_hash
+from scripts.memory_format import (
     evaluate_temporal_validity,
     frontmatter_value,
     is_memory_document,
@@ -49,7 +49,7 @@ from memory_format import (
     set_string_list_field,
     split_frontmatter,
 )
-from memory_review import parse_frontmatter_values, parse_scalar_list
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list
 
 
 DECISION_LOG = os.path.join(RAW_DIR, "archive", "decision-record.jsonl")
@@ -283,7 +283,7 @@ def refresh_lexical_index(
     changed_filenames: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
     """Refresh the rebuildable model-free index while the shared writer lock is held."""
-    from lexical_store import rebuild_lexical_index, upsert_lexical_atoms
+    from scripts.lexical_store import rebuild_lexical_index, upsert_lexical_atoms
 
     index_path = os.path.join(brain_dir, ".sidecar", "lexical.sqlite3")
     if changed_filenames:
@@ -340,7 +340,11 @@ def _write_mutation(
         dense_error = None
         if dense_refresh_required:
             try:
-                import rebuild_vectors as _rv_mod
+                import sys as _sys
+
+                _rv_mod = _sys.modules.get("rebuild_vectors")
+                if _rv_mod is None:
+                    import scripts.rebuild_vectors as _rv_mod
 
                 upsert_fn = getattr(_rv_mod, "upsert_changed_vectors", None)
                 if callable(upsert_fn):
@@ -397,6 +401,24 @@ def _write_mutation(
     return record
 
 
+def _recorded_attestation(actor: str, attestation: dict | None) -> tuple[str, dict]:
+    """Reject synthetic seed actors. Verify a credential when the caller presents one."""
+    from scripts.owner_attestation import OwnerAttestationError, require_attestation, unattested_library_attestation
+
+    try:
+        if attestation is None:
+            return unattested_library_attestation(actor)
+        recorded = require_attestation(
+            attestation,
+            actor=actor,
+            state_dir=attestation.get("state_dir"),
+            auth_path=attestation.get("auth_path"),
+        )
+        return recorded["actor"], recorded
+    except OwnerAttestationError as exc:
+        raise ReviewTransitionError(str(exc)) from exc
+
+
 def apply_atom_mutation(
     *,
     action: str,
@@ -409,9 +431,10 @@ def apply_atom_mutation(
     brain_dir: str | None = None,
     atoms_dir: str | None = None,
     reviewed_on: str | None = None,
+    attestation: dict | None = None,
 ) -> dict:
     """Compare, mutate, reindex, and attest one atom revision as one serialized operation."""
-    from config import resolve_module_atoms_and_brain
+    from scripts.config import resolve_module_atoms_and_brain
 
     resolved_brain, resolved_atoms = resolve_module_atoms_and_brain(
         globals(),
@@ -428,8 +451,7 @@ def apply_atom_mutation(
     )
     history_dir = os.path.abspath(history_dir or os.path.join(atoms_dir, ".history"))
 
-    if not actor or not actor.strip():
-        raise ReviewTransitionError("An explicit owner actor is required for atom mutations.")
+    actor, recorded_attestation = _recorded_attestation(actor, attestation)
     if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
         raise ReviewConflictError("An exact 64-character expected SHA-256 is required for atom mutations.")
     if action not in {*TRANSITIONS, "edit"}:
@@ -471,7 +493,7 @@ def apply_atom_mutation(
                 "Merged or superseded atoms cannot be approved, edited, or demoted; choose and review the surviving atom instead."
             )
 
-        from index_manifest import (
+        from scripts.index_manifest import (
             INDEX_SCHEMA_VERSION,
             atom_revisions,
             index_manifest_is_current,
@@ -576,6 +598,7 @@ def apply_atom_mutation(
             evidence_anchor=evidence_anchor,
             dense_refresh_required=dense_refresh_required,
             dense_model=active_dense_manifest.get("embedding_model") if dense_refresh_required else None,
+            extra_record_fields={"attestation": recorded_attestation},
         )
 
 
@@ -633,13 +656,14 @@ def set_atom_temporal_bounds(
     history_dir: str | None = None,
     brain_dir: str | None = None,
     atoms_dir: str | None = None,
+    attestation: dict | None = None,
 ) -> dict:
     """Set or clear optional ``valid_from`` / ``valid_until`` bounds on an atom under ``writer.lock``.
 
     Preserves owner approval currency on already-approved atoms by re-verifying source byte-offset
     anchors and recording an attested owner approval; never promotes unapproved/pending atoms.
     """
-    from config import resolve_module_atoms_and_brain
+    from scripts.config import resolve_module_atoms_and_brain
 
     brain_dir, atoms_dir = resolve_module_atoms_and_brain(
         globals(),
@@ -654,9 +678,9 @@ def set_atom_temporal_bounds(
     )
     history_dir = os.path.abspath(history_dir or os.path.join(atoms_dir, ".history"))
 
-    clean_actor = str(actor or "").strip()[:120]
+    clean_actor, recorded_attestation = _recorded_attestation(actor, attestation)
     actor_tokens = {tok for tok in __import__("re").split(r"[^a-z0-9]+", clean_actor.casefold()) if tok}
-    if not clean_actor or bool(actor_tokens & _DISALLOWED_TEMPORAL_ACTORS):
+    if bool(actor_tokens & _DISALLOWED_TEMPORAL_ACTORS):
         raise ReviewTransitionError("Setting temporal validity bounds requires an explicit human owner actor.")
     if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
         raise ReviewConflictError("An exact 64-character expected SHA-256 is required.")
@@ -733,7 +757,7 @@ def set_atom_temporal_bounds(
 
         updated_bytes = render_memory_document(updated_fm, body).encode("utf-8")
 
-        from index_manifest import INDEX_SCHEMA_VERSION, index_manifest_is_current, load_index_manifest
+        from scripts.index_manifest import INDEX_SCHEMA_VERSION, index_manifest_is_current, load_index_manifest
 
         active_dense_manifest = load_index_manifest(os.path.join(brain_dir, ".chroma"))
         dense_refresh_required = (
@@ -764,6 +788,7 @@ def set_atom_temporal_bounds(
                 "valid_from": norm_vf,
                 "valid_until": norm_vu,
                 "rationale": clean_rationale,
+                "attestation": recorded_attestation,
             },
         )
         tv_now = evaluate_temporal_validity(norm_vf, norm_vu)
@@ -788,7 +813,7 @@ def archive_atom_to_cold(
     atoms_dir: str | None = None,
 ) -> dict:
     """Reversibly move a low-gravity atom from ``2-atoms/`` to ``2-atoms/.cold-archive/`` under Owner CAS."""
-    from config import resolve_module_atoms_and_brain
+    from scripts.config import resolve_module_atoms_and_brain
 
     brain_dir, atoms_dir = resolve_module_atoms_and_brain(
         globals(),
@@ -857,7 +882,7 @@ def restore_cold_archived_atom(
     atoms_dir: str | None = None,
 ) -> dict:
     """Restore a cold-archived atom from ``2-atoms/.cold-archive/`` back into ``2-atoms/`` under Owner CAS."""
-    from config import resolve_module_atoms_and_brain, safe_file_in_dir
+    from scripts.config import resolve_module_atoms_and_brain, safe_file_in_dir
 
     brain_dir, atoms_dir = resolve_module_atoms_and_brain(
         globals(),
@@ -949,9 +974,10 @@ def apply_atom_merge(
     actor: str, rationale: str, decision_log_path: str | None = None,
     history_dir: str | None = None, brain_dir: str | None = None,
     atoms_dir: str | None = None, reviewed_on: str | None = None,
+    attestation: dict | None = None,
 ) -> list[dict]:
     """Owner-directed two-atom supersession with CAS, rollback, and paired audit."""
-    from config import resolve_module_atoms_and_brain
+    from scripts.config import resolve_module_atoms_and_brain
 
     brain_dir, atoms_dir = resolve_module_atoms_and_brain(
         globals(),
@@ -968,8 +994,7 @@ def apply_atom_merge(
     history_dir = os.path.abspath(history_dir or os.path.join(atoms_dir, ".history"))
     if survivor_path == superseded_path:
         raise ReviewTransitionError("An atom cannot supersede itself.")
-    if not actor or not actor.strip():
-        raise ReviewTransitionError("An explicit owner actor is required for atom merges.")
+    actor, recorded_attestation = _recorded_attestation(actor, attestation)
     if not isinstance(rationale, str) or not rationale.strip():
         raise ReviewTransitionError("A non-empty owner rationale is required for atom merges.")
     for value, label in ((survivor_expected_sha256, "survivor"), (superseded_expected_sha256, "superseded")):
@@ -996,7 +1021,7 @@ def apply_atom_merge(
             if parsed is None or not is_memory_document(text):
                 raise ReviewTransitionError(f"The {label} atom must contain valid frontmatter, Claim, and Evidence sections.")
             frontmatter, body = parsed
-            from memory_review import parse_frontmatter_values
+            from scripts.memory_review import parse_frontmatter_values
             values = parse_frontmatter_values(frontmatter)
             existing_sup_by = values.get("superseded_by", [])
             if isinstance(existing_sup_by, str):
@@ -1066,7 +1091,7 @@ def apply_atom_merge(
             render_memory_document(updated_superseded, superseded_body).encode("utf-8"),
         ]
 
-        from index_manifest import index_manifest_is_current, load_index_manifest
+        from scripts.index_manifest import index_manifest_is_current, load_index_manifest
 
         dense_manifest = load_index_manifest(os.path.join(brain_dir, ".chroma"))
         dense_active = (
@@ -1100,8 +1125,11 @@ def apply_atom_merge(
             merge_dense_error = None
             if dense_active:
                 try:
-                    import rebuild_vectors as _rv_mod
+                    import sys as _sys
 
+                    _rv_mod = _sys.modules.get("rebuild_vectors")
+                    if _rv_mod is None:
+                        import scripts.rebuild_vectors as _rv_mod
                     upsert_fn = getattr(_rv_mod, "upsert_changed_vectors", None)
                     if callable(upsert_fn):
                         dense_res = upsert_fn(
@@ -1136,6 +1164,7 @@ def apply_atom_merge(
                     "action": "merge",
                     "actor": actor.strip(),
                     "rationale": rationale.strip(),
+                    "attestation": recorded_attestation,
                     "atom_filename": Path(path).name,
                     "peer_filename": Path(peer_paths[index]).name,
                     "relationship": "survivor" if index == 0 else "superseded",
@@ -1210,7 +1239,7 @@ def approved_revision_is_current(
             and os.path.isabs(brain_dir)
         )
         if not fast_path:
-            from config import resolve_module_atoms_and_brain
+            from scripts.config import resolve_module_atoms_and_brain
 
             brain_dir, atoms_dir = resolve_module_atoms_and_brain(
                 globals(),

@@ -11,7 +11,24 @@ Outputs under `--out-dir` (default `dist/`):
   * `manifests/homebrew/Formula/second-brain.rb` — Homebrew Python Formula when `.tar.gz` / `.whl` is present
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import hashlib
@@ -29,11 +46,10 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts"))
 
-from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link  # noqa: E402
-from inbox_drop import export_static_pwa_bundle  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes  # noqa: E402
+from scripts.config import _is_immutable_darwin_root_symlink, _is_reparse_or_link  # noqa: E402
+from scripts.inbox_drop import export_static_pwa_bundle  # noqa: E402
 
 
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
@@ -229,7 +245,7 @@ def _collect_homebrew_resources() -> list[tuple[str, str, str]]:
         return []
     try:
         import tomllib
-        from build_wheelhouse import _parse_version_tuple, _requires_python_matches, evaluate_pep508_marker
+        from scripts.build_wheelhouse import _parse_version_tuple, _requires_python_matches, evaluate_pep508_marker
 
         data = tomllib.loads(lock_path.read_text(encoding="utf-8"))
     except Exception:
@@ -672,7 +688,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.manifests_only:
         result["inbox_drop_pwa"] = build_inbox_drop_pwa_zip(args.out_dir)
         try:
-            from mobile_vault_client import export_mobile_vault_client_bundle
+            from scripts.mobile_vault_client import export_mobile_vault_client_bundle
 
             result["mobile_vault_client"] = export_mobile_vault_client_bundle(args.out_dir)
         except Exception as exc:

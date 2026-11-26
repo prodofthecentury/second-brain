@@ -37,7 +37,24 @@ Run:
         --output docs/live-third-party-benchmark-2026-11-22.json
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import asyncio
@@ -64,10 +81,9 @@ os.environ["MEM0_TELEMETRY"] = "false"
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 os.environ.setdefault("CHROMA_TELEMETRY", "False")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import approved_revision_is_current  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import approved_revision_is_current  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     CHROMA_PATH,
     EMBED_MODEL,
@@ -80,14 +96,14 @@ from config import (  # noqa: E402
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from cross_encoder import score_query_atom_pairs  # noqa: E402
-from evaluation_dataset import load_dataset  # noqa: E402
-from hardware_profile import detect_hardware_profile, resolve_active_local_generation_model  # noqa: E402
-from lexical_store import search_lexical_index  # noqa: E402
-from memory_format import split_frontmatter  # noqa: E402
-from memory_review import parse_atom_record, section_text  # noqa: E402
-import ollama_utils  # noqa: E402
-from recall import (  # noqa: E402
+from scripts.cross_encoder import score_query_atom_pairs  # noqa: E402
+from scripts.evaluation_dataset import load_dataset  # noqa: E402
+from scripts.hardware_profile import detect_hardware_profile, resolve_active_local_generation_model  # noqa: E402
+from scripts.lexical_store import search_lexical_index  # noqa: E402
+from scripts.memory_format import split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_atom_record, section_text  # noqa: E402
+import scripts.ollama_utils as ollama_utils  # noqa: E402
+from scripts.recall import (  # noqa: E402
     QUERY_STOP_WORDS,
     RecallOptions,
     project_tags_match,
@@ -95,7 +111,7 @@ from recall import (  # noqa: E402
     search_lexical_memory,
     search_memory,
 )
-from vector_store import _close_chroma_client, close_vector_collection, get_vector_collection  # noqa: E402
+from scripts.vector_store import _close_chroma_client, close_vector_collection, get_vector_collection  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_PATH = ROOT / "docs" / "retrieval-evaluation-proposed.json"
@@ -702,7 +718,7 @@ def run_live_third_party_benchmark(
 
         # Keep Second Brain's live Chroma collection open during the run
         sb_live_col = get_vector_collection(resolved_chroma_path, name="atoms", create=False)
-        import recall as _recall_mod
+        import scripts.recall as _recall_mod
         from unittest.mock import patch
 
         active_optional_adapters: list[_ExternalMemoryAdapter] = []

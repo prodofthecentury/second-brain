@@ -15,7 +15,24 @@ the emitted extraction artifact. Raw binaries are never used as evidence
 sources directly; callers archive them separately with SHA-256 lineage.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 from collections.abc import Callable
 import csv
@@ -32,9 +49,8 @@ from typing import Any
 import xml.etree.ElementTree as ET
 import zipfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import _is_reparse_or_link  # noqa: E402
+from scripts.config import _is_reparse_or_link  # noqa: E402
 
 DOC_EXTRACTOR_EXTS = frozenset({".pdf", ".docx", ".epub", ".html", ".htm", ".csv", ".tsv"})
 MAX_DOC_BINARY_BYTES = 50 * 1024 * 1024
@@ -103,7 +119,7 @@ def _clean_line(value: str) -> str:
     text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
     # Preserve raw LaTeX display/inline spans verbatim without collapsing spacing inside equations
     if "$" in text or "\\[" in text or "\\(" in text or "\\begin{" in text:
-        from math_equivalence import _LATEX_SPAN_RE
+        from scripts.math_equivalence import _LATEX_SPAN_RE
 
         placeholders: list[str] = []
 
@@ -780,15 +796,15 @@ def _run_local_ocr_on_png(
     if use_vision:
         try:
             import base64
-            from config import VISION_MODEL
-            from hardware_profile import call_ollama_chat_maybe_no_think, strip_reasoning_think_blocks
-            from host_adapters import validate_model_identifier
+            from scripts.config import VISION_MODEL
+            from scripts.hardware_profile import call_ollama_chat_maybe_no_think, strip_reasoning_think_blocks
+            from scripts.host_adapters import validate_model_identifier
             import ollama
-            from ollama_utils import _resolve_local_ollama_rule_and_url
+            from scripts.ollama_utils import _resolve_local_ollama_rule_and_url
 
             _eff_rule, base_url = _resolve_local_ollama_rule_and_url()
             try:
-                from ingest_multimodal import select_vision_model
+                from scripts.ingest_multimodal import select_vision_model
 
                 chosen_vision = select_vision_model() or VISION_MODEL
             except Exception:
@@ -1163,7 +1179,7 @@ _HTML_BLOCKS = ("h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "pre", "blockquot
 def _html_to_blocks(markup: str | bytes, *, heading_offset: int = 0) -> tuple[str, list[str]]:
     from bs4 import BeautifulSoup
     try:
-        from math_equivalence import preserve_latex_in_html
+        from scripts.math_equivalence import preserve_latex_in_html
 
         markup = preserve_latex_in_html(markup)
     except Exception:

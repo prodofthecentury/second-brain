@@ -17,7 +17,24 @@ Security invariants:
     preserves existing user hooks and never fails `git commit`.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import datetime
@@ -31,18 +48,17 @@ import subprocess
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import content_sha256, review_lock  # noqa: E402
-import cognitive_core  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import content_sha256, review_lock  # noqa: E402
+import scripts.cognitive_core as cognitive_core  # noqa: E402
+from scripts.config import (  # noqa: E402
     _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     resolve_active_brain_dir,
     safe_file_in_dir,
 )
-from host_adapters import inspect_and_redact_outbound  # noqa: E402
-from inbox_workflow import scan_inbox_payload_risks  # noqa: E402
+from scripts.host_adapters import inspect_and_redact_outbound  # noqa: E402
+from scripts.inbox_workflow import scan_inbox_payload_risks  # noqa: E402
 
 
 HOOK_BEGIN_MARKER = "# >>> second-brain-post-commit >>>"

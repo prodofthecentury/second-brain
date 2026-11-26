@@ -4,7 +4,24 @@
 # ///
 """Quarantined inbox inspection, adversarial risk scanning, and CAS-locked owner promotion."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from dataclasses import asdict, dataclass
@@ -15,10 +32,9 @@ import re
 import shutil
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import ReviewConflictError, atomic_write_bytes
-from config import (
+from scripts.atom_mutator import ReviewConflictError, atomic_write_bytes
+from scripts.config import (
     BRAIN_DIR,
     INBOX_DIR,
     RAW_DIR,
@@ -33,9 +49,9 @@ from config import (
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from security_fs import restrict_security_file_permissions
-from refinery_targets import intake_status
-from review_atom import review_lock
+from scripts.security_fs import restrict_security_file_permissions
+from scripts.refinery_targets import intake_status
+from scripts.review_atom import review_lock
 
 INBOX_AUDIT_FILENAME = "inbox-decisions.jsonl"
 MAX_PROMOTED_BYTES = 64 * 1024
@@ -490,6 +506,23 @@ def _append_inbox_decision(record: dict[str, object], *, brain_dir: str) -> None
         restrict_security_file_permissions(audit_path)
 
 
+def _require_inbox_actor(actor: str, attestation: dict | None) -> tuple[str, dict]:
+    from scripts.owner_attestation import OwnerAttestationError, require_attestation, unattested_library_attestation
+
+    try:
+        if attestation is None:
+            return unattested_library_attestation(actor)
+        recorded = require_attestation(
+            attestation,
+            actor=actor,
+            state_dir=attestation.get("state_dir"),
+            auth_path=attestation.get("auth_path"),
+        )
+        return recorded["actor"], recorded
+    except OwnerAttestationError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def promote_inbox_item(
     filename: str,
     *,
@@ -499,11 +532,10 @@ def promote_inbox_item(
     inbox_dir: str | None = None,
     raw_dir: str | None = None,
     brain_dir: str | None = None,
+    attestation: dict | None = None,
 ) -> dict[str, object]:
     """CAS-verified promotion from quarantined 0-raw/inbox/ (or 0-raw/*.intake) into 0-raw/ for Refinery processing."""
-    actor_clean = str(actor or "").strip()
-    if not actor_clean:
-        raise ValueError("Actor identity is required to promote quarantined inbox captures.")
+    actor_clean, recorded_attestation = _require_inbox_actor(actor, attestation)
     expected = str(expected_sha256 or "").strip().lower()
     if len(expected) != 64:
         raise ValueError("A 64-character expected_sha256 is required for CAS inbox promotion.")
@@ -587,6 +619,7 @@ def promote_inbox_item(
                 "origin": origin,
                 "risk_flags": list(risks),
                 "acknowledged_risks": bool(acknowledge_risks),
+                "attestation": recorded_attestation,
             }
             _append_inbox_decision(decision, brain_dir=resolved_brain)
             return decision
@@ -653,6 +686,7 @@ def promote_inbox_item(
             "origin": origin,
             "risk_flags": list(risks),
             "acknowledged_risks": bool(acknowledge_risks),
+            "attestation": recorded_attestation,
         }
         _append_inbox_decision(decision, brain_dir=resolved_brain)
         return decision
@@ -667,10 +701,9 @@ def reject_inbox_item(
     inbox_dir: str | None = None,
     raw_dir: str | None = None,
     brain_dir: str | None = None,
+    attestation: dict | None = None,
 ) -> dict[str, object]:
-    actor_clean = str(actor or "").strip()
-    if not actor_clean:
-        raise ValueError("Actor identity is required to reject quarantined inbox captures.")
+    actor_clean, recorded_attestation = _require_inbox_actor(actor, attestation)
     expected = str(expected_sha256 or "").strip().lower()
     if len(expected) != 64:
         raise ValueError("A 64-character expected_sha256 is required for CAS inbox rejection.")
@@ -725,12 +758,16 @@ def reject_inbox_item(
             "inbox_sha256": current_sha,
             "archived_to": os.path.relpath(archived_rejected, inbox_dir).replace("\\", "/"),
             "rationale": str(rationale or "").strip()[:500],
+            "attestation": recorded_attestation,
         }
         _append_inbox_decision(decision, brain_dir=resolved_brain)
         return decision
 
 
 def main(argv: list[str] | None = None) -> int:
+    from scripts.owner_attestation import OwnerAttestationError, attestation_from_grant, split_grant_args
+
+    cleaned, grant = split_grant_args(argv)
     parser = argparse.ArgumentParser(description="Inspect, promote, or reject quarantined 0-raw/inbox captures.")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -753,7 +790,7 @@ def main(argv: list[str] | None = None) -> int:
     rej_p.add_argument("--actor", required=True)
     rej_p.add_argument("--rationale", default="Rejected during owner quarantine review")
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(cleaned)
     if args.command == "list":
         items = list_inbox_items()
         if args.json:
@@ -779,23 +816,28 @@ def main(argv: list[str] | None = None) -> int:
             print(detail["content"])
         return 0
 
-    if args.command == "promote":
-        decision = promote_inbox_item(
-            args.filename,
-            expected_sha256=args.expected_sha256,
-            actor=args.actor,
-            acknowledge_risks=args.acknowledge_risks,
-        )
-        print(json.dumps(decision, indent=2, sort_keys=True))
-        return 0
-
-    if args.command == "reject":
-        decision = reject_inbox_item(
-            args.filename,
-            expected_sha256=args.expected_sha256,
-            actor=args.actor,
-            rationale=args.rationale,
-        )
+    if args.command in {"promote", "reject"}:
+        try:
+            attestation = attestation_from_grant(grant)
+        except OwnerAttestationError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        if args.command == "promote":
+            decision = promote_inbox_item(
+                args.filename,
+                expected_sha256=args.expected_sha256,
+                actor=args.actor,
+                acknowledge_risks=args.acknowledge_risks,
+                attestation=attestation,
+            )
+        else:
+            decision = reject_inbox_item(
+                args.filename,
+                expected_sha256=args.expected_sha256,
+                actor=args.actor,
+                rationale=args.rationale,
+                attestation=attestation,
+            )
         print(json.dumps(decision, indent=2, sort_keys=True))
         return 0
 

@@ -53,7 +53,9 @@ jobs:
             libxrandr2 \
             libgbm1 \
             libpango-1.0-0 \
-            libcairo2
+            libcairo2 \
+            ffmpeg \
+            espeak-ng
 
       - name: Set up uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
@@ -100,6 +102,10 @@ jobs:
         run: |
           export BRAIN_VAULT_DIR="${RUNNER_TEMP}/sb-ci-vault"
           uv run --frozen second-brain install
+          # Ollama, ONNX weights, faster-whisper, PyAV, and Pillow are optional.
+          # live_runtime_integration_tests skips those cases when the dependency is
+          # absent. Set BRAIN_REQUIRE_OLLAMA=1 (or BRAIN_REQUIRE_ONNX / WHISPER / PYAV / PILLOW)
+          # only on a runner that actually has them.
           # --exclude skips only the separately-orchestrated GUI/VSIX/wheel steps below so all suites
           # (including doctor, goal4_sync_and_ui_tests, bugfix_1a_regression_tests, parity_1c_tests,
           # phase6_release_and_stores_tests, and scale_benchmark_1500) run automatically.
@@ -119,6 +125,7 @@ jobs:
           uv run --frozen python scripts/build_distribution_manifests.py --pwa-only --out-dir dist
 
       - name: Run VS Code extension tests (zero-dependency Node test runner)
+        # Windows, macOS, and Linux Python 3.11 do not set skip_gui_pack, so this step runs there.
         if: ${{ !matrix.skip_gui_pack }}
         shell: bash
         run: |

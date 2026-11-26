@@ -31,7 +31,24 @@ Covers all 4 SOTA tracks end-to-end:
      - 3-surface UI parity & strict zero-`innerHTML` static XSS enforcement
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import base64
 import hashlib
@@ -51,8 +68,6 @@ import httpx
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -67,8 +82,8 @@ def _seed_verified_atom(
     memory_type: str = "semantic",
     approve: bool = True,
 ) -> Path:
-    from atom_mutator import apply_review_transition, content_sha256
-    from evidence import find_evidence_anchor
+    from scripts.atom_mutator import apply_review_transition, content_sha256
+    from scripts.evidence import find_evidence_anchor
 
     raw_dir = brain_dir / "0-raw"
     atoms_dir = brain_dir / "2-atoms"
@@ -204,9 +219,9 @@ def _build_minimal_linear_onnx_model(seq_len: int = 8) -> bytes:
 
 class V040SotaUpgradesTests(unittest.TestCase):
     def test_track1_hardware_model_incremental_vectors_reranker_and_chat_threads(self) -> None:
-        from api_product import ensure_owner_token
-        from atom_mutator import apply_atom_edit, apply_atom_merge, content_sha256
-        from chat_threads import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.atom_mutator import apply_atom_edit, apply_atom_merge, content_sha256
+        from scripts.chat_threads import (
             append_chat_turn,
             create_chat_thread,
             delete_chat_thread,
@@ -215,24 +230,24 @@ class V040SotaUpgradesTests(unittest.TestCase):
             pin_turn_to_note,
             resolve_followup_query,
         )
-        from cross_encoder import InteractionCrossEncoder, OnnxCrossEncoder, clear_cross_encoder_cache
-        from hardware_profile import (
+        from scripts.cross_encoder import InteractionCrossEncoder, OnnxCrossEncoder, clear_cross_encoder_cache
+        from scripts.hardware_profile import (
             classify_hardware_tier,
             invalidate_hardware_profile_cache,
             resolve_active_local_generation_model,
         )
-        from host_adapters import builtin_default_policies
-        from index_manifest import index_manifest_is_current, load_index_manifest
-        from lexical_store import rebuild_lexical_index
-        from memory_api import (
+        from scripts.host_adapters import builtin_default_policies
+        from scripts.index_manifest import index_manifest_is_current, load_index_manifest
+        from scripts.lexical_store import rebuild_lexical_index
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
             reset_api_rate_limiter,
         )
-        import rebuild_vectors as rv_mod
-        from recall import RecallOptions, search_lexical_memory, search_semantic_memory
+        import scripts.rebuild_vectors as rv_mod
+        from scripts.recall import RecallOptions, search_lexical_memory, search_semantic_memory
 
         # 1.1 Hardware-profile auto-wiring (`qwen2.5-coder:7b`) + explicit env override
         fake_tier2 = classify_hardware_tier(
@@ -272,7 +287,7 @@ class V040SotaUpgradesTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             import zipfile
-            from build_clipper import build_clipper_zip
+            from scripts.build_clipper import build_clipper_zip
 
             built_zip = build_clipper_zip(Path(tmp) / "dist-clipper")
             with zipfile.ZipFile(built_zip, "r") as zf:
@@ -293,7 +308,7 @@ class V040SotaUpgradesTests(unittest.TestCase):
             lines = [f"Cluster shard_{i:03d} enforces deterministic consensus epoch {i}." for i in range(68)]
             src_bulk.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-            from evidence import find_evidence_anchor
+            from scripts.evidence import find_evidence_anchor
 
             dlog_lines: list[str] = []
             for i, cl in enumerate(lines):
@@ -545,9 +560,9 @@ class V040SotaUpgradesTests(unittest.TestCase):
             _ = delete_chat_thread
 
     def test_track2_polarity_precision_fast_nli_autolinking_and_antigravity_plugin(self) -> None:
-        from ide_connector import connect as ide_connect
-        from knowledge_graph import auto_link_vault_atoms, build_knowledge_graph, detect_contradictions
-        from notes_store import NotePaths, create_note, verify_note_excerpt
+        from scripts.ide_connector import connect as ide_connect
+        from scripts.knowledge_graph import auto_link_vault_atoms, build_knowledge_graph, detect_contradictions
+        from scripts.notes_store import NotePaths, create_note, verify_note_excerpt
 
         # 2.1 Live vault regression check: 0 false-positive contradictions on actual brain/ vault
         live_brain = REPO_ROOT / "brain"
@@ -557,7 +572,7 @@ class V040SotaUpgradesTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             import zipfile
-            from build_clipper import build_clipper_zip
+            from scripts.build_clipper import build_clipper_zip
 
             built_zip = build_clipper_zip(Path(tmp) / "dist-clipper")
             with zipfile.ZipFile(built_zip, "r") as zf:
@@ -668,7 +683,7 @@ class V040SotaUpgradesTests(unittest.TestCase):
             self.assertLess(al_res["orphan_after"], al_res["orphan_before"])
 
             # Cross-project & unscoped isolation: unscoped claim MUST NOT auto-link confidential project:sec atoms!
-            from knowledge_graph import suggest_atom_graph_links_for_claim
+            from scripts.knowledge_graph import suggest_atom_graph_links_for_claim
 
             unscoped_sug = suggest_atom_graph_links_for_claim(
                 "Internal gRPC control-plane transport must enforce mutual TLS authentication in production.",
@@ -707,18 +722,18 @@ class V040SotaUpgradesTests(unittest.TestCase):
             self.assertIn(tool_name, plugin_skill)
 
     def test_track3_readability_clipper_oneclick_pairing_and_layout_ocr_pdf(self) -> None:
-        from api_product import ensure_owner_token
-        from audit_sources import audit_sources
-        from doc_extractors import extract_pdf
-        from doc_fixtures import build_positioned_pdf, build_scanned_image_pdf
-        from memory_api import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.audit_sources import audit_sources
+        from scripts.doc_extractors import extract_pdf
+        from scripts.doc_fixtures import build_positioned_pdf, build_scanned_image_pdf
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
             generate_memory_api_token,
             reset_api_rate_limiter,
         )
-        from web_clipper import extract_clean_markdown_from_html
+        from scripts.web_clipper import extract_clean_markdown_from_html
 
         # 3.1 Node.js Readability DOM-to-Markdown + 1-click pairing client tests
         node_proc = subprocess.run(
@@ -753,7 +768,7 @@ class V040SotaUpgradesTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             import zipfile
-            from build_clipper import build_clipper_zip
+            from scripts.build_clipper import build_clipper_zip
 
             built_zip = build_clipper_zip(Path(tmp) / "dist-clipper")
             with zipfile.ZipFile(built_zip, "r") as zf:
@@ -933,8 +948,8 @@ class V040SotaUpgradesTests(unittest.TestCase):
             self.assertIn("| System | RecallAt5 | TrapFPR |", md_2col)
 
             # Policy-gated Ollama Vision OCR fallback test (enabled vs policy-disabled)
-            from doc_extractors import _run_local_ocr_on_png
-            from host_adapters import HostConsentError
+            from scripts.doc_extractors import _run_local_ocr_on_png
+            from scripts.host_adapters import HostConsentError
 
             class _FakeOllamaClient:
                 def __init__(self, *args: object, **kwargs: object) -> None:
@@ -978,8 +993,8 @@ class V040SotaUpgradesTests(unittest.TestCase):
             # Save extracted OCR markdown into 0-raw/ and prove byte-offset source anchor verification!
             ocr_raw_path = brain / "0-raw" / "scanned-extracted.md"
             ocr_raw_path.write_text(ocr_doc.markdown, encoding="utf-8")
-            from atom_mutator import apply_review_transition, content_sha256
-            from evidence import find_evidence_anchor
+            from scripts.atom_mutator import apply_review_transition, content_sha256
+            from scripts.evidence import find_evidence_anchor
 
             ocr_quote = "Scanned Clause 9: Backup encryption keys rotate every 90 days."
             ocr_draft = (
@@ -1006,12 +1021,12 @@ class V040SotaUpgradesTests(unittest.TestCase):
             self.assertTrue(ocr_rep["approval_current"])
 
     def test_track4_s3_sigv4_dpapi_keychain_autosync_3way_conflicts_and_ui_parity(self) -> None:
-        from atom_mutator import approved_revision_is_current, content_sha256
-        from index_manifest import index_manifest_is_current, load_index_manifest
-        from keychain_store import KeychainError, delete_secret, load_secret, store_secret
-        from lexical_store import rebuild_lexical_index
-        import rebuild_vectors as rv_mod
-        from vault_sync import (
+        from scripts.atom_mutator import approved_revision_is_current, content_sha256
+        from scripts.index_manifest import index_manifest_is_current, load_index_manifest
+        from scripts.keychain_store import KeychainError, delete_secret, load_secret, store_secret
+        from scripts.lexical_store import rebuild_lexical_index
+        import scripts.rebuild_vectors as rv_mod
+        from scripts.vault_sync import (
             SyncConflictError,
             configure_auto_sync,
             get_sync_conflict_detail,
@@ -1061,7 +1076,7 @@ class V040SotaUpgradesTests(unittest.TestCase):
             self.assertIsNone(load_secret("second-brain.test", "acct-1", state_dir=sec_a, backend="linux_secret_service"))
 
             # 4.2 Strict RFC S3/R2 SigV4 Mock Object Store Transport (verifies AWS4-HMAC-SHA256 on EVERY request!)
-            from vault_sync import SyncSecurityError, _parse_s3_list_objects_xml
+            from scripts.vault_sync import SyncSecurityError, _parse_s3_list_objects_xml
 
             # >4 KB comment prolog before <!DOCTYPE MUST still be rejected fail-closed!
             padded_xxe = b'<?xml version="1.0"?><!-- ' + (b"A" * 4200) + b' --><!DOCTYPE lol [<!ENTITY x "y">]><ListBucketResult/>'

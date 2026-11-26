@@ -11,10 +11,87 @@ const path = require("path");
  * `afterSign` (`./build/notarize.js`) notarizes the inner `Second Brain.app` bundle before `.dmg`
  * assembly, while this hook notarizes, staples, validates, and Gatekeeper-assesses each outer
  * `.dmg` image after `electron-builder` finishes creating all artifacts.
+ *
+ * Without Developer ID and notary credentials the hook returns the artifact list unchanged.
+ * Set SECOND_BRAIN_REQUIRE_NOTARIZATION=1 to fail instead of skipping.
  */
-exports.default = async function notarizeDmgArtifacts(buildResult) {
+
+function credentialState(env) {
+  const source = env || {};
+  const appleId = String(source.APPLE_ID || "").trim();
+  const applePassword = String(source.APPLE_APP_SPECIFIC_PASSWORD || "").trim();
+  const appleTeamId = String(source.APPLE_TEAM_ID || "").trim();
+  const apiKeyPathEnv = String(source.APPLE_API_KEY || "").trim();
+  const apiKeyB64 = String(source.APPLE_API_KEY_BASE64 || "").trim();
+  const apiKeyId = String(source.APPLE_API_KEY_ID || "").trim();
+  const apiIssuer = String(source.APPLE_API_ISSUER || "").trim();
+  const cscLink = String(source.CSC_LINK || source.MAC_CSC_LINK || "").trim();
+  const cscName = String(source.CSC_NAME || "").trim();
+  return {
+    appleId,
+    applePassword,
+    appleTeamId,
+    apiKeyPathEnv,
+    apiKeyB64,
+    apiKeyId,
+    apiIssuer,
+    hasAppleIdAuth: Boolean(appleId && applePassword && appleTeamId),
+    hasApiKeyAuth: Boolean((apiKeyPathEnv || apiKeyB64) && apiKeyId && apiIssuer),
+    hasSigningIdentity: Boolean(cscLink || cscName),
+  };
+}
+
+function buildNotarySubmitArgs(dmgPath, env, resolvedKeyPath) {
+  const creds = credentialState(env);
+  if (!creds.hasSigningIdentity || (!creds.hasAppleIdAuth && !creds.hasApiKeyAuth)) {
+    return null;
+  }
+  const args = ["notarytool", "submit", dmgPath, "--wait"];
+  if (creds.hasApiKeyAuth) {
+    args.push("--key", resolvedKeyPath, "--key-id", creds.apiKeyId, "--issuer", creds.apiIssuer);
+  } else {
+    args.push(
+      "--apple-id",
+      creds.appleId,
+      "--password",
+      "@env:APPLE_APP_SPECIFIC_PASSWORD",
+      "--team-id",
+      creds.appleTeamId
+    );
+  }
+  return args;
+}
+
+function planDmgNotarization(dmgPath, env, resolvedKeyPath) {
+  const submit = buildNotarySubmitArgs(dmgPath, env, resolvedKeyPath);
+  if (!submit) {
+    return [];
+  }
+  return [
+    ["xcrun", submit],
+    ["xcrun", ["stapler", "staple", dmgPath]],
+    ["xcrun", ["stapler", "validate", dmgPath]],
+    ["spctl", ["--assess", "--type", "open", "--context", "context:primary-signature", "--verbose=4", dmgPath]],
+  ];
+}
+
+function notarizationRequired(env) {
+  const flag = String((env && env.SECOND_BRAIN_REQUIRE_NOTARIZATION) || "").trim().toLowerCase();
+  return flag === "1" || flag === "true";
+}
+
+function hostPlatform(env) {
+  if (env && env.SIMULATED_PLATFORM) {
+    return String(env.SIMULATED_PLATFORM);
+  }
+  return process.platform;
+}
+
+async function notarizeDmgArtifacts(buildResult, env, execFile) {
+  const runtimeEnv = env || process.env;
+  const run = execFile || execFileSync;
   const artifacts = (buildResult && Array.isArray(buildResult.artifactPaths) && buildResult.artifactPaths) || [];
-  if (process.platform !== "darwin") {
+  if (hostPlatform(runtimeEnv) !== "darwin") {
     return artifacts;
   }
 
@@ -23,28 +100,10 @@ exports.default = async function notarizeDmgArtifacts(buildResult) {
     return artifacts;
   }
 
-  const requireNotarization =
-    (process.env.SECOND_BRAIN_REQUIRE_NOTARIZATION || "").trim() === "1" ||
-    (process.env.SECOND_BRAIN_REQUIRE_NOTARIZATION || "").trim().toLowerCase() === "true";
-
-  const cscLink = (process.env.CSC_LINK || process.env.MAC_CSC_LINK || "").trim();
-  const cscName = (process.env.CSC_NAME || "").trim();
-  const appleId = (process.env.APPLE_ID || "").trim();
-  const applePassword = (process.env.APPLE_APP_SPECIFIC_PASSWORD || "").trim();
-  const appleTeamId = (process.env.APPLE_TEAM_ID || "").trim();
-
-  const apiKeyPathEnv = (process.env.APPLE_API_KEY || "").trim();
-  const apiKeyB64 = (process.env.APPLE_API_KEY_BASE64 || "").trim();
-  const apiKeyId = (process.env.APPLE_API_KEY_ID || "").trim();
-  const apiIssuer = (process.env.APPLE_API_ISSUER || "").trim();
-
-  const hasAppleIdAuth = Boolean(appleId && applePassword && appleTeamId);
-  const hasApiKeyAuth = Boolean((apiKeyPathEnv || apiKeyB64) && apiKeyId && apiIssuer);
-  const hasSigningIdentity = Boolean(cscLink || cscName);
-
-  if (!hasSigningIdentity || (!hasAppleIdAuth && !hasApiKeyAuth)) {
+  const creds = credentialState(runtimeEnv);
+  if (!creds.hasSigningIdentity || (!creds.hasAppleIdAuth && !creds.hasApiKeyAuth)) {
     const msg = "[afterAllArtifactBuild] Skipping outer .dmg notarization; Developer ID or Notary credentials absent.";
-    if (requireNotarization) {
+    if (notarizationRequired(runtimeEnv)) {
       throw new Error(`${msg} (SECOND_BRAIN_REQUIRE_NOTARIZATION=1 enforced).`);
     }
     console.log(msg);
@@ -54,44 +113,22 @@ exports.default = async function notarizeDmgArtifacts(buildResult) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sb-dmg-notarize-"));
   let tempKeyFile = null;
   try {
-    let resolvedKeyPath = apiKeyPathEnv;
-    if (hasApiKeyAuth && !resolvedKeyPath && apiKeyB64) {
-      tempKeyFile = path.join(tmpDir, `AuthKey_${apiKeyId}.p8`);
-      fs.writeFileSync(tempKeyFile, Buffer.from(apiKeyB64, "base64"), { mode: 0o600 });
+    let resolvedKeyPath = creds.apiKeyPathEnv;
+    if (creds.hasApiKeyAuth && !resolvedKeyPath && creds.apiKeyB64) {
+      tempKeyFile = path.join(tmpDir, `AuthKey_${creds.apiKeyId}.p8`);
+      fs.writeFileSync(tempKeyFile, Buffer.from(creds.apiKeyB64, "base64"), { mode: 0o600 });
       resolvedKeyPath = tempKeyFile;
     }
 
     for (const dmgPath of dmgPaths) {
-      if (!fs.existsSync(dmgPath)) {
+      if (!runtimeEnv.SIMULATED_PLATFORM && !fs.existsSync(dmgPath)) {
         throw new Error(`[afterAllArtifactBuild] Missing expected .dmg artifact: ${dmgPath}`);
       }
-      const notaryArgs = ["notarytool", "submit", dmgPath, "--wait"];
-      if (hasApiKeyAuth) {
-        notaryArgs.push("--key", resolvedKeyPath, "--key-id", apiKeyId, "--issuer", apiIssuer);
-      } else {
-        notaryArgs.push(
-          "--apple-id",
-          appleId,
-          "--password",
-          "@env:APPLE_APP_SPECIFIC_PASSWORD",
-          "--team-id",
-          appleTeamId
-        );
-      }
-
+      const plan = planDmgNotarization(dmgPath, runtimeEnv, resolvedKeyPath);
       console.log(`[afterAllArtifactBuild] Submitting ${path.basename(dmgPath)} to Apple Notary Service...`);
-      execFileSync("xcrun", notaryArgs, { stdio: "inherit" });
-
-      console.log(`[afterAllArtifactBuild] Stapling & validating ${path.basename(dmgPath)}...`);
-      execFileSync("xcrun", ["stapler", "staple", dmgPath], { stdio: "inherit" });
-      execFileSync("xcrun", ["stapler", "validate", dmgPath], { stdio: "inherit" });
-
-      console.log(`[afterAllArtifactBuild] Assessing Gatekeeper primary signature on ${path.basename(dmgPath)}...`);
-      execFileSync(
-        "spctl",
-        ["--assess", "--type", "open", "--context", "context:primary-signature", "--verbose=4", dmgPath],
-        { stdio: "inherit" }
-      );
+      for (const [command, args] of plan) {
+        run(command, args, { stdio: "inherit" });
+      }
     }
     return artifacts;
   } finally {
@@ -104,4 +141,8 @@ exports.default = async function notarizeDmgArtifacts(buildResult) {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch (_) {}
   }
-};
+}
+
+exports.buildNotarySubmitArgs = buildNotarySubmitArgs;
+exports.planDmgNotarization = planDmgNotarization;
+exports.default = notarizeDmgArtifacts;

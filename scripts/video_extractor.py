@@ -23,7 +23,7 @@ import tempfile
 from typing import Any, Callable
 
 try:
-    from config import VIDEO_EXTS, _is_reparse_or_link
+    from scripts.config import VIDEO_EXTS, _is_reparse_or_link
 except ImportError:  # pragma: no cover
     VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm"}
     _is_reparse_or_link = lambda p: os.path.islink(p)  # noqa: E731
@@ -261,6 +261,39 @@ def hamming_distance64(a: int, b: int) -> int:
     return (int(a) ^ int(b)).bit_count()
 
 
+def render_sample_clip(path: str | Path, *, duration_seconds: float = 1.0) -> Path:
+    """Render a real test-pattern MP4 with ffmpeg. Raises if ffmpeg is missing."""
+    ffmpeg_bin, _ = resolve_ffmpeg_tools()
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg is not on PATH, so a sample clip cannot be rendered.")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    seconds = max(0.4, min(5.0, float(duration_seconds)))
+    proc = subprocess.run(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=160x120:rate=8",
+            "-t",
+            f"{seconds:.2f}",
+            "-pix_fmt",
+            "yuv420p",
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0 or not target.is_file() or target.stat().st_size < 100:
+        detail = (proc.stderr or "")[-400:]
+        raise RuntimeError(f"ffmpeg could not render a sample clip: {detail}")
+    return target
+
+
 def extract_video_keyframes_and_audio(
     filepath: str,
     work_dir: str,
@@ -343,6 +376,19 @@ def extract_video_keyframes_and_audio(
                 for fn in os.listdir(work_dir)
                 if fn.startswith("keyframe_") and fn.endswith(".png")
             )
+            if not raw_frames:
+                one = os.path.join(work_dir, "keyframe_0001.png")
+                grab = runner(
+                    [ffmpeg_bin, "-y", "-protocol_whitelist", "file", "-i", filepath, "-frames:v", "1", one],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                    check=False,
+                )
+                if grab.returncode == 0 and os.path.isfile(one) and os.path.getsize(one) > 8:
+                    raw_frames = [one]
             extracted_frames = _deduplicate_frame_files(
                 raw_frames,
                 pts_times=pts_matches,

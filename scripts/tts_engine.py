@@ -10,7 +10,24 @@ and pairs cleanly with ``faster-whisper`` STT in ``ingest_multimodal.py`` plus
 grounded ``streaming_chat.chat_events`` for push-to-talk spoken conversation.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import base64
@@ -21,6 +38,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -28,12 +47,11 @@ import time
 from typing import Any
 import wave
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("tts_engine", "scripts.tts_engine"):
     sys.modules.setdefault("tts_engine", sys.modules[__name__])
     sys.modules.setdefault("scripts.tts_engine", sys.modules[__name__])
 
-from config import _is_reparse_or_link, security_state_dir  # noqa: E402
+from scripts.config import _is_reparse_or_link, security_state_dir  # noqa: E402
 
 SAMPLE_RATE_HZ = 24000
 DEFAULT_VOICE = "af_heart"
@@ -272,7 +290,7 @@ def encode_pcm16_wav(samples_float32, *, sample_rate: int = SAMPLE_RATE_HZ) -> b
 
 
 def tts_status(*, state_dir: str | Path | None = None, slot_dir: str | Path | None = None) -> dict[str, Any]:
-    from onnx_models import verify_slot_installation
+    from scripts.onnx_models import verify_slot_installation
 
     info = verify_slot_installation("kokoro-tts", state_dir=state_dir, slot_dir=slot_dir, run_inference=False)
     ort_ok = False
@@ -330,6 +348,25 @@ def _get_or_open_session(slot_dir: Path):
         return sess
 
 
+def _synthesize_espeak_wav(text: str, espeak_bin: str, *, timeout_seconds: float = 20.0) -> bytes:
+    """Write a real WAV with espeak-ng or espeak. Raises TtsError on failure."""
+    with tempfile.TemporaryDirectory(prefix="sb-espeak-") as temp:
+        out = Path(temp) / "speech.wav"
+        proc = subprocess.run(
+            [espeak_bin, "-w", str(out), "-s", "150", text],
+            capture_output=True,
+            timeout=max(2.0, float(timeout_seconds)),
+            check=False,
+        )
+        if proc.returncode != 0 or not out.is_file() or out.stat().st_size < 44:
+            detail = (proc.stderr or proc.stdout or b"").decode("utf-8", errors="replace")[:400]
+            raise TtsError(f"{Path(espeak_bin).name} failed to write WAV: {detail or proc.returncode}")
+        data = out.read_bytes()
+    if not data.startswith(b"RIFF"):
+        raise TtsError(f"{Path(espeak_bin).name} did not write a RIFF WAV.")
+    return data
+
+
 def synthesize_wav_bytes(
     text: str,
     *,
@@ -366,12 +403,32 @@ def synthesize_wav_bytes(
             "model_id": "injected_tts_synthesizer",
         }
 
-    from onnx_models import verify_slot_installation
+    from scripts.onnx_models import verify_slot_installation
 
     info = verify_slot_installation("kokoro-tts", state_dir=state_dir, slot_dir=slot_dir, run_inference=False)
+    espeak_bin = shutil.which("espeak-ng") or shutil.which("espeak")
     if not info.get("verified"):
+        if espeak_bin:
+            wav_bytes = _synthesize_espeak_wav(clean_text, espeak_bin, timeout_seconds=20.0)
+            elapsed_s = max(0.001, time.perf_counter() - t0)
+            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+                n_frames = wf.getnframes()
+                sr = wf.getframerate() or 22050
+            dur_s = round(n_frames / float(sr), 3) if sr else 0.0
+            return {
+                "status": "ok",
+                "wav_bytes": wav_bytes,
+                "mime_type": "audio/wav",
+                "sample_rate": sr,
+                "duration_seconds": dur_s,
+                "rtf": round(elapsed_s / max(0.05, dur_s), 3),
+                "clean_text": clean_text,
+                "voice": clean_voice,
+                "model_id": f"espeak:{Path(espeak_bin).name}",
+            }
         raise TtsUnavailableError(
-            "Kokoro-82M ONNX weights are missing or unverified. Run 'second-brain models pull kokoro-tts'."
+            "No speech engine is available. Install Kokoro weights with "
+            "'second-brain models pull kokoro-tts', or install espeak-ng."
         )
     try:
         import numpy as np  # type: ignore
@@ -440,6 +497,7 @@ def voice_conversation_turn(
     mode: str = "stream",
     host_id: str = "ollama_local",
     project_scope: str | None = None,
+    thread_id: str | None = None,
     voice: str = DEFAULT_VOICE,
     speed: float = 1.0,
     transcriber: Callable[[str], str] | None = None,
@@ -455,19 +513,31 @@ def voice_conversation_turn(
     if ext not in ALLOWED_VOICE_EXTS:
         raise TtsError(f"Unsupported voice recording extension {ext!r}; allowed: {sorted(ALLOWED_VOICE_EXTS)}")
 
+    clean_thread_id: str | None = None
+    if thread_id is not None:
+        if not isinstance(thread_id, str):
+            raise ValueError("'thread_id' must be a string or null.")
+        stripped_tid = thread_id.strip().lower()
+        if stripped_tid:
+            from chat_threads import THREAD_ID_RE
+
+            if stripped_tid != "new" and not THREAD_ID_RE.fullmatch(stripped_tid):
+                raise ValueError(f"Invalid thread_id: {thread_id!r}")
+            clean_thread_id = stripped_tid
+
     with tempfile.TemporaryDirectory(prefix="sb_voice_") as td:
         audio_path = Path(td) / f"input{ext}"
         audio_path.write_bytes(bytes(audio_bytes))
         if transcriber is not None:
             transcript = str(transcriber(str(audio_path)) or "").strip()
         else:
-            from ingest_multimodal import transcribe_audio
+            from scripts.ingest_multimodal import transcribe_audio
 
             transcript = str(transcribe_audio(str(audio_path)) or "").strip()
     if not transcript:
         raise TtsError("No speech detected in uploaded voice recording.")
 
-    from streaming_chat import ChatPaths, chat_events
+    from scripts.streaming_chat import ChatPaths, chat_events
 
     resolved_brain = str(Path(brain_dir).resolve()) if brain_dir is not None else None
     cp_kw: dict[str, Any] = {
@@ -495,17 +565,21 @@ def voice_conversation_turn(
     answer_chunks: list[str] = []
     verified_text = ""
     err_msg = ""
+    resolved_thread_id: str | None = clean_thread_id if (clean_thread_id and clean_thread_id != "new") else None
     for evt in chat_events(
         transcript,
         mode=mode,
         paths=cp,
         project_scope=project_scope,
         host_id=host_id,
+        thread_id=clean_thread_id,
         stream_fn=stream_fn,
     ):
         etype = evt.get("type")
         if etype == "context":
             sources = list(evt.get("sources") or [])
+            if evt.get("thread_id"):
+                resolved_thread_id = str(evt["thread_id"])
         elif etype == "token":
             answer_chunks.append(str(evt.get("text") or evt.get("token") or ""))
         elif etype == "verified_answer":
@@ -514,6 +588,9 @@ def voice_conversation_turn(
             verified_text = str(evt.get("text") or evt.get("reason") or "")
         elif etype == "grounding":
             grounding = dict(evt)
+        elif etype == "done":
+            if evt.get("thread_id"):
+                resolved_thread_id = str(evt["thread_id"])
         elif etype == "error":
             err_msg = str(evt.get("error") or "Chat error")
 
@@ -535,6 +612,7 @@ def voice_conversation_turn(
         "status": "ok",
         "transcript": transcript,
         "answer_text": answer_text,
+        "thread_id": resolved_thread_id,
         "sources": sources,
         "grounding": grounding,
         "tts_available": tts_result is not None,

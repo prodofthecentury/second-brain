@@ -4,7 +4,24 @@
 # ///
 """Run repeated answer-level grounding checks against the approved regression set."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import hashlib
@@ -17,22 +34,22 @@ import tempfile
 import time
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, build_grounding_prompt, validate_standard_answer
-from atom_mutator import approved_revision_is_current, review_lock
-from config import ATOMS_DIR, CHROMA_PATH, GEN_MODEL, LEXICAL_INDEX_PATH, SIDECAR_DIR, _is_reparse_or_link
-from evaluation_dataset import validate_dataset
-from host_adapters import (
+from scripts.answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, build_grounding_prompt, validate_standard_answer
+from scripts.atom_mutator import approved_revision_is_current, review_lock
+from scripts.config import ATOMS_DIR, CHROMA_PATH, GEN_MODEL, LEXICAL_INDEX_PATH, SIDECAR_DIR, _is_reparse_or_link
+from scripts.evaluation_dataset import validate_dataset
+from scripts.host_adapters import (
     _redact_outbound_with_map,
     _rehydrate_draft_claims,
     restrict_security_file_permissions,
     validate_model_identifier,
 )
-from index_manifest import load_index_manifest
-from lexical_store import lexical_index_is_current
-from ollama_utils import _DEFAULT_OLLAMA_CHAT, _is_monkeypatched_ollama_fn, _resolve_local_ollama_rule_and_url, ollama_base_url
-from recall import RecallOptions, search_memory
+from scripts.index_manifest import load_index_manifest
+from scripts.lexical_store import lexical_index_is_current
+from scripts.ollama_endpoint import ollama_keep_alive
+from scripts.ollama_utils import _DEFAULT_OLLAMA_CHAT, _is_monkeypatched_ollama_fn, _resolve_local_ollama_rule_and_url, ollama_base_url
+from scripts.recall import RecallOptions, search_memory
 
 ROOT = Path(__file__).resolve().parents[1]
 DATASET_PATH = ROOT / "docs" / "retrieval-evaluation-proposed.json"
@@ -206,7 +223,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
     model = validate_model_identifier(model, provider="ollama")
 
     import ollama
-    from hardware_profile import (
+    from scripts.hardware_profile import (
         call_ollama_chat_maybe_no_think,
         is_reasoning_model_name,
         strip_reasoning_think_blocks,
@@ -239,7 +256,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                 messages=[{"role": "user", "content": 'Return {"claims":[]}.'}],
                 format=ANSWER_DRAFT_SCHEMA,
                 options=cpu_eval_options,
-                keep_alive="10m",
+                keep_alive=ollama_keep_alive(),
                 stream=False,
             )
         except Exception:
@@ -303,7 +320,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
                         messages=[{"role": "user", "content": redaction.sanitized_text}],
                         format=ANSWER_DRAFT_SCHEMA,
                         options=cpu_eval_options,
-                        keep_alive="10m",
+                        keep_alive=ollama_keep_alive(),
                         stream=False,
                     )
                 raw_content = strip_reasoning_think_blocks(str(response["message"]["content"])) or "{}"
@@ -354,7 +371,7 @@ def run_evaluation(*, runs: int, model: str, dataset_path: Path = DATASET_PATH) 
 
 
 def main(argv: list[str] | None = None) -> int:
-    from hardware_profile import resolve_active_local_generation_model
+    from scripts.hardware_profile import resolve_active_local_generation_model
 
     default_model = resolve_active_local_generation_model(fallback=GEN_MODEL)
     parser = argparse.ArgumentParser(description=__doc__)

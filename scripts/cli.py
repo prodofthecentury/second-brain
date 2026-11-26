@@ -1,6 +1,23 @@
 """Stable bootstrap commands for a Second Brain installation."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import asyncio
@@ -15,14 +32,10 @@ import json
 import urllib.error
 import urllib.request
 
-# Existing internal modules use direct imports when executed from the scripts
-# directory. Preserve that import contract inside both repo checkouts and wheels.
+# Sibling modules are imported as ``scripts.<name>``. The directory that
+# contains this file is not added to ``sys.path``.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 _RUNTIME_ROOT = str(Path(__file__).resolve().parent.parent)
-if _RUNTIME_ROOT not in sys.path:
-    sys.path.insert(0, _RUNTIME_ROOT)
-if _SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_DIR)
 
 
 from scripts import config as _config
@@ -312,6 +325,9 @@ def _resolve_active_vault_paths() -> tuple[str, str, str]:
 
 def install(args: argparse.Namespace | None = None) -> int:
     vault_dir, atoms_dir, lexical_index_path = _resolve_active_vault_paths()
+    from scripts.config import ensure_house_rules_file
+
+    ensure_house_rules_file(vault_dir)
     print(f"Created/verified vault at {vault_dir}")
     if getattr(args, "no_index", False) and os.path.isfile(lexical_index_path):
         return 0
@@ -451,6 +467,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     for name, help_text in (
         ("api", "Run or configure the loopback 127.0.0.1 HTTP JSON Memory API."),
         ("inbox", "Inspect, promote, or reject quarantined 0-raw/inbox captures."),
+        ("owner", "Enroll an owner approval key and issue a short-lived approval grant."),
+        ("sources", "Review captured sources and search the ones you have approved."),
         ("hosts", "Inspect and configure per-host AI sharing consent policies."),
         ("cognitive", "Generate memory fitness reports, record feedback, and log experiences."),
         ("playbooks", "Inspect skill candidates and promote, verify, list, or deprecate owner-gated Playbooks."),
@@ -486,6 +504,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("clipper", "Pair, manage, and capture via the local-first Browser Web Clipper."),
         ("vault", "Manage isolated Multi-Vault Workspaces and opt-in cross-vault federated recall."),
         ("backup", "Create, cryptographically verify, or restore portable Three-Store .sbvault backups."),
+        ("restore", "Restore a .sbvault backup into the active vault (or --target)."),
+        ("jobs", "Show or run the persistent ingest, distill, and backup queue."),
+        ("eval", "Score a personal retrieval set with recall@k and MRR."),
         ("hook", "Install/manage git post-commit hooks and distill commits into Second Brain."),
         ("math", "Run DUP + ToRA sandboxed quantitative problem solving and 4D process rubric scoring."),
         ("proof", "Verify SafeVerify formal/algorithmic specs, check Lean readiness, and run proof search."),
@@ -573,11 +594,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
 _PASSTHROUGH_COMMANDS = frozenset({
     "api",
-    "inbox", "hosts", "cognitive", "playbooks", "playbook", "skills", "plan",
+    "inbox", "owner", "sources", "hosts", "cognitive", "playbooks", "playbook", "skills", "plan",
     "notes", "tasks", "capture", "import", "chat", "connect", "benchmark",
     "sota-benchmark", "live-benchmark", "third-party-benchmark", "ledger", "graph", "snapshot", "sync", "mobile", "media", "release",
     "models", "voice", "screen", "external", "proxy", "tunnel", "jarvis", "packs", "runtime", "clipper", "vault",
-    "backup", "hook", "math", "proof",
+    "backup", "restore", "jobs", "eval", "hook", "math", "proof",
     "recall", "answer", "review", "gates", "audit",
     "rebuild-lexical", "rebuild-vectors",
     "refinery", "editor", "scout", "ingest", "daemon", "mcp",
@@ -755,6 +776,14 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.inbox_workflow import main as inbox_main
 
         return inbox_main(forwarded)
+    if command == "owner":
+        from scripts.owner_attestation import main as owner_main
+
+        return owner_main(forwarded)
+    if command == "sources":
+        from scripts.source_review import main as sources_main
+
+        return sources_main(forwarded)
     if command == "hosts":
         from scripts.host_adapters import main as hosts_main
 
@@ -786,8 +815,32 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         p.add_argument("--tag", "--tags", dest="tags", action="append", default=[], help="Optional tag or comma-separated tags (repeatable).")
         p.add_argument("--stdin", action="store_true", help="Read note body from stdin.")
         p.add_argument("--json", action="store_true", help="Emit JSON output.")
+        p.add_argument("--background", action="store_true", help="Enqueue the capture and return without waiting.")
         args = p.parse_args(forwarded)
         body_text = sys.stdin.read() if args.stdin else " ".join(args.text)
+        if args.background:
+            from scripts.job_queue import enqueue
+
+            if not body_text.strip():
+                p.error("Provide capture text or --stdin.")
+            vault_dir, _, _ = _resolve_active_vault_paths()
+            parsed_tags = [
+                part.strip()
+                for raw in (args.tags or [])
+                for part in str(raw).split(",")
+                if part.strip()
+            ]
+            job_id = enqueue(
+                "capture",
+                {
+                    "title": args.title,
+                    "body": body_text,
+                    "tags": parsed_tags,
+                    "brain_dir": vault_dir,
+                },
+            )
+            print(json.dumps({"job_id": job_id, "status": "queued"}))
+            return 0
         if not body_text.strip():
             p.error("Provide capture text or --stdin.")
         parsed_tags = [
@@ -915,6 +968,42 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.vault_backup import main as backup_main
 
         return backup_main(forwarded)
+    if command == "restore":
+        import argparse as _argparse
+
+        from scripts.config import resolve_active_brain_dir
+        from scripts.vault_backup import _resolve_cli_passphrase, restore_vault_backup
+
+        parser = _argparse.ArgumentParser(
+            prog="second-brain restore",
+            description="Verify a .sbvault archive and restore it in one command.",
+        )
+        parser.add_argument("backup", help="Path to the .sbvault archive.")
+        parser.add_argument("--target", default=None, help="Destination vault. Defaults to the active vault.")
+        parser.add_argument("--passphrase", default=None)
+        parser.add_argument("--passphrase-env", default=None)
+        parser.add_argument("--unencrypted", action="store_true")
+        parser.add_argument("--force", action="store_true", help="Overwrite a non-empty target after a safety backup.")
+        ns = parser.parse_args(forwarded)
+        passphrase = None
+        if not ns.unencrypted:
+            passphrase = _resolve_cli_passphrase(
+                passphrase_arg=ns.passphrase,
+                passphrase_env=ns.passphrase_env,
+                unencrypted=False,
+            )
+        target = ns.target or resolve_active_brain_dir()
+        result = restore_vault_backup(ns.backup, target, passphrase=passphrase, force=bool(ns.force))
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+    if command == "jobs":
+        from scripts.job_queue import main as jobs_main
+
+        return jobs_main(forwarded)
+    if command == "eval":
+        from scripts.personal_eval import main as eval_main
+
+        return eval_main(forwarded)
     if command == "hook":
         from scripts.git_distiller import main as hook_main
 

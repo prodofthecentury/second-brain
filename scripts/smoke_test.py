@@ -6,12 +6,29 @@
 #     "chromadb",
 # ]
 # ///
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 """
 Lightweight project smoke checks.
 
 This avoids importing runtime-heavy modules so it can run before Ollama,
 ChromaDB, Streamlit, or Whisper dependencies are installed.
 """
+
+
 
 import pathlib
 import json
@@ -20,7 +37,7 @@ import hashlib
 from contextlib import redirect_stdout
 from io import StringIO
 
-from config import (
+from scripts.config import (
     ARCHIVE_MANIFEST,
     ATOMS_DIR,
     BRAIN_DIR,
@@ -31,12 +48,12 @@ from config import (
     safe_vault_reference,
     vault_relative_path,
 )
-from memory_format import extract_memory_documents, normalize_memory_document
-from memory_review import list_review_queue, parse_atom_record
-from recall import RecallOptions, rerank_candidates
-from answer_policy import NO_APPROVED_MEMORY_RESPONSE, UNVALIDATED_DRAFT_RESPONSE, answer_from_memory
-from refinery_targets import intake_status, is_supported_refinery_target
-from vector_store import JsonVectorCollection, json_collection_path, reset_vector_collection
+from scripts.memory_format import extract_memory_documents, normalize_memory_document
+from scripts.memory_review import list_review_queue, parse_atom_record
+from scripts.recall import RecallOptions, rerank_candidates
+from scripts.answer_policy import NO_APPROVED_MEMORY_RESPONSE, UNVALIDATED_DRAFT_RESPONSE, answer_from_memory
+from scripts.refinery_targets import intake_status, is_supported_refinery_target
+from scripts.vector_store import JsonVectorCollection, json_collection_path, reset_vector_collection
 
 
 def check(condition: bool, message: str):
@@ -261,8 +278,8 @@ def test_dashboard_has_noninteractive_local_streamlit_configuration():
 
 
 def test_embedding_failure_is_explicit_and_never_returns_a_fabricated_vector():
-    import ollama_utils
-    from ollama_utils import EmbeddingUnavailableError, embed_text
+    import scripts.ollama_utils as ollama_utils
+    from scripts.ollama_utils import EmbeddingUnavailableError, embed_text
 
     original_embed = ollama_utils.ollama.embed
 
@@ -282,8 +299,8 @@ def test_embedding_failure_is_explicit_and_never_returns_a_fabricated_vector():
 
 
 def test_rebuild_refuses_to_reset_an_index_before_embedding_preflight_succeeds():
-    import rebuild_vectors
-    from ollama_utils import EmbeddingUnavailableError
+    import scripts.rebuild_vectors as rebuild_vectors
+    from scripts.ollama_utils import EmbeddingUnavailableError
 
     original_embed_text = rebuild_vectors.embed_text
     original_reset = rebuild_vectors.reset_vector_collection
@@ -313,7 +330,7 @@ def test_rebuild_refuses_to_reset_an_index_before_embedding_preflight_succeeds()
 
 
 def test_rebuild_preserves_the_active_index_when_a_staged_embedding_fails():
-    import rebuild_vectors
+    import scripts.rebuild_vectors as rebuild_vectors
 
     original_embed_text = rebuild_vectors.embed_text
 
@@ -370,8 +387,8 @@ def test_rebuild_preserves_the_active_index_when_a_staged_embedding_fails():
 
 
 def test_rebuild_activates_only_a_complete_generation_and_keeps_a_rollback_backup():
-    import rebuild_vectors
-    from index_manifest import index_manifest_is_current, load_index_manifest
+    import scripts.rebuild_vectors as rebuild_vectors
+    from scripts.index_manifest import index_manifest_is_current, load_index_manifest
 
     original_embed_text = rebuild_vectors.embed_text
 
@@ -434,7 +451,7 @@ def test_rebuild_activates_only_a_complete_generation_and_keeps_a_rollback_backu
 
 
 def test_index_manifest_detects_changed_atom_revisions():
-    from index_manifest import build_index_manifest, index_manifest_is_current
+    from scripts.index_manifest import build_index_manifest, index_manifest_is_current
 
     with tempfile.TemporaryDirectory() as temp_dir:
         atoms_dir = pathlib.Path(temp_dir) / "atoms"
@@ -459,8 +476,8 @@ def test_index_manifest_detects_changed_atom_revisions():
 
 
 def test_recall_requires_a_current_matching_index_generation():
-    from index_manifest import build_index_manifest
-    from recall import MemoryRecallUnavailable, validated_index_generation
+    from scripts.index_manifest import build_index_manifest
+    from scripts.recall import MemoryRecallUnavailable, validated_index_generation
 
     with tempfile.TemporaryDirectory() as temp_dir:
         atoms_dir = pathlib.Path(temp_dir) / "atoms"
@@ -500,7 +517,7 @@ def test_recall_requires_a_current_matching_index_generation():
 
 
 def test_owner_review_uses_compare_and_swap_and_records_a_decision():
-    from review_atom import ReviewConflictError, apply_review_transition
+    from scripts.review_atom import ReviewConflictError, apply_review_transition
 
     atom = """---
 id: reviewable-memory
@@ -586,8 +603,8 @@ Anchored source evidence.
 
 def test_editor_reads_only_currently_approved_atoms_and_never_overwrites_threads():
     from unittest.mock import patch
-    from review_atom import apply_review_transition
-    import ollama_editor
+    from scripts.review_atom import apply_review_transition
+    import scripts.ollama_editor as ollama_editor
 
     atom = """---
 id: reviewed-source
@@ -649,7 +666,7 @@ This source sentence is long enough to anchor the evidence.
 
 
 def test_stable_file_wait_rejects_empty_and_missing_files():
-    from stable_file import wait_for_stable_file
+    from scripts.stable_file import wait_for_stable_file
 
     with tempfile.TemporaryDirectory() as temp_dir:
         stable = pathlib.Path(temp_dir) / "stable.md"
@@ -662,7 +679,7 @@ def test_stable_file_wait_rejects_empty_and_missing_files():
 
 
 def test_web_scout_rejects_private_targets_and_quarantines_remote_intake():
-    from ollama_scout import UnsafeRemoteUrlError, create_intake_pointer, validate_remote_url
+    from scripts.ollama_scout import UnsafeRemoteUrlError, create_intake_pointer, validate_remote_url
 
     for unsafe_url in ("http://127.0.0.1", "http://localhost:11434", "file:///etc/passwd"):
         try:
@@ -843,7 +860,7 @@ Invalid status reason.
 
 
 def test_refinery_defers_when_generation_is_unavailable_instead_of_writing_a_fallback_atom():
-    import ollama_refinery
+    import scripts.ollama_refinery as ollama_refinery
 
     original_chat = ollama_refinery.chat_with_fallback
 
@@ -1050,8 +1067,8 @@ Accepted evidence.
 
 
 def test_lexical_index_is_rebuildable_safe_and_trust_filtered():
-    from lexical_store import LexicalIndexUnavailable, lexical_index_is_current, rebuild_lexical_index, search_lexical_index
-    from recall import search_lexical_memory
+    from scripts.lexical_store import LexicalIndexUnavailable, lexical_index_is_current, rebuild_lexical_index, search_lexical_index
+    from scripts.recall import search_lexical_memory
 
     accepted_atom = """---
 id: lexical-accepted

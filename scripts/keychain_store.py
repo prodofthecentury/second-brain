@@ -33,10 +33,9 @@ import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import _is_reparse_or_link, security_state_dir  # noqa: E402
-from host_adapters import restrict_security_file_permissions  # noqa: E402
+from scripts.config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, security_state_dir  # noqa: E402
+from scripts.host_adapters import restrict_security_file_permissions  # noqa: E402
 
 
 class KeychainError(RuntimeError):
@@ -77,6 +76,8 @@ def _entry_slug(service: str, account: str) -> str:
 
 def _assert_safe_keychain_file(path: Path) -> None:
     for candidate in (path, *path.parents):
+        if _is_immutable_darwin_root_symlink(candidate):
+            continue
         if os.path.lexists(str(candidate)) and _is_reparse_or_link(str(candidate)):
             raise KeychainError(f"Refusing to access keychain secret through symlink or reparse point: {candidate}")
 

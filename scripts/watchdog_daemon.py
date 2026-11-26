@@ -25,7 +25,24 @@ Run this once and leave it running:
     uv run scripts/watchdog_daemon.py
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import datetime
@@ -45,9 +62,8 @@ except ImportError:  # Clean minimal wheel without optional [watchdog] extra
     FileSystemEventHandler = object  # type: ignore[assignment,misc]
     Observer = None  # type: ignore[assignment,misc]
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from atom_mutator import atomic_write_bytes, review_lock
-from config import (
+from scripts.atom_mutator import atomic_write_bytes, review_lock
+from scripts.config import (
     ATOMS_DIR,
     AUDIO_EXTS,
     BRAIN_DIR,
@@ -63,9 +79,9 @@ from config import (
     _is_reparse_or_link,
     ensure_dirs,
 )
-from hardware_profile import HardwareCapabilityProfile, detect_hardware_profile
-from refinery_targets import intake_status, is_supported_refinery_target
-from stable_file import wait_for_stable_file
+from scripts.hardware_profile import HardwareCapabilityProfile, detect_hardware_profile
+from scripts.refinery_targets import intake_status, is_supported_refinery_target
+from scripts.stable_file import wait_for_stable_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -200,7 +216,7 @@ def can_auto_run_stage(ext: str, profile: HardwareCapabilityProfile) -> tuple[bo
     if ext in DOC_EXTS:
         return True, "deterministic_document_extractor"
     if ext in VIDEO_ONLY_EXTS:
-        from video_extractor import resolve_ffmpeg_tools
+        from scripts.video_extractor import resolve_ffmpeg_tools
 
         ffmpeg_bin, _ = resolve_ffmpeg_tools()
         if not ffmpeg_bin and not _has_module("av"):
@@ -261,7 +277,7 @@ def handle_new_file(filepath: str) -> str | list[str] | None:
     if ext in DOC_EXTS:
         log.info("→ Routing to deterministic document extractor...")
         try:
-            import ingest_multimodal as im_mod
+            import scripts.ingest_multimodal as im_mod
 
             im_mod.RAW_DIR = RAW_DIR
             im_mod.INBOX_DIR = os.path.join(RAW_DIR, "inbox")
@@ -287,7 +303,7 @@ def handle_new_file(filepath: str) -> str | list[str] | None:
             return None
         log.info("→ Routing to multimodal ingestion...")
         try:
-            import ingest_multimodal as im_mod
+            import scripts.ingest_multimodal as im_mod
 
             im_mod.RAW_DIR = RAW_DIR
             im_mod.INBOX_DIR = os.path.join(RAW_DIR, "inbox")
@@ -308,7 +324,7 @@ def handle_new_file(filepath: str) -> str | list[str] | None:
             return None
         log.info("→ Routing to Refinery...")
         try:
-            from ollama_refinery import process_single_file
+            from scripts.ollama_refinery import process_single_file
 
             saved = process_single_file(filepath)
             _clear_deferred_capture(filename, raw_dir=RAW_DIR)
@@ -453,7 +469,7 @@ def sync_notes_index_for_vault(*, brain_dir: str | None = None, notes_dir: str |
     """Incrementally sync notes.sqlite3 FTS5 for brain/notes/ (100% model-free)."""
     from dataclasses import replace as _dc_replace
     from pathlib import Path as _Path
-    from notes_store import NotePaths, ensure_notes_index
+    from scripts.notes_store import NotePaths, ensure_notes_index
 
     resolved_brain = os.path.abspath(brain_dir or os.path.dirname(os.path.abspath(notes_dir or NOTES_DIR)))
     npaths = NotePaths.for_brain(resolved_brain)
@@ -474,9 +490,9 @@ def sync_atoms_and_detect_stale_anchors(
     sync_vectors: bool = True,
 ) -> dict[str, object]:
     """Incrementally sync lexical.sqlite3 FTS5, O(1) Chroma vectors (when active), and stale-anchor detection on 2-atoms/."""
-    from audit_sources import audit_sources
-    from index_manifest import index_manifest_is_current, load_index_manifest
-    from lexical_store import sync_lexical_index
+    from scripts.audit_sources import audit_sources
+    from scripts.index_manifest import index_manifest_is_current, load_index_manifest
+    from scripts.lexical_store import sync_lexical_index
 
     resolved_atoms = os.path.abspath(
         atoms_dir or (os.path.join(brain_dir, "2-atoms") if brain_dir else ATOMS_DIR)
@@ -504,7 +520,7 @@ def sync_atoms_and_detect_stale_anchors(
                     vector_sync = {"status": "already_current", "generation_id": manifest.get("generation_id")}
                 else:
                     try:
-                        import rebuild_vectors as _rv_mod
+                        import scripts.rebuild_vectors as _rv_mod
 
                         vec_res = _rv_mod.upsert_changed_vectors(
                             atoms_dir=resolved_atoms,
@@ -699,7 +715,7 @@ def run_daemon(*, once: bool = False, auto_sync: bool = False, sync_interval: in
             lexical_index_path=LEXICAL_INDEX_PATH,
         )
         if auto_sync:
-            from vault_sync import run_auto_sync_cycle
+            from scripts.vault_sync import run_auto_sync_cycle
 
             run_auto_sync_cycle(brain_dir=BRAIN_DIR)
         return 0
@@ -711,7 +727,7 @@ def run_daemon(*, once: bool = False, auto_sync: bool = False, sync_interval: in
 
     sync_sched = None
     try:
-        from vault_sync import AutoSyncScheduler, get_auto_sync_status
+        from scripts.vault_sync import AutoSyncScheduler, get_auto_sync_status
 
         auto_st = get_auto_sync_status(brain_dir=BRAIN_DIR)
         if auto_sync or bool(auto_st.get("enabled")):

@@ -1,0 +1,95 @@
+name: Advanced runtimes
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advanced-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lora-lean-tunnels:
+    name: Linux real LoRA, Lean, and tunnel binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Install Python 3.11 and the locked environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11
+
+      - name: Install CPU torch, transformers, and peft
+        run: |
+          uv pip install --python .venv/bin/python \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch
+          uv pip install --python .venv/bin/python transformers peft
+
+      - name: Install Lean via elan
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.14.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Install cloudflared and tailscale binaries
+        run: |
+          curl -fsSL -o /tmp/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/2025.8.1/cloudflared-linux-amd64"
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+          curl -fsSL -o /tmp/tailscale.tgz "https://pkgs.tailscale.com/stable/tailscale_1.76.6_amd64.tgz"
+          tar -xzf /tmp/tailscale.tgz -C /tmp
+          sudo install -m 0755 /tmp/tailscale_1.76.6_amd64/tailscale /usr/local/bin/tailscale
+
+      - name: Train a tiny LoRA, check a Lean file, and run tunnel version probes
+        env:
+          BRAIN_REQUIRE_LORA: "1"
+          BRAIN_REQUIRE_LEAN: "1"
+          BRAIN_REQUIRE_CLOUDFLARED: "1"
+          BRAIN_REQUIRE_TAILSCALE: "1"
+        run: |
+          uv run --locked --python 3.11 python -m unittest \
+            scripts.real_runtime_tests.RealRuntimeTests.test_lora_training_loop_or_a_clear_missing_dependency_error \
+            scripts.real_runtime_tests.RealRuntimeTests.test_lean_checks_a_real_file_when_the_toolchain_is_installed \
+            scripts.real_runtime_tests.RealRuntimeTests.test_tunnel_binaries_report_their_real_version_when_installed
+
+  ollama-debate:
+    name: Linux Ollama cited debate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Install Python 3.11 and the locked environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11
+
+      - name: Install Ollama and pull qwen2.5:0.5b
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve > /tmp/ollama.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:11434/api/tags && break
+            sleep 2
+          done
+          ollama pull qwen2.5:0.5b
+
+      - name: Run a cited debate against the live model
+        env:
+          BRAIN_REQUIRE_OLLAMA: "1"
+          BRAIN_OLLAMA_DEBATE_MODEL: "qwen2.5:0.5b"
+        run: |
+          uv run --locked --python 3.11 python -m unittest \
+            scripts.real_runtime_tests.RealRuntimeTests.test_ollama_debate_uses_a_live_model_and_drops_uncited_claims

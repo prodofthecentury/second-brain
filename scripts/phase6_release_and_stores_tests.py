@@ -6,7 +6,24 @@
 detached Ed25519 manifest signatures, and mobile Fastlane/CI pipeline tests.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import hashlib
 import json
@@ -25,15 +42,47 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import httpx
 import yaml
 
+_DMG_NOTARIZE_BEHAVIOR_SCRIPT = r"""
+const hookMod = require("./desktop/build/afterAllArtifactBuild.js");
+const calls = [];
+const fakeExec = (cmd, args) => { calls.push([cmd, args]); };
+const env = {
+  SIMULATED_PLATFORM: "darwin",
+  CSC_NAME: "Developer ID Application: Example",
+  APPLE_ID: "dev@example.com",
+  APPLE_APP_SPECIFIC_PASSWORD: "app-specific",
+  APPLE_TEAM_ID: "TEAMID1234",
+};
+(async () => {
+  const skipped = await hookMod.default(
+    { artifactPaths: ["dist/Second-Brain-1.0.0-universal.dmg"] },
+    {},
+    fakeExec
+  );
+  if (!skipped || calls.length !== 0) process.exit(2);
+  calls.length = 0;
+  const res = await hookMod.default(
+    { artifactPaths: ["dist/Second-Brain-1.0.0-universal.dmg"] },
+    env,
+    fakeExec
+  );
+  if (!res || res.length !== 1 || calls.length !== 4) process.exit(3);
+  const submit = calls[0];
+  if (submit[0] !== "xcrun" || submit[1][0] !== "notarytool" || submit[1][1] !== "submit") process.exit(4);
+  if (submit[1][2] !== "dist/Second-Brain-1.0.0-universal.dmg" || !submit[1].includes("--apple-id")) process.exit(5);
+  if (calls[1][1][0] !== "stapler" || calls[1][1][1] !== "staple") process.exit(6);
+  if (calls[3][0] !== "spctl") process.exit(7);
+  console.log(calls.map((c) => [c[0], ...c[1]].join(" ")).join("\n"));
+})().catch((err) => { console.error(err); process.exit(1); });
+"""
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 class Phase6ReleaseAndStoresTests(unittest.TestCase):
     def test_chrome_web_store_v2_and_v1_fallback_and_dry_run(self) -> None:
-        import publish_registries as pr
+        import scripts.publish_registries as pr
 
         with tempfile.TemporaryDirectory(prefix="sb_cws_test_") as td:
             zpath = Path(td) / "clipper.zip"
@@ -94,7 +143,7 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
                 self.assertTrue(any("/v1.1/items/ext-11/publish" in u for u in v1_calls))
 
     def test_firefox_amo_polling_and_version_create_and_edge_polling(self) -> None:
-        import publish_registries as pr
+        import scripts.publish_registries as pr
 
         with tempfile.TemporaryDirectory(prefix="sb_amo_edge_") as td:
             xpi = Path(td) / "clipper.xpi"
@@ -173,7 +222,7 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
                 self.assertEqual(edge_polls["n"], 2)
 
     def test_pypi_vsix_ovsx_publishers_and_setup_wizard_never_leak_secrets(self) -> None:
-        import publish_registries as pr
+        import scripts.publish_registries as pr
 
         with tempfile.TemporaryDirectory(prefix="sb_pypi_vsix_") as td:
             dist = Path(td)
@@ -229,7 +278,7 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
         self.assertTrue(any("PYPI_API_TOKEN" in r["secrets"] for r in wiz["registries"]))
 
     def test_ed25519_manifest_signature_roundtrip_and_tamper_rejection(self) -> None:
-        import verify_release_signatures as vrs
+        import scripts.verify_release_signatures as vrs
 
         priv = Ed25519PrivateKey.generate()
         priv_pem = priv.private_bytes(
@@ -264,48 +313,95 @@ class Phase6ReleaseAndStoresTests(unittest.TestCase):
         self.assertIn("manifest_ed25519_configured", readiness)
 
     def test_sign_release_ps1_and_outer_dmg_after_all_artifact_build_hook(self) -> None:
+        from scripts.signing_plan import SigningPlanError, plan_authenticode
+
+        azure = plan_authenticode(
+            file_path="Second Brain.exe",
+            azure_endpoint="https://eus.codesigning.azure.net",
+            azure_account="second-brain",
+            azure_profile="release",
+            dlib_path=r"C:\Azure.CodeSigning.Dlib.dll",
+        )
+        self.assertEqual(azure["backend"], "azure_dlib")
+        argv = list(azure["argv"])
+        self.assertEqual(argv[:6], ["signtool", "sign", "/v", "/fd", "SHA256", "/tr"])
+        self.assertEqual(argv[6], "https://timestamp.acs.microsoft.com")
+        self.assertIn("/dlib", argv)
+        self.assertIn("/dmdf", argv)
+        self.assertEqual(azure["timestamp_urls"], [
+            "https://timestamp.acs.microsoft.com",
+            "https://timestamp.digicert.com",
+        ])
+        hsm = plan_authenticode(
+            file_path="setup.exe",
+            csp_name="SafeNet Smart Card Key Storage Provider",
+            key_container="second-brain",
+            cert_file="cert.cer",
+        )
+        self.assertEqual(hsm["backend"], "hsm_csp")
+        self.assertIn("/csp", hsm["argv"])
+        skipped = plan_authenticode(file_path="setup.exe")
+        self.assertEqual(skipped["backend"], "skip")
+        self.assertEqual(skipped["argv"], [])
+        dev = plan_authenticode(file_path="setup.exe", self_signed=True)
+        self.assertEqual(dev["timestamp_urls"], [])
+        with self.assertRaises(SigningPlanError):
+            plan_authenticode(file_path="setup.exe", self_signed=True, require_trusted=True)
+        with self.assertRaises(SigningPlanError):
+            plan_authenticode(file_path="setup.exe", require_trusted=True)
+
         ps_src = (REPO_ROOT / "scripts" / "sign_release.ps1").read_text(encoding="utf-8")
-        self.assertIn("https://timestamp.acs.microsoft.com", ps_src)
-        self.assertIn("https://timestamp.digicert.com", ps_src)
+        for url in azure["timestamp_urls"]:
+            self.assertIn(url, ps_src)
         self.assertNotIn('"http://timestamp.acs.microsoft.com"', ps_src)
         self.assertIn("Azure.CodeSigning.Dlib.dll", ps_src)
-        self.assertIn("/dlib", ps_src)
-        self.assertIn("/dmdf", ps_src)
+
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if pwsh:
+            with tempfile.TemporaryDirectory(prefix="sb_sign_") as td:
+                dist = Path(td)
+                (dist / "notes.txt").write_text("not a binary\n", encoding="utf-8")
+                proc = subprocess.run(
+                    [
+                        pwsh,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-File",
+                        str(REPO_ROOT / "scripts" / "sign_release.ps1"),
+                        "-DistDir",
+                        str(dist),
+                        "-SkipManifest",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=60,
+                )
+                self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+                self.assertIn("skipping Authenticode", proc.stdout)
 
         desktop_pkg = json.loads((REPO_ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(desktop_pkg["build"].get("afterAllArtifactBuild"), "./build/afterAllArtifactBuild.js")
 
         hook_path = REPO_ROOT / "desktop" / "build" / "afterAllArtifactBuild.js"
         self.assertTrue(hook_path.is_file())
-        hook_src = hook_path.read_text(encoding="utf-8")
-        self.assertIn("notarytool", hook_src)
-        self.assertIn("stapler", hook_src)
-        self.assertIn("spctl", hook_src)
-        self.assertIn(".dmg", hook_src)
 
         node_bin = shutil.which("node")
         if node_bin:
             proc = subprocess.run(
-                [
-                    node_bin,
-                    "-e",
-                    (
-                        "const hook = require('./desktop/build/afterAllArtifactBuild.js').default;"
-                        "(async () => {"
-                        "  const res = await hook({ artifactPaths: ['dist/Second-Brain-1.0.0-universal.dmg'], configuration: {} });"
-                        "  if (!res || res.length !== 1) process.exit(2);"
-                        "})().catch((e) => { console.error(e); process.exit(1); });"
-                    ),
-                ],
+                [node_bin, "-e", _DMG_NOTARIZE_BEHAVIOR_SCRIPT],
                 cwd=str(REPO_ROOT),
                 capture_output=True,
                 text=True,
                 check=False,
             )
             self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+            self.assertIn("notarytool", proc.stdout)
+            self.assertIn("stapler", proc.stdout)
+            self.assertIn("spctl", proc.stdout)
 
     def test_homebrew_cask_bundle_id_and_macos_only_manifest_decoupling(self) -> None:
-        from build_distribution_manifests import build_package_manager_manifests
+        from scripts.build_distribution_manifests import build_package_manager_manifests
 
         with tempfile.TemporaryDirectory(prefix="sb_mac_mf_") as td:
             dist = Path(td)

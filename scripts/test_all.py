@@ -13,7 +13,24 @@ Run:
     uv run python scripts/test_all.py
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from datetime import datetime, timezone
@@ -26,6 +43,21 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT / "scripts"
+
+
+def _configure_utf8_stdio() -> None:
+    """Child suites print ✓. The Windows cp1252 console must not hide their output."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+_configure_utf8_stdio()
 
 
 SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -125,6 +157,31 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "bugfix_1a_regression_tests.py")),
     ),
     (
+        "honesty_regression_tests",
+        "POSIX directory permissions, owner-grant approvals, captured-source search, and MCP tool-count docs (scripts/honesty_regression_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "honesty_regression_tests.py")),
+    ),
+    (
+        "advanced_module_behavior_tests",
+        "Behaviour checks for optional advanced modules (orchestrator, proofs, sandbox, tunnel, LoRA, world model, TTS, video, screen, curiosity, skill packs)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "advanced_module_behavior_tests.py")),
+    ),
+    (
+        "real_runtime_tests",
+        "Real ffmpeg frames, espeak WAV, screen PNG, n8n HTTP, LoRA loop, Lean, Ollama debate, and tunnel binaries when installed",
+        ("-m", "unittest", str(SCRIPTS_DIR / "real_runtime_tests.py")),
+    ),
+    (
+        "speed_restore_tests",
+        "Embedding cache, job queue, personal eval, remote Ollama host policy, and one-command restore",
+        ("-m", "unittest", str(SCRIPTS_DIR / "speed_restore_tests.py")),
+    ),
+    (
+        "fifth_pass_tests",
+        "House rules, explicit generation model, lexical rerank, personal eval labels, and distill repair",
+        ("-m", "unittest", str(SCRIPTS_DIR / "fifth_pass_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),
@@ -141,7 +198,7 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "parity_1c_tests",
-        "1C cross-layer parity: bi-temporal graph API/SDK, 27-tool MCP + ONNX NLI, CLI commands & PWA/clipper manifests/icons (scripts/parity_1c_tests.py)",
+        "1C cross-layer parity: bi-temporal graph API/SDK, 35-tool MCP + ONNX NLI, CLI commands & PWA/clipper manifests/icons (scripts/parity_1c_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "parity_1c_tests.py")),
     ),
     (

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 import stat
@@ -75,8 +76,26 @@ def _current_windows_principal() -> str | None:
     return _CACHED_WINDOWS_USER or None
 
 
+def _is_directory_nofollow(path: Path) -> bool:
+    """True when path is a directory and not a symlink (symlinks are never chmod'd here)."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _posix_owner_mode(path: Path) -> int:
+    """Directories need the execute bit or the owner cannot create or open files inside them."""
+    return 0o700 if _is_directory_nofollow(path) else 0o600
+
+
 def restrict_security_file_permissions(path: Path | str) -> None:
-    """Enforce owner-only permissions on POSIX (0o700/0o600) and Windows NTFS DACLs."""
+    """Enforce owner-only permissions on POSIX (0o700 for directories, 0o600 for files) and Windows NTFS DACLs.
+
+    Callers pass both secret files and the directories that hold them (mobile pairing,
+    ONNX downloads, inbox ledgers). A directory must keep the owner execute bit; 0o600
+    on a directory removes it and the next create/open fails with PermissionError on POSIX.
+    """
     try:
         path = Path(path)
         if _is_reparse_or_link(str(path)):
@@ -85,9 +104,9 @@ def restrict_security_file_permissions(path: Path | str) -> None:
         parent_is_link = os.path.lexists(str(parent)) and _is_reparse_or_link(str(parent))
         if os.name != "nt":
             if not parent_is_link and parent.exists():
-                os.chmod(parent, 0o700)
+                os.chmod(parent, _posix_owner_mode(parent))
             if path.exists():
-                os.chmod(path, 0o600)
+                os.chmod(path, _posix_owner_mode(path))
             return
         icacls_exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
         if not os.path.exists(icacls_exe):
@@ -122,33 +141,64 @@ def restrict_security_file_permissions(path: Path | str) -> None:
         if not parent_is_link and parent.exists() and parent.name in _HARDENED_WIN_PARENT_DIRS:
             _harden_win_dir(parent)
         if path.exists():
-            subprocess.run(
-                [
-                    icacls_exe,
-                    str(path),
-                    "/inheritance:r",
-                    "/grant:r",
-                    "*S-1-5-18:(F)",
-                    "*S-1-5-32-544:(F)",
-                    f"{principal}:(F)",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15.0,
-                check=False,
-            )
+            if _is_directory_nofollow(path):
+                _harden_win_dir(path)
+            else:
+                subprocess.run(
+                    [
+                        icacls_exe,
+                        str(path),
+                        "/inheritance:r",
+                        "/grant:r",
+                        "*S-1-5-18:(F)",
+                        "*S-1-5-32-544:(F)",
+                        f"{principal}:(F)",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15.0,
+                    check=False,
+                )
     except OSError:
         pass
 
 
 def read_bounded_security_file(path: Path | str, *, max_bytes: int = MAX_POLICY_FILE_BYTES) -> str:
-    """Read a security config/token file safely, rejecting symlinks/reparse points and oversized files."""
-    path = Path(path)
-    if os.path.lexists(str(path)) and _is_reparse_or_link(str(path)):
-        raise PermissionError(f"Refusing to read security file via symlink or reparse point: {path}")
-    if os.path.lexists(str(path.parent)) and _is_reparse_or_link(str(path.parent)):
-        raise PermissionError(f"Refusing to read security file under symlinked directory: {path.parent}")
-    stat_info = path.stat()
-    if stat_info.st_size > max_bytes:
-        raise PermissionError(f"Security file exceeds maximum allowed size ({max_bytes} bytes): {path}")
-    return path.read_text(encoding="utf-8")
+    """Read a security config/token file safely via O_NOFOLLOW + fstat(fd), rejecting symlinks/reparse points and oversized files."""
+    p = Path(path)
+    eff_max = max(0, int(max_bytes))
+    if os.path.lexists(str(p)) and _is_reparse_or_link(str(p)):
+        raise PermissionError(f"Refusing to read security file via symlink or reparse point: {p}")
+    seen_ancestors: set[Path] = {p}
+    for anc in (p.parent, p.parent.parent):
+        if anc in seen_ancestors:
+            continue
+        seen_ancestors.add(anc)
+        if os.path.lexists(str(anc)) and _is_reparse_or_link(str(anc)):
+            raise PermissionError(f"Refusing to read security file under symlinked directory: {anc}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(str(p), flags)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise PermissionError(f"Refusing to read security file via symlink or reparse point: {p}") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"Refusing to read non-regular security file: {p}")
+        if st.st_size > eff_max:
+            raise PermissionError(f"Security file exceeds maximum allowed size ({eff_max} bytes): {p}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(8192, (eff_max + 1) - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > eff_max:
+                raise PermissionError(f"Security file exceeds maximum allowed size ({eff_max} bytes): {p}")
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")

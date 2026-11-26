@@ -2,12 +2,29 @@
 # requires-python = ">=3.11,<3.14"
 # dependencies = []
 # ///
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 """
 Second Brain health check.
 
 Run:
     uv run scripts/doctor.py
 """
+
+
 
 import ctypes
 import importlib.util
@@ -20,7 +37,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from config import (
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     BRIEFINGS_DIR,
@@ -42,17 +59,17 @@ from config import (
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from hardware_profile import (
+from scripts.hardware_profile import (
     _NoRedirectHandler,
     detect_hardware_profile,
     fetch_loopback_json,
     loopback_ollama_base_url,
     resolve_active_local_generation_model,
 )
-from index_manifest import index_manifest_is_current, load_index_manifest
-from lexical_store import lexical_index_is_current
-from review_atom import approved_revision_is_current
-from vector_store import JsonVectorCollection, close_vector_collection, get_vector_collection, json_collection_path
+from scripts.index_manifest import index_manifest_is_current, load_index_manifest
+from scripts.lexical_store import lexical_index_is_current
+from scripts.review_atom import approved_revision_is_current
+from scripts.vector_store import JsonVectorCollection, close_vector_collection, get_vector_collection, json_collection_path
 
 
 def ok(area: str, detail: str) -> tuple[str, str, str]:
@@ -331,20 +348,43 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     else:
         checks.append(warn("approved memories", "No atom has current verifiable owner approval; recall will return no memories"))
 
-    ollama_base = loopback_ollama_base_url()
-    models_payload = fetch_json(f"{ollama_base}/api/tags") if ollama_base else None
-    if ollama_base is None:
-        checks.append(warn("ollama", "OLLAMA_HOST is not bound to http://127.0.0.1; remote Ollama probe refused for safety"))
-        names = set()
-        vision_names = set()
-    elif models_payload is None:
-        checks.append(warn("ollama", "Ollama is not reachable; local lexical recall remains available, generation and dense indexing are unavailable"))
-        names = set()
-        vision_names = set()
+    from scripts.ollama_endpoint import fetch_ollama_tags, ollama_host_warning, resolved_ollama_base_url
+
+    resolved_base, ollama_source = resolved_ollama_base_url()
+    host_warning = ollama_host_warning()
+    if ollama_source == "BRAIN_OLLAMA_HOST":
+        if host_warning and resolved_base:
+            checks.append(warn("ollama host", host_warning))
+        if resolved_base is None:
+            checks.append(warn("ollama", host_warning or "BRAIN_OLLAMA_HOST is not loopback or a private LAN address"))
+            names = set()
+            vision_names = set()
+            models_payload = None
+        else:
+            models_payload = fetch_ollama_tags(resolved_base, timeout=3.0)
+            if models_payload is None:
+                checks.append(warn("ollama", f"Ollama at {resolved_base} did not answer within 3 seconds"))
+                names = set()
+                vision_names = set()
+            else:
+                names = model_names(models_payload)
+                vision_names = vision_model_names(models_payload)
+                checks.append(ok("ollama", f"Ollama at {resolved_base} returned {len(models_payload.get('models', []))} model(s)"))
     else:
-        names = model_names(models_payload)
-        vision_names = vision_model_names(models_payload)
-        checks.append(ok("ollama", f"Ollama returned {len(models_payload.get('models', []))} model(s)"))
+        ollama_base = loopback_ollama_base_url()
+        models_payload = fetch_json(f"{ollama_base}/api/tags") if ollama_base else None
+        if ollama_base is None:
+            checks.append(warn("ollama", "OLLAMA_HOST is not bound to http://127.0.0.1; remote Ollama probe refused for safety"))
+            names = set()
+            vision_names = set()
+        elif models_payload is None:
+            checks.append(warn("ollama", "Ollama is not reachable; local lexical recall remains available, generation and dense indexing are unavailable"))
+            names = set()
+            vision_names = set()
+        else:
+            names = model_names(models_payload)
+            vision_names = vision_model_names(models_payload)
+            checks.append(ok("ollama", f"Ollama returned {len(models_payload.get('models', []))} model(s)"))
 
     active_gen_model = resolve_active_local_generation_model(fallback=GEN_MODEL)
     for label, model in [("generation model", active_gen_model), ("embedding model", EMBED_MODEL)]:
@@ -373,7 +413,7 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     active_playbooks = 0
     if playbook_total:
         try:
-            from skill_playbooks import list_playbooks
+            from scripts.skill_playbooks import list_playbooks
 
             reports = list_playbooks(
                 playbooks_dir=eff_playbooks,
@@ -390,7 +430,7 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     active_skills = 0
     if skill_total:
         try:
-            from executable_skills import list_executable_skills
+            from scripts.executable_skills import list_executable_skills
 
             sk_reports = list_executable_skills(
                 skills_dir=skills_dir,
@@ -414,7 +454,7 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
         checks.append(warn("notes", "Working notes directory not yet initialized; run `second-brain install`"))
 
     try:
-        from vault_ledger import verify_vault_ledger
+        from scripts.vault_ledger import verify_vault_ledger
 
         ledger_status = verify_vault_ledger(
             brain_dir=eff_brain,
@@ -439,13 +479,13 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     checks.append(
         ok(
             "capability tier",
-            f"{hw_profile.tier_label} (recommended={hw_profile.recommended_generation_model}, "
-            f"installed={hw_profile.selected_installed_generation_model or 'none'})",
+            f"{hw_profile.tier_label} (active={active_gen_model}, "
+            f"auto={hw_profile.selected_installed_generation_model or 'none'})",
         )
     )
 
     try:
-        from onnx_models import get_onnx_models_status
+        from scripts.onnx_models import get_onnx_models_status
 
         onnx_st = get_onnx_models_status(run_inference=False)
         ce_info = onnx_st["slots"]["cross-encoder"]
@@ -484,6 +524,10 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     inbox_count = count_files(eff_inbox, (".md", ".txt", ".intake"))
     checks.append(ok("raw queue", f"{raw_count} queued capture(s), {inbox_count} quarantined in 0-raw/inbox"))
     checks.append(ok("reading list", f"{queued_reading_items(eff_reading_list)} queued URL(s)"))
+
+    from scripts.runtime_capabilities import capability_checks
+
+    checks.extend(capability_checks())
 
     dashboard = fetch_text("http://127.0.0.1:8501/_stcore/health", timeout=2.0)
     if dashboard is None:

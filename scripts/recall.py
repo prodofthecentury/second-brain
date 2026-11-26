@@ -32,9 +32,9 @@ if __name__ in ("recall", "scripts.recall"):
     sys.modules.setdefault("recall", sys.modules[__name__])
     sys.modules.setdefault("scripts.recall", sys.modules[__name__])
 
-from atom_mutator import latest_decisions_by_atom
-from cross_encoder import rerank_recall_results
-from config import (
+from scripts.atom_mutator import latest_decisions_by_atom
+from scripts.cross_encoder import rerank_recall_results
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     CHROMA_PATH,
@@ -51,18 +51,18 @@ from config import (
     safe_file_in_dir,
     snapshot_module_defaults,
 )
-from index_manifest import cached_atom_hash_for_stat, index_manifest_is_current, load_index_manifest
-from lexical_store import (
+from scripts.index_manifest import cached_atom_hash_for_stat, index_manifest_is_current, load_index_manifest
+from scripts.lexical_store import (
     FTS_STOP_WORDS,
     TOKEN_PATTERN,
     _search_lexical_index_verified,
     porter_stem,
     search_lexical_index,
 )
-from memory_format import evaluate_temporal_validity, normalize_temporal_bound_str, split_frontmatter
-from memory_review import REVIEW_STATUSES, parse_atom_record, parse_atom_record_text, parse_scalar_list, section_text
-from review_atom import approved_revision_is_current
-from vector_store import close_vector_collection, get_vector_collection
+from scripts.memory_format import evaluate_temporal_validity, normalize_temporal_bound_str, split_frontmatter
+from scripts.memory_review import REVIEW_STATUSES, parse_atom_record, parse_atom_record_text, parse_scalar_list, section_text
+from scripts.review_atom import approved_revision_is_current
+from scripts.vector_store import close_vector_collection, get_vector_collection
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 _ORIG_APPROVED_REVISION_IS_CURRENT = approved_revision_is_current
@@ -151,6 +151,8 @@ class RecallOptions:
     use_l0_bus: bool = False
     enable_gravity_boost: bool = False
     enable_spreading_activation: bool = False
+    lexical_rrf_weight: float = 1.0
+    dense_rrf_weight: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -712,7 +714,7 @@ def _load_fitness_signals(
                     resolved_brain = os.path.dirname(parent)
         if resolved_brain:
             try:
-                from cognitive_core import load_durable_feedback_counts
+                from scripts.cognitive_core import load_durable_feedback_counts
 
                 dmap = load_durable_feedback_counts(resolved_brain)
                 dentry = dmap.get(filename) or {}
@@ -967,9 +969,10 @@ def candidate_has_semantic_corroboration(
     sim = cosine_distance_to_similarity(distance)
     literal_hits = len(query_terms.intersection(corroborating_terms))
     stem_hits = sum(1 for qt in query_terms if len(porter_stem(qt)) >= 4 and porter_stem(qt) in corroborating_stems)
-    if (literal_hits >= 1 or stem_hits >= 1) and sim >= 0.86:
-        return True
-    return sim >= 0.90
+    required = min(2, len(query_terms))
+    # Stems can stand in for a missing literal, but one shared word is not enough
+    # when the query has two or more meaningful terms. Vector score alone never is.
+    return (literal_hits + stem_hits) >= required and sim >= 0.86
 
 
 def wikilinks(content: str) -> list[str]:
@@ -1223,7 +1226,7 @@ def _apply_cognitive_boosts(
     gravity_map: dict[str, float] = {}
     if options.enable_gravity_boost:
         try:
-            from cognitive_core import compute_knowledge_gravity
+            from scripts.cognitive_core import compute_knowledge_gravity
 
             eff_db = options.telemetry_db_path or os.path.join(eff_brain, ".sidecar", "telemetry.sqlite3")
             gravity_map = compute_knowledge_gravity(
@@ -1238,7 +1241,7 @@ def _apply_cognitive_boosts(
     activation_map: dict[str, float] = {}
     if options.enable_spreading_activation and len(options.projects) <= 1:
         try:
-            from concept_graph import spreading_activation
+            from scripts.concept_graph import spreading_activation
 
             seeds: list[str] = list(sorted(_extract_query_terms(query)))[:8]
             for top_item in results[:2]:
@@ -1314,7 +1317,7 @@ def search_semantic_memory(
     atoms_dir: str | None = None,
     chroma_path: str | None = None,
 ) -> tuple[list[RecallResult], list[RecallResult]]:
-    from ollama_utils import EmbeddingUnavailableError, embed_text
+    from scripts.ollama_utils import EmbeddingUnavailableError, embed_text
 
     atoms_dir = resolve_module_vault_path(globals(), "ATOMS_DIR", atoms_dir)
     chroma_path = resolve_module_vault_path(globals(), "CHROMA_PATH", chroma_path)
@@ -1596,7 +1599,7 @@ def search_lexical_memory(
             effective_db = os.path.join(hoisted_fitness_brain, ".sidecar", "telemetry.sqlite3")
         hoisted_telemetry_map = _load_all_atom_telemetry_map(effective_db)
         try:
-            from cognitive_core import load_durable_feedback_counts
+            from scripts.cognitive_core import load_durable_feedback_counts
 
             hoisted_durable_map = load_durable_feedback_counts(hoisted_fitness_brain)
         except Exception:
@@ -1651,7 +1654,7 @@ def search_lexical_memory(
     neighbors = []
     seen = {item.filename for item in direct}
     if options.follow_links and direct:
-        from lexical_store import load_indexed_contents_by_filenames
+        from scripts.lexical_store import load_indexed_contents_by_filenames
 
         all_link_targets = {
             target
@@ -1697,6 +1700,24 @@ def _tag_degraded_results(
         for item in neighbors
     ]
     return tagged_direct, tagged_neighbors
+
+
+def _rrf_component_weight(explicit: float, env_name: str) -> float:
+    """Equal fusion stays 1.0 unless the caller or the environment sets a weight."""
+    try:
+        value = float(explicit)
+    except (TypeError, ValueError):
+        value = 1.0
+    if value != 1.0:
+        return value if value > 0 else 0.0
+    raw = (os.environ.get(env_name) or "").strip()
+    if not raw:
+        return 1.0
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return 1.0
+    return parsed if parsed > 0 else 0.0
 
 
 def search_hybrid_rrf_memory(
@@ -1759,13 +1780,19 @@ def search_hybrid_rrf_memory(
     lex_ranks: dict[str, int] = {}
     dense_ranks: dict[str, int] = {}
 
+    lexical_weight = _rrf_component_weight(options.lexical_rrf_weight, "BRAIN_RRF_LEXICAL_WEIGHT")
+    dense_weight = _rrf_component_weight(options.dense_rrf_weight, "BRAIN_RRF_DENSE_WEIGHT")
     for rank, res in enumerate(lex_pool):
-        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
+        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (
+            lexical_weight / (k_constant + rank + 1)
+        )
         candidate_map[res.filename] = res
         lex_ranks[res.filename] = rank + 1
 
     for rank, res in enumerate(dense_pool):
-        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (1.0 / (k_constant + rank + 1))
+        rrf_scores[res.filename] = rrf_scores.get(res.filename, 0.0) + (
+            dense_weight / (k_constant + rank + 1)
+        )
         dense_ranks[res.filename] = rank + 1
         if res.filename not in candidate_map:
             candidate_map[res.filename] = res
@@ -1838,7 +1865,7 @@ def search_memory(
 
     if l0_eligible:
         try:
-            from predictive_memory_bus import lookup_l0_hot, make_options_fingerprint
+            from scripts.predictive_memory_bus import lookup_l0_hot, make_options_fingerprint
 
             l0_opt_fp = make_options_fingerprint(
                 n_results=options.n_results,
@@ -1855,19 +1882,25 @@ def search_memory(
                 enable_gravity_boost=options.enable_gravity_boost,
                 enable_spreading_activation=options.enable_spreading_activation,
             )
-            allow_prewarm = not (
-                options.memory_types
-                or options.contexts
-                or options.active_context_profile
-                or options.enable_fitness_boost
-                or options.enable_gravity_boost
-                or options.enable_spreading_activation
+            allow_prewarm = bool(
+                options.retrieval_mode in {"lexical", "auto"}
+                and not options.allow_cross_project
+                and int(options.n_results) <= 5
+                and not (
+                    options.memory_types
+                    or options.contexts
+                    or options.active_context_profile
+                    or options.enable_fitness_boost
+                    or options.enable_gravity_boost
+                    or options.enable_spreading_activation
+                )
             )
             hit_info = lookup_l0_hot(
                 query,
                 project_scope=proj_one,
                 options_fp=l0_opt_fp,
                 allow_prewarm_match=allow_prewarm,
+                min_results=int(options.n_results),
                 brain_dir=eff_brain_dir,
                 atoms_dir=atoms_dir,
             )
@@ -1902,7 +1935,7 @@ def search_memory(
         if not l0_eligible or not direct_res or options.retrieval_mode not in {"lexical", "auto"}:
             return
         try:
-            from predictive_memory_bus import (
+            from scripts.predictive_memory_bus import (
                 _serialize_recall_item,
                 compute_vault_freshness_key,
                 make_options_fingerprint,
@@ -1935,6 +1968,7 @@ def search_memory(
                 brain_dir=eff_brain_dir,
                 atoms_dir=atoms_dir,
                 entry_kind="exact",
+                n_results=int(options.n_results),
             )
         except Exception:
             pass
@@ -2139,7 +2173,7 @@ def chunk_text_preserving_latex(text: str, *, max_chars: int = 800) -> list[str]
     if len(raw) <= cap:
         return [raw]
 
-    from math_equivalence import _LATEX_SPAN_RE
+    from scripts.math_equivalence import _LATEX_SPAN_RE
 
     protected_spans = [m.span() for m in _LATEX_SPAN_RE.finditer(raw)]
 

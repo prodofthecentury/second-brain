@@ -12,7 +12,24 @@ Ships strictly **disabled by default** (`enabled=False`). When enabled by the ow
   `brain/.sidecar/external_files.sqlite3`.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from contextlib import closing
@@ -28,20 +45,19 @@ import sys
 import tempfile
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("external_indexer", "scripts.external_indexer"):
     sys.modules.setdefault("external_indexer", sys.modules[__name__])
     sys.modules.setdefault("scripts.external_indexer", sys.modules[__name__])
 
-from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes  # noqa: E402
+from scripts.config import (  # noqa: E402
     BRAIN_DIR,
     _is_reparse_or_link,
     resolve_module_vault_path,
     security_state_dir,
     snapshot_module_defaults,
 )
-from host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions  # noqa: E402
+from scripts.host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 

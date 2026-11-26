@@ -15,37 +15,28 @@ import sys
 
 
 def bootstrap_runtime() -> Path:
-    """Configure `sys.path` and `sys.modules['scripts']` for wheel or repo execution."""
+    """Make ``import scripts`` resolve without putting the scripts directory on ``sys.path``.
+
+    A wheel stores the modules at ``second_brain.scripts``. A source checkout
+    already has a top-level ``scripts`` package when the repo root is importable.
+    """
     pkg_dir = Path(__file__).resolve().parent
     bundled_scripts = pkg_dir / "scripts"
     repo_root = pkg_dir.parent
     repo_scripts = repo_root / "scripts"
 
-    if bundled_scripts.is_dir():
-        scripts_dir = bundled_scripts
-        pkg_str = str(pkg_dir)
-        if pkg_str not in sys.path:
-            sys.path.insert(0, pkg_str)
-        scripts_str = str(scripts_dir)
-        if sys.path[:1] != [scripts_str]:
-            if scripts_str in sys.path:
-                sys.path.remove(scripts_str)
-            sys.path.insert(0, scripts_str)
-        sys.modules.setdefault("scripts", importlib.import_module("second_brain.scripts"))
-    elif repo_scripts.is_dir():
-        scripts_dir = repo_scripts
-        repo_str = str(repo_root)
-        if repo_str not in sys.path:
-            sys.path.insert(0, repo_str)
-        scripts_str = str(scripts_dir)
-        if sys.path[:1] != [scripts_str]:
-            if scripts_str in sys.path:
-                sys.path.remove(scripts_str)
-            sys.path.insert(0, scripts_str)
-    else:
-        raise RuntimeError(f"Second Brain runtime scripts directory not found near {pkg_dir}")
-
-    return scripts_dir
+    if bundled_scripts.is_dir() and (bundled_scripts / "config.py").is_file() and not repo_scripts.is_dir():
+        pkg = importlib.import_module("second_brain.scripts")
+        sys.modules.setdefault("scripts", pkg)
+        return bundled_scripts
+    if repo_scripts.is_dir():
+        try:
+            importlib.import_module("scripts")
+        except ModuleNotFoundError:
+            sys.path.insert(0, str(repo_root))
+            importlib.import_module("scripts")
+        return repo_scripts
+    raise RuntimeError(f"Second Brain runtime scripts directory not found near {pkg_dir}")
 
 
 def main(argv: list[str] | None = None) -> int:

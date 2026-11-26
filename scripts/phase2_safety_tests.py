@@ -4,7 +4,24 @@
 # ///
 """Phase 2 security, consent, redaction, inbox quarantine, cognitive core, and loopback API test suite."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 from contextlib import ExitStack
 import hashlib
@@ -20,7 +37,6 @@ from unittest.mock import patch
 
 import httpx
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 class Phase2IsolatedTestCase(unittest.TestCase):
@@ -59,9 +75,9 @@ def _seed_anchored_atom(
     epistemic_label: str = "claim",
     approve: bool = True,
 ) -> tuple[Path, str]:
-    from atom_mutator import apply_review_transition
-    from evidence import find_evidence_anchor
-    from lexical_store import rebuild_lexical_index
+    from scripts.atom_mutator import apply_review_transition
+    from scripts.evidence import find_evidence_anchor
+    from scripts.lexical_store import rebuild_lexical_index
 
     raw_dir = brain_dir / "0-raw"
     atoms_dir = brain_dir / "2-atoms"
@@ -125,7 +141,7 @@ def _seed_anchored_atom(
 
 class HardwareProfileTests(Phase2IsolatedTestCase):
     def test_deterministic_tier_classification_across_all_four_tiers(self):
-        from hardware_profile import classify_hardware_tier, probe_ollama_models
+        from scripts.hardware_profile import classify_hardware_tier, probe_ollama_models
 
         # Tier 0: Ollama offline
         t0 = classify_hardware_tier(
@@ -166,14 +182,31 @@ class HardwareProfileTests(Phase2IsolatedTestCase):
         self.assertEqual(t1.tier_id, "tier_1_cpu_compact")
         self.assertEqual(t1.selected_installed_generation_model, "llama3.2:3b")
 
-        # Tier 2: Balanced CPU (15.9 GiB RAM) selects qwen2.5-coder:7b over 3b
+        # Tier 2: Balanced CPU with enough free RAM selects qwen2.5-coder:7b over 3b.
+        # About 9 GiB free is not enough; that case stays on llama3.2:3b.
+        tight = classify_hardware_tier(
+            os_name="Windows",
+            os_release="11",
+            architecture="AMD64",
+            cpu_threads=8,
+            total_ram_gib=15.9,
+            available_ram_gib=9.0,
+            cpp_runtime_ready=True,
+            cpp_runtime_detail="ok",
+            gpu_backend="cpu",
+            gpu_name="CPU",
+            vram_gib=0.0,
+            ollama_reachable=True,
+            installed_ollama_models=("llama3.2:3b", "nomic-embed-text:latest", "qwen2.5-coder:7b"),
+        )
+        self.assertEqual(tight.selected_installed_generation_model, "llama3.2:3b")
         t2 = classify_hardware_tier(
             os_name="Windows",
             os_release="11",
             architecture="AMD64",
             cpu_threads=8,
             total_ram_gib=15.9,
-            available_ram_gib=10.0,
+            available_ram_gib=14.0,
             cpp_runtime_ready=True,
             cpp_runtime_detail="ok",
             gpu_backend="cpu",
@@ -212,7 +245,7 @@ class HardwareProfileTests(Phase2IsolatedTestCase):
 
 class QuarantinedInboxPromotionTests(Phase2IsolatedTestCase):
     def test_risk_detection_cas_lock_and_sanitized_promotion(self):
-        from inbox_workflow import inspect_inbox_item, list_inbox_items, promote_inbox_item, reject_inbox_item
+        from scripts.inbox_workflow import inspect_inbox_item, list_inbox_items, promote_inbox_item, reject_inbox_item
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -305,8 +338,8 @@ class QuarantinedInboxPromotionTests(Phase2IsolatedTestCase):
 
 class HostAdapterConsentAndRedactionTests(Phase2IsolatedTestCase):
     def test_default_deny_ssrf_redaction_scope_isolation_and_multi_provider_grounding(self):
-        from answer_policy import AnswerRequest
-        from host_adapters import (
+        from scripts.answer_policy import AnswerRequest
+        from scripts.host_adapters import (
             HostConsentError,
             HostSharingRule,
             OutboundSecretBlockedError,
@@ -315,7 +348,7 @@ class HostAdapterConsentAndRedactionTests(Phase2IsolatedTestCase):
             save_host_policies,
             validate_endpoint_network_boundary,
         )
-        from recall import RecallOptions, search_memory
+        from scripts.recall import RecallOptions, search_memory
 
         # 1. Secret detection blocks outbound transmission immediately
         with self.assertRaises(OutboundSecretBlockedError):
@@ -554,7 +587,7 @@ class HostAdapterConsentAndRedactionTests(Phase2IsolatedTestCase):
 
 class CognitiveCoreTests(Phase2IsolatedTestCase):
     def test_disposable_telemetry_zero_atom_churn_skill_maturity_and_experience_inbox_isolation(self):
-        from cognitive_core import (
+        from scripts.cognitive_core import (
             compute_memory_fitness_report,
             record_atom_feedback,
             record_grounded_answer_telemetry,
@@ -651,10 +684,10 @@ class CognitiveCoreTests(Phase2IsolatedTestCase):
 
 class MemoryLoopbackApiPenetrationAndContractTests(Phase2IsolatedTestCase):
     def test_loopback_bind_csrf_dns_rebinding_auth_lockout_and_sdk_contract(self):
-        from api_product import ensure_owner_token
-        from host_adapters import HostSharingRule, save_host_policies
-        from lexical_store import rebuild_lexical_index
-        from memory_api import (
+        from scripts.api_product import ensure_owner_token
+        from scripts.host_adapters import HostSharingRule, save_host_policies
+        from scripts.lexical_store import rebuild_lexical_index
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
@@ -937,7 +970,7 @@ class MemoryLoopbackApiPenetrationAndContractTests(Phase2IsolatedTestCase):
                 )
                 self.assertIn("experience_id", exp)
 
-                from cognitive_core import compute_memory_fitness_report
+                from scripts.cognitive_core import compute_memory_fitness_report
 
                 fit = sdk.fitness()
                 self.assertGreaterEqual(fit["query_summary"]["total_recall_events"], 1)
@@ -961,8 +994,8 @@ class MemoryLoopbackApiPenetrationAndContractTests(Phase2IsolatedTestCase):
 
 class Phase2AuditReconciliationTests(Phase2IsolatedTestCase):
     def test_critical01_dns_pinning_port_443_and_gemini_model_injection_blocked(self):
-        from answer_policy import AnswerRequest
-        from host_adapters import (
+        from scripts.answer_policy import AnswerRequest
+        from scripts.host_adapters import (
             HostConsentError,
             HostSharingRule,
             generate_grounded_answer_via_host,
@@ -1087,8 +1120,8 @@ class Phase2AuditReconciliationTests(Phase2IsolatedTestCase):
                 self.assertEqual(closed_count[0], 1)
 
     def test_high01_leading_comment_frontmatter_bypass_and_origin_laundering_blocked(self):
-        from inbox_workflow import promote_inbox_item
-        from memory_format import capture_origin, frontmatter_value, normalize_memory_document, split_frontmatter
+        from scripts.inbox_workflow import promote_inbox_item
+        from scripts.memory_format import capture_origin, frontmatter_value, normalize_memory_document, split_frontmatter
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -1182,7 +1215,7 @@ class Phase2AuditReconciliationTests(Phase2IsolatedTestCase):
             )
 
     def test_high02_cross_site_fetch_and_unauth_noise_never_lock_out_valid_bearer_token(self):
-        from memory_api import (
+        from scripts.memory_api import (
             MemoryApiClient,
             MemoryApiRuntimeConfig,
             MemoryLoopbackHTTPServer,
@@ -1250,8 +1283,8 @@ class Phase2AuditReconciliationTests(Phase2IsolatedTestCase):
                 server.server_close()
 
     def test_high03_multi_project_all_containment_and_claim_pii_redaction_rehydration(self):
-        from answer_policy import AnswerRequest
-        from host_adapters import HostSharingRule, filter_atoms_for_host, generate_grounded_answer_via_host, save_host_policies
+        from scripts.answer_policy import AnswerRequest
+        from scripts.host_adapters import HostSharingRule, filter_atoms_for_host, generate_grounded_answer_via_host, save_host_policies
 
         with tempfile.TemporaryDirectory() as tmp:
             brain = Path(tmp) / "brain"
@@ -1415,16 +1448,16 @@ class Phase2AuditReconciliationTests(Phase2IsolatedTestCase):
                 self.assertFalse(res_forged.answerable)
 
     def test_medium_and_low_hardening_contracts(self):
-        from hardware_profile import loopback_ollama_base_url
-        from host_adapters import default_host_policy_path
-        import memory_api
-        from memory_api import (
+        from scripts.hardware_profile import loopback_ollama_base_url
+        from scripts.host_adapters import default_host_policy_path
+        import scripts.memory_api as memory_api
+        from scripts.memory_api import (
             ApiExperienceCreateRequest,
             default_api_token_path,
             get_configured_api_token,
             render_host_adapter_configs,
         )
-        from recall import consume_last_degradation_warning, emit_degradation_warning
+        from scripts.recall import consume_last_degradation_warning, emit_degradation_warning
 
         # 1. OLLAMA_HOST SSRF prevention & env override isolation
         self.assertEqual(loopback_ollama_base_url(), "http://127.0.0.1:11434")

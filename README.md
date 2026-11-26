@@ -1,8 +1,93 @@
 # Second Brain
 
-**Status (`v1.0.0` + Quantum Leap Gen-4/5):** Production local-first verifiable AI memory platform with SHA-256-pinned local ONNX Cross-Encoder & clause-aligned bidirectional DeBERTa NLI (`second-brain models pull`, `[reranker]` extra), GGUF-size-aware `qwen3` / `qwen2.5` hardware-tier profiling (`_model_fits_host_memory` + `<think>` stripping), Bi-Temporal Fact Validity (`valid_from` / `valid_until`, point-in-time `as_of`, Cross-Encoder Time-Travel Snapshot Recall, disjoint-window contradiction suppression & `expired_validity` drift radar), **Gen-4 Cognitive Architecture & Quantitative Reasoning** (L0–L5 Fractal Zoom, L0–L3 Predictive Memory Bus, Owner-CAS Principles `7-principles/` & Causal Mental Models `8-mental-models/`, Living Concept Graph with freshness caching & spreading activation, Cognitive Swarm & Two-Sided Debate, World-Model Blast-Radius Simulator, Self-Model & Curiosity Gaps, Meta-Router Deliberative Chat, Nightly Episodic Replay, AST-jailed Symbolic Sandbox, AST-verified Math Equivalence & SafeVerify Formal Proof Search), **Auto-Use + On-Demand Multi-Host Lifecycle Hooks** (`SessionStart`, deduplicated `PreInvocation`/`UserPromptSubmit`/`beforeSubmitPrompt`, and closed-loop DLP-scanned `Stop` episodic logging across Antigravity, Claude Code, Cursor, and Gemini CLI), Multimodal Voice Memo, Video Timeline, Clipboard Screenshot & Document Upload (`/v1/ingest/media`, `/v1/ingest/video-file`, `24 MiB` cap + Pillow/Whisper/FFmpeg protocol whitelist + DLP quarantine), Git Post-Commit & Coding Session Memory Distiller (`second-brain hook`, `/v1/git/*`), Portable Three-Store Encrypted `.sbvault` Backup & Disaster-Recovery Restore (`second-brain backup`, `/v1/vault/backup/*`), Zero-Knowledge Bidirectional Mobile Inbox Drop & Vault Recall (`SBID1` forward-secret `ECDH P-256 + HKDF-SHA256 + AES-256-GCM` drop + opt-in `SBMR1` `HKDF-SHA256 + AES-256-GCM` encrypted vault recall/BM25 search/review static PWA & full On-Device Mobile Vault Client), `O(|changed|)` single-atom ChromaDB vector upserts above 64 atoms, persistent owner-gated multi-turn chat threads (`chat_threads.sqlite3`) with coreference resolution, automatic `[[wikilink]]` graph linking, SOTA Browser Web Clipper (Readability-style Markdown DOM extraction + 1-click `SBC-*` pairing), coordinate-aware multi-column/table + local OCR PDF extraction (`.pdf`, `.docx`, `.epub`, `.html`, `.csv`/`.tsv`), Zero-Knowledge E2EE Cloud Sync (`AWS4-HMAC-SHA256` S3/R2/B2 SigV4, OS Keychain / Windows DPAPI secret sealing, `AutoSyncScheduler`, `sync gc`, and interactive 3-way conflict resolution), Multi-Vault Workspaces & Opt-In Federated Recall, Stage 4 Executable Skills sandbox, Creative Media provenance, Human Owner Governance Gates (`second-brain gates`), dual-token Loopback HTTP API & full `MemoryApiClient` SDK, native Electron desktop companion (with dual-mode Build Canvas, Voice Loop, Debate & Gen-4 Cognition Workbench), **35-tool MCP & 14-host IDE connectors** (Antigravity, Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Codex CLI, Gemini CLI, Cline, Roo Code, Continue, Zed, JetBrains, Neovim), Skill Playbooks, validated WinGet / Homebrew `Formula` manifests, and cryptographic Merkle audit proofs (`37/37` release suites passing in `scripts/test_all.py`; see [v1.0.0 Independent Review](docs/independent-review-2026-11-22-v1.0.0.md) and [v1.0.0 Benchmark Report](docs/benchmark-report-v1.0.0.md)). Under the strict Three-Store boundary, the vault contains durable Markdown and append-only audit state (`brain/0-raw/archive/` holds durable decision logs, `vault-ledger.jsonl`, and `snapshots/`), while `brain/.sidecar/` and `brain/.chroma/` hold strictly disposable, rebuildable SQLite FTS5/notes/chat/telemetry DBs, dense vectors, and runtime locks.
+Second Brain is a local-first memory store for one owner. Notes, clipped articles, PDFs, voice memos, and code history stay on disk. An optional local model (Ollama) can draft memory atoms from those captures. Chat, the dashboard, and MCP may cite an atom only after you approve that exact revision and its source excerpt still matches the file ("no source, no claim").
 
-**Product architecture:** One-click installable Second Brain across local/offline and opted-in online modes, with hardware capability profiling (`second-brain profile` / `doctor`), per-host outbound consent/PII/secret gates (`scripts/host_adapters.py`), IDE connectors (`second-brain connect`), VS Code `.vsix` extension, Browser Web Clipper MV3, bidirectional Mobile Drop & Recall PWA (`mobile/inbox-drop/`) + Mobile Vault Client (`mobile/vault-client/`), WinGet & Homebrew manifests, and cross-platform Electron desktop installer targets (`nsis`, `msi`, `dmg`, `AppImage`, `deb`). Offline lexical FTS5 is a first-class zero-dependency baseline; `scripts/live_third_party_benchmark.py` and `scripts/sota_benchmark.py` benchmark Second Brain (verified lexical + ONNX Cross-Encoder & hybrid ChromaDB HNSW RRF) head-to-head against live installed third-party memory engines (`Mem0` `mem0ai 2.2.1`, `FAISS` `faiss-cpu 1.16.0`, `ChromaDB 1.5.9`, `rank-bm25 0.2.2`, and `SQLite FTS5`) on both the **90-case agent-drafted (pending owner review) vault dataset (`second-brain-retrieval-curated-90`, `v3.0.0`)** and **120–300 atom adversarial/multimodal corpora** with ingested PDF papers, 2-hop graph queries, bi-temporal expired traps, and drift/tamper traps (see [v1.0.0 Benchmark Report](docs/benchmark-report-v1.0.0.md), [live third-party curated benchmark](docs/live-third-party-benchmark-2026-11-22.json), and [300-atom ONNX latency benchmark](docs/sota-benchmark-results-2026-11-21.json)).
+The package version in `pyproject.toml` is 1.0.0. That is not a claim that every screen, store listing, or model-backed path has been proven on every operating system. The check that runs in this repository is `scripts/test_all.py`. GitHub Actions runs it on Windows, macOS, and Linux (see `.github/workflows/ci.yml`). Tests that need a running Ollama, downloaded ONNX weights, or an optional extra are skipped when that dependency is absent. Set `BRAIN_REQUIRE_OLLAMA=1` (or `BRAIN_REQUIRE_ONNX`, `BRAIN_REQUIRE_WHISPER`, `BRAIN_REQUIRE_PYAV`, `BRAIN_REQUIRE_PILLOW`) when you want those tests to fail instead of skip.
+
+`docs/independent-review-*.md` were written by the same automated process that produced the code. They are self-checks, not independent audits. Benchmark JSON files under `docs/` are historical local runs, not a current certification.
+
+## What is in the tree
+
+The Python modules live in the `scripts` package (`from scripts import recall`). They do not add that directory to `sys.path`. `python scripts/<tool>.py` still works: it re-enters as `python -m scripts.<tool>`. The `second-brain` command is unchanged.
+
+The checkout keeps the full surface: the `second-brain` CLI, a loopback HTTP API, a 35-tool MCP server (disabled until `BRAIN_ENABLE_LOCAL_MCP=1`), a Streamlit dashboard, an Electron desktop app, a VS Code extension, a Manifest V3 browser clipper, and mobile clients (an inbox PWA and a Capacitor vault client). Apple notarization, store publishing, live models, and ONNX downloads need accounts, hardware, or weights this repository does not ship. Those paths run as far as they can without those secrets and stop with an explicit skip or error.
+
+Captured web articles land in `sources/` and are not searchable until you approve the current file bytes (`second-brain sources`, the dashboard quarantine tab, or `POST /v1/sources/approve`). Approval makes the text searchable as an approved source capture. It does not create a citable atom. A later refinery run can draft atoms; those still need their own approval.
+
+Approvals made from the CLI require a short-lived owner grant (`second-brain owner enroll`, then `second-brain owner grant`). Passing `--actor owner` alone is rejected. The HTTP API records the fingerprint of the owner token that authorized the call. The dashboard records the unlocked password session. A library call that passes only an actor string still changes the file, and the decision log records `method: unattested_library_call` and `human_approval: false`. That record is not an owner approval.
+
+This repository does not ship a personal daily-use vault. `brain/` is gitignored owner data. The tests build temporary vaults. Creative media, formal checks, and the other optional commands stay in the tree; they are extra surfaces on capture, approval, search, and MCP, and they are not deleted to make the core look smaller.
+
+## Advanced modules
+
+`second-brain doctor` reports these as OK or WARN. A missing tool is a warning, not a failure of the vault. The main CI job installs ffmpeg and espeak-ng on Linux and runs those tests for real. Windows OCR runs inside the Windows CI job. LoRA, Lean, Ollama, cloudflared, and tailscale run in `.github/workflows/advanced-runtime.yml`, which is separate from the five-job CI matrix.
+
+| Module | Status |
+| --- | --- |
+| ffmpeg keyframes | Verified for real in the Linux CI job. A generated MP4 is decoded to a PNG. |
+| espeak-ng speech | Verified for real in the Linux CI job. Kokoro ONNX weights are not downloaded there. |
+| Kokoro TTS | Needs the Kokoro weight files. Doctor stays on WARN until `second-brain models pull kokoro-tts`. |
+| Windows OCR | Verified for real on the windows-latest job. Other OS jobs skip it. |
+| Screen capture | Verified for real on Linux with Xvfb and ffmpeg. |
+| Code sandbox | Verified for real in the main suite. It runs a separate Python process with CPU and memory limits. |
+| n8n client | Verified for real as HTTP against a loopback server. The n8n product is not installed. |
+| Open WebUI tool | The generated tool module is compiled. Open WebUI itself is not booted. |
+| LoRA training | A real PEFT loop on a tiny random GPT-2 runs in the advanced workflow. The main suite only checks the missing-dependency error unless torch, transformers, and peft are installed. |
+| Lean | `lean` checks a real file in the advanced workflow. The main suite skips when `lean` is absent. |
+| Ollama swarm debate | The advanced workflow pulls `qwen2.5:0.5b` and runs cited turns. Uncited sentences are dropped. |
+| cloudflared and tailscale | The advanced workflow runs `--version`. It does not open an authenticated tunnel. That needs owner credentials. |
+| Code sandbox, ledger, creative media | Already covered by the main suite. A GPU diffusion backend is not installed. |
+
+## Speed, retrieval, remote models, and backups
+
+Chat tokens already stream from `POST /v1/chat/stream`. The Streamlit dashboard paints each token into the reply, and the Electron app does the same through `window.secondBrain.streamChat` (`desktop/renderer/chat_send.js`). MCP tools still return one JSON result. The protocol used here has no token stream, so `search_memory` and `run_debate` are unchanged.
+
+`BRAIN_OLLAMA_KEEP_ALIVE` (or `OLLAMA_KEEP_ALIVE`) is sent on Ollama chat and embed calls. The default is `30m`. Values that are not `-1` or a number plus `s`, `m`, or `h` fall back to `30m`. `BRAIN_OLLAMA_TIMEOUT` defaults to 120 seconds and is capped at 600. Doctor's reachability probe uses 3 seconds.
+
+`OLLAMA_HOST` is still loopback only. A laptop can use Ollama on another machine by setting `BRAIN_OLLAMA_HOST` to an `http://` address on loopback or a private LAN range (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, or a private IPv6 address). Link-local addresses, including `169.254.169.254`, and public hosts are refused. Doctor prints a warning when the host is a private LAN address, because vault text is sent to that other machine. `BRAIN_GEN_MODEL=hermes3:8b` selects that model with no code change. Pull it on the machine that runs Ollama (`ollama pull hermes3:8b`). Chat, grounded answers, and the dashboard use that setting. MCP does not call the generator itself.
+
+Embeddings are cached in SQLite by the model name and the SHA-256 of the text actually sent (after any redaction). Set `BRAIN_EMBED_CACHE=0` to turn the cache off, or `BRAIN_EMBED_CACHE_PATH` to move the file. A second embed of the same text does not call Ollama. This environment has no Ollama daemon, so the measured numbers below are local stand-ins, not model latency.
+
+`second-brain capture --background` and `second-brain ingest --background` enqueue work and return. `second-brain jobs work` runs the queue. The database is `jobs.sqlite3` under the security-state directory (`BRAIN_JOB_QUEUE` overrides it). A job left in `running` is marked retry when the worker starts again. `second-brain jobs status` prints the counts. The dashboard System Control page shows the same counts. `GET /v1/jobs` requires the owner token.
+
+`second-brain jobs work` also writes today's vault backup unless `BRAIN_AUTO_BACKUP=0`. `second-brain backup auto` does that without draining the queue. Set `BRAIN_BACKUP_PASSPHRASE` to at least 8 characters or the automatic archive is unencrypted. There is no operating-system timer; the backup runs when you run the worker or `backup auto`. `second-brain restore ARCHIVE --target DIR --unencrypted` (or a passphrase) and `--force` when the target is not empty. `second-brain backup create|verify|restore` is unchanged.
+
+Hybrid retrieval still uses reciprocal rank fusion. `BRAIN_RRF_LEXICAL_WEIGHT` and `BRAIN_RRF_DENSE_WEIGHT` default to `1`, which is the previous equal blend. The reranker is the in-process interaction cross-encoder. If ONNX weights are present, doctor reports that backend; otherwise it reports the interaction fallback. Recall still requires the same literal overlap as before.
+
+`second-brain eval PATH` scores a personal set and prints recall@k and MRR. A relevant label matches a filename, its slug, an atom id, or a title. The example is `docs/personal-eval.example.json`. `second-brain eval-retrieval` and `second-brain eval-answers` are still there. A personal set is not the 90-query code-only dataset. `second-brain install` writes `house-rules.md` when it is missing, and distillation still runs if that file is later removed.
+
+The dashboard graph drawing lives in `dashboard/graph_view.py` and is bound before the sidebar runs. The product route function lives in `scripts/api_dispatch.py` and is rebound onto `api_product` so existing patches see the same function body. SSE writing lives in `scripts/api_sse.py`. Desktop chat send lives in `desktop/renderer/chat_send.js`, loaded immediately after `app.js`.
+
+Local measurements from one Linux agent machine, three runs, no Ollama process:
+
+| What | Result |
+| --- | --- |
+| 200 short texts hashed twice by a local stand-in | 0.733–0.753 ms. This is not a model call. |
+| Same 200 texts inserted in the embedding cache and read back | 159.9–181.8 ms. |
+| Second pass, cache hit only | 14.2–14.4 ms. |
+| Same text embedded twice through `embed_text` with a fake embedder | 1 model call, not 2. |
+| Enqueue 50 capture jobs | 39.3–46.1 ms. |
+| Claim those 50 jobs | 27.8–42.8 ms. |
+
+A before/after of a real Ollama embed was not measured here.
+
+## Install
+
+Python 3.11, 3.12, or 3.13. From a source checkout, `./setup.sh` on Linux/macOS or `setup.ps1` on Windows installs `uv` when it can, syncs the lockfile, creates an empty vault, and builds the model-free SQLite index. Neither script installs Ollama. Pass `--pull-models` / `-PullModels` only when Ollama is already running. `./setup.sh --no-launch` and `setup.ps1 -NoLaunch` stop before opening the dashboard.
+
+If `uv` is already installed:
+
+```bash
+uv sync --locked
+uv run --locked second-brain install
+uv run --locked second-brain doctor
+```
+
+Wheel installs store the vault in the platform user-data directory (`%LOCALAPPDATA%/SecondBrain/brain` on Windows, `~/Library/Application Support/SecondBrain/brain` on macOS, `$XDG_DATA_HOME/second-brain/brain` on Linux). Set `BRAIN_VAULT_DIR` to choose another location. Editable checkouts keep using their local `brain/` directory, which is gitignored because it holds owner data.
+
+The doctor treats a missing lexical index as a failure. Missing Ollama models, a dense index, and zero approved memories are warnings: lexical recall does not need them.
+
+Launch the dashboard with `./run_dashboard.sh` or `.\run_dashboard.ps1`. The first launch asks for a password of at least 12 characters. The session unlocks for 30 minutes. Reset it with `uv run --locked python scripts/dashboard_auth.py set-password`. The app listens on `http://127.0.0.1:8501`.
 
 ## Safety and readiness
 
@@ -41,7 +126,7 @@ second_brain/
 └── docs/                   architecture notes and operator runbooks/templates (docs/runbooks/)
 ```
 
-The root project directory is the Git boundary, and the live `brain/` vault is excluded from the code baseline because it contains owner-specific captures and memories. Back it up separately using `second-brain backup` or an owner-controlled method. Both `master` and `release-code-only` are 100% code-only across their entire commit history (the legacy 18-file initial vault commit was scrubbed from root history).
+The root project directory is the Git boundary, and the live `brain/` vault is excluded from the code baseline because it contains owner-specific captures and memories. Back it up with `second-brain backup` or `second-brain backup auto`, and put it back with `second-brain restore`. Both `master` and `release-code-only` are 100% code-only across their entire commit history (the legacy 18-file initial vault commit was scrubbed from root history).
 
 ## Start with the model-free baseline
 
@@ -161,11 +246,16 @@ uv run --locked second-brain backup verify ..\vault-backup.sbvault
 uv run --locked second-brain benchmark --notes 1500 --queries 20
 uv run --locked second-brain sota-benchmark --atoms 300
 
-# Desktop installer packaging, distribution manifests, index rebuilds & full 36-suite verification gate
+# Owner approval grants, captured-source review, index rebuilds, and the full verification gate
 .\scripts\package_desktop.ps1 -Target nsis -SelfSigned
 uv run --locked python scripts/build_distribution_manifests.py --out-dir dist
 uv run --locked python scripts/rebuild_lexical_index.py
 uv run --locked python scripts/rebuild_vectors.py
+uv run --locked second-brain owner enroll --actor "<your-name>"
+uv run --locked second-brain owner grant
+uv run --locked second-brain sources queue
+uv run --locked second-brain sources approve-clean --actor "<your-name>" --grant "<grant>"
+uv run --locked second-brain sources search "<query>"
 uv run --locked python scripts/test_all.py
 ```
 
@@ -185,9 +275,9 @@ On the 90-case curated suite (`50` scored answerable + trap cases), `qwen2.5-cod
 - **Zero-Knowledge E2EE Multi-Device Vault Sync (`second-brain sync` / `scripts/vault_sync.py` / `/v1/sync/*`):** Owner-token-gated end-to-end encrypted sync (`AES-256-GCM`, per-object `HKDF-SHA256` subkeys, random 96-bit nonces, strict AAD binding, `HMAC-SHA256` keyed blind blob IDs, optional `scrypt` passphrase KDF or 256-bit keyfile mode, and `Ed25519` signed heads with peer key pinning and monotonic anti-rollback checks) over pluggable `local_folder` (OneDrive/iCloud/Syncthing/NAS/USB) or DNS-pinned `http_object` (`https://`) targets. Strictly enforces the Three-Store boundary (syncs only durable Markdown & append-only logs, never `.sidecar/`, `.chroma/`, or security secrets), merges append-only JSONL audit logs via deterministic set-union, backs up fast-forward canonical atom/playbook revisions in `.history/`, quarantines divergent regular-file conflicts into `0-raw/sync-conflicts/`, and automatically rebuilds local SQLite FTS5 indexes after pull.
 - **Local-First Browser Web Clipper (`extensions/browser-clipper/`, `second-brain clipper`, `/v1/clipper/*`):** Cross-browser Manifest V3 extension (Chrome, Edge, Firefox) pinned strictly to `http://127.0.0.1/*` with write-only scoped `clipper_*` tokens (stored hashed in `clipper-pairings.json`), strict extension-origin CORS allowlisting, immutable UTF-8 SHA-256 source snapshots in `0-raw/note-snapshots/`, and automatic DLP/prompt-injection quarantine to `0-raw/inbox/`.
 - **Multi-Vault Workspaces (`second-brain vault`, `scripts/vault_workspaces.py`, `/v1/vaults*`):** Isolated named vault registry (`SecondBrain/security/vaults.json`) with non-nested directory validation, atomic active hot-switching synced to `vault-path.txt` and live API runtime, optional isolated per-vault bearer tokens (`vb_*`), and strictly opt-in owner-gated read-only federated cross-vault recall.
-- **Desktop Companion & VS Code Extension (`desktop/`, `extensions/vscode-second-brain/`, `scripts/package_desktop.ps1`):** Electron local UI (`Notes` + Action Items, `Streaming Chat` with `"research"` view, `Inbox & Review`, `Import, Scout & Jobs` + Multimodal Media/Voice/Paste Upload, `IDE Hub` + Git Post-Commit Distiller, `System` + ONNX Models + E2EE Sync + Mobile Inbox Drop + Multi-Vault Workspaces + Browser Web Clipper + Daemon Sync + Portable `.sbvault` Backup/Restore, `Playbooks & Plan`, `Vault Proof & Audit` with Local NLI Radar & Bi-Temporal/Cross-Encoder Snapshot Recall, `Knowledge Graph`, and `Vault Explorer`) with sidebar Vault Quick-Switcher, global quick capture (`Ctrl+Shift+Space` with screenshot paste & voice memo), tray lifecycle controls (`Start`/`Restart`/`Stop Memory API`, `Open Vault Folder`, `Launch at Login`), automatic first-run `.venv` bootstrap, cross-platform installer targets (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), WinGet / Homebrew Cask manifests, and Windows Authenticode signing + `dist/SHA256SUMS.txt`. All `34` automated verification suites run via `uv run --locked python scripts/test_all.py`.
+- **Desktop Companion & VS Code Extension (`desktop/`, `extensions/vscode-second-brain/`, `scripts/package_desktop.ps1`):** Electron local UI (`Notes` + Action Items, `Streaming Chat` with `"research"` view, `Inbox & Review`, `Import, Scout & Jobs` + Multimodal Media/Voice/Paste Upload, `IDE Hub` + Git Post-Commit Distiller, `System` + ONNX Models + E2EE Sync + Mobile Inbox Drop + Multi-Vault Workspaces + Browser Web Clipper + Daemon Sync + Portable `.sbvault` Backup/Restore, `Playbooks & Plan`, `Vault Proof & Audit` with Local NLI Radar & Bi-Temporal/Cross-Encoder Snapshot Recall, `Knowledge Graph`, and `Vault Explorer`) with sidebar Vault Quick-Switcher, global quick capture (`Ctrl+Shift+Space` with screenshot paste & voice memo), tray lifecycle controls (`Start`/`Restart`/`Stop Memory API`, `Open Vault Folder`, `Launch at Login`), automatic first-run `.venv` bootstrap, cross-platform installer targets (`nsis`, `msi`, `dmg`, `AppImage`, `deb`), WinGet / Homebrew Cask manifests, and Windows Authenticode signing + `dist/SHA256SUMS.txt`. Run `uv run --locked python scripts/test_all.py` for the automated suites. Signing and notarization need the platform credentials; without them the packager skips those steps.
 - **Per-Host Online & Custom AI Adapters (`scripts/host_adapters.py`):** Local loopback Ollama (`ollama_local`) is the only host enabled out of the box. Online providers (`openai_online`, `anthropic_online`, `gemini_online`) and `owner_custom_local` are disabled by default (`enabled: false`), require explicit owner consent and `project:<id>` allowlists in `host-sharing-policy.json`, scrub PII and block outbound secrets before opening any socket, enforce DNS-pinned `https://...:443` transport, and validate every draft claim outside the model via `scripts/answer_policy.py`.
-- **27-Tool MCP & IDE Connectors (`scripts/mcp_server.py`, `scripts/ide_connector.py`, `plugins/`, [docs/mcp-local-policy.md](docs/mcp-local-policy.md)):** MCP is not enabled globally by default; `second-brain connect` configures local IDEs/hosts (with timestamped backups and the Antigravity bundle under `plugins/antigravity/second-brain/`, alongside `plugins/claude-code/second-brain/`) using `BRAIN_MCP_TRUSTED_STDIO=1` paired with a constant-time `BRAIN_MCP_CLIENT_TOKEN` check (or HTTP `_meta` Bearer auth) plus `BRAIN_MCP_ALLOWED_TOOLS` scoping. Do not connect this vault to untrusted cloud hosts or expose the MCP process through a network service. Reads return verified approved atoms (`search_memory`, `get_atom`), clearly separated `<owner_notes untrusted="true">` note results (`search_notes`, `get_note`), playbooks/skills/plan/graph/snapshot/ledger telemetry, and route untrusted or risky `remember`, `add_to_inbox`, or `distill_git_commits` inputs to quarantined `brain/0-raw/inbox/` requiring owner promotion (`scripts/inbox_workflow.py`).
+- **35 MCP tools and IDE connectors (`scripts/mcp_server.py`, `scripts/ide_connector.py`, `plugins/`, [docs/mcp-local-policy.md](docs/mcp-local-policy.md)):** MCP is not enabled globally by default; `second-brain connect` configures local IDEs/hosts (with timestamped backups and the Antigravity bundle under `plugins/antigravity/second-brain/`, alongside `plugins/claude-code/second-brain/`) using `BRAIN_MCP_TRUSTED_STDIO=1` paired with a constant-time `BRAIN_MCP_CLIENT_TOKEN` check (or HTTP `_meta` Bearer auth) plus `BRAIN_MCP_ALLOWED_TOOLS` scoping. Do not connect this vault to untrusted cloud hosts or expose the MCP process through a network service. Reads return verified approved atoms (`search_memory`, `get_atom`), clearly separated `<owner_notes untrusted="true">` note results (`search_notes`, `get_note`), playbooks/skills/plan/graph/snapshot/ledger telemetry, and route untrusted or risky `remember`, `add_to_inbox`, or `distill_git_commits` inputs to quarantined `brain/0-raw/inbox/` requiring owner promotion (`scripts/inbox_workflow.py`).
 
 ## Git safety
 

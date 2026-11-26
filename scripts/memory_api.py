@@ -7,7 +7,24 @@
 # ///
 """Host-independent loopback HTTP JSON Memory API, typed client SDK, and IDE/host adapter generator."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from collections.abc import Sequence
@@ -34,22 +51,21 @@ from urllib.parse import parse_qs, quote, quote as url_quote, urlparse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("memory_api", "scripts.memory_api"):
     sys.modules.setdefault("memory_api", sys.modules[__name__])
     sys.modules.setdefault("scripts.memory_api", sys.modules[__name__])
 
-from answer_policy import AnswerRequest, collect_unverified_leads
-from atom_mutator import approved_revision_is_current, review_lock
-from cognitive_core import (
+from scripts.answer_policy import AnswerRequest, collect_unverified_leads
+from scripts.atom_mutator import approved_revision_is_current, review_lock
+from scripts.cognitive_core import (
     compute_memory_fitness_report,
     peek_lexical_candidate_atom_ids,
     record_grounded_answer_telemetry,
     record_retrieval_telemetry,
     save_experience_record,
 )
-import config as _config
-from config import (
+import scripts.config as _config
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     CHROMA_PATH,
@@ -63,9 +79,9 @@ from config import (
     is_content_markdown,
     safe_file_in_dir,
 )
-from executive_planner import ExecutivePlanRequest, assemble_executive_plan
-from hardware_profile import detect_hardware_profile
-from host_adapters import (
+from scripts.executive_planner import ExecutivePlanRequest, assemble_executive_plan
+from scripts.hardware_profile import detect_hardware_profile
+from scripts.host_adapters import (
     HostConsentError,
     OutboundSecretBlockedError,
     generate_grounded_answer_via_host,
@@ -74,22 +90,22 @@ from host_adapters import (
     restrict_security_file_permissions,
     validate_model_identifier,
 )
-from inbox_workflow import scan_inbox_payload_risks
-from index_manifest import index_manifest_is_current, load_index_manifest
-from lexical_store import LexicalIndexUnavailable, lexical_index_is_current, rebuild_lexical_index
-from memory_format import split_frontmatter
-from memory_review import section_text
-from recall import (
+from scripts.inbox_workflow import scan_inbox_payload_risks
+from scripts.index_manifest import index_manifest_is_current, load_index_manifest
+from scripts.lexical_store import LexicalIndexUnavailable, lexical_index_is_current, rebuild_lexical_index
+from scripts.memory_format import split_frontmatter
+from scripts.memory_review import section_text
+from scripts.recall import (
     MemoryRecallUnavailable,
     RecallOptions,
     consume_last_degradation_warning,
     search_memory,
     suggest_duplicate_atoms,
 )
-from skill_playbooks import list_playbooks, playbook_visible_in_scope
-from vault_workspaces import verify_per_vault_token
-from web_clipper import CLIPPER_TOKEN_PREFIX, is_paired_clipper_origin, is_valid_extension_origin, verify_clipper_token
-import api_product
+from scripts.skill_playbooks import list_playbooks, playbook_visible_in_scope
+from scripts.vault_workspaces import verify_per_vault_token
+from scripts.web_clipper import CLIPPER_TOKEN_PREFIX, is_paired_clipper_origin, is_valid_extension_origin, verify_clipper_token
+import scripts.api_product as api_product
 
 CLIPPER_SCOPED_PATHS = frozenset(
     {
@@ -841,7 +857,7 @@ class MemoryLoopbackHTTPServer(ThreadingHTTPServer):
 
     def _reconcile_auto_sync_for_switch(self, prev_brain: str | None, next_brain: str) -> None:
         try:
-            from vault_sync import configure_auto_sync, get_auto_sync_status, stop_auto_sync_scheduler
+            from scripts.vault_sync import configure_auto_sync, get_auto_sync_status, stop_auto_sync_scheduler
 
             if prev_brain and os.path.normcase(os.path.abspath(prev_brain)) != os.path.normcase(os.path.abspath(next_brain)):
                 stop_auto_sync_scheduler(prev_brain)
@@ -917,7 +933,7 @@ class MemoryLoopbackHTTPServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         self._pool_closed = True
         try:
-            from vault_sync import stop_auto_sync_scheduler
+            from scripts.vault_sync import stop_auto_sync_scheduler
 
             managed = set(getattr(self, "_managed_sync_vaults", set()))
             cur_b = getattr(getattr(self, "runtime", None), "brain_dir", None)
@@ -1623,6 +1639,14 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                         "403 Forbidden: unscoped include_duplicates requires owner authorization or an explicit project_scope."
                     )
 
+                clean_as_of = req.as_of.strip() if req.as_of and req.as_of.strip() else None
+                use_l0_bus = bool(
+                    not req.include_expired
+                    and not clean_as_of
+                    and not req.allow_cross_project
+                    and req.retrieval_mode in {"lexical", "auto"}
+                    and len(projects) <= 1
+                )
                 fetch_n = min(25, req.n_results * 2) if not effective_include_prefs else req.n_results
                 recall_kwargs: dict[str, object] = {
                     "n_results": fetch_n,
@@ -1635,7 +1659,8 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     "active_context_profile": tuple(req.active_context_profile),
                     "telemetry_db_path": rt.telemetry_db_path,
                     "include_expired": bool(req.include_expired),
-                    "as_of": req.as_of.strip() if req.as_of and req.as_of.strip() else None,
+                    "as_of": clean_as_of,
+                    "use_l0_bus": use_l0_bus,
                 }
                 if "include_preferences" in inspect.signature(RecallOptions).parameters:
                     recall_kwargs["include_preferences"] = effective_include_prefs
@@ -1745,7 +1770,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                     )
                     return
                 projects = (req.project_scope.strip(),) if req.project_scope and req.project_scope.strip() else ()
-                from chat_threads import resolve_followup_query
+                from scripts.chat_threads import resolve_followup_query
 
                 resolved_q, q_expanded = resolve_followup_query(
                     req.query,

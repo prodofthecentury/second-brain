@@ -4,7 +4,24 @@
 # ///
 """Layer 4 Cognitive Core: Owner-gated Playbook/Skill promotion and cryptographic staleness re-gating."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from contextlib import closing
@@ -20,14 +37,13 @@ import sqlite3
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("skill_playbooks", "scripts.skill_playbooks"):
     sys.modules.setdefault("skill_playbooks", sys.modules[__name__])
     sys.modules.setdefault("scripts.skill_playbooks", sys.modules[__name__])
 
-from atom_mutator import review_lock
-from cognitive_core import compute_memory_fitness_report, count_canonical_corrections
-from config import (
+from scripts.atom_mutator import review_lock
+from scripts.cognitive_core import compute_memory_fitness_report, count_canonical_corrections
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     PLAYBOOKS_DIR,
@@ -40,7 +56,7 @@ from config import (
     safe_file_in_dir,
     snapshot_module_defaults,
 )
-from memory_format import (
+from scripts.memory_format import (
     evaluate_temporal_validity,
     frontmatter_has_key,
     remove_frontmatter_fields,
@@ -48,9 +64,9 @@ from memory_format import (
     set_scalar_field,
     split_frontmatter,
 )
-from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
-from recall import normalize_project_tag, project_tags_match
-from review_atom import approved_revision_is_current
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list, section_text
+from scripts.recall import normalize_project_tag, project_tags_match
+from scripts.review_atom import approved_revision_is_current
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 

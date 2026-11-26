@@ -1621,6 +1621,114 @@ function buildTurnVerifiedClaimsCards(turn) {
 }
 
 const debateBriefsByTurnId = new Map();
+const cognitiveRoutesByTurnId = new Map();
+
+function buildTurnCognitiveRouteCard(turn) {
+  const route = turn?.cognitiveRoute || cognitiveRoutesByTurnId.get(turn?.id);
+  if (!route || typeof route !== "object") return null;
+
+  const wrap = el("div", "card");
+  wrap.style.marginTop = "8px";
+  wrap.style.gap = "6px";
+
+  const hdr = el("div", "toolbar");
+  hdr.appendChild(el("strong", "", "Cognitive Meta-Router"));
+  if (route.mode) {
+    hdr.appendChild(el("span", "badge ok mono", `mode:${String(route.mode)}`));
+  }
+  if (route.path) {
+    hdr.appendChild(
+      el(
+        "span",
+        `badge ${route.path === "deliberative_path" ? "warn" : "ok"} mono`,
+        String(route.path)
+      )
+    );
+  }
+  if (route.complexity) {
+    hdr.appendChild(
+      el("span", "badge mono", `complexity:${String(route.complexity)}`)
+    );
+  }
+  if (route.profile) {
+    hdr.appendChild(el("span", "badge", `profile:${String(route.profile)}`));
+  }
+  if (route.contested) {
+    hdr.appendChild(el("span", "badge warn", "contested"));
+  }
+  wrap.appendChild(hdr);
+
+  const budget =
+    route.budget && typeof route.budget === "object" ? route.budget : null;
+  if (budget) {
+    const bParts = [];
+    if (budget.max_hops !== undefined) bParts.push(`max_hops=${budget.max_hops}`);
+    if (budget.candidate_samples_k !== undefined) {
+      bParts.push(`k=${budget.candidate_samples_k}`);
+    }
+    if (budget.max_rounds !== undefined) bParts.push(`rounds=${budget.max_rounds}`);
+    if (budget.use_critic_pass) bParts.push("critic=on");
+    if (bParts.length) {
+      wrap.appendChild(
+        el("div", "note-item-meta", `Budget: ${bParts.join(" · ")}`)
+      );
+    }
+  }
+
+  const signals =
+    route.signals && typeof route.signals === "object" ? route.signals : null;
+  if (signals) {
+    const sigLines = [];
+    if (
+      signals.causal_simulation &&
+      typeof signals.causal_simulation === "object"
+    ) {
+      const nodes = Array.isArray(signals.causal_simulation.impacted_nodes)
+        ? signals.causal_simulation.impacted_nodes
+        : [];
+      const target = signals.causal_simulation.target
+        ? ` (${String(signals.causal_simulation.target)})`
+        : "";
+      sigLines.push(`Impact Simulation${target}: ${nodes.length} impacted node(s)`);
+    }
+    if (
+      signals.quantitative_derivation &&
+      typeof signals.quantitative_derivation === "object"
+    ) {
+      const q = signals.quantitative_derivation;
+      const ans = q.majority_answer ? ` = ${String(q.majority_answer)}` : "";
+      sigLines.push(`Symbolic Sandbox: ${String(q.status || "ran")}${ans}`);
+    }
+    if (
+      signals.cognitive_swarm &&
+      typeof signals.cognitive_swarm === "object"
+    ) {
+      const roles =
+        signals.cognitive_swarm.roles &&
+        typeof signals.cognitive_swarm.roles === "object"
+          ? signals.cognitive_swarm.roles
+          : {};
+      const cites = Array.isArray(roles.knowledge?.atom_citations)
+        ? roles.knowledge.atom_citations.length
+        : 0;
+      const warns = Array.isArray(roles.critic?.contradiction_warnings)
+        ? roles.critic.contradiction_warnings.length
+        : 0;
+      sigLines.push(
+        `Cognitive Swarm: ${cites} citation(s), ${warns} contradiction warning(s)`
+      );
+    }
+    if (sigLines.length) {
+      const sigBox = el("div", "sub-panel");
+      for (const line of sigLines) {
+        sigBox.appendChild(el("div", "note-item-meta", line));
+      }
+      wrap.appendChild(sigBox);
+    }
+  }
+
+  return wrap;
+}
 
 function buildTurnDebateBriefCard(turn) {
   const brief = turn?.debateBrief || debateBriefsByTurnId.get(turn?.id);
@@ -1770,6 +1878,9 @@ function buildChatTurnCard(turn, isSelected) {
     card.appendChild(el("div", "status-banner banner-warn", turn.warning));
   }
 
+  const cognitiveRouteCard = buildTurnCognitiveRouteCard(turn);
+  if (cognitiveRouteCard) card.appendChild(cognitiveRouteCard);
+
   const body = el("div", "chat-assistant-body md-rendered");
   if (turn.assistantText) {
     renderRichMarkdown(body, turn.assistantText, {
@@ -1846,6 +1957,16 @@ if (window.secondBrain && typeof window.secondBrain.onChatEvent === "function") 
         chatWarningEl.style.display = "none";
       }
       renderChatSourceCards(turn);
+    } else if (resolvedEvent === "cognitive_route") {
+      const routeObj = data && typeof data === "object" ? { ...data } : null;
+      if (routeObj) {
+        turn.cognitiveRoute = routeObj;
+        cognitiveRoutesByTurnId.set(turn.id, routeObj);
+        const modeLbl = routeObj.mode || "deliberative";
+        const pathLbl = routeObj.path || "deliberative_path";
+        const profileLbl = routeObj.profile || "auto";
+        chatBannerEl.textContent = `Meta-Router: mode=${modeLbl} · path=${pathLbl} · profile=${profileLbl}`;
+      }
     } else if (resolvedEvent === "debate_brief") {
       const briefObj = data.brief && typeof data.brief === "object" ? data.brief : data;
       turn.debateBrief = briefObj;
@@ -1885,102 +2006,6 @@ document
     }
   });
 
-async function sendChat() {
-  const queryInput = document.getElementById("chatQueryInput");
-  const query = queryInput.value.trim();
-  if (!query) {
-    showToast("Enter a question to query your vault.", "warn");
-    return;
-  }
-
-  if (activeStreamingTurnId && chatAbortManager.isActive()) {
-    chatSession.markCancelled(activeStreamingTurnId);
-  }
-
-  const streamHandle = chatAbortManager.beginStream({
-    timeoutMs: 90000,
-    onTimeout: () => {
-      if (activeStreamingTurnId) {
-        chatSession.applyEvent(activeStreamingTurnId, "error", {
-          error: "Chat stream timed out after 90 seconds.",
-        });
-        renderAllChatTurns();
-      }
-      setChatStreamingState(false);
-    },
-  });
-
-  const priorHistory = chatSession.buildPriorHistory();
-  const threadSelVal = document.getElementById("chatThreadSelect")?.value || "";
-  const activeTid = chatSession.getThreadId() || threadSelVal;
-
-  const reqPayload = ChatHelper.buildChatStreamRequest({
-    query,
-    mode: document.getElementById("chatModeSelect").value,
-    host_id: document.getElementById("chatHostSelect").value || "ollama_local",
-    model_override: document.getElementById("chatModelInput").value,
-    retrieval_mode: document.getElementById("chatRetrievalModeSelect").value,
-    answer_view: document.getElementById("chatAnswerViewSelect").value,
-    project_scope: document.getElementById("chatScopeInput").value,
-    include_preferences: document.getElementById("chatIncludePrefsCheck")
-      .checked,
-    include_expired: Boolean(
-      document.getElementById("chatIncludeExpiredCheck")?.checked
-    ),
-    as_of: document.getElementById("chatAsOfInput")?.value || "",
-    thread_id: activeTid,
-    work_mode: activeWorkMode,
-    persona_id: activePersonaId,
-    behavior_mode: document.getElementById("behaviorModeSelect")?.value || "autopilot",
-    custom_rules: document.getElementById("chatCustomRulesInput")?.value || "",
-    done_criteria: document.getElementById("chatDoneCriteriaInput")?.value || "",
-    history: priorHistory,
-  });
-
-  const turn = chatSession.startTurn(reqPayload);
-  activeStreamingTurnId = turn.id;
-  queryInput.value = "";
-  chatWarningEl.style.display = "none";
-  chatBannerEl.textContent = "Retrieving context...";
-  setChatStreamingState(true);
-  renderAllChatTurns();
-  renderChatSourceCards(turn);
-
-  try {
-    const res = await window.secondBrain.streamChat(reqPayload);
-    if (
-      res &&
-      !res.ok &&
-      !res.cancelled &&
-      !streamHandle.signal.aborted &&
-      turn.status === "streaming"
-    ) {
-      const errMsg = res.error || `HTTP ${res.status}`;
-      chatSession.applyEvent(turn.id, "error", { error: errMsg });
-      chatBannerEl.textContent = `Error: ${errMsg}`;
-      renderAllChatTurns();
-      showToast(errMsg, "danger");
-    }
-  } catch (err) {
-    if (!streamHandle.signal.aborted) {
-      const errMsg = err?.message || String(err);
-      chatSession.applyEvent(turn.id, "error", { error: errMsg });
-      chatBannerEl.textContent = `Error: ${errMsg}`;
-      renderAllChatTurns();
-      showToast(errMsg, "danger");
-    }
-  } finally {
-    streamHandle.finish();
-    if (activeStreamingTurnId === turn.id) {
-      setChatStreamingState(false);
-    }
-  }
-}
-
-document.getElementById("chatSendBtn").addEventListener("click", sendChat);
-document.getElementById("chatQueryInput").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") sendChat();
-});
 document.getElementById("chatStopBtn").addEventListener("click", () => {
   if (activeStreamingTurnId) {
     chatSession.markCancelled(activeStreamingTurnId);
@@ -1998,6 +2023,7 @@ document
     setChatStreamingState(false);
     chatSession.clearHistory();
     debateBriefsByTurnId.clear();
+    cognitiveRoutesByTurnId.clear();
     chatWarningEl.style.display = "none";
     chatSourcesEl.replaceChildren();
     if (chatSourcesHeaderEl) {
@@ -2017,6 +2043,7 @@ if (chatThreadSelEl) {
     if (!tid) {
       chatSession.clearHistory();
       debateBriefsByTurnId.clear();
+      cognitiveRoutesByTurnId.clear();
       chatSession.setThreadId("");
       renderAllChatTurns();
       chatSourcesEl.replaceChildren();
@@ -2028,6 +2055,7 @@ if (chatThreadSelEl) {
       return;
     }
     debateBriefsByTurnId.clear();
+    cognitiveRoutesByTurnId.clear();
     const count = chatSession.loadThreadTurns(res.data || {});
     applyThreadBuildSettings(res.data || {});
     renderAllChatTurns();
@@ -9119,7 +9147,7 @@ async function promoteGen4DistilledArtifact(kind, item, action) {
     }
   );
   if (res.ok) {
-    const msg = `${action === "promote" ? "Promoted" : "Deprecated"} ${item.filename} (CAS verified).`;
+    const msg = `${action === "promote" ? "Promoted" : "Revoked"} ${item.filename} (CAS verified).`;
     if (outEl) outEl.textContent = msg;
     showToast(msg, "ok");
     loadGen4DistilledArtifacts();
@@ -9176,10 +9204,10 @@ function renderDistilledArtifactCards(containerEl, items, kind) {
       promBtn.addEventListener("click", () => promoteGen4DistilledArtifact(kind, item, "promote"));
       bar.appendChild(promBtn);
     } else {
-      const depBtn = el("button", "btn sm warn", "Deprecate (CAS)");
-      depBtn.type = "button";
-      depBtn.addEventListener("click", () => promoteGen4DistilledArtifact(kind, item, "deprecate"));
-      bar.appendChild(depBtn);
+      const revBtn = el("button", "btn sm warn", "Revoke (CAS)");
+      revBtn.type = "button";
+      revBtn.addEventListener("click", () => promoteGen4DistilledArtifact(kind, item, "revoke"));
+      bar.appendChild(revBtn);
     }
     card.appendChild(bar);
     containerEl.appendChild(card);

@@ -4,7 +4,24 @@
 # ///
 """Deterministic hardware capability profiling and model/retrieval tier selection."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import ctypes
@@ -22,12 +39,11 @@ import urllib.error
 from urllib.parse import urlsplit
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("hardware_profile", "scripts.hardware_profile"):
     sys.modules.setdefault("hardware_profile", sys.modules[__name__])
     sys.modules.setdefault("scripts.hardware_profile", sys.modules[__name__])
 
-from config import EMBED_MODEL, GEN_MODEL
+from scripts.config import EMBED_MODEL, GEN_MODEL
 
 HARDWARE_PROFILE_CACHE_TTL_SECONDS = 30.0
 NOMINAL_16GB_RAM_GIB: float = 15.5
@@ -607,6 +623,25 @@ def probe_ollama_models(
 _DEFAULT_PROBE_OLLAMA_MODELS = probe_ollama_models
 
 
+def _parameter_billions(model_name: str) -> float | None:
+    """Return the parameter size from a tag such as ``:7b``, not the ``2.5`` in ``qwen2.5``."""
+    match = re.search(r"(?:^|[:_-])(\d+(?:\.\d+)?)b(?:[:_-]|$)", (model_name or "").lower())
+    if match is None:
+        return None
+    return float(match.group(1))
+
+
+def _cpu_free_ram_allows_model(model_name: str, available_ram_gib: float | None) -> bool:
+    """A 7B model is not the automatic choice when only about 9 GiB is free."""
+    available = float(available_ram_gib or 0.0)
+    if available <= 0 or available >= 12.0:
+        return True
+    params = _parameter_billions(model_name)
+    if params is not None and params >= 7.0:
+        return False
+    return True
+
+
 def _model_fits_host_memory(
     model_name: str,
     *,
@@ -614,12 +649,15 @@ def _model_fits_host_memory(
     gpu_backend: str = "cpu",
     vram_gib: float | None = 0.0,
     model_sizes_bytes: dict[str, int] | None = None,
+    available_ram_gib: float | None = None,
 ) -> bool:
     """Return True if a local GGUF model fits host VRAM/RAM without severe pagefile thrashing."""
     total_ram_gib = float(total_ram_gib or 0.0)
     vram_gib = float(vram_gib or 0.0)
     clean = (model_name or "").strip()
     if not clean:
+        return False
+    if gpu_backend not in _DISCRETE_GPU_BACKENDS and not _cpu_free_ram_allows_model(clean, available_ram_gib):
         return False
     if model_sizes_bytes:
         sz = model_sizes_bytes.get(clean) or model_sizes_bytes.get(clean.split(":", 1)[0]) or 0
@@ -692,6 +730,7 @@ def _match_installed_model(
     vram_gib: float = 0.0,
     model_sizes_bytes: dict[str, int] | None = None,
     enforce_memory_fit: bool = False,
+    available_ram_gib: float | None = None,
 ) -> str | None:
     installed_set = set(installed)
     installed_roots: dict[str, list[str]] = {}
@@ -707,6 +746,7 @@ def _match_installed_model(
             gpu_backend=gpu_backend,
             vram_gib=vram_gib,
             model_sizes_bytes=model_sizes_bytes,
+            available_ram_gib=available_ram_gib,
         )
 
     for candidate in candidates:
@@ -820,6 +860,7 @@ def classify_hardware_tier(
             vram_gib=vram_gib,
             model_sizes_bytes=model_sizes_bytes,
             enforce_memory_fit=True,
+            available_ram_gib=available_ram_gib,
         )
         return HardwareCapabilityProfile(
             os_name=os_name,
@@ -873,6 +914,7 @@ def classify_hardware_tier(
             vram_gib=vram_gib,
             model_sizes_bytes=model_sizes_bytes,
             enforce_memory_fit=True,
+            available_ram_gib=available_ram_gib,
         )
         oversized_note = (
             f" Oversized model(s) skipped for auto-default to prevent swap thrashing: {', '.join(oversized)} (override via BRAIN_GEN_MODEL)."
@@ -918,6 +960,7 @@ def classify_hardware_tier(
         vram_gib=vram_gib,
         model_sizes_bytes=model_sizes_bytes,
         enforce_memory_fit=True,
+        available_ram_gib=available_ram_gib,
     )
     return HardwareCapabilityProfile(
         os_name=os_name,
@@ -1007,6 +1050,31 @@ def invalidate_hardware_profile_cache() -> None:
 
 
 _SAFE_LOCAL_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def explicit_generation_model() -> str | None:
+    """Return BRAIN_GEN_MODEL when the owner set a real model name."""
+    explicit_env = (os.environ.get("BRAIN_GEN_MODEL") or "").strip()
+    if (
+        explicit_env
+        and explicit_env.lower() != "auto"
+        and ".." not in explicit_env
+        and _SAFE_LOCAL_MODEL_RE.fullmatch(explicit_env)
+    ):
+        return explicit_env
+    return None
+
+
+def model_for_local_rule(rule_default: str, model_override: str | None = None) -> str:
+    """An explicit request or BRAIN_GEN_MODEL wins over a saved policy default."""
+    override = (model_override or "").strip()
+    if override and override.lower() != "auto":
+        return override
+    pinned = explicit_generation_model()
+    if pinned:
+        return pinned
+    fallback = (rule_default or GEN_MODEL).strip()
+    return fallback or GEN_MODEL
 
 
 def resolve_active_local_generation_model(

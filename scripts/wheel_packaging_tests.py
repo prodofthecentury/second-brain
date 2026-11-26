@@ -4,7 +4,24 @@ Run:
     uv run --frozen python -m unittest scripts.wheel_packaging_tests -v
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import json
 import os
@@ -29,8 +46,6 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 def _find_free_loopback_port() -> int:
@@ -174,7 +189,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         self.assertIn("second_brain/scripts/publish_registries.py", names)
         with zipfile.ZipFile(self._wheel_path, "r") as zf2:
             pub_src = zf2.read("second_brain/scripts/publish_registries.py").decode("utf-8")
-        self.assertIn("import re\n", pub_src)
+        self.assertIn("import re\n", pub_src.replace("\r\n", "\n"))
         self.assertIn("second-brain = second_brain.cli:main", entry_points_txt)
 
     def test_isolated_venv_wheel_doctor_serve_and_headless_dashboard(self) -> None:
@@ -270,7 +285,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
                     "-c",
                     (
                         "from second_brain.cli import bootstrap_runtime; bootstrap_runtime(); "
-                        "import config; print(config.BRAIN_DIR)"
+                        "from scripts import config; print(config.BRAIN_DIR)"
                     ),
                 ],
                 cwd=str(empty_cwd),
@@ -408,7 +423,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
                     "-c",
                     (
                         "from second_brain.cli import bootstrap_runtime; bootstrap_runtime(); "
-                        "from dashboard_auth import build_password_record, save_password_record; "
+                        "from scripts.dashboard_auth import build_password_record, save_password_record; "
                         "save_password_record(build_password_record('correct-horse-battery-staple'))"
                     ),
                 ],
@@ -461,8 +476,8 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
                 _terminate_process_tree(dash_proc)
 
     def test_icons_vsix_electron_config_wheelhouse_and_ci_yaml(self) -> None:
-        from build_vsix import build_vsix
-        from build_wheelhouse import build_wheelhouse
+        from scripts.build_vsix import build_vsix
+        from scripts.build_wheelhouse import build_wheelhouse
 
         # 1. Verify generated icons on disk
         ico_path = REPO_ROOT / "desktop" / "assets" / "icon.ico"
@@ -593,7 +608,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
 
     def test_plugin_skill_prove_leaf_kind_lf_normalization_and_no_bak_pollution(self) -> None:
         import hashlib
-        import ide_connector
+        import scripts.ide_connector as ide_connector
 
         ag_root = REPO_ROOT / "plugins" / "antigravity" / "second-brain"
         cc_root = REPO_ROOT / "plugins" / "claude-code" / "second-brain"
@@ -661,7 +676,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
     def test_wheelhouse_no_duplicate_versions_stale_pruning_and_macos_universal_wheels(self) -> None:
         import platform as py_platform
         from unittest import mock
-        import build_wheelhouse as bw
+        import scripts.build_wheelhouse as bw
 
         with tempfile.TemporaryDirectory(prefix="sb_wh_univ_") as td:
             wh_dir = Path(td) / "wheelhouse"
@@ -678,13 +693,22 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
             self.assertNotIn("soupsieve-2.10-py3-none-any.whl", on_disk)
             self.assertNotIn("obsolete_pkg-0.1.0-py3-none-any.whl", on_disk)
 
-            # On single-arch host builds, every normalized package appears once
-            seen_dists: dict[str, list[str]] = {}
+            # One version per package. macOS host builds keep both arm64 and
+            # x86_64 wheels of that version; those are not duplicate versions.
+            versions_by_dist: dict[str, set[str]] = {}
+            files_by_dist_platform: dict[tuple[str, str], list[str]] = {}
             for fname in on_disk:
-                dist_part = fname.split("-", 1)[0].lower()
-                seen_dists.setdefault(dist_part, []).append(fname)
-            dups = {k: v for k, v in seen_dists.items() if len(v) > 1}
-            self.assertEqual(dups, {}, f"Duplicate wheel versions in host wheelhouse: {dups}")
+                stem = fname[:-4] if fname.endswith(".whl") else fname
+                parts = stem.split("-")
+                dist = parts[0].lower()
+                version = parts[1] if len(parts) > 1 else ""
+                platform_tag = parts[-1] if len(parts) >= 5 else stem
+                versions_by_dist.setdefault(dist, set()).add(version)
+                files_by_dist_platform.setdefault((dist, platform_tag), []).append(fname)
+            version_dups = {k: sorted(v) for k, v in versions_by_dist.items() if len(v) > 1}
+            platform_dups = {f"{k[0]}:{k[1]}": v for k, v in files_by_dist_platform.items() if len(v) > 1}
+            self.assertEqual(version_dups, {}, f"Duplicate wheel versions in host wheelhouse: {version_dups}")
+            self.assertEqual(platform_dups, {}, f"Duplicate platform tags in host wheelhouse: {platform_dups}")
 
             # Verify real uv.lock resolves BOTH arm64 and x86_64 wheels for every core dependency on macOS universal
             mac_plan = bw.resolve_wheelhouse_plan(
@@ -755,7 +779,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         self.assertIn("*.tar.gz", pkg_sh)
 
         # 3. _collect_homebrew_resources must resolve soupsieve 3.0.4 (not 2.10) and cryptography <49
-        from build_distribution_manifests import _collect_homebrew_resources, build_package_manager_manifests
+        from scripts.build_distribution_manifests import _collect_homebrew_resources, build_package_manager_manifests
         import hashlib
 
         brew_res = dict((name, (url, sha)) for name, url, sha in _collect_homebrew_resources())
@@ -815,7 +839,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
     def test_publish_registries_homebrew_formula_winget_pr_github_release_and_verify_assets(self) -> None:
         import hashlib
         import httpx
-        import publish_registries as pr
+        import scripts.publish_registries as pr
 
         with tempfile.TemporaryDirectory(prefix="sb_pub_reg_") as td:
             tmp = Path(td)
@@ -1009,14 +1033,14 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         import ast
         import hashlib
         from unittest import mock
-        import build_distribution_manifests as bdm
-        import build_wheelhouse as bw
-        import evaluation_dataset as eval_ds
-        import ide_connector
-        import memory_api
-        import publish_registries as pr
-        import run_desktop_tests as rdt
-        import _hatch_build as hb
+        import scripts.build_distribution_manifests as bdm
+        import scripts.build_wheelhouse as bw
+        import scripts.evaluation_dataset as eval_ds
+        import scripts.ide_connector as ide_connector
+        import scripts.memory_api as memory_api
+        import scripts.publish_registries as pr
+        import scripts.run_desktop_tests as rdt
+        import scripts._hatch_build as hb
 
         # 1. Wheel excludes scripts/*.ps1/*.sh, _hatch_build.py, mobile fastlane/, gradle-wrapper.jar & stale Capacitor public/
         with zipfile.ZipFile(self._wheel_path, "r") as zf:
@@ -1043,9 +1067,9 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
             self.assertIn(excl, res_by_to["backend/mobile"])
 
         # macOS root compatibility symlink (/var -> private/var) allowed on darwin; arbitrary symlinks still rejected
-        import config as cfg
-        import inbox_drop
-        import mobile_vault_client as mvc
+        import scripts.config as cfg
+        import scripts.inbox_drop as inbox_drop
+        import scripts.mobile_vault_client as mvc
 
         with (
             mock.patch.object(bw.sys, "platform", "darwin"),
@@ -1059,6 +1083,13 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         ):
             self.assertTrue(ide_connector._is_immutable_darwin_root_symlink(PurePosixPath("/tmp")))
             self.assertFalse(ide_connector._is_immutable_darwin_root_symlink(PurePosixPath("/tmp/evil")))
+        # Keychain fallback tests report linux while still walking the real /var symlink.
+        with (
+            mock.patch.object(cfg.sys, "platform", "linux"),
+            mock.patch.object(cfg.os, "readlink", return_value="private/var"),
+        ):
+            self.assertTrue(cfg._is_immutable_darwin_root_symlink("/var"))
+            self.assertFalse(cfg._is_immutable_darwin_root_symlink("/var/folders"))
 
         # End-to-end macOS /var/folders/x traversal allowed for build_distribution_manifests, inbox_drop, mobile_vault_client
         with (
@@ -1167,7 +1198,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
             uv_bin = shutil.which("uv") or "uv"
             cold_env = {**os.environ, "UV_CACHE_DIR": str(tmp / "empty_uv_cache")}
             subprocess.run(
-                [uv_bin, "venv", str(cold_venv), "--python", "3.11", "--clear", "--offline"],
+                [uv_bin, "venv", str(cold_venv), "--python", sys.executable, "--clear", "--offline"],
                 env=cold_env,
                 check=True,
                 capture_output=True,
@@ -1200,7 +1231,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
             )
             self.assertEqual(probe.stdout.strip(), "1.0.0")
 
-        # 4. Exact parameter parity between SKILL.md and scripts/mcp_server.py inputSchema across all 27 tools
+        # 4. Exact parameter parity between SKILL.md and scripts/mcp_server.py inputSchema across every TOOL_NAMES entry
         mcp_src = (REPO_ROOT / "scripts" / "mcp_server.py").read_text(encoding="utf-8")
         mcp_tree = ast.parse(mcp_src)
         mcp_schemas: dict[str, set[str]] = {}
@@ -1345,7 +1376,11 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         self.assertNotIn("npm install --no-package-lock", ci_txt)
         self.assertIn("--exclude desktop_ui_tests vscode_extension_tests wheel_packaging_tests", ci_txt)
         self.assertIn("SB_RELEASE_LINUX_RUNNER", rel_txt)
-        self.assertIn("!inputs.draft && inputs.publish_registries", rel_txt)
+        self.assertIn(
+            "github.event.inputs.draft != 'true' && github.event.inputs.publish_registries == 'true'",
+            rel_txt,
+        )
+        self.assertNotIn("if: ${{ secrets.", rel_txt)
         self.assertNotIn("-PfxPassword", rel_txt)
         self.assertNotIn('--pat "$VSCE_PAT"', rel_txt)
         self.assertNotIn('-p "$OVSX_PAT"', rel_txt)

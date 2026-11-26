@@ -19,7 +19,24 @@ Three-Store invariants:
     symlinks/reparse points, and credential/key files (`*.pfx`, `*.p12`, `*.pem`, `*.key`, `.env*`).
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import base64
@@ -44,15 +61,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import atomic_write_bytes, invalidate_decision_log_cache, review_lock  # noqa: E402
-from config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, resolve_active_brain_dir  # noqa: E402
-from host_adapters import restrict_security_file_permissions  # noqa: E402
-from index_manifest import invalidate_atom_revision_cache  # noqa: E402
-from lexical_store import rebuild_lexical_index  # noqa: E402
-from notes_store import NotePaths  # noqa: E402
-from vault_ledger import (  # noqa: E402
+from scripts.atom_mutator import atomic_write_bytes, invalidate_decision_log_cache, review_lock  # noqa: E402
+from scripts.config import _is_immutable_darwin_root_symlink, _is_reparse_or_link, resolve_active_brain_dir  # noqa: E402
+from scripts.host_adapters import restrict_security_file_permissions  # noqa: E402
+from scripts.index_manifest import invalidate_atom_revision_cache  # noqa: E402
+from scripts.lexical_store import rebuild_lexical_index  # noqa: E402
+from scripts.notes_store import NotePaths  # noqa: E402
+from scripts.vault_ledger import (  # noqa: E402
     _build_merkle_levels,
     _leaf_digest,
     compute_vault_merkle,
@@ -809,6 +825,34 @@ def _peek_backup_is_encrypted(raw_backup_path: str) -> bool:
     return bool(outer_peek.get("encrypted", True))
 
 
+def auto_backup_now(*, brain_dir: str | Path | None = None) -> dict[str, Any]:
+    """Write today's vault backup outside the live vault.
+
+    Uses ``BRAIN_BACKUP_PASSPHRASE`` when it is set. Otherwise the archive is
+    unencrypted, which is explicit in the returned record.
+    A backup that already exists for the local date is left in place.
+    """
+    import time
+
+    from scripts.config import security_state_dir
+
+    root = Path(os.environ.get("BRAIN_AUTO_BACKUP_DIR") or (security_state_dir() / "auto-backups")).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    dest = root / f"vault-{time.strftime('%Y%m%d')}.sbvault"
+    if dest.is_file() and dest.stat().st_size > 0:
+        return {"skipped": True, "backup_path": str(dest), "reason": "already created today"}
+    passphrase = os.environ.get("BRAIN_BACKUP_PASSPHRASE") or None
+    created = create_vault_backup(
+        dest,
+        brain_dir=brain_dir,
+        passphrase=passphrase,
+        unencrypted=not bool(passphrase),
+    )
+    created["automatic"] = True
+    created["encrypted"] = bool(passphrase)
+    return created
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="second-brain backup",
@@ -840,8 +884,15 @@ def main(argv: list[str] | None = None) -> int:
     p_rs.add_argument("--force", action="store_true", help="Create a pre-restore safety backup and overwrite non-empty target.")
     p_rs.add_argument("--json", action="store_true")
 
+    sub.add_parser("auto", help="Write today's automatic backup if one does not already exist.")
+
     args = parser.parse_args(argv)
     try:
+        if args.subcmd == "auto":
+            res = auto_backup_now(brain_dir=None)
+            print(json.dumps(res, indent=2, default=str))
+            return 0
+
         if args.subcmd == "create":
             pw = _resolve_cli_passphrase(
                 passphrase_arg=args.passphrase,

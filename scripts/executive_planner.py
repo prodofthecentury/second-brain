@@ -6,7 +6,24 @@
 # ///
 """Layer 5 Cognitive Core: Read-only Executive Planner grounded strictly in verified Playbooks and approved Atoms."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from collections import Counter
@@ -21,14 +38,13 @@ import sys
 
 import httpx
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("executive_planner", "scripts.executive_planner"):
     sys.modules.setdefault("executive_planner", sys.modules[__name__])
     sys.modules.setdefault("scripts.executive_planner", sys.modules[__name__])
 
-from atom_mutator import review_lock
-from cognitive_core import peek_lexical_candidate_atom_ids
-from config import (
+from scripts.atom_mutator import review_lock
+from scripts.cognitive_core import peek_lexical_candidate_atom_ids
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     BRIEFINGS_DIR,
@@ -44,8 +60,8 @@ from config import (
 )
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from evidence import verify_evidence_anchor
-from host_adapters import (
+from scripts.evidence import verify_evidence_anchor
+from scripts.host_adapters import (
     HostConsentError,
     HostSharingRule,
     OutboundSecretBlockedError,
@@ -58,10 +74,10 @@ from host_adapters import (
     validate_endpoint_network_boundary,
     validate_model_identifier,
 )
-from lexical_store import LexicalIndexUnavailable, TOKEN_PATTERN
-from memory_format import evaluate_temporal_validity, split_frontmatter
-from memory_review import parse_frontmatter_values, parse_scalar_list, section_text
-from recall import (
+from scripts.lexical_store import LexicalIndexUnavailable, TOKEN_PATTERN
+from scripts.memory_format import evaluate_temporal_validity, split_frontmatter
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list, section_text
+from scripts.recall import (
     EXCLUDED_RECALL_STATUSES,
     QUERY_STOP_WORDS,
     MemoryRecallUnavailable,
@@ -72,8 +88,8 @@ from recall import (
     project_tags_match,
     search_memory,
 )
-from review_atom import approved_revision_is_current
-from skill_playbooks import PlaybookIntegrityReport, list_playbooks, playbook_visible_in_scope
+from scripts.review_atom import approved_revision_is_current
+from scripts.skill_playbooks import PlaybookIntegrityReport, list_playbooks, playbook_visible_in_scope
 
 INSUFFICIENT_VERIFIED_MEMORY_FOR_PLAN = (
     "Cannot assemble a grounded executive plan: no verified active Playbooks or owner-approved "
@@ -860,7 +876,7 @@ def assemble_executive_plan(
                 final_rollback_checkpoints.append(r)
 
     try:
-        from cognitive_distiller import list_distilled_artifacts
+        from scripts.cognitive_distiller import list_distilled_artifacts
 
         proj_arg = None if request.allow_cross_project else (projects[0] if len(projects) == 1 else None)
         for pr in list_distilled_artifacts(kind="principle", project=proj_arg, active_only=True, brain_dir=brain_dir, atoms_dir=atoms_dir)[:3]:

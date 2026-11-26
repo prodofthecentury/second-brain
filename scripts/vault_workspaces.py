@@ -20,7 +20,24 @@ Security & isolation invariants:
    preserving every vault's independent approval, source-anchor, and preference filters.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import datetime
@@ -36,10 +53,9 @@ import sys
 import tempfile
 import threading
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from atom_mutator import review_lock  # noqa: E402
-from config import (  # noqa: E402
+from scripts.atom_mutator import review_lock  # noqa: E402
+from scripts.config import (  # noqa: E402
     _is_immutable_darwin_root_symlink,
     _is_reparse_or_link,
     ensure_dirs,
@@ -48,12 +64,12 @@ from config import (  # noqa: E402
     security_state_dir,
     vault_paths_for,
 )
-from host_adapters import restrict_security_file_permissions  # noqa: E402
-from cross_encoder import score_query_atom_pairs  # noqa: E402
-from lexical_store import lexical_index_is_current, rebuild_lexical_index  # noqa: E402
-from memory_format import split_frontmatter  # noqa: E402
-from memory_review import parse_frontmatter_values  # noqa: E402
-from recall import RecallOptions, search_memory  # noqa: E402
+from scripts.host_adapters import restrict_security_file_permissions  # noqa: E402
+from scripts.cross_encoder import score_query_atom_pairs  # noqa: E402
+from scripts.lexical_store import lexical_index_is_current, rebuild_lexical_index  # noqa: E402
+from scripts.memory_format import split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_frontmatter_values  # noqa: E402
+from scripts.recall import RecallOptions, search_memory  # noqa: E402
 
 
 VAULTS_REGISTRY_FILENAME = "vaults.json"

@@ -4,7 +4,24 @@
 # ///
 """Compare raw lexical/dense candidate ranking and verify the trust gate."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import json
 import argparse
@@ -15,22 +32,21 @@ import statistics
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import ATOMS_DIR, CHROMA_PATH, EMBED_MODEL, LEXICAL_INDEX_PATH
-from atom_mutator import approved_revision_is_current
-from evaluation_dataset import load_dataset
-from index_manifest import index_manifest_is_current, load_index_manifest
-from lexical_store import search_lexical_index
-from ollama_utils import EmbeddingUnavailableError, embed_text
-from recall import (
+from scripts.config import ATOMS_DIR, CHROMA_PATH, EMBED_MODEL, LEXICAL_INDEX_PATH
+from scripts.atom_mutator import approved_revision_is_current
+from scripts.evaluation_dataset import load_dataset
+from scripts.index_manifest import index_manifest_is_current, load_index_manifest
+from scripts.lexical_store import search_lexical_index
+from scripts.ollama_utils import EmbeddingUnavailableError, embed_text
+from scripts.recall import (
     RecallOptions,
     search_hybrid_rrf_memory,
     search_lexical_memory,
     search_semantic_memory,
     validated_index_generation,
 )
-from vector_store import get_vector_collection, close_vector_collection
+from scripts.vector_store import get_vector_collection, close_vector_collection
 
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -15,7 +15,24 @@ Implements:
    - Aggregates `majority@k` via `math_equivalence.aggregate_majority_at_k`.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from collections.abc import Callable
@@ -29,19 +46,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("cgv_reasoner", "scripts.cgv_reasoner"):
     sys.modules.setdefault("cgv_reasoner", sys.modules[__name__])
     sys.modules.setdefault("scripts.cgv_reasoner", sys.modules[__name__])
 
-from math_equivalence import (  # noqa: E402
+from scripts.math_equivalence import (  # noqa: E402
     _UNIT_TABLE,
     aggregate_majority_at_k,
     are_math_equivalent,
     extract_final_answer,
 )
-from process_evaluator import score_reasoning_trace  # noqa: E402
-from symbolic_sandbox import SandboxSecurityError, run_sandboxed_python  # noqa: E402
+from scripts.process_evaluator import score_reasoning_trace  # noqa: E402
+from scripts.symbolic_sandbox import SandboxSecurityError, run_sandboxed_python  # noqa: E402
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _QUANTITY_RE = re.compile(
@@ -197,8 +213,34 @@ def _loopback_ollama_chat_url() -> str | None:
         return None
     if not (1 <= port <= 65535):
         return None
+    if host == "localhost":
+        host = "127.0.0.1"
     netloc_host = "[::1]" if host == "::1" else host
     return f"http://{netloc_host}:{port}/api/chat"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Fail closed on any HTTP redirect from the loopback Ollama endpoint."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"Redirects are disallowed for local Ollama requests (HTTP {code})",
+            headers,
+            fp,
+        )
+
+    def http_error_302(self, req: Any, fp: Any, code: int, msg: str, headers: Any) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"Redirects are disallowed for local Ollama requests (HTTP {code})",
+            headers,
+            fp,
+        )
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
 def _local_ollama_tora_solver(
@@ -247,7 +289,7 @@ def _local_ollama_tora_solver(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirectHandler())
     eff_timeout = max(0.5, min(20.0, float(timeout_seconds)))
     try:
         with opener.open(req, timeout=eff_timeout) as resp:

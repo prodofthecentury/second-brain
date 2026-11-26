@@ -23,19 +23,18 @@ import sqlite3
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("chat_threads", "scripts.chat_threads"):
     sys.modules.setdefault("chat_threads", sys.modules[__name__])
     sys.modules.setdefault("scripts.chat_threads", sys.modules[__name__])
 
-from config import (
+from scripts.config import (
     BRAIN_DIR,
     _is_reparse_or_link,
     resolve_module_vault_path,
     snapshot_module_defaults,
 )
-from host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions
-from lexical_store import FTS_STOP_WORDS, TOKEN_PATTERN
+from scripts.host_adapters import inspect_and_redact_outbound, restrict_security_file_permissions
+from scripts.lexical_store import FTS_STOP_WORDS, TOKEN_PATTERN
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
@@ -652,7 +651,7 @@ def pin_turn_to_note(
     brain_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Save an assistant chat turn (plus its preceding user question & citations) as a Working Note."""
-    from notes_store import NotePaths, create_note
+    from scripts.notes_store import NotePaths, create_note
 
     resolved_brain = resolve_module_vault_path(
         globals(), "BRAIN_DIR", str(brain_dir) if brain_dir is not None else None

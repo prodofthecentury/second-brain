@@ -11,7 +11,24 @@ active principles, and episodic experience records, plus Two-Sided Debate Mode
 Supersede, or Context-Partition). Never mutates canonical stores autonomously.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 from collections.abc import Callable
@@ -23,12 +40,11 @@ import re
 import sys
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("cognitive_swarm", "scripts.cognitive_swarm"):
     sys.modules.setdefault("cognitive_swarm", sys.modules[__name__])
     sys.modules.setdefault("scripts.cognitive_swarm", sys.modules[__name__])
 
-from config import (  # noqa: E402
+from scripts.config import (  # noqa: E402
     ATOMS_DIR,
     BRAIN_DIR,
     _is_reparse_or_link,
@@ -36,12 +52,12 @@ from config import (  # noqa: E402
     resolve_module_atoms_and_brain,
     snapshot_module_defaults,
 )
-from knowledge_graph import detect_contradictions  # noqa: E402
-from memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
-from memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list  # noqa: E402
-from meta_router import classify_query, route_and_retrieve  # noqa: E402
-from recall import normalize_project_tag, project_tags_match  # noqa: E402
-from review_atom import approved_revision_is_current  # noqa: E402
+from scripts.knowledge_graph import detect_contradictions  # noqa: E402
+from scripts.memory_format import evaluate_temporal_validity, split_frontmatter  # noqa: E402
+from scripts.memory_review import parse_atom_record_text, parse_frontmatter_values, parse_scalar_list  # noqa: E402
+from scripts.meta_router import classify_query, route_and_retrieve  # noqa: E402
+from scripts.recall import normalize_project_tag, project_tags_match  # noqa: E402
+from scripts.review_atom import approved_revision_is_current  # noqa: E402
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
@@ -219,7 +235,7 @@ def run_cognitive_swarm(
 
     active_principles: list[dict[str, Any]] = []
     try:
-        from cognitive_distiller import list_distilled_artifacts
+        from scripts.cognitive_distiller import list_distilled_artifacts
 
         active_principles = list_distilled_artifacts(
             kind="principle",
@@ -462,6 +478,125 @@ def run_two_sided_debate(
                 "description": "Set bi-temporal bounds or project/environment context tags on each atom.",
             },
         ],
+    }
+
+
+class SwarmRuntimeError(RuntimeError):
+    """A real Ollama debate round could not be completed."""
+
+
+def enforce_cited_sentences(text: str, allowed_ids: set[str] | frozenset[str]) -> list[str]:
+    """Keep only sentences whose [V#] citations are in the approved set."""
+    allowed = {str(item) for item in allowed_ids}
+    kept: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", str(text or "").strip()):
+        found = set(re.findall(r"\[(V\d+)\]", sentence))
+        if found and found <= allowed:
+            kept.append(sentence.strip())
+    return kept
+
+
+def run_ollama_cited_debate(
+    topic: str,
+    citations: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    rounds: int = 2,
+    timeout_seconds: float = 60.0,
+) -> dict[str, Any]:
+    """Ask a local Ollama model for cited thesis and antithesis turns.
+
+    Sentences that do not carry an allowed ``[V#]`` citation are dropped.
+    If every sentence is dropped, the round abstains instead of inventing a claim.
+    """
+    import httpx
+
+    clean_topic = str(topic or "").strip()
+    if not clean_topic:
+        raise ValueError("Debate topic is required.")
+    allowed = {
+        str(item.get("citation_id") or "").strip()
+        for item in citations
+        if str(item.get("citation_id") or "").strip()
+    }
+    if not allowed:
+        return {
+            "status": "abstained",
+            "reason": "no approved citations were supplied",
+            "rounds": [],
+            "model": model or "",
+        }
+    if base_url:
+        host = str(base_url).rstrip("/")
+    elif (os.environ.get("BRAIN_OLLAMA_HOST") or "").strip():
+        from scripts.ollama_endpoint import ollama_host_warning, resolved_ollama_base_url
+
+        resolved, _source = resolved_ollama_base_url()
+        if not resolved:
+            raise SwarmRuntimeError(ollama_host_warning() or "BRAIN_OLLAMA_HOST was refused")
+        host = resolved
+    else:
+        host = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
+    chosen = (model or os.environ.get("BRAIN_OLLAMA_DEBATE_MODEL") or "qwen2.5:0.5b").strip()
+    timeout = max(5.0, min(180.0, float(timeout_seconds)))
+    catalog = ""
+    for item in citations:
+        catalog += f"[{item.get('citation_id')}] {item.get('claim') or ''}\n"
+    turns = []
+    try:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
+            tags = client.get(f"{host}/api/tags")
+            tags.raise_for_status()
+            names = {
+                str(row.get("name") or "")
+                for row in (tags.json().get("models") or [])
+                if isinstance(row, dict)
+            }
+            if chosen not in names and not any(name.startswith(chosen) for name in names):
+                raise SwarmRuntimeError(
+                    f"Ollama at {host} does not have model {chosen!r}. Installed: {sorted(names) or 'none'}."
+                )
+            for role, stance in (
+                ("thesis", "Argue for the topic using only the citations."),
+                ("antithesis", "Argue against the topic using only the citations."),
+            )[: max(1, min(2, int(rounds)))]:
+                prompt = (
+                    f"{stance}\nTopic: {clean_topic}\n"
+                    "Every sentence must cite one of these ids in square brackets.\n"
+                    f"{catalog}"
+                )
+                response = client.post(
+                    f"{host}/api/chat",
+                    json={
+                        "model": chosen,
+                        "stream": False,
+                        "messages": [
+                            {"role": "system", "content": "You may only use the supplied citations."},
+                            {"role": "user", "content": prompt},
+                        ],
+                    },
+                )
+                response.raise_for_status()
+                content = str(((response.json().get("message") or {}).get("content")) or "")
+                accepted = enforce_cited_sentences(content, allowed)
+                turns.append(
+                    {
+                        "role": role,
+                        "raw": content[:2000],
+                        "accepted": accepted,
+                        "abstained": not accepted,
+                    }
+                )
+    except SwarmRuntimeError:
+        raise
+    except Exception as exc:
+        raise SwarmRuntimeError(f"Ollama debate failed against {host}: {exc}") from exc
+    return {
+        "status": "completed" if any(not turn["abstained"] for turn in turns) else "abstained",
+        "model": chosen,
+        "rounds": turns,
+        "uncited_claims_emitted": 0,
     }
 
 

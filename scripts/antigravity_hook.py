@@ -49,7 +49,24 @@ Security & Trust Invariants:
   blocked.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import hashlib
@@ -128,6 +145,32 @@ _STOP_WORDS: frozenset[str] = frozenset(
 )
 _OPEN_TAG_RE = re.compile(r"<\s*second_brain_auto_context\b", re.IGNORECASE)
 _CLOSE_TAG_RE = re.compile(r"<\s*/\s*second_brain_auto_context\s*>", re.IGNORECASE)
+_FAST_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bsk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\b(?:sk|rk)_live_[0-9A-Za-z]{20,}\b"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
+    re.compile(r"https?://[^/\s:@\"']+:[^/\s@\"']+@"),
+    re.compile(
+        r"(?i)\b(?:password|passwd|pwd|api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|private[_-]?token|token)\s*[:=]\s*['\"]?[^\s'\",;]{4,}"
+    ),
+)
+
+
+def _contains_likely_secret_fast(text: str) -> bool:
+    """Fast stdlib-only credential/secret detector used before any state or experience persistence."""
+    raw = str(text or "")
+    if not raw:
+        return False
+    return any(pat.search(raw) for pat in _FAST_SECRET_PATTERNS)
 
 
 def _auto_recall_enabled() -> bool:
@@ -287,6 +330,13 @@ def _save_conv_state(path: Path | None, data: dict[str, Any], *, verify_unix_uid
                 pass
             return
         tmp = None
+        try:
+            _ensure_scripts_on_path()
+            from security_fs import restrict_security_file_permissions
+
+            restrict_security_file_permissions(path)
+        except Exception:
+            pass
         _prune_conv_state_files(parent)
     except Exception:
         if tmp is not None:
@@ -403,7 +453,7 @@ def _extract_contested_by_targets(raw_markdown: str) -> list[str]:
     if "contested_by" not in fm:
         return []
     try:
-        from memory_review import parse_frontmatter_values, parse_scalar_list
+        from scripts.memory_review import parse_frontmatter_values, parse_scalar_list
 
         vals = parse_frontmatter_values(fm.splitlines())
         raw_val = vals.get("contested_by")
@@ -420,8 +470,6 @@ def _extract_contested_by_targets(raw_markdown: str) -> list[str]:
 
 def _ensure_scripts_on_path() -> None:
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
 
 
 def _tags_allowed_for_workspace(tags: Any, project_tag: str | None, project_tags_match_fn: Any) -> bool:
@@ -524,7 +572,7 @@ def _load_visible_distilled_artifacts(
     if not has_p and not has_m:
         return []
     try:
-        from cognitive_distiller import list_distilled_artifacts
+        from scripts.cognitive_distiller import list_distilled_artifacts
     except Exception:
         return []
 
@@ -605,7 +653,7 @@ def _detect_workspace_contradictions(
     if not _dir_has_markdown(atoms_dir):
         return [], []
     try:
-        import knowledge_graph
+        import scripts.knowledge_graph as knowledge_graph
 
         if project_tag:
             # Project-scoped build avoids scanning unrelated projects for fast SessionStart latency.
@@ -679,8 +727,8 @@ def _detect_candidate_contradictions(
     if len(candidates) < 2:
         return []
     try:
-        import knowledge_graph
-        from memory_review import parse_frontmatter_values
+        import scripts.knowledge_graph as knowledge_graph
+        from scripts.memory_review import parse_frontmatter_values
 
         nodes: list[dict[str, Any]] = []
         by_key: dict[str, str] = {}
@@ -754,7 +802,7 @@ def _detect_candidate_contradictions(
 
 def _meta_router_tool_hint(raw_prompt: str) -> str | None:
     try:
-        from meta_router import classify_query
+        from scripts.meta_router import classify_query
 
         budget = classify_query(raw_prompt, reasoning_profile="local_compact")
     except Exception:
@@ -843,9 +891,9 @@ def _build_session_start_response(
     event_name: str = "SessionStart",
 ) -> dict[str, Any]:
     _ensure_scripts_on_path()
-    import config as _cfg
-    from recall import RecallOptions, project_tags_match, search_memory
-    from skill_playbooks import list_playbooks
+    import scripts.config as _cfg
+    from scripts.recall import RecallOptions, project_tags_match, search_memory
+    from scripts.skill_playbooks import list_playbooks
 
     resolved_brain = os.path.abspath(brain_dir or _cfg.resolve_active_brain_dir())
     if not os.path.isdir(resolved_brain) or _is_reparse_or_link_fast(resolved_brain):
@@ -888,7 +936,7 @@ def _build_session_start_response(
     # 2. Active Stage 4 Executable Skills in workspace + global scope.
     if _dir_has_markdown(skills_dir):
         try:
-            from executable_skills import list_executable_skills
+            from scripts.executable_skills import list_executable_skills
 
             all_skills = list_executable_skills(
                 brain_dir=resolved_brain,
@@ -954,9 +1002,9 @@ def _build_session_start_response(
                 and _item_matches_project(r.contexts, project_tag, project_tags_match)
             ]
             if not proj_atoms:
-                from memory_format import evaluate_temporal_validity
-                from memory_review import parse_atom_record
-                from review_atom import approved_revision_is_current
+                from scripts.memory_format import evaluate_temporal_validity
+                from scripts.memory_review import parse_atom_record
+                from scripts.review_atom import approved_revision_is_current
 
                 fallback_rows: list[tuple[str, str]] = []
                 for fname in sorted(os.listdir(atoms_dir), reverse=True):
@@ -1034,7 +1082,7 @@ def _build_session_start_response(
     # 6. Open project-scoped action items from working notes (unverified).
     if project_tag:
         try:
-            from notes_store import NotePaths, extract_action_items
+            from scripts.notes_store import NotePaths, extract_action_items
 
             npaths = NotePaths.for_brain(resolved_brain)
             if os.path.isdir(npaths.notes_dir) and not _is_reparse_or_link_fast(npaths.notes_dir):
@@ -1087,10 +1135,24 @@ def _build_pre_invocation_response(
         return {}
 
     project_tag = _normalize_workspace_project_tag(payload)
+    _ensure_scripts_on_path()
+    prompt_excerpt = raw_prompt[:500]
+    prompt_flagged = _contains_likely_secret_fast(raw_prompt)
+    try:
+        from inbox_workflow import scan_inbox_payload_risks
+
+        if scan_inbox_payload_risks(prompt_excerpt):
+            prompt_flagged = True
+    except Exception:
+        # Fail-closed for prompt persistence if DLP risk scanner is unavailable.
+        prompt_flagged = True
+
     # Record prompt hash immediately so subsequent tool-loop invocations skip cleanly.
+    # Never persist unredacted secret/risky prompts into %TEMP% or PLUGIN_DATA.
     next_state: dict[str, Any] = {
         "prompt_hash": prompt_hash,
-        "last_prompt": raw_prompt[:500],
+        "last_prompt": "" if prompt_flagged else prompt_excerpt,
+        "skip_stop_log": bool(prompt_flagged),
         "project_tag": project_tag or "",
         "referenced_atoms": [],
         "last_stop_prompt_hash": str(prev_state.get("last_stop_prompt_hash") or ""),
@@ -1100,9 +1162,9 @@ def _build_pre_invocation_response(
         _save_conv_state(conv_path, next_state, verify_unix_uid=is_unix_fb)
 
     _ensure_scripts_on_path()
-    import config as _cfg
-    from recall import RecallOptions, project_tags_match, search_memory
-    from skill_playbooks import list_playbooks
+    import scripts.config as _cfg
+    from scripts.recall import RecallOptions, project_tags_match, search_memory
+    from scripts.skill_playbooks import list_playbooks
 
     resolved_brain = os.path.abspath(brain_dir or _cfg.resolve_active_brain_dir())
     if not os.path.isdir(resolved_brain) or _is_reparse_or_link_fast(resolved_brain):
@@ -1118,7 +1180,7 @@ def _build_pre_invocation_response(
     recalled_items: list[tuple[str, str, float, list[str]]] = []
     all_candidates: list[tuple[str, str, float, list[str]]] = []
 
-    # 1. Fast Predictive Memory Bus check (lookup_l0_hot) + workspace-starvation-proof scoped/global lexical recall.
+    # 1. Workspace-starvation-proof scoped + global lexical recall over verified atoms.
     try:
         merged_by_file: dict[str, tuple[str, str, float, list[str]]] = {}
 
@@ -1148,7 +1210,7 @@ def _build_pre_invocation_response(
         # 1a. Fast L0 Predictive Memory Bus lookup (<0.5ms; skip cold import when L0 RAM cache is uninitialized).
         if "predictive_memory_bus" in sys.modules or "scripts.predictive_memory_bus" in sys.modules:
             try:
-                from predictive_memory_bus import lookup_l0_hot
+                from scripts.predictive_memory_bus import lookup_l0_hot
 
                 l0_hit = lookup_l0_hot(
                     raw_prompt,
@@ -1333,7 +1395,7 @@ def _build_pre_invocation_response(
 
     # 6. Relevant owner working notes (unverified, strictly scoped to workspace/global).
     try:
-        from notes_store import NotePaths, search_notes
+        from scripts.notes_store import NotePaths, search_notes
 
         npaths = NotePaths.for_brain(resolved_brain)
         if os.path.isdir(npaths.notes_dir) and not _is_reparse_or_link_fast(npaths.notes_dir):
@@ -1404,34 +1466,59 @@ def _handle_stop_event(
     prompt_hash = str(state.get("prompt_hash") or "").strip()
     last_stop_hash = str(state.get("last_stop_prompt_hash") or "").strip()
     last_prompt = str(state.get("last_prompt") or "").strip()
+    skip_stop_log = bool(state.get("skip_stop_log"))
     ref_atoms = [str(a).strip() for a in (state.get("referenced_atoms") or []) if str(a).strip()]
     project_tag = str(state.get("project_tag") or "").strip() or _normalize_workspace_project_tag(payload) or ""
 
+    def _clear_and_save_stop_state(*, mark_stopped: bool = True) -> None:
+        state["last_prompt"] = ""
+        if mark_stopped and prompt_hash:
+            state["last_stop_prompt_hash"] = prompt_hash
+        state["ts"] = time.time()
+        _save_conv_state(conv_path, state, verify_unix_uid=is_unix_fb)
+
     if not prompt_hash or prompt_hash == last_stop_hash:
+        if state.get("last_prompt"):
+            _clear_and_save_stop_state(mark_stopped=False)
+        return {}
+    if skip_stop_log or _contains_likely_secret_fast(last_prompt):
+        _clear_and_save_stop_state(mark_stopped=True)
         return {}
     if len(last_prompt) < MIN_STOP_PROMPT_CHARS and not ref_atoms:
+        _clear_and_save_stop_state(mark_stopped=True)
         return {}
 
     _ensure_scripts_on_path()
     try:
-        import cognitive_core
-        import config as _cfg
-        from inbox_workflow import scan_inbox_payload_risks
+        import scripts.cognitive_core as cognitive_core
+        import scripts.config as _cfg
+        from scripts.host_adapters import OutboundSecretBlockedError, inspect_and_redact_outbound
+        from scripts.inbox_workflow import scan_inbox_payload_risks
 
         resolved_brain = os.path.abspath(brain_dir or _cfg.resolve_active_brain_dir())
         if not os.path.isdir(resolved_brain) or _is_reparse_or_link_fast(resolved_brain):
-            return {}
-
-        goal_text = _sanitize_untrusted_text(last_prompt, max_chars=240)
-        if not goal_text:
+            _clear_and_save_stop_state(mark_stopped=True)
             return {}
 
         # DLP & risk scan strictly before persisting; skip risky/secret turns cleanly.
         risk_flags = scan_inbox_payload_risks(last_prompt)
         if risk_flags:
-            state["last_stop_prompt_hash"] = prompt_hash
-            state["ts"] = time.time()
-            _save_conv_state(conv_path, state, verify_unix_uid=is_unix_fb)
+            _clear_and_save_stop_state(mark_stopped=True)
+            return {}
+
+        try:
+            redacted = inspect_and_redact_outbound(
+                last_prompt,
+                redact_pii=True,
+                fail_on_secret_detection=True,
+            )
+        except OutboundSecretBlockedError:
+            _clear_and_save_stop_state(mark_stopped=True)
+            return {}
+
+        goal_text = _sanitize_untrusted_text(redacted.sanitized_text, max_chars=240)
+        if not goal_text:
+            _clear_and_save_stop_state(mark_stopped=True)
             return {}
 
         clean_host = (host or "antigravity").strip().lower()
@@ -1455,12 +1542,13 @@ def _handle_stop_event(
             inbox_dir=os.path.join(resolved_brain, "0-raw", "inbox"),
             brain_dir=resolved_brain,
         )
-        state["last_stop_prompt_hash"] = prompt_hash
-        state["ts"] = time.time()
-        _save_conv_state(conv_path, state, verify_unix_uid=is_unix_fb)
+        _clear_and_save_stop_state(mark_stopped=True)
     except Exception:
         # Never block host shutdown / turn completion on logging errors or DLP rejection.
-        pass
+        try:
+            _clear_and_save_stop_state(mark_stopped=True)
+        except Exception:
+            pass
     return {}
 
 

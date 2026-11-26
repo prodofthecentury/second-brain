@@ -7,7 +7,24 @@ emergency kill-switch (pre-run & mid-flight), deterministic rollback, staleness 
 hash-chained execution audit verification.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 from contextlib import ExitStack
 import hashlib
@@ -23,7 +40,6 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def _create_dir_link_or_junction(link_path: Path, target_dir: Path) -> bool:
@@ -54,9 +70,9 @@ def _seed_atom(
     epistemic_label: str = "claim",
     approve: bool = True,
 ) -> tuple[Path, str]:
-    from atom_mutator import apply_review_transition
-    from evidence import find_evidence_anchor
-    from lexical_store import rebuild_lexical_index
+    from scripts.atom_mutator import apply_review_transition
+    from scripts.evidence import find_evidence_anchor
+    from scripts.lexical_store import rebuild_lexical_index
 
     raw_dir = brain_dir / "0-raw"
     atoms_dir = brain_dir / "2-atoms"
@@ -134,8 +150,8 @@ def _seed_mature_playbook(
     successful_episodes: int = 1,
     contexts: list[str] | None = None,
 ) -> tuple[Path, str, dict[str, object]]:
-    from cognitive_core import record_grounded_answer_telemetry, save_experience_record
-    from skill_playbooks import promote_skill_playbook
+    from scripts.cognitive_core import record_grounded_answer_telemetry, save_experience_record
+    from scripts.skill_playbooks import promote_skill_playbook
 
     claim_body = "\n".join(f"{idx}. {s}" for idx, s in enumerate(steps, start=1))
     evidence_body = " ".join(steps)
@@ -192,7 +208,9 @@ class Stage4IsolatedTestCase(unittest.TestCase):
         super().setUp()
         self._stack = ExitStack()
         self.addCleanup(self._stack.close)
-        self.root_tmp = Path(self._stack.enter_context(tempfile.TemporaryDirectory()))
+        self.root_tmp = Path(
+            self._stack.enter_context(tempfile.TemporaryDirectory(ignore_cleanup_errors=True))
+        )
         self.sec_dir = self.root_tmp / "security"
         self.sec_dir.mkdir(parents=True, exist_ok=True)
         self._stack.enter_context(
@@ -209,8 +227,8 @@ class Stage4IsolatedTestCase(unittest.TestCase):
 
 class CandidateReadinessAndPromotionGateTests(Stage4IsolatedTestCase):
     def test_readiness_gates_actor_checks_ast_inspections_dlp_and_cas_updates(self) -> None:
-        from cognitive_core import record_grounded_answer_telemetry
-        from executable_skills import (
+        from scripts.cognitive_core import record_grounded_answer_telemetry
+        from scripts.executable_skills import (
             ExecutableSkillSecretBlockedError,
             ExecutableSkillValidationError,
             inspect_executable_skill_candidates,
@@ -218,7 +236,7 @@ class CandidateReadinessAndPromotionGateTests(Stage4IsolatedTestCase):
             skill_visible_in_scope,
             verify_executable_skill_integrity,
         )
-        from skill_playbooks import PlaybookValidationError, promote_skill_playbook
+        from scripts.skill_playbooks import PlaybookValidationError, promote_skill_playbook
 
         brain = self.root_tmp / "brain"
         telemetry_db = str(brain / ".sidecar" / "telemetry.sqlite3")
@@ -468,7 +486,7 @@ class CandidateReadinessAndPromotionGateTests(Stage4IsolatedTestCase):
 
 class EndToEndExecutionAndAuditChainTests(Stage4IsolatedTestCase):
     def test_promote_verify_dry_run_live_execution_audit_chain_and_experience_record(self) -> None:
-        from executable_skills import (
+        from scripts.executable_skills import (
             ExecutableSkillSecretBlockedError,
             execute_promoted_skill,
             inspect_executable_skill_candidates,
@@ -664,7 +682,7 @@ class EndToEndExecutionAndAuditChainTests(Stage4IsolatedTestCase):
 
 class SandboxSecurityIsolationTests(Stage4IsolatedTestCase):
     def test_env_secret_stripping_network_block_path_confinement_and_timeout_rollback(self) -> None:
-        from executable_skills import (
+        from scripts.executable_skills import (
             ExecutableSkillValidationError,
             execute_promoted_skill,
             promote_playbook_to_executable_skill,
@@ -863,7 +881,7 @@ class SandboxSecurityIsolationTests(Stage4IsolatedTestCase):
 
 class KillSwitchGovernanceTests(Stage4IsolatedTestCase):
     def test_pre_execution_and_mid_flight_kill_switch_terminates_and_rolls_back_under_2s(self) -> None:
-        from executable_skills import (
+        from scripts.executable_skills import (
             ExecutableSkillExecutionDeniedError,
             execute_promoted_skill,
             get_skill_kill_switch_status,
@@ -1019,9 +1037,9 @@ class KillSwitchGovernanceTests(Stage4IsolatedTestCase):
 
 class StalenessCascadeRevocationAndTamperTests(Stage4IsolatedTestCase):
     def test_atom_edit_demote_correction_playbook_deprecate_skill_tamper_revoke_and_audit_tamper(self) -> None:
-        from atom_mutator import apply_atom_edit, apply_review_transition
-        from cognitive_core import record_atom_feedback
-        from executable_skills import (
+        from scripts.atom_mutator import apply_atom_edit, apply_review_transition
+        from scripts.cognitive_core import record_atom_feedback
+        from scripts.executable_skills import (
             ExecutableSkillExecutionDeniedError,
             ExecutableSkillValidationError,
             execute_promoted_skill,
@@ -1033,7 +1051,7 @@ class StalenessCascadeRevocationAndTamperTests(Stage4IsolatedTestCase):
             verify_executable_skill_integrity,
             verify_skill_execution_audit_chain,
         )
-        from skill_playbooks import deprecate_skill_playbook
+        from scripts.skill_playbooks import deprecate_skill_playbook
 
         brain = self.root_tmp / "brain"
         telemetry_db = str(brain / ".sidecar" / "telemetry.sqlite3")
@@ -1224,9 +1242,9 @@ class AssertionOpsAuditKindsDlpOutputAndCliTests(Stage4IsolatedTestCase):
     def test_all_assert_ops_ledger_sources_audits_inputs_readonly_output_dlp_and_cli(self) -> None:
         from contextlib import redirect_stdout
         import io
-        import executable_skills as es_top
+        import scripts.executable_skills as es_top
         from scripts import executable_skills as es_pkg
-        from vault_ledger import commit_ledger_checkpoint
+        from scripts.vault_ledger import commit_ledger_checkpoint
 
         self.assertIs(es_top, es_pkg)
 
@@ -1420,11 +1438,11 @@ class AssertionOpsAuditKindsDlpOutputAndCliTests(Stage4IsolatedTestCase):
         """Verify end-to-end Loopback HTTP API, MemoryApiClient SDK, Merkle proofs, CLI, and 3-surface UI parity."""
         import threading
         import httpx
-        from cognitive_core import compute_memory_fitness_report
-        from host_adapters import restrict_security_file_permissions
-        from memory_api import MemoryApiClient, MemoryApiRuntimeConfig, create_memory_api_server
-        from vault_ledger import prove_leaf_membership, verify_merkle_proof
-        from vault_sync import LocalFolderSyncBackend, init_sync
+        from scripts.cognitive_core import compute_memory_fitness_report
+        from scripts.host_adapters import restrict_security_file_permissions
+        from scripts.memory_api import MemoryApiClient, MemoryApiRuntimeConfig, create_memory_api_server
+        from scripts.vault_ledger import prove_leaf_membership, verify_merkle_proof
+        from scripts.vault_sync import LocalFolderSyncBackend, init_sync
 
         brain = self.root_tmp / "brain_api"
         _, _, pb_res = _seed_mature_playbook(

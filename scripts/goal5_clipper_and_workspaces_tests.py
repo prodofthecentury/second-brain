@@ -10,7 +10,24 @@
   federated cross-vault recall, non-destructive removal, CLI & 3-surface UI parity).
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 from contextlib import redirect_stdout
 import io
@@ -31,23 +48,21 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT / "scripts"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 
-from api_product import ensure_owner_token  # noqa: E402
-from atom_mutator import apply_review_transition, content_sha256  # noqa: E402
-from evidence import find_evidence_anchor  # noqa: E402
-from lexical_store import rebuild_lexical_index  # noqa: E402
-from memory_api import (  # noqa: E402
+from scripts.api_product import ensure_owner_token  # noqa: E402
+from scripts.atom_mutator import apply_review_transition, content_sha256  # noqa: E402
+from scripts.evidence import find_evidence_anchor  # noqa: E402
+from scripts.lexical_store import rebuild_lexical_index  # noqa: E402
+from scripts.memory_api import (  # noqa: E402
     MemoryApiClient,
     MemoryApiRuntimeConfig,
     MemoryLoopbackHTTPServer,
     generate_memory_api_token,
     reset_api_rate_limiter,
 )
-from notes_store import NotePaths, get_note, verify_note_excerpt  # noqa: E402
-import cli  # noqa: E402
-import web_clipper  # noqa: E402
+from scripts.notes_store import NotePaths, get_note, verify_note_excerpt  # noqa: E402
+import scripts.cli as cli  # noqa: E402
+import scripts.web_clipper as web_clipper  # noqa: E402
 
 
 CHROME_ORIGIN_A = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -345,7 +360,7 @@ class BrowserWebClipperTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, f"Browser clipper node tests failed:\n{proc.stdout}\n{proc.stderr}")
 
-        from build_clipper import build_clipper_zip
+        from scripts.build_clipper import build_clipper_zip
         import zipfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -594,9 +609,9 @@ class MultiVaultWorkspacesTests(unittest.TestCase):
         self.assertIn('"PATCH"', main_js)
 
     def test_cross_boundary_security_remediations_local_only_policy_agent_redaction_and_snapshot_isolation(self) -> None:
-        from host_adapters import HostSharingRule, builtin_default_policies, save_host_policies
-        import mcp_server
-        import vault_ledger
+        from scripts.host_adapters import HostSharingRule, builtin_default_policies, save_host_policies
+        import scripts.mcp_server as mcp_server
+        import scripts.vault_ledger as vault_ledger
 
         # 1. Active-vault prove_leaf_membership works cleanly when brain_dir == BRAIN_DIR
         with tempfile.TemporaryDirectory() as tmp:

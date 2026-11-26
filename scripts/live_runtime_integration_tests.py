@@ -18,7 +18,24 @@ Tests requiring a running Ollama daemon respect ``BRAIN_CI_CODE_ONLY=1`` for
 offline/headless CI runs while keeping all non-Ollama runtime checks active.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import base64
 from contextlib import ExitStack
@@ -40,10 +57,8 @@ from urllib.parse import parse_qs, urlsplit
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPTS_DIR.parent
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
 
-from config import security_state_dir  # noqa: E402
+from scripts.config import security_state_dir  # noqa: E402
 
 # Capture the host's verified read-only ONNX model location before per-test env isolation.
 REAL_SECURITY_DIR = Path(security_state_dir())
@@ -51,6 +66,33 @@ REAL_SECURITY_DIR = Path(security_state_dir())
 
 def _ci_code_only() -> bool:
     return (os.environ.get("BRAIN_CI_CODE_ONLY") or "").strip() == "1"
+
+
+def _skip_if_unavailable(test: unittest.TestCase, *, flag: str, available: bool, reason: str) -> None:
+    """Skip optional hardware/model tests unless the caller sets the matching BRAIN_REQUIRE_* flag."""
+    if available:
+        return
+    if (os.environ.get(flag) or "").strip() == "1":
+        test.fail(f"{reason} ({flag}=1 requires it.)")
+    test.skipTest(reason)
+
+
+def _ollama_reachable() -> bool:
+    import socket
+
+    host = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip()
+    port = 11434
+    if host.startswith("http://") or host.startswith("https://"):
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(host)
+        port = parsed.port or (443 if parsed.scheme == "https" else 11434)
+        host = parsed.hostname or "127.0.0.1"
+    try:
+        with socket.create_connection((host, port), timeout=0.4):
+            return True
+    except OSError:
+        return False
 
 
 def _seed_approved_atom(
@@ -62,9 +104,9 @@ def _seed_approved_atom(
     contexts: list[str] | None = None,
 ) -> Path:
     """Create a source-anchored, owner-approved atom inside an isolated temp vault."""
-    from atom_mutator import apply_review_transition
-    from evidence import find_evidence_anchor
-    from lexical_store import rebuild_lexical_index
+    from scripts.atom_mutator import apply_review_transition
+    from scripts.evidence import find_evidence_anchor
+    from scripts.lexical_store import rebuild_lexical_index
 
     raw_dir = brain_dir / "0-raw"
     atoms_dir = brain_dir / "2-atoms"
@@ -192,7 +234,7 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
         )
 
     def _enable_local_ollama_policy(self, *, project_scope: str = "project:second_brain", model: str = "qwen2.5-coder:7b") -> None:
-        import host_adapters
+        import scripts.host_adapters as host_adapters
 
         policies = host_adapters.load_host_policies(self.policy_file)
         cur = policies["ollama_local"]
@@ -207,13 +249,26 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
         host_adapters.save_host_policies(policies, policy_path=self.policy_file)
 
     def test_01_real_onnx_cross_encoder_and_nli_weights(self) -> None:
-        import cross_encoder
-        import knowledge_graph
-        import onnx_models
+        import importlib.util
 
+        _skip_if_unavailable(
+            self,
+            flag="BRAIN_REQUIRE_ONNX",
+            available=importlib.util.find_spec("onnxruntime") is not None and importlib.util.find_spec("tokenizers") is not None,
+            reason="onnxruntime and tokenizers are not installed. They ship in the optional reranker extra.",
+        )
+        import scripts.cross_encoder as cross_encoder
+        import scripts.knowledge_graph as knowledge_graph
+        import scripts.onnx_models as onnx_models
+
+        status = onnx_models.get_onnx_models_status(state_dir=REAL_SECURITY_DIR, run_inference=False)
+        _skip_if_unavailable(
+            self,
+            flag="BRAIN_REQUIRE_ONNX",
+            available=bool(status.get("all_verified")),
+            reason="Pinned ONNX cross-encoder and NLI weights are not installed. Run `second-brain models pull`.",
+        )
         status = onnx_models.get_onnx_models_status(state_dir=REAL_SECURITY_DIR, run_inference=True)
-        if _ci_code_only() and not status["all_verified"]:
-            self.skipTest("BRAIN_CI_CODE_ONLY=1 skips pre-downloaded ONNX model weights.")
         self.assertTrue(status["onnx_runtime_ready"])
         self.assertTrue(status["all_verified"], f"Local ONNX weights incomplete: {status}")
         self.assertTrue(status["slots"]["cross-encoder"]["verified"])
@@ -259,7 +314,15 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
             cross_encoder.clear_cross_encoder_cache()
 
     def test_02_real_faster_whisper_tiny_en_transcription(self) -> None:
-        import ingest_multimodal
+        import importlib.util
+
+        _skip_if_unavailable(
+            self,
+            flag="BRAIN_REQUIRE_WHISPER",
+            available=importlib.util.find_spec("faster_whisper") is not None and not _ci_code_only(),
+            reason="faster-whisper tiny.en is an optional multimodal extra and is skipped in code-only CI.",
+        )
+        import scripts.ingest_multimodal as ingest_multimodal
 
         wav_path = self.temp_root / "voice_probe.wav"
         if not _synthesize_spoken_wav(wav_path, "Second brain verification passes."):
@@ -301,13 +364,17 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(len(archived_files), 1)
 
     def test_03_real_ollama_llava_vision_ocr_image_and_pdf(self) -> None:
-        if _ci_code_only():
-            self.skipTest("BRAIN_CI_CODE_ONLY=1 skips live Ollama Vision OCR.")
+        _skip_if_unavailable(
+            self,
+            flag="BRAIN_REQUIRE_OLLAMA",
+            available=_ollama_reachable() and not _ci_code_only(),
+            reason="Ollama is not reachable on the loopback host. Start Ollama to run live vision OCR.",
+        )
 
         from PIL import Image, ImageDraw, ImageFont
         import ollama
-        import doc_extractors
-        import ingest_multimodal
+        import scripts.doc_extractors as doc_extractors
+        import scripts.ingest_multimodal as ingest_multimodal
 
         self._enable_local_ollama_policy()
 
@@ -352,8 +419,16 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
                 pass
 
     def test_04_real_pyav_libx264_mp4_encode_and_decode(self) -> None:
+        import importlib.util
+
+        _skip_if_unavailable(
+            self,
+            flag="BRAIN_REQUIRE_PYAV",
+            available=importlib.util.find_spec("av") is not None,
+            reason="PyAV is not installed. It ships in the optional multimodal extra.",
+        )
         import av
-        import creative_media
+        import scripts.creative_media as creative_media
 
         art = creative_media.generate_local_video(
             "Local encrypted knowledge graph pipeline telemetry",
@@ -382,8 +457,16 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(decoded_frames, 6)
 
     def test_05_real_loopback_tcp_sd_webui_and_comfyui_daemons(self) -> None:
+        import importlib.util
+
+        _skip_if_unavailable(
+            self,
+            flag="BRAIN_REQUIRE_PILLOW",
+            available=importlib.util.find_spec("PIL") is not None,
+            reason="Pillow is not installed. It ships in the optional multimodal extra.",
+        )
         from PIL import Image
-        import creative_media
+        import scripts.creative_media as creative_media
 
         png_buf = io.BytesIO()
         Image.new("RGB", (64, 64), color=(32, 128, 192)).save(png_buf, format="PNG")
@@ -505,14 +588,18 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
         self.assertIn(("GET", "/view"), requests_seen)
 
     def test_06_real_ollama_dense_vectors_and_qwen_grounded_answer(self) -> None:
-        if _ci_code_only():
-            self.skipTest("BRAIN_CI_CODE_ONLY=1 skips live Ollama embeddings & chat generation.")
+        _skip_if_unavailable(
+            self,
+            flag="BRAIN_REQUIRE_OLLAMA",
+            available=_ollama_reachable() and not _ci_code_only(),
+            reason="Ollama is not reachable on the loopback host. Start Ollama to run live embeddings and grounded answers.",
+        )
 
-        import config
-        import host_adapters
-        import index_manifest
-        import recall
-        import rebuild_vectors
+        import scripts.config as config
+        import scripts.host_adapters as host_adapters
+        import scripts.index_manifest as index_manifest
+        import scripts.recall as recall
+        import scripts.rebuild_vectors as rebuild_vectors
 
         _seed_approved_atom(
             self.vault_dir,

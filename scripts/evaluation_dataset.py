@@ -1,6 +1,23 @@
 """Validate versioned retrieval and answerability evaluation datasets."""
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import hashlib
 import json
@@ -379,11 +396,9 @@ def main(argv: list[str] | None = None) -> int:
 
     scripts_dir = Path(__file__).resolve().parent
     root_dir = scripts_dir.parent
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
 
-    from config import ATOMS_DIR, BRAIN_DIR
-    from review_atom import approved_revision_is_current
+    from scripts.config import ATOMS_DIR, BRAIN_DIR
+    from scripts.review_atom import approved_revision_is_current
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -406,6 +421,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Validate schema/splits/revision-format when running on a code-only checkout without vault atoms.",
     )
     args = parser.parse_args(argv)
+
+    # A bare `evaluation_dataset.py` run is the test suite. It must not read the
+    # owner's active vault. Pass --brain-dir when the check should use a vault.
+    isolated_fixture = args.brain_dir is None and args.atoms_dir is None
+    if isolated_fixture:
+        import tempfile
+
+        args.allow_code_only = True
+        args.brain_dir = tempfile.mkdtemp(prefix="sb-eval-fixture-")
+        Path(args.brain_dir, "2-atoms").mkdir(parents=True, exist_ok=True)
 
     eff_brain_dir = args.brain_dir if args.brain_dir is not None else BRAIN_DIR
     if args.atoms_dir is not None:

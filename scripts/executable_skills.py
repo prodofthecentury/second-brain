@@ -6,7 +6,24 @@
 emergency kill-switch governance, deterministic rollback, and hash-chained execution audit trail.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import ast
@@ -30,15 +47,14 @@ import time
 from typing import Any
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 if __name__ in ("executable_skills", "scripts.executable_skills"):
     sys.modules.setdefault("executable_skills", sys.modules[__name__])
     sys.modules.setdefault("scripts.executable_skills", sys.modules[__name__])
 
-from atom_mutator import review_lock
-from audit_sources import audit_sources
-from cognitive_core import save_experience_record
-from config import (
+from scripts.atom_mutator import review_lock
+from scripts.audit_sources import audit_sources
+from scripts.cognitive_core import save_experience_record
+from scripts.config import (
     ATOMS_DIR,
     BRAIN_DIR,
     CHROMA_PATH,
@@ -58,26 +74,26 @@ from config import (
     security_state_dir,
     snapshot_module_defaults,
 )
-from host_adapters import (
+from scripts.host_adapters import (
     OutboundSecretBlockedError,
     inspect_and_redact_outbound,
     restrict_security_file_permissions,
 )
-from inbox_workflow import scan_inbox_payload_risks
-from knowledge_graph import detect_contradictions
-from lexical_store import LexicalIndexUnavailable
+from scripts.inbox_workflow import scan_inbox_payload_risks
+from scripts.knowledge_graph import detect_contradictions
+from scripts.lexical_store import LexicalIndexUnavailable
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
-from memory_format import (
+from scripts.memory_format import (
     frontmatter_has_key,
     remove_frontmatter_fields,
     render_memory_document,
     set_scalar_field,
     split_frontmatter,
 )
-from memory_review import parse_frontmatter_values, parse_scalar_list
-from recall import MemoryRecallUnavailable, RecallOptions, project_tags_match, search_memory
-from skill_playbooks import (
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list
+from scripts.recall import MemoryRecallUnavailable, RecallOptions, project_tags_match, search_memory
+from scripts.skill_playbooks import (
     DISALLOWED_AUTOMATED_ACTORS,
     PlaybookIntegrityReport,
     _backup_playbook_revision,
@@ -90,7 +106,7 @@ from skill_playbooks import (
     list_playbooks,
     verify_playbook_integrity,
 )
-from vault_ledger import verify_vault_ledger
+from scripts.vault_ledger import verify_vault_ledger
 
 SKILL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
 PARAM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
@@ -4005,8 +4021,8 @@ def execute_promoted_skill(
                         )
                     elif audit_kind == "contradictions":
                         if len(skill_projects) > 1:
-                            from knowledge_graph import build_knowledge_graph
-                            from recall import normalize_project_tag
+                            from scripts.knowledge_graph import build_knowledge_graph
+                            from scripts.recall import normalize_project_tag
 
                             raw_graph = build_knowledge_graph(
                                 brain_dir=dirs["brain_dir"],

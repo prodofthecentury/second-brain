@@ -13,11 +13,6 @@ import argparse
 import os
 import sys
 
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-_SCRIPTS_DIR = os.path.join(_REPO_ROOT, "scripts")
-if _SCRIPTS_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPTS_DIR)
-
 import ollama
 from rich.console import Console
 from rich.markup import escape as rich_escape
@@ -32,7 +27,7 @@ from scripts.recall import (
     consume_last_degradation_warning,
     search_memory as recall_search_memory,
 )
-import streaming_chat
+from scripts import streaming_chat
 
 console = Console()
 

@@ -9,7 +9,24 @@ This is the first lightweight review queue surface. It returns structured
 records for reuse by CLI, dashboard, or later MCP tools.
 """
 
+
+
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:
+    import runpy as _sb_runpy
+    import sys as _sb_sys
+    from pathlib import Path as _sb_Path
+
+    _sb_repo = _sb_Path(__file__).resolve().parents[1]
+    _sb_here = _sb_Path(__file__).resolve().parent
+    if _sb_Path(_sb_sys.path[0]).resolve() == _sb_here:
+        _sb_sys.path[0] = str(_sb_repo)
+    elif str(_sb_repo) not in _sb_sys.path:
+        _sb_sys.path.insert(0, str(_sb_repo))
+    _sb_runpy.run_module("scripts." + _sb_Path(__file__).stem, run_name="__main__")
+    raise SystemExit(0)
+
 
 import argparse
 import functools
@@ -19,13 +36,13 @@ import re
 import sys
 from pathlib import Path
 
-from config import (
+from scripts.config import (
     ATOMS_DIR,
     is_content_markdown,
     resolve_module_vault_path,
     snapshot_module_defaults,
 )
-from memory_format import split_frontmatter
+from scripts.memory_format import split_frontmatter
 
 _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 
