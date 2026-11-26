@@ -33,6 +33,7 @@ concurrency:
 jobs:
   verify-clean-tree:
     name: Verify Code-Only Release Hygiene & Test Gate
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -302,6 +303,28 @@ jobs:
           mkdir -p pypi-dist
           cp merged-dist/*.whl pypi-dist/
 
+      - name: Record which optional publishers have credentials
+        id: publishers
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          PUBLISH_PYPI: ${{ vars.PUBLISH_PYPI }}
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+          CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+          EDGE_API_KEY: ${{ secrets.EDGE_API_KEY }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          present() { if [ -n "$1" ]; then echo true; else echo false; fi; }
+          {
+            if [ "${PUBLISH_PYPI}" = "true" ] || [ -n "${PYPI_API_TOKEN}" ]; then echo "pypi=true"; else echo "pypi=false"; fi
+            echo "vsce=$(present "${VSCE_PAT}")"
+            echo "ovsx=$(present "${OVSX_PAT}")"
+            if [ -n "${CWS_CLIENT_ID}" ] || [ -n "${EDGE_API_KEY}" ] || [ -n "${AMO_JWT_SECRET}" ]; then echo "browser=true"; else echo "browser=false"; fi
+            echo "homebrew=$(present "${HOMEBREW_TAP_TOKEN}")"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -314,28 +337,28 @@ jobs:
             merged-dist/*
 
       - name: Publish Python wheel to PyPI (when configured)
-        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && (vars.PUBLISH_PYPI == 'true' || secrets.PYPI_API_TOKEN != '')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
+        if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && steps.publishers.outputs.pypi == 'true') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi) }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: pypi-dist
           password: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Publish VSIX to VS Code Marketplace (when VSCE_PAT secret is set)
-        if: ${{ secrets.VSCE_PAT != '' && (github.event_name == 'push' || inputs.publish_extensions) }}
+        if: ${{ steps.publishers.outputs.vsce == 'true' && (github.event_name == 'push' || inputs.publish_extensions) }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
           npx --yes @vscode/vsce@3.3.2 publish --packagePath merged-dist/*.vsix --pat "$VSCE_PAT"
 
       - name: Publish VSIX to Open VSX (when OVSX_PAT secret is set)
-        if: ${{ secrets.OVSX_PAT != '' && (github.event_name == 'push' || inputs.publish_extensions) }}
+        if: ${{ steps.publishers.outputs.ovsx == 'true' && (github.event_name == 'push' || inputs.publish_extensions) }}
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
           npx --yes ovsx@0.10.1 publish merged-dist/*.vsix -p "$OVSX_PAT"
 
       - name: Publish Browser Web Clipper to Chrome Web Store, Edge Add-ons & Firefox AMO (when configured)
-        if: ${{ (secrets.CWS_CLIENT_ID != '' || secrets.EDGE_API_KEY != '' || secrets.AMO_JWT_SECRET != '') && (github.event_name == 'push' || inputs.publish_extensions) }}
+        if: ${{ steps.publishers.outputs.browser == 'true' && (github.event_name == 'push' || inputs.publish_extensions) }}
         env:
           CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
           CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
@@ -354,7 +377,7 @@ jobs:
             --skip-missing-creds
 
       - name: Update Live Homebrew Tap (when HOMEBREW_TAP_TOKEN is configured)
-        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ steps.publishers.outputs.homebrew == 'true' }}
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO != '' && vars.HOMEBREW_TAP_REPO || format('{0}/homebrew-second-brain', github.repository_owner) }}

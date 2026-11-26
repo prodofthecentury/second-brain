@@ -82,8 +82,30 @@ class UpgradeRecallTests(unittest.TestCase):
                 index_path=str(self.index),
                 chroma_path=str(self.chroma),
             )
-            self.assertEqual([item.filename for item in direct], ["synonym.md"])
+            self.assertEqual(direct, [])
             self.assertEqual(consume_last_retrieval_fallback(), "dense")
+
+            anchored = _card(
+                "anchored.md",
+                "Nightly consignments need a verified reversal method.",
+                similarity=0.88,
+            )
+
+            def dense_anchored(query, _options, **_kwargs):
+                calls["dense"] += 1
+                if "anchored" in query:
+                    return [anchored], []
+                return [], []
+
+            with patch.object(recall, "search_semantic_memory", side_effect=dense_anchored):
+                kept, _kept_neighbors = search_memory(
+                    "anchored consignments reversal",
+                    opts,
+                    atoms_dir=str(self.brain / "2-atoms"),
+                    index_path=str(self.index),
+                    chroma_path=str(self.chroma),
+                )
+            self.assertEqual([item.filename for item in kept], ["anchored.md"])
 
             missed, _ = search_memory(
                 "under-gate shipments",
@@ -425,6 +447,65 @@ class SecurityPathTests(unittest.TestCase):
             alias = root / "alias-models"
             alias.symlink_to(real, target_is_directory=True)
             self.assertIsNone(resolve_cross_encoder_dir(alias / "cross-encoder"))
+
+
+class UpgradeRecallGateTests(unittest.TestCase):
+    def test_high_cosine_without_shared_words_is_not_corroboration(self) -> None:
+        from hardware_profile import classify_hardware_tier
+        from recall import candidate_has_semantic_corroboration
+
+        logs = (
+            "---\nid: logs\n---\n\n## Claim\nLexical retrieval indexes structured logs.\n\n"
+            "## Evidence\nStructured logs stay traceable.\n"
+        )
+        self.assertFalse(
+            candidate_has_semantic_corroboration(
+                "What is the owner's favorite battery chemistry?",
+                logs,
+                distance=0.05,
+            )
+        )
+        self.assertTrue(
+            candidate_has_semantic_corroboration(
+                "How should logs be formatted so requests are traceable?",
+                logs,
+                distance=0.20,
+            )
+        )
+        profile = classify_hardware_tier(
+            os_name="linux",
+            os_release="test",
+            architecture="x86_64",
+            cpu_threads=8,
+            total_ram_gib=16.0,
+            available_ram_gib=8.0,
+            cpp_runtime_ready=True,
+            cpp_runtime_detail="ok",
+            gpu_backend="cpu",
+            gpu_name="",
+            vram_gib=0.0,
+            ollama_reachable=True,
+            installed_ollama_models=("qwen2.5-coder:7b", "nomic-embed-text"),
+            model_sizes_bytes={"qwen2.5-coder:7b": 4_000_000_000},
+        )
+        self.assertEqual(profile.tier_id, "tier_2_cpu_balanced")
+        self.assertEqual(profile.answer_p95_slo_ms, 35000.0)
+
+    def test_new_thread_and_pending_dataset_stay_honest(self) -> None:
+        from chat_threads import create_chat_thread
+        from evaluation_dataset import release_gate_for_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "brain"
+            brain.mkdir()
+            created = create_chat_thread(title="cables", brain_dir=str(brain))
+        self.assertEqual(created["mode"], "direct")
+        payload = json.loads(
+            (Path(__file__).resolve().parents[1] / "docs" / "retrieval-evaluation-proposed.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["status"], "pending_owner_review")
+        self.assertEqual(release_gate_for_status(payload["status"]), "blocked_pending_owner_review")
+        self.assertNotIn("owner_approval", payload)
 
 
 if __name__ == "__main__":

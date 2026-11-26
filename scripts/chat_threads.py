@@ -97,7 +97,7 @@ def _connect_db(brain_dir: str | Path = BRAIN_DIR) -> sqlite3.Connection:
             updated_at TEXT NOT NULL,
             project_scope TEXT,
             host_id TEXT NOT NULL DEFAULT 'ollama_local',
-            mode TEXT NOT NULL DEFAULT 'verified',
+            mode TEXT NOT NULL DEFAULT 'direct',
             turn_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS chat_turns (
@@ -157,7 +157,7 @@ def create_chat_thread(
     title: str = "",
     project_scope: str | None = None,
     host_id: str = "ollama_local",
-    mode: str = "verified",
+    mode: str = "direct",
     brain_dir: str | Path = BRAIN_DIR,
 ) -> dict[str, Any]:
     now = _now_iso()
@@ -165,7 +165,7 @@ def create_chat_thread(
     clean_title = _derive_thread_title(title)
     clean_proj = (project_scope or "").strip()[:120] or None
     clean_host = (host_id or "ollama_local").strip()[:64] or "ollama_local"
-    clean_mode = (mode or "verified").strip()[:32] or "verified"
+    clean_mode = (mode or "direct").strip()[:32] or "direct"
     with closing(_connect_db(brain_dir)) as conn, conn:
         conn.execute(
             """

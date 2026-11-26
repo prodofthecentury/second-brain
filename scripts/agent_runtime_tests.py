@@ -91,7 +91,7 @@ class AgentRuntimeTests(unittest.TestCase):
         draft_agent_skill(
             "planner",
             "recall-cables",
-            [{"action_type": "vault_recall", "query": "spare cables", "output_file": "recall.json"}],
+            [{"action_type": "sandbox_python", "script_body": "print('ok')\n"}],
             trigger="spare cables",
             brain_dir=self._brain(),
         )
@@ -255,7 +255,7 @@ class AgentRuntimeTests(unittest.TestCase):
         goal.mkdir(parents=True)
         (goal / "open-goal.md").write_text("---\nstatus: open\n---\n\ncatalog spare fuses\n", encoding="utf-8")
         self.assertEqual(run_scheduled_goals(brain_dir=self._brain()), [])
-        set_agent_schedule(True, brain_dir=self._brain(), interval_seconds=900)
+        set_agent_schedule(True, actor="camer", brain_dir=self._brain(), interval_seconds=900)
         ran = run_scheduled_goals(brain_dir=self._brain(), force=True)
         self.assertEqual(len(ran), 1)
         self.assertEqual(ran[0]["status"], "done")
@@ -379,13 +379,161 @@ class AgentRuntimeTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         port = server.server_address[1]
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        owner = (owner_token_path.read_text(encoding="utf-8")).strip()
         with httpx.Client(trust_env=False, timeout=20) as client:
             response = client.get(
                 f"http://127.0.0.1:{port}/v1/agent/status",
                 headers={"Authorization": f"Bearer {agent_token}", "Host": f"127.0.0.1:{port}"},
             )
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("summary", response.json())
+            self.assertEqual(response.status_code, 403)
+            allowed = client.get(
+                f"http://127.0.0.1:{port}/v1/agent/status",
+                headers={
+                    "Authorization": f"Bearer {agent_token}",
+                    "Host": f"127.0.0.1:{port}",
+                    "X-Owner-Token": owner,
+                },
+            )
+            self.assertEqual(allowed.status_code, 200)
+            self.assertIn("summary", allowed.json())
+            created = client.post(
+                f"http://127.0.0.1:{port}/v1/chat/threads",
+                headers={
+                    "Authorization": f"Bearer {agent_token}",
+                    "Host": f"127.0.0.1:{port}",
+                    "X-Owner-Token": owner,
+                },
+                json={"title": "cables"},
+            )
+            self.assertEqual(created.status_code, 201)
+            self.assertEqual(created.json()["mode"], "direct")
+
+    def test_empty_recall_does_not_activate_and_other_actions_run(self) -> None:
+        from agent_runtime import draft_agent_skill, execute_agent_skill, list_agent_skills
+
+        draft_agent_skill(
+            "planner",
+            "empty-recall",
+            [{"action_type": "vault_recall", "query": "missing cables", "output_file": "recall.json"}],
+            trigger="missing cables",
+            brain_dir=self._brain(),
+        )
+        for _ in range(3):
+            result = execute_agent_skill(
+                "empty-recall",
+                {"query": "missing cables"},
+                agent_id="planner",
+                run_id="run-empty",
+                brain_dir=self._brain(),
+                security_dir=str(self.security),
+            )
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["detail"], "recall 0")
+        statuses = {item["skill_id"]: item["status"] for item in list_agent_skills(brain_dir=self._brain())}
+        self.assertEqual(statuses["empty-recall"], "agent_trial")
+
+        draft_agent_skill(
+            "planner",
+            "write-note",
+            [
+                {"action_type": "workspace_write", "rel_path": "note.txt", "content": "alpha cable"},
+                {"action_type": "workspace_assert", "rel_path": "note.txt", "op": "contains", "expected": "alpha cable"},
+            ],
+            trigger="write note",
+            brain_dir=self._brain(),
+        )
+        wrote = execute_agent_skill(
+            "write-note",
+            {},
+            agent_id="planner",
+            run_id="run-write",
+            brain_dir=self._brain(),
+            security_dir=str(self.security),
+        )
+        self.assertEqual(wrote["status"], "ok")
+        self.assertIn("contains_ok", wrote["detail"])
+
+        draft_agent_skill(
+            "planner",
+            "missing-note",
+            [{"action_type": "workspace_assert", "rel_path": "missing.txt", "op": "exists"}],
+            trigger="missing note",
+            brain_dir=self._brain(),
+        )
+        missing = execute_agent_skill(
+            "missing-note",
+            {},
+            agent_id="planner",
+            run_id="run-missing",
+            brain_dir=self._brain(),
+            security_dir=str(self.security),
+        )
+        self.assertEqual(missing["status"], "failed")
+
+        draft_agent_skill(
+            "planner",
+            "audit-sources",
+            [{"action_type": "vault_audit", "audit_kind": "sources", "output_file": "audit.json"}],
+            trigger="audit sources",
+            brain_dir=self._brain(),
+        )
+        audited = execute_agent_skill(
+            "audit-sources",
+            {},
+            agent_id="planner",
+            run_id="run-audit",
+            brain_dir=self._brain(),
+            security_dir=str(self.security),
+        )
+        self.assertEqual(audited["status"], "ok")
+        self.assertTrue(str(audited["detail"]).startswith("audit sources"))
+
+    def test_schedule_requires_a_human_actor(self) -> None:
+        from agent_runtime import AgentRuntimeError, run_scheduled_goals, set_agent_schedule
+
+        goal = self.brain / "7-agent" / "goals"
+        goal.mkdir(parents=True)
+        (goal / "open-goal.md").write_text("---\nstatus: open\n---\n\ncatalog spare fuses\n", encoding="utf-8")
+        forged = {
+            "enabled": True,
+            "enabled_by": "agent_runtime:planner",
+            "interval_seconds": 60,
+        }
+        schedule = self.brain / "7-agent" / "schedule.json"
+        schedule.parent.mkdir(parents=True, exist_ok=True)
+        schedule.write_text(json.dumps(forged), encoding="utf-8")
+        self.assertEqual(run_scheduled_goals(brain_dir=self._brain(), force=True), [])
+        with self.assertRaises(AgentRuntimeError):
+            set_agent_schedule(True, actor="agent_runtime:planner", brain_dir=self._brain())
+        enabled = set_agent_schedule(True, actor="camer", brain_dir=self._brain(), interval_seconds=900)
+        self.assertEqual(enabled["enabled_by"], "camer")
+        ran = run_scheduled_goals(brain_dir=self._brain(), force=True)
+        self.assertEqual(len(ran), 1)
+
+    def test_halt_remains_visible_when_the_kill_switch_file_is_locked(self) -> None:
+        from unittest.mock import patch
+
+        from executable_skills import (
+            KILL_SWITCH_REPLACE_ATTEMPTS_WINDOWS,
+            KILL_SWITCH_REPLACE_DELAY_SECONDS,
+            get_skill_kill_switch_status,
+            set_skill_kill_switch,
+        )
+
+        self.assertGreaterEqual(KILL_SWITCH_REPLACE_ATTEMPTS_WINDOWS * KILL_SWITCH_REPLACE_DELAY_SECONDS, 5.0)
+
+        with patch("executable_skills.os.replace", side_effect=PermissionError):
+            set_skill_kill_switch(
+                engaged=True,
+                scope="global",
+                actor="camer",
+                reason="stop the agent",
+                brain_dir=self._brain(),
+                security_dir=str(self.security),
+            )
+        status = get_skill_kill_switch_status(brain_dir=self._brain(), security_dir=str(self.security))
+        self.assertTrue(status["global_engaged"])
+        self.assertTrue((self.security / "skill-kill-switch.json.halt").is_file())
 
 
 if __name__ == "__main__":

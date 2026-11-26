@@ -12,6 +12,13 @@ class EvaluationDatasetError(ValueError):
     """Raised when an evaluation dataset is ambiguous or unsafe to score."""
 
 
+def release_gate_for_status(status: str) -> str:
+    """An agent-drafted dataset does not open a release gate."""
+    if status == "owner_approved":
+        return "open"
+    return "blocked_pending_owner_review"
+
+
 SPLITS = {"regression", "development", "holdout"}
 ANSWERABILITY = {"answerable", "unanswerable", "exploratory", "preference"}
 

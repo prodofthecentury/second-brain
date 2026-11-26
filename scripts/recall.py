@@ -867,7 +867,7 @@ def candidate_has_semantic_corroboration(
     stem_hits = sum(1 for qt in query_terms if len(porter_stem(qt)) >= 4 and porter_stem(qt) in corroborating_stems)
     if (literal_hits >= 1 or stem_hits >= 1) and sim >= 0.86:
         return True
-    return sim >= 0.90
+    return False
 
 
 def wikilinks(content: str) -> list[str]:

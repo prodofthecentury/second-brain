@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from answer_policy import ANSWER_DRAFT_SCHEMA, AnswerRequest, build_grounding_prompt, validate_standard_answer
 from atom_mutator import approved_revision_is_current, review_lock
 from config import ATOMS_DIR, CHROMA_PATH, GEN_MODEL, LEXICAL_INDEX_PATH, SIDECAR_DIR, _is_reparse_or_link
-from evaluation_dataset import validate_dataset
+from evaluation_dataset import release_gate_for_status, validate_dataset
 from host_adapters import (
     _redact_outbound_with_map,
     _rehydrate_draft_claims,
@@ -414,6 +414,7 @@ def run_direct_model_check(*, model: str, dataset_path: Path | None = None) -> d
     return {
         "dataset_id": payload.get("dataset_id"),
         "dataset_status": payload.get("status") or "pending_owner_review",
+        "release_gate": release_gate_for_status(str(payload.get("status") or "pending_owner_review")),
         "note": "The dataset is still pending owner review. This file is a measurement, not a default-model change.",
         "chat_mode": "direct",
         "model": model,

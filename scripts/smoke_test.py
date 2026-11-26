@@ -1158,6 +1158,21 @@ Structured JSON logs contain request IDs for tracing and avoid logging PII.
                 # Similarity 0.80 sits under the 0.86 corroboration gate.
                 "distances": [[0.40]],
             }
+            dense_lookalike = {
+                "documents": dense_trap["documents"],
+                "metadatas": dense_trap["metadatas"],
+                # Similarity 0.975 would pass a cosine-only gate.
+                "distances": [[0.05]],
+            }
+            check(
+                rerank_candidates(
+                    dense_lookalike,
+                    RecallOptions(n_results=1),
+                    query="What is the owner's favorite battery chemistry?",
+                    atoms_dir=str(atoms_dir),
+                ) == [],
+                "dense recall does not inject an approved lookalike when the cosine is high and no words match",
+            )
             check(
                 rerank_candidates(
                     dense_trap,

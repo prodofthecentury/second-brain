@@ -31,14 +31,22 @@ from cognitive_core import save_experience_record
 from config import BRAIN_DIR, safe_file_in_dir
 from executable_skills import (
     ALLOWED_ACTION_TYPES,
+    ALLOWED_ASSERT_OPS,
+    ALLOWED_AUDIT_KINDS,
+    MAX_WORKSPACE_WRITE_BYTES,
     POLL_INTERVAL_SECONDS,
+    ExecutableSkillValidationError,
     _SANDBOX_RUNNER_SOURCE,
     _SANDBOX_SITECUSTOMIZE_SOURCE,
     _build_sandbox_child_env,
+    _evaluate_workspace_assert,
     _is_skill_killed,
     _normalize_skill_id,
+    _scan_text_for_secrets_and_risks,
     _terminate_process_tree,
+    _validate_human_actor,
     _validate_sandbox_python_ast,
+    _write_workspace_file_safe,
     get_skill_kill_switch_status,
     set_skill_kill_switch,
 )
@@ -288,6 +296,23 @@ def _validate_steps(steps: list[dict[str, Any]]) -> None:
             raise AgentRuntimeError(f"Unsupported skill action: {action!r}")
         if action == "sandbox_python":
             _validate_sandbox_python_ast(str(step.get("script_body") or ""))
+        elif action == "vault_audit":
+            kind = str(step.get("audit_kind") or "")
+            if kind not in ALLOWED_AUDIT_KINDS:
+                raise AgentRuntimeError(f"audit_kind must be one of {sorted(ALLOWED_AUDIT_KINDS)}")
+        elif action == "workspace_write":
+            rel_path = str(step.get("rel_path") or "")
+            content = step.get("content")
+            if not rel_path or not isinstance(content, str):
+                raise AgentRuntimeError("workspace_write requires rel_path and string content.")
+            if len(content.encode("utf-8")) > MAX_WORKSPACE_WRITE_BYTES:
+                raise AgentRuntimeError("workspace_write content is too large.")
+        elif action == "workspace_assert":
+            if not str(step.get("rel_path") or ""):
+                raise AgentRuntimeError("workspace_assert requires rel_path.")
+            op = str(step.get("op") or "")
+            if op not in ALLOWED_ASSERT_OPS:
+                raise AgentRuntimeError(f"workspace_assert op must be one of {sorted(ALLOWED_ASSERT_OPS)}")
 
 
 def draft_agent_skill(
@@ -379,6 +404,107 @@ def _run_python(script_body: str, *, skill_id: str, security_dir: str | None, ti
         return "ok", Path(stdout_log).read_text(encoding="utf-8", errors="replace")[:300]
 
 
+def _run_agent_step(
+    step: dict[str, Any],
+    *,
+    inputs: dict[str, Any] | None,
+    skill_id: str,
+    brain_dir: str,
+    security_dir: str | None,
+    timeout: float,
+    workspace: str,
+) -> tuple[str, str, bool]:
+    """Run one allow-listed action. The third value is true only when the step did real work."""
+    action = str(step.get("action_type") or "")
+    try:
+        if action == "vault_recall":
+            query = str(inputs.get("query") if inputs and inputs.get("query") else step.get("query") or "")
+            _scan_text_for_secrets_and_risks(query, context_label="vault_recall.query")
+            found = _recall(query, brain_dir)
+            payload = json.dumps({"query": query, "count": len(found), "filenames": found}, sort_keys=True) + "\n"
+            out_file = str(step.get("output_file") or "recall.json")
+            _write_workspace_file_safe(
+                workspace,
+                out_file,
+                payload.encode("utf-8"),
+                max_output_bytes=MAX_WORKSPACE_WRITE_BYTES,
+            )
+            return "ok", f"recall {len(found)}", bool(found)
+        if action == "vault_audit":
+            kind = str(step.get("audit_kind") or "")
+            report = _run_vault_audit(kind, brain_dir)
+            raw = (json.dumps(report, indent=2, sort_keys=True, default=str) + "\n").encode("utf-8")
+            _write_workspace_file_safe(
+                workspace,
+                str(step.get("output_file") or "audit.json"),
+                raw,
+                max_output_bytes=MAX_WORKSPACE_WRITE_BYTES,
+            )
+            count = len(report) if isinstance(report, list) else ""
+            suffix = f" {count}" if count != "" else ""
+            return "ok", f"audit {kind}{suffix}", True
+        if action == "workspace_write":
+            content = str(step.get("content") or "")
+            _scan_text_for_secrets_and_risks(content, context_label="workspace_write.content")
+            _write_workspace_file_safe(
+                workspace,
+                str(step.get("rel_path") or ""),
+                content.encode("utf-8"),
+                max_output_bytes=MAX_WORKSPACE_WRITE_BYTES,
+            )
+            return "ok", f"wrote {step.get('rel_path')}", True
+        if action == "workspace_assert":
+            ok, assert_detail = _evaluate_workspace_assert(
+                workspace,
+                rel_path=str(step.get("rel_path") or ""),
+                op=str(step.get("op") or ""),
+                expected=str(step.get("expected") or ""),
+                json_key=str(step.get("json_key") or ""),
+            )
+            if not ok:
+                return "failed", assert_detail, False
+            return "ok", assert_detail, True
+        if action == "sandbox_python":
+            run_status, run_detail = _run_python(
+                str(step.get("script_body") or ""),
+                skill_id=skill_id,
+                security_dir=security_dir,
+                timeout=timeout,
+            )
+            return run_status, run_detail, run_status == "ok"
+    except (AgentRuntimeError, ExecutableSkillValidationError, OSError, PermissionError, ValueError) as exc:
+        return "failed", str(exc), False
+    return "failed", f"unsupported {action}", False
+
+
+def _run_vault_audit(kind: str, brain_dir: str) -> object:
+    root = os.path.abspath(brain_dir)
+    atoms = os.path.join(root, "2-atoms")
+    if kind == "sources":
+        from audit_sources import audit_sources
+
+        return audit_sources(atoms_dir=atoms, brain_dir=root, demote_stale=False)
+    if kind == "ledger":
+        from vault_ledger import verify_vault_ledger
+
+        return verify_vault_ledger(brain_dir=root, atoms_dir=atoms, playbooks_dir=os.path.join(root, "5-playbooks"))
+    if kind == "contradictions":
+        from knowledge_graph import detect_contradictions
+
+        report = detect_contradictions(
+            brain_dir=root,
+            atoms_dir=atoms,
+            include_pending=False,
+            enable_nli=False,
+        )
+        return {
+            "contradiction_count": report.get("contradiction_count", 0),
+            "high_severity_count": report.get("high_severity_count", 0),
+            "drift_count": report.get("drift_count", 0),
+        }
+    raise AgentRuntimeError(f"Unsupported audit_kind: {kind}")
+
+
 def _recall(query: str, brain_dir: str) -> list[str]:
     atoms = os.path.join(brain_dir, "2-atoms")
     index = os.path.join(brain_dir, ".sidecar", "lexical.sqlite3")
@@ -425,24 +551,30 @@ def execute_agent_skill(
         return record
     status = "ok"
     detail = ""
-    for step in loaded["steps"]:
-        action = str(step["action_type"])
-        if action == "vault_recall":
-            query = str(inputs.get("query") if inputs and inputs.get("query") else step.get("query") or "")
-            found = _recall(query, os.path.abspath(brain_dir))
-            detail = f"recall {len(found)}"
-        elif action == "sandbox_python":
-            status, detail = _run_python(str(step.get("script_body") or ""), skill_id=norm_id, security_dir=security_dir, timeout=timeout)
-        elif action in ALLOWED_ACTION_TYPES:
-            detail = action
-        else:
-            status, detail = "failed", f"unsupported {action}"
-        if status != "ok":
-            break
-    if status == "ok":
+    productive = False
+    try:
+        _validate_steps(loaded["steps"])
+    except (AgentRuntimeError, ExecutableSkillValidationError) as exc:
+        status, detail = "failed", str(exc)
+    with tempfile.TemporaryDirectory(prefix="sb-agent-workspace-") as workspace:
+        if status == "ok":
+            for step in loaded["steps"]:
+                status, detail, step_productive = _run_agent_step(
+                    step,
+                    inputs=inputs,
+                    skill_id=norm_id,
+                    brain_dir=os.path.abspath(brain_dir),
+                    security_dir=security_dir,
+                    timeout=timeout,
+                    workspace=workspace,
+                )
+                productive = productive or step_productive
+                if status != "ok":
+                    break
+    if status == "ok" and productive:
         successes += 1
         skill_status = "agent_active" if successes >= 3 and failures == 0 else "agent_trial"
-    elif status == "stopped":
+    elif status in {"ok", "stopped"}:
         skill_status = str(fm.get("status") or "agent_trial")
     else:
         failures += 1
@@ -645,9 +777,24 @@ def agent_status(brain_dir: str = BRAIN_DIR) -> dict[str, Any]:
     }
 
 
-def set_agent_schedule(enabled: bool, *, brain_dir: str = BRAIN_DIR, interval_seconds: int = DEFAULT_SCHEDULE_SECONDS) -> dict[str, Any]:
+def set_agent_schedule(
+    enabled: bool,
+    *,
+    actor: str,
+    brain_dir: str = BRAIN_DIR,
+    interval_seconds: int = DEFAULT_SCHEDULE_SECONDS,
+) -> dict[str, Any]:
+    try:
+        clean_actor = _validate_human_actor(actor)
+    except ExecutableSkillValidationError as exc:
+        raise AgentRuntimeError(str(exc)) from exc
     dirs = _dirs(brain_dir)
-    payload = {"enabled": bool(enabled), "interval_seconds": max(60, int(interval_seconds)), "updated_at": _now()}
+    payload = {
+        "enabled": bool(enabled),
+        "enabled_by": clean_actor if enabled else "",
+        "interval_seconds": max(60, int(interval_seconds)),
+        "updated_at": _now(),
+    }
     with open(dirs["schedule"], "w", encoding="utf-8") as handle:
         json.dump(payload, handle, sort_keys=True)
         handle.write("\n")
@@ -665,6 +812,10 @@ def run_scheduled_goals(*, brain_dir: str = BRAIN_DIR, force: bool = False) -> l
     except (OSError, json.JSONDecodeError):
         return []
     if not schedule.get("enabled"):
+        return []
+    try:
+        _validate_human_actor(str(schedule.get("enabled_by") or ""))
+    except ExecutableSkillValidationError:
         return []
     stamp_path = os.path.join(dirs["root"], "last-tick.txt")
     now = time.time()
@@ -702,7 +853,7 @@ def run_scheduled_goals(*, brain_dir: str = BRAIN_DIR, force: bool = False) -> l
 
 
 def stop_agent_runs(*, actor: str, reason: str, brain_dir: str = BRAIN_DIR, security_dir: str | None = None) -> dict[str, Any]:
-    set_agent_schedule(False, brain_dir=brain_dir)
+    set_agent_schedule(False, actor=actor, brain_dir=brain_dir)
     return set_skill_kill_switch(
         engaged=True,
         scope="global",
@@ -720,7 +871,8 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--goal", required=True)
     run_p.add_argument("--project", default="")
     run_p.add_argument("--json", action="store_true")
-    sub.add_parser("start", help="Enable the scheduled goal tick.")
+    start_p = sub.add_parser("start", help="Enable the scheduled goal tick.")
+    start_p.add_argument("--actor", required=True, help="Human owner who is arming the schedule.")
     stop_p = sub.add_parser("stop", help="Disable the tick and engage the skill kill switch.")
     stop_p.add_argument("--actor", required=True)
     stop_p.add_argument("--reason", required=True)
@@ -732,7 +884,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, sort_keys=True) if args.json else f"run {result['run_id']} {result['status']}")
         return 0
     if args.command == "start":
-        payload = set_agent_schedule(True)
+        payload = set_agent_schedule(True, actor=args.actor)
         print(json.dumps(payload, sort_keys=True))
         return 0
     if args.command == "stop":

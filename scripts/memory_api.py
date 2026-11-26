@@ -2116,7 +2116,7 @@ class MemoryApiClient:
         title: str = "",
         project_scope: str | None = None,
         host_id: str = "ollama_local",
-        mode: str = "verified",
+        mode: str = "direct",
     ) -> dict[str, object]:
         return self._request(
             "POST",
@@ -2159,7 +2159,7 @@ class MemoryApiClient:
         self,
         query: str,
         *,
-        mode: str = "verified",
+        mode: str = "direct",
         retrieval_mode: str = "lexical",
         host_id: str = "ollama_local",
         project_scope: str | None = None,

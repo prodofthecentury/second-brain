@@ -1187,8 +1187,10 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
             return send(202 if res["status"] == "quarantined" else 201, res)
 
-        # ── Agent runtime status (read-only) ──
+        # ── Agent runtime status (owner-only; skill triggers stay off the agent bearer) ──
         if path == "/v1/agent/status" and method == "GET":
+            if not owner_only():
+                return True
             from agent_runtime import agent_status
 
             return send(200, agent_status(rt.brain_dir))
@@ -1215,7 +1217,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 title=_str(body, "title", max_len=160, required=False),
                 project_scope=_str(body, "project_scope", max_len=120, required=False).strip() or None,
                 host_id=_str(body, "host_id", default="ollama_local", max_len=64, required=False) or "ollama_local",
-                mode=_str(body, "mode", default="verified", max_len=32, required=False) or "verified",
+                mode=_str(body, "mode", default="direct", max_len=32, required=False) or "direct",
                 brain_dir=rt.brain_dir,
             )
             return send(201, created)

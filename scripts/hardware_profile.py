@@ -90,6 +90,12 @@ def fetch_loopback_json(url: str, *, timeout: float = 3.0, max_bytes: int = 6553
         return None
 
 
+# Owner-accepted Tier-2 answer budget. The 45s figure is a measured proposal
+# (8-thread P95 was 36.45s) and stays out of the gate until the owner accepts it.
+TIER2_ANSWER_P95_SLO_MS = 35000.0
+TIER2_ANSWER_P95_SLO_PROPOSAL_MS = 45000.0
+
+
 @dataclass(frozen=True)
 class HardwareCapabilityProfile:
     os_name: str
@@ -532,10 +538,12 @@ def classify_hardware_tier(
             recommended_embedding_model=EMBED_MODEL,
             recommended_retrieval_mode="lexical",
             retrieval_p95_slo_ms=15.0,
-            answer_p95_slo_ms=35000.0 if cpu_threads >= 12 else 45000.0,
+            answer_p95_slo_ms=TIER2_ANSWER_P95_SLO_MS,
             rationale=(
-                f"CPU host with {total_ram_gib:.1f} GiB RAM ({cpu_threads} threads) comfortably fits quantized 7B/8B models "
-                "(100.0% benchmarked positive coverage on qwen2.5-coder:7b across the 90-case curated suite); lexical FTS5 stays default for sub-15ms recall, with RRF opt-in."
+                f"CPU host with {total_ram_gib:.1f} GiB RAM ({cpu_threads} threads) fits quantized 7B/8B models. "
+                f"The owner-accepted answer budget is {TIER2_ANSWER_P95_SLO_MS / 1000.0:.0f}s; "
+                f"a {TIER2_ANSWER_P95_SLO_PROPOSAL_MS / 1000.0:.0f}s 8-thread proposal is not the gate. "
+                "Lexical FTS5 stays default for sub-15ms recall, with RRF opt-in."
                 + oversized_note
             ),
             oversized_installed_models=oversized,
