@@ -1094,15 +1094,32 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/notes" and method == "POST":
-            if not owner_only():
-                return True
+            # Connected agents may add a note. They cannot change or delete one that already exists.
+            if had_failed_owner_hdr:
+                return send(403, {"error": "403 Forbidden: invalid owner token."})
+            if is_owner:
+                res = create_note(
+                    _str(body, "title", max_len=200, required=False),
+                    _str(body, "body", max_len=MAX_NOTE_BYTES, required=False),
+                    tags=_tags(body),
+                    paths=paths,
+                )
+                return send(201, res)
+            client_ip = handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1"
+            if not check_capture_rate_limit(client_ip):
+                return send(429, {"error": "Too Many Requests: capture write rate limit exceeded (max 180 per minute)."})
+            text = _str(body, "body", max_len=16_000, required=False) or _str(body, "content", max_len=16_000, required=False)
+            if not str(text or "").strip():
+                raise NoteError("A note needs text.")
             res = create_note(
                 _str(body, "title", max_len=200, required=False),
-                _str(body, "body", max_len=MAX_NOTE_BYTES, required=False),
+                text,
+                origin="agent_capture",
                 tags=_tags(body),
+                capture_source="api-agent",
                 paths=paths,
             )
-            return send(201, res)
+            return send(202 if res.get("status") == "quarantined" else 201, res)
 
         if path == "/v1/notes/tasks" and method == "GET":
             from notes_store import extract_action_items

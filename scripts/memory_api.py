@@ -1694,6 +1694,19 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                             if d.get("atom_a") not in pref_files and d.get("atom_b") not in pref_files
                         ]
 
+                shared_knowledge: list[dict[str, str]] = []
+                try:
+                    from agent_runtime import search_connected_knowledge
+
+                    shared_knowledge = search_connected_knowledge(
+                        req.query,
+                        brain_dir=rt.brain_dir,
+                        limit=req.n_results,
+                        project=req.project_scope.strip() if req.project_scope else "",
+                    )
+                except Exception:
+                    shared_knowledge = []
+
                 _audit_api_event(rt.brain_dir, path, "POST", 200)
                 self._send_json(
                     200,
@@ -1701,6 +1714,7 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                         "latency_ms": elapsed_ms,
                         "degraded_to_lexical": bool(degradation_banner),
                         "degradation_warning": degradation_banner,
+                        "shared": shared_knowledge,
                         "results": [
                             {
                                 "filename": r.filename,

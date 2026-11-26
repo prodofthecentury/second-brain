@@ -583,9 +583,10 @@ def retrieve_context(
         for n in notes
     ]
     try:
-        from agent_runtime import search_agent_memory
+        from agent_runtime import learn_from_notes, search_agent_memory
 
-        for hit in search_agent_memory(query, brain_dir=paths.brain_dir, limit=4):
+        learn_from_notes(brain_dir=paths.brain_dir)
+        for hit in search_agent_memory(query, brain_dir=paths.brain_dir, project=scope_raw, limit=4):
             sources.append(
                 {
                     "tier": "agent",
@@ -1243,13 +1244,22 @@ def chat_events(
 
     if mode == "instant":
         instant_summary = ""
-        if not verified and not preferences and not notes:
+        learned = [
+            source
+            for source in list(ctx.get("sources") or [])
+            if isinstance(source, dict) and source.get("tier") == "agent"
+        ]
+        if not verified and not preferences and not notes and not learned:
             msg = "Nothing in your verified memory or notes matches this question yet."
             instant_summary = msg
             yield {"type": "abstain", "text": msg, "reason": msg}
         else:
             instant_summary = "\n".join(
-                [*(f"[{v['id']}] {v['claim']}" for v in verified), *(f"[{n['id']}] {n['title']}" for n in notes)]
+                [
+                    *(f"[{v['id']}] {v['claim']}" for v in verified),
+                    *(f"[{n['id']}] {n['title']}" for n in notes),
+                    *(f"[{source.get('citation_id')}] {source.get('claim')}" for source in learned),
+                ]
             )
         if leads_block:
             yield {"type": "research_leads", "text": leads_block, "unverified_leads": leads_payload, "leads": leads_payload}

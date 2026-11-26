@@ -53,7 +53,7 @@ from executable_skills import (
 from inbox_workflow import scan_inbox_payload_risks
 from memory_format import split_frontmatter
 from memory_review import parse_frontmatter_values
-from recall import RecallOptions, search_memory
+from recall import RecallOptions, normalize_project_tag, project_tags_match, search_memory
 
 MAX_AGENT_DEPTH = 3
 DEFAULT_MAX_STEPS = 8
@@ -62,6 +62,9 @@ DEFAULT_SCHEDULE_SECONDS = 900
 MEMORY_TYPES = frozenset({"semantic", "episodic", "procedural", "self"})
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
 _STEPS_RE = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
+_STEP_LINE_RE = re.compile(r"^\s*(?:\d+[.)]|[-*])\s+\S", re.MULTILINE)
+_LEARN_BATCH = 40
+_LEARN_CLAIM_CHARS = 1800
 
 
 class AgentRuntimeError(ValueError):
@@ -227,6 +230,39 @@ def write_agent_memory(
     return os.path.basename(target)
 
 
+def _note_scope(tags: object) -> str:
+    found: list[str] = []
+    items = tags if isinstance(tags, (list, tuple)) else ()
+    for raw in items:
+        text = str(raw or "").strip()
+        if text.lower().startswith("project:"):
+            found.append(text)
+    if len(found) > 1:
+        return "mixed"
+    return found[0] if found else ""
+
+
+def _scope_visible(stored: str, requested: str) -> bool:
+    asked = str(requested or "").strip()
+    if not asked:
+        return True
+    if not stored or stored == "mixed":
+        return False
+    scope = normalize_project_tag(asked)
+    return bool(scope) and bool(project_tags_match((stored,), (scope,)))
+
+
+def _write_ledger(path: str, payload: dict[str, str]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".tmp"
+    data = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    with open(temporary, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
 def search_agent_memory(query: str, *, brain_dir: str = BRAIN_DIR, project: str = "", limit: int = 6) -> list[dict[str, str]]:
     """Return agent_active memories whose claim shares a query term."""
     memory_dir = os.path.join(agent_root(brain_dir), "memory")
@@ -246,7 +282,7 @@ def search_agent_memory(query: str, *, brain_dir: str = BRAIN_DIR, project: str 
             continue
         if str(fm.get("superseded_by") or "").strip():
             continue
-        if project and str(fm.get("project") or "") not in {"", project}:
+        if not _scope_visible(str(fm.get("project") or ""), project):
             continue
         parsed = split_frontmatter(text)
         body = "\n".join(parsed[1]) if parsed else text
@@ -259,13 +295,25 @@ def search_agent_memory(query: str, *, brain_dir: str = BRAIN_DIR, project: str 
     return hits
 
 
-def _render_skill(skill_id: str, *, agent_id: str, trigger: str, steps: list[dict[str, Any]], status: str, successes: int, failures: int) -> str:
+def _render_skill(
+    skill_id: str,
+    *,
+    agent_id: str,
+    trigger: str,
+    steps: list[dict[str, Any]],
+    status: str,
+    successes: int,
+    failures: int,
+    project: str = "",
+) -> str:
     payload = json.dumps(steps, indent=2, sort_keys=True)
+    project_line = f"project: {json.dumps(project)}\n" if project else ""
     return (
         "---\n"
         f"skill_id: {skill_id}\n"
         f"status: {status}\n"
         f"trigger: {json.dumps(trigger)}\n"
+        f"{project_line}"
         f"authored_by: agent_runtime:{agent_id}\n"
         f"successes: {successes}\n"
         f"failures: {failures}\n"
@@ -322,6 +370,7 @@ def draft_agent_skill(
     *,
     trigger: str,
     brain_dir: str = BRAIN_DIR,
+    project: str = "",
 ) -> str:
     dirs = _dirs(brain_dir)
     author = _agent_id(agent_id)
@@ -331,7 +380,16 @@ def draft_agent_skill(
     target = safe_file_in_dir(dirs["skills"], name, allowed_exts={".md"}, must_exist=False)
     if not target:
         raise AgentRuntimeError(f"Unsafe skill filename: {name}")
-    body = _render_skill(norm_id, agent_id=author, trigger=trigger, steps=steps, status="agent_trial", successes=0, failures=0)
+    body = _render_skill(
+        norm_id,
+        agent_id=author,
+        trigger=trigger,
+        steps=steps,
+        status="agent_trial",
+        successes=0,
+        failures=0,
+        project=project,
+    )
     if os.path.exists(target):
         os.remove(target)
     _write_exclusive(target, body)
@@ -518,7 +576,15 @@ def _recall(query: str, brain_dir: str) -> list[str]:
         )
     except Exception:
         return []
-    return [item.filename for item in direct]
+    names = [item.filename for item in direct]
+    try:
+        for hit in search_connected_knowledge(query, brain_dir=brain_dir, limit=5, learn=False):
+            label = hit["filename"]
+            if label not in names:
+                names.append(label)
+    except Exception:
+        return names
+    return names
 
 
 def execute_agent_skill(
@@ -801,6 +867,152 @@ def set_agent_schedule(
     return payload
 
 
+def learn_from_notes(*, brain_dir: str = BRAIN_DIR) -> dict[str, int]:
+    """Turn new and edited notes into memories the next agent can use.
+
+    Existing notes are not edited or deleted. A later edit adds another memory.
+    Risky text is left in the note and is not copied into agent memory.
+    """
+    from notes_store import parse_note
+
+    dirs = _dirs(brain_dir)
+    notes_dir = os.path.join(os.path.abspath(brain_dir), "notes")
+    ledger_path = os.path.join(dirs["root"], "learned-notes.json")
+    ledger: dict[str, str] = {}
+    if os.path.isfile(ledger_path):
+        try:
+            loaded = json.loads(_read_text(ledger_path))
+            if isinstance(loaded, dict):
+                ledger = {str(key): str(value) for key, value in loaded.items()}
+        except (OSError, json.JSONDecodeError):
+            ledger = {}
+    learned = skills = skipped = 0
+    if not os.path.isdir(notes_dir):
+        return {"learned": 0, "skills": 0, "skipped": 0}
+    changed = False
+    for name in sorted(os.listdir(notes_dir)):
+        if learned >= _LEARN_BATCH:
+            break
+        if not name.endswith(".md") or name.startswith("."):
+            continue
+        path = safe_file_in_dir(notes_dir, name, allowed_exts={".md"}, must_exist=True)
+        if not path:
+            continue
+        try:
+            text = _read_text(path)
+        except OSError:
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if ledger.get(name) == digest:
+            continue
+        meta, body = parse_note(text, name)
+        title = str(meta.get("title") or name).strip() or name
+        scope = _note_scope(meta.get("tags"))
+        readable = f"{title}\n{body}".strip()
+        if len(readable) < 12 or scan_inbox_payload_risks(readable):
+            ledger[name] = digest
+            skipped += 1
+            changed = True
+            continue
+        claim = f"From note {name} ({title}): {body.strip() or title}"[:_LEARN_CLAIM_CHARS].strip()
+        episode_id = f"note-{digest[:16]}"
+        _append_execution(dirs, {"episode_id": episode_id, "kind": "note_learned", "note": name})
+        try:
+            write_agent_memory(
+                "learner",
+                "semantic",
+                claim,
+                episode_id,
+                project=scope,
+                filename=f"note-{_slug(title)}-{digest[:8]}.md",
+                brain_dir=brain_dir,
+            )
+        except AgentRuntimeError as exc:
+            if "already exists" not in str(exc):
+                ledger[name] = digest
+                skipped += 1
+                changed = True
+                continue
+        learned += 1
+        changed = True
+        procedural = len(_STEP_LINE_RE.findall(body)) >= 2 or "how to" in readable.casefold()
+        if procedural and scope != "mixed":
+            try:
+                draft_agent_skill(
+                    "learner",
+                    f"note-{_slug(title, 24)}-{digest[:6]}",
+                    [{"action_type": "vault_recall", "query": title[:200], "output_file": "recall.json"}],
+                    trigger=title[:200],
+                    project=scope,
+                    brain_dir=brain_dir,
+                )
+                skills += 1
+            except (AgentRuntimeError, ExecutableSkillValidationError):
+                pass
+        ledger[name] = digest
+    if changed:
+        _write_ledger(ledger_path, ledger)
+    return {"learned": learned, "skills": skills, "skipped": skipped}
+
+
+def search_connected_knowledge(
+    query: str,
+    *,
+    brain_dir: str = BRAIN_DIR,
+    limit: int = 8,
+    project: str = "",
+    learn: bool = True,
+) -> list[dict[str, str]]:
+    """Search notes, learned memories, and skills for any connected agent."""
+    if learn:
+        try:
+            learn_from_notes(brain_dir=brain_dir)
+        except Exception:
+            pass
+    cap = max(1, min(int(limit), 20))
+    hits: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(source: str, filename: str, title: str, text: str) -> None:
+        key = (source, filename)
+        if key in seen or len(hits) >= cap:
+            return
+        seen.add(key)
+        hits.append({"source": source, "filename": filename, "title": title, "text": text[:_LEARN_CLAIM_CHARS]})
+
+    try:
+        from notes_store import NotePaths, search_notes
+
+        for note in search_notes(query, limit=cap, project=project or None, paths=NotePaths.for_brain(brain_dir)):
+            add("note", note.filename, note.title, note.snippet or note.title)
+    except Exception:
+        pass
+    for memory in search_agent_memory(query, brain_dir=brain_dir, project=project, limit=cap):
+        add("agent_memory", memory["filename"], memory["filename"], memory["claim"])
+    terms = {token.casefold() for token in _TOKEN_RE.findall(query or "")}
+    skills_dir = os.path.join(agent_root(brain_dir), "skills")
+    if terms and os.path.isdir(skills_dir):
+        for name in sorted(os.listdir(skills_dir)):
+            if len(hits) >= cap:
+                break
+            path = safe_file_in_dir(skills_dir, name, allowed_exts={".md"}, must_exist=True)
+            if not path:
+                continue
+            try:
+                frontmatter = _frontmatter(_read_text(path))
+            except OSError:
+                continue
+            if str(frontmatter.get("status") or "") not in {"agent_trial", "agent_active"}:
+                continue
+            if not _scope_visible(str(frontmatter.get("project") or ""), project):
+                continue
+            trigger = str(frontmatter.get("trigger") or "")
+            if not terms.intersection({token.casefold() for token in _TOKEN_RE.findall(trigger)}):
+                continue
+            add("agent_skill", name, str(frontmatter.get("skill_id") or name), trigger)
+    return hits
+
+
 def run_scheduled_goals(*, brain_dir: str = BRAIN_DIR, force: bool = False) -> list[dict[str, Any]]:
     """Run the oldest open goal when the agent schedule is enabled."""
     schedule_path = os.path.join(agent_root(brain_dir), "schedule.json")
@@ -817,6 +1029,10 @@ def run_scheduled_goals(*, brain_dir: str = BRAIN_DIR, force: bool = False) -> l
         _validate_human_actor(str(schedule.get("enabled_by") or ""))
     except ExecutableSkillValidationError:
         return []
+    try:
+        learn_from_notes(brain_dir=brain_dir)
+    except Exception:
+        pass
     stamp_path = os.path.join(dirs["root"], "last-tick.txt")
     now = time.time()
     if not force and os.path.isfile(stamp_path):

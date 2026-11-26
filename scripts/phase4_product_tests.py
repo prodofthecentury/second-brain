@@ -488,9 +488,18 @@ class ProductApiTests(IsolatedVaultCase):
             r = c.request(method, f"http://127.0.0.1:{self.port}{path}", headers=headers, json=body if body is not None else None)
         return r if raw else (r.status_code, r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text)
 
-    def test_agent_token_cannot_write_notes_or_grant_trust(self) -> None:
-        status, _ = self.req("POST", "/v1/notes", {"title": "x", "body": "y"})
-        self.assertEqual(status, 403)
+    def test_agent_can_add_notes_but_not_change_or_delete(self) -> None:
+        status, added = self.req("POST", "/v1/notes", {"title": "Agent note", "body": "Keep the rollback plan with the deploy."})
+        self.assertEqual(status, 201)
+        self.assertEqual(added["status"], "saved")
+        for method, path, body in (
+            ("PUT", f"/v1/notes/{added['filename']}", {"body": "hijack", "expected_sha256": added["sha256"]}),
+            ("DELETE", f"/v1/notes/{added['filename']}", {"expected_sha256": added["sha256"]}),
+        ):
+            denied, _ = self.req(method, path, body)
+            self.assertEqual(denied, 403, f"{method} {path}")
+        status, _ = self.req("POST", "/v1/notes", {"title": "x", "body": ""})
+        self.assertEqual(status, 422)
         status, created = self.req("POST", "/v1/notes", {"title": "Owner note", "body": "Rotate API keys every 90 days."}, owner=True)
         self.assertEqual(status, 201)
         fname = created["filename"]
@@ -791,8 +800,11 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
 
         ctx = retrieve_context("xylophone", self.chat_paths(), project_scope="alpha")
         self.assertEqual([n["title"] for n in ctx["notes"]], ["Alpha Spec"])
-        source_titles = [s.get("title") for s in ctx["sources"] if s.get("title")]
-        self.assertEqual(source_titles, ["Alpha Spec"])
+        source_text = " ".join(
+            f"{s.get('title') or ''} {s.get('claim') or ''} {s.get('excerpt') or ''}" for s in ctx["sources"]
+        )
+        self.assertIn("Alpha Spec", source_text)
+        self.assertNotIn("beta", source_text.casefold())
 
         # Add a verified atom for alpha so verified mode exercises claim-selection secret scan.
         alpha_note = get_note(alpha["filename"], paths=self.paths)
@@ -875,8 +887,16 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
             conn.close()
             return resp.status, data
 
-        # Agent-only mutation must 403 and be audited.
-        st_denied, _ = req("POST", "/v1/notes", {"title": "Blocked", "body": "Nope"}, owner=False)
+        # Agents may add a note. Changing one that already exists stays forbidden.
+        st_added, raw_added = req("POST", "/v1/notes", {"title": "Agent note", "body": "Agents may add a note."}, owner=False)
+        self.assertEqual(st_added, 201)
+        added = json.loads(raw_added)
+        st_denied, _ = req(
+            "PUT",
+            f"/v1/notes/{added['filename']}",
+            {"body": "rewrite", "expected_sha256": added["sha256"]},
+            owner=False,
+        )
         self.assertEqual(st_denied, 403)
 
         # Owner note creation + retrieval must return both items and legacy keys.
@@ -912,7 +932,8 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
         self.assertTrue(audit_path.is_file())
         records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         endpoints = {(r["method"], r["endpoint"], r["status_code"]) for r in records}
-        self.assertIn(("POST", "/v1/notes", 403), endpoints)
+        self.assertIn(("POST", "/v1/notes", 201), endpoints)
+        self.assertTrue(any(method == "PUT" and code == 403 for method, _endpoint, code in endpoints))
         self.assertIn(("GET", "/v1/notes", 200), endpoints)
         self.assertIn(("GET", "/v1/atoms", 200), endpoints)
         self.assertIn(("POST", "/v1/chat/stream", 200), endpoints)

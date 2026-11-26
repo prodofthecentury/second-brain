@@ -446,7 +446,14 @@ def sync_notes_index_for_vault(*, brain_dir: str | None = None, notes_dir: str |
     if os.path.lexists(npaths.notes_dir) and _is_reparse_or_link(str(npaths.notes_dir)):
         raise PermissionError(f"Refusing to sync symlinked notes directory: {npaths.notes_dir}")
     os.makedirs(npaths.notes_dir, exist_ok=True)
-    return ensure_notes_index(npaths)
+    indexed = ensure_notes_index(npaths)
+    try:
+        from agent_runtime import learn_from_notes
+
+        learn_from_notes(brain_dir=resolved_brain)
+    except Exception:
+        pass
+    return indexed
 
 
 def sync_atoms_and_detect_stale_anchors(

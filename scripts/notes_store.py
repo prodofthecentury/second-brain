@@ -346,6 +346,16 @@ def _quarantine_agent_capture(paths: NotePaths, title: str, body: str, risks: tu
     }
 
 
+def _learn_saved_notes(paths: NotePaths) -> None:
+    """Best-effort: a saved note becomes shared memory without blocking the save."""
+    try:
+        from agent_runtime import learn_from_notes
+
+        learn_from_notes(brain_dir=paths.brain_dir)
+    except Exception:
+        return
+
+
 def create_note(
     title: str,
     body: str,
@@ -385,7 +395,9 @@ def create_note(
         name = _create_exclusive(paths.notes_dir, slugify(clean_title), rendered)
         if reindex:
             upsert_lexical_atoms(paths.notes_dir, paths.index_path, [name])
-    return {"status": "saved", "filename": name, "sha256": content_sha256(rendered), "origin": origin}
+    saved = {"status": "saved", "filename": name, "sha256": content_sha256(rendered), "origin": origin}
+    _learn_saved_notes(paths)
+    return saved
 
 
 def update_note(
@@ -435,7 +447,9 @@ def update_note(
             atomic_write_bytes(str(backup), original)
         atomic_write_bytes(str(target), rendered)
         upsert_lexical_atoms(paths.notes_dir, paths.index_path, [filename])
-    return {"status": "saved", "filename": filename, "sha256": content_sha256(rendered), "previous_sha256": current}
+    saved = {"status": "saved", "filename": filename, "sha256": content_sha256(rendered), "previous_sha256": current}
+    _learn_saved_notes(paths)
+    return saved
 
 
 def delete_note(filename: str, *, expected_sha256: str, paths: NotePaths = DEFAULT_PATHS) -> dict[str, object]:
