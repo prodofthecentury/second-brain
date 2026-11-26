@@ -401,6 +401,10 @@ def _normalized_claim_key(memory_doc: str) -> str:
 
 
 SOURCE_SPAN_MIN_RATIO = 0.72
+_GENERATION_DOWN_RE = re.compile(
+    r"unavailable|connection refused|failed to connect|timed out|timeout|name or service not known",
+    re.IGNORECASE,
+)
 MAX_ATOMS_PER_NOTE = 5
 
 
@@ -582,26 +586,55 @@ def _claim_is_truncated(claim: str) -> bool:
     return False
 
 
+def _stem_token(word: str) -> str:
+    for suffix in ("ments", "ment", "ings", "ing", "ied", "ed", "es", "s"):
+        if len(word) > len(suffix) + 3 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
+def _stem_terms(text: str) -> set[str]:
+    return {_stem_token(word) for word in _content_terms(text)}
+
+
+def _is_heading_or_boilerplate(text: str) -> bool:
+    raw = str(text or "").strip().strip("`").strip()
+    if not raw:
+        return True
+    if raw.lstrip().startswith("#"):
+        return True
+    if re.search(r"\bTEST DATA\b", raw, re.IGNORECASE):
+        return True
+    if _BOILERPLATE_RE.search(raw):
+        return True
+    return False
+
+
 def claim_supported_by_evidence(claim: str, evidence: str) -> bool:
-    """Most of the claim's content words must be in the cited evidence span."""
-    terms = _content_terms(claim)
+    """Stemmed content words in the claim must substantially appear in the evidence sentence."""
+    terms = _stem_terms(claim)
     if not terms:
         return False
-    evidence_terms = _content_terms(evidence)
-    evidence_fold = evidence.casefold()
+    evidence_terms = _stem_terms(evidence)
+    evidence_fold = " ".join(_stem_token(word) for word in re.findall(r"[a-z0-9]+", evidence.casefold()))
     hits = sum(1 for term in terms if term in evidence_terms or term in evidence_fold)
-    needed = max(1, int(round(len(terms) * 0.7)))
+    needed = max(1, int(round(len(terms) * 0.5)))
     return hits >= needed
 
 
 def salvage_claim(claim: str, evidence: str, source: str) -> str | None:
-    """Keep a claim that the evidence supports, or replace it with the evidence sentence."""
-    if _is_boilerplate(evidence) or evidence not in source:
+    """Keep a claim the evidence supports, or the source sentence the claim itself quotes."""
+    claim_span = exact_source_span(source, claim)
+    if claim_span and not _is_heading_or_boilerplate(claim_span):
+        sentence = claim_span if claim_span.endswith((".", "!", "?")) else claim_span.rstrip(".") + "."
+        if claim_grounded_in_source(sentence, source):
+            return sentence
+    if _is_heading_or_boilerplate(evidence) or evidence not in source:
         return None
     cleaned = _clean_quote_hint(claim)
     unusable = (
         not cleaned
-        or _is_boilerplate(cleaned)
+        or _is_heading_or_boilerplate(cleaned)
         or _ARTIFACT_CLAIM_RE.search(cleaned)
         or _claim_is_truncated(cleaned)
         or not claim_supported_by_evidence(cleaned, evidence)
@@ -610,18 +643,18 @@ def salvage_claim(claim: str, evidence: str, source: str) -> str | None:
     if not unusable:
         return cleaned if cleaned.endswith((".", "!", "?")) else cleaned.rstrip(".") + "."
     sentence = evidence if evidence.endswith((".", "!", "?")) else evidence.rstrip(".") + "."
-    if _is_boilerplate(sentence) or not claim_grounded_in_source(sentence, source):
+    if _is_heading_or_boilerplate(sentence) or not claim_grounded_in_source(sentence, source):
         return None
     return sentence
 
 
 def claim_grounded_in_source(claim: str, source: str) -> bool:
-    """Drop a claim whose content words are not substantially in this note."""
-    terms = _content_terms(claim)
+    """Drop a claim whose stemmed content words are not substantially in this note."""
+    terms = _stem_terms(claim)
     if not terms:
         return False
-    source_terms = _content_terms(source)
-    source_fold = source.casefold()
+    source_terms = _stem_terms(source)
+    source_fold = " ".join(_stem_token(word) for word in re.findall(r"[a-z0-9]+", source.casefold()))
     hits = sum(1 for term in terms if term in source_terms or term in source_fold)
     needed = 1 if len(terms) <= 2 else max(2, (len(terms) + 1) // 2)
     return hits >= min(needed, len(terms))
@@ -869,7 +902,8 @@ def _rows_from_output(output: str) -> tuple[list[dict], list[str]]:
 
 def _schema_prompt(note: str) -> str:
     return (
-        "Extract every distinct fact in the note, at most 5. "
+        "List each distinct fact in the note, including numbers, times, sizes, and setting names. "
+        "Return up to 5 atoms. "
         "evidence must be an exact quote copied from the note. "
         "claim must be one sentence about that quote, using words that appear in the note. "
         "Do not add facts, names, or examples that are not in the note.\n\n"
@@ -973,9 +1007,15 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     if memory_type not in {"semantic", "episodic", "procedural", "self"}:
         memory_type = "semantic"
     exact = exact_source_span(source_text, evidence) if len(evidence) >= 8 else None
+    if exact and _is_heading_or_boilerplate(exact):
+        exact = None
     if not exact or exact not in source_text:
-        print(f"  [!] Dropped atom; evidence is not a span of this note: {evidence[:80]!r}")
-        return None, "unanchored"
+        claim_span = exact_source_span(source_text, claim)
+        if claim_span and not _is_heading_or_boilerplate(claim_span) and claim_span in source_text:
+            exact = claim_span
+        else:
+            print(f"  [!] Dropped atom; evidence is not a span of this note: {evidence[:80]!r}")
+            return None, "unanchored"
     evidence = exact
     path = "schema"
     if title and claim.casefold().strip(" .") == title.casefold().strip(" ."):
@@ -1018,6 +1058,51 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     if model_support is None and not evidence_supports_claim(claim, evidence):
         return None, "unsupported"
     return finished, path
+
+
+def _fact_sentences(source: str) -> list[str]:
+    """Sentences in the note that can stand as a fact. Headings and boilerplate are skipped."""
+    sentences: list[str] = []
+    for part in re.split(r"(?<=[.!?])\s+|\n+", source or ""):
+        sentence = part.strip().strip("`").strip()
+        if len(sentence) < 12 or _is_heading_or_boilerplate(sentence):
+            continue
+        if not _stem_terms(sentence):
+            continue
+        if not sentence.endswith((".", "!", "?")):
+            sentence = sentence.rstrip(".") + "."
+        sentences.append(sentence)
+    return sentences
+
+
+def _priority_sentence(sentence: str) -> bool:
+    return bool(re.search(r"\d|\bGB\b|BRAIN_[A-Z0-9_]+|:[0-9]", sentence))
+
+
+def _sentence_mentioned(sentence: str, output: str) -> bool:
+    folded = _clean_quote_hint(output).casefold()
+    if not folded:
+        return False
+    if sentence.casefold().rstrip(".") in folded:
+        return True
+    terms = _stem_terms(sentence)
+    if len(terms) < 2:
+        return False
+    hits = sum(1 for term in terms if term in folded)
+    return hits >= max(2, int(round(len(terms) * 0.6)))
+
+
+def _rows_for_sentences(sentences: list[str], *, why: str) -> list[dict]:
+    return [
+        {
+            "title": "",
+            "claim": sentence,
+            "evidence": sentence.rstrip("."),
+            "why": why,
+            "memory_type": "semantic",
+        }
+        for sentence in sentences
+    ]
 
 
 def _claims_are_near_duplicates(left: str, right: str) -> bool:
@@ -1083,6 +1168,8 @@ def draft_memory_atoms(
     seen_claim_texts: list[str] = []
     existing_claims = _existing_vault_claims(atoms_dir)
     last_unparsed_output = ""
+    model_outputs: list[str] = []
+    generation_down = ""
 
     for chunk in chunks:
         if len(collected) >= MAX_ATOMS_PER_DOCUMENT:
@@ -1114,6 +1201,10 @@ def draft_memory_atoms(
         if err:
             errors.append(err)
             output = ""
+            if not repeat_abort and _GENERATION_DOWN_RE.search(err):
+                generation_down = err
+        if output:
+            model_outputs.append(output)
         rows, problems = _rows_from_output(output or "")
         finished: list[tuple[str, str]] = []
         for row in rows:
@@ -1206,9 +1297,12 @@ def draft_memory_atoms(
                         doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
                         if doc:
                             finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
-        if not finished and errors and not output:
-            raise RuntimeError(f"LLM drafting unavailable; capture deferred: {errors[-1]}")
-
+        if output:
+            mentioned = [sentence for sentence in _fact_sentences(chunk_text) if _sentence_mentioned(sentence, output)]
+            for row in _rows_for_sentences(mentioned, why="Salvaged from model text that quoted this sentence."):
+                doc, _row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                if doc:
+                    finished.append((doc, "salvaged"))
         stripped_out = (output or "").strip()
         if multi_chunk and stripped_out.upper() in {"NONE", "NO_CLAIMS", "EMPTY"}:
             print(f"  [*] Chunk {chunk_idx + 1}/{chunk_total}: boilerplate/no durable claims; skipping chunk.")
@@ -1221,11 +1315,9 @@ def draft_memory_atoms(
             print(f"  [*] Distill path: {used}")
         if not chunk_memories:
             last_unparsed_output = output or ""
-            if multi_chunk:
-                preview = re.sub(r"\s+", " ", output or "").strip()[:80]
-                print(f"  [*] Chunk {chunk_idx + 1}/{chunk_total}: 0 valid memories parsed (preview: {preview!r}); continuing.")
-                continue
-            break
+            preview = re.sub(r"\s+", " ", output or "").strip()[:80]
+            print(f"  [*] Chunk {chunk_idx + 1}/{chunk_total}: 0 valid memories parsed (preview: {preview!r}); continuing.")
+            continue
 
         for mem in chunk_memories:
             claim_text = section_text(mem, "Claim") or _normalized_claim_key(mem)
@@ -1242,6 +1334,44 @@ def draft_memory_atoms(
             collected.append(mem)
             if len(collected) >= MAX_ATOMS_PER_DOCUMENT:
                 break
+
+    def _keep(doc: str, path: str) -> None:
+        if len(collected) >= MAX_ATOMS_PER_NOTE:
+            return
+        claim_text = section_text(doc, "Claim") or ""
+        if not claim_text:
+            return
+        if any(_claims_are_near_duplicates(claim_text, prior) for prior in (*seen_claim_texts, *existing_claims)):
+            return
+        seen_claim_texts.append(claim_text)
+        collected.append(doc)
+        LAST_DISTILL_PATHS.append(path)
+        print(f"  [*] Distill path: {path}")
+
+    if not collected and generation_down and not model_outputs:
+        raise RuntimeError(f"LLM drafting unavailable; capture deferred: {generation_down}")
+
+    had_model_atoms = bool(collected)
+    covered_text = "\n".join(collected).casefold()
+    mention_blob = "\n".join(model_outputs)
+    for sentence in _fact_sentences(str(raw_content)):
+        if len(collected) >= MAX_ATOMS_PER_NOTE:
+            break
+        if sentence.casefold() in covered_text:
+            continue
+        mentioned = bool(mention_blob) and _sentence_mentioned(sentence, mention_blob)
+        if had_model_atoms and not mentioned and not _priority_sentence(sentence):
+            continue
+        why = (
+            "Salvaged from model text that quoted this sentence."
+            if mentioned
+            else "Extracted from the source sentence."
+        )
+        for row in _rows_for_sentences([sentence], why=why):
+            doc, _row_path = _finish_row(row, str(raw_content), raw_filename, today_str, model)
+            if doc:
+                _keep(doc, "salvaged" if mentioned else "extracted")
+                covered_text = "\n".join(collected).casefold()
 
     if collected:
         return collected
