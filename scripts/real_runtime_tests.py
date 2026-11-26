@@ -219,7 +219,7 @@ class RealRuntimeTests(unittest.TestCase):
 
         from scripts.evidence import find_evidence_anchor
         from scripts.lexical_store import rebuild_lexical_index
-        from scripts.ollama_refinery import draft_memory_atoms
+        from scripts.ollama_refinery import LAST_DISTILL_PATHS, draft_memory_atoms
         from scripts.personal_eval import evaluate_file
 
         fixture_path = Path(__file__).resolve().parents[1] / "docs" / "distill-fixtures.json"
@@ -260,6 +260,7 @@ class RealRuntimeTests(unittest.TestCase):
                         continue
                     (vault / note["filename"]).parent.mkdir(parents=True, exist_ok=True)
                     (vault / note["filename"]).write_text(note["text"] + "\n", encoding="utf-8")
+                    LAST_DISTILL_PATHS.clear()
                     try:
                         drafted = draft_memory_atoms(note["text"], note["filename"], "Copy evidence verbatim.")
                     except Exception as exc:
@@ -289,7 +290,7 @@ class RealRuntimeTests(unittest.TestCase):
                     gate_pass += anchored
                     print(
                         f"DISTILL_NOTE {note['id']} atoms={len(drafted)} "
-                        f"verbatim={verbatim} gate={anchored}"
+                        f"verbatim={verbatim} gate={anchored} path={','.join(LAST_DISTILL_PATHS) or 'none'}"
                     )
                 print(f"DISTILL_SUCCESS {notes_with_atoms}/{len(notes)} model={model} atoms={atoms_total} gate={gate_pass}")
                 if contaminated:
