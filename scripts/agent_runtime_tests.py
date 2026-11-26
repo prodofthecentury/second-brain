@@ -594,6 +594,13 @@ class AgentRuntimeTests(unittest.TestCase):
             paths=paths,
         )
         self.assertEqual(specific["status"], "saved")
+        named_file = create_note(
+            "CSS Rule",
+            "Frontend styles live in styles.css.",
+            origin="agent_capture",
+            paths=paths,
+        )
+        self.assertEqual(named_file["status"], "saved")
 
         cyber = self.root / "cyber"
         for relative in ("notes", "2-atoms", "0-raw/inbox", ".sidecar", "4-experiences"):

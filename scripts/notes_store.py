@@ -352,6 +352,10 @@ _GENERIC_NOTE_MESSAGE = (
     "config value, or a local choice such as which tool this project uses."
 )
 _PATH_ANCHOR_RE = re.compile(r"(?:^|[\s\"'(])((?:\.\./|\./|/)[\w./-]{3,})", re.MULTILINE)
+_FILE_ANCHOR_RE = re.compile(
+    r"\b[\w.-]+\.(?:css|scss|sass|less|js|mjs|cjs|jsx|ts|tsx|py|pyi|go|rs|java|kt|rb|php|json|ya?ml|toml|ini|cfg|conf|md|html|htm|sql|sh|ps1|xml|lock|txt|vue|svelte)\b",
+    re.IGNORECASE,
+)
 _FLAG_ANCHOR_RE = re.compile(r"\b[\w.-]+\s+--[\w-]+")
 _UNIT_ANCHOR_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:%|ms|s|px|mb|gb)\b", re.IGNORECASE)
 _VERSION_ANCHOR_RE = re.compile(r"\bv?\d+\.\d+\.\d+\b")
@@ -369,11 +373,12 @@ def agent_capture_rejection(title: str, body: str) -> str | None:
     """Refuse an agent note that is only knowledge a model already has.
 
     Owner-written notes are not checked. A keepable agent note names something
-    local: a path, command, version, threshold, config value, or a project choice.
+    local: a path, filename, command, version, threshold, config value, or a project choice.
     """
     text = f"{title}\n{body}"
     if (
         _PATH_ANCHOR_RE.search(text)
+        or _FILE_ANCHOR_RE.search(text)
         or _FLAG_ANCHOR_RE.search(text)
         or _UNIT_ANCHOR_RE.search(text)
         or _VERSION_ANCHOR_RE.search(text)
