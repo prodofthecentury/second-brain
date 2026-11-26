@@ -31,6 +31,8 @@ class OllamaEndpointTests(unittest.TestCase):
         with patch.dict(os.environ, {"OLLAMA_KEEP_ALIVE": "45s"}):
             os.environ.pop("BRAIN_OLLAMA_KEEP_ALIVE", None)
             self.assertEqual(ollama_keep_alive(), "45s")
+        with patch.dict(os.environ, {"BRAIN_OLLAMA_KEEP_ALIVE": "0"}):
+            self.assertEqual(ollama_keep_alive(), "0")
         with patch.dict(os.environ, {"BRAIN_OLLAMA_KEEP_ALIVE": "forever"}):
             self.assertEqual(ollama_keep_alive(), "30m")
 

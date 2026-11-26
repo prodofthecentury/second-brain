@@ -19,6 +19,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -34,6 +35,25 @@ from scripts.zero_trust_tunnel import probe_tunnel_binary
 
 def _require(flag: str) -> bool:
     return os.environ.get(flag) == "1"
+
+
+def _unload_ollama_model(model: str) -> None:
+    """Ask Ollama to drop a model immediately so the next test does not wait on keep-alive."""
+    import urllib.request
+
+    body = json.dumps({"model": model, "keep_alive": 0, "prompt": ""}).encode("utf-8")
+    request = urllib.request.Request(
+        "http://127.0.0.1:11434/api/generate",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read()
+        print(f"OLLAMA_UNLOAD {model}")
+    except Exception as exc:
+        print(f"OLLAMA_UNLOAD {model} failed: {exc}")
 
 
 class RealRuntimeTests(unittest.TestCase):
@@ -219,11 +239,14 @@ class RealRuntimeTests(unittest.TestCase):
             self.skipTest(f"{model} is not installed")
 
         previous = os.environ.get("BRAIN_GEN_MODEL")
+        previous_timeout = os.environ.get("BRAIN_OLLAMA_TIMEOUT")
         os.environ["BRAIN_GEN_MODEL"] = model
+        os.environ["BRAIN_OLLAMA_TIMEOUT"] = "60"
         notes_with_atoms = 0
         atoms_total = 0
         gate_pass = 0
         contaminated = False
+        started = time.monotonic()
         try:
             with tempfile.TemporaryDirectory(prefix="sb-distill-") as tmp:
                 vault = Path(tmp) / "brain"
@@ -232,6 +255,9 @@ class RealRuntimeTests(unittest.TestCase):
                 raw.mkdir(parents=True)
                 atoms.mkdir()
                 for note in notes:
+                    if time.monotonic() - started > 480:
+                        print(f"DISTILL_NOTE {note['id']} atoms=0 path=timeout verbatim=0 gate=0")
+                        continue
                     (vault / note["filename"]).parent.mkdir(parents=True, exist_ok=True)
                     (vault / note["filename"]).write_text(note["text"] + "\n", encoding="utf-8")
                     try:
@@ -284,10 +310,15 @@ class RealRuntimeTests(unittest.TestCase):
                 else:
                     print(f"EVAL_RECALL 0.0 EVAL_MRR 0.0 model={model}")
         finally:
+            _unload_ollama_model(model)
             if previous is None:
                 os.environ.pop("BRAIN_GEN_MODEL", None)
             else:
                 os.environ["BRAIN_GEN_MODEL"] = previous
+            if previous_timeout is None:
+                os.environ.pop("BRAIN_OLLAMA_TIMEOUT", None)
+            else:
+                os.environ["BRAIN_OLLAMA_TIMEOUT"] = previous_timeout
         if _require(require_flag) and notes_with_atoms == 0:
             self.fail(f"{model} distilled 0/{len(notes)} notes")
 

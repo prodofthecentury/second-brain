@@ -238,9 +238,10 @@ class DistillRepairTests(unittest.TestCase):
             '"why":"No.","memory_type":"semantic"}]}'
         )
         with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
-            with self.assertRaises(RuntimeError) as caught:
-                draft_memory_atoms(source, "0-raw/coffee.md", "House rules")
-        self.assertIn("Could not parse model memories", str(caught.exception))
+            drafted = draft_memory_atoms(source, "0-raw/coffee.md", "House rules")
+        self.assertEqual(len(drafted), 1)
+        self.assertIn("## Claim\n" + source, drafted[0])
+        self.assertNotIn("Bananas", drafted[0])
 
     def test_optional_model_support_check_can_drop_a_lexical_match(self) -> None:
         from scripts.ollama_refinery import draft_memory_atoms
@@ -369,6 +370,129 @@ class DistillGroundingTests(unittest.TestCase):
         joined = "\n".join(drafted)
         self.assertIn("Daily backups run at 02:00.", joined)
         self.assertIn("A 70B Hermes model needs a large GPU.", joined)
+
+    def test_bad_span_does_not_discard_the_other_facts(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = (
+            "A laptop with 16 GB of RAM runs the 3B model on CPU. "
+            "A desktop with 64 GB of RAM can keep a larger model loaded."
+        )
+        recorded = (
+            "```markdown\n## Claim\nA laptop with 16 GB of RAM runs the 3B model on CPU.\n"
+            "## Evidence\nA laptop with 16 GB of RAM runs the 3B model on CPU. ##\n"
+            "## Claim\nA desktop with 64 GB of RAM can keep a larger model loaded.\n"
+            "## Evidence\nA desktop with 64 GB of RAM can keep a larger model loaded.\n"
+            "leftover: not yaml\n"
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/04-laptop.md", "House rules")
+        self.assertGreaterEqual(len(drafted), 2)
+        joined = "\n".join(drafted)
+        self.assertIn("16 GB", joined)
+        self.assertIn("64 GB", joined)
+
+    def test_commentary_and_boilerplate_do_not_become_the_claim(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "The pour-over coffee ratio is one gram of coffee to sixteen grams of water."
+        recorded = (
+            '{"atoms":['
+            '{"title":"Ratio","claim":"The pour-over coffee ratio is used in this test note and avoids redundant computations.",'
+            '"evidence":"The pour-over coffee ratio is one gram of coffee to sixteen grams of water.","why":"x","memory_type":"semantic"},'
+            '{"title":"Banner","claim":"SYNTHETIC TEST DATA","evidence":"SYNTHETIC TEST DATA","why":"x","memory_type":"semantic"},'
+            '{"title":"Broken","claim":"## Claim yaml leftover The pour-over coffee ratio is one gram of coffee to sixteen grams of water.",'
+            '"evidence":"A 23 GB Qwen 3.6 model","why":"x","memory_type":"semantic"}'
+            "]}"
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/01-coffee.md", "House rules")
+        self.assertEqual(len(drafted), 1)
+        self.assertIn("## Claim\n" + source, drafted[0])
+        self.assertNotIn("redundant", drafted[0].casefold())
+        self.assertNotIn("SYNTHETIC", drafted[0])
+        self.assertNotIn("yaml", drafted[0].casefold())
+
+    def test_truncated_evidence_grows_to_the_full_sentence(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "A 23 GB Qwen 3.6 model fits in 24 GB of memory."
+        recorded = (
+            '{"atoms":[{"title":"Qwen size","claim":"A 23 GB Qwen 3.6 model fits in 24 GB of memory.",'
+            '"evidence":"A 23 GB Qwen 3.6 model","why":"Size.","memory_type":"semantic"}]}'
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/qwen.md", "House rules")
+        self.assertIn("## Evidence\n" + source, drafted[0])
+
+    def test_near_duplicate_atoms_collapse_but_different_sizes_remain(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = (
+            "Daily backups run at 02:00 from the vault. "
+            "Daily backups run at 02:00 from the vault each night. "
+            "An 8B model needs 6 GB of memory. "
+            "A 70B model needs 48 GB of memory."
+        )
+        recorded = (
+            '{"atoms":['
+            '{"title":"Backups","claim":"Daily backups run at 02:00 from the vault.","evidence":"Daily backups run at 02:00 from the vault.","why":"a","memory_type":"semantic"},'
+            '{"title":"Backups again","claim":"Daily backups run at 02:00 from the vault each night.","evidence":"Daily backups run at 02:00 from the vault each night.","why":"b","memory_type":"semantic"},'
+            '{"title":"8B","claim":"An 8B model needs 6 GB of memory.","evidence":"An 8B model needs 6 GB of memory.","why":"c","memory_type":"semantic"},'
+            '{"title":"70B","claim":"A 70B model needs 48 GB of memory.","evidence":"A 70B model needs 48 GB of memory.","why":"d","memory_type":"semantic"}'
+            "]}"
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/02-backups.md", "House rules")
+        claims = []
+        for document in drafted:
+            claims.append(document.split("## Claim\n", 1)[1].split("\n", 1)[0])
+        self.assertTrue(any("8B" in claim for claim in claims))
+        self.assertTrue(any("70B" in claim for claim in claims))
+        self.assertEqual(sum("02:00" in claim for claim in claims), 1)
+
+    def test_json_wrapped_in_prose_still_counts_as_schema(self) -> None:
+        from scripts.ollama_refinery import LAST_DISTILL_PATHS, draft_memory_atoms
+
+        source = "SQLite is the job queue for background capture."
+        wrapped = (
+            "Here is the JSON you asked for:\n"
+            '{"atoms":[{"title":"Queue","claim":"SQLite is the job queue for background capture.",'
+            '"evidence":"SQLite is the job queue for background capture.","why":"Jobs.","memory_type":"semantic"}]}\n'
+            "Thanks."
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": wrapped}}):
+            drafted = draft_memory_atoms(source, "0-raw/07-queue.md", "House rules")
+        self.assertEqual(len(drafted), 1)
+        self.assertIn("schema", LAST_DISTILL_PATHS[-1])
+
+
+class ChatGroundingTests(unittest.TestCase):
+    def test_false_abstention_is_replaced_by_the_top_claim(self) -> None:
+        from scripts.streaming_chat import answer_with_citations
+
+        verified = [{
+            "id": "V1",
+            "claim": "Hermes 8B needs about 6 GB of VRAM.",
+        }]
+        answer = answer_with_citations("No information.", "How much VRAM does Hermes 8B need?", verified)
+        self.assertIn("Hermes 8B needs about 6 GB of VRAM.", answer)
+        self.assertIn("[V1]", answer)
+        self.assertNotIn("No information", answer)
+
+    def test_uncited_answer_gets_a_citation_tag(self) -> None:
+        from scripts.streaming_chat import answer_with_citations
+
+        verified = [{
+            "id": "V1",
+            "claim": "Hermes 8B needs about 6 GB of VRAM.",
+        }]
+        answer = answer_with_citations(
+            "Hermes 8B needs about 6 GB of VRAM.",
+            "How much VRAM does Hermes 8B need?",
+            verified,
+        )
+        self.assertIn("[V1]", answer)
 
 
 class PinnedModelFallbackTests(unittest.TestCase):
