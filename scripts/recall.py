@@ -1990,7 +1990,11 @@ def search_memory(
             raise
     if options.retrieval_mode == "lexical":
         lex_direct, lex_neighbors = search_lexical_memory(
-            query, options, atoms_dir=atoms_dir, index_path=index_path
+            query,
+            options,
+            atoms_dir=atoms_dir,
+            index_path=index_path,
+            _allow_neural_rerank=True,
         )
         _maybe_store_l0(lex_direct, lex_neighbors)
         return lex_direct, lex_neighbors

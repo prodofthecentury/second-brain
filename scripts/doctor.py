@@ -476,13 +476,7 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
         checks.append(warn("vault ledger", f"Could not verify vault ledger: {exc}"))
 
     hw_profile = detect_hardware_profile(ollama_timeout=2.0)
-    checks.append(
-        ok(
-            "capability tier",
-            f"{hw_profile.tier_label} (active={active_gen_model}, "
-            f"auto={hw_profile.selected_installed_generation_model or 'none'})",
-        )
-    )
+    checks.append(ok("capability tier", capability_tier_detail(hw_profile)))
 
     try:
         from scripts.onnx_models import get_onnx_models_status
@@ -538,6 +532,16 @@ def run_checks(brain_dir: str | None = None) -> list[tuple[str, str, str]]:
     return checks
 
 
+def capability_tier_detail(hw_profile) -> str:
+    """Report the pinned generation model as the selected model when one is set."""
+    from scripts.hardware_profile import explicit_generation_model
+
+    pinned_model = explicit_generation_model()
+    selected_model = pinned_model or getattr(hw_profile, "selected_installed_generation_model", None) or "none"
+    auto_model = getattr(hw_profile, "selected_installed_generation_model", None) or "none"
+    return f"{hw_profile.tier_label} (selected={selected_model}, auto={auto_model})"
+
+
 def print_checks(checks: list[tuple[str, str, str]]):
     width = max(len(area) for _, area, _ in checks)
     for status, area, detail in checks:
@@ -546,11 +550,36 @@ def print_checks(checks: list[tuple[str, str, str]]):
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
+    import tempfile
 
     parser = argparse.ArgumentParser(description="Second Brain health check.")
     parser.add_argument("--json", action="store_true", help="Emit structured JSON health report.")
     args = parser.parse_args(argv)
-    checks = run_checks()
+    from scripts.config import ensure_dirs, ensure_house_rules_file, get_active_brain_dir
+
+    configured = get_active_brain_dir()
+    owned_temp = None
+    check_root = configured if os.path.isdir(configured) else None
+    if check_root is None:
+        owned_temp = tempfile.TemporaryDirectory(prefix="sb-doctor-")
+        check_root = owned_temp.name
+        ensure_dirs(check_root)
+        ensure_house_rules_file(check_root)
+        from scripts.lexical_store import rebuild_lexical_index
+
+        rebuild_lexical_index(
+            os.path.join(check_root, "2-atoms"),
+            os.path.join(check_root, ".sidecar", "lexical.sqlite3"),
+        )
+        print(f"Configured vault is missing ({configured}). Checking a temporary vault at {check_root}.")
+    try:
+        checks = run_checks(check_root)
+    finally:
+        if owned_temp is not None:
+            try:
+                owned_temp.cleanup()
+            except Exception:
+                pass
     failed = any(status == "FAIL" for status, _, _ in checks)
     if args.json:
         print(

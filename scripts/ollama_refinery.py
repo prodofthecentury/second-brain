@@ -516,7 +516,13 @@ def _documents_from_json(output: str, source_filename: str, current_date: str) -
         payload = json.loads(text)
     except json.JSONDecodeError:
         return []
-    rows = payload.get("memories") if isinstance(payload, dict) else payload
+    rows = None
+    if isinstance(payload, dict):
+        rows = payload.get("atoms")
+        if rows is None:
+            rows = payload.get("memories")
+    elif isinstance(payload, list):
+        rows = payload
     if not isinstance(rows, list):
         return []
     documents = []
@@ -561,6 +567,227 @@ def _documents_from_json(output: str, source_filename: str, current_date: str) -
     return documents
 
 
+ATOM_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "atoms": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "minLength": 3},
+                    "claim": {"type": "string", "minLength": 12},
+                    "evidence": {"type": "string", "minLength": 8},
+                    "why": {"type": "string"},
+                    "memory_type": {"type": "string"},
+                },
+                "required": ["title", "claim", "evidence"],
+            },
+        }
+    },
+    "required": ["atoms"],
+}
+
+_DISTILL_STOP = frozenset({
+    "that", "this", "with", "from", "have", "been", "were", "they", "them", "your", "into", "about",
+    "when", "where", "what", "which", "their", "there", "would", "could", "should", "after", "before",
+})
+LAST_DISTILL_PATHS: list[str] = []
+
+
+def _content_terms(text: str) -> set[str]:
+    return {
+        word
+        for word in re.findall(r"[a-z0-9]+", str(text or "").casefold())
+        if len(word) >= 4 and word not in _DISTILL_STOP
+    }
+
+
+def evidence_supports_claim(claim: str, evidence: str) -> bool:
+    """Cheap lexical check that the evidence is about the same thing as the claim."""
+    claim_terms = _content_terms(claim)
+    evidence_terms = _content_terms(evidence)
+    if not claim_terms or not evidence_terms:
+        return False
+    overlap = claim_terms & evidence_terms
+    needed = 1 if len(claim_terms) < 3 else 2
+    return len(overlap) >= min(needed, len(claim_terms))
+
+
+def _optional_model_support_check(claim: str, evidence: str, model: str | None) -> bool | None:
+    if (os.environ.get("BRAIN_DISTILL_MODEL_SUPPORT_CHECK") or "").strip().lower() not in {"1", "true", "yes"}:
+        return None
+    prompt = (
+        "Does the evidence support the claim? Answer yes or no.\n"
+        f"Claim: {claim}\nEvidence: {evidence}"
+    )
+    try:
+        response = chat_with_fallback(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            allow_model_fallback=False,
+            options={"temperature": 0},
+        )
+        answer = str(response["message"]["content"]).strip().casefold()
+    except Exception:
+        return None
+    if answer.startswith("yes"):
+        return True
+    if answer.startswith("no"):
+        return False
+    return None
+
+
+def _rows_from_output(output: str) -> tuple[list[dict], list[str]]:
+    text = (output or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return [], ["output was not JSON"]
+    rows = payload.get("atoms") if isinstance(payload, dict) else None
+    if rows is None and isinstance(payload, dict):
+        rows = payload.get("memories")
+    if isinstance(payload, list):
+        rows = payload
+    if not isinstance(rows, list):
+        return [], ["JSON has no atoms array"]
+    problems: list[str] = []
+    clean: list[dict] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            problems.append(f"atom {index} is not an object")
+            continue
+        title = str(row.get("title") or "").strip()
+        claim = str(row.get("claim") or "").strip()
+        evidence = str(row.get("evidence") or "").strip()
+        if len(title) < 3:
+            problems.append(f"atom {index} title is empty")
+        if len(claim) < 12:
+            problems.append(f"atom {index} claim is empty")
+        if len(evidence) < 8:
+            problems.append(f"atom {index} evidence is empty")
+        clean.append(row)
+    return clean, problems
+
+
+def _schema_prompt(note: str) -> str:
+    return (
+        "Extract 1 or 2 atoms from the note. Copy evidence verbatim from the note. "
+        "The claim must be a full sentence, not the title.\n\n"
+        "Example note: Pour-over coffee uses 1 g coffee per 16 g water.\n"
+        "Example JSON: {\"atoms\":[{\"title\":\"Pour-over ratio\","
+        "\"claim\":\"Pour-over coffee uses 1 gram of coffee per 16 grams of water.\","
+        "\"evidence\":\"Pour-over coffee uses 1 g coffee per 16 g water.\","
+        "\"why\":\"The brewing ratio.\",\"memory_type\":\"semantic\"}]}\n\n"
+        f"RAW CAPTURE:\n{note}"
+    )
+
+
+def _legacy_markdown_prompt(raw_filename: str, today_str: str, extra_instructions: str, chunk_text: str, rules: str) -> str:
+    return f"""You are a dedicated local intelligence agent running the Second Brain.
+{rules}
+
+YOUR TASK:
+Read the following raw capture. Identify 1 to 2 distinct, standalone core ideas, architectural patterns, or procedures.
+Extract each one into its own atomic memory using the exact Markdown template below. Keep them concise and focused.
+Do NOT generate redundant, trivial, or duplicate variations.
+Classify each memory with one of these memory_type values: semantic, episodic, procedural, self.
+
+CRITICAL FORMAT RULES:
+1. Every atomic memory MUST be wrapped in its own fenced code block starting with ```markdown and ending with ```.
+2. Inside each fenced block, start with YAML frontmatter (between --- and ---), followed by these exact section headings:
+## Claim
+<One clear, falsifiable assertion sentence>
+
+## Evidence
+<Exact verbatim quote copied character-for-character from RAW CAPTURE so byte-offset provenance anchoring can verify it without manual repair>
+
+## Why It Matters
+<One or two sentences explaining why this matters or what question it answers>
+
+3. If you extract more than one memory, put this exact boundary line between fenced documents:
+{MEMORY_BOUNDARY}
+
+4. Output ONLY fenced Markdown memory documents. No introduction, no conversational filler, no summary, no headings outside the code blocks.
+
+Use today's date: {today_str}
+Use the source filename: {raw_filename}{extra_instructions}
+
+RAW CAPTURE:
+{chunk_text}
+"""
+
+
+def _call_model(prompt: str, model: str | None, *, schema: dict | None, temperature: float) -> tuple[str | None, str]:
+    kwargs: dict = {
+        "model": model,
+        "allow_model_fallback": False,
+        "options": {"temperature": temperature},
+    }
+    if schema is not None:
+        kwargs["format"] = schema
+    try:
+        response = chat_with_fallback(messages=[{"role": "user", "content": prompt}], **kwargs)
+        return strip_reasoning_think_blocks(response["message"]["content"]), ""
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _finish_row(row: dict, source_text: str, source_filename: str, current_date: str, model: str | None) -> tuple[str | None, str]:
+    title = str(row.get("title") or "").strip()
+    claim = str(row.get("claim") or "").strip()
+    evidence = str(row.get("evidence") or "").strip()
+    why = str(row.get("why") or row.get("why_it_matters") or "").strip() or "This is a durable note from the capture."
+    memory_type = str(row.get("memory_type") or "semantic").strip()
+    if memory_type not in {"semantic", "episodic", "procedural", "self"}:
+        memory_type = "semantic"
+    exact = exact_source_span(source_text, evidence) if len(evidence) >= 8 else None
+    if exact:
+        evidence = exact
+    path = "schema"
+    title_key = re.sub(r"[^a-z0-9]+", " ", title.casefold()).strip()
+    claim_key = re.sub(r"[^a-z0-9]+", " ", claim.casefold()).strip().rstrip(".")
+    claim_is_title = bool(title_key) and claim_key in {title_key, ""}
+    if (len(claim) < 12 or claim_is_title) and len(evidence) >= 12:
+        derived = evidence if evidence.endswith((".", "!", "?")) else evidence.rstrip(".") + "."
+        if len(derived) >= 12:
+            claim = derived
+            path = "derived_claim"
+            if len(title) < 3:
+                title = " ".join(claim.split()[:8]).rstrip(".")
+    if len(claim) < 12 or len(evidence) < 8:
+        return None, path
+    if not evidence_supports_claim(claim, evidence):
+        print(f"  [!] Dropped atom; evidence does not overlap the claim: {claim[:80]!r}")
+        return None, "unsupported"
+    model_support = _optional_model_support_check(claim, evidence, model)
+    if model_support is False:
+        print(f"  [!] Dropped atom; model said the evidence does not support the claim: {claim[:80]!r}")
+        return None, "unsupported"
+    if len(title) < 3:
+        title = " ".join(claim.split()[:8]).rstrip(".")
+    document = _documents_from_json(
+        json.dumps({"atoms": [{
+            "title": title,
+            "claim": claim,
+            "evidence": evidence,
+            "why": why,
+            "memory_type": memory_type,
+        }]}),
+        source_filename,
+        current_date,
+    )
+    if not document:
+        return None, path
+    finished = _rewrite_memory_identity(document[0], source_text, current_date)
+    if model_support is None and not evidence_supports_claim(claim, evidence):
+        return None, "unsupported"
+    return finished, path
+
+
 def draft_memory_atoms(
     raw_content,
     raw_filename,
@@ -572,6 +799,7 @@ def draft_memory_atoms(
     overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS,
 ):
     print(f"[*] Drafting memory atoms from {raw_filename}...")
+    LAST_DISTILL_PATHS.clear()
     if allow_fallback:
         raise ValueError("Fallback atom generation is prohibited; defer this capture until the model is healthy.")
 
@@ -609,118 +837,100 @@ def draft_memory_atoms(
                 "(context label only — copy ## Evidence quotes strictly verbatim from RAW CAPTURE below)."
             )
         extra_instructions = ("\n" + "\n".join(chunk_context_lines)) if chunk_context_lines else ""
-
-        prompt = f"""You are a dedicated local intelligence agent running the Second Brain.
-{rules}
-
-YOUR TASK:
-Read the following raw capture. Identify 1 to 2 distinct, standalone core ideas, architectural patterns, or procedures.
-Extract each one into its own atomic memory using the exact Markdown template below. Keep them concise and focused.
-Do NOT generate redundant, trivial, or duplicate variations.
-Classify each memory with one of these memory_type values: semantic, episodic, procedural, self.
-
-CRITICAL FORMAT RULES:
-1. Every atomic memory MUST be wrapped in its own fenced code block starting with ```markdown and ending with ```.
-2. Inside each fenced block, start with YAML frontmatter (between --- and ---), followed by these exact section headings:
-## Claim
-<One clear, falsifiable assertion sentence>
-
-## Evidence
-<Exact verbatim quote copied character-for-character from RAW CAPTURE so byte-offset provenance anchoring can verify it without manual repair>
-
-## Why It Matters
-<One or two sentences explaining why this matters or what question it answers>
-
-3. If you extract more than one memory, put this exact boundary line between fenced documents:
-{MEMORY_BOUNDARY}
-
-4. Output ONLY fenced Markdown memory documents. No introduction, no conversational filler, no summary, no headings outside the code blocks.
-
-Use today's date: {today_str}
-Use the source filename: {raw_filename}{extra_instructions}
-
-EXAMPLE OUTPUT:
-```markdown
----
-id: {today_str}-slug-title
-type: atom
-memory_type: semantic
-certainty: tentative
-created: {today_str}
-last-reviewed: {today_str}
-importance: 0.50
-confidence: 0.50
-sources:
-  - {raw_filename}
-links: []
-tags: []
-contexts: []
-supersedes: []
-superseded_by: []
-contested_by: []
-review_status: pending
----
-
-## Claim
-A single clear asserting claim sentence.
-
-## Evidence
-Exact quote copied verbatim from raw capture.
-
-## Why It Matters
-Explanation of why this claim is important.
-```
-
-CRITICAL: Output ONLY fenced ```markdown blocks. Start each block immediately with --- and frontmatter. Do NOT write conversational filler or un-fenced text.
-
-RAW CAPTURE:
-{chunk_text}
-"""
-        try:
-            response = chat_with_fallback(
-                messages=[{"role": "user", "content": prompt}],
-                model=model,
-                format="json",
+        note = chunk_text if not extra_instructions else f"{extra_instructions.strip()}\n\n{chunk_text}"
+        errors: list[str] = []
+        output, err = _call_model(_schema_prompt(note), model, schema=ATOM_JSON_SCHEMA, temperature=0.1)
+        if err:
+            errors.append(err)
+            output = ""
+            if "repeat" in err.casefold():
+                raise RuntimeError(f"LLM drafting unavailable; capture deferred: {err}") from None
+        rows, problems = _rows_from_output(output or "")
+        finished: list[tuple[str, str]] = []
+        for row in rows:
+            doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+            if doc:
+                finished.append((doc, row_path))
+        if not finished and output and problems:
+            gap_text = "; ".join(problems) if problems else "the claim or title was empty"
+            repair_prompt = (
+                "Your last JSON was incomplete: "
+                f"{gap_text}. Fill title, claim, and evidence. "
+                "The claim must be one full sentence. Copy evidence from the note.\n\n"
+                f"RAW CAPTURE:\n{note}\n\nPREVIOUS:\n{output[:1200]}"
             )
-            output = strip_reasoning_think_blocks(response["message"]["content"])
-        except Exception as exc:
-            raise RuntimeError(f"LLM drafting unavailable; capture deferred: {exc}") from exc
+            repaired, repair_err = _call_model(repair_prompt, model, schema=ATOM_JSON_SCHEMA, temperature=0)
+            if repair_err:
+                errors.append(repair_err)
+            else:
+                rows, problems = _rows_from_output(repaired or "")
+                for row in rows:
+                    doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                    if doc:
+                        finished.append((doc, "repair" if row_path == "schema" else row_path))
+                output = repaired or output
+        if not finished:
+            for row in rows:
+                evidence = str(row.get("evidence") or "").strip()
+                if len(str(row.get("claim") or "").strip()) >= 12 or len(evidence) < 12:
+                    continue
+                follow, follow_err = _call_model(
+                    "State one full sentence that this evidence supports. Output the sentence only.\n"
+                    f"Evidence: {evidence}",
+                    model,
+                    schema=None,
+                    temperature=0,
+                )
+                if follow_err:
+                    errors.append(follow_err)
+                    continue
+                sentence = ""
+                for line in (follow or "").splitlines():
+                    sentence = line.strip().strip('"')
+                    if len(sentence) >= 12:
+                        break
+                if len(sentence) < 12:
+                    continue
+                followed = {
+                    "title": str(row.get("title") or ""),
+                    "claim": sentence,
+                    "evidence": evidence,
+                    "why": str(row.get("why") or ""),
+                    "memory_type": str(row.get("memory_type") or "semantic"),
+                }
+                doc, _row_path = _finish_row(followed, chunk_text, raw_filename, today_str, model)
+                if doc:
+                    finished.append((doc, "claim_followup"))
+        if not finished:
+            legacy_prompt = _legacy_markdown_prompt(raw_filename, today_str, extra_instructions, chunk_text, rules)
+            legacy, legacy_err = _call_model(legacy_prompt, model, schema=None, temperature=0.2)
+            if legacy_err:
+                errors.append(legacy_err)
+            elif legacy:
+                output = legacy
+                for document in extract_memory_documents(legacy, source_filename=raw_filename, current_date=today_str):
+                    rewritten = _rewrite_memory_identity(document, chunk_text, today_str)
+                    parsed = split_frontmatter(rewritten)
+                    body = "\n".join(parsed[1]) if parsed else ""
+                    claim = section_text(body, "Claim")
+                    evidence = section_text(body, "Evidence")
+                    if claim and evidence and evidence_supports_claim(claim, evidence):
+                        finished.append((rewritten, "legacy_markdown"))
+                    elif claim and evidence:
+                        print(f"  [!] Dropped legacy atom; evidence does not overlap the claim: {claim[:80]!r}")
+        if not finished and errors and not output:
+            raise RuntimeError(f"LLM drafting unavailable; capture deferred: {errors[-1]}")
 
         stripped_out = (output or "").strip()
         if multi_chunk and stripped_out.upper() in {"NONE", "NO_CLAIMS", "EMPTY"}:
             print(f"  [*] Chunk {chunk_idx + 1}/{chunk_total}: boilerplate/no durable claims; skipping chunk.")
             continue
 
-        chunk_memories = _documents_from_model_output(
-            output,
-            source_filename=raw_filename,
-            current_date=today_str,
-            source_text=chunk_text,
-        )
-        if not chunk_memories and not (multi_chunk and stripped_out.upper() in {"NONE", "NO_CLAIMS", "EMPTY"}):
-            repair_prompt = (
-                "The previous output could not be parsed. Return only JSON with this shape: "
-                '{"memories":[{"title":"","claim":"","evidence":"","why":"","memory_type":"semantic"}]}. '
-                "Copy evidence from the capture. Use an empty memories list when there is no durable claim.\n\n"
-                f"CAPTURE:\n{chunk_text}"
-            )
-            try:
-                repaired = chat_with_fallback(
-                    messages=[{"role": "user", "content": repair_prompt}],
-                    model=model,
-                    format="json",
-                )
-                repaired_output = strip_reasoning_think_blocks(repaired["message"]["content"])
-            except Exception:
-                repaired_output = ""
-            if repaired_output:
-                output = repaired_output
-                chunk_memories = _documents_from_model_output(
-                    output,
-                    source_filename=raw_filename,
-                    current_date=today_str,
-                    source_text=chunk_text,
-                )
+        chunk_memories = [doc for doc, _row_path in finished]
+        if chunk_memories:
+            used = ",".join(dict.fromkeys(row_path for _doc, row_path in finished))
+            LAST_DISTILL_PATHS.append(used)
+            print(f"  [*] Distill path: {used}")
         if not chunk_memories:
             last_unparsed_output = output or ""
             if multi_chunk:
