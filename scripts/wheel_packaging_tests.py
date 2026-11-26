@@ -1376,7 +1376,11 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         self.assertNotIn("npm install --no-package-lock", ci_txt)
         self.assertIn("--exclude desktop_ui_tests vscode_extension_tests wheel_packaging_tests", ci_txt)
         self.assertIn("SB_RELEASE_LINUX_RUNNER", rel_txt)
-        self.assertIn("!inputs.draft && inputs.publish_registries", rel_txt)
+        self.assertIn(
+            "github.event.inputs.draft != 'true' && github.event.inputs.publish_registries == 'true'",
+            rel_txt,
+        )
+        self.assertNotIn("if: ${{ secrets.", rel_txt)
         self.assertNotIn("-PfxPassword", rel_txt)
         self.assertNotIn('--pat "$VSCE_PAT"', rel_txt)
         self.assertNotIn('-p "$OVSX_PAT"', rel_txt)
