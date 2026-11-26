@@ -275,16 +275,16 @@ class DistillRepairTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"BRAIN_GEN_MODEL": "llama3.2:3b"}):
             with patch("scripts.ollama_utils.ollama.chat", boom):
-                with self.assertRaises(RuntimeError) as caught:
-                    draft_memory_atoms(
-                        "The pour-over ratio is one gram of coffee to sixteen grams of water.",
-                        "0-raw/coffee.md",
-                        "House rules",
-                        model="qwen2.5-coder:7b",
-                    )
-        self.assertEqual(seen, ["llama3.2:3b"])
-        self.assertIn("token repeat", str(caught.exception).lower())
+                drafted = draft_memory_atoms(
+                    "The pour-over ratio is one gram of coffee to sixteen grams of water.",
+                    "0-raw/coffee.md",
+                    "House rules",
+                    model="qwen2.5-coder:7b",
+                )
+        self.assertTrue(seen)
+        self.assertTrue(all(model_name == "llama3.2:3b" for model_name in seen))
         self.assertNotIn("qwen2.5-coder:7b", seen)
+        self.assertIn("one gram of coffee", "\n".join(drafted))
 
 
 class DistillGroundingTests(unittest.TestCase):
@@ -326,8 +326,10 @@ class DistillGroundingTests(unittest.TestCase):
             '"why":"Leaked example.","memory_type":"semantic"}]}'
         )
         with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": leaked}}):
-            with self.assertRaises(RuntimeError):
-                draft_memory_atoms(source, "0-raw/06-no-source.md", "House rules")
+            drafted = draft_memory_atoms(source, "0-raw/06-no-source.md", "House rules")
+        joined = "\n".join(drafted)
+        self.assertNotIn("coffee", joined.casefold())
+        self.assertIn("exact quote", joined)
 
     def test_paraphrased_evidence_is_replaced_by_the_source_span(self) -> None:
         from scripts.ollama_refinery import draft_memory_atoms
@@ -466,6 +468,54 @@ class DistillGroundingTests(unittest.TestCase):
         self.assertEqual(len(drafted), 1)
         self.assertIn("schema", LAST_DISTILL_PATHS[-1])
 
+    def test_leftover_preview_keeps_a_quoted_sentence_and_a_heading_is_rejected(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = (
+            "# TEST DATA: GTX 965M\n"
+            "The GTX 965M has 2 GB of video memory.\n"
+            "A laptop can run a small model on that GPU."
+        )
+        leftover = (
+            "```yaml\n## Claim\nThe card is fast.\n## Evidence\nSELECT * FROM gpu\n"
+            "preview: 2 GB of video memory is enough for the small model.\n"
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": leftover}}):
+            drafted = draft_memory_atoms(source, "0-raw/05-gtx.md", "House rules")
+        joined = "\n".join(drafted)
+        self.assertIn("2 GB of video memory", joined)
+        self.assertNotIn("TEST DATA", joined)
+        self.assertNotIn("SELECT", joined)
+
+    def test_citation_rule_sentence_is_not_a_grounding_false_negative(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "No source, no claim. A memory needs an exact quote from this note."
+        recorded = (
+            '{"atoms":[{"title":"Citation rule","claim":"A memory needs an exact quote from this note.",'
+            '"evidence":"needs an exact quote","why":"Rule.","memory_type":"semantic"}]}'
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/06-no-source.md", "House rules")
+        self.assertTrue(any("exact quote" in doc for doc in drafted))
+        self.assertFalse(any(doc.split("## Claim\n", 1)[-1].startswith("#") for doc in drafted))
+
+    def test_unusable_model_output_still_extracts_source_sentences(self) -> None:
+        from scripts.ollama_refinery import LAST_DISTILL_PATHS, draft_memory_atoms
+
+        source = "Daily backups run at 02:00. A 70B Hermes model needs a large GPU."
+        with patch(
+            "scripts.ollama_refinery.chat_with_fallback",
+            return_value={"message": {"content": "```yaml\n## Evidence\nSELECT * FROM cache\n"}},
+        ):
+            drafted = draft_memory_atoms(source, "0-raw/08-cache.md", "House rules")
+        self.assertGreaterEqual(len(drafted), 2)
+        joined = "\n".join(drafted)
+        self.assertIn("02:00", joined)
+        self.assertIn("70B", joined)
+        self.assertIn("extracted", ",".join(LAST_DISTILL_PATHS))
+        self.assertNotIn("SELECT", joined)
+
 
 class ChatGroundingTests(unittest.TestCase):
     def test_false_abstention_is_replaced_by_the_top_claim(self) -> None:
@@ -493,6 +543,73 @@ class ChatGroundingTests(unittest.TestCase):
             verified,
         )
         self.assertIn("[V1]", answer)
+
+    def test_overlap_uses_evidence_when_the_claim_omits_the_name(self) -> None:
+        from scripts.streaming_chat import answer_with_citations
+
+        verified = [{
+            "id": "V1",
+            "claim": "The model requires 6 to 8 GB of video memory.",
+            "evidence": "Hermes 8B requires 6 to 8 GB of video memory.",
+            "title": "Hermes 8B",
+        }]
+        answer = answer_with_citations(
+            "No information is available on the video memory requirements of the Hermes 8B.",
+            "How much video memory does the Hermes 8B need?",
+            verified,
+        )
+        self.assertIn("6 to 8 GB", answer)
+        self.assertIn("[V1]", answer)
+        self.assertNotIn("No information", answer)
+
+    def test_existing_citation_is_not_duplicated(self) -> None:
+        from scripts.streaming_chat import answer_with_citations
+
+        verified = [{
+            "id": "V1",
+            "claim": "Hermes 8B requires 6 to 8 GB of video memory.",
+            "evidence": "Hermes 8B requires 6 to 8 GB of video memory.",
+        }]
+        answer = answer_with_citations(
+            "Hermes 8B requires 6 to 8 GB of video memory. [V1]",
+            "How much video memory does the Hermes 8B need?",
+            verified,
+        )
+        self.assertEqual(answer.count("[V1]"), 1)
+        self.assertNotIn("[V1] [V1]", answer)
+
+    def test_overlap_uses_the_title_when_the_claim_and_evidence_omit_the_name(self) -> None:
+        from scripts.streaming_chat import answer_with_citations
+
+        verified = [{
+            "id": "V1",
+            "claim": "The model requires 6 to 8 GB of video memory.",
+            "evidence": "The model requires 6 to 8 GB of video memory.",
+            "title": "Hermes 8B video memory",
+        }]
+        answer = answer_with_citations(
+            "No information is available on the video memory requirements of the Hermes 8B.",
+            "How much video memory does the Hermes 8B need?",
+            verified,
+        )
+        self.assertIn("6 to 8 GB", answer)
+        self.assertIn("[V1]", answer)
+        self.assertNotIn("No information", answer)
+
+    def test_prompt_forbids_words_that_are_not_in_the_evidence(self) -> None:
+        from scripts.streaming_chat import build_synthesis_prompt
+
+        verified = [{
+            "id": "V1",
+            "claim": "The model requires 6 to 8 GB of video memory.",
+            "evidence": "Hermes 8B requires 6 to 8 GB of video memory.",
+            "title": "Hermes 8B",
+        }]
+        prompt = build_synthesis_prompt("How much video memory does the Hermes 8B need?", verified, [])
+        self.assertIn("Use only words that appear in the claim or its evidence.", prompt)
+        self.assertIn("Do not add reasons or details that are not written there.", prompt)
+        self.assertIn("Evidence: Hermes 8B requires 6 to 8 GB of video memory.", prompt)
+        self.assertIn("Title: Hermes 8B", prompt)
 
 
 class PinnedModelFallbackTests(unittest.TestCase):
