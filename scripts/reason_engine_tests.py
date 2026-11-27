@@ -58,6 +58,7 @@ _INDEPENDENT_EXACT = {
     "4/20": Fraction(4, 20),
     "What is 1/2 + 1/4?": Fraction(1, 2) + Fraction(1, 4),
     "What is 11 / 2 as a decimal?": Fraction(11, 2),
+    "What is (10) -4?": Fraction(10) - 4,
 }
 
 @contextmanager
@@ -945,6 +946,8 @@ class MechanismProbeTests(unittest.TestCase):
             "(09) 377-1234",
             "2026 -11",
             "10 -4",
+            "(10) -4",
+            "((10)) -4",
             "What is 24/7?",
             "Compute 12/25.",
             "Evaluate 9/11.",
@@ -1006,6 +1009,7 @@ class MechanismProbeTests(unittest.TestCase):
             "4/20": "1/5",
             "What is 1/2 + 1/4?": "3/4",
             "What is 11 / 2 as a decimal?": "5.5",
+            "What is (10) -4?": "6",
         }
 
         def check() -> None:
@@ -1170,6 +1174,11 @@ class MechanismProbeTests(unittest.TestCase):
             "1 Gm to m": "1000000000",
             "1 Pg to g": "1000000000000000",
             "1 Ps to s": "1000000000000000",
+            "1 Km to m": "1000",
+            "1 CM to m": "0.01",
+            "1 km to m": "1000",
+            "1 cm to m": "0.01",
+            "1 dm to m": "0.1",
         }
         declined = (
             "1 MB to mb",
@@ -1204,6 +1213,9 @@ class MechanismProbeTests(unittest.TestCase):
             "1 GM to m",
             "1 PG to g",
             "1 PS to s",
+            "1 kM to m",
+            "1 cM to m",
+            "1 dM to m",
         )
         independent = {
             "100 Mb to kB": Fraction(100) * 10**6 / 8 / 10**3,
@@ -1240,6 +1252,11 @@ class MechanismProbeTests(unittest.TestCase):
             "1 Gm to m": Fraction(10**9),
             "1 Pg to g": Fraction(10**15),
             "1 Ps to s": Fraction(10**15),
+            "1 Km to m": Fraction(1000),
+            "1 CM to m": Fraction(1, 100),
+            "1 km to m": Fraction(1000),
+            "1 cm to m": Fraction(1, 100),
+            "1 dm to m": Fraction(1, 10),
         }
 
         def check() -> None:

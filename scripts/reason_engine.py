@@ -457,8 +457,12 @@ def _irreducible_ratio(expr: str) -> bool:
 
 
 def _lopsided_minus(text: str) -> bool:
-    """'2026 -11' has a space only before the minus. '40 - 15' does not."""
-    return re.search(r"\d\s+-\d", text) is not None
+    """'2026 -11' and '(10) -4' have a space only before the minus. '40 - 15' does not.
+
+    Brackets are ignored, so they cannot hide the space.
+    """
+    seen = re.sub(r"[()]", "", text)
+    return re.search(r"\d\s+-\d", seen) is not None
 
 
 def _ordinary_literal(text: str) -> bool:
@@ -645,8 +649,9 @@ def _parse_unit_strict(token: str) -> tuple[str, Fraction | str] | object | None
 def _parse_unit(raw: str) -> tuple[str, Fraction | str] | None:
     """M is mega, m is milli or metre, B is byte, b is bit.
 
-    Only KM, KG, LB, OZ, FT, MI, MIN, CM, DM and KS are read in either case.
-    A single letter and a capital SI prefix stay case-sensitive.
+    Only KM, KG, LB, OZ, FT, MI, MIN, CM, DM and KS fold, and only when the
+    token is all capitals or capitalised. kM, cM and dM do not. Lower case
+    parses as written.
     """
     token = raw.strip().replace("°", "")
     if len(token) > 2 and token.casefold() in _WORD_UNITS:
@@ -659,6 +664,10 @@ def _parse_unit(raw: str) -> tuple[str, Fraction | str] | None:
     if parsed is not None:
         return parsed
     folded = token.casefold()
+    all_caps = token.isupper()
+    capitalised = len(token) > 1 and token[0].isupper() and token[1:].islower()
+    if not all_caps and not capitalised:
+        return None
     if len(token) == 1 or folded not in _FOLDABLE_UNITS or folded == token:
         return None
     folded_parsed = _parse_unit_strict(folded)
