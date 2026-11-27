@@ -64,7 +64,11 @@ class HashTests(unittest.TestCase):
         self.assertTrue(path_is_forbidden("templates.sbsealed"))
         self.assertTrue(path_is_forbidden("corpus/heldout/notes/a.md"))
         self.assertFalse(path_is_forbidden("bench/reasoning/heldout.commitment.json"))
-        self.assertFalse(path_is_forbidden("bench/reasoning/heldout-results/run.json"))
+        self.assertTrue(path_is_forbidden("bench/reasoning/heldout-results/run.json"))
+        self.assertTrue(path_is_forbidden("bench/reasoning/heldout-results/heldout.jsonl"))
+        self.assertTrue(path_is_forbidden("bench/reasoning/heldout_items.json"))
+        self.assertTrue(path_is_forbidden("heldout/heldout.commitment.json"))
+        self.assertFalse(path_is_forbidden("bench/reasoning/heldout-results/summary.md"))
         self.assertFalse(path_is_forbidden("bench/reasoning/heldout-access.jsonl"))
 
 
@@ -279,6 +283,14 @@ class GateTests(unittest.TestCase):
         gates = {row[0] for row in failure_tuples(hijack_reports=[{"fires": [], "crashes": []}], records=[timed])}
         self.assertIn("engine_timeout", gates)
         self.assertNotIn("engine_exception", gates)
+        from scripts.reason_bench import _record_exception, read_timeout_s
+
+        record = {"id": "typed", "sympy_mode": "natural", "status": "ok"}
+        _record_exception(record, ValueError("bad token"))
+        self.assertEqual(record["status"], "engine_exception")
+        self.assertTrue(str(record["error"]).startswith("ValueError:"))
+        with patch.dict(os.environ, {"BRAIN_OLLAMA_TIMEOUT": "17"}):
+            self.assertEqual(read_timeout_s(), 17.0)
 
     def test_majority_tie_abstains_and_resume_has_no_duplicates(self) -> None:
         from scripts.reason_bench import majority_vote as bench_majority
@@ -444,25 +456,15 @@ class ScoringReferenceTests(unittest.TestCase):
 
         from scripts.reason_bench_scoring import bca_interval, cluster_t_interval
 
-        groups = {"a": [1.0, 1.0], "b": [0.0, 0.0]}
-        interval = cluster_t_interval(groups)
-        # CR2: se is 0.5 here. Multiplying residuals by G/(G-1) would double it.
-        point = 0.5
-        se = 0.5
-        critical = interval[1] - point
-        self.assertAlmostEqual(critical / se, (interval[1] - point) / 0.5, places=6)
-        self.assertAlmostEqual(interval[0], point - (interval[1] - point), places=9)
-        self.assertGreater(interval[1] - interval[0], 0)
-        # A G/(G-1) inflation would move the half-width from t*0.5 to t*1.0.
-        half = interval[1] - point
-        inflated = point + half * 2
-        self.assertNotAlmostEqual(interval[1], inflated, places=6)
-        self.assertAlmostEqual(half, 0.5 * abs(half / 0.5), places=9)
-        reps = [index / 40 for index in range(40)]
-        biased = bca_interval(reps, 0.0, theta=0.9)
-        around_mean = bca_interval(reps, 0.0)
-        self.assertNotEqual(biased, around_mean)
-        self.assertGreater(biased[0], around_mean[0])
+        # Two equal clusters of 1 and 0. CR2 se is 0.5. Published t_{1, 0.975} is 12.7062047364.
+        interval = cluster_t_interval({"a": [1.0, 1.0], "b": [0.0, 0.0]})
+        self.assertAlmostEqual(interval[0], 0.5 - 12.7062047364 * 0.5, places=4)
+        self.assertAlmostEqual(interval[1], 0.5 + 12.7062047364 * 0.5, places=4)
+        # BCa with theta 0.2 on five evenly spaced replicates. z0 = Phi^{-1}(0.2).
+        replicates = [0.1, 0.2, 0.3, 0.4, 0.5]
+        # z0 = Phi^{-1}(1/5). With a=0 the adjusted tails land on order stats 0.1 and 0.4.
+        biased = bca_interval(replicates, 0.0, theta=0.2)
+        self.assertEqual(biased, (0.1, 0.4))
         self.assertTrue(math.isfinite(biased[0]))
 
     def test_sealed_extension_is_forbidden_inside_heldout_results(self) -> None:

@@ -1,6 +1,6 @@
 TEMPLATE_ID = 't026'
 SUITE = "math"
-ANSWER_TYPE = 'integer'
+ANSWER_TYPE = 'fraction'
 TAGS = ['count']
 DIFFICULTY = 2
 INSTANCES = 2
@@ -14,8 +14,8 @@ MISSING_ON_INSTANCE_1 = False
 PROVENANCE = {"source": "original", "derived_from": None, "license": "CC0-1.0", "author": "grok-bot", "created": "2026-11-27", "llm_assisted": True, "seed": None}
 PINNED = None
 RANGES = [('price', 40, 200), ('pct', 10, 25), ('fee', 1, 8)]
-STEM = 'An item priced {price} dollars is discounted by {pct} percent and then a fee of {fee} dollars is added. What is the final price?'
-EXPR = "params['price'] * (100 - params['pct']) // 100 + params['fee']"
+STEM = 'An item priced {price} dollars is discounted by {pct} percent and then a fee of {fee} dollars is added. What is the final price, as an exact fraction if needed?'
+EXPR = "__import__('fractions').Fraction(params['price'] * (100 - params['pct']), 100) + params['fee']"
 
 def sample(rng):
     for _ in range(400):

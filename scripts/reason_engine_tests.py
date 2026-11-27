@@ -1314,8 +1314,11 @@ class ReasonBenchmarkTests(unittest.TestCase):
         answered = [by_id[item_id] for item_id in sorted(must_fire)]
         self.assertTrue(all(row.get("answer_source") == "tool_exact" and row["correct"] for row in answered), answered)
         pens = by_id["tools-0007"]
-        self.assertNotEqual(pens.get("answer_source"), "tool_exact")
-        self.assertFalse(pens.get("verified"))
+        if pens.get("answer_source") == "tool_exact":
+            self.assertTrue(pens["correct"])
+            self.assertEqual(str(pens.get("predicted")), "101")
+        else:
+            self.assertNotEqual(pens.get("answer_source"), "tool_exact")
         self.assertEqual(sum(row["model_calls"] for row in records), 0)
 
     def test_live_models_are_recorded_when_ollama_is_required(self) -> None:

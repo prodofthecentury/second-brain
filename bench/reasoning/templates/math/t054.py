@@ -1,6 +1,6 @@
 TEMPLATE_ID = 't054'
 SUITE = "math"
-ANSWER_TYPE = 'integer'
+ANSWER_TYPE = 'fraction'
 TAGS = ['count']
 DIFFICULTY = 2
 INSTANCES = 2
@@ -14,8 +14,8 @@ MISSING_ON_INSTANCE_1 = False
 PROVENANCE = {"source": "original", "derived_from": None, "license": "CC0-1.0", "author": "grok-bot", "created": "2026-11-27", "llm_assisted": True, "seed": None}
 PINNED = None
 RANGES = [('whole', 20, 100), ('pct', 10, 40)]
-STEM = 'A store of {whole} items discounts {pct} percent of them as seconds. How many items are not seconds?'
-EXPR = "params['whole'] - params['whole'] * params['pct'] // 100"
+STEM = 'A store of {whole} items discounts {pct} percent of them as seconds. How many items are not seconds, as an exact fraction if needed?'
+EXPR = "params['whole'] - __import__('fractions').Fraction(params['whole'] * params['pct'], 100)"
 
 def sample(rng):
     for _ in range(400):

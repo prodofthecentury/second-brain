@@ -1,6 +1,6 @@
 TEMPLATE_ID = 't010'
 SUITE = "math"
-ANSWER_TYPE = 'integer'
+ANSWER_TYPE = 'fraction'
 TAGS = ['template-trap', 'percent-of-percent', 'count']
 DIFFICULTY = 2
 INSTANCES = 2
@@ -14,8 +14,8 @@ MISSING_ON_INSTANCE_1 = False
 PROVENANCE = {"source": "original", "derived_from": None, "license": "CC0-1.0", "author": "grok-bot", "created": "2026-11-27", "llm_assisted": True, "seed": None}
 PINNED = {'price': 200, 'pct': 10}
 RANGES = [('price', 100, 400), ('pct', 10, 20)]
-STEM = 'A price of {price} dollars falls by {pct} percent and then by {pct} percent of the reduced price. What is the price now, in dollars?'
-EXPR = "(params['price'] * (100 - params['pct']) // 100) * (100 - params['pct']) // 100"
+STEM = 'A price of {price} dollars falls by {pct} percent and then by {pct} percent of the reduced price. What is the price now, in dollars, as an exact fraction if needed?'
+EXPR = "__import__('fractions').Fraction(params['price'] * (100 - params['pct']), 100) * __import__('fractions').Fraction(100 - params['pct'], 100)"
 
 def sample(rng):
     for _ in range(400):

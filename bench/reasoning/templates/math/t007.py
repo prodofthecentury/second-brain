@@ -15,13 +15,15 @@ PROVENANCE = {"source": "original", "derived_from": None, "license": "CC0-1.0", 
 PINNED = {'pupils': 40, 'extra': 5, 'left_out': 3}
 RANGES = [('pupils', 20, 40), ('extra', 1, 4), ('left_out', 1, 3)]
 STEM = 'A class has {pupils} pupils. {extra} more than half of them walk to school. All but {left_out} of the rest take the bus. How many take the bus?'
-EXPR = "(params['pupils'] - (params['pupils'] // 2 + params['extra'])) - params['left_out']"
+EXPR = "int(params['pupils'] - (__import__('fractions').Fraction(params['pupils'], 2) + params['extra']) - params['left_out'])"
 
 def sample(rng):
     for _ in range(400):
         params = {name: rng.randint(lo, hi) for name, lo, hi in RANGES}
         if SHAPE in {"half_then_add", "boxes_all_but"} and (params["boxes"] * params["each"]) % 2:
             params["each"] += 1
+        if SHAPE == "pupils_bus" and params["pupils"] % 2:
+            params["pupils"] += 1
         if SHAPE == "ratio_part" and params["total"] % (params["num"] + params["den"]):
             continue
         if SHAPE in {"tax_amount", "percent_of", "complement_percent", "discount_fee", "split_tip", "percent_twice"}:

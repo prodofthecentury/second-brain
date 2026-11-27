@@ -31,10 +31,10 @@ FORMULAS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "change_note": lambda p: p["paid"] - p["count"] * p["price"],
     "lowest_terms": lambda p: Fraction(p["n"], p["d"]),
     "sum_fractions": lambda p: Fraction(p["a"], p["b"]) + Fraction(p["c"], p["d"]),
-    "pupils_bus": lambda p: (p["pupils"] - (p["pupils"] // 2 + p["extra"])) - p["left_out"],
+    "pupils_bus": lambda p: p["pupils"] - (Fraction(p["pupils"], 2) + p["extra"]) - p["left_out"],
     "boxes_all_but": lambda p: p["boxes"] * p["each"] // 2 + p["extra"],
     "fax_boxes": lambda p: p["boxes"] * p["each"],
-    "percent_twice": lambda p: (p["price"] * (100 - p["pct"]) // 100) * (100 - p["pct"]) // 100,
+    "percent_twice": lambda p: Fraction(p["price"] * (100 - p["pct"]), 100) * Fraction(100 - p["pct"], 100),
     "fraction_diff": lambda p: Fraction(p["a"], p["b"]) - Fraction(p["c"], p["d"]),
     "fraction_of_sum": lambda p: Fraction(p["n"], p["a"] + p["b"]),
     "mixed_number": lambda p: p["whole"] + Fraction(p["n"], p["d"]),
@@ -47,10 +47,10 @@ FORMULAS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "boxes_removed": lambda p: p["boxes"] * p["each"] - p["removed"],
     "rectangle_area": lambda p: p["length"] * p["width"],
     "rectangle_perimeter": lambda p: 2 * (p["length"] + p["width"]),
-    "speed_time": lambda p: p["distance"] // p["speed"],
+    "speed_time": lambda p: Fraction(p["distance"], p["speed"]),
     "unit_price": lambda p: p["count"] * p["price"],
-    "tax_amount": lambda p: p["price"] * p["pct"] // 100,
-    "discount_fee": lambda p: p["price"] * (100 - p["pct"]) // 100 + p["fee"],
+    "tax_amount": lambda p: Fraction(p["price"] * p["pct"], 100),
+    "discount_fee": lambda p: Fraction(p["price"] * (100 - p["pct"]), 100) + p["fee"],
     "resale_profit": lambda p: p["sold"] * p["sell"] - p["bought"] * p["buy"],
     "floor_bags": lambda p: p["items"] // p["per"],
     "age_gap": lambda p: p["older"] - p["younger"],
@@ -78,7 +78,7 @@ FORMULAS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "quotient_floor": lambda p: p["a"] // p["b"],
     "successive_add": lambda p: p["a"] + p["b"] + p["b"],
     "percent_of": lambda p: p["base"] * p["pct"] // 100,
-    "complement_percent": lambda p: p["whole"] - p["whole"] * p["pct"] // 100,
+    "complement_percent": lambda p: p["whole"] - Fraction(p["whole"] * p["pct"], 100),
     "min_of_two_sums": lambda p: min(p["a"] + p["b"], p["c"] + p["d"]),
     "max_gap": lambda p: max(p["a"], p["b"]) - min(p["a"], p["b"]),
     "nested_half": lambda p: (p["a"] // 2) // 2,
@@ -92,6 +92,26 @@ def question_skeleton(text: str) -> str:
     masked = re.sub(r"\d+", "#", text or "")
     masked = re.sub(r"\s+", " ", masked).strip().casefold()
     return masked
+
+
+def silent_floor(shape: str, params: dict[str, Any]) -> bool:
+    """True when an integer reading would hide a non-integral exact value."""
+    if shape == "pupils_bus" and int(params["pupils"]) % 2:
+        return True
+    if shape == "tax_amount":
+        return Fraction(int(params["price"]) * int(params["pct"]), 100).denominator != 1
+    if shape == "percent_twice":
+        step = Fraction(int(params["price"]) * (100 - int(params["pct"])), 100)
+        return (step * Fraction(100 - int(params["pct"]), 100)).denominator != 1
+    if shape == "discount_fee":
+        return Fraction(int(params["price"]) * (100 - int(params["pct"])), 100).denominator != 1
+    if shape == "complement_percent":
+        return Fraction(int(params["whole"]) * int(params["pct"]), 100).denominator != 1
+    if shape == "speed_time":
+        return Fraction(int(params["distance"]), int(params["speed"])).denominator != 1
+    if shape in {"percent_of", "split_tip"}:
+        return Fraction(int(params.get("base", params.get("bill", 0))) * int(params["pct"]), 100).denominator != 1
+    return False
 
 
 def independent_value(item: dict[str, Any]) -> Any:

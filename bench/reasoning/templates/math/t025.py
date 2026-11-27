@@ -1,6 +1,6 @@
 TEMPLATE_ID = 't025'
 SUITE = "math"
-ANSWER_TYPE = 'integer'
+ANSWER_TYPE = 'fraction'
 TAGS = ['count']
 DIFFICULTY = 1
 INSTANCES = 2
@@ -14,8 +14,8 @@ MISSING_ON_INSTANCE_1 = False
 PROVENANCE = {"source": "original", "derived_from": None, "license": "CC0-1.0", "author": "grok-bot", "created": "2026-11-27", "llm_assisted": True, "seed": None}
 PINNED = None
 RANGES = [('price', 20, 200), ('pct', 5, 20)]
-STEM = 'A bill of {price} dollars has a tax of {pct} percent. How many dollars of tax is that?'
-EXPR = "params['price'] * params['pct'] // 100"
+STEM = 'A bill of {price} dollars has a tax of {pct} percent. How much tax is that, in dollars, as an exact fraction if needed?'
+EXPR = "__import__('fractions').Fraction(params['price'] * params['pct'], 100)"
 
 def sample(rng):
     for _ in range(400):

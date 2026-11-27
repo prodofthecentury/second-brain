@@ -1,6 +1,6 @@
 TEMPLATE_ID = 't023'
 SUITE = "math"
-ANSWER_TYPE = 'integer'
+ANSWER_TYPE = 'fraction'
 TAGS = ['count']
 DIFFICULTY = 1
 INSTANCES = 2
@@ -14,8 +14,8 @@ MISSING_ON_INSTANCE_1 = False
 PROVENANCE = {"source": "original", "derived_from": None, "license": "CC0-1.0", "author": "grok-bot", "created": "2026-11-27", "llm_assisted": True, "seed": None}
 PINNED = None
 RANGES = [('distance', 20, 80), ('speed', 4, 10)]
-STEM = 'A tram travels {distance} km at {speed} km per hour. How many whole hours does the trip take?'
-EXPR = "params['distance'] // params['speed']"
+STEM = 'A tram travels {distance} km at {speed} km per hour. How many hours does the trip take, as an exact fraction if needed?'
+EXPR = "__import__('fractions').Fraction(params['distance'], params['speed'])"
 
 def sample(rng):
     for _ in range(400):
