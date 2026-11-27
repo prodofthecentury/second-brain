@@ -1297,23 +1297,25 @@ class MechanismProbeTests(unittest.TestCase):
 
 class ReasonBenchmarkTests(unittest.TestCase):
     def test_tool_precision_on_the_migrated_controls(self) -> None:
-        """The six migrated tool controls stay exact. Trap siblings are gated by the harness, not here."""
+        """Five migrated tool controls stay exact. gsm-pens (tools-0007) correctly declines."""
         from scripts.reason_bench import read_jsonl, bench_root, run_tools_only, repo_root
 
-        wanted = {
+        must_fire = {
             "tools-0001",
             "tools-0002",
             "tools-0003",
             "tools-0004",
             "tools-0005",
-            "tools-0007",
         }
-        items = [row for row in read_jsonl(bench_root(repo_root()) / "suites" / "tools.jsonl") if row["id"] in wanted]
+        items = [row for row in read_jsonl(bench_root(repo_root()) / "suites" / "tools.jsonl") if row["id"] in must_fire or row["id"] == "tools-0007"]
         self.assertEqual(len(items), 6)
         records = run_tools_only(items, sympy="natural", tier="tool-precision")
-        answered = [row for row in records if row.get("answer_source") == "tool_exact"]
-        self.assertEqual(len(answered), 6)
-        self.assertTrue(all(row["correct"] for row in answered), answered)
+        by_id = {row["id"]: row for row in records}
+        answered = [by_id[item_id] for item_id in sorted(must_fire)]
+        self.assertTrue(all(row.get("answer_source") == "tool_exact" and row["correct"] for row in answered), answered)
+        pens = by_id["tools-0007"]
+        self.assertNotEqual(pens.get("answer_source"), "tool_exact")
+        self.assertFalse(pens.get("verified"))
         self.assertEqual(sum(row["model_calls"] for row in records), 0)
 
     def test_live_models_are_recorded_when_ollama_is_required(self) -> None:

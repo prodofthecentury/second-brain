@@ -269,7 +269,14 @@ def verify_commitment(payload: dict, commitment: dict) -> None:
     except ValueError as exc:
         raise HeldoutError("sealed payload salt is not hex") from exc
     items = list(payload.get("items") or [])
-    digest = commitment_digest(salt, canonical_jsonl(items))
+    hidden = list(payload.get("hidden_tests") or [])
+    corpus = list(payload.get("corpus") or payload.get("notes") or [])
+    if commitment.get("empty_placeholder") and not items:
+        digest = commitment_digest(salt, canonical_jsonl([]))
+    else:
+        from scripts.reason_bench import canonical_json
+
+        digest = commitment_digest(salt, canonical_json({"items": items, "hidden_tests": hidden, "corpus": corpus}).encode("utf-8"))
     if digest != str(commitment.get("commitment") or ""):
         raise HeldoutError("held-out commitment does not match the decrypted set")
     if str(commitment.get("schema_sha256") or "") != schema_sha256():

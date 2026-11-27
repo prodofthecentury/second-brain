@@ -58,7 +58,7 @@ Code: 20 tasks, one instance each: 5 string, 5 list/dict, 5 parsing, 5 algorithm
 
 Logic: 12 × 2, each with exactly one brute-force solution.
 
-`tools.jsonl` migrates the six `docs/reasoning-benchmarks.json` controls, keeps `gsm-pens` (answer 101) as a should-fire control, and adds fractions, dates, units, and at least 20 should-fire controls. The trap sibling (answer 53) lives in math.
+`tools.jsonl` migrates the six `docs/reasoning-benchmarks.json` controls. `gsm-pens` (answer 101) is decline-ok: the whole-parse engine does not fire that sentence, and a decline is not a HARD failure. A fired answer still has to be 101. The suite adds fractions, dates, units, and at least 20 should-fire controls. The trap sibling (answer 53) lives in math. Memory answers stay unverified because the engine has no span-level support check. An unverified memory answer is expected and is not `claimed_verified_wrong`.
 
 `hijack.jsonl` has 220 sentences: 60 hand-written, including the 12 B3 sentences, and 160 from a fixed seed. Categories: phone 20, dates and times 30, versions 20, numeric ranges 20, scores and ratios 15, recipe fractions 20, "N times" 20, boxes narrative 20, ids 25, money 15, units in prose 15.
 

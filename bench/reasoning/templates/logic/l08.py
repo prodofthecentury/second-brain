@@ -4,7 +4,7 @@ SUITE = "logic"
 ANSWER_TYPE = "sequence"
 INSTANCES = 2
 SKIP_NUMBER_CHECK = True
-WORLDS = _json.loads('[{"question": "Ann, Bo and Cy each use a different room: Red, Blue or Green. Ann uses the Red room. Bo uses the Blue room. Which room does each person use?", "answer_format_hint": "Answer as Ann: room, Bo: room, Cy: room.", "answer": {"Ann": "Red", "Bo": "Blue", "Cy": "Green"}, "answer_type": "assignment", "difficulty": 1, "tags": ["assignment"], "solver": "SOLUTIONS = []\\npeople = [\'Ann\', \'Bo\', \'Cy\']\\nrooms = [\'Red\', \'Blue\', \'Green\']\\nfrom itertools import permutations\\nfor assign in permutations(rooms):\\n    got = dict(zip(people, assign))\\n    if got[\'Ann\'] == \'Red\' and got[\'Bo\'] == \'Blue\' and got[\'Cy\'] == \'Green\':\\n        SOLUTIONS.append(got)\\n"}, {"question": "Ann, Bo and Cy each use a different room: Red, Blue or Green. Ann uses the Red room. Bo uses the Green room. Which room does each person use?", "answer_format_hint": "Answer as Ann: room, Bo: room, Cy: room.", "answer": {"Ann": "Red", "Bo": "Green", "Cy": "Blue"}, "answer_type": "assignment", "difficulty": 1, "tags": ["assignment"], "solver": "SOLUTIONS = []\\npeople = [\'Ann\', \'Bo\', \'Cy\']\\nrooms = [\'Red\', \'Blue\', \'Green\']\\nfrom itertools import permutations\\nfor assign in permutations(rooms):\\n    got = dict(zip(people, assign))\\n    if got[\'Ann\'] == \'Red\' and got[\'Bo\'] == \'Green\' and got[\'Cy\'] == \'Blue\':\\n        SOLUTIONS.append(got)\\n"}]')
+WORLDS = _json.loads('[{"question": "I am a whole number from 1 to 20. Exactly three of these are true: I am even, I am greater than 10, I am divisible by 3, I am less than 8. I am also divisible by 4. What number am I?", "answer_format_hint": "Give the number only.", "answer": "12", "answer_type": "integer", "difficulty": 2, "tags": ["number-constraint"], "solver": "SOLUTIONS = [n for n in range(1, 21) if sum([n % 2 == 0, n > 10, n % 3 == 0, n < 8]) == 3 and n % 4 == 0]\\n"}, {"question": "I am a whole number from 1 to 20. Exactly three of these are true: I am odd, I am greater than 9, I am divisible by 5, I am less than 16. I am also divisible by 11. What number am I?", "answer_format_hint": "Give the number only.", "answer": "11", "answer_type": "integer", "difficulty": 2, "tags": ["number-constraint"], "solver": "SOLUTIONS = [n for n in range(1, 21) if sum([n % 2 == 1, n > 9, n % 5 == 0, n < 16]) == 3 and n % 11 == 0]\\n"}]')
 
 def sample(rng):
     return {"index": rng.randrange(2)}
@@ -33,5 +33,5 @@ def build_item(instance):
         "tags": world["tags"],
         "solver": world["solver"],
         "expected_tool": None,
-        "provenance": {'source': 'original', 'derived_from': None, 'license': 'CC0-1.0', 'author': 'grok-bot', 'created': '2026-11-27', 'llm_assisted': True, 'seed': None},
+        "provenance": {"source": "original", "derived_from": None, "license": "CC0-1.0", "author": "grok-bot", "created": "2026-11-27", "llm_assisted": True, "seed": None},
     }

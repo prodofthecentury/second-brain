@@ -4,7 +4,7 @@ SUITE = "logic"
 ANSWER_TYPE = "sequence"
 INSTANCES = 2
 SKIP_NUMBER_CHECK = True
-WORLDS = _json.loads('[{"question": "I am a three-digit number. My digits strictly increase from left to right, they add up to 8, my middle digit is 3, and I am divisible by 2. What number am I?", "answer_format_hint": "Give the number only.", "answer": "134", "answer_type": "integer", "difficulty": 1, "tags": ["number-constraint"], "solver": "SOLUTIONS = [n for n in range(100, 1000) if (lambda d: d[0] < d[1] < d[2] and sum(d) == 8 and d[1] == 3 and n % 2 == 0)([int(x) for x in str(n)])]\\n"}, {"question": "I am a three-digit number. My digits strictly increase from left to right, they add up to 10, my middle digit is 4, and I am divisible by 5. What number am I?", "answer_format_hint": "Give the number only.", "answer": "145", "answer_type": "integer", "difficulty": 1, "tags": ["number-constraint"], "solver": "SOLUTIONS = [n for n in range(100, 1000) if (lambda d: d[0] < d[1] < d[2] and sum(d) == 10 and d[1] == 4 and n % 5 == 0)([int(x) for x in str(n)])]\\n"}]')
+WORLDS = _json.loads('[{"question": "A meeting is on a weekday from Monday to Friday. It is after Tuesday and before Friday, and the previous weekday is Tuesday. Which day is the meeting?", "answer_format_hint": "Give the day as Mon, Tue, Wed, Thu or Fri.", "answer": "Wed", "answer_type": "entity", "aliases": ["Wed", "Wednesday"], "difficulty": 1, "tags": ["scheduling"], "solver": "days = [\\"Mon\\", \\"Tue\\", \\"Wed\\", \\"Thu\\", \\"Fri\\"]\\nSOLUTIONS = [day for i, day in enumerate(days) if i > 1 and i < 4 and days[i-1] == \\"Tue\\"]\\n"}, {"question": "A rehearsal is on a weekday from Monday to Friday. It is before Thursday and after Monday, and the next weekday is Thursday. Which day is the rehearsal?", "answer_format_hint": "Give the day as Mon, Tue, Wed, Thu or Fri.", "answer": "Wed", "answer_type": "entity", "aliases": ["Wed"], "difficulty": 1, "tags": ["scheduling"], "solver": "days = [\\"Mon\\", \\"Tue\\", \\"Wed\\", \\"Thu\\", \\"Fri\\"]\\nSOLUTIONS = [day for i, day in enumerate(days) if i < 3 and i > 0 and days[i+1] == \\"Thu\\"]\\n"}]')
 
 def sample(rng):
     return {"index": rng.randrange(2)}
@@ -33,5 +33,5 @@ def build_item(instance):
         "tags": world["tags"],
         "solver": world["solver"],
         "expected_tool": None,
-        "provenance": {'source': 'original', 'derived_from': None, 'license': 'CC0-1.0', 'author': 'grok-bot', 'created': '2026-11-27', 'llm_assisted': True, 'seed': None},
+        "provenance": {"source": "original", "derived_from": None, "license": "CC0-1.0", "author": "grok-bot", "created": "2026-11-27", "llm_assisted": True, "seed": None},
     }

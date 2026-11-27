@@ -2,10 +2,10 @@
 id: kestrel-lead-2025
 type: atom
 memory_type: semantic
-review_status: accepted
+review_status: synthetic_benchmark
 status: active
 contexts: []
-claim_state: human_reviewed
+claim_state: synthetic_benchmark
 valid_from: 2025-01-01
 valid_until: 2026-03-01
 ---

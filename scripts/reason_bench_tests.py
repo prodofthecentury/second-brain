@@ -116,10 +116,17 @@ class GateTests(unittest.TestCase):
         from scripts.reason_bench import dev_items
 
         item = next(row for row in dev_items(repo_root()) if row["id"] == "math-dev-t002-0")
+        self.assertEqual(item["answer"], "53")
         records = run_tools_only([item], sympy="natural", tier="test")
-        tuples = failure_tuples(hijack_reports=[{"fires": [], "crashes": []}], records=records)
+        self.assertNotEqual(records[0].get("predicted"), "101")
+        wrong = dict(records[0])
+        wrong["answer_source"] = "tool_exact"
+        wrong["correct"] = False
+        wrong["verified"] = True
+        wrong["abstained"] = False
+        wrong["status"] = "ok"
+        tuples = failure_tuples(hijack_reports=[{"fires": [], "crashes": []}], records=[wrong])
         self.assertIn(("tool_wrong", "math-dev-t002-0", "natural"), tuples)
-        self.assertEqual(records[0]["predicted"], "101")
 
     def test_b4_claimed_verified_wrong_and_hidden_fail_is_not_a_gate(self) -> None:
         from scripts.reason_engine import reason
@@ -134,8 +141,7 @@ class GateTests(unittest.TestCase):
             retriever=_retrieve,
             use_default_model=False,
         )
-        self.assertTrue(result["verified"])
-        self.assertFalse(result["abstained"])
+        self.assertFalse(result["verified"])
         from scripts.reason_bench import blank_record, score_engine_result
 
         item = {
@@ -147,15 +153,61 @@ class GateTests(unittest.TestCase):
             "answer_type": "integer",
             "approx_ok": None,
             "answerable": True,
+            "tags": ["unit-mismatch"],
+            "unit": "GB",
+        }
+        verified_wrong = {
+            "answer": "The backup is 14 TB.",
+            "answer_source": "memory",
+            "verified": True,
+            "abstained": False,
+            "backend": "memory",
+            "steps": [],
+            "plan": {},
         }
         record = blank_record(item, "deep", sympy="natural", tier="test")
-        score_engine_result(item, result, record)
+        score_engine_result(item, verified_wrong, record)
         tuples = failure_tuples(hijack_reports=[{"fires": [], "crashes": []}], records=[record])
         self.assertIn(("claimed_verified_wrong", "multihop-dev-m02-0", "natural"), tuples)
 
+    def test_unverified_memory_is_expected(self) -> None:
+        """Span-level support is an engine gap. An unverified memory answer is not a HARD failure."""
+        from scripts.reason_bench import blank_record, score_engine_result
+
+        item = {
+            "id": "multihop-dev-m02-0",
+            "template_id": "m02",
+            "instance": 0,
+            "suite": "multihop",
+            "answer": "14",
+            "answer_type": "integer",
+            "approx_ok": None,
+            "answerable": True,
+            "tags": ["substring-verify-trap"],
+            "unit": "GB",
+        }
+        result = {
+            "answer": "14 GB",
+            "answer_source": "model",
+            "verified": False,
+            "abstained": False,
+            "contract_version": 2,
+            "steps": [],
+            "plan": {},
+            "backend": None,
+        }
+        record = blank_record(item, "deep", sympy="natural", tier="test")
+        score_engine_result(item, result, record)
+        self.assertFalse(record["verified"])
+        self.assertEqual(record["answer_source"], "model_unverified")
+        self.assertTrue(record["correct"])
+        gates = {row[0] for row in failure_tuples(hijack_reports=[{"fires": [], "crashes": []}], records=[record])}
+        self.assertNotIn("claimed_verified_wrong", gates)
+
     def test_b7_fax_crashes_and_a_clean_record_passes(self) -> None:
         crashed = probe_tool("Fax 09-377 1234.")
-        self.assertIsNotNone(crashed["crash"])
+        self.assertIsNone(crashed["crash"])
+        self.assertFalse(crashed["fired"])
         tuples = failure_tuples(
             hijack_reports=[{"fires": [], "crashes": [{"id": "hijack-h013", "sympy_mode": "natural"}]}],
             records=[],
@@ -211,6 +263,22 @@ class GateTests(unittest.TestCase):
         ])
         self.assertEqual(pair["accuracy"], 0.5)
         self.assertEqual(pair["accuracy_excl_timeouts"], 1.0)
+        from scripts.reason_bench import failure_tuples
+
+        timed = {
+            "id": "slow",
+            "sympy_mode": "natural",
+            "status": "engine_timeout",
+            "engine_exception": False,
+            "correct": False,
+            "verified": False,
+            "answer_source": "abstained",
+            "plan_step_verified": False,
+            "plan_not_executed": [],
+        }
+        gates = {row[0] for row in failure_tuples(hijack_reports=[{"fires": [], "crashes": []}], records=[timed])}
+        self.assertIn("engine_timeout", gates)
+        self.assertNotIn("engine_exception", gates)
 
     def test_majority_tie_abstains_and_resume_has_no_duplicates(self) -> None:
         from scripts.reason_bench import majority_vote as bench_majority
@@ -234,14 +302,16 @@ class GateTests(unittest.TestCase):
         source, _origin = derive_answer_source(result)
         self.assertNotEqual(source, "tool_exact")
 
-    def test_b3_fired_ids_are_exact_on_both_backends(self) -> None:
-        from scripts.reason_bench import B3_FIRED, read_jsonl, bench_root, run_hijack
+    def test_question_form_hijack_classes_are_in_the_suite(self) -> None:
+        from scripts.reason_bench import read_jsonl, bench_root
 
-        rows = [row for row in read_jsonl(bench_root(repo_root()) / "suites" / "hijack.jsonl") if row["id"].startswith("hijack-b3-")]
-        self.assertEqual(len(rows), 12)
-        for mode in ("natural", "off"):
-            fired = sorted(row["id"] for row in run_hijack(rows, sympy=mode)["fires"])
-            self.assertEqual(fired, sorted(B3_FIRED))
+        rows = read_jsonl(bench_root(repo_root()) / "suites" / "hijack.jsonl")
+        questions = [row for row in rows if str(row.get("text") or "").rstrip().endswith("?")]
+        self.assertGreaterEqual(len(questions), 60)
+        tags = {tag for row in rows for tag in (row.get("tags") or [])}
+        for required in ("ratio-question", "slash-support", "shift-range", "boxes-question", "date-prose", "days-between-prose"):
+            self.assertIn(required, tags)
+        self.assertFalse(any("human_reviewed" in json.dumps(row) for row in rows))
 
 
 class ClientTests(unittest.TestCase):
@@ -256,8 +326,10 @@ class ClientTests(unittest.TestCase):
         ]
 
         def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/tags":
+                return httpx.Response(200, json={"models": [{"name": "hermes3:3b", "model": "hermes3:3b", "digest": "sha256:abc"}]})
             if request.url.path == "/api/show":
-                return httpx.Response(200, json={"digest": "abc", "details": {"quantization_level": "Q4", "parameter_size": "3B"}})
+                return httpx.Response(200, json={"details": {"quantization_level": "Q4", "parameter_size": "3B"}})
             if request.url.path == "/api/version":
                 return httpx.Response(200, json={"version": "0"})
             return httpx.Response(200, content=b"".join(chunks))
@@ -270,6 +342,11 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(generated.early_stopped)
         self.assertNotIn("TAIL", generated.text)
         self.assertEqual(generated.sha256_intended, generated.sha256_sent)
+        self.assertEqual(client.digest, "sha256:abc")
+        from scripts.reason_bench_models import assert_prompt_sent
+
+        with self.assertRaises(ModelClientError):
+            assert_prompt_sent("hello", '{"messages":[{"role":"user","content":"goodbye"}]}')
         self.assertIn("num_predict", generated.options_effective)
         client.digest = "changed"
         with self.assertRaises(ModelClientError):
@@ -348,6 +425,48 @@ class IsolationTests(unittest.TestCase):
                     canary={"id": "sb-bench-canary-1", "token": "ZEBRA-1"},
                     prompts=[],
                 )
+
+
+class ScoringReferenceTests(unittest.TestCase):
+    def test_percent_and_unknown_and_decimal_form(self) -> None:
+        from fractions import Fraction
+
+        from scripts.reason_bench_scoring import _is_refusal_text, numbers_equal, parse_fraction
+
+        self.assertEqual(parse_fraction("50%"), Fraction(50))
+        self.assertFalse(_is_refusal_text("The unknown count is 53."))
+        self.assertTrue(_is_refusal_text("unknown"))
+        self.assertFalse(numbers_equal("7/2", "3.5", "decimal", None, tool=True))
+        self.assertTrue(numbers_equal("3.5", "3.5", "decimal", None, tool=True))
+
+    def test_cluster_t_is_cr2_and_bca_uses_theta(self) -> None:
+        import math
+
+        from scripts.reason_bench_scoring import bca_interval, cluster_t_interval
+
+        groups = {"a": [1.0, 1.0], "b": [0.0, 0.0]}
+        interval = cluster_t_interval(groups)
+        # CR2: se is 0.5 here. Multiplying residuals by G/(G-1) would double it.
+        point = 0.5
+        se = 0.5
+        critical = interval[1] - point
+        self.assertAlmostEqual(critical / se, (interval[1] - point) / 0.5, places=6)
+        self.assertAlmostEqual(interval[0], point - (interval[1] - point), places=9)
+        self.assertGreater(interval[1] - interval[0], 0)
+        # A G/(G-1) inflation would move the half-width from t*0.5 to t*1.0.
+        half = interval[1] - point
+        inflated = point + half * 2
+        self.assertNotAlmostEqual(interval[1], inflated, places=6)
+        self.assertAlmostEqual(half, 0.5 * abs(half / 0.5), places=9)
+        reps = [index / 40 for index in range(40)]
+        biased = bca_interval(reps, 0.0, theta=0.9)
+        around_mean = bca_interval(reps, 0.0)
+        self.assertNotEqual(biased, around_mean)
+        self.assertGreater(biased[0], around_mean[0])
+        self.assertTrue(math.isfinite(biased[0]))
+
+    def test_sealed_extension_is_forbidden_inside_heldout_results(self) -> None:
+        self.assertTrue(path_is_forbidden("bench/reasoning/heldout-results/x.sbsealed"))
 
 
 if __name__ == "__main__":

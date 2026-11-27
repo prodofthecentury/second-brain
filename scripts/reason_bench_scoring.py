@@ -60,8 +60,8 @@ def parse_fraction(text: str) -> Fraction | None:
     raw = raw.replace("$", "").replace("£", "").replace("€", "").replace(",", "")
     raw = raw.replace("**", "").replace("*", "")
     raw = re.sub(r"\s+", " ", raw).strip()
-    percent = raw.endswith("%")
-    if percent:
+    if raw.endswith("%"):
+        # Stripping the percent sign leaves the written number: 50% is 50, not 1/2.
         raw = raw[:-1].strip()
     raw = re.sub(
         r"\s+(?:" + "|".join(sorted(UNIT_WORDS, key=len, reverse=True)) + r")\b\.?$",
@@ -78,20 +78,17 @@ def parse_fraction(text: str) -> Fraction | None:
             return None
         sign = -1 if whole < 0 else 1
         value = Fraction(abs(whole) * den + num, den) * sign
-        return value / 100 if percent else value
+        return value
     slash = re.fullmatch(r"([+-]?\d+)\s*/\s*([+-]?\d+)", raw)
     if slash:
         den = int(slash.group(2))
         if den == 0:
             return None
-        value = Fraction(int(slash.group(1)), den)
-        return value / 100 if percent else value
+        return Fraction(int(slash.group(1)), den)
     if re.fullmatch(r"[+-]?\d+", raw):
-        value = Fraction(int(raw), 1)
-        return value / 100 if percent else value
+        return Fraction(int(raw), 1)
     if re.fullmatch(r"[+-]?\d+\.\d+", raw):
-        value = Fraction(Decimal(raw))
-        return value / 100 if percent else value
+        return Fraction(Decimal(raw))
     return None
 
 
@@ -132,6 +129,9 @@ def numbers_equal(got_text: str, gold: Any, answer_type: str, approx_ok: dict | 
     got = parse_fraction(got_text)
     target = _gold_fraction(gold)
     if got is None or target is None:
+        return False
+    # "as a decimal" is a different answer from the unreduced fraction, even when the values match.
+    if answer_type == "decimal" and "/" in str(got_text):
         return False
     if answer_type == "integer" and target.denominator != 1:
         return False
@@ -249,6 +249,17 @@ def _last_date_token(text: str) -> str | None:
     return matches[-1].group(0)
 
 
+def _is_refusal_text(text: str) -> bool:
+    """A refusal is the whole reply, not the word 'unknown' inside an answer."""
+    raw = (text or "").strip().strip(".")
+    if not raw or re.search(r"\d", raw):
+        return False
+    return re.fullmatch(
+        r"(?i)(?:unknown|abstain|not enough(?: information)?|i (?:cannot|can't|can not|do not|don't) (?:verify|know|tell)(?: an answer)?(?: for this)?)",
+        raw,
+    ) is not None
+
+
 def extract_answer(text: str, item: dict, *, engine_abstained: bool = False, engine_value: bool = False) -> dict[str, Any]:
     """Return extraction metadata. Precedence is the spec's five steps."""
     if engine_abstained:
@@ -262,15 +273,11 @@ def extract_answer(text: str, item: dict, *, engine_abstained: bool = False, eng
             answer_lines.append(match.group(1).strip())
     if answer_lines:
         chosen = answer_lines[-1]
-        if chosen.casefold() == "unknown" or ABSTAIN_WORDS.search(chosen):
+        if _is_refusal_text(chosen):
             return {"value": "ABSTAIN", "extraction": "strict", "format_ok": True}
         return {"value": chosen, "extraction": "strict", "format_ok": True}
-    if ABSTAIN_WORDS.search(raw) and not answer_lines:
-        # A free-text refusal with no ANSWER line is an abstention only when the
-        # engine itself abstained or the whole reply is a short refusal.
-        if engine_value or len(raw) < 280:
-            if re.search(r"\b(cannot|can't|not enough|unknown)\b", raw, re.IGNORECASE):
-                return {"value": "ABSTAIN", "extraction": "engine" if engine_value else "fallback", "format_ok": False}
+    if not answer_lines and _is_refusal_text(raw.strip()):
+        return {"value": "ABSTAIN", "extraction": "engine" if engine_value else "fallback", "format_ok": False}
     answer_type = str(item.get("answer_type") or "")
     aliases = list(item.get("aliases") or [])
     stripped = raw.strip()
@@ -528,11 +535,19 @@ def _jackknife_acceleration(groups: dict[str, list[float]]) -> float:
     return numer / (6.0 * (denom ** 1.5))
 
 
-def bca_interval(replicates: Sequence[float], acceleration: float, *, alpha: float = 0.05) -> tuple[float, float]:
+def bca_interval(
+    replicates: Sequence[float],
+    acceleration: float,
+    *,
+    theta: float | None = None,
+    alpha: float = 0.05,
+) -> tuple[float, float]:
     if not replicates:
         return (0.0, 0.0)
     ordered = sorted(replicates)
-    theta = _mean(ordered)
+    # z0 is the bias of the bootstrap around the original estimate, not around the replicate mean.
+    if theta is None:
+        theta = _mean(ordered)
     n = len(ordered)
     prop = sum(1 for value in ordered if value < theta) / n
     prop = min(max(prop, 1e-6), 1 - 1e-6)
@@ -643,9 +658,11 @@ def cluster_t_interval(groups: dict[str, list[float]], *, alpha: float = 0.05) -
     for values in groups.values():
         local = _mean(values)
         h = len(values) / n
-        adjusted = (local - point) / max(1e-12, 1.0 - h)
-        pieces.append((len(values) / n) * adjusted)
-    variance = sum(piece * piece for piece in pieces) * (g / (g - 1.0))
+        # CR2: scale the cluster residual by (1-h)^{-1/2}. Do not also multiply by G/(G-1).
+        residual = len(values) * (local - point)
+        adjusted = residual / math.sqrt(max(1e-12, 1.0 - h))
+        pieces.append(adjusted / n)
+    variance = sum(piece * piece for piece in pieces)
     se = math.sqrt(max(0.0, variance))
     critical = student_t_ppf(1.0 - alpha / 2.0, g - 1)
     return (point - critical * se, point + critical * se)
@@ -683,7 +700,7 @@ def accuracy_interval(
         **effect,
     }
     if g < 50:
-        bca = bca_interval(replicates, _jackknife_acceleration(groups))
+        bca = bca_interval(replicates, _jackknife_acceleration(groups), theta=point)
         cluster_t = cluster_t_interval(groups)
         verdict = _wider(bca, cluster_t)
         result.update({
@@ -718,7 +735,7 @@ def paired_cluster_delta(
     g = len(groups)
     payload: dict[str, Any] = {"point": point, "percentile": interval, "templates": g}
     if g < 50:
-        bca = bca_interval(replicates, _jackknife_acceleration(dict(groups)))
+        bca = bca_interval(replicates, _jackknife_acceleration(dict(groups)), theta=point)
         cluster_t = cluster_t_interval(dict(groups))
         payload["bca"] = bca
         payload["cluster_t"] = cluster_t

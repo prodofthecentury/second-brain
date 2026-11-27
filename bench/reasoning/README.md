@@ -32,7 +32,7 @@ Exit 0 is pass or warn. Exit 1 is a HARD gate or a calibrated FAIL. Exit 2 is a 
 - `hard-failure-fingerprint` requires the observed `(gate, item_id, sympy_mode)` set to equal `expected-hard-failures.f24d020.json`. That file may only shrink.
 - A Windows job checks out with `core.autocrlf=true` and re-runs `validate`.
 
-GSM-Symbolic stays off unless the owner passes `--external gsm-symbolic --owner-noncommercial-confirm "<statement>"`. A confirmation from an agent does not count. If the dataset card's licence is not `cc-by-nc-nd-4.0`, the run exits 2.
+GSM-Symbolic stays off unless the owner types the confirmation at an interactive TTY after `--external gsm-symbolic`. A CLI string does not count. If the dataset card's licence is not `cc-by-nc-nd-4.0`, the run exits 2. Dev notes use `claim_state: synthetic_benchmark`. Nothing in this harness writes an owner approval.
 
 ## Held-out rules
 

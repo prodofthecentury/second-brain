@@ -29,6 +29,57 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def assert_prompt_sent(prompt: str, serialized: str) -> str:
+    """Hash the message content of the serialized request body.
+
+    The check parses the bytes that would be sent. A body whose message
+    content is not the intended prompt fails, including when a test passes
+    a tampered body.
+    """
+    try:
+        body = json.loads(serialized)
+        sent = str(body["messages"][0]["content"])
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        raise ModelClientError("serialized request body has no message content") from exc
+    sent_hash = sha256_text(sent)
+    if sent_hash != sha256_text(prompt):
+        raise ModelClientError("sha256(prompt sent) does not equal sha256(prompt intended)")
+    return sent_hash
+
+
+def _digest_for_exact_name(payload: dict[str, Any], model: str) -> str:
+    """Digest from /api/tags for the exact requested name. No architecture fallback."""
+    wanted = str(model or "").strip()
+    for row in payload.get("models") or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "")
+        model_field = str(row.get("model") or "")
+        if wanted and wanted in {name, model_field}:
+            digest = str(row.get("digest") or "")
+            if digest:
+                return digest
+            raise ModelClientError(f"Ollama /api/tags lists {wanted} without a digest")
+    raise ModelClientError(f"Ollama /api/tags has no digest for the exact model name {wanted!r}")
+
+
+def physical_core_count() -> int:
+    """Physical cores, not logical CPUs. Falls back only when topology is unreadable."""
+    root = __import__("pathlib").Path("/sys/devices/system/cpu")
+    found: set[tuple[str, str]] = set()
+    if root.is_dir():
+        for cpu in root.glob("cpu[0-9]*"):
+            package = cpu / "topology" / "physical_package_id"
+            core = cpu / "topology" / "core_id"
+            try:
+                found.add((package.read_text(encoding="utf-8").strip(), core.read_text(encoding="utf-8").strip()))
+            except OSError:
+                continue
+    if found:
+        return len(found)
+    return os.cpu_count() or 1
+
+
 def canonical_options(options: dict[str, Any]) -> str:
     return json.dumps(options, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
@@ -178,10 +229,11 @@ class RawChatClient:
         if self.backend != "ollama":
             self.digest = "openai"
             return {"digest": self.digest, "model": self.model}
-        response = self.client.post(f"{self.base_url}/api/show", json={"model": self.model})
+        response = self.client.get(f"{self.base_url}/api/tags")
         response.raise_for_status()
-        body = response.json()
-        self.digest = str(body.get("digest") or body.get("model_info", {}).get("general.architecture") or "")
+        self.digest = _digest_for_exact_name(response.json(), self.model)
+        show = self.client.post(f"{self.base_url}/api/show", json={"model": self.model})
+        body = show.json() if show.status_code == 200 else {}
         details = body.get("details") or {}
         self.quantization = str(details.get("quantization_level") or "")
         self.parameter_size = str(details.get("parameter_size") or "")
@@ -189,7 +241,7 @@ class RawChatClient:
         if version.status_code == 200:
             self.server_version = str((version.json() or {}).get("version") or "")
         if not self.digest:
-            raise ModelClientError("Ollama /api/show did not return a digest")
+            raise ModelClientError("Ollama /api/tags did not return a digest for the exact model name")
         return {
             "digest": self.digest,
             "quantization": self.quantization,
@@ -224,10 +276,8 @@ class RawChatClient:
             "options": body_options,
             "keep_alive": "30m",
         }
-        sent_prompt = body["messages"][0]["content"]
-        sent_hash = sha256_text(sent_prompt)
-        if sent_hash != intended:
-            raise ModelClientError("sha256(prompt sent) does not equal sha256(prompt intended)")
+        serialized = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        sent_hash = assert_prompt_sent(prompt, serialized)
         text_parts: list[str] = []
         tokens = 0
         prompt_tokens = None
@@ -317,9 +367,8 @@ class RawChatClient:
             "seed": options["seed"],
             "max_tokens": options["num_predict"],
         }
-        sent_hash = sha256_text(body["messages"][0]["content"])
-        if sent_hash != intended:
-            raise ModelClientError("sha256(prompt sent) does not equal sha256(prompt intended)")
+        serialized = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        sent_hash = assert_prompt_sent(prompt, serialized)
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         text_parts: list[str] = []
         tokens = 0

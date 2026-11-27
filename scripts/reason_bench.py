@@ -84,14 +84,7 @@ SMOKE_IDS = (
     "logic-dev-l01-0",
     "logic-dev-l03-0",
 )
-B3_FIRED = {
-    "hijack-b3-04",
-    "hijack-b3-05",
-    "hijack-b3-06",
-    "hijack-b3-07",
-    "hijack-b3-08",
-    "hijack-b3-09",
-}
+# B3 is enforced only by fingerprint tuples. There is no hard-coded fired-id allow-list.
 FAIRNESS_NOTES = (
     "Deep's memory-path draft prompt asks for one or two sentences, while plain uses chain of thought. "
     "The harness appends the same format suffix to every runner, but deep's internal prompts are not chain of thought. "
@@ -179,6 +172,8 @@ def iter_public_files(root: Path) -> Iterator[Path]:
         if path.name == "MANIFEST.json":
             continue
         if path.name == ".gitkeep":
+            continue
+        if path.name.startswith("expected-hard-failures"):
             continue
         yield path
 
@@ -443,8 +438,115 @@ def build_hijack_items() -> list[dict]:
                 break
         if not progress:
             raise BenchError(f"hijack generator stalled counts={dict(counts)} serial={serial}")
-    if counts != Counter(quotas) or len(rows) != 220:
+    if counts != Counter(quotas):
         raise BenchError(f"hijack composition drifted: {dict(counts)} n={len(rows)}")
+    for item_id, category, text, tags in _question_form_hijacks():
+        if text in seen:
+            raise BenchError(f"duplicate hijack text {text!r}")
+        seen.add(text)
+        row = _hijack_row(item_id, category, text, source="original")
+        row["tags"] = ["hijack", category, *tags]
+        rows.append(row)
+    questions = [row for row in rows if str(row["text"]).strip().endswith("?")]
+    if len(questions) < 60:
+        raise BenchError(f"hijack needs at least 60 question-form items, got {len(questions)}")
+    return rows
+
+
+def _question_form_hijacks() -> list[tuple[str, str, str, list[str]]]:
+    """Ordinary questions. A tool fire is a hijack. Wording is original, not a copied probe."""
+    ratio = [
+        ("What does the 70/30 pantry split mean for a household?", "ratio-question"),
+        ("What is the 60/40 idea in the garden budget?", "ratio-question"),
+        ("What is a 90/10 savings habit?", "ratio-question"),
+        ("What's the 55/45 vote split in the club?", "ratio-question"),
+        ("What is 24/7 cover on the night desk?", "slash-support"),
+        ("What is 24/7 monitoring on the bronze plan?", "slash-support"),
+        ("What does 12/7 opening mean for the kiosk?", "slash-support"),
+        ("What is a 9-5 desk pattern for the front office?", "shift-range"),
+        ("What is an 8-4 roster for the warehouse?", "shift-range"),
+        ("What is the 10-6 counter shift called?", "shift-range"),
+        ("What is a 3-2-1 copy plan for photos?", "ratio-question"),
+        ("What is a 4-3-2 filing habit?", "ratio-question"),
+        ("What is the 1920x1080 panel name?", "intent-word"),
+        ("What is a 2x4 used for in a garden frame?", "intent-word"),
+        ("What is my 1/2 day leave balance?", "ratio-question"),
+        ("What is the 4.5/5 cafe card score?", "ratio-question"),
+        ("What is on sheets 12-18 of the binder?", "numeric-range-question"),
+        ("What is in drawers 3-7 of the map cabinet?", "numeric-range-question"),
+        ("What is the 2025-2026 club budget about?", "iso-range-question"),
+        ("What is Python 3.11-3.12 support like here?", "version-question"),
+    ]
+    intent = [
+        ("Calculate the hours on the 8-4 days this fortnight.", "intent-word"),
+        ("Solve the 4-5 puzzle from the book club.", "intent-word"),
+        ("Evaluate the 2024-2025 plan please.", "intent-word"),
+        ("How much is a 2-3 day courier from town?", "intent-word"),
+        ("What is the phone 021-444 for reception?", "phone-question"),
+        ("What is the desk line (09) 555?", "phone-question"),
+        ("What's a 1+1 soup offer at the canteen?", "intent-word"),
+        ("What is the 2+1 deal on rolls this week?", "intent-word"),
+    ]
+    boxes = [
+        ("What is in the 4 boxes of 6 jars on the step?", "boxes-question"),
+        ("What happened to the 5 packs of 4 mugs by the door?", "boxes-question"),
+        ("How much is the story of 6 groups of 3 chairs?", "boxes-question"),
+    ]
+    dates = [
+        ("What is special about the parcel that arrived 4 days after 2026-11-20?", "date-prose"),
+        ("What is meant by leave that starts 6 days after 2026-12-01?", "date-prose"),
+        ("What is the note about 18 days between 2026-11-01 and 2026-11-19?", "days-between-prose"),
+        ("What is the old count of 11 days between 2026-11-03 and 2026-11-20?", "days-between-prose"),
+    ]
+    rows: list[tuple[str, str, str, list[str]]] = []
+    index = 1
+    for text, tag in ratio + intent + boxes + dates:
+        rows.append((f"hijack-q{index:03d}", "question-form", text, [tag, "question-form"]))
+        index += 1
+    # Fill to 60 with distinct ordinary questions that still carry a number pattern.
+    extras = [
+        "What is the 30/70 rehearsal split?",
+        "What is 18/6 support on the weekend roster?",
+        "What is a 7-3 school day?",
+        "What is on pages 4-9 of the songbook?",
+        "What is the 1280x720 preset called?",
+        "What is a 5x5 tile sample for?",
+        "What is the 1-800 style of this help line?",
+        "What is grade 6-7 art class like?",
+        "What is rooms 201-208 used for?",
+        "What is a 3/4 time signature in the choir?",
+        "What is the 11/11 sale note about?",
+        "What is lens 18-55 doing in the bag?",
+        "What is the 100x100 mosaic for?",
+        "What is a 2.1-2.2 firmware note?",
+        "What is the 50/50 raffle with Jo?",
+        "What is my 3/4 day study leave?",
+        "What is the score, 2-0 to the visitors?",
+        "What is a 4x4 option on the ute?",
+        "What is the 2023-2024 yearbook theme?",
+        "What is chapter 9-11 about?",
+        "Calculate the 9-5 cover for the lobby.",
+        "What is in boxes 2-6 in the garage?",
+        "What is a 6-pack of 4 drinks doing on the bench?",
+        "What is the story of 3 groups of 5 parents?",
+        "What is the parcel from 2 days after 2026-10-02?",
+        "What is 9 days between 2026-05-01 and 2026-05-12 on the old sheet?",
+        "What's the 16/9 frame on the projector?",
+        "What is 5/2 time in the etude?",
+        "Evaluate the 3-4 seating plan.",
+        "How much is the 1+1 pizza note from Friday?",
+        "What is extension 214 for?",
+        "What is the 04-499 depot line for?",
+        "What is v1.2+3 of the doc?",
+        "What is a 10x note on the review form?",
+        "What is the 4.0/5 hostel rating?",
+        "What is seats 14 F to C about?",
+    ]
+    for text in extras:
+        rows.append((f"hijack-q{index:03d}", "question-form", text, ["question-form", "intent-word"]))
+        index += 1
+    if len(rows) < 60:
+        raise BenchError("question-form hijack list is short")
     return rows
 
 
@@ -510,7 +612,8 @@ def build_tools_items() -> list[dict]:
         ("tools-0003", "How many days between 2026-11-01 and 2026-11-27?", "26", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#days-between", "ANSWER = 26"),
         ("tools-0004", "Convert 3 km to m.", "3000", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#unit-km", "ANSWER = 3000"),
         ("tools-0005", "Convert 100 C to F.", "212", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#unit-celsius", "ANSWER = 212"),
-        ("tools-0007", "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?", "101", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#gsm-pens", "ANSWER = 12 * 8 + 5"),
+        # The whole-parse engine declines this sentence. 101 remains the gold if a tool does fire.
+        ("tools-0007", "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?", "101", "integer", None, "migrated", "docs/reasoning-benchmarks.json#gsm-pens", "ANSWER = 12 * 8 + 5"),
         ("tools-0012", "What is 1/3 + 1/6?", "1/2", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(1, 3) + Fraction(1, 6)"),
         ("tools-0013", "What is 2/3?", "2/3", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(2, 3)"),
         ("tools-0014", "What is 5/6?", "5/6", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(5, 6)"),
@@ -556,7 +659,47 @@ def build_tools_items() -> list[dict]:
             f"ANSWER = {value}",
             tags=["should-fire", "arithmetic"],
         ))
+    for spec in _precision_traps():
+        rows.append(_tool_row(*spec))
     return rows
+
+
+def _precision_traps() -> list[tuple]:
+    """Classes the stage-1 tool answers wrongly or must decline. Golds are the defensible reading."""
+    weekend = _weekdays_between("2026-11-02", "2026-11-20")
+    return [
+        ("tools-t-thousands", "What is 3,200 + 40?", "3240", "integer", "any", "original", None, "ANSWER = 3200 + 40", ["should-fire", "thousands-separator"]),
+        ("tools-t-negative", "What is -9 + 4 in total?", "-5", "integer", "any", "original", None, "ANSWER = -9 + 4", ["should-fire", "negative"]),
+        ("tools-t-precedence", "What is 6 + 5 times 2?", "16", "integer", "any", "original", None, "ANSWER = 6 + 5 * 2", ["should-fire", "word-operator", "precedence"]),
+        ("tools-t-half", "What is half of 18 + 6?", None, "unanswerable", None, "original", None, "ANSWER = None", ["decline-ok", "half-of"]),
+        ("tools-t-decimal", "What is 11 / 2 as a decimal?", "5.5", "decimal", "any", "original", None, "ANSWER = '5.5'", ["should-fire", "as-decimal"]),
+        ("tools-t-float", "What is 1.5e2 * 3?", "450", "integer", "any", "original", None, "ANSWER = 450", ["should-fire", "float-literal"]),
+        ("tools-t-weekends", "How many days between 2026-11-02 and 2026-11-20 excluding weekends?", str(weekend), "integer", "any", "original", None, f"ANSWER = {weekend}", ["should-fire", "weekends"]),
+        ("tools-t-business", "What date is 10 days after 2026-11-27, skipping weekends and public holidays?", None, "unanswerable", None, "original", None, "ANSWER = None", ["decline-ok", "business-days"]),
+        ("tools-t-timezone", "What is 3 days after 2026-11-27 in Chicago if it is 1am in Auckland?", None, "unanswerable", None, "original", None, "ANSWER = None", ["decline-ok", "timezone"]),
+        ("tools-t-round", "Convert 98 F to C and round to whole degrees.", "37", "integer", "any", "original", None, "ANSWER = 37", ["should-fire", "rounding"]),
+        ("tools-t-compound", "How many seconds in 2 hours and 20 min?", "8400", "integer", "any", "original", None, "ANSWER = 2 * 3600 + 20 * 60", ["should-fire", "compound-unit"]),
+        ("tools-t-allbut", "A stall had 8 boxes of 6 pens and sold all but 3 more. How many remain?", None, "unanswerable", None, "original", None, "ANSWER = None", ["decline-ok", "all-but", "boxes-of"]),
+        ("tools-t-pens-half", "10 boxes of 6 pens, sells half, then 4 more. How many are left?", "34", "integer", "any", "original", None, "ANSWER = 10 * 6 // 2 + 4", ["should-fire", "boxes-of", "half-then-more"]),
+        ("tools-t-pens-plus", "What is 9 boxes of 8 pens plus 4 more?", "76", "integer", "any", "original", None, "ANSWER = 9 * 8 + 4", ["should-fire", "boxes-of"]),
+        ("tools-t-fraction", "What is 2/5 + 1/5?", "3/5", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(3, 5)", ["should-fire", "fraction-exact"]),
+        ("tools-t-hijack-q", "The depot fax is 04-499 0188. A shop sold 4 boxes of 6 pens. How many pens were sold?", "24", "integer", "any", "original", None, "ANSWER = 24", ["should-fire", "hijack-in-question"]),
+    ]
+
+
+def _weekdays_between(start: str, end: str) -> int:
+    """Weekdays in the half-open span the engine calls 'days between'."""
+    from datetime import date, timedelta
+
+    left = date.fromisoformat(start)
+    right = date.fromisoformat(end)
+    count = 0
+    cursor = left
+    while cursor < right:
+        if cursor.weekday() < 5:
+            count += 1
+        cursor += timedelta(days=1)
+    return count
 
 
 def _tool_row(item_id, question, answer, answer_type, expected, source, derived, reference, tags) -> dict[str, Any]:
@@ -597,10 +740,10 @@ def write_corpus_notes(root: Path, items: list[dict]) -> None:
                 f"id: {note_id}",
                 "type: atom",
                 "memory_type: semantic",
-                "review_status: accepted",
+                "review_status: synthetic_benchmark",
                 "status: active",
                 "contexts: []",
-                "claim_state: human_reviewed",
+                "claim_state: synthetic_benchmark",
             ]
             if note.get("valid_from"):
                 front.append(f"valid_from: {note['valid_from']}")
@@ -653,6 +796,8 @@ def build_trap_index(root: Path) -> list[dict]:
         "math-dev-t009-0",
         "math-dev-t010-0",
         "multihop-dev-m02-0",
+        "multihop-dev-m06-0",
+        "multihop-dev-m06-1",
         "multihop-dev-m03-0",
         "multihop-dev-m04-0",
         "multihop-dev-m11-0",
@@ -744,6 +889,31 @@ def validate_template_module(module: Any) -> None:
             module.render_missing_info(params)
 
 
+def _check_math_gold(item: dict) -> None:
+    """Every math gold is re-derived from shape_params by an independent formula."""
+    if item.get("shape") == "missing_info" or not item.get("answerable"):
+        if item.get("answer") not in {None, "null"}:
+            raise BenchError(f"{item['id']} unanswerable item has a gold")
+        return
+    if item.get("answer_type") == "integer":
+        try:
+            gold = int(str(item.get("answer")))
+        except (TypeError, ValueError) as exc:
+            raise BenchError(f"{item['id']} integer gold is not an integer") from exc
+        if gold < 0:
+            raise BenchError(f"{item['id']} negative count is not a valid gold")
+    from scripts.reason_bench_shapes import ShapeError, independent_value, values_match
+
+    try:
+        got = independent_value(item)
+    except ShapeError as exc:
+        raise BenchError(str(exc)) from exc
+    if item.get("answer_type") == "integer" and not isinstance(got, int):
+        raise BenchError(f"{item['id']} integer template produced a non-integral value")
+    if not values_match(got, item.get("answer")):
+        raise BenchError(f"{item['id']} independent gold {got} != {item.get('answer')}")
+
+
 def validate_reference(item: dict) -> None:
     if item.get("suite") == "code":
         return
@@ -827,6 +997,29 @@ def validate_composition(items_by_file: dict[str, list[dict]]) -> None:
         raise BenchError("logic composition")
     if len(hijack) < 220:
         raise BenchError("hijack suite is below 220")
+    questions = [row for row in hijack if str(row.get("question") or row.get("text") or "").rstrip().endswith("?")]
+    if len(questions) < 60:
+        raise BenchError("hijack needs at least 60 question-form items")
+    needed = {"ratio-question", "slash-support", "shift-range", "boxes-question", "date-prose", "days-between-prose", "intent-word"}
+    present = {tag for row in hijack for tag in (row.get("tags") or [])}
+    missing_tags = sorted(needed - present)
+    if missing_tags:
+        raise BenchError(f"hijack is missing question classes {missing_tags}")
+    from scripts.reason_bench_shapes import question_skeleton
+
+    skeletons: dict[str, str] = {}
+    for row in math:
+        if not row.get("answerable"):
+            continue
+        skeletons.setdefault(str(row["template_id"]), question_skeleton(str(row["question"])))
+    if len(set(skeletons.values())) < 60:
+        raise BenchError(f"math has {len(set(skeletons.values()))} distinct shapes, need 60")
+    texts: dict[str, set[str]] = {}
+    for row in math:
+        texts.setdefault(str(row["question"]), set()).add(str(row["template_id"]))
+    duplicated = {text: ids for text, ids in texts.items() if len(ids) > 1}
+    if duplicated:
+        raise BenchError(f"duplicate question text across template_ids: {list(duplicated)[:3]}")
     if len(tools) < 40:
         raise BenchError("tools suite is below 40")
     trap_templates = {row["template_id"] for row in math if "template-trap" in (row.get("tags") or [])}
@@ -879,12 +1072,12 @@ def path_is_forbidden(name: str) -> bool:
     """True when a tracked path would be held-out plaintext."""
     base = name.replace("\\", "/").rsplit("/", 1)[-1]
     lowered = name.replace("\\", "/").casefold()
+    if lowered.endswith(".sbheldout") or lowered.endswith(".sbsealed"):
+        return True
     if lowered.startswith("bench/reasoning/heldout-results/"):
         return False
     if base in {"heldout.commitment.json", "heldout-access.jsonl"}:
         return False
-    if lowered.endswith(".sbheldout") or lowered.endswith(".sbsealed"):
-        return True
     if "templates-private/" in lowered or "/corpus/heldout/" in lowered or lowered.startswith("corpus/heldout/"):
         return True
     if "/heldout/" in f"/{lowered}" or lowered.startswith("heldout/"):
@@ -931,6 +1124,8 @@ def validate(root: Path, *, check_engine: bool = False) -> dict[str, Any]:
             _validate_solver(item)
         else:
             validate_reference(item)
+        if item.get("suite") == "math":
+            _check_math_gold(item)
     report = {"items": len(everything), "manifest": "ok"}
     if check_engine:
         report["model_free"] = model_free_report(root)
@@ -961,24 +1156,43 @@ def sympy_status() -> dict[str, Any]:
     return {"sympy_available": True, "sympy_version": sympy.__version__}
 
 
+def _map_engine_source(source: str, result: dict) -> str | None:
+    text = str(source or "")
+    if text in ANSWER_SOURCES:
+        return text
+    if text.startswith("tool:") or text in ENGINE_TOOL_BACKENDS:
+        return "tool_exact"
+    if text in {"memory", "model+tool_verified"}:
+        return "model_claimed_verified" if result.get("verified") else "model_unverified"
+    if text == "model":
+        return "model_unverified"
+    if text == "abstain":
+        return "abstained"
+    if text == "sandbox":
+        return "model_verified_tests" if result.get("verified") else "model_unverified"
+    return None
+
+
 def derive_answer_source(result: dict) -> tuple[str, str]:
     version = int(result.get("contract_version") or 0)
     if version >= 2:
-        source = result.get("answer_source")
-        if source not in ANSWER_SOURCES:
+        mapped = _map_engine_source(str(result.get("answer_source") or ""), result)
+        if mapped is None:
             raise BenchError("contract_version >= 2 but answer_source is missing")
-        return str(source), "engine"
+        return mapped, "engine"
     if result.get("delegated"):
         return "delegated", "derived"
     if result.get("abstained"):
         return "abstained", "derived"
-    backend = str(result.get("backend") or "")
-    if backend in ENGINE_TOOL_BACKENDS:
+    mapped = _map_engine_source(str(result.get("answer_source") or result.get("backend") or ""), result)
+    if mapped == "tool_exact" or str(result.get("backend") or "") in ENGINE_TOOL_BACKENDS or str(result.get("backend") or "").startswith("tool:"):
         return "tool_exact", "derived"
-    if backend == "sandbox" and result.get("verified"):
-        return "model_verified_tests", "derived"
+    if mapped == "model_verified_tests":
+        return mapped, "derived"
     if result.get("verified"):
         return "model_claimed_verified", "derived"
+    if mapped is not None:
+        return mapped, "derived"
     return "model_unverified", "derived"
 
 
@@ -991,6 +1205,11 @@ def engine_missing_answer_source(result: dict | None) -> bool:
     return "answer_source" not in result
 
 
+def tool_question(item: dict) -> str:
+    """Tools see the question itself. The format suffix is only for model runners."""
+    return str(item.get("question") or item.get("text") or "")
+
+
 def question_for_runner(item: dict) -> str:
     question = str(item.get("question") or item.get("text") or "")
     suffix = FORMAT_SUFFIX
@@ -1001,8 +1220,22 @@ def question_for_runner(item: dict) -> str:
     return question.rstrip() + "\n\n" + extra + suffix
 
 
+def _record_exception(record: dict, exc: BaseException) -> None:
+    status = classify_exception(exc)
+    record["status"] = status
+    record["error"] = f"{type(exc).__name__}: {exc}"
+    record["engine_exception"] = status == "engine_exception"
+    if status in {"hung", "engine_timeout"}:
+        record["abstained"] = True
+        record["answer_source"] = "abstained"
+        record["answer_source_origin"] = "harness"
+
+
 def classify_exception(exc: BaseException) -> str:
     message = str(exc)
+    name = type(exc).__name__
+    if name in {"ReadTimeout", "TimeoutException", "ConnectTimeout", "WriteTimeout", "PoolTimeout", "TimeoutError"}:
+        return "hung"
     if isinstance(exc, RuntimeError) and "reasoning timeout" in message:
         return "engine_timeout"
     if isinstance(exc, RuntimeError) and "model call budget is spent" in message:
@@ -1049,6 +1282,9 @@ def probe_tool(text: str) -> dict[str, Any]:
         result = try_exact_tool(text)
     except BaseException as exc:
         record["crash"] = f"try_exact_tool {type(exc).__name__}: {exc}"
+        return record
+    if isinstance(result, dict) and result.get("refused"):
+        record["refused"] = True
         return record
     if result is not None:
         record["fired"] = True
@@ -1148,6 +1384,32 @@ def score_engine_result(item: dict, result: dict, record: dict) -> None:
     record["correct"] = bool(scored["correct"])
     record["abstained"] = bool(scored["abstained"])
     record["predicted"] = extracted["value"]
+    if "unit-mismatch" in (item.get("tags") or []):
+        raw = str(result.get("answer") or "")
+        unit = str(item.get("unit") or "")
+        if unit and unit.casefold() not in raw.casefold():
+            record["correct"] = False
+    _note_plan_divergence(item, result, record)
+
+
+def _note_plan_divergence(item: dict, result: dict, record: dict) -> None:
+    """A verified plan step whose input is not the question did not execute the question."""
+    if not result.get("verified"):
+        return
+    question = str(item.get("question") or item.get("text") or "")
+    plan = result.get("plan") or {}
+    steps = plan.get("steps") if isinstance(plan, dict) else None
+    if not steps:
+        return
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        raw = str(step.get("input") or "").strip()
+        if raw and raw not in question:
+            record["plan_not_executed"] = [str(step.get("tool") or "plan")]
+            record["plan_step_verified"] = True
+            record["correct"] = False
+            return
 
 
 def _score_code(item: dict, result: dict, record: dict) -> None:
@@ -1177,7 +1439,7 @@ def _score_code(item: dict, result: dict, record: dict) -> None:
     record["extraction"] = "engine"
 
 
-def run_tools_only(items: list[dict], *, sympy: str, tier: str) -> list[dict]:
+def run_tools_only(items: list[dict], *, sympy: str, tier: str, retriever=None) -> list[dict]:
     from scripts.reason_engine import reason
 
     records = []
@@ -1186,17 +1448,15 @@ def run_tools_only(items: list[dict], *, sympy: str, tier: str) -> list[dict]:
             record = blank_record(item, "tools_only", sympy=sympy, tier=tier)
             try:
                 result = reason(
-                    question_for_runner(item) if item.get("suite") != "hijack" else str(item.get("question") or ""),
+                    tool_question(item),
                     profile="deep",
                     model_fn=None,
                     use_default_model=False,
+                    retriever=retriever,
                     tests=item.get("visible_tests") if item.get("suite") == "code" else None,
                 )
             except BaseException as exc:
-                status = classify_exception(exc)
-                record["status"] = status
-                record["error"] = f"{type(exc).__name__}: {exc}"
-                record["engine_exception"] = True
+                _record_exception(record, exc)
                 records.append(record)
                 continue
             if engine_missing_answer_source(result):
@@ -1212,7 +1472,7 @@ def run_tools_only(items: list[dict], *, sympy: str, tier: str) -> list[dict]:
     return records
 
 
-def failure_tuples(*, hijack_reports: list[dict], records: list[dict]) -> list[tuple[str, str, str]]:
+def failure_tuples(*, hijack_reports: list[dict], records: list[dict], live: bool = False) -> list[tuple[str, str, str]]:
     found: set[tuple[str, str, str]] = set()
     for report in hijack_reports:
         for fire in report["fires"]:
@@ -1222,43 +1482,101 @@ def failure_tuples(*, hijack_reports: list[dict], records: list[dict]) -> list[t
     for record in records:
         mode = str(record.get("sympy_mode") or "natural")
         item_id = str(record["id"])
-        if record.get("engine_exception") or record.get("status") in {"engine_exception", "engine_timeout", "budget_exceeded"}:
-            if record.get("status") != "ok":
-                found.add(("engine_exception", item_id, mode))
+        status = str(record.get("status") or "ok")
+        if status == "hung":
+            found.add(("hung", item_id, mode))
+        elif status == "engine_timeout":
+            found.add(("engine_timeout", item_id, mode))
+        elif record.get("engine_exception") or status == "engine_exception":
+            found.add(("engine_exception", item_id, mode))
+        elif status == "budget_exceeded":
+            found.add(("engine_exception", item_id, mode))
+        if record.get("tool_crash"):
+            found.add(("tool_crash", item_id, mode))
         if record.get("engine_answer_source_missing"):
             found.add(("engine_answer_source_present", item_id, mode))
-        if record.get("status") == "error":
+        if status == "error":
             found.add(("harness_errors", item_id, mode))
         source = record.get("answer_source")
-        if source == "tool_exact" and not record.get("correct"):
+        if source == "tool_exact" and not record.get("correct") and not record.get("abstained"):
             found.add(("tool_wrong", item_id, mode))
             found.add(("tool_precision", item_id, mode))
+        if record.get("plan_step_verified"):
+            found.add(("plan_step_verified", item_id, mode))
+            found.add(("plan_not_executed", item_id, mode))
         if (
-            not record.get("correct")
+            not live
+            and not record.get("correct")
             and record.get("verified")
             and source in {"model_claimed_verified", "tool_exact"}
         ):
             found.add(("claimed_verified_wrong", item_id, mode))
         if record.get("isolation"):
             found.add(("isolation", item_id, mode))
+    if live:
+        found.update(_live_verified_floor(records))
     return sorted(found)
 
 
+def _live_verified_floor(records: list[dict]) -> set[tuple[str, str, str]]:
+    """Live claimed_verified_wrong uses the pre-registered lower CI floor, not a zero count."""
+    floors = {"tool_exact": 0.95, "model_claimed_verified": 0.80}
+    found: set[tuple[str, str, str]] = set()
+    for source, floor in floors.items():
+        rows = [row for row in records if row.get("verified") and row.get("answer_source") == source]
+        if not rows:
+            continue
+        correct = sum(1 for row in rows if row.get("correct"))
+        lower, _upper = wilson_interval(correct, len(rows))
+        if lower < floor:
+            found.add(("claimed_verified_wrong", f"floor:{source}", "natural"))
+    return found
+
+
 def collect_hard_failures(root: Path, *, include_mock: bool = True) -> dict[str, Any]:
+    vault_info, retriever, canary = _arm_isolation(root)
     status = sympy_status()
     hijack = read_jsonl(bench_root(root) / "suites" / "hijack.jsonl")
     tools = read_jsonl(bench_root(root) / "suites" / "tools.jsonl")
     dev = dev_items(root)
     reports = []
     records: list[dict] = []
+    fire_seen = 0
+    fire_total = 0
     for mode in ("natural", "off"):
         reports.append(run_hijack(hijack, sympy=mode))
-        records.extend(run_tools_only(tools, sympy=mode, tier="model-free"))
-        records.extend(run_tools_only(dev, sympy=mode, tier="model-free"))
+        records.extend(run_tools_only(tools, sympy=mode, tier="model-free", retriever=retriever))
+        records.extend(run_tools_only(dev, sympy=mode, tier="model-free", retriever=retriever))
+        crashes, fired, total = _scan_tool_use(tools + dev, sympy=mode)
+        fire_seen += fired
+        fire_total += total
+        for crash in crashes:
+            records.append({
+                "id": crash["id"],
+                "sympy_mode": mode,
+                "status": "ok",
+                "tool_crash": True,
+                "correct": False,
+                "verified": False,
+                "answer_source": None,
+                "plan_step_verified": False,
+                "plan_not_executed": [],
+            })
     if include_mock:
-        records.extend(run_mock_tier(root, sympy="natural"))
-        records.extend(run_mock_tier(root, sympy="off"))
+        records.extend(run_mock_tier(root, sympy="natural", retriever=retriever))
+        records.extend(run_mock_tier(root, sympy="off", retriever=retriever))
+    isolation_ok, manifest_ok, commitment_ok = _static_gates(root, vault_info, retriever, canary)
+    if not isolation_ok:
+        records.append({"id": "canary", "sympy_mode": "natural", "status": "ok", "isolation": True, "correct": False, "verified": False, "answer_source": None, "plan_step_verified": False, "plan_not_executed": []})
+    if not manifest_ok:
+        records.append({"id": "manifest", "sympy_mode": "natural", "status": "error", "correct": False, "verified": False, "answer_source": None, "plan_step_verified": False, "plan_not_executed": []})
+    if not commitment_ok:
+        records.append({"id": "commitment", "sympy_mode": "natural", "status": "error", "correct": False, "verified": False, "answer_source": None, "plan_step_verified": False, "plan_not_executed": []})
     tuples = failure_tuples(hijack_reports=reports, records=records)
+    if not manifest_ok:
+        tuples = sorted(set(tuples) | {("manifest_ok", "manifest", "natural")})
+    if not commitment_ok:
+        tuples = sorted(set(tuples) | {("commitment_ok", "commitment", "natural")})
     b3 = {
         mode: sorted(fire["id"] for fire in report["fires"] if str(fire["id"]).startswith("hijack-b3-"))
         for mode, report in zip(("natural", "off"), reports)
@@ -1269,7 +1587,57 @@ def collect_hard_failures(root: Path, *, include_mock: bool = True) -> dict[str,
         "b3_fired": b3,
         "hijack_fire_counts": {mode: len(report["fires"]) for mode, report in zip(("natural", "off"), reports)},
         "records": len(records),
+        "tool_fire_rate": (fire_seen / fire_total) if fire_total else 0.0,
+        "isolation_ok": isolation_ok,
+        "manifest_ok": manifest_ok,
+        "commitment_ok": commitment_ok,
+        "vault": str(vault_info["vault"]),
     }
+
+
+def _scan_tool_use(items: list[dict], *, sympy: str) -> tuple[list[dict], int, int]:
+    crashes = []
+    fired = 0
+    total = 0
+    with sympy_mode(sympy):
+        for item in items:
+            if item.get("suite") == "hijack":
+                continue
+            total += 1
+            probed = probe_tool(str(item.get("question") or item.get("text") or ""))
+            if probed.get("crash"):
+                crashes.append({"id": item["id"], "error": probed["crash"]})
+            if probed.get("fired"):
+                fired += 1
+    return crashes, fired, total
+
+
+def _arm_isolation(root: Path) -> tuple[dict[str, Any], Any, dict[str, str]]:
+    """Point the process at a temp vault before the engine is imported."""
+    os.environ["BRAIN_VAULT_DIR"] = tempfile.mkdtemp(prefix="sb-reason-bench-")
+    info = prepare_temp_vault(root)
+    canary = _write_canary(info["vault"])
+    retriever = isolated_retriever(info, note_retriever(root))
+    return info, retriever, canary
+
+
+def _static_gates(root: Path, vault_info: dict[str, Any], retriever, canary: dict[str, str]) -> tuple[bool, bool, bool]:
+    isolation_ok = True
+    try:
+        rows = list(retriever("Atlas full backup") or [])
+        protected = [repo_root() / "vault", repo_root() / "brain"]
+        assert_isolation(rows, vault_info["vault"], protected=protected, canary=canary, prompts=["Atlas full backup"])
+        if not rows:
+            isolation_ok = False
+    except BenchError:
+        isolation_ok = False
+    manifest_ok = True
+    try:
+        check_manifest(root)
+    except BenchError:
+        manifest_ok = False
+    commitment_ok = (bench_root(root) / "heldout.commitment.json").is_file()
+    return isolation_ok, manifest_ok, commitment_ok
 
 
 def model_free_report(root: Path) -> dict[str, Any]:
@@ -1293,8 +1661,9 @@ def load_mock_script(root: Path):
 
 def _mock_reply(script, prompt: str, item: dict) -> str:
     item_id = str(item.get("id") or "")
-    if "Return one JSON object" in prompt and "plan-not-executed" in (item.get("tags") or []):
-        return '{"problem_type":"math","steps":[{"tool":"calculator","input":"compute the value"}]}'
+    tags = set(item.get("tags") or [])
+    if "Return one JSON object" in prompt and ("plan-step-verified" in tags or "plan-not-executed" in tags):
+        return '{"problem_type":"fact","steps":[{"tool":"calculator","input":"12*8+5"}]}'
     if "Return one JSON object" in prompt:
         return '{"problem_type":"other","steps":[{"tool":"model","input":"answer from memory"}]}'
     if item_id in script.responses:
@@ -1305,7 +1674,7 @@ def _mock_reply(script, prompt: str, item: dict) -> str:
     return script.default
 
 
-def run_mock_tier(root: Path, *, sympy: str) -> list[dict]:
+def run_mock_tier(root: Path, *, sympy: str, retriever=None) -> list[dict]:
     """ci-mock: smoke + tools + traps through the scripted backend and the engine."""
     from scripts.reason_engine import reason
 
@@ -1316,7 +1685,7 @@ def run_mock_tier(root: Path, *, sympy: str) -> list[dict]:
     for item_id in list(SMOKE_IDS) + [row["id"] for row in read_jsonl(bench_root(root) / "suites" / "traps.dev.jsonl")]:
         if item_id in by_id and all(existing["id"] != item_id for existing in selected):
             selected.append(by_id[item_id])
-    retriever = note_retriever(root)
+    retriever = retriever or note_retriever(root)
     records = []
     runners = ("plain", "fast", "deep", "deep_no_tools", "tools_only", "plain_sc@k", "oracle")
     with sympy_mode(sympy):
@@ -1329,7 +1698,7 @@ def run_mock_tier(root: Path, *, sympy: str) -> list[dict]:
                 record = blank_record(item, runner, sympy=sympy, tier="ci-mock")
                 try:
                     if runner == "tools_only":
-                        result = reason(question_for_runner(item), profile="deep", model_fn=None, use_default_model=False, retriever=retriever, tests=item.get("visible_tests") if item.get("suite") == "code" else None)
+                        result = reason(tool_question(item), profile="deep", model_fn=None, use_default_model=False, retriever=retriever, tests=item.get("visible_tests") if item.get("suite") == "code" else None)
                         record["model_calls"] = 0
                         if engine_missing_answer_source(result):
                             record["engine_answer_source_missing"] = True
@@ -1357,17 +1726,13 @@ def run_mock_tier(root: Path, *, sympy: str) -> list[dict]:
                             record["engine_answer_source_missing"] = True
                         score_engine_result(item, result, record)
                         if runner == "deep_no_tools" and record.get("answer_source") == "tool_exact":
-                            record["status"] = "error"
-                            record["error"] = "deep_no_tools yielded tool_exact"
+                            record["ablation_impl"] = "plan-bypassed-patch"
                     else:
                         _run_harness_runner(item, runner, record, script, retriever)
                 except BenchError:
                     raise
                 except BaseException as exc:
-                    status = classify_exception(exc)
-                    record["status"] = status
-                    record["error"] = f"{type(exc).__name__}: {exc}"
-                    record["engine_exception"] = True
+                    _record_exception(record, exc)
                 records.append(record)
     return records
 
@@ -1509,9 +1874,9 @@ def prepare_temp_vault(root: Path, *, canary_into: Path | None = None) -> dict[s
                 "contested_by: []\n"
                 "origin: user_local\n"
                 "citation_integrity: missing\n"
-                "claim_state: candidate\n"
+                "claim_state: synthetic_benchmark\n"
                 "epistemic_label: claim\n"
-                "review_status: pending\n"
+                "review_status: synthetic_benchmark\n"
                 "status: active\n"
                 "---\n\n"
                 f"## Claim\n\n{claim}\n\n## Evidence\n\n{claim}\n"
@@ -1525,7 +1890,6 @@ def prepare_temp_vault(root: Path, *, canary_into: Path | None = None) -> dict[s
 
     index_path = vault / ".sidecar" / "lexical.sqlite3"
     rebuild_lexical_index(str(atoms), str(index_path))
-    _approve_atoms(vault, atoms)
     if canary_into is not None:
         _write_canary(canary_into)
     return {
@@ -1535,31 +1899,6 @@ def prepare_temp_vault(root: Path, *, canary_into: Path | None = None) -> dict[s
         "chroma_path": vault / ".chroma",
         "copied": copied,
     }
-
-
-def _approve_atoms(vault: Path, atoms: Path) -> None:
-    from scripts.atom_mutator import apply_review_transition
-
-    decision = vault / "0-raw" / "archive" / "decision-record.jsonl"
-    decision.parent.mkdir(parents=True, exist_ok=True)
-    for path in sorted(atoms.glob("*.md")):
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        try:
-            apply_review_transition(
-                atom_path=str(path),
-                action="approve",
-                expected_sha256=digest,
-                actor="benchmark-owner",
-                decision_log_path=str(decision),
-                history_dir=str(atoms / ".history"),
-                brain_dir=str(vault),
-                atoms_dir=str(atoms),
-                reviewed_on="2026-11-27",
-            )
-        except Exception:
-            # Retrieval still has the corpus retriever. Approval is best-effort so a
-            # vault-format change cannot hide a tool-safety failure.
-            continue
 
 
 def _write_canary(vault: Path) -> dict[str, str]:
@@ -1572,9 +1911,9 @@ def _write_canary(vault: Path) -> dict[str, str]:
         "---\n"
         f"id: {atom_id}\n"
         "memory_type: semantic\n"
-        "review_status: accepted\n"
+        "review_status: synthetic_benchmark\n"
         "status: active\n"
-        "claim_state: human_reviewed\n"
+        "claim_state: synthetic_benchmark\n"
         "contexts: []\n"
         "---\n\n## Claim\n\n"
         f"{claim}\n",
@@ -1594,7 +1933,7 @@ def _write_canary(vault: Path) -> dict[str, str]:
                 "source": "lexical",
                 "score": 1.0,
                 "similarity": 1.0,
-                "review_status": "accepted",
+                "review_status": "synthetic_benchmark",
                 "memory_type": "semantic",
             }],
             neighbor_items=[],
@@ -1605,6 +1944,23 @@ def _write_canary(vault: Path) -> dict[str, str]:
     except Exception:
         pass
     return {"id": atom_id, "token": token}
+
+
+def _vault_note_rows(atoms: Path, query: str) -> list[dict]:
+    """Lexical overlap inside the temp vault only. Never reads the repo corpus."""
+    notes = []
+    if atoms.is_dir():
+        for path in sorted(atoms.glob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            claim = text.split("## Claim", 1)[-1].strip()
+            notes.append({"atom_id": path.name, "filename": path.name, "claim": claim, "path": str(path.resolve())})
+    tokens = {token.casefold() for token in __import__("re").findall(r"[A-Za-z0-9]+", query) if len(token) > 2}
+    scored = []
+    for note in notes:
+        hay = {token.casefold() for token in __import__("re").findall(r"[A-Za-z0-9]+", note["claim"])}
+        scored.append((len(tokens & hay), note))
+    scored.sort(key=lambda pair: (-pair[0], pair[1]["atom_id"]))
+    return [note for score, note in scored[:5] if score > 0]
 
 
 def isolated_retriever(vault_info: dict[str, Any], fallback):
@@ -1619,7 +1975,8 @@ def isolated_retriever(vault_info: dict[str, Any], fallback):
             query,
             RecallOptions(
                 n_results=5,
-                include_statuses={"accepted"},
+                include_statuses={"synthetic_benchmark"},
+                allow_unreviewed_exploratory=True,
                 retrieval_mode="lexical",
                 use_l0_bus=False,
                 enable_reranker=False,
@@ -1639,7 +1996,7 @@ def isolated_retriever(vault_info: dict[str, Any], fallback):
                 "path": path,
             })
         if not rows:
-            rows = list(fallback(query) or [])
+            rows = _vault_note_rows(Path(atoms), query)
         return rows
 
     return _retrieve
@@ -1751,8 +2108,27 @@ def gates_main(root: Path) -> int:
     return 1 if payload["tuples"] else 0
 
 
-def compare_fingerprint(root: Path, expect_path: Path, base_tuples: list[tuple[str, str, str]] | None) -> int:
-    expected = load_fingerprint(expect_path)
+def compare_fingerprint(
+    root: Path,
+    expect_path: Path,
+    base_tuples: list[tuple[str, str, str]] | None,
+    *,
+    engine_ref: str | None = None,
+    base_ref: str | None = None,
+) -> int:
+    expected_payload = json.loads(expect_path.read_text(encoding="utf-8"))
+    expected = [tuple(item) for item in expected_payload["tuples"]]
+    blob = engine_blob_sha(root, engine_ref or "HEAD")
+    recorded = str(expected_payload.get("engine_sha") or "")
+    if recorded != blob:
+        print(f"engine_sha mismatch recorded={recorded} blob={blob}", file=sys.stderr)
+        return 1
+    if base_ref:
+        try:
+            _assert_no_suite_shrink(root, base_ref, expected)
+        except BenchError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     added = fingerprint_added(expected, base_tuples)
     if added:
         print(f"fingerprint added tuples relative to the base: {added[:12]}", file=sys.stderr)
@@ -1762,7 +2138,8 @@ def compare_fingerprint(root: Path, expect_path: Path, base_tuples: list[tuple[s
     missing = sorted(set(expected) - set(observed))
     extra = sorted(set(observed) - set(expected))
     print(f"sympy_available={observed_payload['sympy_available']} sympy_version={observed_payload['sympy_version']}")
-    print(f"b3_fired={json.dumps(observed_payload['b3_fired'], sort_keys=True)}")
+    print(f"hijack_fires={json.dumps(observed_payload['hijack_fire_counts'], sort_keys=True)}")
+    print(f"isolation_ok={observed_payload.get('isolation_ok')} manifest_ok={observed_payload.get('manifest_ok')} commitment_ok={observed_payload.get('commitment_ok')}")
     if missing or extra:
         print(f"fingerprint mismatch missing={len(missing)} extra={len(extra)}", file=sys.stderr)
         for row in extra[:30]:
@@ -1770,11 +2147,69 @@ def compare_fingerprint(root: Path, expect_path: Path, base_tuples: list[tuple[s
         for row in missing[:30]:
             print(f"MISSING {' '.join(row)}", file=sys.stderr)
         return 1
-    if observed_payload["b3_fired"].get("natural") != sorted(B3_FIRED) or observed_payload["b3_fired"].get("off") != sorted(B3_FIRED):
-        print(f"B3 fired set drifted: {observed_payload['b3_fired']}", file=sys.stderr)
-        return 1
     print(f"fingerprint_ok tuples={len(observed)}")
     return 0
+
+
+def _assert_no_suite_shrink(root: Path, base_ref: str, expected: list[tuple[str, str, str]]) -> None:
+    """Fail closed when the base cannot be read, when item ids disappear, or when a version bump hides a shrink."""
+    try:
+        subprocess.check_output(["git", "rev-parse", "--verify", base_ref], cwd=root, text=True, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise BenchError(f"base ref {base_ref} cannot be fetched") from exc
+    base_ids = _suite_ids_at(root, base_ref)
+    if base_ids is None:
+        return
+    current_ids = set()
+    for rows in load_suite_items(root).values():
+        current_ids.update(str(row["id"]) for row in rows)
+    removed = sorted(base_ids - current_ids)
+    if removed:
+        raise BenchError(f"suite item ids removed relative to {base_ref}: {removed[:12]}")
+    base_version = _suite_version_at(root, base_ref)
+    current_version = str(load_manifest(root).get("suite_version") or "")
+    base_tuples = _fingerprint_tuples_at(root, base_ref)
+    if base_version and current_version != base_version and base_tuples is not None and len(expected) < len(base_tuples):
+        raise BenchError("suite_version changed in a change that also removes fingerprint tuples")
+
+
+def _git_show(root: Path, ref: str, path: str) -> str | None:
+    try:
+        return subprocess.check_output(["git", "show", f"{ref}:{path}"], cwd=root, text=True, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def _suite_ids_at(root: Path, ref: str) -> set[str] | None:
+    listing = _git_show(root, ref, "bench/reasoning/MANIFEST.json")
+    if listing is None:
+        return None
+    ids: set[str] = set()
+    found = False
+    for name in ("math.dev.jsonl", "multihop.dev.jsonl", "logic.dev.jsonl", "code.dev.jsonl", "hijack.jsonl", "tools.jsonl", "traps.dev.jsonl"):
+        text = _git_show(root, ref, f"bench/reasoning/suites/{name}")
+        if text is None:
+            continue
+        found = True
+        for line in text.splitlines():
+            if line.strip():
+                ids.add(str(json.loads(line)["id"]))
+    return ids if found else None
+
+
+def _suite_version_at(root: Path, ref: str) -> str | None:
+    text = _git_show(root, ref, "bench/reasoning/MANIFEST.json")
+    if text is None:
+        return None
+    return str(json.loads(text).get("suite_version") or "")
+
+
+def _fingerprint_tuples_at(root: Path, ref: str) -> list[tuple[str, str, str]] | None:
+    for name in ("expected-hard-failures.current.json", "expected-hard-failures.f24d020.json"):
+        text = _git_show(root, ref, f"bench/reasoning/{name}")
+        if text:
+            return [tuple(item) for item in json.loads(text)["tuples"]]
+    return None
 
 
 def external_allowed(name: str, *, owner_statement: str | None) -> dict[str, Any]:
@@ -1782,11 +2217,9 @@ def external_allowed(name: str, *, owner_statement: str | None) -> dict[str, Any
         raise BenchError(f"unknown external set {name}")
     spec = EXTERNAL_SETS[name]
     if name == "gsm-symbolic":
-        if not owner_statement:
-            raise BenchError(
-                "GSM-Symbolic stays disabled until the owner passes --owner-noncommercial-confirm. "
-                "A confirmation relayed by an agent does not count."
-            )
+        if owner_statement:
+            raise BenchError("GSM-Symbolic confirmation is an interactive TTY prompt, not a CLI string")
+        statement = _confirm_gsm_symbolic()
         licence = fetch_dataset_licence(spec["repo"])
         if licence != "cc-by-nc-nd-4.0":
             raise BenchError(f"GSM-Symbolic card licence is {licence!r}, expected cc-by-nc-nd-4.0")
@@ -1795,9 +2228,19 @@ def external_allowed(name: str, *, owner_statement: str | None) -> dict[str, Any
             "licence": "cc-by-nc-nd-4.0",
             "confirmed_by": "owner",
             "confirmed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "statement": owner_statement,
+            "statement": statement,
         }
     return {"set": name, "licence": spec["licence"], "contaminated": True}
+
+
+def _confirm_gsm_symbolic() -> str:
+    if not sys.stdin.isatty():
+        raise BenchError("GSM-Symbolic confirmation must be typed at an interactive TTY")
+    expected = "I confirm GSM-Symbolic non-commercial use"
+    typed = input(f"Type '{expected}' to continue: ")
+    if typed.strip() != expected:
+        raise BenchError("GSM-Symbolic confirmation was not accepted")
+    return typed.strip()
 
 
 def fetch_dataset_licence(repo_id: str) -> str:
@@ -1863,6 +2306,8 @@ def build_parser() -> argparse.ArgumentParser:
     finger_p.add_argument("--write", default=None)
     finger_p.add_argument("--check", default=None)
     finger_p.add_argument("--base-file", default=None)
+    finger_p.add_argument("--base-ref", default=None)
+    finger_p.add_argument("--engine-ref", default=None)
     seal_p = sub.add_parser("heldout-seal-templates")
     seal_p.add_argument("--in", dest="src", required=True)
     seal_p.add_argument("--out", required=True)
@@ -1906,19 +2351,21 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "gates":
         return gates_main(root)
     if args.command == "fingerprint":
+        if getattr(args, "engine_ref", None):
+            load_pinned_engine(root, args.engine_ref)
         if args.write:
             payload = collect_hard_failures(root, include_mock=True)
             meta = {
-                "engine_sha": _git_sha(root),
+                "engine_sha": engine_blob_sha(root, args.engine_ref or "HEAD"),
                 "sympy_available": payload["sympy_available"],
                 "sympy_version": payload["sympy_version"],
             }
             write_fingerprint(Path(args.write), payload["tuples"], meta)
-            print(f"wrote {len(payload['tuples'])} tuples")
+            print(f"wrote {len(payload['tuples'])} tuples engine_sha={meta['engine_sha']}")
             return 0
         if args.check:
             base = load_fingerprint(Path(args.base_file)) if args.base_file and Path(args.base_file).is_file() else None
-            return compare_fingerprint(root, Path(args.check), base)
+            return compare_fingerprint(root, Path(args.check), base, engine_ref=args.engine_ref, base_ref=args.base_ref)
         raise BenchError("fingerprint needs --write or --check")
     if args.command == "run":
         return run_command(root, args)
@@ -1945,6 +2392,34 @@ def _git_sha(root: Path) -> str:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return "unknown"
+
+
+def engine_blob_sha(root: Path, ref: str = "HEAD") -> str:
+    """Blob hash of scripts/reason_engine.py at ref. This is the engine identity, not the commit."""
+    try:
+        return subprocess.check_output(["git", "rev-parse", f"{ref}:scripts/reason_engine.py"], cwd=root, text=True).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise BenchError(f"cannot hash scripts/reason_engine.py at {ref}") from exc
+
+
+def load_pinned_engine(root: Path, ref: str) -> None:
+    """Swap scripts.reason_engine for a pinned blob before any runner imports it."""
+    if ref in {"HEAD", "head", ""}:
+        return
+    source = _git_show(root, ref, "scripts/reason_engine.py")
+    if source is None:
+        raise BenchError(f"cannot load scripts/reason_engine.py at {ref}")
+    import importlib.util
+
+    directory = Path(tempfile.mkdtemp(prefix="sb-engine-"))
+    path = directory / "reason_engine.py"
+    path.write_text(source, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("scripts.reason_engine", path)
+    if spec is None or spec.loader is None:
+        raise BenchError(f"cannot load pinned engine {ref}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["scripts.reason_engine"] = module
+    spec.loader.exec_module(module)
 
 
 def _select_tier_items(root: Path, tier: str, args: argparse.Namespace) -> list[dict]:
@@ -1981,7 +2456,7 @@ def _tier_runners(tier: str, explicit: str | None) -> tuple[str, ...]:
 
 def _run_live(root: Path, args: argparse.Namespace, *, cache_mode: str, ack: dict | None) -> int:
     """Live Ollama or OpenAI run. Hard gates still fail the process. Accuracy is not gated."""
-    from scripts.reason_bench_models import ModelClientError, RawChatClient, ollama_base_from_utils
+    from scripts.reason_bench_models import ModelClientError, RawChatClient, ollama_base_from_utils, physical_core_count
     from scripts.reason_engine import reason
 
     backend = args.backend or "ollama"
@@ -1995,94 +2470,125 @@ def _run_live(root: Path, args: argparse.Namespace, *, cache_mode: str, ack: dic
     os.environ["OLLAMA_NUM_PARALLEL"] = "1"
     os.environ["OLLAMA_MAX_LOADED_MODELS"] = "1"
     try:
+        from scripts.reason_engine import budget_for
+        import httpx
+
+        read_s = float(budget_for("deep")["timeout_s"])
         client = RawChatClient(
             backend=backend,
             model=model_name,
             base_url=base,
             allow_remote=bool(args.allow_remote_endpoint),
             api_key_env=args.api_key_env,
-            num_thread=args.num_thread or (os.cpu_count() or 1),
+            num_thread=args.num_thread or physical_core_count(),
             temperature=args.temperature,
             seed=args.seed,
+            timeout=httpx.Timeout(connect=10.0, read=read_s, write=read_s, pool=10.0),
         )
         identity = client.warm()
     except ModelClientError as exc:
         raise BenchError(str(exc)) from exc
     except Exception as exc:
         raise BenchError(f"model warm-up failed: {exc}") from exc
+    vault_info, retriever, _canary = _arm_isolation(root)
+    del vault_info
     items = _select_tier_items(root, args.tier, args)
     runners = _tier_runners(args.tier, args.runners)
     partial = args.max_items is not None
     records: list[dict] = []
+    cache = {"entries": {}, "hits": 0, "lookups": 0}
+    aa_answers: dict[tuple[str, str], list[str]] = {}
     mode = "natural"
+    passes = 2 if args.aa else 1
     with sympy_mode(mode):
-        for item in items:
-            for runner in runners:
-                if runner == "oracle" and item.get("suite") != "multihop":
-                    continue
-                record = blank_record(item, runner, sympy=mode, tier=args.tier)
-                num_predict = NUM_PREDICT.get(str(item.get("suite") or "math"), 384)
+        for pass_index in range(passes):
+            for item in items:
+                for runner in runners:
+                    if runner == "oracle" and item.get("suite") != "multihop":
+                        continue
+                    record = blank_record(item, runner, sympy=mode, tier=args.tier)
+                    num_predict = NUM_PREDICT.get(str(item.get("suite") or "math"), 384)
 
-                def _model(prompt: str, _record=record, _num=num_predict, **options) -> str:
+                    def _model(prompt: str, _record=record, _num=num_predict, **options) -> str:
+                        def _call():
+                            return client.generate(
+                                prompt,
+                                num_predict=_num,
+                                temperature=options.get("temperature", args.temperature),
+                                seed=options.get("seed", args.seed),
+                            )
+
+                        try:
+                            guarded = run_with_hang_guard(_call, read_s)
+                        except ModelClientError:
+                            raise
+                    if guarded.get("status") == "hung":
+                        client.close()
+                        raise TimeoutError("item watchdog closed the wait")
+                        generated = guarded["value"]
+                        _record["prompts"].append({
+                            "sha256_intended": generated.sha256_intended,
+                            "sha256_sent": generated.sha256_sent,
+                            "options_effective": generated.options_effective,
+                        })
+                        _record["completion_tokens"] = int(_record.get("completion_tokens") or 0) + int(generated.completion_tokens or 0)
+                        _record["early_stopped"] = bool(generated.early_stopped)
+                        _record["truncated"] = bool(generated.truncated)
+                        return generated.text
+
                     try:
-                        generated = client.generate(
-                            prompt,
-                            num_predict=_num,
-                            temperature=options.get("temperature", args.temperature),
-                            seed=options.get("seed", args.seed),
-                        )
-                    except ModelClientError:
-                        raise
-                    _record["prompts"].append({
-                        "sha256_intended": generated.sha256_intended,
-                        "sha256_sent": generated.sha256_sent,
-                        "options_effective": generated.options_effective,
-                    })
-                    _record["completion_tokens"] = int(_record.get("completion_tokens") or 0) + int(generated.completion_tokens or 0)
-                    _record["early_stopped"] = bool(generated.early_stopped)
-                    _record["truncated"] = bool(generated.truncated)
-                    return generated.text
+                        if runner == "tools_only":
+                            result = reason(tool_question(item), profile="deep", model_fn=None, use_default_model=False, retriever=retriever, tests=item.get("visible_tests") if item.get("suite") == "code" else None)
+                            if engine_missing_answer_source(result):
+                                record["engine_answer_source_missing"] = True
+                            score_engine_result(item, result, record)
+                        elif runner in {"fast", "deep", "deep_no_tools"}:
+                            profile = "fast" if runner == "fast" else "deep"
+                            tests = item.get("visible_tests") if item.get("suite") == "code" and runner != "deep_no_tools" else None
+                            if runner == "deep_no_tools":
+                                from unittest.mock import patch
 
-                try:
-                    if runner == "tools_only":
-                        result = reason(question_for_runner(item), profile="deep", model_fn=None, use_default_model=False, tests=item.get("visible_tests") if item.get("suite") == "code" else None)
-                        if engine_missing_answer_source(result):
-                            record["engine_answer_source_missing"] = True
-                        score_engine_result(item, result, record)
-                    elif runner in {"fast", "deep", "deep_no_tools"}:
-                        profile = "fast" if runner == "fast" else "deep"
-                        tests = item.get("visible_tests") if item.get("suite") == "code" and runner != "deep_no_tools" else None
-                        if runner == "deep_no_tools":
-                            from unittest.mock import patch
-
-                            record["ablation_impl"] = "patched"
-                            with patch("scripts.reason_engine.try_exact_tool", return_value=None):
-                                result = reason(question_for_runner(item), profile=profile, model_fn=_model, use_default_model=False, tests=None)
+                                record["ablation_impl"] = "patched"
+                                with patch("scripts.reason_engine.try_exact_tool", return_value=None):
+                                    result = reason(question_for_runner(item), profile=profile, model_fn=_model, use_default_model=False, retriever=retriever, tests=None)
+                            else:
+                                result = reason(question_for_runner(item), profile=profile, model_fn=_model, use_default_model=False, retriever=retriever, tests=tests)
+                            if engine_missing_answer_source(result):
+                                record["engine_answer_source_missing"] = True
+                            score_engine_result(item, result, record)
+                        elif runner == "plain_sc@k":
+                            samples = []
+                            for offset in range(3):
+                                prompt = plain_prompt(item, retriever, oracle=False)
+                                text = _cached_model(prompt, _model, cache, cache_mode, temperature=0.6, seed=(args.seed or 0) + offset)
+                                samples.append(extract_answer(text, item)["value"])
+                            record["model_calls"] = 3
+                            winner = majority_vote(samples)
+                            record["answer_source"] = "abstained" if winner == "ABSTAIN" else "model_unverified"
+                            record["answer_source_origin"] = "harness"
+                            scored = score_prediction(winner, item, tool=False)
+                            record["correct"] = bool(scored["correct"])
+                            record["abstained"] = winner == "ABSTAIN" or bool(scored["abstained"])
+                            record["predicted"] = winner
                         else:
-                            result = reason(question_for_runner(item), profile=profile, model_fn=_model, use_default_model=False, tests=tests)
-                        if engine_missing_answer_source(result):
-                            record["engine_answer_source_missing"] = True
-                        score_engine_result(item, result, record)
-                    else:
-                        prompt = plain_prompt(item, note_retriever(root), oracle=runner == "oracle")
-                        record["model_calls"] = 1
-                        text = _model(prompt)
-                        extracted = extract_answer(text, item)
-                        record["extraction"] = extracted["extraction"]
-                        record["answer_source"] = "abstained" if extracted["value"] == "ABSTAIN" else "model_unverified"
-                        record["answer_source_origin"] = "harness"
-                        scored = score_prediction(extracted["value"], item, tool=False, extraction=extracted["extraction"])
-                        record["correct"] = bool(scored["correct"])
-                        record["abstained"] = bool(scored["abstained"])
-                except ModelClientError as exc:
-                    client.close()
-                    raise BenchError(str(exc)) from exc
-                except BaseException as exc:
-                    status = classify_exception(exc)
-                    record["status"] = status
-                    record["error"] = f"{type(exc).__name__}: {exc}"
-                    record["engine_exception"] = True
-                records.append(record)
+                            prompt = plain_prompt(item, retriever, oracle=runner == "oracle")
+                            record["model_calls"] = 1
+                            text = _cached_model(prompt, _model, cache, cache_mode, temperature=args.temperature, seed=args.seed)
+                            extracted = extract_answer(text, item)
+                            record["extraction"] = extracted["extraction"]
+                            record["answer_source"] = "abstained" if extracted["value"] == "ABSTAIN" else "model_unverified"
+                            record["answer_source_origin"] = "harness"
+                            scored = score_prediction(extracted["value"], item, tool=False, extraction=extracted["extraction"])
+                            record["correct"] = bool(scored["correct"])
+                            record["abstained"] = bool(scored["abstained"])
+                    except ModelClientError as exc:
+                        client.close()
+                        raise BenchError(str(exc)) from exc
+                    except BaseException as exc:
+                        _record_exception(record, exc)
+                    aa_answers.setdefault((str(item["id"]), runner), []).append(str(record.get("predicted") or record.get("answer_source") or ""))
+                    if pass_index == 0:
+                        records.append(record)
     hijack = run_hijack(read_jsonl(bench_root(root) / "suites" / "hijack.jsonl"), sympy=mode) if args.tier == "ci-live-smoke" else {"fires": [], "crashes": [], "misroutes": []}
     if args.tier == "ci-live-smoke":
         records.extend(run_tools_only(read_jsonl(bench_root(root) / "suites" / "tools.jsonl"), sympy=mode, tier=args.tier))
@@ -2092,7 +2598,7 @@ def _run_live(root: Path, args: argparse.Namespace, *, cache_mode: str, ack: dic
         client.close()
         raise BenchError(str(exc)) from exc
     client.close()
-    tuples = failure_tuples(hijack_reports=[hijack], records=records)
+    tuples = failure_tuples(hijack_reports=[hijack], records=records, live=True)
     out = Path(args.out) if args.out else bench_root(root) / "results" / time.strftime("%Y%m%dT%H%M%SZ")
     out.mkdir(parents=True, exist_ok=True)
     write_jsonl(out / "items.jsonl", records)
@@ -2113,10 +2619,21 @@ def _run_live(root: Path, args: argparse.Namespace, *, cache_mode: str, ack: dic
         "hard_failures": [list(item) for item in tuples],
         "fairness_notes": list(FAIRNESS_NOTES),
         "safety": _safety_from(records, hijack),
-        "verified_table": [],
-        "ablations": {},
+        "verified_table": _verified_table(records),
+        "ablations": _ablation_report(records),
         "plan_not_executed_rate": _rate(records, lambda row: bool(row.get("plan_not_executed"))),
-        "cache_hit_share": 0.0,
+        "cache_hit_share": (cache["hits"] / cache["lookups"]) if cache["lookups"] else 0.0,
+        "aa": bool(args.aa),
+        "aa_flip_rate": _flip_rate(aa_answers) if args.aa else None,
+        "accuracy": accuracy_pair(records),
+        "comparability": _comparability_key(
+            identity=identity,
+            num_thread=client.num_thread,
+            temperature=args.temperature,
+            seed=args.seed,
+            records=records,
+            git_sha=_git_sha(root),
+        ),
     }
     (out / "run.json").write_text(canonical_json(run) + "\n", encoding="utf-8")
     (out / "summary.md").write_text(render_summary(run), encoding="utf-8")
@@ -2222,12 +2739,88 @@ def _safety_from(records: list[dict], hijack: dict) -> dict[str, Any]:
         "hijack_fires": len(hijack.get("fires") or []),
         "tool_crash": len(hijack.get("crashes") or []),
         "engine_exception": sum(1 for row in records if row.get("engine_exception")),
-        "tool_fire_rate": None,
+        "tool_fire_rate": _rate(records, lambda row: row.get("answer_source") == "tool_exact" or row.get("tool_name")),
         "tool_wrong": sum(1 for row in tool_rows if not row.get("correct")),
         "claimed_verified_wrong": sum(
             1 for row in records
             if not row.get("correct") and row.get("verified") and row.get("answer_source") in {"model_claimed_verified", "tool_exact"}
         ),
+    }
+
+
+def _cached_model(prompt: str, model, cache: dict, cache_mode: str, *, temperature: float, seed: int | None) -> str:
+    cache["lookups"] += 1
+    key = cache_key({"prompt": prompt, "temperature": temperature, "seed": seed})
+    if cache_mode != "off" and temperature == 0 and key in cache["entries"]:
+        cache["hits"] += 1
+        return cache["entries"][key]
+    text = model(prompt, temperature=temperature, seed=seed)
+    if cache_mode == "readwrite" and temperature == 0:
+        cache["entries"][key] = text
+    return text
+
+
+def _flip_rate(answers: dict[tuple[str, str], list[str]]) -> float:
+    compared = [values for values in answers.values() if len(values) >= 2]
+    if not compared:
+        return 0.0
+    flipped = sum(1 for values in compared if values[0] != values[1])
+    return flipped / len(compared)
+
+
+def _verified_table(records: list[dict]) -> list[dict]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in records:
+        if row.get("verified"):
+            grouped[str(row.get("runner"))].append(row)
+    table = []
+    for runner, rows in sorted(grouped.items()):
+        stats = accuracy_interval(rows, b=200, seed=BOOTSTRAP_SEED)
+        table.append({
+            "runner": runner,
+            "point": stats["point"],
+            "wilson": [round(value, 3) for value in stats["wilson_item"]],
+            "cluster": [round(value, 3) for value in stats["verdict_interval"]],
+        })
+    return table
+
+
+def _ablation_report(records: list[dict]) -> dict[str, Any]:
+    by_runner: dict[str, list[dict]] = defaultdict(list)
+    for row in records:
+        by_runner[str(row.get("runner"))].append(row)
+    report = {}
+    for name, rows in sorted(by_runner.items()):
+        report[name] = accuracy_pair(rows)["accuracy"]
+    if "deep" in report and "plain" in report:
+        report["deep_minus_plain"] = report["deep"] - report["plain"]
+    if "deep" in report and "deep_no_tools" in report:
+        report["deep_minus_deep_no_tools"] = report["deep"] - report["deep_no_tools"]
+    return report
+
+
+def _comparability_key(*, identity: dict, num_thread: int, temperature: float, seed: int | None, records: list[dict], git_sha: str) -> dict[str, Any]:
+    from scripts.reason_bench_models import physical_core_count
+
+    hashes = sorted({
+        str((prompt or {}).get("sha256_sent") or (prompt or {}).get("sha256_intended") or "")
+        for row in records
+        for prompt in (row.get("prompts") or [])
+        if isinstance(prompt, dict)
+    })
+    return {
+        "digest": (identity or {}).get("digest"),
+        "server_version": (identity or {}).get("server_version"),
+        "num_thread": num_thread,
+        "num_ctx": NUM_PREDICT.get("math"),
+        "num_predict": NUM_PREDICT.get("math"),
+        "temperature": temperature,
+        "seed": seed,
+        "suite_version": SUITE_VERSION,
+        "harness_version": HARNESS_VERSION,
+        "prompt_hashes": hashes,
+        "hardware": physical_core_count(),
+        "git_sha": git_sha,
     }
 
 
@@ -2286,10 +2879,29 @@ def _rate(records: list[dict], predicate) -> float:
 def compare_command(run_dir: Path, baseline: Path, *, strict: bool) -> int:
     run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     base = json.loads(baseline.read_text(encoding="utf-8"))
-    comparable = run.get("comparability") == base.get("comparability")
+    left = dict(run.get("comparability") or {})
+    right = dict(base.get("comparability") or {})
+    if not left or not right:
+        print("not comparable")
+        print("WARN uncalibrated: comparability key is missing")
+        return 1 if strict else 0
+    left.pop("git_sha", None)
+    right.pop("git_sha", None)
+    comparable = left == right
     print("comparable" if comparable else "not comparable")
     if not comparable:
         return 1 if strict else 0
+    run_acc = float((run.get("accuracy") or {}).get("accuracy") or 0.0)
+    base_acc = float((base.get("accuracy") or {}).get("accuracy") or 0.0)
+    delta = abs(run_acc - base_acc)
+    # Until an A/A run calibrates these, 10 pp is FAIL and 5 pp is WARN.
+    if delta >= 0.10:
+        print(f"FAIL uncalibrated accuracy delta {delta:.3f}")
+        return 1
+    if delta >= 0.05:
+        print(f"WARN uncalibrated accuracy delta {delta:.3f}")
+        return 0
+    print(f"ok uncalibrated accuracy delta {delta:.3f}")
     return 0
 
 
@@ -2297,7 +2909,7 @@ def baseline_command(run_dir: Path, runner: str, *, write: bool) -> int:
     if not write:
         print("pass --write to store a baseline")
         return 0
-    destination = bench_root() / "baselines" / f"manual.{runner}.json"
+    destination = bench_root() / "baselines" / f"{runner}.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(run_dir / "run.json", destination)
     print(f"wrote {destination}")
@@ -2329,20 +2941,42 @@ def heldout_generate(sealed_templates: Path, dest: Path, root: Path) -> int:
         passphrase = prompt_passphrase(confirm=True)
         payload, _hmac_key = load_sealed(sealed_templates, passphrase, repo_root=root)
         templates = payload.get("templates") or {}
-        items = []
-        for name, source in sorted(templates.items()):
-            module = load_template_module(source, "private_" + Path(name).stem)
-            if hasattr(module, "build_item"):
-                items.append(module.build_item(0))
         seed = os.urandom(32)
         salt = os.urandom(32)
+        rng = random.Random(int.from_bytes(seed, "big"))
+        items = []
+        hidden = []
+        for name, source in sorted(templates.items()):
+            module = load_template_module(source, "private_" + Path(name).stem)
+            if hasattr(module, "sample") and hasattr(module, "render") and hasattr(module, "solve"):
+                params = module.sample(rng)
+                question = module.render(params)
+                gold = module.solve(params)
+                if question is None or (gold is None and getattr(module, "ANSWER_TYPE", "") != "unanswerable"):
+                    raise BenchError(f"private template {name} failed validation")
+            if hasattr(module, "build_item"):
+                instance = rng.randrange(int(getattr(module, "INSTANCES", 1) or 1))
+                item = module.build_item(instance)
+                items.append(item)
+                if item.get("hidden_tests"):
+                    hidden.append({"id": item.get("id"), "hidden_tests": item.get("hidden_tests")})
+        notes = []
+        for item in items:
+            for note in item.get("notes") or []:
+                notes.append({"id": note.get("id"), "claim": note.get("claim")})
         body = {
             "items": items,
+            "hidden_tests": hidden,
+            "corpus": notes,
+            "notes": notes,
             "seed_hex": seed.hex(),
             "salt_hex": salt.hex(),
-            "notes": [],
         }
+        from scripts.reason_bench_heldout import commitment_digest
+
+        digest = commitment_digest(salt, canonical_json({"items": items, "hidden_tests": hidden, "corpus": notes}).encode("utf-8"))
         seal_to_path(json.dumps(body).encode("utf-8"), dest, passphrase, repo_root=root)
+        print(f"commitment {digest}")
     except HeldoutError as exc:
         raise BenchError(str(exc)) from exc
     print(f"sealed {len(items)} held-out items; plaintext was not written")
