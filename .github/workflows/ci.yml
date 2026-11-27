@@ -1,5 +1,12 @@
 name: CI
 
+# Owner pin. The fingerprint job reads this line from the base branch only.
+# A value committed on a pull request is ignored. After reviewing the harness,
+# set a 40-character SHA on the base branch:
+#   PINNED_HARNESS_SHA: "<sha>"
+env:
+  PINNED_HARNESS_SHA: ""
+
 on:
   push:
     branches: [main, master]
@@ -228,8 +235,21 @@ jobs:
             echo "fingerprint check requires a pull request base ref" >&2
             exit 2
           fi
-          git fetch --depth=1 origin "${{ github.base_ref }}"
-          bash scripts/ci_fingerprint_check.sh "origin/${{ github.base_ref }}"
+          git fetch origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          # The pin is read from the base branch workflow. This file's value is ignored.
+          pin=$(git show "$base:.github/workflows/ci.yml" | python3 -c 'import re,sys; m=re.search(r"^PINNED_HARNESS_SHA:\s*\"([0-9a-f]{40})\"", sys.stdin.read(), re.M); print(m.group(1) if m else "")')
+          if [ -z "$pin" ]; then
+            echo "owner has not set PINNED_HARNESS_SHA on ${base}; fail closed" >&2
+            exit 2
+          fi
+          git fetch origin "$pin"
+          dest="${RUNNER_TEMP}/pinned-harness"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          git archive "$pin" | tar -x -C "$dest"
+          # Run the pinned checker. Do not execute the pull request's copy.
+          bash "$dest/scripts/ci_fingerprint_check.sh" "$base"
 
   reason-bench-windows-crlf:
     name: windows crlf reason-bench

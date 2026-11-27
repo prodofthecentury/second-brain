@@ -1,0 +1,6 @@
+# The harness gate. The owner has to approve changes to the checker.
+scripts/ci_fingerprint_check.sh @prodofthecentury
+scripts/reason_bench.py @prodofthecentury
+scripts/reason_bench_*.py @prodofthecentury
+bench/reasoning/** @prodofthecentury
+.github/workflows/ci.yml @prodofthecentury

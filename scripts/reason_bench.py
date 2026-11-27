@@ -772,9 +772,9 @@ def _coverage_tools() -> list[tuple]:
         ("tools-cov-word-4", "What is 6 + 2 times 5?", "16", "integer", "any", "ANSWER = 16", ["should-fire", "word-operator"]),
         ("tools-cov-float-3", "Compute 5/6 + 0.5.", "4/3", "fraction", "any", fraction.format(n=4, d=3), ["should-fire", "rounded-float"]),
         ("tools-cov-mbmb-2", "What is 2 MB in Mb?", "16", "integer", "any", "ANSWER = 16", ["should-fire", "mb-to-Mb"]),
-        ("tools-cov-mbmb-3", "8 MB to Mb", "64", "integer", "any", "ANSWER = 64", ["should-fire", "mb-to-Mb"]),
+        ("tools-cov-mbmb-3", "How much is 64 MB in Mb?", "512", "integer", "any", "ANSWER = 512", ["should-fire", "mb-to-Mb"]),
         ("tools-cov-bit-2", "What is 8 b in B?", "1", "integer", "any", "ANSWER = 1", ["should-fire", "bit-to-byte"]),
-        ("tools-cov-bit-3", "3 b to B", "3/8", "fraction", "any", fraction.format(n=3, d=8), ["should-fire", "bit-to-byte"]),
+        ("tools-cov-bit-3", "Evaluate 24 b into B.", "3", "integer", "any", "ANSWER = 3", ["should-fire", "bit-to-byte"]),
         ("tools-cov-mega-1", "Convert 4 Mm to m.", "4000000", "integer", "any", "ANSWER = 4000000", ["should-fire", "mega-to-metre"]),
         ("tools-cov-mega-2", "What is 3 Mm in metres?", "3000000", "integer", "any", "ANSWER = 3000000", ["should-fire", "mega-to-metre"]),
         ("tools-cov-mega-3", "How long is 12 Mm, in metres?", "12000000", "integer", "any", "ANSWER = 12000000", ["should-fire", "mega-to-metre"]),
@@ -1745,20 +1745,57 @@ def collect_hard_failures(root: Path, *, include_mock: bool = True, recall_answe
     }
 
 
+# Fields the runners actually read. `text` and `question` are both hashed:
+# the hijack runner executes `text`, and a text-only edit must change the hash.
+HASHED_ITEM_FIELDS = ("text", "question", "answer", "answer_type", "expected_tool", "tags", "approx_ok", "reference")
+FATAL_INTEGRITY = frozenset({
+    "manifest_ok",
+    "commitment_ok",
+    "isolation",
+    "canary",
+    "harness_errors",
+    "tool_crash",
+    "engine_exception",
+})
+GATE_BASELINE = "bench/reasoning/baseline/fingerprint.json"
+OWNER_APPROVALS = "bench/reasoning/owner-approvals.json"
+
+
+def hash_item(row: dict) -> str:
+    body = {
+        "text": row.get("text"),
+        "question": row.get("question"),
+        "answer": row.get("answer"),
+        "answer_type": row.get("answer_type"),
+        "expected_tool": row.get("expected_tool"),
+        "tags": list(row.get("tags") or []),
+        "approx_ok": row.get("approx_ok"),
+        "reference": row.get("reference"),
+    }
+    return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+
+
 def item_content_hashes(root: Path) -> dict[str, str]:
-    """Stable hash of each suite item. An in-place edit changes the hash."""
+    """Stable hash of every field the runner reads, including text and question separately."""
     hashes: dict[str, str] = {}
     for rows in load_suite_items(root).values():
         for row in rows:
-            body = {
-                "question": row.get("question") or row.get("text"),
-                "answer": row.get("answer"),
-                "answer_type": row.get("answer_type"),
-                "expected_tool": row.get("expected_tool"),
-                "tags": list(row.get("tags") or []),
-            }
-            hashes[str(row["id"])] = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+            hashes[str(row["id"])] = hash_item(row)
     return hashes
+
+
+def is_integrity_tuple(row: tuple[str, str, str] | list[str]) -> bool:
+    gate, item_id = str(row[0]), str(row[1])
+    return gate in FATAL_INTEGRITY or item_id in FATAL_INTEGRITY
+
+
+def reject_integrity(tuples: list) -> None:
+    """Integrity failures are fatal. They are never a recorded or grandfathered fingerprint."""
+    bad = [tuple(row) for row in tuples if is_integrity_tuple(row)]
+    if not bad:
+        return
+    shown = " ".join(str(part) for part in bad[0])
+    raise BenchError(f"integrity failure {shown} is fatal and cannot be recorded in a fingerprint")
 
 
 def _should_fire_ids(root: Path) -> set[str]:
@@ -2316,15 +2353,17 @@ def render_summary(run: dict[str, Any]) -> str:
 
 
 def write_fingerprint(path: Path, tuples: list[tuple[str, str, str]], meta: dict[str, Any]) -> None:
+    reject_integrity(tuples)
+    # Owner approval is never stored here. --write must not fill it in.
     payload = {
         "engine_sha": meta.get("engine_sha"),
-        "sympy_available": meta.get("sympy_available"),
-        "sympy_version": meta.get("sympy_version"),
+        "item_hashes": meta.get("item_hashes") or {},
+        "recall_source": meta.get("recall_source") or "none",
         "should_fire_answered": meta.get("should_fire_answered") or [],
         "should_fire_recall": meta.get("should_fire_recall") or {},
-        "item_hashes": meta.get("item_hashes") or {},
         "suite_version": meta.get("suite_version") or SUITE_VERSION,
-        "owner_approved_suite_versions": meta.get("owner_approved_suite_versions") or [SUITE_VERSION],
+        "sympy_available": meta.get("sympy_available"),
+        "sympy_version": meta.get("sympy_version"),
         "tuples": [list(item) for item in tuples],
     }
     path.write_text(canonical_json(payload) + "\n", encoding="utf-8", newline="\n")
@@ -2341,6 +2380,20 @@ def fingerprint_added(current: list[tuple[str, str, str]], base: list[tuple[str,
     return sorted(set(current) - set(base))
 
 
+def evaluate_gates(observed: list[tuple[str, str, str]], expected: list[tuple[str, str, str]]) -> int:
+    """Integrity tuples fail even when the fingerprint lists them. Drift fails after that."""
+    try:
+        reject_integrity(observed)
+        reject_integrity(expected)
+    except BenchError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if set(expected) != set(observed):
+        print(f"fingerprint drift missing={len(set(expected) - set(observed))} extra={len(set(observed) - set(expected))}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def gates_main(root: Path) -> int:
     payload = collect_hard_failures(root, include_mock=True)
     print(f"sympy_available={payload['sympy_available']} sympy_version={payload['sympy_version']}")
@@ -2352,12 +2405,8 @@ def gates_main(root: Path) -> int:
     if not expected_path.is_file():
         print("missing expected-hard-failures.current.json", file=sys.stderr)
         return 1
-    expected = {tuple(item) for item in json.loads(expected_path.read_text(encoding="utf-8"))["tuples"]}
-    observed = set(payload["tuples"])
-    if expected != observed:
-        print(f"fingerprint drift missing={len(expected - observed)} extra={len(observed - expected)}", file=sys.stderr)
-        return 1
-    return 0
+    expected = [tuple(item) for item in json.loads(expected_path.read_text(encoding="utf-8"))["tuples"]]
+    return evaluate_gates(list(payload["tuples"]), expected)
 
 
 def compare_fingerprint(
@@ -2371,6 +2420,11 @@ def compare_fingerprint(
 ) -> int:
     expected_payload = json.loads(expect_path.read_text(encoding="utf-8"))
     expected = [tuple(item) for item in expected_payload["tuples"]]
+    try:
+        reject_integrity(expected)
+    except BenchError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     blob = engine_blob_sha(root, engine_ref or "HEAD")
     recorded = str(expected_payload.get("engine_sha") or "")
     if recorded != blob:
@@ -2463,7 +2517,8 @@ def _assert_no_suite_shrink(
         raise BenchError(f"suite item ids removed relative to the baseline: {removed[:12]}")
     base_tuples = {tuple(item) for item in baseline.get("tuples") or []}
     new_tuples = set(expected)
-    approved = {str(item) for item in baseline.get("owner_approved_suite_versions") or []}
+    # Approval lives on the base branch or a signed tag, never in the baseline file.
+    approved = owner_approved_versions(root, base_ref)
     base_version = str(baseline.get("suite_version") or "")
     current_version = str(load_manifest(root).get("suite_version") or "")
     bump_ok = bool(current_version) and current_version in approved and current_version != base_version
@@ -2474,7 +2529,7 @@ def _assert_no_suite_shrink(
         gained = [row for row in new_tuples if row[1] == item_id and row not in base_tuples]
         if (item_id in tupled or gained) and not bump_ok:
             raise BenchError(
-                f"item {item_id} changed and has HARD tuples; that needs an owner-approved suite version bump"
+                f"item {item_id} content hash changed; that needs an owner-approved suite version bump"
             )
     for gate, item_id, mode in sorted(new_tuples - base_tuples):
         if item_id in base_hashes and base_hashes.get(item_id) == tree_hashes.get(item_id):
@@ -2494,6 +2549,188 @@ def _assert_no_suite_shrink(
         current_version = str(load_manifest(root).get("suite_version") or "")
         if base_version and current_version != base_version and len(new_tuples) < len(base_tuples):
             raise BenchError("suite_version changed in a change that also removes fingerprint tuples")
+
+
+def owner_approved_versions(root: Path, base_ref: str) -> set[str]:
+    """Suite bumps are approved only from the base branch file or a verified signed tag."""
+    approved: set[str] = set()
+    if base_ref:
+        text = _git_show(root, base_ref, OWNER_APPROVALS)
+        if text:
+            payload = json.loads(text)
+            approved.update(str(item) for item in payload.get("suite_versions") or [])
+    try:
+        tags = subprocess.check_output(
+            ["git", "tag", "-l", "reason-bench-approve-*"],
+            cwd=root,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        tags = ""
+    for tag in tags.split():
+        verified = subprocess.run(
+            ["git", "verify-tag", tag],
+            cwd=root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if verified.returncode == 0:
+            approved.add(tag.removeprefix("reason-bench-approve-"))
+    return approved
+
+
+def assert_item_edits(
+    base_hashes: dict[str, str],
+    tree_hashes: dict[str, str],
+    *,
+    approved: set[str],
+    base_version: str,
+    current_version: str,
+) -> None:
+    removed = sorted(set(base_hashes) - set(tree_hashes))
+    if removed:
+        raise BenchError(f"suite item ids removed relative to the baseline: {removed[:12]}")
+    bump_ok = bool(current_version) and current_version in approved and current_version != base_version
+    for item_id in sorted(set(base_hashes) & set(tree_hashes)):
+        if base_hashes[item_id] != tree_hashes[item_id] and not bump_ok:
+            raise BenchError(
+                f"item {item_id} content hash changed; that needs an owner-approved suite version bump"
+            )
+
+
+def _extract_commit(repo: Path, ref: str) -> Path:
+    dest = Path(tempfile.mkdtemp(prefix="sb-gate-"))
+    archive = subprocess.check_output(["git", "archive", ref], cwd=repo)
+    subprocess.run(["tar", "-x", "-C", str(dest)], input=archive, check=True)
+    return dest
+
+
+def _scan_recorded_fingerprints(root: Path) -> None:
+    bench = bench_root(root)
+    for path in sorted(bench.glob("expected-hard-failures*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        reject_integrity(payload.get("tuples") or [])
+
+
+def _absolute_zero(workspace: Path, pin: str) -> int:
+    """An engine pull request passes only with zero HARD tuples under the pinned harness suite."""
+    pin_tree = _extract_commit(workspace, pin)
+    try:
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=workspace, text=True).strip()
+        load_pinned_engine(workspace, sha)
+        payload = collect_hard_failures(pin_tree, include_mock=True, recall_answered=None)
+        try:
+            reject_integrity(payload["tuples"])
+        except BenchError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if payload["tuples"]:
+            print(
+                f"absolute-zero failed: {len(payload['tuples'])} HARD tuples under pinned harness {pin}",
+                file=sys.stderr,
+            )
+            for row in payload["tuples"][:8]:
+                print(f"HARD {' '.join(row)}", file=sys.stderr)
+            return 1
+        print("absolute_zero_ok")
+        return 0
+    finally:
+        shutil.rmtree(pin_tree, ignore_errors=True)
+
+
+def gate_main(workspace: Path, base_ref: str, pin: str) -> int:
+    """Judge the workspace with the pinned harness. The baseline is regenerated, not trusted."""
+    try:
+        _scan_recorded_fingerprints(workspace)
+    except BenchError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    pr_engine = engine_blob_sha(workspace, "HEAD")
+    base_engine = engine_blob_sha(workspace, base_ref)
+    if pr_engine != base_engine:
+        return _absolute_zero(workspace, pin)
+    text = _git_show(workspace, base_ref, GATE_BASELINE)
+    if not text:
+        print(f"baseline fingerprint missing at {base_ref}:{GATE_BASELINE}; fail closed", file=sys.stderr)
+        return 2
+    baseline = json.loads(text)
+    if "owner_approved_suite_versions" in baseline:
+        print("owner approval is not read from the baseline file", file=sys.stderr)
+        return 1
+    if str(baseline.get("engine_sha") or "") != base_engine:
+        print("baseline engine_sha does not match the engine at the base commit", file=sys.stderr)
+        return 1
+    recorded = baseline.get("item_hashes")
+    if not isinstance(recorded, dict) or not recorded:
+        print("baseline fingerprint has no item_hashes; fail closed", file=sys.stderr)
+        return 2
+    if "should_fire_answered" not in baseline:
+        print("baseline fingerprint has no should_fire_answered; fail closed", file=sys.stderr)
+        return 2
+    base_tree = _extract_commit(workspace, base_ref)
+    try:
+        suite_hashes = item_content_hashes(base_tree)
+        recorded_hashes = {str(key): str(value) for key, value in recorded.items()}
+        if recorded_hashes != suite_hashes:
+            print("baseline item_hashes do not match the suite at the base commit", file=sys.stderr)
+            return 1
+        try:
+            assert_item_edits(
+                recorded_hashes,
+                item_content_hashes(workspace),
+                approved=owner_approved_versions(workspace, base_ref),
+                base_version=str(baseline.get("suite_version") or ""),
+                current_version=str(load_manifest(workspace).get("suite_version") or ""),
+            )
+        except BenchError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        load_pinned_engine(workspace, base_ref)
+        payload = collect_hard_failures(base_tree, include_mock=True, recall_answered=None)
+        try:
+            reject_integrity(payload["tuples"])
+        except BenchError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if list(baseline.get("should_fire_answered") or []) != list(payload.get("should_fire_answered") or []):
+            print("baseline should_fire_answered does not match regeneration at the base commit", file=sys.stderr)
+            return 1
+        regenerated = [list(row) for row in payload["tuples"]]
+        if list(baseline.get("tuples") or []) != regenerated:
+            print("baseline tuples do not match regeneration at the base commit", file=sys.stderr)
+            return 1
+        meta = {
+            "engine_sha": base_engine,
+            "sympy_available": payload["sympy_available"],
+            "sympy_version": payload["sympy_version"],
+            "should_fire_answered": payload.get("should_fire_answered") or [],
+            "should_fire_recall": payload.get("should_fire_recall") or {},
+            "item_hashes": payload.get("item_hashes") or {},
+            "suite_version": str(load_manifest(base_tree).get("suite_version") or SUITE_VERSION),
+            "recall_source": "none",
+        }
+        expected_body = {
+            "engine_sha": meta["engine_sha"],
+            "item_hashes": meta["item_hashes"],
+            "recall_source": "none",
+            "should_fire_answered": meta["should_fire_answered"],
+            "should_fire_recall": meta["should_fire_recall"],
+            "suite_version": meta["suite_version"],
+            "sympy_available": meta["sympy_available"],
+            "sympy_version": meta["sympy_version"],
+            "tuples": regenerated,
+        }
+        if canonical_json(baseline) != canonical_json(expected_body):
+            print("baseline does not match the fingerprint regenerated at the base commit", file=sys.stderr)
+            return 1
+        if regenerated:
+            print(f"regenerated baseline has {len(regenerated)} HARD tuples; residue is not accepted", file=sys.stderr)
+            return 1
+        print("fingerprint_ok tuples=0")
+        return 0
+    finally:
+        shutil.rmtree(base_tree, ignore_errors=True)
 
 
 def _git_show(root: Path, ref: str, path: str) -> str | None:
@@ -2628,10 +2865,17 @@ def build_parser() -> argparse.ArgumentParser:
     finger_p = sub.add_parser("fingerprint")
     finger_p.add_argument("--write", default=None)
     finger_p.add_argument("--check", default=None)
+    finger_p.add_argument("--gate", action="store_true")
+    finger_p.add_argument("--workspace", default=None)
+    finger_p.add_argument("--pin", default=None)
     finger_p.add_argument("--base-file", default=None)
     finger_p.add_argument("--base-ref", default=None)
     finger_p.add_argument("--engine-ref", default=None)
-    finger_p.add_argument("--recall-file", default=None)
+    finger_p.add_argument(
+        "--recall-file",
+        default=None,
+        help="Historical record only. The CI gate does not read this and regenerates without it.",
+    )
     seal_p = sub.add_parser("heldout-seal-templates")
     seal_p.add_argument("--in", dest="src", required=True)
     seal_p.add_argument("--out", required=True)
@@ -2690,10 +2934,15 @@ def _dispatch(args: argparse.Namespace) -> int:
                 "should_fire_answered": payload.get("should_fire_answered") or [],
                 "should_fire_recall": payload.get("should_fire_recall") or {},
                 "item_hashes": payload.get("item_hashes") or {},
+                "recall_source": args.recall_file or "none",
             }
             write_fingerprint(Path(args.write), payload["tuples"], meta)
             print(f"wrote {len(payload['tuples'])} tuples engine_sha={meta['engine_sha']}")
             return 0
+        if args.gate:
+            if not args.base_ref or not args.pin or not args.workspace:
+                raise BenchError("fingerprint --gate needs --base-ref, --pin, and --workspace")
+            return gate_main(Path(args.workspace), args.base_ref, args.pin)
         if args.check:
             base = load_fingerprint(Path(args.base_file)) if args.base_file and Path(args.base_file).is_file() else None
             return compare_fingerprint(

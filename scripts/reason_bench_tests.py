@@ -531,17 +531,94 @@ class ScoringReferenceTests(unittest.TestCase):
         cr2 = cluster_t_interval(unequal)
         cr1 = _cr1_interval(unequal)
         self.assertNotAlmostEqual(cr2[0], cr1[0], places=4)
-        self.assertAlmostEqual(cr2[0], _cr2_reference(unequal)[0], places=6)
-        self.assertAlmostEqual(cr2[1], _cr2_reference(unequal)[1], places=6)
-        # BCa formula: Efron, B. (1987), "Better Bootstrap Confidence Intervals",
-        # Journal of the American Statistical Association 82(397), 171-185, eq. (2.3).
-        replicates = [0.1, 0.2, 0.3, 0.4, 0.5]
-        biased = bca_interval(replicates, 0.0, theta=0.2)
-        self.assertEqual(biased, _bca_reference(replicates, theta=0.2, acceleration=0.0))
+        # Numeric CR2 constants for this unequal set. CR1 is a different interval.
+        self.assertAlmostEqual(cr2[0], 0.2319505887, places=9)
+        self.assertAlmostEqual(cr2[1], 0.8449724882, places=9)
+        # DiCiccio, T. J. and Efron, B. (1996), "Bootstrap Confidence Intervals",
+        # Statistical Science 11(3), 189-228. Section 2, the cd4 maximum-eigenvalue
+        # example: z0 = 0.226, acceleration a = 0.105, and the 90% BCa interval
+        # is (1.10, 3.18), the 0.157 and 0.995 quantiles of the bootstrap.
+        from statistics import NormalDist
+
+        published_z0 = 0.226
+        published_a = 0.105
+
+        def adjusted(z_alpha: float) -> float:
+            numer = published_z0 + z_alpha
+            return NormalDist().cdf(published_z0 + numer / (1.0 - published_a * numer))
+
+        self.assertAlmostEqual(adjusted(NormalDist().inv_cdf(0.05)), 0.157, places=3)
+        self.assertAlmostEqual(adjusted(NormalDist().inv_cdf(0.95)), 0.995, places=3)
+        replicates = []
+        for index in range(2000):
+            if index < 99:
+                replicates.append(0.50)
+            elif index < 312:
+                replicates.append(0.90)
+            elif index < 1179:
+                replicates.append(1.10)
+            elif index < 1900:
+                replicates.append(2.00)
+            elif index < 1989:
+                replicates.append(2.40)
+            else:
+                replicates.append(3.18)
+        biased = bca_interval(replicates, published_a, theta=1.5, alpha=0.10)
+        self.assertEqual(biased, (1.10, 3.18))
+        self.assertNotEqual(bca_interval(replicates, 0.0, theta=1.5, alpha=0.10), (1.10, 3.18))
         self.assertTrue(math.isfinite(biased[0]))
 
     def test_sealed_extension_is_forbidden_inside_heldout_results(self) -> None:
         self.assertTrue(path_is_forbidden("bench/reasoning/heldout-results/x.sbsealed"))
+
+
+class GateIntegrityTests(unittest.TestCase):
+    def test_text_only_edit_changes_the_hash_and_fails(self) -> None:
+        from scripts.reason_bench import assert_item_edits, hash_item
+
+        original = {
+            "id": "hijack-d04-dec-1",
+            "text": "10.5-12",
+            "question": "10.5-12",
+            "answer": None,
+            "answer_type": "unanswerable",
+            "expected_tool": None,
+            "tags": ["hijack", "decimal-range"],
+            "approx_ok": None,
+            "reference": "ANSWER = None",
+        }
+        edited = dict(original)
+        edited["text"] = "The kettle is blue."
+        self.assertNotEqual(hash_item(original), hash_item(edited))
+        self.assertEqual(edited["question"], original["question"])
+        with self.assertRaises(BenchError) as caught:
+            assert_item_edits(
+                {"hijack-d04-dec-1": hash_item(original)},
+                {"hijack-d04-dec-1": hash_item(edited)},
+                approved=set(),
+                base_version="2.2.0",
+                current_version="2.2.0",
+            )
+        self.assertIn("hijack-d04-dec-1", str(caught.exception))
+
+    def test_integrity_tuples_fail_gates_even_when_recorded(self) -> None:
+        from scripts.reason_bench import evaluate_gates
+
+        recorded = [("manifest_ok", "manifest", "natural"), ("harness_errors", "manifest", "natural")]
+        self.assertEqual(evaluate_gates(recorded, recorded), 1)
+        self.assertEqual(evaluate_gates([], [("tool_crash", "tools-0001", "natural")]), 1)
+
+    def test_baseline_approval_field_is_not_owner_approval(self) -> None:
+        from scripts.reason_bench import assert_item_edits
+
+        with self.assertRaises(BenchError):
+            assert_item_edits(
+                {"tools-0001": "abc"},
+                {"tools-0001": "def"},
+                approved=set(),
+                base_version="2.2.0",
+                current_version="2.3.0",
+            )
 
 
 if __name__ == "__main__":
