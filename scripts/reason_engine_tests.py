@@ -230,8 +230,7 @@ class ReasonBenchmarkTests(unittest.TestCase):
                     [{"role": "user", "content": prompt}],
                     model=model_name,
                     allow_model_fallback=False,
-                    temperature=0.1,
-                    options={"num_predict": 128},
+                    options={"temperature": 0.1, "num_predict": 128},
                 )
                 if isinstance(response, dict):
                     return str((response.get("message") or {}).get("content") or "")
@@ -242,9 +241,12 @@ class ReasonBenchmarkTests(unittest.TestCase):
             for row in rows:
                 print(
                     f"BENCH {row['id']} {row['runner']} {row['model']} correct={int(bool(row['correct']))} "
-                    f"elapsed_ms={row['elapsed_ms']} answer={str(row.get('answer') or '')[:160]!r}"
+                    f"elapsed_ms={row['elapsed_ms']} answer={str(row.get('answer') or '')[:160]!r} "
+                    f"error={str(row.get('error') or '')[:200]!r}"
                 )
         self.assertEqual(len(models), 8)
+        failed_calls = [row for row in models if row.get("error")]
+        self.assertEqual(failed_calls, [], "a required live model call did not reach Ollama")
         engine_arith = [row for row in models if row["runner"] == "engine" and row["id"] == "arith-17-23-9"]
         self.assertTrue(all(row["correct"] for row in engine_arith))
 

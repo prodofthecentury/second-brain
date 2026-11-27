@@ -362,8 +362,7 @@ def _default_model(prompt: str) -> str:
 
     response = chat_with_fallback(
         [{"role": "user", "content": prompt}],
-        temperature=0.1,
-        options={"num_predict": 256},
+        options={"temperature": 0.1, "num_predict": 256},
     )
     if isinstance(response, dict):
         return str((response.get("message") or {}).get("content") or "")
