@@ -246,6 +246,7 @@ class Phase8EcosystemAndCanvasTests(unittest.TestCase):
                 sc.chat_events(
                     "How should landing page sandbox previews bind?",
                     mode="stream",
+                    profile="fast",
                     paths=cp,
                     project_scope="project:alpha",
                     work_mode="build",

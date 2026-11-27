@@ -153,3 +153,32 @@ jobs:
             npx electron-builder --dir --publish never
           )
           uv run --frozen python scripts/run_desktop_tests.py --require-packaged --skip-unit
+
+  # Separate from the required build. continue-on-error keeps this off the required
+  # check list while it still runs the engine with SymPy installed and again without it.
+  reason-hard-gate:
+    name: reason hard gate (not required)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.12 and the locked environment
+        run: |
+          uv python install 3.12
+          uv sync --locked --python 3.12
+
+      - name: Reason engine with SymPy
+        run: uv run --frozen python -m unittest scripts.reason_engine_tests -q
+
+      - name: Reason engine without SymPy
+        run: |
+          uv pip uninstall --python .venv/bin/python sympy
+          uv run --no-sync --python .venv/bin/python -m unittest scripts.reason_engine_tests -q

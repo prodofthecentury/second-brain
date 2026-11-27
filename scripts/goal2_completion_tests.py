@@ -1084,7 +1084,7 @@ class ResearchViewAndMultiHostStreamingTests(unittest.TestCase):
             with patch.dict(os.environ, fake_env, clear=False):
                 # Test OpenAI streaming: PII redacted on wire, rehydrated locally, project:beta excluded,
                 # sentence-buffered, short uncited sentence ("Escalation is fast.") caught!
-                oa_events = list(chat_events("alpha incident contact outage", mode="stream", paths=cp, host_id="openai_online"))
+                oa_events = list(chat_events("alpha incident contact outage", mode="stream", profile="fast", paths=cp, host_id="openai_online"))
                 self.assertIn("[REDACTED_PII:email_address:1]", wire_bodies["openai_online"])
                 self.assertNotIn("alice@example.com", wire_bodies["openai_online"])
                 self.assertNotIn("bob@beta.internal", wire_bodies["openai_online"])
@@ -1099,7 +1099,7 @@ class ResearchViewAndMultiHostStreamingTests(unittest.TestCase):
 
                 # Test Anthropic, Gemini, and owner_custom_local hosts
                 for hid in ("anthropic_online", "gemini_online", "owner_custom_local"):
-                    evs = list(chat_events("alpha incident contact outage", mode="stream", paths=cp, host_id=hid))
+                    evs = list(chat_events("alpha incident contact outage", mode="stream", profile="fast", paths=cp, host_id=hid))
                     text_out = "".join(str(e["text"]) for e in evs if e["type"] == "token")
                     self.assertIn("alice@example.com", text_out)
                     g = next(e for e in evs if e["type"] == "grounding")
@@ -1112,6 +1112,7 @@ class ResearchViewAndMultiHostStreamingTests(unittest.TestCase):
                     chat_events(
                         "alpha outage using token sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
                         mode="stream",
+                        profile="fast",
                         paths=cp,
                         host_id="openai_online",
                     )

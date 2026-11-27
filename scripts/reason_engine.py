@@ -13,8 +13,10 @@ import json
 import operator
 import os
 import re
+import threading
 import time
 from datetime import date, timedelta
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
 
@@ -55,9 +57,6 @@ _UNIT_ALIASES = {
     "second": "s", "seconds": "s", "minute": "min", "minutes": "min",
     "celsius": "c", "fahrenheit": "f",
 }
-_EXPR_RE = re.compile(
-    r"(?<![A-Za-z0-9])([+\-]?\d+(?:\.\d+)?(?:\s*[+\-*/%^]\s*[+\-]?\d+(?:\.\d+)?)+)"
-)
 
 
 def load_config() -> dict[str, Any]:
@@ -100,32 +99,73 @@ def budget_for(profile: str | None) -> dict[str, float]:
 def server_instructions() -> str:
     note = load_config()["latency_note"]
     return (
-        "Deep reasoning is the default. For a question, a plan, or a build, call reason before you answer. "
+        "Use this brain's tools and memory for the owner's notes. "
+        "Do not route your own reasoning through the local reason tool before every plan or build. "
+        "Deep reasoning is the default for this brain's own chat and for callers that use the reason tool. "
         "Omit profile to use deep. Pass profile fast only when the caller explicitly wants the smaller budget. "
-        "Use the tool result for arithmetic, dates, and units instead of guessing. "
-        "If reason abstains, say the answer was not verified. "
+        "The reason tool checks arithmetic, dates, and units. "
+        "A result is verified only when an independent check says so; otherwise say it was not verified. "
         + note
     )
 
 
+def _format_fraction(numer: int, denom: int) -> str:
+    if denom < 0:
+        numer, denom = -numer, -denom
+    if denom == 0:
+        raise ValueError("non-finite result")
+    if denom == 1:
+        return str(numer)
+    return f"{numer}/{denom}"
+
+
 def _format_number(value: Any) -> str:
+    """One format for SymPy values and for the restricted evaluator.
+
+    Exact ratios stay as fractions. 2/3 is not a rounded decimal.
+    """
     if isinstance(value, bool):
         raise ValueError("not a number")
+    if isinstance(value, Fraction):
+        return _format_fraction(value.numerator, value.denominator)
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        if not value == value or value in {float("inf"), float("-inf")}:  # NaN / inf
+        if value != value or value in {float("inf"), float("-inf")}:
             raise ValueError("non-finite result")
         if value.is_integer():
             return str(int(value))
         return format(value, ".12g")
-    if getattr(value, "is_integer", False) and bool(value.is_integer):
-        return str(int(value))
-    return str(value)
+    as_numer_denom = getattr(value, "as_numer_denom", None)
+    if getattr(value, "is_rational", None) is True and callable(as_numer_denom):
+        numer, denom = as_numer_denom()
+        return _format_fraction(int(numer), int(denom))
+    is_integer = getattr(value, "is_integer", None)
+    if isinstance(is_integer, bool) or callable(is_integer):
+        integer = is_integer() if callable(is_integer) else is_integer
+        if integer:
+            return str(int(value))
+        number = float(value)
+        if number != number or number in {float("inf"), float("-inf")}:
+            raise ValueError("non-finite result")
+        if number.is_integer():
+            return str(int(number))
+        return format(number, ".12g")
+    raise ValueError("not a number")
 
 
-def _eval_node(node: ast.AST) -> float | int:
+def _as_fraction(value: Any) -> Fraction | None:
+    if isinstance(value, Fraction):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return Fraction(value)
+    return None
+
+
+def _eval_node(node: ast.AST) -> Fraction | float | int:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        if isinstance(node.value, int):
+            return Fraction(node.value)
         return node.value
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         return -_eval_node(node.operand)
@@ -133,14 +173,26 @@ def _eval_node(node: ast.AST) -> float | int:
         left = _eval_node(node.left)
         right = _eval_node(node.right)
         if isinstance(node.op, ast.Pow):
-            if isinstance(right, float) or abs(float(right)) > 8:
+            exponent = _as_fraction(right)
+            if exponent is None or exponent.denominator != 1 or abs(exponent.numerator) > _MAX_EXPONENT:
                 raise ValueError("exponent is too large")
+            return left ** exponent.numerator
+        if isinstance(node.op, ast.Div):
+            if right == 0:
+                raise ZeroDivisionError("division by zero")
+            left_exact = _as_fraction(left)
+            right_exact = _as_fraction(right)
+            if left_exact is not None and right_exact is not None:
+                return left_exact / right_exact
         return _OPS[type(node.op)](left, right)
     raise ValueError("expression is not allowed")
 
 
-def _ast_eval(expr: str) -> float | int:
-    tree = ast.parse(expr, mode="eval")
+def _ast_eval(expr: str) -> Fraction | float | int:
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("expression is not plain arithmetic") from exc
     return _eval_node(tree.body)
 
 
@@ -153,57 +205,163 @@ def _sympy_value(expr: str) -> Any:
     return value
 
 
-def exact_arithmetic(expr: str) -> tuple[str, str]:
-    cleaned = expr.replace("^", "**").replace(" ", "")
-    if len(cleaned) > 80 or not re.fullmatch(r"[0-9+\-*/%.()]+", cleaned):
+_COMPUTE_INTENT_RE = re.compile(
+    r"\b(?:what(?:'s| is)|calculate|compute|evaluate|how much is|solve)\b",
+    re.IGNORECASE,
+)
+_ORDINARY_HYPHEN_RE = re.compile(r"^\d+-\d+$")
+_ORDINARY_SLASH_RE = re.compile(r"^\d+/\d+(?:/\d+)?$")
+_MAX_EXPONENT = 20
+
+
+def _normalize_operators(text: str) -> str:
+    cleaned = text.replace("×", "*").replace("·", "*").replace("∙", "*")
+    cleaned = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", "*", cleaned)
+    cleaned = cleaned.replace("^", "**")
+    return cleaned
+
+
+def _balanced(expr: str) -> bool:
+    depth = 0
+    for char in expr:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _prepare_expression(expr: str) -> str:
+    cleaned = re.sub(r"\s+", "", _normalize_operators(expr))
+    if re.fullmatch(r"\d+(?:\.\d+)?%", cleaned):
+        cleaned = f"({cleaned[:-1]})/100"
+    if len(cleaned) > 80 or not re.fullmatch(r"[0-9+\-*/%.()**]+", cleaned) or not _balanced(cleaned):
         raise ValueError("expression is not plain arithmetic")
+    if re.search(r"(?<![\d.])0\d", cleaned):
+        raise ValueError("expression is not plain arithmetic")
+    if not re.search(r"[+\-*/%]|(\*\*)", cleaned):
+        raise ValueError("expression has no operator")
     for power in re.finditer(r"\*\*(\d+)", cleaned):
-        if int(power.group(1)) > 8:
+        if int(power.group(1)) > _MAX_EXPONENT:
             raise ValueError("exponent is too large")
     try:
-        value = _sympy_value(cleaned)
-        return _format_number(value), "sympy"
+        ast.parse(cleaned, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError("expression is not plain arithmetic") from exc
+    return cleaned
+
+
+def _ordinary_number_text(expr: str) -> bool:
+    """Phone numbers, dates, and year ranges are not arithmetic unless the caller asks to compute."""
+    compact = re.sub(r"\s+", "", expr)
+    if _ORDINARY_HYPHEN_RE.fullmatch(compact):
+        return True
+    if _ORDINARY_SLASH_RE.fullmatch(compact):
+        return True
+    return False
+
+
+def _is_whole_expression(text: str) -> bool:
+    try:
+        _prepare_expression(text)
+    except ValueError:
+        return False
+    return True
+
+
+def exact_arithmetic(expr: str) -> tuple[str, str, bool]:
+    """Return (text, answer_source, verified). Verified only when SymPy and the AST agree."""
+    cleaned = _prepare_expression(expr)
+    try:
+        restricted = _format_number(_ast_eval(cleaned))
+    except SyntaxError as exc:
+        raise ValueError("expression is not plain arithmetic") from exc
+    try:
+        symbolic = _format_number(_sympy_value(cleaned))
     except ImportError:
-        return _format_number(_ast_eval(cleaned)), "arithmetic"
-    except Exception:
-        return _format_number(_ast_eval(cleaned)), "arithmetic"
+        return restricted, "tool:calculator", False
+    except (ValueError, ZeroDivisionError, OverflowError, SyntaxError):
+        raise
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+    if symbolic != restricted:
+        raise ValueError("calculator mismatch")
+    return symbolic, "tool:sympy", True
 
 
 def extract_expression(question: str) -> str | None:
-    cleaned = re.sub(r"\d{4}-\d{2}-\d{2}", " ", question)
-    match = _EXPR_RE.search(cleaned)
+    """An expression is used only for an explicit compute request or a whole-expression question."""
+    raw = str(question or "").strip()
+    if not raw:
+        return None
+    intent = bool(_COMPUTE_INTENT_RE.search(raw))
+    body = _COMPUTE_INTENT_RE.sub(" ", raw)
+    body = re.sub(r"\d{4}-\d{2}-\d{2}", " ", body)
+    body = body.strip().rstrip("?.!").strip()
+    candidate = re.sub(r"\s+", "", _normalize_operators(body))
+    if _is_whole_expression(candidate):
+        if not intent and _ordinary_number_text(candidate):
+            return None
+        return candidate
+    if not intent:
+        return None
+    match = re.search(r"\(?\d[\d+\-*/%.()\s*^×xX·]*\d\)?", body)
     if not match:
         return None
-    expr = re.sub(r"\s+", "", match.group(1))
-    if not re.search(r"[+\-*/%^]", expr):
+    found = re.sub(r"\s+", "", _normalize_operators(match.group(0)))
+    if not _is_whole_expression(found):
+        return None
+    if not intent and _ordinary_number_text(found):
+        return None
+    return found
+
+
+def word_problem_expression(question: str) -> str | None:
+    """Only a question whose every number is consumed by one exact pattern. Extra clauses do not match."""
+    text = re.sub(r"\s+", " ", str(question or "")).strip()
+    if re.search(r"\b(?:half|eats?|sells?|divided|splits?)\b", text, re.IGNORECASE):
+        return None
+    times = re.fullmatch(
+        r"(?:what is |calculate |compute )?(\d+)\s+times\s+(\d+)\s*\??",
+        text,
+        re.IGNORECASE,
+    )
+    if times and not re.search(r"\b(?:plus|minus|boxes|groups|packs)\b", text, re.IGNORECASE):
+        return f"{int(times.group(1))}*{int(times.group(2))}"
+    if re.search(r"\btimes\b", text, re.IGNORECASE):
+        return None
+    grouped = re.search(r"(\d+)\s+(?:boxes|groups|packs)\s+of\s+(\d+)", text, re.IGNORECASE)
+    if not grouped:
+        return None
+    used = [grouped.group(1), grouped.group(2)]
+    expr = f"{int(grouped.group(1))}*{int(grouped.group(2))}"
+    more = re.search(r"(\d+)\s+more\b", text, re.IGNORECASE)
+    fewer = re.search(r"(\d+)\s+(?:fewer|less)\b", text, re.IGNORECASE)
+    if more and fewer:
+        return None
+    if more:
+        used.append(more.group(1))
+        expr += f"+{int(more.group(1))}"
+    elif fewer:
+        used.append(fewer.group(1))
+        expr += f"-{int(fewer.group(1))}"
+    if sorted(re.findall(r"\d+", text)) != sorted(used):
         return None
     return expr
 
 
-def word_problem_expression(question: str) -> str | None:
-    grouped = re.search(r"(\d+)\s+(?:boxes|groups|packs)\s+of\s+(\d+)", question, re.I)
-    times = re.search(r"(\d+)\s+times\s+(\d+)", question, re.I)
-    if grouped:
-        total = int(grouped.group(1)) * int(grouped.group(2))
-    elif times:
-        total = int(times.group(1)) * int(times.group(2))
-    else:
-        return None
-    more = re.search(r"(\d+)\s+more", question, re.I)
-    fewer = re.search(r"(\d+)\s+(?:fewer|less)", question, re.I)
-    if more:
-        total += int(more.group(1))
-    if fewer:
-        total -= int(fewer.group(1))
-    return str(total)
-
-
-def _date_answer(question: str) -> str | None:
+def _date_pair(question: str) -> tuple[str, str] | None:
+    """Two independent date calculations. They must agree before the result is verified."""
     try:
         after = re.search(r"(\d+)\s+days?\s+after\s+(\d{4}-\d{2}-\d{2})", question, re.I)
         if after:
             start = date.fromisoformat(after.group(2))
-            return (start + timedelta(days=int(after.group(1)))).isoformat()
+            days = int(after.group(1))
+            by_delta = (start + timedelta(days=days)).isoformat()
+            by_ordinal = date.fromordinal(start.toordinal() + days).isoformat()
+            return by_delta, by_ordinal
         between = re.search(
             r"days?\s+between\s+(\d{4}-\d{2}-\d{2})\s+and\s+(\d{4}-\d{2}-\d{2})",
             question,
@@ -212,10 +370,19 @@ def _date_answer(question: str) -> str | None:
         if between:
             left = date.fromisoformat(between.group(1))
             right = date.fromisoformat(between.group(2))
-            return str(abs((right - left).days))
+            by_delta = str(abs((right - left).days))
+            by_ordinal = str(abs(right.toordinal() - left.toordinal()))
+            return by_delta, by_ordinal
     except ValueError:
         return None
     return None
+
+
+def _date_answer(question: str) -> str | None:
+    pair = _date_pair(question)
+    if pair is None or pair[0] != pair[1]:
+        return None
+    return pair[0]
 
 
 def _canon_unit(raw: str) -> str:
@@ -253,11 +420,26 @@ def _unit_answer(question: str) -> str | None:
             value = amount
         else:
             return None
-        return _format_number(value)
+        forward = _format_number(value)
+        if src == dst:
+            back = float(forward)
+        elif src == "c" and dst == "f":
+            back = (float(forward) - 32.0) * 5.0 / 9.0
+        elif src == "f" and dst == "c":
+            back = float(forward) * 9.0 / 5.0 + 32.0
+        else:
+            return None
+        if abs(back - amount) > 1e-6:
+            return None
+        return forward
     for table in (_LENGTH_TO_M, _MASS_TO_G, _TIME_TO_S, _BYTES):
         if src in table and dst in table:
             value = amount * table[src] / table[dst]
-            return _format_number(value)
+            forward = _format_number(value)
+            back = float(forward) * table[dst] / table[src]
+            if abs(back - amount) > max(1e-6, abs(amount) * 1e-9):
+                return None
+            return forward
     return None
 
 
@@ -276,54 +458,66 @@ def classify(question: str) -> str:
 
 
 def try_exact_tool(question: str) -> dict[str, Any] | None:
-    """Solve a question with a tool, or return None when no exact tool applies."""
-    kind = classify(question)
-    if kind == "date":
-        answer = _date_answer(question)
-        if answer is None or _date_answer(question) != answer:
-            return None
-        return _tool_result(question, "date", answer, "datetime", f"date math -> {answer}")
-    if kind == "unit":
+    """Solve a question with a tool, return a refusal, or None when no exact tool applies."""
+    if _date_pair(question) is not None:
+        pair = _date_pair(question)
+        if pair is None or pair[0] != pair[1]:
+            return {"refused": True, "problem_type": "date"}
+        return _tool_result(question, "date", pair[0], "tool:date", f"date math -> {pair[0]}", verified=True)
+    if _unit_answer(question) is not None:
         answer = _unit_answer(question)
-        if answer is None or _unit_answer(question) != answer:
+        if answer is None:
+            return {"refused": True, "problem_type": "unit"}
+        return _tool_result(question, "unit", answer, "tool:unit", f"unit conversion -> {answer}", verified=True)
+    expr = extract_expression(question)
+    if expr:
+        try:
+            value, source, verified = exact_arithmetic(expr)
+        except (SyntaxError, ValueError) as exc:
+            if isinstance(exc, SyntaxError) or "not plain arithmetic" in str(exc):
+                return None
+            return {"refused": True, "problem_type": "math"}
+        except (ZeroDivisionError, OverflowError):
+            return {"refused": True, "problem_type": "math"}
+        return _tool_result(question, "math", value, source, f"{expr} = {value}", verified=verified)
+    word = word_problem_expression(question)
+    if word:
+        try:
+            value, source, verified = exact_arithmetic(word)
+        except (SyntaxError, ValueError, ZeroDivisionError, OverflowError):
             return None
-        return _tool_result(question, "unit", answer, "unit-table", f"unit conversion -> {answer}")
-    if kind == "math":
-        expr = extract_expression(question)
-        if expr:
-            try:
-                value, backend = exact_arithmetic(expr)
-                again, _backend = exact_arithmetic(expr)
-            except (ValueError, ZeroDivisionError, OverflowError):
-                return None
-            if value != again:
-                return None
-            return _tool_result(question, "math", value, backend, f"{expr} = {value}")
-        word = word_problem_expression(question)
-        if word and re.fullmatch(r"-?\d+", word):
-            return _tool_result(question, "math", word, "word-template", f"template -> {word}")
+        return _tool_result(question, "math", value, source, f"{word} = {value}", verified=verified)
     return None
 
 
-def _tool_result(question: str, kind: str, answer: str, backend: str, detail: str) -> dict[str, Any]:
+def _tool_result(
+    question: str,
+    kind: str,
+    answer: str,
+    answer_source: str,
+    detail: str,
+    *,
+    verified: bool,
+) -> dict[str, Any]:
     step = {
         "tool": kind,
-        "status": "verified",
+        "status": "verified" if verified else "unchecked",
         "input": question[:500],
         "output": answer,
-        "backend": backend,
+        "answer_source": answer_source,
     }
     return {
         "answer": answer,
+        "answer_source": answer_source,
         "abstained": False,
         "problem_type": kind,
         "steps": [step],
         "tool_calls": [step],
-        "citations": [{"source": f"tool:{kind}", "detail": detail}],
-        "confidence": 1.0,
-        "backend": backend,
+        "citations": [{"source": answer_source, "detail": detail}],
+        "confidence": 1.0 if verified else 0.0,
+        "backend": answer_source,
         "model_calls": 0,
-        "verified": True,
+        "verified": verified,
     }
 
 
@@ -342,19 +536,50 @@ def run_python_checks(code: str, tests: str, *, timeout_s: float = 5.0) -> dict[
         return {"ok": False, "error": str(exc), "result": None, "stdout": ""}
 
 
+_NUMBER_TOKEN_RE = re.compile(r"(?<![\d.])\d+(?:\.\d+)?(?!\d)")
+_REFUSAL_RE = re.compile(
+    r"\b(?:i don't know|i do not know|i dont know|i'm not sure|i am not sure|"
+    r"cannot verify|can't verify|i can't|i cannot|no information|not enough information|"
+    r"i have no|unsure)\b",
+    re.IGNORECASE,
+)
+
+
 def _numbers_in(text: str) -> list[str]:
-    return re.findall(r"\d+(?:\.\d+)?", text)
+    """Whole number tokens. '20' does not match inside '2026'."""
+    return _NUMBER_TOKEN_RE.findall(str(text or ""))
+
+
+def _is_refusal(text: str) -> bool:
+    return bool(_REFUSAL_RE.search(str(text or "")))
+
+
+def _memory_blob(item: dict[str, Any]) -> str:
+    return "\n".join(str(item.get(key) or "") for key in ("claim", "evidence", "title"))
+
+
+def _overlaps_memory(answer: str, sources: list[dict[str, Any]]) -> bool:
+    answer_terms = {token for token in re.findall(r"[a-z0-9]+", answer.casefold()) if len(token) >= 3}
+    if not answer_terms:
+        return False
+    for item in sources:
+        claim_terms = {token for token in re.findall(r"[a-z0-9]+", _memory_blob(item).casefold()) if len(token) >= 3}
+        if answer_terms & claim_terms:
+            return True
+    return False
 
 
 def unsupported_numbers(answer: str, sources: list[dict[str, Any]]) -> list[str]:
-    blob = "\n".join(
-        f"{item.get('claim', '')}\n{item.get('evidence', '')}\n{item.get('title', '')}" for item in sources
-    )
-    missing = []
-    for number in _numbers_in(answer):
-        if number not in blob and number.lstrip("0") not in blob:
-            missing.append(number)
-    return missing
+    """Numbers in the answer that are not whole tokens in retrieved memory.
+
+    An empty source list does not reject the answer. The caller leaves it unverified.
+    """
+    if not sources:
+        return []
+    known: set[str] = set()
+    for item in sources:
+        known.update(_numbers_in(_memory_blob(item)))
+    return [number for number in _numbers_in(answer) if number not in known]
 
 
 def _default_model(prompt: str) -> str:
@@ -362,6 +587,7 @@ def _default_model(prompt: str) -> str:
 
     response = chat_with_fallback(
         [{"role": "user", "content": prompt}],
+        allow_model_fallback=False,
         options={"temperature": 0.1, "num_predict": 256},
     )
     if isinstance(response, dict):
@@ -369,12 +595,25 @@ def _default_model(prompt: str) -> str:
     return str(response or "")
 
 
+def _budget_expired(state: dict[str, Any]) -> bool:
+    """True once the profile budget, including the 180s deep budget, is spent."""
+    limit = float(state["budget"]["timeout_s"])
+    return (time.perf_counter() - state["started"]) > limit
+
+
 def _call_model(model_fn: Callable[[str], str] | None, prompt: str, state: dict[str, Any]) -> str:
+    """One model call on a worker thread, bounded by the time still left in the budget."""
     budget = state["budget"]
     if state["model_calls"] >= int(budget["max_model_calls"]):
-        raise RuntimeError("model call budget is spent")
-    if time.perf_counter() - state["started"] > float(budget["timeout_s"]):
-        raise RuntimeError("reasoning timeout")
+        state["errors"].append("model call budget is spent")
+        return ""
+    if _budget_expired(state):
+        state["errors"].append("reasoning timeout")
+        return ""
+    remaining = float(budget["timeout_s"]) - (time.perf_counter() - state["started"])
+    if remaining <= 0:
+        state["errors"].append("reasoning timeout")
+        return ""
     fn = model_fn
     if fn is None:
         if not state.get("allow_default_model"):
@@ -382,11 +621,24 @@ def _call_model(model_fn: Callable[[str], str] | None, prompt: str, state: dict[
             return ""
         fn = _default_model
     state["model_calls"] += 1
-    try:
-        return str(fn(prompt) or "")
-    except Exception as exc:
-        state["errors"].append(str(exc))
+    box: dict[str, str] = {}
+
+    def _run() -> None:
+        try:
+            box["text"] = str(fn(prompt) or "")
+        except Exception as exc:
+            box["error"] = str(exc)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(remaining)
+    if worker.is_alive():
+        state["errors"].append("reasoning timeout")
         return ""
+    if "error" in box:
+        state["errors"].append(box["error"])
+        return ""
+    return box.get("text", "")
 
 
 def _parse_plan(text: str) -> dict[str, Any] | None:
@@ -438,6 +690,96 @@ def _model_plan(question: str, model_fn: Callable[[str], str] | None, state: dic
     return plan
 
 
+def _execute_plan_step(step: dict[str, Any], question: str) -> dict[str, Any] | None:
+    """Run one planned tool step. Calculator input must itself be a safe expression."""
+    tool = str(step.get("tool") or "").strip().lower()
+    raw = str(step.get("input") or "").strip() or question
+    if tool in {"calculator", "math"}:
+        expr = raw if _is_whole_expression(re.sub(r"\s+", "", _normalize_operators(raw))) else extract_expression(raw)
+        if not expr:
+            return None
+        try:
+            value, source, verified = exact_arithmetic(expr)
+        except (SyntaxError, ValueError, ZeroDivisionError, OverflowError):
+            return None
+        solved = _tool_result(raw, "math", value, source, f"{expr} = {value}", verified=verified)
+        solved["answer_source"] = "model+tool_verified" if verified else source
+        return solved
+    if tool == "date":
+        pair = _date_pair(raw)
+        if pair and pair[0] == pair[1]:
+            return _tool_result(raw, "date", pair[0], "tool:date", f"date math -> {pair[0]}", verified=True)
+    if tool == "unit":
+        answer = _unit_answer(raw)
+        if answer is not None:
+            return _tool_result(raw, "unit", answer, "tool:unit", f"unit conversion -> {answer}", verified=True)
+    return None
+
+
+def _abstain(kind: str, steps: list[dict[str, Any]], sources: list[dict[str, Any]], plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    body = {
+        "answer": ABSTAIN,
+        "answer_source": "abstain",
+        "abstained": True,
+        "problem_type": kind,
+        "steps": steps,
+        "tool_calls": [],
+        "citations": [_citation(item) for item in sources],
+        "confidence": 0.0,
+        "backend": None,
+        "verified": False,
+    }
+    if plan is not None:
+        body["plan"] = plan
+    return body
+
+
+def _model_answer(
+    draft: str,
+    *,
+    kind: str,
+    sources: list[dict[str, Any]],
+    steps: list[dict[str, Any]],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    text = draft.strip()
+    missing = unsupported_numbers(text, sources)
+    refusal = _is_refusal(text)
+    if not text or missing or refusal:
+        return _abstain(kind, steps + [{"tool": "model", "status": "rejected"}], sources, plan)
+    verified = bool(sources) and _overlaps_memory(text, sources) and not missing and not refusal
+    return {
+        "answer": text,
+        "answer_source": "memory" if verified else "model",
+        "abstained": False,
+        "problem_type": kind,
+        "steps": steps + [{"tool": "model", "status": "verified" if verified else "unchecked"}],
+        "tool_calls": [],
+        "citations": [_citation(item) for item in sources],
+        "confidence": 0.6 if verified else 0.0,
+        "backend": None,
+        "verified": verified,
+        "plan": plan,
+    }
+
+
+def _safe_abstain(question: str, profile: str | None, exc: BaseException) -> dict[str, Any]:
+    """A caller always gets a result dict. A bad question does not raise."""
+    try:
+        budget = budget_for(profile)
+    except ValueError:
+        budget = {"name": "deep", **_PROFILES["deep"]}
+    started = time.perf_counter()
+    state: dict[str, Any] = {
+        "budget": budget,
+        "model_calls": 0,
+        "started": started,
+        "errors": [f"{exc.__class__.__name__}: {exc}"],
+        "allow_default_model": False,
+    }
+    return _finish(_abstain(classify(str(question or "")), [], [], None), budget, state, started)
+
+
 def reason(
     question: str,
     *,
@@ -446,10 +788,50 @@ def reason(
     retriever: Callable[[str], list[dict[str, Any]]] | None = None,
     tests: str | None = None,
     atoms_dir: str | None = None,
+    index_path: str | None = None,
+    chroma_path: str | None = None,
     delegate_fn: Callable[[], list[dict[str, Any]]] | None = None,
     use_default_model: bool = False,
 ) -> dict[str, Any]:
-    """Run one question. Profile defaults to deep. A delegate is the existing chat path."""
+    """Run one question. Profile defaults to deep. A delegate is the existing chat path.
+
+    Question text never raises. Unparseable input stays on the non-tool path.
+    An invalid profile name still raises ValueError.
+    """
+    try:
+        budget_for(profile)
+    except ValueError:
+        raise
+    try:
+        return _reason(
+            question,
+            profile=profile,
+            model_fn=model_fn,
+            retriever=retriever,
+            tests=tests,
+            atoms_dir=atoms_dir,
+            index_path=index_path,
+            chroma_path=chroma_path,
+            delegate_fn=delegate_fn,
+            use_default_model=use_default_model,
+        )
+    except Exception as exc:
+        return _safe_abstain(question, profile, exc)
+
+
+def _reason(
+    question: str,
+    *,
+    profile: str | None = None,
+    model_fn: Callable[[str], str] | None = None,
+    retriever: Callable[[str], list[dict[str, Any]]] | None = None,
+    tests: str | None = None,
+    atoms_dir: str | None = None,
+    index_path: str | None = None,
+    chroma_path: str | None = None,
+    delegate_fn: Callable[[], list[dict[str, Any]]] | None = None,
+    use_default_model: bool = False,
+) -> dict[str, Any]:
     started = time.perf_counter()
     budget = budget_for(profile)
     state: dict[str, Any] = {
@@ -458,26 +840,33 @@ def reason(
         "started": started,
         "errors": [],
         "allow_default_model": bool(use_default_model),
+        "index_path": index_path,
+        "chroma_path": chroma_path,
     }
     text = str(question or "").strip()
     if not text:
-        raise ValueError("question is empty")
-    solved = try_exact_tool(text)
-    if solved is not None and not tests:
+        return _finish(_abstain("other", [], [], None), budget, state, started)
+    if _budget_expired(state):
+        state["errors"].append("reasoning timeout")
+        return _finish(_abstain("other", [], [], None), budget, state, started)
+    solved = None if tests else try_exact_tool(text)
+    tool_refused = bool(solved and solved.get("refused"))
+    if solved is not None and not tool_refused:
         return _finish(solved, budget, state, started)
     kind = "code" if tests else classify(text)
     if tests:
         return _finish(_solve_code(text, tests, model_fn if model_fn or use_default_model else model_fn, state), budget, state, started)
-    if delegate_fn is not None and kind in {"other", "planning", "code"}:
+    if delegate_fn is not None and kind in {"other", "planning", "code"} and not tool_refused:
         events = list(delegate_fn())
         trace = {
             "answer": _answer_from_events(events),
+            "answer_source": "model",
             "abstained": any(event.get("type") == "abstain" for event in events),
             "problem_type": kind,
             "steps": [{"tool": "grounded_chat", "status": "delegated", "input": text[:500]}],
             "tool_calls": [],
             "citations": _citations_from_events(events),
-            "confidence": 0.5,
+            "confidence": 0.0,
             "backend": None,
             "verified": False,
             "events": events,
@@ -485,65 +874,59 @@ def reason(
         }
         return _finish(trace, budget, state, started)
     sources = _retrieve(text, retriever, atoms_dir, state)
-    plan = _model_plan(text, model_fn if (model_fn or use_default_model) else None, state) if (model_fn or use_default_model) else _heuristic_plan(kind)
-    if not (model_fn or use_default_model):
-        abstained = {
-            "answer": ABSTAIN,
-            "abstained": True,
-            "problem_type": kind,
-            "steps": plan.get("steps") or [],
-            "tool_calls": [],
-            "citations": [_citation(item) for item in sources],
-            "confidence": 0.0,
-            "backend": None,
-            "verified": False,
-            "plan": plan,
-        }
-        return _finish(abstained, budget, state, started)
+    can_model = bool(model_fn or use_default_model)
+    if tool_refused and can_model:
+        draft = _call_model(model_fn, f"Answer the question in one or two sentences.\nQuestion: {text[:1500]}", state)
+        if draft.strip() and not _is_refusal(draft):
+            return _finish(_model_answer(draft, kind=kind, sources=[], steps=[], plan={"problem_type": kind, "steps": [], "planner": "tool-refused"}), budget, state, started)
+        return _finish(_abstain(kind, [], sources, None), budget, state, started)
+    plan = _model_plan(text, model_fn if can_model else None, state) if can_model else _heuristic_plan(kind)
+    executed: list[dict[str, Any]] = []
+    for step in plan.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        hit = _execute_plan_step(step, text)
+        executed.append({
+            "tool": step.get("tool"),
+            "status": "done" if hit else "skipped",
+            "input": str(step.get("input") or "")[:300],
+            "output": None if not hit else hit.get("answer"),
+        })
+        if hit and hit.get("answer"):
+            hit["plan"] = plan
+            hit["steps"] = executed
+            return _finish(hit, budget, state, started)
+    if _budget_expired(state):
+        state["errors"].append("reasoning timeout")
+        return _finish(_abstain(kind, executed, sources, plan), budget, state, started)
+    if not can_model:
+        return _finish(_abstain(kind, executed or list(plan.get("steps") or []), sources, plan), budget, state, started)
     source_block = "\n".join(f"[{item.get('atom_id', 'S')}] {item.get('claim', '')}" for item in sources) or "(no retrieved memory)"
-    prompt = (
-        "Answer in one or two sentences using only the memory below. "
-        "Do not add a number that is not in the memory. If the memory is not enough, say you cannot verify it.\n"
-        f"Memory:\n{source_block[:4000]}\nQuestion: {text[:1500]}"
-    )
+    if sources:
+        prompt = (
+            "Answer in one or two sentences using only the memory below. "
+            "Do not add a number that is not in the memory. If the memory is not enough, say you cannot verify it.\n"
+            f"Memory:\n{source_block[:4000]}\nQuestion: {text[:1500]}"
+        )
+    else:
+        prompt = f"Answer the question in one or two sentences.\nQuestion: {text[:1500]}"
     draft = _call_model(model_fn, prompt, state)
-    missing = unsupported_numbers(draft, sources) if sources else _numbers_in(draft)
+    missing = unsupported_numbers(draft, sources)
     retries = 0
-    while missing and retries < int(budget["max_retries"]) and state["model_calls"] < int(budget["max_model_calls"]):
+    while missing and sources and retries < int(budget["max_retries"]) and state["model_calls"] < int(budget["max_model_calls"]):
         retries += 1
         draft = _call_model(
             model_fn,
             prompt + f"\nThe previous answer used numbers that are not in memory: {', '.join(missing)}. Fix it or say you cannot verify it.",
             state,
         )
-        missing = unsupported_numbers(draft, sources) if sources else _numbers_in(draft)
-    if not draft.strip() or missing or "cannot verify" in draft.lower():
-        body = {
-            "answer": ABSTAIN,
-            "abstained": True,
-            "problem_type": plan.get("problem_type") or kind,
-            "steps": [{"tool": "retrieve", "status": "done", "output": str(len(sources))}, {"tool": "model", "status": "rejected"}],
-            "tool_calls": [],
-            "citations": [_citation(item) for item in sources],
-            "confidence": 0.0,
-            "backend": None,
-            "verified": False,
-            "plan": plan,
-        }
-        return _finish(body, budget, state, started)
-    body = {
-        "answer": draft.strip(),
-        "abstained": False,
-        "problem_type": plan.get("problem_type") or kind,
-        "steps": [{"tool": "retrieve", "status": "done", "output": str(len(sources))}, {"tool": "model", "status": "verified"}],
-        "tool_calls": [],
-        "citations": [_citation(item) for item in sources],
-        "confidence": 0.6 if sources else 0.3,
-        "backend": None,
-        "verified": bool(sources),
-        "plan": plan,
-    }
-    return _finish(body, budget, state, started)
+        missing = unsupported_numbers(draft, sources)
+    return _finish(
+        _model_answer(draft, kind=plan.get("problem_type") or kind, sources=sources, steps=executed, plan=plan),
+        budget,
+        state,
+        started,
+    )
 
 
 def _solve_code(question: str, tests: str, model_fn: Callable[[str], str] | None, state: dict[str, Any]) -> dict[str, Any]:
@@ -572,6 +955,7 @@ def _solve_code(question: str, tests: str, model_fn: Callable[[str], str] | None
             "citations": [{"source": "tool:python", "detail": "tests failed"}],
             "confidence": 0.0,
             "backend": "sandbox",
+            "answer_source": "abstain",
             "verified": False,
         }
     return {
@@ -583,6 +967,7 @@ def _solve_code(question: str, tests: str, model_fn: Callable[[str], str] | None
         "citations": [{"source": "tool:python", "detail": "sandbox tests passed"}],
         "confidence": 1.0,
         "backend": "sandbox",
+        "answer_source": "tool:code",
         "verified": True,
     }
 
@@ -597,7 +982,12 @@ def _retrieve(
         if retriever is not None:
             rows = list(retriever(question) or [])
         elif atoms_dir:
-            rows = retrieve_atoms(question, atoms_dir=atoms_dir)
+            rows = retrieve_atoms(
+                question,
+                atoms_dir=atoms_dir,
+                index_path=state.get("index_path"),
+                chroma_path=state.get("chroma_path"),
+            )
         else:
             rows = []
     except Exception as exc:
@@ -610,13 +1000,39 @@ def _retrieve(
     return clean
 
 
-def retrieve_atoms(question: str, *, atoms_dir: str, limit: int = 5) -> list[dict[str, Any]]:
+def vault_search_paths(atoms_dir: str) -> tuple[str, str]:
+    """Index paths that belong to this vault, never the process-wide default vault."""
+    brain = os.path.dirname(os.path.abspath(atoms_dir))
+    return (
+        os.path.join(brain, ".sidecar", "lexical.sqlite3"),
+        os.path.join(brain, ".chroma"),
+    )
+
+
+def retrieve_atoms(
+    question: str,
+    *,
+    atoms_dir: str,
+    index_path: str | None = None,
+    chroma_path: str | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    from scripts.config import CHROMA_PATH, LEXICAL_INDEX_PATH
     from scripts.recall import RecallOptions, search_memory
 
+    derived_index, derived_chroma = vault_search_paths(atoms_dir)
+    index_path = index_path or derived_index
+    chroma_path = chroma_path or derived_chroma
+    if os.path.abspath(index_path) == os.path.abspath(LEXICAL_INDEX_PATH) and os.path.abspath(index_path) != os.path.abspath(derived_index):
+        index_path = derived_index
+    if os.path.abspath(chroma_path) == os.path.abspath(CHROMA_PATH) and os.path.abspath(chroma_path) != os.path.abspath(derived_chroma):
+        chroma_path = derived_chroma
     direct, neighbors = search_memory(
         question,
         RecallOptions(n_results=limit, include_statuses={"accepted"}, retrieval_mode="lexical"),
         atoms_dir=atoms_dir,
+        index_path=index_path,
+        chroma_path=chroma_path,
     )
     rows = []
     for result in list(direct) + list(neighbors):
@@ -660,6 +1076,9 @@ def _citations_from_events(events: list[dict[str, Any]]) -> list[dict[str, str]]
 
 def _finish(body: dict[str, Any], budget: dict[str, Any], state: dict[str, Any], started: float) -> dict[str, Any]:
     elapsed = round((time.perf_counter() - started) * 1000.0, 2)
+    if not body.get("answer_source"):
+        body = {**body, "answer_source": "abstain" if body.get("abstained") else "model"}
+    body = {**body, "verified": bool(body.get("verified"))}
     return {
         **body,
         "profile": budget["name"],
@@ -709,6 +1128,8 @@ def tool_chat_events(result: dict[str, Any]) -> list[dict[str, Any]]:
             "type": "done",
             "total_ms": elapsed,
             "elapsed_ms": elapsed,
+            "answer_source": result.get("answer_source"),
+            "verified": bool(result.get("verified")),
             "reasoning": {
                 "engine": True,
                 "profile": result.get("profile"),
@@ -719,6 +1140,8 @@ def tool_chat_events(result: dict[str, Any]) -> list[dict[str, Any]]:
                 "confidence": result.get("confidence"),
                 "model_calls": result.get("model_calls"),
                 "latency_note": result.get("latency_note"),
+                "answer_source": result.get("answer_source"),
+                "verified": bool(result.get("verified")),
             },
         },
     ]
@@ -733,6 +1156,8 @@ def delegation_trace(question: str, *, profile: str | None) -> dict[str, Any]:
         "steps": [{"tool": "grounded_chat", "status": "delegated"}],
         "tool_calls": [],
         "model_calls": 0,
+        "answer_source": "model",
+        "verified": False,
         "latency_note": load_config()["latency_note"],
     }
 
@@ -742,7 +1167,21 @@ def load_benchmark() -> dict[str, Any]:
 
 
 def score_answer(expected: str, answer: str) -> bool:
-    return expected.casefold() in str(answer or "").casefold()
+    """Exact normalized match. The token 40 does not match 400."""
+    def _norm(text: str) -> str:
+        token = str(text or "").strip().casefold().replace(",", "")
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", token):
+            number = float(token) if "." in token else int(token)
+            return _format_number(number)
+        return re.sub(r"\s+", " ", token)
+
+    expected_norm = _norm(expected)
+    answer_text = str(answer or "")
+    if _norm(answer_text) == expected_norm:
+        return True
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", expected_norm):
+        return any(_norm(token) == expected_norm for token in re.findall(r"-?\d+(?:\.\d+)?", answer_text))
+    return False
 
 
 def run_deterministic_benchmark() -> list[dict[str, Any]]:

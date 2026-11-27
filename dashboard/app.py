@@ -1085,10 +1085,13 @@ if nav_selection == "💬 Chat with Memory":
             st.session_state.chat_history = []
             st.session_state.pop("active_chat_thread_id", None)
             st.rerun()
+    from scripts.reason_engine import resolve_profile as _resolve_reason_profile
+
+    _reason_default = _resolve_reason_profile(None)
     reason_profile = st.selectbox(
         "Reasoning",
         options=["deep", "fast"],
-        index=0,
+        index=0 if _reason_default == "deep" else 1,
         format_func=lambda key: "Deep (default)" if key == "deep" else "Fast (single-pass opt-out)",
         key="chat_reason_profile",
         help="Deep is the default and can take several model calls on a small CPU model. Fast is the previous single-pass chat path.",

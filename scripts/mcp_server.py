@@ -82,6 +82,7 @@ import glob
 import hashlib
 import hmac
 import inspect
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -1204,6 +1205,11 @@ ALL_TOOLS = (
                     "type": "string",
                     "enum": ["deep", "fast"],
                     "description": "Default deep. fast keeps the engine and uses the smaller budget.",
+                },
+                "tests": {
+                    "type": "string",
+                    "maxLength": 4000,
+                    "description": "Optional Python asserts. They are appended to generated code and run in the sandbox. They are not shown back as the answer.",
                 },
             },
             "required": ["question"],
@@ -2971,11 +2977,16 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                 isError=True,
             )
         profile_arg = arguments.get("profile")
+        tests_arg = arguments.get("tests")
         try:
-            reasoned = _reason(
+            reasoned = await asyncio.to_thread(
+                _reason,
                 question,
                 profile=None if profile_arg in (None, "") else str(profile_arg),
+                tests=None if tests_arg in (None, "") else str(tests_arg),
                 atoms_dir=vdirs.get("atoms_dir"),
+                index_path=vdirs.get("lexical_index_path"),
+                chroma_path=vdirs.get("chroma_path"),
                 use_default_model=True,
             )
         except ValueError as exc:
