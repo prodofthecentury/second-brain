@@ -176,7 +176,13 @@ def _eval_node(node: ast.AST) -> Fraction | float | int:
             exponent = _as_fraction(right)
             if exponent is None or exponent.denominator != 1 or abs(exponent.numerator) > _MAX_EXPONENT:
                 raise ValueError("exponent is too large")
-            return left ** exponent.numerator
+            try:
+                powered = left ** exponent.numerator
+            except OverflowError as exc:
+                raise ValueError("result is too large") from exc
+            if isinstance(powered, int) and abs(powered) > _MAX_ABS_RESULT:
+                raise ValueError("result is too large")
+            return powered
         if isinstance(node.op, ast.Div):
             if right == 0:
                 raise ZeroDivisionError("division by zero")
@@ -205,13 +211,29 @@ def _sympy_value(expr: str) -> Any:
     return value
 
 
-_COMPUTE_INTENT_RE = re.compile(
-    r"\b(?:what(?:'s| is)|calculate|compute|evaluate|how much is|solve)\b",
+_COMPUTE_PREFIXES = (
+    "what date is",
+    "how much is",
+    "how many",
+    "what is",
+    "what's",
+    "calculate",
+    "compute",
+    "evaluate",
+    "convert",
+    "solve",
+)
+_DATE_AFTER_RE = re.compile(r"^(\d{1,6})\s+days?\s+after\s+(\d{4}-\d{2}-\d{2})$", re.IGNORECASE)
+_DATE_BETWEEN_RE = re.compile(
+    r"^days?\s+between\s+(\d{4}-\d{2}-\d{2})\s+and\s+(\d{4}-\d{2}-\d{2})$",
     re.IGNORECASE,
 )
-_ORDINARY_HYPHEN_RE = re.compile(r"^\d+-\d+$")
-_ORDINARY_SLASH_RE = re.compile(r"^\d+/\d+(?:/\d+)?$")
+_UNIT_RE = re.compile(
+    r"^(\d{1,18}(?:\.\d{1,12})?)\s*([A-Za-z°]+)\s+(?:to|in|into)\s+([A-Za-z°]+)$",
+    re.IGNORECASE,
+)
 _MAX_EXPONENT = 20
+_MAX_ABS_RESULT = 10**18
 
 
 def _normalize_operators(text: str) -> str:
@@ -291,89 +313,101 @@ def exact_arithmetic(expr: str) -> tuple[str, str, bool]:
     return symbolic, "tool:sympy", True
 
 
+def _question_text(question: Any) -> str:
+    """Coerce a caller value to text. Bad types become an empty question, not an exception."""
+    try:
+        if question is None:
+            return ""
+        if isinstance(question, (bytes, bytearray)):
+            return question.decode("utf-8", "replace")
+        return str(question)
+    except Exception:
+        return ""
+
+
+def _normalize_question(question: str) -> str:
+    text = question.replace("\u2019", "'").replace("\u2018", "'")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.rstrip("?.!").strip()
+
+
+def _strip_compute_prefix(text: str) -> tuple[str, bool]:
+    """Remove one leading compute phrase. A phrase later in the sentence is not a route."""
+    for prefix in _COMPUTE_PREFIXES:
+        if text.casefold().startswith(prefix) and (len(text) == len(prefix) or text[len(prefix)].isspace()):
+            return text[len(prefix):].strip(), True
+    return text, False
+
+
+def _strip_thousands(text: str) -> str:
+    return re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text)
+
+
+def _glued_dimension(text: str) -> bool:
+    """2x4 and 1920x1080 are names. Spaced '2 x 3' is multiplication."""
+    compact = re.sub(r"\s+", "", text)
+    return bool(re.fullmatch(r"\d+[xX]\d+", compact)) and not re.search(r"\d\s+[xX]\s+\d", text)
+
+
+def _ordinary_literal(text: str) -> bool:
+    """A bare phone, date, range, percent, or dimension is not a calculation."""
+    compact = re.sub(r"\s+", "", text)
+    if " " not in text and re.fullmatch(r"\d+(?:-\d+)+", text.strip()):
+        return True
+    if re.fullmatch(r"\d+/\d+(?:/\d+)?", compact):
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+)?%", compact):
+        return True
+    if _glued_dimension(text):
+        return True
+    if re.fullmatch(r"\d+\.\d+-\d+\.\d+", compact):
+        return True
+    return False
+
+
+def _expression_text(text: str, *, prefixed: bool) -> str | None:
+    """The whole remainder is one expression, or it is not a tool question."""
+    if not text or _glued_dimension(text):
+        return None
+    if _ordinary_literal(text) and not prefixed:
+        return None
+    if not re.fullmatch(r"[0-9+\-*/%.()\s*^×xX·∙,eE]+", text):
+        return None
+    candidate = re.sub(r"\s+", "", _normalize_operators(_strip_thousands(text)))
+    if not _is_whole_expression(candidate):
+        return None
+    return candidate
+
+
 def extract_expression(question: str) -> str | None:
-    """An expression is used only for an explicit compute request or a whole-expression question."""
-    raw = str(question or "").strip()
-    if not raw:
+    """Fire only when the whole question, minus one leading compute phrase, is the expression."""
+    text = _normalize_question(_question_text(question))
+    if not text:
         return None
-    intent = bool(_COMPUTE_INTENT_RE.search(raw))
-    body = _COMPUTE_INTENT_RE.sub(" ", raw)
-    body = re.sub(r"\d{4}-\d{2}-\d{2}", " ", body)
-    body = body.strip().rstrip("?.!").strip()
-    candidate = re.sub(r"\s+", "", _normalize_operators(body))
-    if _is_whole_expression(candidate):
-        if not intent and _ordinary_number_text(candidate):
-            return None
-        return candidate
-    if not intent:
-        return None
-    match = re.search(r"\(?\d[\d+\-*/%.()\s*^×xX·]*\d\)?", body)
-    if not match:
-        return None
-    found = re.sub(r"\s+", "", _normalize_operators(match.group(0)))
-    if not _is_whole_expression(found):
-        return None
-    if not intent and _ordinary_number_text(found):
-        return None
-    return found
-
-
-def word_problem_expression(question: str) -> str | None:
-    """Only a question whose every number is consumed by one exact pattern. Extra clauses do not match."""
-    text = re.sub(r"\s+", " ", str(question or "")).strip()
-    if re.search(r"\b(?:half|eats?|sells?|divided|splits?)\b", text, re.IGNORECASE):
-        return None
-    times = re.fullmatch(
-        r"(?:what is |calculate |compute )?(\d+)\s+times\s+(\d+)\s*\??",
-        text,
-        re.IGNORECASE,
-    )
-    if times and not re.search(r"\b(?:plus|minus|boxes|groups|packs)\b", text, re.IGNORECASE):
-        return f"{int(times.group(1))}*{int(times.group(2))}"
-    if re.search(r"\btimes\b", text, re.IGNORECASE):
-        return None
-    grouped = re.search(r"(\d+)\s+(?:boxes|groups|packs)\s+of\s+(\d+)", text, re.IGNORECASE)
-    if not grouped:
-        return None
-    used = [grouped.group(1), grouped.group(2)]
-    expr = f"{int(grouped.group(1))}*{int(grouped.group(2))}"
-    more = re.search(r"(\d+)\s+more\b", text, re.IGNORECASE)
-    fewer = re.search(r"(\d+)\s+(?:fewer|less)\b", text, re.IGNORECASE)
-    if more and fewer:
-        return None
-    if more:
-        used.append(more.group(1))
-        expr += f"+{int(more.group(1))}"
-    elif fewer:
-        used.append(fewer.group(1))
-        expr += f"-{int(fewer.group(1))}"
-    if sorted(re.findall(r"\d+", text)) != sorted(used):
-        return None
-    return expr
+    body, prefixed = _strip_compute_prefix(text)
+    return _expression_text(body, prefixed=prefixed)
 
 
 def _date_pair(question: str) -> tuple[str, str] | None:
-    """Two independent date calculations. They must agree before the result is verified."""
+    """Two independent date calculations. The whole question must be the pattern."""
+    text = _normalize_question(_question_text(question))
+    body, _prefixed = _strip_compute_prefix(text)
     try:
-        after = re.search(r"(\d+)\s+days?\s+after\s+(\d{4}-\d{2}-\d{2})", question, re.I)
+        after = _DATE_AFTER_RE.fullmatch(body)
         if after:
             start = date.fromisoformat(after.group(2))
             days = int(after.group(1))
             by_delta = (start + timedelta(days=days)).isoformat()
             by_ordinal = date.fromordinal(start.toordinal() + days).isoformat()
             return by_delta, by_ordinal
-        between = re.search(
-            r"days?\s+between\s+(\d{4}-\d{2}-\d{2})\s+and\s+(\d{4}-\d{2}-\d{2})",
-            question,
-            re.I,
-        )
+        between = _DATE_BETWEEN_RE.fullmatch(body)
         if between:
             left = date.fromisoformat(between.group(1))
             right = date.fromisoformat(between.group(2))
             by_delta = str(abs((right - left).days))
             by_ordinal = str(abs(right.toordinal() - left.toordinal()))
             return by_delta, by_ordinal
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     return None
 
@@ -391,26 +425,17 @@ def _canon_unit(raw: str) -> str:
 
 
 def _unit_answer(question: str) -> str | None:
-    pattern = re.compile(
-        r"(\d+(?:\.\d+)?)\s*([A-Za-z°]+)\s*(?:to|in|into)\s*([A-Za-z°]+)",
-        re.I,
-    )
-    match = pattern.search(question)
+    text = _normalize_question(_question_text(question))
+    body, _prefixed = _strip_compute_prefix(text)
+    match = _UNIT_RE.fullmatch(body)
     if not match:
-        how_many = re.search(
-            r"how many\s+([A-Za-z°]+)\s+(?:are\s+)?in\s+(\d+(?:\.\d+)?)\s*([A-Za-z°]+)",
-            question,
-            re.I,
-        )
-        if not how_many:
-            return None
-        amount = float(how_many.group(2))
-        src = _canon_unit(how_many.group(3))
-        dst = _canon_unit(how_many.group(1))
-    else:
+        return None
+    try:
         amount = float(match.group(1))
-        src = _canon_unit(match.group(2))
-        dst = _canon_unit(match.group(3))
+    except (ValueError, OverflowError):
+        return None
+    src = _canon_unit(match.group(2))
+    dst = _canon_unit(match.group(3))
     if src in {"c", "f"} or dst in {"c", "f"}:
         if src == "c" and dst == "f":
             value = amount * 9.0 / 5.0 + 32.0
@@ -450,7 +475,7 @@ def classify(question: str) -> str:
         return "unit"
     if re.search(r"\b(write|implement)\b.{0,40}\bfunction\b|\bdef\s+[A-Za-z_]", question, re.I):
         return "code"
-    if extract_expression(question) or word_problem_expression(question):
+    if extract_expression(question):
         return "math"
     if re.search(r"\b(plan|design|architecture)\b", question, re.I):
         return "planning"
@@ -458,36 +483,33 @@ def classify(question: str) -> str:
 
 
 def try_exact_tool(question: str) -> dict[str, Any] | None:
-    """Solve a question with a tool, return a refusal, or None when no exact tool applies."""
-    if _date_pair(question) is not None:
-        pair = _date_pair(question)
+    """Solve a whole-question tool, refuse a real divide-by-zero, or decline."""
+    try:
+        return _try_exact_tool(question)
+    except Exception:
+        return None
+
+
+def _try_exact_tool(question: str) -> dict[str, Any] | None:
+    text = _question_text(question)
+    if _date_pair(text) is not None:
+        pair = _date_pair(text)
         if pair is None or pair[0] != pair[1]:
-            return {"refused": True, "problem_type": "date"}
-        return _tool_result(question, "date", pair[0], "tool:date", f"date math -> {pair[0]}", verified=True)
-    if _unit_answer(question) is not None:
-        answer = _unit_answer(question)
-        if answer is None:
-            return {"refused": True, "problem_type": "unit"}
-        return _tool_result(question, "unit", answer, "tool:unit", f"unit conversion -> {answer}", verified=True)
-    expr = extract_expression(question)
-    if expr:
-        try:
-            value, source, verified = exact_arithmetic(expr)
-        except (SyntaxError, ValueError) as exc:
-            if isinstance(exc, SyntaxError) or "not plain arithmetic" in str(exc):
-                return None
-            return {"refused": True, "problem_type": "math"}
-        except (ZeroDivisionError, OverflowError):
-            return {"refused": True, "problem_type": "math"}
-        return _tool_result(question, "math", value, source, f"{expr} = {value}", verified=verified)
-    word = word_problem_expression(question)
-    if word:
-        try:
-            value, source, verified = exact_arithmetic(word)
-        except (SyntaxError, ValueError, ZeroDivisionError, OverflowError):
             return None
-        return _tool_result(question, "math", value, source, f"{word} = {value}", verified=verified)
-    return None
+        return _tool_result(text, "date", pair[0], "tool:date", f"date math -> {pair[0]}", verified=True)
+    answer = _unit_answer(text)
+    if answer is not None:
+        return _tool_result(text, "unit", answer, "tool:unit", f"unit conversion -> {answer}", verified=True)
+    expr = extract_expression(text)
+    if not expr:
+        return None
+    try:
+        value, source, verified = exact_arithmetic(expr)
+    except ZeroDivisionError:
+        return {"refused": True, "problem_type": "math"}
+    except (SyntaxError, ValueError, OverflowError, ArithmeticError):
+        return None
+    return _tool_result(text, "math", value, source, f"{expr} = {value}", verified=verified)
 
 
 def _tool_result(
@@ -536,7 +558,9 @@ def run_python_checks(code: str, tests: str, *, timeout_s: float = 5.0) -> dict[
         return {"ok": False, "error": str(exc), "result": None, "stdout": ""}
 
 
-_NUMBER_TOKEN_RE = re.compile(r"(?<![\d.])\d+(?:\.\d+)?(?!\d)")
+_NUMBER_TOKEN_RE = re.compile(
+    r"(?<![\d.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?!\d)"
+)
 _REFUSAL_RE = re.compile(
     r"\b(?:i don't know|i do not know|i dont know|i'm not sure|i am not sure|"
     r"cannot verify|can't verify|i can't|i cannot|no information|not enough information|"
@@ -545,8 +569,22 @@ _REFUSAL_RE = re.compile(
 )
 
 
+def _canon_number(token: str) -> str:
+    """'1,250' and '1250' are the same token. '-5' is not '5'. '4' is not '14'."""
+    body = str(token or "").replace(",", "").strip()
+    sign = ""
+    if body[:1] in "+-":
+        sign = "-" if body[0] == "-" else ""
+        body = body[1:]
+    if "." in body:
+        whole, frac = body.split(".", 1)
+        frac = frac.rstrip("0")
+        body = whole if not frac else f"{whole}.{frac}"
+    return (sign + (body or "0")) if body else ""
+
+
 def _numbers_in(text: str) -> list[str]:
-    """Whole number tokens. '20' does not match inside '2026'."""
+    """Whole number tokens, including a sign and thousands separators."""
     return _NUMBER_TOKEN_RE.findall(str(text or ""))
 
 
@@ -558,37 +596,30 @@ def _memory_blob(item: dict[str, Any]) -> str:
     return "\n".join(str(item.get(key) or "") for key in ("claim", "evidence", "title"))
 
 
-def _overlaps_memory(answer: str, sources: list[dict[str, Any]]) -> bool:
-    answer_terms = {token for token in re.findall(r"[a-z0-9]+", answer.casefold()) if len(token) >= 3}
-    if not answer_terms:
-        return False
-    for item in sources:
-        claim_terms = {token for token in re.findall(r"[a-z0-9]+", _memory_blob(item).casefold()) if len(token) >= 3}
-        if answer_terms & claim_terms:
-            return True
-    return False
-
-
 def unsupported_numbers(answer: str, sources: list[dict[str, Any]]) -> list[str]:
-    """Numbers in the answer that are not whole tokens in retrieved memory.
+    """Numbers in the answer that are not the same whole token in retrieved memory.
 
-    An empty source list does not reject the answer. The caller leaves it unverified.
+    An empty source list does not reject the answer. Sharing a word is not support.
     """
     if not sources:
         return []
-    known: set[str] = set()
-    for item in sources:
-        known.update(_numbers_in(_memory_blob(item)))
-    return [number for number in _numbers_in(answer) if number not in known]
+    known = {_canon_number(number) for item in sources for number in _numbers_in(_memory_blob(item))}
+    known.discard("")
+    return [number for number in _numbers_in(answer) if _canon_number(number) not in known]
 
 
-def _default_model(prompt: str) -> str:
+def _default_model(prompt: str, *, timeout_s: float | None = None) -> str:
     from scripts.ollama_utils import chat_with_fallback
 
+    call: dict[str, Any] = {
+        "allow_model_fallback": False,
+        "options": {"temperature": 0.1, "num_predict": 256},
+    }
+    if timeout_s is not None:
+        call["timeout"] = max(0.05, float(timeout_s))
     response = chat_with_fallback(
         [{"role": "user", "content": prompt}],
-        allow_model_fallback=False,
-        options={"temperature": 0.1, "num_predict": 256},
+        **call,
     )
     if isinstance(response, dict):
         return str((response.get("message") or {}).get("content") or "")
@@ -619,7 +650,11 @@ def _call_model(model_fn: Callable[[str], str] | None, prompt: str, state: dict[
         if not state.get("allow_default_model"):
             state["errors"].append("no model configured")
             return ""
-        fn = _default_model
+        budget_left = remaining
+
+        def fn(prompt: str, _left: float = budget_left) -> str:
+            return _default_model(prompt, timeout_s=_left)
+
     state["model_calls"] += 1
     box: dict[str, str] = {}
 
@@ -702,17 +737,22 @@ def _execute_plan_step(step: dict[str, Any], question: str) -> dict[str, Any] | 
             value, source, verified = exact_arithmetic(expr)
         except (SyntaxError, ValueError, ZeroDivisionError, OverflowError):
             return None
-        solved = _tool_result(raw, "math", value, source, f"{expr} = {value}", verified=verified)
-        solved["answer_source"] = "model+tool_verified" if verified else source
+        solved = _tool_result(raw, "math", value, source, f"{expr} = {value}", verified=False)
+        solved["answer_source"] = source
+        solved["verified"] = False
         return solved
     if tool == "date":
         pair = _date_pair(raw)
         if pair and pair[0] == pair[1]:
-            return _tool_result(raw, "date", pair[0], "tool:date", f"date math -> {pair[0]}", verified=True)
+            solved = _tool_result(raw, "date", pair[0], "tool:date", f"date math -> {pair[0]}", verified=False)
+            solved["verified"] = False
+            return solved
     if tool == "unit":
         answer = _unit_answer(raw)
         if answer is not None:
-            return _tool_result(raw, "unit", answer, "tool:unit", f"unit conversion -> {answer}", verified=True)
+            solved = _tool_result(raw, "unit", answer, "tool:unit", f"unit conversion -> {answer}", verified=False)
+            solved["verified"] = False
+            return solved
     return None
 
 
@@ -747,37 +787,60 @@ def _model_answer(
     refusal = _is_refusal(text)
     if not text or missing or refusal:
         return _abstain(kind, steps + [{"tool": "model", "status": "rejected"}], sources, plan)
-    verified = bool(sources) and _overlaps_memory(text, sources) and not missing and not refusal
     return {
         "answer": text,
-        "answer_source": "memory" if verified else "model",
+        "answer_source": "model",
         "abstained": False,
         "problem_type": kind,
-        "steps": steps + [{"tool": "model", "status": "verified" if verified else "unchecked"}],
+        "steps": steps + [{"tool": "model", "status": "unchecked"}],
         "tool_calls": [],
         "citations": [_citation(item) for item in sources],
-        "confidence": 0.6 if verified else 0.0,
+        "confidence": 0.0,
         "backend": None,
-        "verified": verified,
+        "verified": False,
         "plan": plan,
     }
 
 
-def _safe_abstain(question: str, profile: str | None, exc: BaseException) -> dict[str, Any]:
-    """A caller always gets a result dict. A bad question does not raise."""
-    try:
-        budget = budget_for(profile)
-    except ValueError:
-        budget = {"name": "deep", **_PROFILES["deep"]}
-    started = time.perf_counter()
-    state: dict[str, Any] = {
-        "budget": budget,
+def _fallback_result() -> dict[str, Any]:
+    return {
+        "answer": ABSTAIN,
+        "answer_source": "abstain",
+        "verified": False,
+        "abstained": True,
+        "problem_type": "other",
+        "contract_version": 2,
+        "steps": [],
+        "tool_calls": [],
+        "citations": [],
+        "confidence": 0.0,
+        "backend": None,
         "model_calls": 0,
-        "started": started,
-        "errors": [f"{exc.__class__.__name__}: {exc}"],
-        "allow_default_model": False,
+        "elapsed_ms": 0.0,
+        "errors": ["reasoning failed"],
+        "engine": True,
+        "profile": "deep",
     }
-    return _finish(_abstain(classify(str(question or "")), [], [], None), budget, state, started)
+
+
+def _safe_abstain(question: Any, profile: str | None, exc: BaseException) -> dict[str, Any]:
+    """A caller always gets a result dict. This helper does not classify or raise."""
+    try:
+        try:
+            budget = budget_for(profile)
+        except Exception:
+            budget = {"name": "deep", **_PROFILES["deep"]}
+        started = time.perf_counter()
+        state: dict[str, Any] = {
+            "budget": budget,
+            "model_calls": 0,
+            "started": started,
+            "errors": ["reasoning failed"],
+            "allow_default_model": False,
+        }
+        return _finish(_abstain("other", [], [], None), budget, state, started)
+    except Exception:
+        return _fallback_result()
 
 
 def reason(
@@ -796,12 +859,7 @@ def reason(
     """Run one question. Profile defaults to deep. A delegate is the existing chat path.
 
     Question text never raises. Unparseable input stays on the non-tool path.
-    An invalid profile name still raises ValueError.
     """
-    try:
-        budget_for(profile)
-    except ValueError:
-        raise
     try:
         return _reason(
             question,
@@ -843,7 +901,7 @@ def _reason(
         "index_path": index_path,
         "chroma_path": chroma_path,
     }
-    text = str(question or "").strip()
+    text = _question_text(question).strip()
     if not text:
         return _finish(_abstain("other", [], [], None), budget, state, started)
     if _budget_expired(state):
@@ -885,17 +943,12 @@ def _reason(
     for step in plan.get("steps") or []:
         if not isinstance(step, dict):
             continue
-        hit = _execute_plan_step(step, text)
         executed.append({
             "tool": step.get("tool"),
-            "status": "done" if hit else "skipped",
+            "status": "not_adopted",
             "input": str(step.get("input") or "")[:300],
-            "output": None if not hit else hit.get("answer"),
+            "output": None,
         })
-        if hit and hit.get("answer"):
-            hit["plan"] = plan
-            hit["steps"] = executed
-            return _finish(hit, budget, state, started)
     if _budget_expired(state):
         state["errors"].append("reasoning timeout")
         return _finish(_abstain(kind, executed, sources, plan), budget, state, started)
@@ -1078,7 +1131,7 @@ def _finish(body: dict[str, Any], budget: dict[str, Any], state: dict[str, Any],
     elapsed = round((time.perf_counter() - started) * 1000.0, 2)
     if not body.get("answer_source"):
         body = {**body, "answer_source": "abstain" if body.get("abstained") else "model"}
-    body = {**body, "verified": bool(body.get("verified"))}
+    body = {**body, "verified": bool(body.get("verified")), "contract_version": 2}
     return {
         **body,
         "profile": budget["name"],
@@ -1130,6 +1183,7 @@ def tool_chat_events(result: dict[str, Any]) -> list[dict[str, Any]]:
             "elapsed_ms": elapsed,
             "answer_source": result.get("answer_source"),
             "verified": bool(result.get("verified")),
+            "contract_version": result.get("contract_version", 2),
             "reasoning": {
                 "engine": True,
                 "profile": result.get("profile"),
@@ -1167,20 +1221,23 @@ def load_benchmark() -> dict[str, Any]:
 
 
 def score_answer(expected: str, answer: str) -> bool:
-    """Exact normalized match. The token 40 does not match 400."""
+    """Exact normalized match, or the final number token when the expected answer is numeric.
+
+    An earlier number does not count. 'Not 4; it is 5.' does not score as 4.
+    """
     def _norm(text: str) -> str:
         token = str(text or "").strip().casefold().replace(",", "")
-        if re.fullmatch(r"-?\d+(?:\.\d+)?", token):
-            number = float(token) if "." in token else int(token)
-            return _format_number(number)
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", token):
+            return _canon_number(token)
         return re.sub(r"\s+", " ", token)
 
     expected_norm = _norm(expected)
     answer_text = str(answer or "")
     if _norm(answer_text) == expected_norm:
         return True
-    if re.fullmatch(r"-?\d+(?:\.\d+)?", expected_norm):
-        return any(_norm(token) == expected_norm for token in re.findall(r"-?\d+(?:\.\d+)?", answer_text))
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", expected_norm):
+        numbers = _numbers_in(answer_text)
+        return bool(numbers) and _canon_number(numbers[-1]) == _canon_number(expected_norm)
     return False
 
 
@@ -1219,6 +1276,7 @@ def run_model_comparison(model_name: str, model_fn: Callable[[str], str], questi
         plain_ms = round((time.perf_counter() - started) * 1000.0, 2)
         rows.append({
             "id": item["id"],
+            "kind": item.get("kind", ""),
             "runner": "plain",
             "model": model_name,
             "correct": score_answer(item["answer"], plain),
@@ -1230,11 +1288,14 @@ def run_model_comparison(model_name: str, model_fn: Callable[[str], str], questi
         result = reason(item["question"], profile="deep", model_fn=model_fn, use_default_model=False)
         rows.append({
             "id": item["id"],
+            "kind": item.get("kind", ""),
             "runner": "engine",
             "model": model_name,
-            "correct": (not result["abstained"]) and score_answer(item["answer"], result["answer"]),
+            "correct": (not result["abstained"]) and score_answer(item["answer"], result["answer"]) if item.get("answer") else False,
             "abstained": result["abstained"],
             "answer": str(result["answer"])[:300],
+            "answer_source": result.get("answer_source"),
+            "verified": result.get("verified"),
             "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
             "model_calls": result["model_calls"],
         })

@@ -35,18 +35,10 @@ def _sympy_blocked():
 
 
 def _assert_sells_half_declines(test: unittest.TestCase) -> None:
-    """Half-sold pens are 53. No template may answer 101 or mark that verified."""
-    from scripts.reason_engine import word_problem_expression
-
+    """Pens prose is not a calculator question. The model may answer; that answer is unverified."""
     question = "12 boxes of 8 pens, sells half, then 5 more"
-    expression = word_problem_expression(question)
-    test.assertTrue(expression is None or exact_arithmetic(expression)[0] == "53", expression)
     tool = try_exact_tool(question)
-    if tool is not None and not tool.get("refused"):
-        test.assertEqual(tool["answer"], "53")
-        test.assertNotEqual(tool["answer"], "101")
-    else:
-        test.assertTrue(tool is None or tool.get("refused"))
+    test.assertTrue(tool is None or tool.get("refused"))
     declined = reason(question, use_default_model=False)
     test.assertNotEqual(declined["answer"], "101")
     test.assertFalse(declined["verified"])
@@ -55,18 +47,12 @@ def _assert_sells_half_declines(test: unittest.TestCase) -> None:
     test.assertEqual(handed["answer"], "53")
     test.assertFalse(handed["verified"])
     test.assertEqual(handed["answer_source"], "model")
-    sold = reason(
-        "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?",
-        use_default_model=False,
-    )
-    test.assertEqual(sold["answer"], "101")
-    test.assertEqual(sold["model_calls"], 0)
-    if _sympy_present():
-        test.assertTrue(sold["verified"])
-        test.assertEqual(sold["answer_source"], "tool:sympy")
-    else:
-        test.assertFalse(sold["verified"])
-        test.assertEqual(sold["answer_source"], "tool:calculator")
+    test.assertEqual(handed["contract_version"], 2)
+    sold = "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?"
+    test.assertTrue(try_exact_tool(sold) is None or try_exact_tool(sold).get("refused"))
+    sold_result = reason(sold, use_default_model=False)
+    test.assertNotEqual(sold_result["answer"], "101")
+    test.assertFalse(sold_result["verified"])
 
 
 def _sympy_present() -> bool:
@@ -142,6 +128,38 @@ def ordinary_non_math_sentences() -> list[str]:
         "Row 18, seat 4, aisle left.",
         "Catalogue item No. 77 is the blue mug.",
         "The warranty card says model XR-200.",
+        "What is on pages 10-20 of the manual?",
+        "What is the 2024-2025 budget for the garden?",
+        "What's the score, 3-1 to us?",
+        "What is my 9-5 shift pattern next week?",
+        "What is the 80/20 rule?",
+        "What is 24/7 support on my plan?",
+        "What is a 3-2-1 backup?",
+        "What is the 1920x1080 setting called?",
+        "What's a 2x4 used for in framing?",
+        "What is the 50/50 split with Sam?",
+        "How much is a 2-3 day courier?",
+        "What is in boxes 3-5 in the garage?",
+        "Calculate my hours for the 9-5 days this week.",
+        "Solve the 3-4 puzzle from the book club.",
+        "What is the ratio for 2/3 of the class going on camp?",
+        "Evaluate the 2025-2026 plan please.",
+        "The parcel arrived 3 days after 2026-11-20.",
+        "I was born 5 days after 1990-03-01, apparently.",
+        "There are 26 days between 2026-11-01 and 2026-11-27 on the old calendar.",
+        "The 3 boxes of 10 apples had 2 more rotten than last week.",
+        "We stacked 6 packs of 4 drinks and 2 fewer chairs.",
+        "Kids: 3 groups of 5 and 2 more parents.",
+        "12 boxes of 8 pens, sells half, then 5 more",
+        "9 groups of 7 pens, lost 3 more than usual",
+        "3 boxes of 4 pens, 2 fewer than needed",
+        "1+1 deal on pizzas this week.",
+        "Buy 2+1 free at the shop.",
+        "Remember 5*3 stars on the review form.",
+        "10x faster than before, apparently.",
+        "Rated 4.5/5 on the app store.",
+        "Lens 18-55 mm is in the bag.",
+        "Rooms 101-110 are on level one.",
     ]
     for index, name in enumerate(names):
         street = streets[index]
@@ -198,7 +216,8 @@ class ReasonEngineTests(unittest.TestCase):
 
         cases = {
             "What is 17 * 23 + 9?": "400",
-            "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?": "101",
+            "What is 1,500 + 20?": "1520",
+            "What is -5 + 3?": "-2",
             "What date is 14 days after 2026-11-27?": "2026-12-11",
             "How many days between 2026-11-01 and 2026-11-27?": "26",
             "Convert 3 km to m.": "3000",
@@ -507,13 +526,10 @@ class ReviewRegressionTests(unittest.TestCase):
                 return '{"problem_type":"math","steps":[{"tool":"calculator","input":"(2+3)*4"}]}'
             return "5"
         result = reason("Use the calculator on (2+3)*4", model_fn=_plan)
-        self.assertEqual(result["answer"], "20")
-        if _sympy_present():
-            self.assertTrue(result["verified"])
-            self.assertEqual(result["answer_source"], "model+tool_verified")
-        else:
-            self.assertFalse(result["verified"])
-            self.assertEqual(result["answer_source"], "tool:calculator")
+        self.assertEqual(result["answer"], "5")
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["answer_source"], "model")
+        self.assertTrue(any(step.get("status") == "not_adopted" for step in result["steps"]))
 
     def test_timeout_bounds_an_in_flight_call_and_counts_it(self) -> None:
         import time
@@ -579,6 +595,8 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertTrue(score_answer("400", "400"))
         self.assertTrue(score_answer("400", "The result is 400."))
         self.assertFalse(score_answer("40", "The result is 400."))
+        self.assertFalse(score_answer("4", "Not 4; it is 5."))
+        self.assertTrue(score_answer("5", "Not 4; it is 5."))
 
     def test_engine_result_exposes_answer_source_and_verified(self) -> None:
         from scripts.reason_engine import tool_chat_events
@@ -687,6 +705,183 @@ class ReviewRegressionTests(unittest.TestCase):
             self.assertFalse(verified)
 
 
+class MechanismProbeTests(unittest.TestCase):
+    """General route, verification, and exception rules. Both SymPy modes."""
+
+    def _both(self, check) -> None:
+        check()
+        with _sympy_blocked():
+            check()
+
+    def test_prose_and_qualified_patterns_do_not_fire(self) -> None:
+        questions = [
+            "What is the 80/20 rule?",
+            "What's a 2x4 used for in framing?",
+            "What is on pages 10-20 of the manual?",
+            "What is 24/7 support on my plan?",
+            "Calculate my hours for the 9-5 days this week.",
+            "12 boxes of 8 pens, sells half, then 5 more",
+            "12 boxes of 8 pens, sold all but 5 more than half, how many left?",
+            "9 groups of 7 pens, lost 3 more than usual",
+            "3 boxes of 4 pens, 2 fewer than needed",
+            "12 boxes of 8 pens with 5 more removed",
+            "12 boxes of 8 pens minus 5 more",
+            "then 5 fewer were sold after 12 boxes of 8 pens",
+            "days between 2026-11-01 and 2026-11-27 excluding weekends",
+            "14 days after 2026-11-27 not counting public holidays",
+            "The parcel arrived 3 days after 2026-11-20.",
+            "How many seconds in 1 hour and 30 min?",
+            "Convert 5 ft 6 in to cm.",
+            "What is 1 hour and 30 min in seconds?",
+            "Fax 09-377 1234.",
+            "What is 6/2(1+2)?",
+            "3/4",
+            "9/11",
+            "2x4",
+            "50%",
+            "1+1 deal on pizzas this week.",
+        ]
+
+        def check() -> None:
+            for question in questions:
+                tool = try_exact_tool(question)
+                self.assertTrue(tool is None or tool.get("refused"), question)
+                result = reason(question, use_default_model=False)
+                self.assertIsInstance(result, dict, question)
+                self.assertFalse(result["verified"], question)
+                self.assertFalse(str(result["answer_source"]).startswith("tool:"), question)
+                self.assertEqual(result["contract_version"], 2, question)
+
+        self._both(check)
+
+    def test_explicit_whole_expressions_still_compute(self) -> None:
+        def check() -> None:
+            self.assertEqual(reason("What is 1,500 + 20?")["answer"], "1520")
+            self.assertEqual(reason("What is -5 + 3?")["answer"], "-2")
+            self.assertEqual(reason("What is 1/3 + 1/3?")["answer"], "2/3")
+            self.assertEqual(reason("What date is 14 days after 2026-11-27?")["answer"], "2026-12-11")
+            self.assertEqual(reason("How many days between 2026-11-01 and 2026-11-27?")["answer"], "26")
+            qualified = reason(
+                "How many days between 2026-11-01 and 2026-11-27 excluding weekends?",
+                use_default_model=False,
+            )
+            self.assertNotEqual(qualified["answer"], "26")
+            self.assertFalse(qualified["verified"])
+
+        self._both(check)
+
+    def test_memory_word_overlap_is_not_verification(self) -> None:
+        samples = [
+            ("Does a 70B model need a large GPU?", "A 70B model needs a large GPU.", "A 70B model does not need a large GPU."),
+            ("Who is my dentist?", "My dentist is Dr. Hale.", "Your dentist is Dr. Smith."),
+            ("What is the invoice total?", "Invoice 1044 total is $1,250.", "The invoice total is $250."),
+            ("What was the low temperature?", "The low temperature was -5 C.", "The low temperature was 5 C."),
+            ("When is the dentist?", "Dentist on 2026-11-27.", "The dentist appointment is in 27 days."),
+            ("Who paid whom?", "Alice paid Bob 40 dollars.", "Bob paid Alice 40 dollars."),
+            ("How large is the backup?", "The backup is 14 GB.", "The backup is 14 TB."),
+        ]
+
+        def check() -> None:
+            self.assertEqual(
+                unsupported_numbers("250", [{"claim": "Invoice 1044 total is $1,250."}]),
+                ["250"],
+            )
+            self.assertEqual(
+                unsupported_numbers("5 C", [{"claim": "The low temperature was -5 C."}]),
+                ["5"],
+            )
+            for question, memory, answer in samples:
+                result = reason(
+                    question,
+                    model_fn=lambda _prompt, text=answer: text,
+                    retriever=lambda _question, claim=memory: [{"atom_id": "m.md", "claim": claim, "evidence": claim}],
+                )
+                self.assertFalse(result["verified"], question)
+                self.assertNotEqual(result["answer_source"], "memory", question)
+                self.assertNotIn(result["answer_source"], {"model+tool_verified"}, question)
+
+        self._both(check)
+
+    def test_a_model_chosen_plan_step_is_not_verified(self) -> None:
+        def _plan(prompt: str) -> str:
+            if "Return one JSON object" in prompt:
+                return '{"problem_type":"math","steps":[{"tool":"calculator","input":"12*8+5"}]}'
+            return "I cannot verify it."
+
+        def _dentist(prompt: str) -> str:
+            if "Return one JSON object" in prompt:
+                return '{"problem_type":"fact","steps":[{"tool":"calculator","input":"2+2"}]}'
+            return "I have not written that down."
+
+        def check() -> None:
+            pens = reason(
+                "A shop has 12 boxes of 8 pens. It sold all but 5 more than half of them. How many are left?",
+                model_fn=_plan,
+            )
+            self.assertNotEqual(pens["answer"], "101")
+            self.assertFalse(pens["verified"])
+            self.assertNotEqual(pens["answer_source"], "model+tool_verified")
+            dentist = reason("Who is my dentist?", model_fn=_dentist)
+            self.assertNotEqual(dentist["answer"], "4")
+            self.assertFalse(dentist["verified"])
+
+        self._both(check)
+
+    def test_no_question_raises_and_huge_values_decline(self) -> None:
+        samples = [
+            "99999999999 days after 2026-11-27",
+            "9" * 400 + " km to m",
+            "What is ((10**20)**20)**20?",
+            "What is 1e400+1?",
+            "\x00",
+            "(" * 60 + "1" + ")" * 60,
+        ]
+
+        def check() -> None:
+            for question in samples:
+                result = reason(question, use_default_model=False)
+                self.assertIsInstance(result, dict, question)
+                self.assertTrue(result.get("answer_source"), question)
+                self.assertFalse(result["verified"], question)
+            small = reason("What is 2**-20?", use_default_model=False)
+            self.assertIsInstance(small, dict)
+            self.assertTrue(small.get("answer_source"))
+            for question in (None, 123, b"bytes", ["list"]):
+                result = reason(question, use_default_model=False)
+                self.assertIsInstance(result, dict)
+                self.assertTrue(result.get("answer_source"))
+            raised = reason(
+                "Where is the spare key?",
+                model_fn=lambda _prompt: (_ for _ in ()).throw(RuntimeError("ollama down")),
+            )
+            self.assertIsInstance(raised, dict)
+            self.assertFalse(raised["verified"])
+
+        self._both(check)
+
+    def test_held_out_prose_does_not_fire_a_tool(self) -> None:
+        """Sentences kept out of the routing rules. A fire means the mechanism is still too wide."""
+        held_out = [
+            "Please calculate the tip after you read page 12-14.",
+            "What is inside the 4 boxes of nails in the shed?",
+            "The invoice says net 30 days after 2026-01-15, and weekends still count on that form.",
+            "How many people fit when we make groups of 8 at tables 3 and 4?",
+            "Solve which shelf holds box 12 before lunch.",
+            "What is 2,500 people doing at the fair?",
+            "Evaluate whether 3 days after 2026-11-27 is a Monday in our notes.",
+            "Convert the story of 5 km to a diary entry, not to metres.",
+            "I bought 3 boxes of 6 eggs and the receipt is in the blue folder.",
+            "What's left of the 12 boxes of 8 pens after the sale talk?",
+        ]
+
+        def check() -> None:
+            for question in held_out:
+                tool = try_exact_tool(question)
+                self.assertTrue(tool is None or tool.get("refused"), question)
+
+        self._both(check)
+
+
 class ReasonBenchmarkTests(unittest.TestCase):
     def test_deterministic_benchmark_is_exact(self) -> None:
         rows = run_deterministic_benchmark()
@@ -702,11 +897,24 @@ class ReasonBenchmarkTests(unittest.TestCase):
         from scripts.ollama_utils import chat_with_fallback
 
         questions = [
-            {"id": "arith-17-23-9", "question": "What is 17 * 23 + 9?", "answer": "400"},
+            {"id": "arith-17-23-9", "kind": "tool", "question": "What is 17 * 23 + 9?", "answer": "400"},
             {
-                "id": "gsm-pens",
-                "question": "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?",
-                "answer": "101",
+                "id": "date-14-days",
+                "kind": "tool",
+                "question": "What date is 14 days after 2026-11-27?",
+                "answer": "2026-12-11",
+            },
+            {
+                "id": "pens-half",
+                "kind": "model",
+                "question": "12 boxes of 8 pens, sells half, then 5 more",
+                "answer": "53",
+            },
+            {
+                "id": "rule-80-20",
+                "kind": "model",
+                "question": "What is the 80/20 rule?",
+                "answer": "",
             },
         ]
         models = []
@@ -726,15 +934,28 @@ class ReasonBenchmarkTests(unittest.TestCase):
             models.extend(rows)
             for row in rows:
                 print(
-                    f"BENCH {row['id']} {row['runner']} {row['model']} correct={int(bool(row['correct']))} "
-                    f"elapsed_ms={row['elapsed_ms']} answer={str(row.get('answer') or '')[:160]!r} "
+                    f"BENCH {row['id']} kind={row.get('kind') or ''} {row['runner']} {row['model']} "
+                    f"correct={int(bool(row['correct']))} elapsed_ms={row['elapsed_ms']} "
+                    f"source={row.get('answer_source')} verified={row.get('verified')} "
+                    f"model_calls={row.get('model_calls')} "
+                    f"answer={str(row.get('answer') or '')[:160]!r} "
                     f"error={str(row.get('error') or '')[:200]!r}"
                 )
-        self.assertEqual(len(models), 8)
+        self.assertEqual(len(models), 16)
         failed_calls = [row for row in models if row.get("error")]
         self.assertEqual(failed_calls, [], "a required live model call did not reach Ollama")
-        engine_arith = [row for row in models if row["runner"] == "engine" and row["id"] == "arith-17-23-9"]
-        self.assertTrue(all(row["correct"] for row in engine_arith))
+        engine_tools = [
+            row for row in models
+            if row["runner"] == "engine" and row.get("kind") == "tool"
+        ]
+        self.assertTrue(engine_tools)
+        self.assertTrue(all(row["correct"] and row.get("verified") for row in engine_tools))
+        engine_models = [
+            row for row in models
+            if row["runner"] == "engine" and row.get("kind") == "model"
+        ]
+        self.assertTrue(engine_models)
+        self.assertTrue(all(row.get("verified") is False for row in engine_models))
 
 
 def _empty_paths():

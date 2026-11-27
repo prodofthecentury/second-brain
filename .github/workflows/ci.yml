@@ -154,12 +154,10 @@ jobs:
           )
           uv run --frozen python scripts/run_desktop_tests.py --require-packaged --skip-unit
 
-  # Separate from the required build. continue-on-error keeps this off the required
-  # check list while it still runs the engine with SymPy installed and again without it.
+  # Fails the workflow when the engine tests fail with SymPy or without it.
   reason-hard-gate:
-    name: reason hard gate (not required)
+    name: reason hard gate
     runs-on: ubuntu-latest
-    continue-on-error: true
     timeout-minutes: 20
     steps:
       - name: Checkout repository

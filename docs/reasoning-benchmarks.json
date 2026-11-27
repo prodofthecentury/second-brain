@@ -14,6 +14,20 @@
       "kind": "math",
       "question": "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?",
       "answer": "101",
+      "requires_model": true
+    },
+    {
+      "id": "thousands-1500-20",
+      "kind": "math",
+      "question": "What is 1,500 + 20?",
+      "answer": "1520",
+      "requires_model": false
+    },
+    {
+      "id": "signed-minus-5-plus-3",
+      "kind": "math",
+      "question": "What is -5 + 3?",
+      "answer": "-2",
       "requires_model": false
     },
     {
