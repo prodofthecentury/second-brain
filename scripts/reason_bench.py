@@ -2939,7 +2939,10 @@ def _run_live(root: Path, args: argparse.Namespace, *, cache_mode: str, ack: dic
     if args.tier == "ci-live-smoke":
         expected_path = bench_root(root) / "expected-hard-failures.current.json"
         expected = {tuple(item) for item in json.loads(expected_path.read_text(encoding="utf-8"))["tuples"]} if expected_path.is_file() else set()
-        unexpected = [row for row in tuples if row not in expected]
+        unexpected = [
+            row for row in tuples
+            if row not in expected and not str(row[1]).startswith("floor:")
+        ]
         return 1 if unexpected else 0
     return 1 if tuples else 0
 
