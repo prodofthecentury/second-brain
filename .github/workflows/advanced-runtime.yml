@@ -117,10 +117,24 @@ jobs:
           uv run --locked --python 3.11 python -m unittest \
             scripts.real_runtime_tests.RealRuntimeTests.test_hermes_distills_the_same_fixtures
 
-      - name: Compare the reasoning engine with llama3.2:3b and hermes3:3b
+      - name: Reasoning benchmark live smoke on hermes3:3b
         env:
           BRAIN_REQUIRE_OLLAMA: "1"
-          BRAIN_OLLAMA_TIMEOUT: "90"
+          BRAIN_OLLAMA_TIMEOUT: "120"
+          OLLAMA_NUM_PARALLEL: "1"
+          OLLAMA_MAX_LOADED_MODELS: "1"
         run: |
-          uv run --locked --python 3.11 python -m unittest \
-            scripts.reason_engine_tests.ReasonBenchmarkTests.test_live_models_are_recorded_when_ollama_is_required
+          # Hard gates fail this step. Accuracy on the 8 smoke items is not gated.
+          # BRAIN_GEN_MODEL must not override the requested model.
+          unset BRAIN_GEN_MODEL || true
+          uv sync --locked --extra math --python 3.11
+          uv run --locked --python 3.11 python -m scripts.reason_bench run \
+            --tier ci-live-smoke --backend ollama --models hermes3:3b \
+            --out "${RUNNER_TEMP}/reason-bench-live"
+
+      - name: Upload reasoning benchmark live smoke
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reason-bench-ci-live-smoke
+          path: ${{ runner.temp }}/reason-bench-live

@@ -1,0 +1,1 @@
+Solve the puzzle by checking the constraints. There is exactly one solution.

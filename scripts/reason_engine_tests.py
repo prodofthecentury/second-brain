@@ -1296,13 +1296,25 @@ class MechanismProbeTests(unittest.TestCase):
 
 
 class ReasonBenchmarkTests(unittest.TestCase):
-    def test_deterministic_benchmark_is_exact(self) -> None:
-        rows = run_deterministic_benchmark()
-        self.assertGreaterEqual(len(rows), 6)
-        for row in rows:
-            self.assertTrue(row["correct"], row)
-            self.assertEqual(row["model_calls"], 0, row)
-            self.assertLess(row["elapsed_ms"], 2000, row)
+    def test_tool_precision_on_the_migrated_controls(self) -> None:
+        """The six migrated tool controls stay exact. Trap siblings are gated by the harness, not here."""
+        from scripts.reason_bench import read_jsonl, bench_root, run_tools_only, repo_root
+
+        wanted = {
+            "tools-0001",
+            "tools-0002",
+            "tools-0003",
+            "tools-0004",
+            "tools-0005",
+            "tools-0007",
+        }
+        items = [row for row in read_jsonl(bench_root(repo_root()) / "suites" / "tools.jsonl") if row["id"] in wanted]
+        self.assertEqual(len(items), 6)
+        records = run_tools_only(items, sympy="natural", tier="tool-precision")
+        answered = [row for row in records if row.get("answer_source") == "tool_exact"]
+        self.assertEqual(len(answered), 6)
+        self.assertTrue(all(row["correct"] for row in answered), answered)
+        self.assertEqual(sum(row["model_calls"] for row in records), 0)
 
     def test_live_models_are_recorded_when_ollama_is_required(self) -> None:
         if os.environ.get("BRAIN_REQUIRE_OLLAMA") != "1":

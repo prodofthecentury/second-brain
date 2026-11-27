@@ -1,0 +1,1 @@
+If a direct calculation is enough, do it. Otherwise abstain.

@@ -571,7 +571,11 @@ class Cli1CSubcommandsTests(unittest.TestCase):
                 self.assertEqual(rc_pin, 0)
                 self.assertIn("Pinned turn #", out_pin.getvalue())
 
-                # 5. live-benchmark / third-party-benchmark dispatch works (--help exits 0 cleanly)
+                # 5. reason-bench is a passthrough command. The harness needs a source checkout.
+                self.assertIn("reason-bench", cli._PASSTHROUGH_COMMANDS)
+                self.assertEqual(len(cli._PASSTHROUGH_COMMANDS), 61)
+
+                # 6. live-benchmark / third-party-benchmark dispatch works (--help exits 0 cleanly)
                 for subcmd in ("live-benchmark", "third-party-benchmark"):
                     help_buf = io.StringIO()
                     with patch("sys.stdout", help_buf):

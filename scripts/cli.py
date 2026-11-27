@@ -524,6 +524,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ("mcp", "Run or configure the loopback stdio MCP server."),
         ("eval-retrieval", "Run retrieval quality evaluation over labeled suites."),
         ("eval-answers", "Run grounded answer policy evaluation suites."),
+        ("reason-bench", "Run the reasoning benchmark harness (needs a source checkout)."),
     ):
         p = subparsers.add_parser(name, help=help_text, add_help=False)
         p.add_argument("sub_argv", nargs=argparse.REMAINDER)
@@ -602,6 +603,7 @@ _PASSTHROUGH_COMMANDS = frozenset({
     "rebuild-lexical", "rebuild-vectors",
     "refinery", "editor", "scout", "ingest", "daemon", "mcp",
     "eval-retrieval", "eval-answers",
+    "reason-bench",
 })
 
 
@@ -1124,6 +1126,10 @@ def _dispatch_passthrough(command: str, forwarded: list[str]) -> int:
         from scripts.evaluate_answers import main as eval_ans_main
 
         return _invoke_entrypoint(eval_ans_main, forwarded, prog="second-brain eval-answers", description="Evaluate grounded answer policy.")
+    if command == "reason-bench":
+        from scripts.reason_bench import main as reason_bench_main
+
+        return _invoke_entrypoint(reason_bench_main, forwarded, prog="second-brain reason-bench", description="Run the reasoning benchmark harness.")
     return 2
 
 
