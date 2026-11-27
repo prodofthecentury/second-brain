@@ -544,7 +544,7 @@ review_status: pending
 ---
 
 ## Claim
-Reviewable claim.
+Anchored source evidence.
 
 ## Evidence
 Anchored source evidence.
@@ -620,7 +620,7 @@ review_status: pending
 ---
 
 ## Claim
-This reviewed claim is backed by a source.
+This source sentence is long enough to anchor the evidence.
 
 ## Evidence
 This source sentence is long enough to anchor the evidence.

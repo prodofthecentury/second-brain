@@ -218,12 +218,13 @@ class DistillRepairTests(unittest.TestCase):
 
         def _chat(*, messages, model=None, **_kwargs):
             calls["n"] += 1
-            if calls["n"] < 3:
+            if calls["n"] == 1:
                 return {"message": {"content": "I think the ratio is about one to sixteen."}}
             return {"message": {"content": legacy}}
 
         with patch("scripts.ollama_refinery.chat_with_fallback", side_effect=_chat):
             drafted = draft_memory_atoms(source, "0-raw/coffee.md", "House rules")
+        self.assertEqual(calls["n"], 2)
         self.assertEqual(len(drafted), 1)
         self.assertIn("legacy_markdown", LAST_DISTILL_PATHS[-1])
         self.assertIn(source, drafted[0])
@@ -468,6 +469,102 @@ class DistillGroundingTests(unittest.TestCase):
         self.assertEqual(len(drafted), 1)
         self.assertIn("schema", LAST_DISTILL_PATHS[-1])
 
+    def test_mismatched_evidence_is_repaired_to_the_claim_sentence(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "Daily backups run at 02:00. A 70B Hermes model needs a large GPU."
+        recorded = (
+            '{"atoms":[{"title":"Backups","claim":"Daily backups run at 02:00.",'
+            '"evidence":"A 70B Hermes model needs a large GPU.","why":"Wrong quote.","memory_type":"semantic"}]}'
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/02-backups-hermes.md", "House rules")
+        paired = []
+        for document in drafted:
+            claim = document.split("## Claim\n", 1)[1].split("\n", 1)[0]
+            evidence = document.split("## Evidence\n", 1)[1].split("\n", 1)[0]
+            paired.append((claim, evidence))
+            if "02:00" in claim:
+                self.assertIn("02:00", evidence)
+                self.assertNotIn("70B", evidence)
+            if "70B" in claim:
+                self.assertIn("70B", evidence)
+                self.assertNotIn("02:00", evidence)
+        self.assertTrue(any("02:00" in claim for claim, _evidence in paired))
+
+    def test_same_evidence_keeps_the_faithful_claim(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "The GTX 965M has 2 GB of video memory."
+        recorded = (
+            '{"atoms":['
+            '{"title":"Memory","claim":"The GTX 965M has 2 GB of video memory.",'
+            '"evidence":"The GTX 965M has 2 GB of video memory.","why":"a","memory_type":"semantic"},'
+            '{"title":"Again","claim":"A GTX 965M graphics card includes 2 GB of video memory for local models.",'
+            '"evidence":"The GTX 965M has 2 GB of video memory.","why":"b","memory_type":"semantic"}'
+            "]}"
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/05-gtx.md", "House rules")
+        self.assertEqual(len(drafted), 1)
+        self.assertIn("## Claim\n" + source, drafted[0])
+        self.assertNotIn("local models", drafted[0])
+
+    def test_garbled_host_fact_does_not_survive_beside_the_quote(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "BRAIN_OLLAMA_HOST may point at a private LAN address. The laptop has 8 GB of memory."
+        recorded = (
+            '{"atoms":['
+            '{"title":"Host","claim":"BRAIN_OLLAMA_HOST may point at a private LAN address.",'
+            '"evidence":"BRAIN_OLLAMA_HOST may point at a private LAN address.","why":"a","memory_type":"semantic"},'
+            '{"title":"Garbled","claim":"BRAIN_OLLAMA_HOST may point at a private LAN address and the laptop has 8 GB of memory.",'
+            '"evidence":"BRAIN_OLLAMA_HOST may point at a private LAN address.","why":"b","memory_type":"semantic"}'
+            "]}"
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/04-host.md", "House rules")
+        claims = [document.split("## Claim\n", 1)[1].split("\n", 1)[0] for document in drafted]
+        self.assertTrue(any(claim == "BRAIN_OLLAMA_HOST may point at a private LAN address." for claim in claims))
+        self.assertFalse(any("BRAIN_OLLAMA_HOST" in claim and "8 GB" in claim for claim in claims))
+        self.assertTrue(any("8 GB" in claim and "BRAIN_OLLAMA_HOST" not in claim for claim in claims))
+
+    def test_padded_paraphrase_falls_back_to_the_evidence_sentence(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "Lexical search can rerank with the local cross-encoder."
+        recorded = (
+            '{"atoms":[{"title":"Rerank","claim":"Lexical search can rerank with the local cross-encoder, '
+            'which avoids redundant computations and improves retrieval quality.",'
+            '"evidence":"Lexical search can rerank with the local cross-encoder.","why":"x","memory_type":"semantic"}]}'
+        )
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            drafted = draft_memory_atoms(source, "0-raw/05-lexical.md", "House rules")
+        self.assertEqual(len(drafted), 1)
+        self.assertIn("## Claim\n" + source, drafted[0])
+        self.assertNotIn("redundant", drafted[0].casefold())
+        self.assertNotIn("quality", drafted[0].casefold())
+
+    def test_rejected_json_does_not_spend_a_second_model_call(self) -> None:
+        from scripts.ollama_refinery import draft_memory_atoms
+
+        source = "SQLite is the job queue for background capture."
+        recorded = (
+            '{"atoms":[{"title":"Other","claim":"Hermes invented a new SQL dialect for this queue.",'
+            '"evidence":"SELECT * FROM jobs","why":"x","memory_type":"semantic"}]}'
+        )
+        calls = {"n": 0}
+
+        def _chat(*, messages, model=None, **_kwargs):
+            calls["n"] += 1
+            return {"message": {"content": recorded}}
+
+        with patch("scripts.ollama_refinery.chat_with_fallback", side_effect=_chat):
+            drafted = draft_memory_atoms(source, "0-raw/07-queue.md", "House rules")
+        self.assertEqual(calls["n"], 1)
+        self.assertIn(source, "\n".join(drafted))
+        self.assertNotIn("SELECT", "\n".join(drafted))
+
     def test_leftover_preview_keeps_a_quoted_sentence_and_a_heading_is_rejected(self) -> None:
         from scripts.ollama_refinery import draft_memory_atoms
 
@@ -610,6 +707,94 @@ class ChatGroundingTests(unittest.TestCase):
         self.assertIn("Do not add reasons or details that are not written there.", prompt)
         self.assertIn("Evidence: Hermes 8B requires 6 to 8 GB of video memory.", prompt)
         self.assertIn("Title: Hermes 8B", prompt)
+        self.assertIn("Do not add a sentence about a different fact", prompt)
+
+    def test_an_unrelated_clause_is_dropped_from_the_answer(self) -> None:
+        from scripts.streaming_chat import answer_with_citations
+
+        verified = [
+            {
+                "id": "V1",
+                "claim": "The laptop has 8 GB of memory and the desktop has 32 GB.",
+                "evidence": "The laptop has 8 GB of memory and the desktop has 32 GB.",
+                "title": "Laptop and desktop memory",
+            },
+            {
+                "id": "V2",
+                "claim": "The LAN server listens on port 11434.",
+                "evidence": "The LAN server listens on port 11434.",
+                "title": "LAN server",
+            },
+        ]
+        answer = answer_with_citations(
+            "The laptop has 8 GB of memory and the desktop has 32 GB [V1]. The LAN server listens on port 11434 [V2].",
+            "How much memory does the laptop have compared with the desktop?",
+            verified,
+        )
+        self.assertIn("32 GB", answer)
+        self.assertIn("[V1]", answer)
+        self.assertNotIn("LAN", answer)
+        self.assertNotIn("[V2]", answer)
+
+    def test_approval_rejects_a_claim_its_evidence_does_not_support(self) -> None:
+        import hashlib
+        import tempfile
+        from pathlib import Path
+
+        from scripts.atom_mutator import ReviewTransitionError, apply_review_transition, content_sha256
+
+        source = "Daily backups run at 02:00. A 70B Hermes model needs a large GPU.\n"
+        mismatched = (
+            "---\n"
+            "id: mismatch\n"
+            "type: atom\n"
+            "memory_type: semantic\n"
+            "epistemic_label: claim\n"
+            "sources:\n"
+            "  - 0-raw/note.md\n"
+            "review_status: pending\n"
+            "citation_integrity: missing\n"
+            "---\n\n"
+            "## Claim\n"
+            "Daily backups run at 02:00.\n\n"
+            "## Evidence\n"
+            "A 70B Hermes model needs a large GPU.\n"
+        )
+        matched = mismatched.replace(
+            "## Evidence\nA 70B Hermes model needs a large GPU.\n",
+            "## Evidence\nDaily backups run at 02:00.\n",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / "0-raw"
+            atoms = root / "2-atoms"
+            raw.mkdir()
+            atoms.mkdir()
+            (raw / "note.md").write_text(source, encoding="utf-8")
+            bad = atoms / "bad.md"
+            bad.write_text(mismatched, encoding="utf-8")
+            with self.assertRaises(ReviewTransitionError):
+                apply_review_transition(
+                    action="approve",
+                    atom_path=str(bad),
+                    expected_sha256=hashlib.sha256(bad.read_bytes()).hexdigest(),
+                    actor="owner-test",
+                    brain_dir=str(root),
+                    atoms_dir=str(atoms),
+                    decision_log_path=str(raw / "decision-record.jsonl"),
+                )
+            good = atoms / "good.md"
+            good.write_text(matched, encoding="utf-8")
+            result = apply_review_transition(
+                action="approve",
+                atom_path=str(good),
+                expected_sha256=content_sha256(good.read_bytes()),
+                actor="owner-test",
+                brain_dir=str(root),
+                atoms_dir=str(atoms),
+                decision_log_path=str(raw / "decision-record.jsonl"),
+            )
+        self.assertEqual(result["action"], "approve")
 
 
 class PinnedModelFallbackTests(unittest.TestCase):

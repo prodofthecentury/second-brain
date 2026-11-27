@@ -30,6 +30,7 @@ _MOD_PATH_DEFAULTS = snapshot_module_defaults(globals())
 from scripts.evidence import (
     ANCHOR_FIELDS,
     EvidenceValidationError,
+    claim_entailed_by_evidence,
     extract_evidence_from_body_lines,
     find_evidence_anchor,
     has_cached_normalized_source,
@@ -49,7 +50,7 @@ from scripts.memory_format import (
     set_string_list_field,
     split_frontmatter,
 )
-from scripts.memory_review import parse_frontmatter_values, parse_scalar_list
+from scripts.memory_review import parse_frontmatter_values, parse_scalar_list, section_text
 
 
 DECISION_LOG = os.path.join(RAW_DIR, "archive", "decision-record.jsonl")
@@ -574,6 +575,13 @@ def apply_atom_mutation(
                     evidence_anchor = find_evidence_anchor(original_text, brain_dir)
                 except (EvidenceValidationError, OSError, ValueError) as exc:
                     raise ReviewTransitionError(f"Approval requires verifiable source evidence: {exc}") from exc
+                if epistemic_label != "preference":
+                    claim_text = section_text("\n".join(body), "Claim")
+                    evidence_text = section_text("\n".join(body), "Evidence")
+                    if not claim_entailed_by_evidence(claim_text, evidence_text):
+                        raise ReviewTransitionError(
+                            "Approval requires the claim to be supported by its own evidence quote."
+                        )
 
             reviewed_on = reviewed_on or datetime.datetime.now().strftime("%Y-%m-%d")
             transition = TRANSITIONS[action]

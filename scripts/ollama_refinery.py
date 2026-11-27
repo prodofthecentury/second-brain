@@ -67,6 +67,7 @@ _MOD_PATH_DEFAULTS["HOUSE_RULES_PATH"] = str(HOUSE_RULES_PATH)
 _MOD_PATH_DEFAULTS["CHROMA_DB_PATH"] = str(CHROMA_DB_PATH)
 from scripts.hardware_profile import strip_reasoning_think_blocks
 from scripts.ollama_utils import chat_with_fallback, embed_text, embedding_metadata
+from scripts.evidence import claim_entailed_by_evidence, entail_stems, number_tokens
 from scripts.memory_format import (
     MEMORY_BOUNDARY,
     capture_origin,
@@ -622,30 +623,59 @@ def claim_supported_by_evidence(claim: str, evidence: str) -> bool:
     return hits >= needed
 
 
+def _claim_is_padded(claim: str, evidence: str) -> bool:
+    """True when the claim adds content words or is much longer than its evidence."""
+    extras = entail_stems(claim) - entail_stems(evidence)
+    if extras:
+        return True
+    claim_words = len(str(claim or "").split())
+    evidence_words = max(1, len(str(evidence or "").split()))
+    return claim_words > evidence_words * 1.6 + 2
+
+
+def _support_score(claim: str, sentence: str) -> int:
+    return len(entail_stems(claim) & entail_stems(sentence)) + len(number_tokens(claim) & number_tokens(sentence))
+
+
+def _as_sentence(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if cleaned.endswith((".", "!", "?")):
+        return cleaned
+    return cleaned.rstrip(".") + "."
+
+
+def _align_claim_and_evidence(claim: str, evidence: str, source: str) -> tuple[str, str]:
+    """Pair the claim with the source sentence that supports it, or use that sentence as the claim."""
+    best = evidence
+    best_score = -1
+    if claim_entailed_by_evidence(claim, evidence) and not _claim_is_padded(claim, evidence):
+        best_score = _support_score(claim, evidence)
+    else:
+        for sentence in _fact_sentences(source):
+            if _is_heading_or_boilerplate(sentence):
+                continue
+            if not claim_entailed_by_evidence(claim, sentence) or _claim_is_padded(claim, sentence):
+                continue
+            score = _support_score(claim, sentence)
+            if score > best_score:
+                best = sentence
+                best_score = score
+    if best_score >= 0:
+        return claim.strip(), best
+    return _as_sentence(evidence), evidence
+
+
 def salvage_claim(claim: str, evidence: str, source: str) -> str | None:
-    """Keep a claim the evidence supports, or the source sentence the claim itself quotes."""
-    claim_span = exact_source_span(source, claim)
-    if claim_span and not _is_heading_or_boilerplate(claim_span):
-        sentence = claim_span if claim_span.endswith((".", "!", "?")) else claim_span.rstrip(".") + "."
-        if claim_grounded_in_source(sentence, source):
-            return sentence
-    if _is_heading_or_boilerplate(evidence) or evidence not in source:
+    """Keep a claim its own evidence supports, or the evidence sentence itself."""
+    if _is_heading_or_boilerplate(evidence) or (evidence and evidence not in source and exact_source_span(source, evidence) is None):
+        span = exact_source_span(source, claim)
+        if not span or _is_heading_or_boilerplate(span):
+            return None
+        evidence = span
+    aligned, _paired = _align_claim_and_evidence(claim, evidence, source)
+    if not aligned or _is_heading_or_boilerplate(aligned) or not claim_entailed_by_evidence(aligned, _paired):
         return None
-    cleaned = _clean_quote_hint(claim)
-    unusable = (
-        not cleaned
-        or _is_heading_or_boilerplate(cleaned)
-        or _ARTIFACT_CLAIM_RE.search(cleaned)
-        or _claim_is_truncated(cleaned)
-        or not claim_supported_by_evidence(cleaned, evidence)
-        or not claim_grounded_in_source(cleaned, source)
-    )
-    if not unusable:
-        return cleaned if cleaned.endswith((".", "!", "?")) else cleaned.rstrip(".") + "."
-    sentence = evidence if evidence.endswith((".", "!", "?")) else evidence.rstrip(".") + "."
-    if _is_heading_or_boilerplate(sentence) or not claim_grounded_in_source(sentence, source):
-        return None
-    return sentence
+    return aligned
 
 
 def claim_grounded_in_source(claim: str, source: str) -> bool:
@@ -794,6 +824,7 @@ ATOM_JSON_SCHEMA = {
     "required": ["atoms"],
 }
 
+LAST_REJECTED_SPANS: set[str] = set()
 _DISTILL_STOP = frozenset({
     "that", "this", "with", "from", "have", "been", "were", "they", "them", "your", "into", "about",
     "when", "where", "what", "which", "their", "there", "would", "could", "should", "after", "before",
@@ -905,7 +936,8 @@ def _schema_prompt(note: str) -> str:
         "List each distinct fact in the note, including numbers, times, sizes, and setting names. "
         "Return up to 5 atoms. "
         "evidence must be an exact quote copied from the note. "
-        "claim must be one sentence about that quote, using words that appear in the note. "
+        "claim must be one sentence about that quote, using only words from its own evidence. "
+        "Pair each fact with the quote that states it. Do not repeat a fact. "
         "Do not add facts, names, or examples that are not in the note.\n\n"
         f"RAW CAPTURE:\n{note}"
     )
@@ -989,9 +1021,11 @@ def _call_model(prompt: str, model: str | None, *, schema: dict | str | None, te
     text, err = _once(schema)
     if err and "repeat" in err.casefold():
         return text, err
-    if text or schema is None:
+    if text or schema is None or not err:
         return text, err
-    # A complex schema can be rejected or ignored. One plain JSON retry stays on the same model.
+    # Retry plain JSON only when the server rejected the schema. A timeout is not a second attempt.
+    if not any(token in err.casefold() for token in ("format", "schema", "json")):
+        return text, err
     plain, plain_err = _once("json")
     if plain:
         return plain, ""
@@ -1020,15 +1054,19 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     path = "schema"
     if title and claim.casefold().strip(" .") == title.casefold().strip(" ."):
         claim = ""
-    kept_claim = salvage_claim(claim, evidence, source_text)
-    if not kept_claim:
-        print(f"  [!] Dropped atom; claim is not grounded in the evidence: {claim[:80]!r}")
+    original_claim = claim
+    claim, evidence = _align_claim_and_evidence(claim, evidence, source_text)
+    if (
+        _is_heading_or_boilerplate(claim)
+        or _is_heading_or_boilerplate(evidence)
+        or not claim_entailed_by_evidence(claim, evidence)
+    ):
+        print(f"  [!] Dropped atom; claim is not grounded in the evidence: {original_claim[:80]!r}")
         return None, "ungrounded"
-    if kept_claim.casefold() != claim.casefold():
+    if claim.casefold().strip() != original_claim.casefold().strip() or evidence.casefold().strip() != exact.casefold().strip():
         path = "derived_claim"
-        if not claim_supported_by_evidence(title, kept_claim):
-            title = " ".join(kept_claim.split()[:8]).rstrip(".")
-    claim = kept_claim
+        if not claim_supported_by_evidence(title, claim):
+            title = " ".join(claim.split()[:8]).rstrip(".")
     title_key = re.sub(r"[^a-z0-9]+", " ", title.casefold()).strip()
     claim_key = re.sub(r"[^a-z0-9]+", " ", claim.casefold()).strip().rstrip(".")
     if len(title) < 3 or (title_key and claim_key.startswith(title_key) and len(title_key.split()) < 3):
@@ -1037,6 +1075,7 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
         return None, path
     model_support = _optional_model_support_check(claim, evidence, model)
     if model_support is False:
+        LAST_REJECTED_SPANS.add(evidence.casefold().strip())
         print(f"  [!] Dropped atom; model said the evidence does not support the claim: {claim[:80]!r}")
         return None, "unsupported"
     if len(title) < 3:
@@ -1105,6 +1144,44 @@ def _rows_for_sentences(sentences: list[str], *, why: str) -> list[dict]:
     ]
 
 
+def _norm_quote(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").casefold()).strip()
+
+
+def _stem_coverage(left: str, right: str) -> float:
+    left_terms = entail_stems(left)
+    right_terms = entail_stems(right)
+    if not left_terms or not right_terms:
+        return 0.0
+    return len(left_terms & right_terms) / min(len(left_terms), len(right_terms))
+
+
+def _faithfulness(claim: str, evidence: str) -> float:
+    """Higher when the claim is the evidence sentence, lower when it adds words."""
+    if _norm_quote(claim) == _norm_quote(evidence):
+        return 2.0
+    claim_terms = entail_stems(claim)
+    evidence_terms = entail_stems(evidence)
+    if not evidence_terms:
+        return 0.0
+    extras = len(claim_terms - evidence_terms)
+    covered = len(claim_terms & evidence_terms)
+    return covered / len(evidence_terms) - 0.25 * extras
+
+
+def _same_fact(left_claim: str, left_evidence: str, right_claim: str, right_evidence: str) -> bool:
+    """Same evidence sentence, or the same numbers and content with a different wording."""
+    if left_evidence and right_evidence and _norm_quote(left_evidence) == _norm_quote(right_evidence):
+        return True
+    if number_tokens(left_claim) != number_tokens(right_claim):
+        return False
+    if number_tokens(left_evidence) != number_tokens(right_evidence):
+        return False
+    if _claims_are_near_duplicates(left_claim, right_claim):
+        return True
+    return _stem_coverage(left_claim, right_claim) >= 0.75
+
+
 def _claims_are_near_duplicates(left: str, right: str) -> bool:
     """True when two claims say the same thing. Different numbers stay distinct."""
     if re.findall(r"\d+(?:\.\d+)?", left) != re.findall(r"\d+(?:\.\d+)?", right):
@@ -1153,6 +1230,7 @@ def draft_memory_atoms(
 ):
     print(f"[*] Drafting memory atoms from {raw_filename}...")
     LAST_DISTILL_PATHS.clear()
+    LAST_REJECTED_SPANS.clear()
     if allow_fallback:
         raise ValueError("Fallback atom generation is prohibited; defer this capture until the model is healthy.")
 
@@ -1170,6 +1248,38 @@ def draft_memory_atoms(
     last_unparsed_output = ""
     model_outputs: list[str] = []
     generation_down = ""
+
+    def _keep_atom(doc: str, path: str, *, limit: int) -> None:
+        claim_text = section_text(doc, "Claim") or ""
+        evidence_text = section_text(doc, "Evidence") or ""
+        if not claim_text:
+            return
+        if any(_claims_are_near_duplicates(claim_text, prior) for prior in existing_claims):
+            print(f"  [!] Dropped near-duplicate atom: {claim_text[:80]!r}")
+            return
+        for index, prior_claim in enumerate(seen_claim_texts):
+            prior_evidence = section_text(collected[index], "Evidence") or ""
+            if not _same_fact(claim_text, evidence_text, prior_claim, prior_evidence):
+                continue
+            if _faithfulness(claim_text, evidence_text) > _faithfulness(prior_claim, prior_evidence) + 0.05:
+                collected[index] = doc
+                seen_claim_texts[index] = claim_text
+                LAST_DISTILL_PATHS.append(path)
+                print(f"  [*] Distill path: {path}")
+            else:
+                print(f"  [!] Dropped near-duplicate atom: {claim_text[:80]!r}")
+            return
+        claim_key = _normalized_claim_key(doc)
+        if claim_key and claim_key in seen_claims:
+            return
+        if len(collected) >= limit:
+            return
+        if claim_key:
+            seen_claims.add(claim_key)
+        seen_claim_texts.append(claim_text)
+        collected.append(doc)
+        LAST_DISTILL_PATHS.append(path)
+        print(f"  [*] Distill path: {path}")
 
     for chunk in chunks:
         if len(collected) >= MAX_ATOMS_PER_DOCUMENT:
@@ -1218,9 +1328,11 @@ def draft_memory_atoms(
                     finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
         empty_fields = any("empty" in item for item in problems)
         refusal = bool(re.search(r"unable to help|no information|i cannot|i can't", output or "", re.IGNORECASE))
-        already_headed = "##" in (output or "")
         parsed_and_rejected = bool(rows) and not empty_fields and "not JSON" not in " ".join(problems)
-        if not finished and output and not repeat_abort and not refusal and not already_headed and not parsed_and_rejected:
+        json_like = bool(rows) or '"atoms"' in (output or "") or '"memories"' in (output or "")
+        gave_up = (output or "").strip().upper() in {"NONE", "NO_CLAIMS", "EMPTY"}
+        # Repair only incomplete JSON. Prose, a refusal, and a parsed rejection do not spend another schema call.
+        if not finished and json_like and empty_fields and output and not repeat_abort and not refusal and not parsed_and_rejected and not gave_up:
             gap_text = "; ".join(problems) if problems else "the claim or title was empty"
             repair_prompt = (
                 "Your last JSON was incomplete: "
@@ -1231,122 +1343,80 @@ def draft_memory_atoms(
             repaired, repair_err = _call_model(repair_prompt, model, schema=ATOM_JSON_SCHEMA, temperature=0)
             if repair_err:
                 errors.append(repair_err)
-            else:
-                rows, problems = _rows_from_output(repaired or "")
+            elif repaired:
+                output = repaired
+                model_outputs.append(repaired)
+                rows, problems = _rows_from_output(repaired)
                 for row in rows:
                     doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
                     if doc:
                         finished.append((doc, "repair" if row_path == "schema" else row_path))
-                output = repaired or output
-        if not finished and output:
-            for row in _rows_from_loose_markdown(output):
-                doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                if doc:
-                    finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
-        if not finished and not repeat_abort:
-            for row in rows:
-                evidence = str(row.get("evidence") or "").strip()
-                if len(str(row.get("claim") or "").strip()) >= 12 or len(evidence) < 12:
+                for row in _rows_from_loose_markdown(repaired):
+                    doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                    if doc:
+                        finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
+        if not finished and output and not gave_up and not refusal:
+            for sentence in _fact_sentences(chunk_text):
+                if sentence.casefold().strip() in LAST_REJECTED_SPANS or not _sentence_mentioned(sentence, output):
                     continue
-                follow, follow_err = _call_model(
-                    "State one full sentence that this evidence supports. Output the sentence only.\n"
-                    f"Evidence: {evidence}",
-                    model,
-                    schema=None,
-                    temperature=0,
-                )
-                if follow_err:
-                    errors.append(follow_err)
-                    continue
-                sentence = ""
-                for line in (follow or "").splitlines():
-                    sentence = line.strip().strip('"')
-                    if len(sentence) >= 12:
-                        break
-                if len(sentence) < 12:
-                    continue
-                followed = {
-                    "title": str(row.get("title") or ""),
-                    "claim": sentence,
-                    "evidence": evidence,
-                    "why": str(row.get("why") or ""),
-                    "memory_type": str(row.get("memory_type") or "semantic"),
-                }
-                doc, _row_path = _finish_row(followed, chunk_text, raw_filename, today_str, model)
-                if doc:
-                    finished.append((doc, "claim_followup"))
-        if not finished and not repeat_abort:
+                for row in _rows_for_sentences([sentence], why="Salvaged from model text that quoted this sentence."):
+                    doc, _row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                    if doc:
+                        finished.append((doc, "salvaged"))
+        # One legacy call only when the first answer was prose and local salvage found nothing.
+        if not finished and not json_like and not repeat_abort and not refusal and not parsed_and_rejected and not gave_up:
             legacy_prompt = _legacy_markdown_prompt(raw_filename, today_str, extra_instructions, chunk_text, rules)
             legacy, legacy_err = _call_model(legacy_prompt, model, schema=None, temperature=0.2)
             if legacy_err:
                 errors.append(legacy_err)
             elif legacy:
                 output = legacy
+                model_outputs.append(legacy)
                 for document in extract_memory_documents(legacy, source_filename=raw_filename, current_date=today_str):
-                    rewritten = _rewrite_memory_identity(document, chunk_text, today_str, raw_filename)
-                    parsed = split_frontmatter(rewritten)
-                    body = "\n".join(parsed[1]) if parsed else ""
-                    claim = section_text(body, "Claim")
-                    evidence = section_text(body, "Evidence")
-                    if claim and evidence and evidence in chunk_text and claim_grounded_in_source(claim, chunk_text) and evidence_supports_claim(claim, evidence):
-                        finished.append((rewritten, "legacy_markdown"))
-                    elif claim and evidence:
-                        print(f"  [!] Dropped legacy atom; evidence does not overlap the claim: {claim[:80]!r}")
+                    parsed = split_frontmatter(document)
+                    body = "\n".join(parsed[1]) if parsed else document
+                    values = parse_frontmatter_values(parsed[0]) if parsed else {}
+                    row = {
+                        "title": str(values.get("title") or ""),
+                        "claim": section_text(body, "Claim"),
+                        "evidence": section_text(body, "Evidence"),
+                        "why": section_text(body, "Why It Matters"),
+                        "memory_type": str(values.get("memory_type") or "semantic"),
+                    }
+                    doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                    if doc:
+                        finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
                 if not finished:
                     for row in _rows_from_loose_markdown(legacy):
                         doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
                         if doc:
                             finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
-        if output:
-            mentioned = [sentence for sentence in _fact_sentences(chunk_text) if _sentence_mentioned(sentence, output)]
-            for row in _rows_for_sentences(mentioned, why="Salvaged from model text that quoted this sentence."):
-                doc, _row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                if doc:
-                    finished.append((doc, "salvaged"))
-        stripped_out = (output or "").strip()
-        if multi_chunk and stripped_out.upper() in {"NONE", "NO_CLAIMS", "EMPTY"}:
+                    for row in _rows_from_output(legacy)[0]:
+                        doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                        if doc:
+                            finished.append((doc, "repair" if row_path == "schema" else row_path))
+                if not finished:
+                    for sentence in _fact_sentences(chunk_text):
+                        if sentence.casefold().strip() in LAST_REJECTED_SPANS or not _sentence_mentioned(sentence, legacy):
+                            continue
+                        for row in _rows_for_sentences([sentence], why="Salvaged from model text that quoted this sentence."):
+                            doc, _row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
+                            if doc:
+                                finished.append((doc, "salvaged"))
+        if multi_chunk and gave_up:
             print(f"  [*] Chunk {chunk_idx + 1}/{chunk_total}: boilerplate/no durable claims; skipping chunk.")
             continue
 
-        chunk_memories = [doc for doc, _row_path in finished]
-        if chunk_memories:
-            used = ",".join(dict.fromkeys(row_path for _doc, row_path in finished))
-            LAST_DISTILL_PATHS.append(used)
-            print(f"  [*] Distill path: {used}")
-        if not chunk_memories:
+        if not finished:
             last_unparsed_output = output or ""
             preview = re.sub(r"\s+", " ", output or "").strip()[:80]
             print(f"  [*] Chunk {chunk_idx + 1}/{chunk_total}: 0 valid memories parsed (preview: {preview!r}); continuing.")
             continue
 
-        for mem in chunk_memories:
-            claim_text = section_text(mem, "Claim") or _normalized_claim_key(mem)
-            if any(_claims_are_near_duplicates(claim_text, prior) for prior in (*seen_claim_texts, *existing_claims)):
-                print(f"  [!] Dropped near-duplicate atom: {claim_text[:80]!r}")
-                continue
-            claim_key = _normalized_claim_key(mem)
-            if claim_key and claim_key in seen_claims:
-                continue
-            if claim_key:
-                seen_claims.add(claim_key)
-            if claim_text:
-                seen_claim_texts.append(claim_text)
-            collected.append(mem)
+        for mem, row_path in finished:
+            _keep_atom(mem, row_path, limit=MAX_ATOMS_PER_DOCUMENT)
             if len(collected) >= MAX_ATOMS_PER_DOCUMENT:
                 break
-
-    def _keep(doc: str, path: str) -> None:
-        if len(collected) >= MAX_ATOMS_PER_NOTE:
-            return
-        claim_text = section_text(doc, "Claim") or ""
-        if not claim_text:
-            return
-        if any(_claims_are_near_duplicates(claim_text, prior) for prior in (*seen_claim_texts, *existing_claims)):
-            return
-        seen_claim_texts.append(claim_text)
-        collected.append(doc)
-        LAST_DISTILL_PATHS.append(path)
-        print(f"  [*] Distill path: {path}")
 
     if not collected and generation_down and not model_outputs:
         raise RuntimeError(f"LLM drafting unavailable; capture deferred: {generation_down}")
@@ -1357,7 +1427,7 @@ def draft_memory_atoms(
     for sentence in _fact_sentences(str(raw_content)):
         if len(collected) >= MAX_ATOMS_PER_NOTE:
             break
-        if sentence.casefold() in covered_text:
+        if sentence.casefold().strip() in LAST_REJECTED_SPANS or sentence.casefold() in covered_text:
             continue
         mentioned = bool(mention_blob) and _sentence_mentioned(sentence, mention_blob)
         if had_model_atoms and not mentioned and not _priority_sentence(sentence):
@@ -1370,7 +1440,7 @@ def draft_memory_atoms(
         for row in _rows_for_sentences([sentence], why=why):
             doc, _row_path = _finish_row(row, str(raw_content), raw_filename, today_str, model)
             if doc:
-                _keep(doc, "salvaged" if mentioned else "extracted")
+                _keep_atom(doc, "salvaged" if mentioned else "extracted", limit=MAX_ATOMS_PER_NOTE)
                 covered_text = "\n".join(collected).casefold()
 
     if collected:

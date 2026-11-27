@@ -1542,19 +1542,31 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
             )
         self.assertEqual(list(atoms_dir.glob("*.md")), [])
 
-        # Heading prefix must be stripped from the stored claim.
+        # A heading that is not the excerpt cannot be approved as the claim.
+        with self.assertRaises(NoteError):
+            verify_note_excerpt(
+                saved["filename"],
+                "Use parameterized SQL queries always.",
+                actor="camer",
+                expected_note_sha256=note.sha256,
+                claim="## Heading Claim",
+                paths=self.paths,
+            )
+        self.assertEqual(list(atoms_dir.glob("*.md")), [])
+
+        # A heading prefix on the excerpt itself is stripped, and the stored claim stays the quote.
         verified = verify_note_excerpt(
             saved["filename"],
             "Use parameterized SQL queries always.",
             actor="camer",
             expected_note_sha256=note.sha256,
-            claim="## Heading Claim",
+            claim="## Use parameterized SQL queries always.",
             paths=self.paths,
         )
         self.assertEqual(verified["status"], "verified")
         atom_text = (atoms_dir / verified["atom_filename"]).read_text(encoding="utf-8")
-        self.assertIn("## Claim\nHeading Claim\n", atom_text)
-        self.assertNotIn("## Heading Claim", atom_text)
+        self.assertIn("## Claim\nUse parameterized SQL queries always.\n", atom_text)
+        self.assertNotIn("## Use parameterized", atom_text)
 
         # Transition failure must remove any newly created orphan atom and lexical index row.
         note_after = get_note(saved["filename"], paths=self.paths)

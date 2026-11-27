@@ -1182,7 +1182,10 @@ class SecurityAuditRegressionTests(Phase3IsolatedTestCase):
                 brain,
                 filename="no-force-push.md",
                 claim="Never force push to the main branch. Open a reviewed pull request instead.",
-                evidence="Engineers must never force push to the main branch under any circumstance.",
+                evidence=(
+                    "Never force push to the main branch. Open a reviewed pull request instead. "
+                    "Engineers must never force push to the main branch under any circumstance."
+                ),
                 memory_type="procedural",
             )
             atoms = [("no-force-push.md", sha)]

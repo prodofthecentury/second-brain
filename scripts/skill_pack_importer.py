@@ -370,7 +370,7 @@ def import_skill_pack(
             atom_id = f"pack-{clean_pack}-{slug}"
             atom_body = (
                 f"## Claim\n"
-                f"External skill pack procedure `{parsed['title']}` (from `{clean_pack}`): {parsed['description']}\n\n"
+                f"{parsed['quote']}\n\n"
                 f"## Context\n"
                 f"- Origin pack: `{clean_pack}` (`origin: imported_unknown`, source: skill pack import).\n"
                 f"- Requires explicit owner CAS approval before promotion to recall or active Playbooks.\n\n"
