@@ -58,6 +58,12 @@ class HashTests(unittest.TestCase):
             right.write_bytes("\ufeff{\"id\":\"b\",\"a\":2}\r\n{\"id\":\"a\",\"b\":1}\r\n".encode("utf-8"))
             self.assertEqual(file_hash(left), file_hash(right))
 
+    def test_committed_manifest_matches_every_public_file(self) -> None:
+        """A README or suite edit that skips `reason_bench lock` fails here."""
+        from scripts.reason_bench import check_manifest
+
+        check_manifest(repo_root())
+
     def test_forbidden_heldout_names(self) -> None:
         self.assertTrue(path_is_forbidden("bench/reasoning/suites/math.heldout.jsonl"))
         self.assertTrue(path_is_forbidden("notes.sbheldout"))
