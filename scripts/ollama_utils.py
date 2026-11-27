@@ -340,15 +340,16 @@ def chat_with_fallback(messages: list[dict], model: str | None = None, **kwargs)
                     )
                 timeout_arg = kwargs.get("timeout")
                 env_timeout = os.environ.get("BRAIN_OLLAMA_TIMEOUT")
+                default_timeout = 360.0 if is_reasoning_model_name(candidate) else 360.0
                 if env_timeout:
                     try:
                         timeout_val = float(env_timeout)
                     except ValueError:
-                        timeout_val = 360.0 if is_reasoning_model_name(candidate) else 360.0
-                elif timeout_arg is not None:
-                    timeout_val = float(timeout_arg)
+                        timeout_val = default_timeout
                 else:
-                    timeout_val = 360.0 if is_reasoning_model_name(candidate) else 360.0
+                    timeout_val = default_timeout
+                if timeout_arg is not None:
+                    timeout_val = min(timeout_val, float(timeout_arg))
                 client = ollama.Client(
                     host=base_url,
                     timeout=timeout_val,

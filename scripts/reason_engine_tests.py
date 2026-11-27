@@ -881,6 +881,147 @@ class MechanismProbeTests(unittest.TestCase):
 
         self._both(check)
 
+    def test_review_probes_in_both_sympy_modes(self) -> None:
+        """Every probe from the d04b7fa review, plus the B3 word-problem sentences."""
+        blocked = [
+            "What is 2026-11-27?",
+            "Calculate 2026-11-27",
+            "What is 555-1234?",
+            "What is 1/1/2027?",
+            "10.5-12",
+            "What is 2 + 3 4?",
+            "What is 3 4 + 1?",
+            "Convert 100 Mb to MB",
+            "Convert 8 b to B",
+            "A shop packs 12 boxes of 8 pens. It sells half of the pens and then gets 5 more pens delivered. How many pens does it have now?",
+            "10 boxes of 5 pens",
+            "8 groups of 6 and 2 more",
+            "12 boxes of 8 pens, sells half, then 5 more",
+            "12 boxes of 8 pens, sold all but 5 more",
+            "9 groups of 7 pens, lost 3 more than usual",
+            "3 boxes of 4 pens, 2 fewer than needed",
+            "What is 12 boxes of 8 pens plus 5 more?",
+            "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?",
+        ]
+        exact = {
+            "What is 2/3 + 0.5?": "7/6",
+            "What is 1/3 + 0.0?": "1/3",
+            "What is 2.5 * 2?": "5",
+            "What is 17 * 23 + 9?": "400",
+            "What is 1,500 + 20?": "1520",
+            "What is -5 + 3?": "-2",
+        }
+
+        def check() -> None:
+            seen: dict[str, str] = {}
+            for question in blocked:
+                tool = try_exact_tool(question)
+                self.assertTrue(tool is None or tool.get("refused"), question)
+                result = reason(question, use_default_model=False)
+                self.assertFalse(result["verified"], question)
+                self.assertFalse(result.get("internal_error"), question)
+            for question, answer in exact.items():
+                result = reason(question, use_default_model=False)
+                self.assertEqual(result["answer"], answer, question)
+                if result["verified"]:
+                    self.assertNotIn(".", result["answer"])
+                seen[question] = result["answer"]
+            self.assertEqual(seen["What is 2.5 * 2?"], "5")
+            self.assertEqual(seen["What is 2/3 + 0.5?"], "7/6")
+
+        natural = {}
+        for question, answer in exact.items():
+            natural[question] = reason(question, use_default_model=False)["answer"]
+        with _sympy_blocked():
+            blocked_answers = {
+                question: reason(question, use_default_model=False)["answer"] for question in exact
+            }
+            check()
+        self.assertEqual(natural, blocked_answers)
+        check()
+
+    def test_internal_error_keeps_the_exception_type(self) -> None:
+        with patch("scripts.reason_engine.try_exact_tool", side_effect=OverflowError("too big")):
+            result = reason("What is 1 + 1?")
+        self.assertTrue(result["internal_error"])
+        self.assertTrue(any("OverflowError" in error for error in result["errors"]))
+        self.assertFalse(result["verified"])
+
+    def test_a_plain_question_does_not_spend_a_planner_call(self) -> None:
+        calls: list[str] = []
+
+        def _model(prompt: str) -> str:
+            calls.append(prompt)
+            return "The kiln is warm."
+
+        result = reason("How hot is the kiln?", model_fn=_model)
+        self.assertEqual(result["model_calls"], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("JSON", calls[0])
+        self.assertFalse(result["verified"])
+        self.assertFalse(result["internal_error"])
+
+    def test_budget_wins_over_the_ollama_env_timeout(self) -> None:
+        import socket
+        import threading
+        import time
+
+        from scripts.reason_engine import load_config
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        stop = threading.Event()
+
+        def _hang() -> None:
+            while not stop.is_set():
+                server.settimeout(0.2)
+                try:
+                    conn, _addr = server.accept()
+                except (TimeoutError, socket.timeout):
+                    continue
+                except OSError:
+                    return
+                try:
+                    while not stop.is_set():
+                        stop.wait(0.1)
+                finally:
+                    conn.close()
+
+        worker = threading.Thread(target=_hang, daemon=True)
+        worker.start()
+        original = load_config
+
+        def _short() -> dict:
+            config = original()
+            config["profiles"]["deep"] = {**config["profiles"]["deep"], "timeout_s": 0.8, "max_retries": 0}
+            return config
+
+        env = {
+            "OLLAMA_HOST": f"http://127.0.0.1:{port}",
+            "BRAIN_OLLAMA_TIMEOUT": "30",
+        }
+        try:
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("BRAIN_OLLAMA_HOST", None)
+                with patch("scripts.reason_engine.load_config", _short):
+                    before = threading.active_count()
+                    started = time.perf_counter()
+                    result = reason("Why is the sky blue?", use_default_model=True)
+                    elapsed = time.perf_counter() - started
+                    time.sleep(1.5)
+                    afterwards = threading.active_count()
+        finally:
+            stop.set()
+            server.close()
+        self.assertGreaterEqual(elapsed, 0.5)
+        self.assertLess(elapsed, 4.0)
+        self.assertLessEqual(afterwards, before)
+        self.assertIsInstance(result, dict)
+        self.assertFalse(result["verified"])
+        self.assertTrue(any("timeout" in error for error in result["errors"]))
+
 
 class ReasonBenchmarkTests(unittest.TestCase):
     def test_deterministic_benchmark_is_exact(self) -> None:

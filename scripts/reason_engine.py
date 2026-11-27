@@ -140,6 +140,13 @@ def _format_number(value: Any) -> str:
     if getattr(value, "is_rational", None) is True and callable(as_numer_denom):
         numer, denom = as_numer_denom()
         return _format_fraction(int(numer), int(denom))
+    if type(value).__name__ == "Float":
+        number = float(value)
+        if number != number or number in {float("inf"), float("-inf")}:
+            raise ValueError("non-finite result")
+        if number.is_integer():
+            return str(int(number))
+        return format(number, ".12g")
     is_integer = getattr(value, "is_integer", None)
     if isinstance(is_integer, bool) or callable(is_integer):
         integer = is_integer() if callable(is_integer) else is_integer
@@ -255,6 +262,16 @@ def _balanced(expr: str) -> bool:
     return depth == 0
 
 
+def _decimals_to_ratios(expr: str) -> str:
+    """Turn 2.5 into 25/10 so both evaluators see an exact ratio, not a rounded float."""
+    def _replace(match: re.Match[str]) -> str:
+        whole, frac = match.group(0).split(".", 1)
+        digits = f"{whole or '0'}{frac}"
+        return f"({int(digits)}/{10 ** len(frac)})"
+
+    return re.sub(r"\d*\.\d+(?![eE])", _replace, expr)
+
+
 def _prepare_expression(expr: str) -> str:
     cleaned = re.sub(r"\s+", "", _normalize_operators(expr))
     if re.fullmatch(r"\d+(?:\.\d+)?%", cleaned):
@@ -268,6 +285,7 @@ def _prepare_expression(expr: str) -> str:
     for power in re.finditer(r"\*\*(\d+)", cleaned):
         if int(power.group(1)) > _MAX_EXPONENT:
             raise ValueError("exponent is too large")
+    cleaned = _decimals_to_ratios(cleaned)
     try:
         ast.parse(cleaned, mode="eval")
     except SyntaxError as exc:
@@ -276,13 +294,8 @@ def _prepare_expression(expr: str) -> str:
 
 
 def _ordinary_number_text(expr: str) -> bool:
-    """Phone numbers, dates, and year ranges are not arithmetic unless the caller asks to compute."""
-    compact = re.sub(r"\s+", "", expr)
-    if _ORDINARY_HYPHEN_RE.fullmatch(compact):
-        return True
-    if _ORDINARY_SLASH_RE.fullmatch(compact):
-        return True
-    return False
+    """Dates, phones, and bare ranges stay non-arithmetic even after a compute prefix."""
+    return _date_phone_or_range(expr)
 
 
 def _is_whole_expression(text: str) -> bool:
@@ -294,12 +307,17 @@ def _is_whole_expression(text: str) -> bool:
 
 
 def exact_arithmetic(expr: str) -> tuple[str, str, bool]:
-    """Return (text, answer_source, verified). Verified only when SymPy and the AST agree."""
+    """Return (text, answer_source, verified). Verified only when SymPy and the AST agree.
+
+    A rounded float is never verified. Decimal literals are exact ratios first.
+    """
     cleaned = _prepare_expression(expr)
     try:
-        restricted = _format_number(_ast_eval(cleaned))
+        restricted_value = _ast_eval(cleaned)
+        restricted = _format_number(restricted_value)
     except SyntaxError as exc:
         raise ValueError("expression is not plain arithmetic") from exc
+    rounded = isinstance(restricted_value, float) and not float(restricted_value).is_integer()
     try:
         symbolic = _format_number(_sympy_value(cleaned))
     except ImportError:
@@ -310,6 +328,8 @@ def exact_arithmetic(expr: str) -> tuple[str, str, bool]:
         raise ValueError(str(exc)) from exc
     if symbolic != restricted:
         raise ValueError("calculator mismatch")
+    if rounded:
+        return restricted, "tool:calculator", False
     return symbolic, "tool:sympy", True
 
 
@@ -349,10 +369,25 @@ def _glued_dimension(text: str) -> bool:
     return bool(re.fullmatch(r"\d+[xX]\d+", compact)) and not re.search(r"\d\s+[xX]\s+\d", text)
 
 
+def _date_phone_or_range(text: str) -> bool:
+    """ISO dates, d/m/y dates, phones, and bare a-b ranges are not calculations.
+
+    A leading 'what is' or 'calculate' does not turn them into arithmetic.
+    """
+    compact = re.sub(r"\s+", "", text)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", compact):
+        return True
+    if re.fullmatch(r"\d{1,4}/\d{1,4}/\d{2,4}", compact):
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)+", compact) and not re.search(r"[+*/%^xX×]", text):
+        return True
+    return False
+
+
 def _ordinary_literal(text: str) -> bool:
     """A bare phone, date, range, percent, or dimension is not a calculation."""
     compact = re.sub(r"\s+", "", text)
-    if " " not in text and re.fullmatch(r"\d+(?:-\d+)+", text.strip()):
+    if _date_phone_or_range(text):
         return True
     if re.fullmatch(r"\d+/\d+(?:/\d+)?", compact):
         return True
@@ -367,9 +402,11 @@ def _ordinary_literal(text: str) -> bool:
 
 def _expression_text(text: str, *, prefixed: bool) -> str | None:
     """The whole remainder is one expression, or it is not a tool question."""
-    if not text or _glued_dimension(text):
+    if not text or _glued_dimension(text) or _date_phone_or_range(text):
         return None
     if _ordinary_literal(text) and not prefixed:
+        return None
+    if re.search(r"\d\s+\d", text):
         return None
     if not re.fullmatch(r"[0-9+\-*/%.()\s*^×xX·∙,eE]+", text):
         return None
@@ -434,8 +471,12 @@ def _unit_answer(question: str) -> str | None:
         amount = float(match.group(1))
     except (ValueError, OverflowError):
         return None
-    src = _canon_unit(match.group(2))
-    dst = _canon_unit(match.group(3))
+    raw_src = match.group(2)
+    raw_dst = match.group(3)
+    if raw_src.casefold() == raw_dst.casefold() and raw_src != raw_dst:
+        return None
+    src = _canon_unit(raw_src)
+    dst = _canon_unit(raw_dst)
     if src in {"c", "f"} or dst in {"c", "f"}:
         if src == "c" and dst == "f":
             value = amount * 9.0 / 5.0 + 32.0
@@ -802,7 +843,7 @@ def _model_answer(
     }
 
 
-def _fallback_result() -> dict[str, Any]:
+def _fallback_result(exc: BaseException | None = None) -> dict[str, Any]:
     return {
         "answer": ABSTAIN,
         "answer_source": "abstain",
@@ -817,10 +858,15 @@ def _fallback_result() -> dict[str, Any]:
         "backend": None,
         "model_calls": 0,
         "elapsed_ms": 0.0,
-        "errors": ["reasoning failed"],
+        "errors": ["reasoning failed" if exc is None else f"reasoning failed: {type(exc).__name__}"],
+        "internal_error": True,
         "engine": True,
         "profile": "deep",
     }
+
+
+def _failure_note(exc: BaseException) -> str:
+    return f"reasoning failed: {type(exc).__name__}"
 
 
 def _safe_abstain(question: Any, profile: str | None, exc: BaseException) -> dict[str, Any]:
@@ -835,12 +881,12 @@ def _safe_abstain(question: Any, profile: str | None, exc: BaseException) -> dic
             "budget": budget,
             "model_calls": 0,
             "started": started,
-            "errors": ["reasoning failed"],
+            "errors": [_failure_note(exc)],
             "allow_default_model": False,
         }
-        return _finish(_abstain("other", [], [], None), budget, state, started)
+        return _finish(_abstain("other", [], [], None), budget, state, started, internal_error=True)
     except Exception:
-        return _fallback_result()
+        return _fallback_result(exc)
 
 
 def reason(
@@ -938,7 +984,7 @@ def _reason(
         if draft.strip() and not _is_refusal(draft):
             return _finish(_model_answer(draft, kind=kind, sources=[], steps=[], plan={"problem_type": kind, "steps": [], "planner": "tool-refused"}), budget, state, started)
         return _finish(_abstain(kind, [], sources, None), budget, state, started)
-    plan = _model_plan(text, model_fn if can_model else None, state) if can_model else _heuristic_plan(kind)
+    plan = _heuristic_plan(kind)
     executed: list[dict[str, Any]] = []
     for step in plan.get("steps") or []:
         if not isinstance(step, dict):
@@ -1127,13 +1173,22 @@ def _citations_from_events(events: list[dict[str, Any]]) -> list[dict[str, str]]
     return citations
 
 
-def _finish(body: dict[str, Any], budget: dict[str, Any], state: dict[str, Any], started: float) -> dict[str, Any]:
+def _finish(
+    body: dict[str, Any],
+    budget: dict[str, Any],
+    state: dict[str, Any],
+    started: float,
+    *,
+    internal_error: bool = False,
+) -> dict[str, Any]:
     elapsed = round((time.perf_counter() - started) * 1000.0, 2)
     if not body.get("answer_source"):
         body = {**body, "answer_source": "abstain" if body.get("abstained") else "model"}
     body = {**body, "verified": bool(body.get("verified")), "contract_version": 2}
+    flag = bool(internal_error or body.get("internal_error"))
     return {
         **body,
+        "internal_error": flag,
         "profile": budget["name"],
         "model_calls": state["model_calls"],
         "elapsed_ms": elapsed,
