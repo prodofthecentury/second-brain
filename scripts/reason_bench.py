@@ -2607,10 +2607,15 @@ def _extract_commit(repo: Path, ref: str) -> Path:
 
 
 def _scan_recorded_fingerprints(root: Path) -> None:
-    bench = bench_root(root)
-    for path in sorted(bench.glob("expected-hard-failures*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        reject_integrity(payload.get("tuples") or [])
+    """The current fingerprint is the hard-gates file. Integrity tuples cannot sit in it.
+
+    Older engine records are not an allow-list. hard-gates does not read them.
+    """
+    path = bench_root(root) / "expected-hard-failures.current.json"
+    if not path.is_file():
+        raise BenchError("missing expected-hard-failures.current.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    reject_integrity(payload.get("tuples") or [])
 
 
 def _absolute_zero(workspace: Path, pin: str) -> int:
