@@ -1,0 +1,18 @@
+{
+  "default_profile": "deep",
+  "profiles": {
+    "deep": {
+      "max_steps": 6,
+      "max_model_calls": 8,
+      "max_retries": 1,
+      "timeout_s": 180
+    },
+    "fast": {
+      "max_steps": 2,
+      "max_model_calls": 1,
+      "max_retries": 0,
+      "timeout_s": 25
+    }
+  },
+  "latency_note": "Deep is the default for chat and for the reason tool. On a small CPU model a single generation often takes several seconds to a minute, and a deep answer can add a planner call plus one call per model step, so it is several times a single reply. Arithmetic, dates, and unit conversions are computed with tools and do not call a model. Profile fast on chat is the previous single-pass path. Profile fast on the reason tool still uses the engine, with the smaller budget above."
+}

@@ -1085,6 +1085,18 @@ if nav_selection == "💬 Chat with Memory":
             st.session_state.chat_history = []
             st.session_state.pop("active_chat_thread_id", None)
             st.rerun()
+    reason_profile = st.selectbox(
+        "Reasoning",
+        options=["deep", "fast"],
+        index=0,
+        format_func=lambda key: "Deep (default)" if key == "deep" else "Fast (single-pass opt-out)",
+        key="chat_reason_profile",
+        help="Deep is the default and can take several model calls on a small CPU model. Fast is the previous single-pass chat path.",
+    )
+    st.caption(
+        "Deep reasoning is the default. Arithmetic, dates, and units are computed exactly. "
+        "A small model on CPU can take several times as long as one reply when a step needs the model."
+    )
 
     # Persistent Multi-Turn Chat Thread Bar
     try:
@@ -1411,6 +1423,8 @@ if nav_selection == "💬 Chat with Memory":
                     chat_kwargs["thread_id"] = active_tid
                 if "history" in chat_sig and prior_turns:
                     chat_kwargs["history"] = prior_turns
+                if "profile" in chat_sig:
+                    chat_kwargs["profile"] = reason_profile
                 if "include_expired" in chat_sig and rag_include_expired:
                     chat_kwargs["include_expired"] = True
                 if "as_of" in chat_sig and rag_as_of.strip():
@@ -1435,6 +1449,12 @@ if nav_selection == "💬 Chat with Memory":
                                 lines.append(f"  [{src.get('citation_id')}] ({src.get('tier')}) {src.get('filename')}: {body_txt[:220]}")
                             final_text = "\n".join(lines)
                             stream_box.text(final_text)
+                    elif etype == "reasoning":
+                        steps = ev.get("steps") or []
+                        route_box.caption(
+                            f"Reasoning ({ev.get('profile')}, {ev.get('problem_type')}): "
+                            + ", ".join(str(step.get("tool")) for step in steps if isinstance(step, dict))
+                        )
                     elif etype == "cognitive_route":
                         cognitive_route_event = dict(ev)
                         with route_box:

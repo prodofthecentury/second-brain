@@ -541,7 +541,7 @@ class ConnectorAndMcpTests(IsolatedVaultCase):
         self.assertTrue((plugin / "skills" / "second-brain-memory" / "SKILL.md").is_file())
         cfg = json.loads((plugin / "mcp_config.json").read_text(encoding="utf-8"))
         self.assertIn("second-brain", cfg["mcpServers"])
-        self.assertEqual(cfg["mcpServers"]["second-brain"]["env"]["BRAIN_MCP_SCHEMA_REVISION"], "v1.1.0-35tools")
+        self.assertEqual(cfg["mcpServers"]["second-brain"]["env"]["BRAIN_MCP_SCHEMA_REVISION"], "v1.2.0-36tools",)
 
         hooks = json.loads((plugin / "hooks.json").read_text(encoding="utf-8"))
         self.assertIn("second-brain-auto-recall", hooks)
@@ -561,7 +561,7 @@ class ConnectorAndMcpTests(IsolatedVaultCase):
         skill_text = (plugin / "skills" / "second-brain-memory" / "SKILL.md").read_text(encoding="utf-8")
         readme_text = (plugin / "README.md").read_text(encoding="utf-8")
         rules_text = (plugin / "rules" / "AGENTS.md").read_text(encoding="utf-8")
-        self.assertIn("35 audited", readme_text)
+        self.assertIn("36 audited", readme_text)
         self.assertIn("<second_brain_auto_context>", rules_text)
         for tool_name in sorted(mcp_server.TOOL_NAMES):
             self.assertIn(tool_name, skill_text)
@@ -755,7 +755,7 @@ class ConnectorAndMcpTests(IsolatedVaultCase):
         from mcp import types
 
         mcp_server._preload_tool_modules()
-        self.assertEqual(len(mcp_server.ALL_TOOLS), 35)
+        self.assertEqual(len(mcp_server.ALL_TOOLS), 36)
         token = mcp_server.generate_bearer_token()
         mcp_server.save_bearer_token(token)
         with (
@@ -1396,7 +1396,7 @@ class ConnectorAndMcpTests(IsolatedVaultCase):
 
         async def _scenario() -> None:
             listed = await mcp_server.handle_list_tools(ctx, None)
-            self.assertEqual(len(listed.tools), 35)
+            self.assertEqual(len(listed.tools), 36)
             self.assertEqual({t.name for t in listed.tools}, mcp_server.TOOL_NAMES)
 
             # 1. list_principles strips raw host path & enforces project scope

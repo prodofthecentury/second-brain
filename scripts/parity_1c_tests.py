@@ -298,7 +298,7 @@ class McpExpanded27ToolsAndNliTests(unittest.TestCase):
             "git_hook_status",
             "distill_git_commits",
         }
-        self.assertEqual(len(mcp_server.ALL_TOOLS), 35)
+        self.assertEqual(len(mcp_server.ALL_TOOLS), 36)
         self.assertTrue(expected_new.issubset(mcp_server.TOOL_NAMES))
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -378,7 +378,7 @@ class McpExpanded27ToolsAndNliTests(unittest.TestCase):
 
             async def _run() -> None:
                 listed = await mcp_server.handle_list_tools(ctx, None)
-                self.assertEqual(len(listed.tools), 35)
+                self.assertEqual(len(listed.tools), 36)
 
                 # list_contradictions auto-enables ONNX NLI when DeBERTa slot verified
                 seen_calls: list[dict] = []

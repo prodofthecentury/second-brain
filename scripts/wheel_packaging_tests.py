@@ -1250,7 +1250,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
                                         props.add(pk.value)
                 if tname:
                     mcp_schemas[tname] = props
-        self.assertEqual(len(mcp_schemas), 35)
+        self.assertEqual(len(mcp_schemas), 36)
         skill_lines = (
             REPO_ROOT / "plugins" / "antigravity" / "second-brain" / "skills" / "second-brain-memory" / "SKILL.md"
         ).read_text(encoding="utf-8").splitlines()

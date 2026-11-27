@@ -235,10 +235,10 @@ class McpDocCountTests(unittest.TestCase):
                 continue
             self.assertIsInstance(node.value, ast.Set)
             names = {elt.value for elt in node.value.elts if isinstance(elt, ast.Constant)}
-        self.assertEqual(len(names), 35)
+        self.assertEqual(len(names), 36)
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         policy = (ROOT / "docs" / "mcp-local-policy.md").read_text(encoding="utf-8")
-        self.assertIn("35 MCP tools", readme)
+        self.assertIn("36 MCP tools", readme)
         self.assertNotIn("27-Tool", readme)
         self.assertNotIn("31 MCP", readme)
         for name in names:

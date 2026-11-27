@@ -373,7 +373,7 @@ class Phase10MathAndFormalDiscoveryTests(unittest.TestCase):
             ):
                 ctx = SimpleNamespace(meta={"authorization": f"Bearer {token}"})
                 listed = asyncio.run(mcp_server.handle_list_tools(ctx, None))
-                self.assertEqual(len(listed.tools), 35)
+                self.assertEqual(len(listed.tools), 36)
                 eq_res = asyncio.run(
                     mcp_server.handle_call_tool(
                         ctx,

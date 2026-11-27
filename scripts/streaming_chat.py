@@ -222,6 +222,19 @@ class ChatStreamRequest(BaseModel):
     custom_rules: str | None = Field(default=None, max_length=4000)
     done_criteria: str | None = Field(default=None, max_length=2000)
     history: list[ChatHistoryItem] = Field(default_factory=list, max_length=20)
+    profile: str | None = None
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def _coerce_profile(cls, v: object) -> str | None:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        if not isinstance(v, str):
+            raise ValueError("profile must be 'deep' or 'fast'.")
+        cleaned = v.strip().lower()
+        if cleaned not in {"deep", "fast"}:
+            raise ValueError("profile must be 'deep' or 'fast'.")
+        return cleaned
 
     @field_validator("work_mode", mode="before")
     @classmethod
@@ -1305,14 +1318,108 @@ def chat_events(
     behavior_mode: str | None = None,
     custom_rules: str | None = None,
     done_criteria: str | None = None,
+    profile: str | None = None,
 ) -> Iterator[dict[str, object]]:
-    """Yield chat events: context → (tokens|verified_answer) → grounding → [research_leads] → done."""
+    """Yield chat events. The default profile is deep and goes through the reasoning engine."""
     if mode not in CHAT_MODES:
         raise ValueError(f"mode must be one of {CHAT_MODES}")
     if retrieval_mode not in RETRIEVAL_MODES:
         raise ValueError(f"retrieval_mode must be one of {RETRIEVAL_MODES}")
     if answer_view not in ANSWER_VIEWS:
         raise ValueError(f"answer_view must be one of {ANSWER_VIEWS}")
+    from scripts.reason_engine import delegation_trace, reason, resolve_profile, tool_chat_events
+
+    resolved_profile = resolve_profile(profile)
+    if resolved_profile != "fast" and mode in {"stream", "verified"}:
+        def _delegate_existing_chat() -> list[dict[str, object]]:
+            return list(
+                chat_events(
+                    query,
+                    mode=mode,
+                    paths=paths,
+                    project_scope=project_scope,
+                    stream_fn=stream_fn,
+                    json_fn=json_fn,
+                    model_override=model_override,
+                    include_preferences=include_preferences,
+                    host_id=host_id,
+                    retrieval_mode=retrieval_mode,
+                    allow_cross_project=allow_cross_project,
+                    answer_view=answer_view,
+                    allow_unverified_leads=allow_unverified_leads,
+                    thread_id=thread_id,
+                    history=history,
+                    include_expired=include_expired,
+                    as_of=as_of,
+                    work_mode=work_mode,
+                    persona_id=persona_id,
+                    behavior_mode=behavior_mode,
+                    custom_rules=custom_rules,
+                    done_criteria=done_criteria,
+                    profile="fast",
+                )
+            )
+
+        routed = reason(
+            query,
+            profile=resolved_profile,
+            delegate_fn=_delegate_existing_chat,
+            use_default_model=False,
+        )
+        if routed.get("delegated"):
+            trace = {
+                "engine": True,
+                "profile": routed.get("profile"),
+                "problem_type": routed.get("problem_type"),
+                "steps": routed.get("steps") or [],
+                "tool_calls": routed.get("tool_calls") or [],
+                "citations": routed.get("citations") or [],
+                "confidence": routed.get("confidence"),
+                "model_calls": routed.get("model_calls"),
+                "elapsed_ms": routed.get("elapsed_ms"),
+                "latency_note": routed.get("latency_note"),
+            }
+            for event in routed.get("events") or []:
+                if event.get("type") == "done":
+                    event = {**event, "reasoning": trace}
+                yield event
+            return
+        yield from tool_chat_events(routed)
+        return
+    if resolved_profile != "fast":
+        delegated = list(
+            chat_events(
+                query,
+                mode=mode,
+                paths=paths,
+                project_scope=project_scope,
+                stream_fn=stream_fn,
+                json_fn=json_fn,
+                model_override=model_override,
+                include_preferences=include_preferences,
+                host_id=host_id,
+                retrieval_mode=retrieval_mode,
+                allow_cross_project=allow_cross_project,
+                answer_view=answer_view,
+                allow_unverified_leads=allow_unverified_leads,
+                thread_id=thread_id,
+                history=history,
+                include_expired=include_expired,
+                as_of=as_of,
+                work_mode=work_mode,
+                persona_id=persona_id,
+                behavior_mode=behavior_mode,
+                custom_rules=custom_rules,
+                done_criteria=done_criteria,
+                profile="fast",
+            )
+        )
+        trace = delegation_trace(query, profile=resolved_profile)
+        for event in delegated:
+            if event.get("type") == "done":
+                event = {**event, "reasoning": trace}
+            yield event
+        return
     paths = paths or ChatPaths()
     started = time.perf_counter()
     active_host_id = (host_id or "ollama_local").strip() or "ollama_local"
@@ -2208,6 +2315,7 @@ def _render_chat_turn(
     json_fn: JsonFn | None = None,
     json_output: bool = False,
     print_fn: Callable[..., None] = print,
+    profile: str | None = None,
 ) -> dict[str, Any]:
     """Stream and render a single query turn via `chat_events`, returning turn summary metadata."""
     resolved_thread_id = thread_id if (thread_id and thread_id != "new") else ""
@@ -2233,6 +2341,7 @@ def _render_chat_turn(
         allow_unverified_leads=allow_unverified_leads,
         thread_id=thread_id,
         history=history,
+        profile=profile,
     ):
         kind = event.get("type")
         if kind == "context" and event.get("thread_id"):
@@ -2339,6 +2448,7 @@ def run_interactive_chat_repl(
     json_output: bool = False,
     input_fn: Callable[[str], str] | None = None,
     print_fn: Callable[..., None] | None = None,
+    profile: str | None = None,
 ) -> int:
     """Run an interactive multi-turn terminal chat loop backed by `chat_events()`."""
     if mode not in CHAT_MODES:
@@ -2471,6 +2581,7 @@ def run_interactive_chat_repl(
                 json_fn=json_fn,
                 json_output=json_output,
                 print_fn=emit,
+                profile=profile,
             )
         except Exception as exc:
             emit(f"! Error processing turn: {exc}")
@@ -2524,6 +2635,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("query", nargs="?", default="", help="Chat question (omit to start interactive REPL, or use --list-threads / --pin).")
     parser.add_argument("--interactive", action="store_true", help="Start interactive multi-turn terminal chat REPL.")
     parser.add_argument("--mode", choices=CHAT_MODES, default="stream")
+    parser.add_argument(
+        "--profile",
+        choices=("deep", "fast"),
+        default=None,
+        help="Reasoning profile. Default is deep (the engine). fast is the single-pass chat path.",
+    )
     parser.add_argument("--retrieval-mode", "--retrieval", dest="retrieval_mode", choices=RETRIEVAL_MODES, default="lexical")
     parser.add_argument("--host-id", "--host", dest="host_id", default="ollama_local", help="Host policy id (default ollama_local).")
     parser.add_argument("--view", "--answer-mode", dest="answer_view", choices=ANSWER_VIEWS, default="standard", help="Answer view (standard/preference/research).")
@@ -2653,6 +2770,7 @@ def main(argv: list[str] | None = None) -> int:
             pin_title=args.pin_title,
             pin_tags=parsed_pin_tags,
             json_output=bool(args.json),
+            profile=args.profile,
         )
 
     turn_summary = _render_chat_turn(
@@ -2669,6 +2787,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_unverified_leads=bool(args.answer_view == "research" or args.mode == "research"),
         thread_id=chosen_thread_id,
         json_output=bool(args.json),
+        profile=args.profile,
     )
 
     if args.pin is not None and turn_summary["thread_id"] and not turn_summary["saw_error_or_abstain"]:
