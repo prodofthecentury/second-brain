@@ -1055,7 +1055,7 @@ def _call_model(prompt: str, model: str | None, *, schema: dict | str | None, te
 
 
 def _finish_row(row: dict, source_text: str, source_filename: str, current_date: str, model: str | None) -> tuple[str | None, str]:
-    from scripts.sentence_spans import _fact_clauses
+    from scripts.sentence_spans import _fact_clauses, bind_table_row
 
     title = str(row.get("title") or "").strip()
     claim = str(row.get("claim") or "").strip()
@@ -1064,6 +1064,12 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     memory_type = str(row.get("memory_type") or "semantic").strip()
     if memory_type not in {"semantic", "episodic", "procedural", "self"}:
         memory_type = "semantic"
+    context = str(row.get("context") or "").strip()
+    bound = bind_table_row(source_text, claim, evidence)
+    if bound:
+        evidence, header = bound
+        if header and header not in context:
+            context = header if not context else f"{context} ¦ {header}"
     exact = exact_source_span(source_text, evidence) if len(evidence) >= 8 else None
     if exact and _is_heading_or_boilerplate(exact):
         exact = None
@@ -1083,10 +1089,9 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
         claim = ""
     original_claim = claim
     support = str(row.get("support") or "").strip()
-    context = str(row.get("context") or "").strip()
     clauses = _fact_clauses(evidence)
     if len(clauses) > 1:
-        print(f"  [!] Dropped atom; evidence hides more than one fact: {evidence[:80]!r}")
+        print(f"  [!] Splitting evidence that hides more than one fact: {evidence[:80]!r}")
         return None, "split"
     if _evidence_is_table_header(source_text, evidence):
         print(f"  [!] Dropped atom; evidence is a table header: {evidence[:80]!r}")
@@ -1145,6 +1150,52 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     if model_support is None and not claim_entailed_by_evidence(claim, evidence, context):
         return None, "unsupported"
     return finished, path
+
+
+def _complete_rows(row: dict, source_text: str, source_filename: str, current_date: str, model: str | None) -> list[tuple[str, str]]:
+    """Finish one model row, splitting a multi-fact quote into the source clauses it covers."""
+    from scripts.sentence_spans import _fact_clauses
+
+    evidence = str(row.get("evidence") or "")
+    verbatim = [clause for clause in _fact_clauses(evidence) if clause in source_text]
+    if len(verbatim) > 1:
+        produced: list[tuple[str, str]] = []
+        for clause in verbatim:
+            sub = dict(row)
+            sub["evidence"] = clause
+            sub["claim"] = clause
+            sub["support"] = ""
+            doc, path = _finish_row(sub, source_text, source_filename, current_date, model)
+            if doc:
+                produced.append((doc, path))
+        if produced:
+            return produced
+    doc, path = _finish_row(row, source_text, source_filename, current_date, model)
+    if path not in {"split", "unanchored"}:
+        return [(doc, path)] if doc else []
+    evidence_nums = set(re.findall(r"\d+", evidence))
+    if path == "unanchored" and len(evidence_nums) < 2:
+        return []
+    produced = []
+    seen: set[str] = set()
+    for sentence in split_sentences(source_text):
+        sentence_nums = set(re.findall(r"\d+", sentence))
+        if evidence_nums and not sentence_nums <= evidence_nums:
+            continue
+        if evidence_nums and not sentence_nums:
+            continue
+        for clause in _fact_clauses(sentence):
+            if clause not in source_text or clause in seen:
+                continue
+            seen.add(clause)
+            sub = dict(row)
+            sub["evidence"] = clause
+            sub["claim"] = clause
+            sub["support"] = ""
+            piece, piece_path = _finish_row(sub, source_text, source_filename, current_date, model)
+            if piece:
+                produced.append((piece, piece_path))
+    return produced
 
 
 def _short_config_fact(claim: str, evidence: str) -> bool:
@@ -1381,13 +1432,11 @@ def draft_memory_atoms(
         rows, problems = _rows_from_output(output or "")
         finished: list[tuple[str, str]] = []
         for row in rows:
-            doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-            if doc:
+            for doc, row_path in _complete_rows(row, chunk_text, raw_filename, today_str, model):
                 finished.append((doc, row_path))
         if output:
             for row in _rows_from_loose_markdown(output):
-                doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                if doc:
+                for doc, row_path in _complete_rows(row, chunk_text, raw_filename, today_str, model):
                     finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
         empty_fields = any("empty" in item for item in problems)
         refusal = bool(re.search(r"unable to help|no information|i cannot|i can't", output or "", re.IGNORECASE))
@@ -1411,20 +1460,17 @@ def draft_memory_atoms(
                 model_outputs.append(repaired)
                 rows, problems = _rows_from_output(repaired)
                 for row in rows:
-                    doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                    if doc:
+                    for doc, row_path in _complete_rows(row, chunk_text, raw_filename, today_str, model):
                         finished.append((doc, "repair" if row_path == "schema" else row_path))
                 for row in _rows_from_loose_markdown(repaired):
-                    doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                    if doc:
+                    for doc, row_path in _complete_rows(row, chunk_text, raw_filename, today_str, model):
                         finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
         if not finished and output and not gave_up and not refusal:
             for sentence in _fact_sentences(chunk_text):
                 if sentence.casefold().strip() in LAST_REJECTED_SPANS or not _sentence_mentioned(sentence, output):
                     continue
                 for row in _rows_for_sentences([sentence], why="Salvaged from model text that quoted this sentence."):
-                    doc, _row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                    if doc:
+                    for doc, _row_path in _complete_rows(row, chunk_text, raw_filename, today_str, model):
                         finished.append((doc, "salvaged"))
         # One legacy call only when the first answer was prose and local salvage found nothing.
         if not finished and not json_like and not repeat_abort and not refusal and not parsed_and_rejected and not gave_up:
@@ -1446,25 +1492,21 @@ def draft_memory_atoms(
                         "why": section_text(body, "Why It Matters"),
                         "memory_type": str(values.get("memory_type") or "semantic"),
                     }
-                    doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                    if doc:
+                    for doc, row_path in _complete_rows(row, chunk_text, raw_filename, today_str, model):
                         finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
                 if not finished:
                     for row in _rows_from_loose_markdown(legacy):
-                        doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                        if doc:
+                        for doc, row_path in _complete_rows(row, chunk_text, raw_filename, today_str, model):
                             finished.append((doc, "legacy_markdown" if row_path == "schema" else row_path))
                     for row in _rows_from_output(legacy)[0]:
-                        doc, row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                        if doc:
+                        for doc, row_path in _complete_rows(row, chunk_text, raw_filename, today_str, model):
                             finished.append((doc, "repair" if row_path == "schema" else row_path))
                 if not finished:
                     for sentence in _fact_sentences(chunk_text):
                         if sentence.casefold().strip() in LAST_REJECTED_SPANS or not _sentence_mentioned(sentence, legacy):
                             continue
                         for row in _rows_for_sentences([sentence], why="Salvaged from model text that quoted this sentence."):
-                            doc, _row_path = _finish_row(row, chunk_text, raw_filename, today_str, model)
-                            if doc:
+                            for doc, _row_path in _complete_rows(row, chunk_text, raw_filename, today_str, model):
                                 finished.append((doc, "salvaged"))
         if multi_chunk and gave_up:
             print(f"  [*] Chunk {chunk_idx + 1}/{chunk_total}: boilerplate/no durable claims; skipping chunk.")
@@ -1503,8 +1545,7 @@ def draft_memory_atoms(
             if mentioned
             else str(row.get("why") or "Extracted from the source sentence.")
         )
-        doc, _row_path = _finish_row(row, str(raw_content), raw_filename, today_str, model)
-        if doc:
+        for doc, _row_path in _complete_rows(row, str(raw_content), raw_filename, today_str, model):
             _keep_atom(doc, "salvaged" if mentioned else "extracted", limit=union_limit)
             covered_text = "\n".join(collected).casefold()
 

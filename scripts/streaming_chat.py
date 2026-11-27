@@ -505,10 +505,10 @@ def warmup(policy_path: Path | None = None) -> dict[str, object]:
     return {"model": model, "warmup_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
 
-def _claim_and_evidence(content: str) -> tuple[str, str]:
+def _claim_and_evidence(content: str) -> tuple[str, str, str]:
     parsed = split_frontmatter(content)
     body = "\n".join(parsed[1]) if parsed else content
-    return section_text(body, "Claim"), section_text(body, "Evidence")
+    return section_text(body, "Claim"), section_text(body, "Evidence"), section_text(body, "Context")
 
 
 def _note_excerpt(body: str, query: str) -> str:
@@ -593,7 +593,7 @@ def retrieve_context(
                 seen_fnames.add(nb.filename)
                 combined.append(nb)
         for result in combined[:MAX_VERIFIED]:
-            claim, evidence = _claim_and_evidence(result.content)
+            claim, evidence, context = _claim_and_evidence(result.content)
             if not claim:
                 continue
             parsed_fm = split_frontmatter(result.content)
@@ -606,6 +606,7 @@ def retrieve_context(
                     "atom_id": result.filename,
                     "claim": claim,
                     "evidence": evidence,
+                    "context": context,
                     "title": support_title,
                 })
             else:
@@ -614,6 +615,7 @@ def retrieve_context(
                     "atom_id": result.filename,
                     "claim": claim,
                     "evidence": evidence,
+                    "context": context,
                     "title": support_title,
                 })
             records.append({"filename": result.filename, "content": result.content})
@@ -643,13 +645,14 @@ def retrieve_context(
             for result in extra:
                 if result.filename in known or len(verified) >= MAX_VERIFIED + 4:
                     continue
-                claim, evidence = _claim_and_evidence(result.content)
+                claim, evidence, context = _claim_and_evidence(result.content)
                 if not claim:
                     continue
                 parsed_fm = split_frontmatter(result.content)
                 fm = parse_frontmatter_values(parsed_fm[0]) if parsed_fm else {}
                 sibling_title = _support_title(fm)
-                if label.casefold() not in sibling_title.casefold() and label.casefold() not in claim.casefold():
+                sibling_blob = f"{sibling_title} {claim} {context}"
+                if label.casefold() not in sibling_blob.casefold():
                     continue
                 known.add(result.filename)
                 verified.append({
@@ -657,6 +660,7 @@ def retrieve_context(
                     "atom_id": result.filename,
                     "claim": claim,
                     "evidence": evidence,
+                    "context": context,
                     "title": sibling_title,
                 })
         try:
@@ -826,6 +830,8 @@ def build_synthesis_prompt(
         line = f"[{item['id']}] {item['claim']}"
         if item.get("evidence"):
             line += f" Evidence: {item['evidence']}"
+        if item.get("context"):
+            line += f" Context: {item['context']}"
         if item.get("title"):
             line += f" Title: {item['title']}"
         return line
@@ -860,7 +866,7 @@ def build_synthesis_prompt(
         "[V#] are owner-verified claims; [N#] are the owner's unverified notes."
         f"{pref_instruction}{hist_instruction}\n"
         "Use only words that appear in the claim or its evidence. Do not add reasons or details that are not written there.\n"
-        "Facts that share a Title are one block. Use every line from that block together.\n"
+        "Facts that share a Title or a context block name are one block. Use every line from that block together.\n"
         "Answer only the question. Do not add a sentence about a different fact, even if that fact is in the sources.\n"
         "If the sources do not answer the question, say so briefly. Do not use outside knowledge.\n\n"
         f"<verified_claims>\n{v_block}\n</verified_claims>\n\n<notes>\n{n_block}\n</notes>{pref_block}{hist_block}{ws_block}\n\n"
@@ -871,7 +877,7 @@ def build_synthesis_prompt(
 def _support_blob(item: dict[str, object]) -> str:
     return " ".join(
         str(item.get(key) or "")
-        for key in ("claim", "evidence", "title", "source_note", "atom_id")
+        for key in ("claim", "evidence", "context", "title", "source_note", "atom_id")
     )
 
 
@@ -885,16 +891,34 @@ def best_supporting_claims(query: str, verified: list[dict[str, object]], *, min
     scored.sort(key=lambda pair: pair[0], reverse=True)
     chosen = [item for _score, item in scored[:3]]
     titles = {str(item.get("title") or "") for item in chosen if item.get("title")}
-    if not titles:
-        return chosen
     seen = {id(item) for item in chosen}
+    block_keys = {_block_key(item) for item in chosen}
+    block_keys.discard("")
+    if not titles and not block_keys:
+        return chosen
     for item in verified:
         if id(item) in seen:
             continue
-        if str(item.get("title") or "") in titles:
+        same_title = str(item.get("title") or "") in titles
+        same_block = _block_key(item) in block_keys
+        if same_title or same_block:
             chosen.append(item)
             seen.add(id(item))
     return chosen
+
+
+def _block_key(item: dict[str, object]) -> str:
+    """A config block label shared by the lines inside one server or host block."""
+    for part in re.split(r"\s+¦\s+", str(item.get("context") or "")):
+        part = part.strip()
+        named = re.match(r"^(?:.*\s)?([A-Za-z0-9_.:-]+)\s*\{\s*$", part)
+        if named:
+            return named.group(1).casefold()
+        if re.fullmatch(r"[A-Za-z0-9_.:-]+\s*:", part):
+            return part[:-1].strip().casefold()
+    claim = str(item.get("claim") or "")
+    named = re.match(r"^([^:]{1,40}):\s+", claim)
+    return named.group(1).strip().casefold() if named else ""
 
 
 def _chat_stem(word: str) -> str:
@@ -1024,39 +1048,117 @@ def _sentence_is_grounded(sentence: str, verified: list[dict[str, object]]) -> b
     return all(_token_covered(token, blob) for token in tokens)
 
 
+def _cite(sentence: str, ids: list[str]) -> str:
+    body = CITATION_RE.sub(" ", sentence)
+    body = re.sub(r"\s+", " ", body).strip()
+    if not ids:
+        return body
+    suffix = " ".join(f"[{item_id}]" for item_id in ids)
+    if body.endswith((".", "!", "?")):
+        return f"{body[:-1]} {suffix}{body[-1]}"
+    return f"{body} {suffix}"
+
+
+def _covering_ids(sentence: str, verified: list[dict[str, object]]) -> list[str] | None:
+    """Atom ids that entail this sentence, or None when a checkable token is unsupported."""
+    tokens = _sensitive_tokens(sentence)
+    if tokens:
+        for item in verified:
+            blob = _support_blob(item)
+            if all(_token_covered(token, blob) for token in tokens):
+                return [str(item["id"])]
+        covered: list[str] = []
+        for token in tokens:
+            hits = [item for item in verified if _token_covered(token, _support_blob(item))]
+            if not hits:
+                return None
+            item_id = str(hits[0]["id"])
+            if item_id not in covered:
+                covered.append(item_id)
+        return covered
+    best_item = None
+    best_score = 0.0
+    for item in verified:
+        score = _query_claim_overlap(sentence, _support_blob(item))
+        if score > best_score:
+            best_score = score
+            best_item = item
+    words = re.findall(r"[A-Za-z']+", sentence)
+    if best_item is not None and best_score >= 0.34:
+        return [str(best_item["id"])]
+    if len(words) < 6:
+        return []
+    return None
+
+
+def _extractive_answer(query: str, verified: list[dict[str, object]]) -> str:
+    chosen = best_supporting_claims(query, verified)
+    if not chosen:
+        ranked = sorted(
+            verified,
+            key=lambda item: _query_claim_overlap(query, _support_blob(item)),
+            reverse=True,
+        )
+        chosen = [item for item in ranked if _query_claim_overlap(query, _support_blob(item)) > 0][:3]
+        chosen = chosen or ranked[:1]
+    parts = []
+    for item in chosen[:4]:
+        claim = str(item.get("claim") or "").strip()
+        if claim:
+            parts.append(f"{claim} [{item['id']}]")
+    return " ".join(parts)
+
+
+def _rich_fact(token: str) -> bool:
+    """An address, clock time, date, or mixed quantity, not a bare name fragment."""
+    if "." in token or ":" in token or re.search(r"\d{4}", token):
+        return True
+    return bool(re.search(r"[A-Za-z]", token) and re.search(r"\d", token))
+
+
+def _addresses_question(answer: str, query: str, verified: list[dict[str, object]]) -> bool:
+    words = re.findall(r"[A-Za-z0-9']+", CITATION_RE.sub(" ", answer or ""))
+    if len(words) >= 6:
+        return True
+    chosen = best_supporting_claims(query, verified) or verified[:1]
+    missing = [
+        token
+        for item in chosen[:2]
+        for token in _sensitive_tokens(_support_blob(item))
+        if _rich_fact(token) and not _token_covered(token, answer or "")
+    ]
+    if missing and len(words) < 6:
+        return False
+    return len(words) >= 4 or bool(_sensitive_tokens(answer or ""))
+
+
 def answer_with_citations(text: str, query: str, verified: list[dict[str, object]]) -> str:
-    """Replace a false abstention and attach one [V#] tag at the end of a sentence."""
+    """Keep sentences whose facts are in the retrieved atoms, and cite those atoms."""
     if not verified:
         return text
     supporting = best_supporting_claims(query, verified)
     if supporting and (not (text or "").strip() or _MODEL_ABSTENTION_RE.search(text or "")):
-        top = supporting[0]
-        return f"{top['claim']} [{top['id']}]"
+        return _extractive_answer(query, verified)
     parts = split_sentences(text or "")
     if not parts:
-        return text
+        return _extractive_answer(query, verified) or text
     rewritten: list[str] = []
     for part in parts:
-        sentence = _move_citations_to_end(part)
-        if not CITATION_RE.search(sentence):
-            best_item = None
-            best_score = 0.0
-            for item in verified:
-                score = _query_claim_overlap(sentence, _support_blob(item))
-                if score > best_score:
-                    best_score = score
-                    best_item = item
-            if best_item is not None and best_score >= 0.34:
-                sentence = f"{sentence.rstrip()} [{best_item['id']}]"
-        if CITATION_RE.search(sentence):
-            if not _sentence_is_grounded(sentence, verified):
-                continue
-        elif not _uncited_sentence_allowed(sentence, verified):
+        sentence = CITATION_RE.sub(" ", part)
+        sentence = re.sub(r"\s+", " ", sentence).strip()
+        if not sentence:
             continue
-        rewritten.append(sentence)
-    if not rewritten:
-        return "No grounded sentence remained in the cited sources."
-    return _drop_off_question_clauses(_collapse_adjacent_citations(" ".join(rewritten)), query, verified)
+        ids = _covering_ids(sentence, verified)
+        if ids is None:
+            continue
+        rewritten.append(_cite(sentence, ids))
+    joined = _drop_off_question_clauses(_collapse_adjacent_citations(" ".join(rewritten)), query, verified)
+    if joined and _addresses_question(joined, query, verified):
+        return joined
+    extracted = _extractive_answer(query, verified)
+    if extracted:
+        return extracted
+    return "No grounded sentence remained in the cited sources."
 
 
 def _drop_off_question_clauses(text: str, query: str, verified: list[dict[str, object]]) -> str:

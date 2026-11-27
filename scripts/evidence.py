@@ -173,6 +173,44 @@ def _short_config_quote(text: str) -> bool:
     return len(raw.split()) <= 6
 
 
+def _loose_span(text: str) -> str:
+    """Ignore pipe characters and spacing so an aligned table row still matches."""
+    return re.sub(r"\s+", " ", str(text or "").replace("|", " ")).strip().casefold()
+
+
+def context_spans(text: str) -> list[str]:
+    """Verbatim context spans. Table headers stay one span; short labels may use `` | ``."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    if "¦" in raw:
+        chunks = [part.strip() for part in raw.split("¦") if part.strip()]
+    elif raw.startswith("|") or raw.count("|") >= 2:
+        chunks = [raw]
+    else:
+        chunks = [part.strip() for part in re.split(r"\s+\|\s+", raw) if part.strip()]
+    # Skill-pack notes use ## Context as commentary, not as a source span.
+    if any(span.lstrip().startswith(("- ", "* ", "`")) or "Origin pack" in span for span in chunks):
+        return []
+    return chunks
+
+
+def span_in_source(part: str, source: str) -> bool:
+    """True when part is verbatim, or the same pipe-row once spacing is ignored."""
+    if part and part in source:
+        return True
+    loose = _loose_span(part)
+    if len(loose) < 3:
+        return False
+    for line in source.splitlines():
+        line_loose = _loose_span(line)
+        if not line_loose:
+            continue
+        if loose == line_loose or (len(loose) >= 8 and loose in line_loose):
+            return True
+    return False
+
+
 def _context_parts(content: str) -> list[str]:
     parsed = split_frontmatter(content)
     if parsed is None:
@@ -180,11 +218,18 @@ def _context_parts(content: str) -> list[str]:
     from scripts.memory_review import section_text
 
     context = section_text("\n".join(parsed[1]), "Context")
-    parts = [part.strip() for part in re.split(r"\s+\|\s+", context) if part.strip()]
-    # Skill-pack and other notes use ## Context as commentary. Capture context is a short label.
-    if any("\n" in part or part.lstrip().startswith(("-", "*", "`")) or len(part) > 160 for part in parts):
-        return []
-    return parts
+    return context_spans(context)
+
+
+def quotes_in_source(content: str, source: str) -> bool:
+    """True when the evidence quote and every context span occur in this source text."""
+    try:
+        evidence = _evidence_text(content)
+    except EvidenceValidationError:
+        return False
+    if not span_in_source(evidence, source):
+        return False
+    return all(span_in_source(part, source) for part in _context_parts(content))
 
 
 def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
@@ -207,14 +252,11 @@ def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
             if loaded is None:
                 continue
             source_sha256, source_text, normalized_source, offsets = loaded
-            if context_parts and any(part not in source_text for part in context_parts):
+            if context_parts and any(not span_in_source(part, source_text) for part in context_parts):
                 continue
-            start = 0
-            while True:
-                start = normalized_source.find(normalized_quote, start)
-                if start < 0:
-                    break
-                end = start + len(normalized_quote)
+            for start, end in _locate_quote(source_text, normalized_source, normalized_quote):
+                if not (0 <= start < end <= len(offsets)):
+                    continue
                 source_start = offsets[start]
                 source_end = offsets[end - 1] + 1
                 matches.append({
@@ -224,7 +266,6 @@ def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
                     "evidence_end": len(source_text[:source_end].encode("utf-8")),
                     "evidence_quote_sha256": hashlib.sha256(normalized_quote.encode("utf-8")).hexdigest(),
                 })
-                start += 1
 
     if not matches:
         if context_parts:
@@ -351,17 +392,70 @@ def entail_stems(text: str) -> set[str]:
     }
 
 
+def _context_label(part: str) -> str:
+    """Claim prefix for a context span. A raw table header is not copied into the claim."""
+    text = str(part or "").strip()
+    if not text or text.startswith("|") or text.count("|") >= 2:
+        return ""
+    named = re.match(r"^(?:.*\s)?([A-Za-z0-9_.:-]+)\s*\{\s*$", text)
+    if named:
+        return named.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_.:-]+\s*:", text):
+        return text[:-1].strip()
+    return text.lstrip("#").strip()
+
+
+def _locate_quote(source_text: str, normalized_source: str, normalized_quote: str) -> list[tuple[int, int]]:
+    """Spans of the quote in the normalized source, including a pipe-row whose spacing differs."""
+    found: list[tuple[int, int]] = []
+    start = 0
+    while True:
+        start = normalized_source.find(normalized_quote, start)
+        if start < 0:
+            break
+        found.append((start, start + len(normalized_quote)))
+        start += 1
+    if found:
+        return found
+    loose_quote = _loose_span(normalized_quote)
+    if len(loose_quote) < 8:
+        return []
+    seen: set[tuple[int, int]] = set()
+    for line in source_text.splitlines():
+        line_loose = _loose_span(line)
+        if not line_loose:
+            continue
+        if loose_quote != line_loose and not (len(loose_quote) >= 12 and loose_quote in line_loose and "|" in line):
+            continue
+        norm_line, _offsets = _normalize_with_offsets(line.strip())
+        start = 0
+        while True:
+            start = normalized_source.find(norm_line, start)
+            if start < 0:
+                break
+            span = (start, start + len(norm_line))
+            if span not in seen:
+                seen.add(span)
+                found.append(span)
+            start += 1
+    return found
+
+
 def fact_portion(claim: str, context: str = "") -> str:
     """Drop heading, block-label, or speaker prefixes that are recorded as context."""
     text = str(claim or "").strip()
-    parts = [part.strip() for part in re.split(r"\s+\|\s+", str(context or "")) if part.strip()]
-    for part in parts:
-        for prefix in (f"{part}:", part):
-            if text.casefold().startswith(prefix.casefold()):
-                rest = text[len(prefix) :].lstrip(" :-")
-                if rest:
-                    text = rest
-                    break
+    for part in context_spans(context):
+        labels = [label for label in (_context_label(part), part) if label]
+        for label in labels:
+            for prefix in (f"{label}:", label):
+                if text.casefold().startswith(prefix.casefold()):
+                    rest = text[len(prefix) :].lstrip(" :-")
+                    if rest:
+                        text = rest
+                        break
+            else:
+                continue
+            break
     return text
 
 

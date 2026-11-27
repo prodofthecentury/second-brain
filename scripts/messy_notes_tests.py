@@ -100,9 +100,12 @@ class MessyFixtureTests(unittest.TestCase):
         by_note: dict[str, list[str]] = {}
         for note in fixture["notes"]:
             by_note[note["id"]] = _distill_note(note["text"], note["filename"])
+            from scripts.evidence import quotes_in_source
+
             for document in by_note[note["id"]]:
                 evidence = document.split("## Evidence\n", 1)[1].split("\n##", 1)[0].strip()
                 self.assertIn(evidence, note["text"])
+                self.assertTrue(quotes_in_source(document, note["text"]), evidence)
                 self.assertNotIn("I feel worn out", document)
                 self.assertNotIn("The hint is the", document)
                 self.assertNotIn("should grab", document)
@@ -247,6 +250,136 @@ class SyntheticCaptureTests(unittest.TestCase):
         self.assertIn("Tess", answer)
         self.assertIn("2026", answer)
         self.assertNotIn("10.9.9.9", answer)
+        self.assertNotIn("No grounded sentence", answer)
+
+    def test_aligned_pipe_table_approves_with_the_raw_row(self) -> None:
+        from scripts.evidence import find_evidence_anchor
+
+        note = "\n".join([
+            "# Shelf list",
+            "| kit    | length | last used | shelf |",
+            "| ------ | ------ | --------- | ----- |",
+            "| 70cm   | 60m    | 2 Nov     | B2    |",
+            "| 40cm   | 10m    | 8 Nov     | B4    |",
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp)
+            raw = brain / "0-raw"
+            raw.mkdir()
+            (raw / "shelf.md").write_text(note, encoding="utf-8")
+            docs = _distill_note(note, "0-raw/shelf.md")
+            claims = [approved_claim(document) for document in docs]
+            blob = "\n".join(claim for claim in claims if claim)
+            self.assertIn("70cm", blob)
+            self.assertIn("60m", blob)
+            self.assertIn("40cm", blob)
+            self.assertIn("B2", blob)
+            self.assertFalse(any(claim and claim.strip().startswith("|") for claim in claims))
+            for document in docs:
+                if approved_claim(document):
+                    find_evidence_anchor(document, str(brain))
+                    self.assertIn("|", document.split("## Evidence\n", 1)[1])
+
+    def test_indented_server_block_keeps_the_block_name(self) -> None:
+        from scripts.evidence import find_evidence_anchor
+
+        note = "\n".join([
+            "# Resolver",
+            "server:",
+            "    interface: 10.8.8.8",
+            "    port: 5353",
+            "cache-01 {",
+            "    bind 10.8.8.9",
+            "}",
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp)
+            raw = brain / "0-raw"
+            raw.mkdir()
+            (raw / "resolver.md").write_text(note, encoding="utf-8")
+            docs = _distill_note(note, "0-raw/resolver.md")
+            for document in docs:
+                if approved_claim(document):
+                    find_evidence_anchor(document, str(brain))
+            claims = [approved_claim(document) or "" for document in docs]
+            blob = "\n".join(claims)
+            self.assertIn("10.8.8.8", blob)
+            self.assertIn("5353", blob)
+            self.assertIn("10.8.8.9", blob)
+            self.assertIn("Resolver", blob)
+            self.assertIn("server", blob.casefold())
+            self.assertIn("cache-01", blob)
+
+    def test_two_rates_and_an_and_joined_pair_both_survive(self) -> None:
+        note = "\n".join([
+            "# Glaze review 4 Apr 2026",
+            "The glaze API limit is 30 calls/min, and we will raise it to 90.",
+            "The flight is on 6 June 2026 and the workshop is on 9 June 2026.",
+        ])
+        docs = _distill_note(note, "0-raw/glaze.md")
+        claims = [approved_claim(document) or "" for document in docs]
+        self.assertTrue(any("30" in claim and "calls/min" in claim for claim in claims), claims)
+        self.assertTrue(any("90" in claim for claim in claims), claims)
+        flight = [claim for claim in claims if "6 June 2026" in claim]
+        workshop = [claim for claim in claims if "9 June 2026" in claim]
+        self.assertTrue(flight and workshop, claims)
+        self.assertNotEqual(flight[0], workshop[0])
+
+    def test_model_paragraph_still_yields_the_later_facts(self) -> None:
+        note = "\n".join([
+            "The flight is on 6 June 2026 and the workshop is on 9 June 2026.",
+            "The loaner lens is in cage 4.",
+            "The river plot is number 18 and the fee is $27 with water included.",
+        ])
+        recorded = json.dumps({"atoms": [{
+            "title": "Trip",
+            "claim": "The flight is on 6 June 2026 and the workshop is on 9 June 2026. The river plot is number 18 and the fee is $27 with water included.",
+            "evidence": "The flight is on 6 June 2026 and the workshop is on 9 June 2026. The river plot is number 18 and the fee is $27 with water included.",
+            "why": "Plans.",
+            "memory_type": "semantic",
+        }]})
+        with patch("scripts.ollama_refinery.chat_with_fallback", return_value={"message": {"content": recorded}}):
+            docs = draft_memory_atoms(note, "0-raw/trip.md", "rules")
+        claims = [approved_claim(document) or "" for document in docs]
+        blob = "\n".join(claims)
+        self.assertIn("6 June 2026", blob)
+        self.assertIn("9 June 2026", blob)
+        self.assertIn("18", blob)
+        self.assertIn("27", blob)
+        self.assertIn("cage 4", blob)
+
+    def test_supported_paraphrase_is_kept_and_a_fragment_falls_back(self) -> None:
+        from scripts.streaming_chat import answer_with_citations
+
+        fan = {
+            "id": "V1",
+            "claim": "Tried the 12V fan. Too loud, ~40 dB at one metre.",
+            "evidence": "Tried the 12V fan. Too loud, ~40 dB at one metre.",
+            "title": "Fan",
+        }
+        kept = answer_with_citations(
+            "The 12V fan ran at approximately 40 decibels and was found to be too loud.",
+            "How loud was the 12V fan?",
+            [fan],
+        )
+        self.assertIn("12V", kept)
+        self.assertIn("40", kept)
+        self.assertIn("[V1]", kept)
+        self.assertNotIn("No grounded sentence", kept)
+        host = {
+            "id": "V2",
+            "claim": "cache-01: bind 10.8.8.9",
+            "evidence": "bind 10.8.8.9",
+            "context": "cache-01 {",
+            "title": "cache-01",
+        }
+        replaced = answer_with_citations(
+            "The controller is at 10.9.9.9. cache-01",
+            "What address does cache-01 bind?",
+            [host],
+        )
+        self.assertIn("10.8.8.9", replaced)
+        self.assertNotIn("10.9.9.9", replaced)
 
 
 class CapturePolicyTests(unittest.TestCase):

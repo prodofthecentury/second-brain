@@ -141,12 +141,11 @@ def _code_and_table_rows(source: str, consumed: set[int]) -> list[dict]:
                 index += 1
             if index < len(lines):
                 consumed.add(index)
-            label = ""
+            opener = ""
             for _body_index, body_line in body:
                 stripped = body_line.strip()
-                named = re.match(r"^(?:.*\s)?([A-Za-z0-9_.:-]+)\s*\{\s*$", stripped)
-                if named:
-                    label = named.group(1)
+                if re.match(r"^(?:.*\s)?[A-Za-z0-9_.:-]+\s*\{\s*$", stripped):
+                    opener = stripped
                     continue
                 if not stripped or stripped in {"{", "}", "};"} or stripped.endswith("{"):
                     continue
@@ -155,7 +154,7 @@ def _code_and_table_rows(source: str, consumed: set[int]) -> list[dict]:
                     continue
                 claim = evidence
                 row = _row(claim, evidence, evidence, "Extracted from a config block.")
-                rows.append(_remember_context(row, label))
+                rows.append(_remember_context(row, opener))
             index += 1
             continue
         index += 1
@@ -185,10 +184,9 @@ def _code_and_table_rows(source: str, consumed: set[int]) -> list[dict]:
             if header and cells and cells[0]:
                 claim = f"{header[0]} {cells[0]}: " + ", ".join(parts[1:])
             if evidence in source and claim and "|" not in claim:
-                row = _row(claim, evidence, claim, "Extracted from a table row.")
-                header_words = " ".join(cell for cell in header if cell and set(cell) - {"-", ":"})
-                if header_words:
-                    row["context"] = header_words
+                row = _row(claim, evidence, evidence, "Extracted from a table row.")
+                if header_line:
+                    row["context"] = header_line
                 rows.append(row)
             index += 1
     return rows
@@ -203,11 +201,10 @@ def _brace_blocks(source: str, consumed: set[int]) -> list[dict]:
             index += 1
             continue
         stripped = lines[index][2].strip()
-        named = re.match(r"^(?:.*\s)?([A-Za-z0-9_.:-]+)\s*\{\s*$", stripped)
-        if not named:
+        if not re.match(r"^(?:.*\s)?[A-Za-z0-9_.:-]+\s*\{\s*$", stripped):
             index += 1
             continue
-        label = named.group(1)
+        opener = stripped
         consumed.add(index)
         index += 1
         while index < len(lines):
@@ -223,7 +220,79 @@ def _brace_blocks(source: str, consumed: set[int]) -> list[dict]:
             if body not in source:
                 continue
             row = _row(body, body, body, "Extracted from a config block.")
-            rows.append(_remember_context(row, label))
+            rows.append(_remember_context(row, opener))
+    return rows
+
+
+def bind_table_row(source: str, claim: str, evidence: str) -> tuple[str, str] | None:
+    """Pair a table claim with the raw data line and the raw header line."""
+    lines = source.splitlines()
+    header = ""
+    best: tuple[int, str, str] | None = None
+    blob = f"{claim}\n{evidence}".casefold()
+    for index, line in enumerate(lines):
+        if _is_table_line(line) and index + 1 < len(lines) and _is_separator(lines[index + 1]):
+            header = line.strip()
+            continue
+        if not header or not _is_table_line(line) or _is_separator(line):
+            continue
+        cells = [cell for cell in _cells(line) if cell]
+        if len(cells) < 2:
+            continue
+        if evidence.strip() == line.strip():
+            return line.strip(), header
+        hits = sum(1 for cell in cells if cell.casefold() in blob)
+        if hits == len(cells) and (best is None or hits * 100 + sum(len(cell) for cell in cells) > best[0]):
+            best = (hits * 100 + sum(len(cell) for cell in cells), line.strip(), header)
+    if best and ("|" in evidence or evidence.strip() not in source):
+        return best[1], best[2]
+    return None
+
+
+def _line_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _colon_blocks(source: str, consumed: set[int]) -> list[dict]:
+    """Indented lines under a `name:` label, such as an Unbound `server:` block."""
+    rows: list[dict] = []
+    lines = _line_spans(source)
+    section = ""
+    index = 0
+    while index < len(lines):
+        raw = lines[index][2]
+        stripped = raw.strip()
+        if stripped.startswith("#"):
+            section = stripped
+            index += 1
+            continue
+        if index in consumed or not re.fullmatch(r"[A-Za-z0-9_.:-]+\s*:", stripped):
+            index += 1
+            continue
+        opener_index = index
+        opener = stripped
+        label_indent = _line_indent(raw)
+        index += 1
+        body_rows: list[dict] = []
+        while index < len(lines):
+            body_raw = lines[index][2]
+            body = body_raw.strip()
+            if not body:
+                index += 1
+                continue
+            if _line_indent(body_raw) <= label_indent:
+                break
+            consumed.add(index)
+            index += 1
+            if body.endswith("{") or body in {"{", "}", "};"} or body.startswith("}"):
+                continue
+            if body not in source:
+                continue
+            row = _row(body, body, body, "Extracted from a config block.")
+            body_rows.append(_remember_context(row, opener, section))
+        if body_rows:
+            consumed.add(opener_index)
+            rows.extend(body_rows)
     return rows
 
 
@@ -270,24 +339,50 @@ def _trim_intention(text: str) -> str:
     return str(text or "").strip()
 
 
+def _keep_joined_followup(sentence: str) -> bool:
+    """A subject-less tail such as 'Too slow, ~2 tok/s' stays with the sentence before it."""
+    starters = {item.casefold() for item in load_policy()["subjectless_starts"]}
+    match = re.search(r"\.\s+([A-Za-z]+)\b", sentence)
+    return bool(match and match.group(1).casefold() in starters)
+
+
 def _fact_clauses(text: str) -> list[str]:
     clauses: list[str] = []
     for sentence in split_sentences(text) or [text.strip()]:
-        pieces = re.split(r";\s+", sentence)
-        for piece in pieces:
-            bits = [bit.strip(" ,") for bit in re.split(r",\s+", piece) if bit.strip(" ,")]
-            rich = [bit for bit in bits if re.search(r"\d|\$", bit)]
-            verbs = re.compile(r"\b(?:is|are|was|were|expires|expire|paid|owns|has|have)\b", re.I)
-            if len(rich) >= 2 and all(verbs.search(bit) for bit in rich):
-                clauses.extend(rich)
-            elif piece.strip():
-                clauses.append(piece.strip())
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if _keep_joined_followup(sentence):
+            clauses.append(sentence)
+            continue
+        bits = [bit.strip(" ,") for bit in re.split(r";\s+|\s+\band\b\s+|,\s+", sentence) if bit.strip(" ,")]
+        rich = [bit for bit in bits if re.search(r"\d|\$", bit) and len(bit.split()) >= 2]
+        if len(rich) >= 2 and (len(rich) == len(bits) or all(len(bit.split()) >= 3 or re.search(r"\d|\$", bit) for bit in bits)):
+            clauses.extend(rich)
+        else:
+            clauses.append(sentence)
     return [clause for clause in clauses if clause]
 
 
+def _stored_spans(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    if "¦" in raw:
+        return [part.strip() for part in raw.split("¦") if part.strip()]
+    if raw.startswith("|") or raw.count("|") >= 2:
+        return [raw]
+    return [part.strip() for part in re.split(r"\s+\|\s+", raw) if part.strip()]
+
+
+def _label_for_claim(part: str) -> str:
+    from scripts.evidence import _context_label
+
+    return _context_label(part)
+
+
 def _remember_context(row: dict, *spans: str) -> dict:
-    existing = [part.strip() for part in re.split(r"\s+\|\s+", str(row.get("context") or "")) if part.strip()]
-    parts = list(existing)
+    parts = _stored_spans(str(row.get("context") or ""))
     for part in spans:
         cleaned = str(part or "").strip()
         if cleaned and cleaned not in parts:
@@ -296,13 +391,12 @@ def _remember_context(row: dict, *spans: str) -> dict:
         return row
     claim = row["claim"]
     for part in parts:
-        words = [word for word in re.findall(r"[A-Za-z0-9_.-]+", part) if word]
-        if words and all(word.casefold() in claim.casefold() for word in words):
+        label = _label_for_claim(part)
+        if not label or label.casefold() in claim.casefold():
             continue
-        if part.casefold() not in claim.casefold():
-            claim = f"{part}: {claim}"
-            row["claim"] = claim
-    row["context"] = " | ".join(parts)
+        claim = f"{label}: {claim}"
+    row["claim"] = claim
+    row["context"] = " ¦ ".join(parts)
     row["support"] = " ".join(parts + [row.get("evidence") or ""])
     return row
 
@@ -312,6 +406,7 @@ def extract_fact_rows(source: str) -> list[dict]:
     consumed: set[int] = set()
     rows = [row for row in _code_and_table_rows(source, consumed) if not rejection_reasons(row["claim"], config_line=True)]
     rows.extend(row for row in _brace_blocks(source, consumed) if not rejection_reasons(row["claim"], config_line=True))
+    rows.extend(row for row in _colon_blocks(source, consumed) if not rejection_reasons(row["claim"], config_line=True))
     context = _heading_context(source)
     lines = _line_spans(source)
     for index, (_start, _end, line) in enumerate(lines):
