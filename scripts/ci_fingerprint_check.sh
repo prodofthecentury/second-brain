@@ -23,7 +23,11 @@ fi
 protected=(
   scripts/ci_fingerprint_check.sh
   .github/workflows/ci.yml
+  .github/owner-signing-fingerprint
 )
+if git cat-file -e "${pin}:.github/owner-signing-key.asc" 2>/dev/null; then
+  protected+=(".github/owner-signing-key.asc")
+fi
 while IFS= read -r path; do
   protected+=("$path")
 done < <(git ls-tree -r --name-only "$pin" | grep -E '^scripts/reason_bench.*\.py$' || true)
