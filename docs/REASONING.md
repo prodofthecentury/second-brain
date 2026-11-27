@@ -4,7 +4,7 @@ Deep reasoning is the default for chat and for the `reason` MCP tool. The commit
 
 ## Latency
 
-A 3B model on CPU often spends several seconds to a minute on one generation. Deep can add a planner call and one call per model step, so an open question can take several times a single reply. Arithmetic, dates, and unit conversions are computed by tools and do not call a model. Chat profile `fast` is the previous single-pass grounded reply.
+A 3B model on CPU often spends several seconds to a minute on one generation. A deep answer can take several times a single reply when the question needs the model. Arithmetic, dates, and unit conversions are computed by tools and do not call a model. Chat profile `fast` is the previous single-pass grounded reply.
 
 This is stage 1. It does not yet sample several drafts, search a tree of plans, store worked examples, or route hard steps to a larger remote model. Those are later stages. The numbers below are only as good as the run that produced them.
 

@@ -119,15 +119,54 @@ def _format_fraction(numer: int, denom: int) -> str:
     return f"{numer}/{denom}"
 
 
-def _format_number(value: Any) -> str:
+def _fraction_to_decimal(numer: int, denom: int) -> str | None:
+    """Exact decimal text when the fraction terminates. Otherwise None."""
+    if denom < 0:
+        numer, denom = -numer, -denom
+    a, b = abs(numer), abs(denom)
+    while b:
+        a, b = b, a % b
+    numer //= a or 1
+    denom //= a or 1
+    factor = abs(denom)
+    while factor % 2 == 0:
+        factor //= 2
+    while factor % 5 == 0:
+        factor //= 5
+    if factor != 1:
+        return None
+    sign = "-" if numer < 0 else ""
+    numer = abs(numer)
+    whole, rem = divmod(numer, denom)
+    if rem == 0:
+        return sign + str(whole)
+    digits: list[str] = []
+    while rem and len(digits) < 24:
+        rem *= 10
+        digits.append(str(rem // denom))
+        rem %= denom
+    if rem:
+        return None
+    return sign + str(whole) + "." + "".join(digits)
+
+
+def _format_number(value: Any, *, prefer_decimal: bool = False) -> str:
     """One format for SymPy values and for the restricted evaluator.
 
-    Exact ratios stay as fractions. 2/3 is not a rounded decimal.
+    Exact ratios stay as fractions. A decimal input with a terminating result
+    is shown as a decimal, so 0.1 + 0.2 is 0.3 and 7/6 stays 7/6.
     """
+    def _ratio(numer: int, denom: int) -> str:
+        if prefer_decimal:
+            text = _fraction_to_decimal(numer, denom)
+            if text is not None:
+                return text
+        return _format_fraction(numer, denom)
+
     if isinstance(value, bool):
         raise ValueError("not a number")
     if isinstance(value, Fraction):
-        return _format_fraction(value.numerator, value.denominator)
+        return _ratio(value.numerator, value.denominator)
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
@@ -139,7 +178,7 @@ def _format_number(value: Any) -> str:
     as_numer_denom = getattr(value, "as_numer_denom", None)
     if getattr(value, "is_rational", None) is True and callable(as_numer_denom):
         numer, denom = as_numer_denom()
-        return _format_fraction(int(numer), int(denom))
+        return _ratio(int(numer), int(denom))
     if type(value).__name__ == "Float":
         number = float(value)
         if number != number or number in {float("inf"), float("-inf")}:
@@ -311,15 +350,16 @@ def exact_arithmetic(expr: str) -> tuple[str, str, bool]:
 
     A rounded float is never verified. Decimal literals are exact ratios first.
     """
+    had_decimal = bool(re.search(r"\d\.\d", expr))
     cleaned = _prepare_expression(expr)
     try:
         restricted_value = _ast_eval(cleaned)
-        restricted = _format_number(restricted_value)
+        restricted = _format_number(restricted_value, prefer_decimal=had_decimal)
     except SyntaxError as exc:
         raise ValueError("expression is not plain arithmetic") from exc
     rounded = isinstance(restricted_value, float) and not float(restricted_value).is_integer()
     try:
-        symbolic = _format_number(_sympy_value(cleaned))
+        symbolic = _format_number(_sympy_value(cleaned), prefer_decimal=had_decimal)
     except ImportError:
         return restricted, "tool:calculator", False
     except (ValueError, ZeroDivisionError, OverflowError, SyntaxError):
@@ -369,19 +409,39 @@ def _glued_dimension(text: str) -> bool:
     return bool(re.fullmatch(r"\d+[xX]\d+", compact)) and not re.search(r"\d\s+[xX]\s+\d", text)
 
 
+def _hyphen_literal(text: str) -> bool:
+    """Hyphenated numbers are literals only without spaces around the hyphens.
+
+    Three or more tight parts are an id or a date. A phone shape is a literal
+    even with two parts or parentheses. Spaced subtraction is not a literal.
+    """
+    if "-" not in text or re.search(r"[+*/%^xX×]", text):
+        return False
+    if re.search(r"\s-|-\s", text):
+        return False
+    core = re.sub(r"[()\s]", "", text)
+    if not re.fullmatch(r"\d+(?:-\d+)+", core):
+        return False
+    parts = core.split("-")
+    if len(parts) >= 3:
+        return True
+    if "(" in text or ")" in text:
+        return True
+    return sum(len(part) for part in parts) >= 7 and all(len(part) >= 2 for part in parts)
+
+
 def _date_phone_or_range(text: str) -> bool:
-    """ISO dates, d/m/y dates, phones, and bare a-b ranges are not calculations.
+    """ISO dates, d/m/y dates, phones, and tight multi-part hyphen ids are not calculations.
 
     A leading 'what is' or 'calculate' does not turn them into arithmetic.
+    Spaced subtraction such as 40 - 15 still is arithmetic.
     """
     compact = re.sub(r"\s+", "", text)
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", compact):
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", compact) and " " not in text:
         return True
     if re.fullmatch(r"\d{1,4}/\d{1,4}/\d{2,4}", compact):
         return True
-    if re.fullmatch(r"\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)+", compact) and not re.search(r"[+*/%^xX×]", text):
-        return True
-    return False
+    return _hyphen_literal(text)
 
 
 def _ordinary_literal(text: str) -> bool:
@@ -456,9 +516,88 @@ def _date_answer(question: str) -> str | None:
     return pair[0]
 
 
-def _canon_unit(raw: str) -> str:
-    token = raw.strip().lower().replace("°", "")
-    return _UNIT_ALIASES.get(token, token)
+_SI_PREFIXES = (
+    ("da", 10),
+    ("Y", 10**24),
+    ("Z", 10**21),
+    ("E", 10**18),
+    ("P", 10**15),
+    ("T", 10**12),
+    ("G", 10**9),
+    ("M", 10**6),
+    ("k", 10**3),
+    ("h", 100),
+    ("d", Fraction(1, 10)),
+    ("c", Fraction(1, 100)),
+    ("m", Fraction(1, 1000)),
+    ("u", Fraction(1, 10**6)),
+    ("n", Fraction(1, 10**9)),
+    ("p", Fraction(1, 10**12)),
+)
+_IEC_PREFIXES = (
+    ("Ti", 1024**4),
+    ("Gi", 1024**3),
+    ("Mi", 1024**2),
+    ("Ki", 1024),
+)
+_WORD_UNITS = {
+    "meter": "m", "meters": "m", "metre": "m", "metres": "m",
+    "kilometer": "km", "kilometers": "km", "kilometre": "km", "kilometres": "km",
+    "gram": "g", "grams": "g", "kilogram": "kg", "kilograms": "kg",
+    "pound": "lb", "pounds": "lb", "ounce": "oz", "ounces": "oz",
+    "second": "s", "seconds": "s", "minute": "min", "minutes": "min",
+    "celsius": "C", "fahrenheit": "F",
+}
+
+
+def _base_unit(symbol: str) -> tuple[str, Fraction] | None:
+    if symbol == "m":
+        return ("length", Fraction(1))
+    if symbol == "g":
+        return ("mass", Fraction(1))
+    if symbol == "s":
+        return ("time", Fraction(1))
+    if symbol == "B":
+        return ("data", Fraction(1))
+    if symbol == "b":
+        return ("data", Fraction(1, 8))
+    return None
+
+
+def _parse_unit(raw: str) -> tuple[str, Fraction | str] | None:
+    """Case-sensitive symbol parse. M is mega, m is milli or metre, B is byte, b is bit."""
+    token = raw.strip().replace("°", "")
+    if len(token) > 2 and token.casefold() in _WORD_UNITS:
+        token = _WORD_UNITS[token.casefold()]
+    if token in {"C", "F"}:
+        return ("temp", token)
+    whole = {
+        "in": ("length", Fraction(254, 10000)),
+        "ft": ("length", Fraction(3048, 10000)),
+        "mi": ("length", Fraction("1609.344")),
+        "oz": ("mass", Fraction("28.349523125")),
+        "lb": ("mass", Fraction("453.59237")),
+        "min": ("time", Fraction(60)),
+        "sec": ("time", Fraction(1)),
+        "h": ("time", Fraction(3600)),
+        "hour": ("time", Fraction(3600)),
+        "hours": ("time", Fraction(3600)),
+    }
+    if token in whole:
+        return whole[token]
+    for name, scale in _IEC_PREFIXES:
+        if token.startswith(name) and len(token) > len(name):
+            base = _base_unit(token[len(name):])
+            if base is None or base[0] != "data":
+                return None
+            return ("data", Fraction(scale) * base[1])
+    for name, scale in _SI_PREFIXES:
+        if token.startswith(name) and len(token) > len(name):
+            base = _base_unit(token[len(name):])
+            if base is None:
+                continue
+            return (base[0], Fraction(scale) * base[1])
+    return _base_unit(token)
 
 
 def _unit_answer(question: str) -> str | None:
@@ -468,45 +607,42 @@ def _unit_answer(question: str) -> str | None:
     if not match:
         return None
     try:
-        amount = float(match.group(1))
-    except (ValueError, OverflowError):
+        amount = Fraction(match.group(1))
+    except (ValueError, OverflowError, ZeroDivisionError):
         return None
-    raw_src = match.group(2)
-    raw_dst = match.group(3)
-    if raw_src.casefold() == raw_dst.casefold() and raw_src != raw_dst:
+    src = _parse_unit(match.group(2))
+    dst = _parse_unit(match.group(3))
+    if src is None or dst is None or src[0] != dst[0]:
         return None
-    src = _canon_unit(raw_src)
-    dst = _canon_unit(raw_dst)
-    if src in {"c", "f"} or dst in {"c", "f"}:
-        if src == "c" and dst == "f":
-            value = amount * 9.0 / 5.0 + 32.0
-        elif src == "f" and dst == "c":
-            value = (amount - 32.0) * 5.0 / 9.0
-        elif src == dst:
-            value = amount
+    if src[0] == "temp":
+        if src[1] == "C" and dst[1] == "F":
+            value = float(amount) * 9.0 / 5.0 + 32.0
+        elif src[1] == "F" and dst[1] == "C":
+            value = (float(amount) - 32.0) * 5.0 / 9.0
+        elif src[1] == dst[1]:
+            value = float(amount)
         else:
             return None
         forward = _format_number(value)
-        if src == dst:
+        if src[1] == dst[1]:
             back = float(forward)
-        elif src == "c" and dst == "f":
+        elif src[1] == "C" and dst[1] == "F":
             back = (float(forward) - 32.0) * 5.0 / 9.0
-        elif src == "f" and dst == "c":
+        elif src[1] == "F" and dst[1] == "C":
             back = float(forward) * 9.0 / 5.0 + 32.0
         else:
             return None
-        if abs(back - amount) > 1e-6:
+        if abs(back - float(amount)) > 1e-6:
             return None
         return forward
-    for table in (_LENGTH_TO_M, _MASS_TO_G, _TIME_TO_S, _BYTES):
-        if src in table and dst in table:
-            value = amount * table[src] / table[dst]
-            forward = _format_number(value)
-            back = float(forward) * table[dst] / table[src]
-            if abs(back - amount) > max(1e-6, abs(amount) * 1e-9):
-                return None
-            return forward
-    return None
+    try:
+        forward_value = amount * src[1] / dst[1]
+        back = forward_value * dst[1] / src[1]
+    except (ZeroDivisionError, OverflowError):
+        return None
+    if back != amount:
+        return None
+    return _format_number(forward_value, prefer_decimal="." in match.group(1))
 
 
 def classify(question: str) -> str:
@@ -717,20 +853,6 @@ def _call_model(model_fn: Callable[[str], str] | None, prompt: str, state: dict[
     return box.get("text", "")
 
 
-def _parse_plan(text: str) -> dict[str, Any] | None:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        loaded = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(loaded, dict) or not isinstance(loaded.get("steps"), list):
-        return None
-    return loaded
-
-
 def _heuristic_plan(kind: str) -> dict[str, Any]:
     if kind == "code":
         steps = [{"tool": "python", "input": "write the function, then run the tests"}]
@@ -745,56 +867,6 @@ def _heuristic_plan(kind: str) -> dict[str, Any]:
             {"tool": "model", "input": "answer only from the retrieved text"},
         ]
     return {"problem_type": kind, "steps": steps, "planner": "template"}
-
-
-def _model_plan(question: str, model_fn: Callable[[str], str] | None, state: dict[str, Any]) -> dict[str, Any]:
-    prompt = (
-        "Return one JSON object and no other text. "
-        '{"problem_type":"math|date|unit|code|fact|planning|other",'
-        '"steps":[{"tool":"calculator|date|unit|python|retrieve|model","input":"short"}]}'
-        f"\nQuestion: {question[:1500]}"
-    )
-    text = _call_model(model_fn, prompt, state)
-    plan = _parse_plan(text)
-    if plan is None and int(state["budget"]["max_retries"]) > 0 and state["model_calls"] < int(state["budget"]["max_model_calls"]):
-        text = _call_model(model_fn, prompt + "\nThe previous reply was not a JSON object. Return only the object.", state)
-        plan = _parse_plan(text)
-    if plan is None:
-        return _heuristic_plan(classify(question))
-    plan["planner"] = "model"
-    plan["steps"] = [step for step in plan.get("steps") or [] if isinstance(step, dict)][: int(state["budget"]["max_steps"])]
-    return plan
-
-
-def _execute_plan_step(step: dict[str, Any], question: str) -> dict[str, Any] | None:
-    """Run one planned tool step. Calculator input must itself be a safe expression."""
-    tool = str(step.get("tool") or "").strip().lower()
-    raw = str(step.get("input") or "").strip() or question
-    if tool in {"calculator", "math"}:
-        expr = raw if _is_whole_expression(re.sub(r"\s+", "", _normalize_operators(raw))) else extract_expression(raw)
-        if not expr:
-            return None
-        try:
-            value, source, verified = exact_arithmetic(expr)
-        except (SyntaxError, ValueError, ZeroDivisionError, OverflowError):
-            return None
-        solved = _tool_result(raw, "math", value, source, f"{expr} = {value}", verified=False)
-        solved["answer_source"] = source
-        solved["verified"] = False
-        return solved
-    if tool == "date":
-        pair = _date_pair(raw)
-        if pair and pair[0] == pair[1]:
-            solved = _tool_result(raw, "date", pair[0], "tool:date", f"date math -> {pair[0]}", verified=False)
-            solved["verified"] = False
-            return solved
-    if tool == "unit":
-        answer = _unit_answer(raw)
-        if answer is not None:
-            solved = _tool_result(raw, "unit", answer, "tool:unit", f"unit conversion -> {answer}", verified=False)
-            solved["verified"] = False
-            return solved
-    return None
 
 
 def _abstain(kind: str, steps: list[dict[str, Any]], sources: list[dict[str, Any]], plan: dict[str, Any] | None = None) -> dict[str, Any]:
