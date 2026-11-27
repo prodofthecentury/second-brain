@@ -2518,13 +2518,10 @@ def _run_live(root: Path, args: argparse.Namespace, *, cache_mode: str, ack: dic
                                 seed=options.get("seed", args.seed),
                             )
 
-                        try:
-                            guarded = run_with_hang_guard(_call, read_s)
-                        except ModelClientError:
-                            raise
-                    if guarded.get("status") == "hung":
-                        client.close()
-                        raise TimeoutError("item watchdog closed the wait")
+                        guarded = run_with_hang_guard(_call, read_s)
+                        if guarded.get("status") == "hung":
+                            client.close()
+                            raise TimeoutError("item watchdog closed the wait")
                         generated = guarded["value"]
                         _record["prompts"].append({
                             "sha256_intended": generated.sha256_intended,
