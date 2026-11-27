@@ -67,7 +67,9 @@ _MOD_PATH_DEFAULTS["HOUSE_RULES_PATH"] = str(HOUSE_RULES_PATH)
 _MOD_PATH_DEFAULTS["CHROMA_DB_PATH"] = str(CHROMA_DB_PATH)
 from scripts.hardware_profile import strip_reasoning_think_blocks
 from scripts.ollama_utils import chat_with_fallback, embed_text, embedding_metadata
+from scripts.capture_policy import max_atoms_per_note, max_claim_words, prompt_text, rejection_reasons
 from scripts.evidence import claim_entailed_by_evidence, entail_stems, number_tokens
+from scripts.sentence_spans import extract_fact_rows, sentence_spans, split_sentences
 from scripts.memory_format import (
     MEMORY_BOUNDARY,
     capture_origin,
@@ -477,20 +479,11 @@ def _expand_to_sentence(source: str, span: str) -> str:
     idx = source.find(span)
     if idx < 0:
         return span
-    boundary = max(
-        source.rfind(".", 0, idx),
-        source.rfind("!", 0, idx),
-        source.rfind("?", 0, idx),
-        source.rfind("\n", 0, idx),
-    )
-    start = 0 if boundary < 0 else boundary + 1
-    ends = [source.find(mark, idx + max(len(span) - 1, 0)) for mark in ".!?\n"]
-    ends = [pos for pos in ends if pos >= 0]
-    end = (min(ends) + 1) if ends else len(source)
-    if end > start and source[end - 1] == "\n":
-        end -= 1
-    sentence = source[start:end].strip()
-    return sentence or span
+    for start, end in sentence_spans(source):
+        if start <= idx < end:
+            sentence = source[start:end].strip()
+            return sentence or span
+    return span
 
 
 def _span_in_source(source: str, hint: str) -> str | None:
@@ -729,8 +722,12 @@ def _rewrite_memory_identity(document: str, source_text: str, current_date: str,
 
 def _replace_section(body: str, heading: str, new_text: str) -> str:
     pattern = re.compile(rf"(^## {re.escape(heading)}\s*\n)(.*?)(?=^## |\Z)", re.MULTILINE | re.DOTALL)
-    replacement = rf"\1{new_text.strip()}\n\n"
-    updated, count = pattern.subn(replacement, body, count=1)
+
+    def _replacement(match: re.Match[str]) -> str:
+        # A lambda keeps Windows paths such as D:\BrainBackups from being read as regex escapes.
+        return match.group(1) + new_text.strip() + "\n\n"
+
+    updated, count = pattern.subn(_replacement, body, count=1)
     return updated if count else body
 
 
@@ -933,6 +930,7 @@ def _rows_from_output(output: str) -> tuple[list[dict], list[str]]:
 
 def _schema_prompt(note: str) -> str:
     return (
+        f"{prompt_text()} "
         "List each distinct fact in the note, including numbers, times, sizes, and setting names. "
         "Return up to 5 atoms. "
         "evidence must be an exact quote copied from the note. "
@@ -1055,11 +1053,23 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     if title and claim.casefold().strip(" .") == title.casefold().strip(" ."):
         claim = ""
     original_claim = claim
-    claim, evidence = _align_claim_and_evidence(claim, evidence, source_text)
+    support = str(row.get("support") or "").strip()
+    structured = bool(support) and claim_entailed_by_evidence(claim, support)
+    if not structured and (len(split_sentences(claim)) >= 3 or len(claim.split()) > max_claim_words()):
+        print(f"  [!] Dropped atom; claim is a paragraph dump: {claim[:80]!r}")
+        return None, "too_long"
+    if structured:
+        pass
+    else:
+        claim, evidence = _align_claim_and_evidence(claim, evidence, source_text)
+        support = evidence
+    if rejection_reasons(claim):
+        print(f"  [!] Dropped atom; capture policy rejected the claim: {claim[:80]!r}")
+        return None, "policy"
     if (
         _is_heading_or_boilerplate(claim)
         or _is_heading_or_boilerplate(evidence)
-        or not claim_entailed_by_evidence(claim, evidence)
+        or not claim_entailed_by_evidence(claim, support or evidence)
     ):
         print(f"  [!] Dropped atom; claim is not grounded in the evidence: {original_claim[:80]!r}")
         return None, "ungrounded"
@@ -1094,24 +1104,14 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     if not document:
         return None, path
     finished = _rewrite_memory_identity(document[0], source_text, current_date, source_filename)
-    if model_support is None and not evidence_supports_claim(claim, evidence):
+    if model_support is None and not evidence_supports_claim(claim, support or evidence):
         return None, "unsupported"
     return finished, path
 
 
 def _fact_sentences(source: str) -> list[str]:
-    """Sentences in the note that can stand as a fact. Headings and boilerplate are skipped."""
-    sentences: list[str] = []
-    for part in re.split(r"(?<=[.!?])\s+|\n+", source or ""):
-        sentence = part.strip().strip("`").strip()
-        if len(sentence) < 12 or _is_heading_or_boilerplate(sentence):
-            continue
-        if not _stem_terms(sentence):
-            continue
-        if not sentence.endswith((".", "!", "?")):
-            sentence = sentence.rstrip(".") + "."
-        sentences.append(sentence)
-    return sentences
+    """Verbatim fact spans in the note. Headings, markup, and non-facts are skipped."""
+    return [str(row["evidence"]) for row in extract_fact_rows(source)]
 
 
 def _priority_sentence(sentence: str) -> bool:
@@ -1421,27 +1421,27 @@ def draft_memory_atoms(
     if not collected and generation_down and not model_outputs:
         raise RuntimeError(f"LLM drafting unavailable; capture deferred: {generation_down}")
 
-    had_model_atoms = bool(collected)
     covered_text = "\n".join(collected).casefold()
     mention_blob = "\n".join(model_outputs)
-    for sentence in _fact_sentences(str(raw_content)):
-        if len(collected) >= MAX_ATOMS_PER_NOTE:
+    union_limit = max(MAX_ATOMS_PER_NOTE, max_atoms_per_note())
+    for row in extract_fact_rows(str(raw_content)):
+        if len(collected) >= union_limit:
             break
-        if sentence.casefold().strip() in LAST_REJECTED_SPANS or sentence.casefold() in covered_text:
+        evidence_text = str(row.get("evidence") or "")
+        if not evidence_text:
             continue
-        mentioned = bool(mention_blob) and _sentence_mentioned(sentence, mention_blob)
-        if had_model_atoms and not mentioned and not _priority_sentence(sentence):
+        if evidence_text.casefold().strip() in LAST_REJECTED_SPANS or evidence_text.casefold() in covered_text:
             continue
-        why = (
+        mentioned = bool(mention_blob) and _sentence_mentioned(evidence_text, mention_blob)
+        row["why"] = (
             "Salvaged from model text that quoted this sentence."
             if mentioned
-            else "Extracted from the source sentence."
+            else str(row.get("why") or "Extracted from the source sentence.")
         )
-        for row in _rows_for_sentences([sentence], why=why):
-            doc, _row_path = _finish_row(row, str(raw_content), raw_filename, today_str, model)
-            if doc:
-                _keep_atom(doc, "salvaged" if mentioned else "extracted", limit=MAX_ATOMS_PER_NOTE)
-                covered_text = "\n".join(collected).casefold()
+        doc, _row_path = _finish_row(row, str(raw_content), raw_filename, today_str, model)
+        if doc:
+            _keep_atom(doc, "salvaged" if mentioned else "extracted", limit=union_limit)
+            covered_text = "\n".join(collected).casefold()
 
     if collected:
         return collected

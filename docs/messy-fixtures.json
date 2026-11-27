@@ -1,0 +1,354 @@
+{
+  "name": "messy-fixtures",
+  "notes": [
+    {
+      "id": "01-backup",
+      "filename": "0-raw/01-backup.md",
+      "text": "# Nightly backup\nThe nightly copy lands on D:\\BrainBackups.\nKeep 14 days of copies.\nThe copy runs at 02:00.\nRestore with the script at D:\\BrainBackups\\restore.ps1.\nI feel worn out by backups.\n"
+    },
+    {
+      "id": "02-dentist",
+      "filename": "0-raw/02-dentist.md",
+      "text": "# Dentist\nSaw Dr. Hale at 9:30 on 27 Nov 2026.\nBring the x-ray disk.\nThe clinic is on St. Mary Road.\n"
+    },
+    {
+      "id": "03-garden",
+      "filename": "0-raw/03-garden.md",
+      "text": "# Sowing log\n| variety | sown | days to germ | tray |\n| --- | --- | --- | --- |\n| Dragon bean | 12 Nov | 7 | A |\n| Kale | 14 Nov | 5 | B |\n| Peas | 18 Nov | 9 | C |\n"
+    },
+    {
+      "id": "04-caddy",
+      "filename": "0-raw/04-caddy.md",
+      "text": "this is the block I ended up with:\n\n```\ncoral-bay.local {\n    encode gzip\n    bind 192.168.1.40\n    reverse_proxy 127.0.0.1:8088\n}\n```\n"
+    },
+    {
+      "id": "05-todos",
+      "filename": "0-raw/05-todos.md",
+      "text": "# Errands\n- [x] email the landlord about the leak\n- [ ] order more coffee filters\n- Priya: will bring the spare router on Friday\n- ollama port 11434\n- dashboard 8501\n- wifi HomeLab-5G\n"
+    },
+    {
+      "id": "06-standup",
+      "filename": "0-raw/06-standup.md",
+      "text": "# Standup 27 Nov 2026\nDecision: public beta paused until the staging rate limit is raised.\nTLS is off because the home network is the only network.\nPriya owns the staging check.\nStaging stays closed until the limit review.\nThe hint is the.\nRotation to.\nshould grab.\n"
+    },
+    {
+      "id": "07-speed",
+      "filename": "0-raw/07-speed.md",
+      "text": "Tried 7b. Too slow, ~2 tok/s on CPU.\nThe 70b run used 40 GB.\n"
+    },
+    {
+      "id": "08-versions",
+      "filename": "0-raw/08-versions.md",
+      "text": "Mr. Chen said the agent 1.4.2 build is at C:\\Tools\\agent.exe.\nThe printer is at 192.168.1.50.\napprox. 2 GB is free on the backup disk.\nThe new card has 4 GB vs. the old 1 GB card.\n"
+    },
+    {
+      "id": "09-initials",
+      "filename": "0-raw/09-initials.md",
+      "text": "J. R. Hale signed the lease.\nKeep the vault local, e.g. on this laptop.\nThe copy is local, i.e. there is no cloud copy.\nNo. 14 is the filter we use.\n"
+    },
+    {
+      "id": "10-errands",
+      "filename": "0-raw/10-errands.md",
+      "text": "# Errand list\nOrder more paper filters.\nCall the plumber about the leaky tap.\nWater the kale before noon.\nCheck the TLS certificate expiry.\nRecord the meter reading.\n"
+    }
+  ],
+  "facts": [
+    {
+      "note": "01-backup",
+      "must": [
+        "lands on D:\\BrainBackups"
+      ],
+      "must_not": [
+        "restore.ps1"
+      ]
+    },
+    {
+      "note": "01-backup",
+      "must": [
+        "14 days"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "01-backup",
+      "must": [
+        "02:00"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "01-backup",
+      "must": [
+        "restore.ps1"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "02-dentist",
+      "must": [
+        "Dr. Hale",
+        "9:30",
+        "27 Nov 2026"
+      ],
+      "must_not": [
+        "x-ray"
+      ]
+    },
+    {
+      "note": "02-dentist",
+      "must": [
+        "x-ray disk"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "02-dentist",
+      "must": [
+        "St. Mary Road"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "03-garden",
+      "must": [
+        "Dragon bean",
+        "12 Nov",
+        "tray A"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "03-garden",
+      "must": [
+        "Kale",
+        "14 Nov",
+        "tray B"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "03-garden",
+      "must": [
+        "Peas",
+        "18 Nov",
+        "tray C"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "04-caddy",
+      "must": [
+        "coral-bay.local",
+        "encode gzip"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "04-caddy",
+      "must": [
+        "coral-bay.local",
+        "192.168.1.40"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "04-caddy",
+      "must": [
+        "coral-bay.local",
+        "127.0.0.1:8088"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "05-todos",
+      "must": [
+        "landlord",
+        "- [x]"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "05-todos",
+      "must": [
+        "coffee filters",
+        "- [ ]"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "05-todos",
+      "must": [
+        "Priya will bring"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "05-todos",
+      "must": [
+        "11434"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "05-todos",
+      "must": [
+        "8501"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "05-todos",
+      "must": [
+        "HomeLab-5G"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "06-standup",
+      "must": [
+        "public beta",
+        "27 Nov 2026"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "06-standup",
+      "must": [
+        "TLS is off",
+        "27 Nov 2026"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "06-standup",
+      "must": [
+        "Priya owns the staging check",
+        "27 Nov 2026"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "06-standup",
+      "must": [
+        "Staging stays closed",
+        "27 Nov 2026"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "07-speed",
+      "must": [
+        "7b",
+        "tok/s"
+      ],
+      "must_not": [
+        "40 GB"
+      ]
+    },
+    {
+      "note": "07-speed",
+      "must": [
+        "70b",
+        "40 GB"
+      ],
+      "must_not": [
+        "tok/s"
+      ]
+    },
+    {
+      "note": "08-versions",
+      "must": [
+        "Mr. Chen",
+        "1.4.2",
+        "C:\\Tools\\agent.exe"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "08-versions",
+      "must": [
+        "192.168.1.50"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "08-versions",
+      "must": [
+        "approx.",
+        "2 GB"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "08-versions",
+      "must": [
+        "4 GB",
+        "vs."
+      ],
+      "must_not": []
+    },
+    {
+      "note": "09-initials",
+      "must": [
+        "J. R. Hale"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "09-initials",
+      "must": [
+        "e.g."
+      ],
+      "must_not": []
+    },
+    {
+      "note": "09-initials",
+      "must": [
+        "i.e."
+      ],
+      "must_not": []
+    },
+    {
+      "note": "09-initials",
+      "must": [
+        "No. 14"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "10-errands",
+      "must": [
+        "paper filters"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "10-errands",
+      "must": [
+        "plumber"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "10-errands",
+      "must": [
+        "kale"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "10-errands",
+      "must": [
+        "TLS certificate"
+      ],
+      "must_not": []
+    },
+    {
+      "note": "10-errands",
+      "must": [
+        "meter reading"
+      ],
+      "must_not": []
+    }
+  ]
+}

@@ -1143,7 +1143,9 @@ class MCPBoundaryTests(unittest.TestCase):
         self.assertIn("MAX_INBOX_CHARS = 100_000", implementation)
         self.assertNotIn('name="list_atoms"', implementation)
         self.assertNotIn('name="list_threads"', implementation)
-        self.assertIn("ListResourcesResult(resources=[])", implementation)
+        self.assertIn("brain://policy/capture", implementation)
+        list_body = implementation.split("async def handle_list_resources", 1)[1].split("async def handle_read_resource", 1)[0]
+        self.assertNotIn("os.listdir", list_body)
         self.assertIn("do not register it with cloud-connected clients", readme_policy)
 
         vault_policy_path = ROOT / "brain" / "mcp-config.md"
@@ -1240,7 +1242,7 @@ class MCPBoundaryTests(unittest.TestCase):
                     },
                 )
                 resources = await mcp_server.handle_list_resources(auth_ctx, None)
-                self.assertEqual(resources.resources, [])
+                self.assertEqual([str(item.uri) for item in resources.resources], ["brain://policy/capture"])
                 with patch("mcp_server.audit_mcp_use", side_effect=OSError("audit unavailable")):
                     with self.assertRaises(OSError):
                         await mcp_server.handle_call_tool(

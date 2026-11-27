@@ -582,6 +582,13 @@ def apply_atom_mutation(
                         raise ReviewTransitionError(
                             "Approval requires the claim to be supported by its own evidence quote."
                         )
+                    from scripts.capture_policy import rejection_reasons
+
+                    reasons = rejection_reasons(claim_text)
+                    if reasons:
+                        raise ReviewTransitionError(
+                            "Approval blocked by capture policy: " + "; ".join(reasons)
+                        )
 
             reviewed_on = reviewed_on or datetime.datetime.now().strftime("%Y-%m-%d")
             transition = TRANSITIONS[action]

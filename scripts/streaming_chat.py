@@ -130,6 +130,7 @@ from scripts.host_adapters import (  # noqa: E402
 from scripts.memory_format import split_frontmatter  # noqa: E402
 from scripts.memory_review import parse_frontmatter_values, section_text  # noqa: E402
 from scripts.notes_store import NotePaths, search_notes  # noqa: E402
+from scripts.sentence_spans import split_sentences  # noqa: E402
 from scripts.recall import (  # noqa: E402
     MemoryRecallUnavailable,
     RecallOptions,
@@ -875,33 +876,98 @@ _MODEL_ABSTENTION_RE = re.compile(
 )
 
 
+def _sensitive_tokens(text: str) -> list[str]:
+    """Numbers, addresses, dates, weekdays, paths, and proper nouns a citation must cover."""
+    found: list[str] = []
+    for pattern in (
+        r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+        r"\b\d{1,2}:\d{2}\b",
+        r"[A-Za-z]:\\[^\s]+",
+        r"\b\d{1,2}\s+[A-Za-z]{3,9}(?:\s+\d{4})?\b",
+        r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
+    ):
+        found.extend(match.group(0).rstrip(".,") for match in re.finditer(pattern, text, flags=re.IGNORECASE))
+    masked = text
+    for token in found:
+        masked = masked.replace(token, " ")
+    found.extend(match.group(0) for match in re.finditer(r"\b\d+(?:\.\d+)?\b", masked))
+    words = re.findall(r"[A-Za-z][A-Za-z'.-]*", CITATION_RE.sub(" ", text))
+    for index, word in enumerate(words):
+        if index == 0 or len(word) < 3 or not word[0].isupper():
+            continue
+        if word.casefold() in {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "dr", "mr", "mrs", "ms", "st"}:
+            continue
+        found.append(word)
+    return found
+
+
+def _move_citations_to_end(sentence: str) -> str:
+    tags: list[str] = []
+
+    def _grab(match: re.Match[str]) -> str:
+        tag = f"[{match.group(1)}{int(match.group(2))}]"
+        if tag not in tags:
+            tags.append(tag)
+        return " "
+
+    body = CITATION_RE.sub(_grab, sentence)
+    body = re.sub(r"\s+", " ", body).strip()
+    if not tags:
+        return body
+    suffix = " ".join(tags)
+    if body.endswith((".", "!", "?")):
+        return f"{body[:-1]} {suffix}{body[-1]}"
+    return f"{body} {suffix}"
+
+
+def _cited_items(sentence: str, verified: list[dict[str, object]]) -> tuple[list[dict[str, object]], list[str]]:
+    ids = [f"{match.group(1)}{int(match.group(2))}" for match in CITATION_RE.finditer(sentence)]
+    by_id = {str(item.get("id")): item for item in verified}
+    return [by_id[item_id] for item_id in ids if item_id in by_id], ids
+
+
+def _sentence_is_grounded(sentence: str, verified: list[dict[str, object]]) -> bool:
+    tokens = _sensitive_tokens(sentence)
+    if not tokens:
+        return True
+    items, ids = _cited_items(sentence, verified)
+    if ids and not items:
+        return True
+    if not items:
+        return False
+    blob = " ".join(_support_blob(item) for item in items)
+    return all(token.casefold() in blob.casefold() for token in tokens)
+
+
 def answer_with_citations(text: str, query: str, verified: list[dict[str, object]]) -> str:
-    """Replace a false abstention and attach [V#] tags the model left off."""
+    """Replace a false abstention and attach one [V#] tag at the end of a sentence."""
     if not verified:
         return text
     supporting = best_supporting_claims(query, verified)
     if supporting and (not (text or "").strip() or _MODEL_ABSTENTION_RE.search(text or "")):
         top = supporting[0]
         return f"{top['claim']} [{top['id']}]"
-    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if part.strip()]
+    parts = split_sentences(text or "")
     if not parts:
         return text
     rewritten: list[str] = []
     for part in parts:
-        if CITATION_RE.search(part):
-            rewritten.append(part)
+        sentence = _move_citations_to_end(part)
+        if not CITATION_RE.search(sentence):
+            best_item = None
+            best_score = 0.0
+            for item in verified:
+                score = _query_claim_overlap(sentence, _support_blob(item))
+                if score > best_score:
+                    best_score = score
+                    best_item = item
+            if best_item is not None and best_score >= 0.34:
+                sentence = f"{sentence.rstrip()} [{best_item['id']}]"
+        if CITATION_RE.search(sentence) and not _sentence_is_grounded(sentence, verified):
             continue
-        best_item = None
-        best_score = 0.0
-        for item in verified:
-            score = _query_claim_overlap(part, _support_blob(item))
-            if score > best_score:
-                best_score = score
-                best_item = item
-        if best_item is not None and best_score >= 0.34 and f"[{best_item['id']}]" not in part:
-            rewritten.append(f"{part.rstrip()} [{best_item['id']}]")
-        else:
-            rewritten.append(part)
+        rewritten.append(sentence)
+    if not rewritten:
+        return "No grounded sentence remained in the cited sources."
     return _drop_off_question_clauses(_collapse_adjacent_citations(" ".join(rewritten)), query, verified)
 
 
@@ -961,7 +1027,7 @@ def check_citations(
         cleaned_line = _BULLET_PREFIX_RE.sub("", stripped).strip()
         if not cleaned_line:
             continue
-        for sentence in SENTENCE_RE.split(cleaned_line):
+        for sentence in split_sentences(cleaned_line):
             seg = sentence.strip()
             if not seg:
                 continue
