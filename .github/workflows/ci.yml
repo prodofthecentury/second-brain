@@ -238,7 +238,7 @@ jobs:
           git fetch origin "${{ github.base_ref }}"
           base="origin/${{ github.base_ref }}"
           # The pin is read from the base branch workflow. This file's value is ignored.
-          pin=$(git show "$base:.github/workflows/ci.yml" | python3 -c 'import re,sys; m=re.search(r"^PINNED_HARNESS_SHA:\s*\"([0-9a-f]{40})\"", sys.stdin.read(), re.M); print(m.group(1) if m else "")')
+          pin=$(git show "$base:.github/workflows/ci.yml" | python3 -c 'import re,sys; m=re.search(r"^[ \t]*PINNED_HARNESS_SHA:\s*\"([0-9a-f]{40})\"", sys.stdin.read(), re.M); print(m.group(1) if m else "")')
           if [ -z "$pin" ]; then
             echo "owner has not set PINNED_HARNESS_SHA on ${base}; fail closed" >&2
             exit 2

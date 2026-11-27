@@ -9,7 +9,7 @@ workspace="$(pwd)"
 
 pin="$(git show "${base_ref}:.github/workflows/ci.yml" | python3 -c '
 import re, sys
-match = re.search(r"^PINNED_HARNESS_SHA:\s*\"([0-9a-f]{40})\"", sys.stdin.read(), re.M)
+match = re.search(r"^[ \t]*PINNED_HARNESS_SHA:\s*\"([0-9a-f]{40})\"", sys.stdin.read(), re.M)
 print(match.group(1) if match else "")
 ')"
 if [ -z "$pin" ]; then
