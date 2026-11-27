@@ -515,6 +515,11 @@ def _coverage_hijacks() -> list[tuple[str, str, str, list[str]]]:
         ("hijack-spaced-paren", "spaced-hyphen", "(2026 -11)", ["spaced-hyphen", "must-not-fire"]),
         ("hijack-spaced-ten", "spaced-hyphen", "10 -4", ["spaced-hyphen", "must-not-fire"]),
         ("hijack-spaced-nine", "spaced-hyphen", "9 -5", ["spaced-hyphen", "must-not-fire"]),
+        ("hijack-bracket-10", "bracket-minus", "(10) -4", ["bracket-minus", "must-not-fire"]),
+        ("hijack-bracket-12", "bracket-minus", "(12) -3", ["bracket-minus", "must-not-fire"]),
+        ("hijack-bracket-8", "bracket-minus", "(8) -5", ["bracket-minus", "must-not-fire"]),
+        ("hijack-bracket-room", "bracket-minus", "Room (10) -4 east", ["bracket-minus", "must-not-fire"]),
+        ("hijack-bracket-see", "bracket-minus", "see (12) -3", ["bracket-minus", "must-not-fire"]),
     ]
     return rows
 
@@ -802,6 +807,9 @@ def _coverage_tools() -> list[tuple]:
         ("tools-cov-dec-bare", "11 / 2 as a decimal", "5.5", "decimal", "any", "ANSWER = '5.5'", ["should-fire", "as-decimal"]),
         # A compute prefix asks for arithmetic. 2026 - 11 is 2015. Bare '2026 -11' stays must-not-fire.
         ("tools-spaced-ask", "What is 2026 -11?", "2015", "integer", "any", "ANSWER = 2026 - 11", ["should-fire", "spaced-hyphen"]),
+        ("tools-bracket-ask", "What is (10) -4?", "6", "integer", "any", "ANSWER = 10 - 4", ["should-fire", "bracket-minus"]),
+        ("tools-bracket-compute", "Compute (8) -3.", "5", "integer", "any", "ANSWER = 8 - 3", ["should-fire", "bracket-minus"]),
+        ("tools-bracket-much", "How much is (12) -3?", "9", "integer", "any", "ANSWER = 12 - 3", ["should-fire", "bracket-minus"]),
     ]
     out = []
     for item_id, question, answer, answer_type, expected, reference, tags in specs:
@@ -872,6 +880,15 @@ def _case_unit_traps() -> list[tuple]:
     exact("tools-wl-cm", "whitelist", "1 CM to m", "0.01", "decimal", "ANSWER = '0.01'")
     exact("tools-wl-dm", "whitelist", "1 DM to m", "0.1", "decimal", "ANSWER = '0.1'")
     exact("tools-wl-ks", "whitelist", "1 KS to s", "1000", "integer", "ANSWER = 1000")
+    # Capitalised whitelist spellings are the same reading as the all-caps form.
+    exact("tools-wl-km-cap", "whitelist", "1 Km to m", "1000", "integer", "ANSWER = 1000")
+    exact("tools-wl-cm-cap", "whitelist", "1 Cm to m", "0.01", "decimal", "ANSWER = '0.01'")
+    # A mixed-case fold of a whitelisted unit is not that reading. Any answer fails.
+    decline("tools-case-km-fold", "mixed-whitelist", "1 kM to m")
+    decline("tools-case-cm-fold", "mixed-whitelist", "1 cM to m")
+    decline("tools-case-dm-fold", "mixed-whitelist", "1 dM to m")
+    decline("tools-case-kg-fold", "mixed-whitelist", "1 kG to g")
+    decline("tools-case-mi-fold", "mixed-whitelist", "1 mI to km")
     return rows
 
 

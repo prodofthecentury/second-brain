@@ -35,7 +35,7 @@ Exit 0 is pass or warn. Exit 1 is a HARD gate or a calibrated FAIL. Exit 2 is a 
 
 ## Gold notes
 
-A single reduced `a/b` with no other operator and no conversion asked is an echo and must decline. `What is 2/3?`, `24/7`, `12/25` and `9/11` are that shape. A reducible `a/b` is computed: `100/4` is 25 and `50/50` is 1. `11 / 2 as a decimal` is 5.5. A question with a compute prefix is arithmetic: `What is 2026 -11?` is 2015. Bare `2026 -11` and `(2026 -11)` stay must-not-fire.
+A single reduced `a/b` with no other operator and no conversion asked is an echo and must decline. `What is 2/3?`, `24/7`, `12/25` and `9/11` are that shape. A reducible `a/b` is computed: `100/4` is 25 and `50/50` is 1. `11 / 2 as a decimal` is 5.5. A question with a compute prefix is arithmetic: `What is 2026 -11?` is 2015 and `What is (10) -4?` is 6. Bare `2026 -11`, `(2026 -11)`, and `(10) -4` must not fire. A mixed-case fold of a whitelisted unit (`kM`, `cM`, `dM`, `kG`, `mI`) must decline. `KM` and `Km` to m are 1000. `CM` and `Cm` to m are 0.01.
 
 ## Two gates
 
