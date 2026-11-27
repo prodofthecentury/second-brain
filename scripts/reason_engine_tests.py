@@ -2,12 +2,72 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
+import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
+
+@contextmanager
+def _sympy_blocked():
+    """Run a block as if SymPy were not installed."""
+    real_import = builtins.__import__
+
+    def _blocked(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "sympy" or str(name).startswith("sympy."):
+            raise ImportError("sympy blocked for this test")
+        return real_import(name, globals, locals, fromlist, level)
+
+    hidden = {
+        key: sys.modules.pop(key)
+        for key in list(sys.modules)
+        if key == "sympy" or key.startswith("sympy.")
+    }
+    try:
+        with patch("builtins.__import__", _blocked):
+            yield
+    finally:
+        sys.modules.update(hidden)
+
+
+def _assert_sells_half_declines(test: unittest.TestCase) -> None:
+    """Half-sold pens are 53. No template may answer 101 or mark that verified."""
+    from scripts.reason_engine import word_problem_expression
+
+    question = "12 boxes of 8 pens, sells half, then 5 more"
+    expression = word_problem_expression(question)
+    test.assertTrue(expression is None or exact_arithmetic(expression)[0] == "53", expression)
+    tool = try_exact_tool(question)
+    if tool is not None and not tool.get("refused"):
+        test.assertEqual(tool["answer"], "53")
+        test.assertNotEqual(tool["answer"], "101")
+    else:
+        test.assertTrue(tool is None or tool.get("refused"))
+    declined = reason(question, use_default_model=False)
+    test.assertNotEqual(declined["answer"], "101")
+    test.assertFalse(declined["verified"])
+    test.assertFalse(str(declined["answer_source"]).startswith("tool:"))
+    handed = reason(question, model_fn=lambda _prompt: "53")
+    test.assertEqual(handed["answer"], "53")
+    test.assertFalse(handed["verified"])
+    test.assertEqual(handed["answer_source"], "model")
+    sold = reason(
+        "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?",
+        use_default_model=False,
+    )
+    test.assertEqual(sold["answer"], "101")
+    test.assertEqual(sold["model_calls"], 0)
+    if _sympy_present():
+        test.assertTrue(sold["verified"])
+        test.assertEqual(sold["answer_source"], "tool:sympy")
+    else:
+        test.assertFalse(sold["verified"])
+        test.assertEqual(sold["answer_source"], "tool:calculator")
+
 
 def _sympy_present() -> bool:
     try:
@@ -411,9 +471,7 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertTrue(eats is None or eats.get("refused") or eats.get("answer") != "12")
         times = try_exact_tool("2 times 3 plus 4 times 5")
         self.assertTrue(times is None or times.get("refused") or times.get("answer") != "6")
-        half = reason("12 boxes of 8 pens, sells half, then 5 more", model_fn=lambda _prompt: "53")
-        self.assertNotEqual(half["answer"], "101")
-        self.assertFalse(half["verified"] and half["answer"] == "101")
+        _assert_sells_half_declines(self)
 
     def test_division_by_zero_uses_the_model_reply(self) -> None:
         result = reason("10/0", model_fn=lambda _prompt: "Division by zero is undefined.")
@@ -616,39 +674,17 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertTrue(any("timeout" in error for error in result["errors"]))
 
     def test_boxes_template_does_not_depend_on_sympy(self) -> None:
-        import builtins
-        import sys
-
-        real_import = builtins.__import__
-
-        def _blocked(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "sympy" or name.startswith("sympy."):
-                raise ImportError("sympy blocked for this test")
-            return real_import(name, globals, locals, fromlist, level)
-
-        hidden = {
-            key: sys.modules.pop(key)
-            for key in list(sys.modules)
-            if key == "sympy" or key.startswith("sympy.")
-        }
-        try:
-            with patch("builtins.__import__", _blocked):
-                eats = try_exact_tool("3 boxes of 4, eats 2")
-                self.assertTrue(eats is None or eats.get("answer") != "12")
-                result = reason("3 boxes of 4, eats 2", use_default_model=False)
-                self.assertNotEqual(result["answer"], "12")
-                self.assertFalse(result["verified"])
-                sold = reason(
-                    "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?",
-                    use_default_model=False,
-                )
-                self.assertEqual(sold["answer"], "101")
-                third, source, verified = exact_arithmetic("2/3")
-                self.assertEqual(third, "2/3")
-                self.assertEqual(source, "tool:calculator")
-                self.assertFalse(verified)
-        finally:
-            sys.modules.update(hidden)
+        with _sympy_blocked():
+            eats = try_exact_tool("3 boxes of 4, eats 2")
+            self.assertTrue(eats is None or eats.get("answer") != "12")
+            result = reason("3 boxes of 4, eats 2", use_default_model=False)
+            self.assertNotEqual(result["answer"], "12")
+            self.assertFalse(result["verified"])
+            _assert_sells_half_declines(self)
+            third, source, verified = exact_arithmetic("2/3")
+            self.assertEqual(third, "2/3")
+            self.assertEqual(source, "tool:calculator")
+            self.assertFalse(verified)
 
 
 class ReasonBenchmarkTests(unittest.TestCase):
