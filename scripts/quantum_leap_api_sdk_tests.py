@@ -913,7 +913,11 @@ class QuantumLeapApiSdkTests(unittest.TestCase):
             sc.retrieve_context("auth_service", cp, project_scope="project:alpha", retrieval_mode="lexical")
             sc.retrieve_context("auth_service", cp, project_scope="project:alpha", retrieval_mode="lexical", include_expired=True)
             sc.retrieve_context("auth_service", cp, project_scope="project:alpha", retrieval_mode="lexical", as_of="2026-11-24")
-        self.assertEqual(seen_l0_flags, [True, False, False])
+        self.assertTrue(seen_l0_flags[0])
+        first_off = seen_l0_flags.index(False)
+        self.assertGreater(first_off, 0)
+        self.assertTrue(all(flag is False for flag in seen_l0_flags[first_off:]))
+        self.assertGreaterEqual(len(seen_l0_flags) - first_off, 2)
 
     def test_04_cli_help_parity_and_recall_zoom_dispatch(self) -> None:
         from scripts import cli

@@ -213,7 +213,33 @@ class RealRuntimeTests(unittest.TestCase):
             require_flag="BRAIN_REQUIRE_HERMES",
         )
 
-    def _distill_shared_fixtures(self, *, model: str, require_flag: str) -> None:
+    def test_llama32_distills_messy_notes(self) -> None:
+        self._distill_shared_fixtures(
+            model=os.environ.get("BRAIN_DISTILL_FIXTURE_MODEL") or "llama3.2:3b",
+            require_flag="BRAIN_REQUIRE_DISTILL",
+            fixture_name="messy-fixtures.json",
+            deadline=700,
+            chat_check=True,
+        )
+
+    def test_hermes_distills_messy_notes(self) -> None:
+        self._distill_shared_fixtures(
+            model=os.environ.get("BRAIN_HERMES_DISTILL_MODEL") or "hermes3:3b",
+            require_flag="BRAIN_REQUIRE_HERMES",
+            fixture_name="messy-fixtures.json",
+            deadline=700,
+            chat_check=True,
+        )
+
+    def _distill_shared_fixtures(
+        self,
+        *,
+        model: str,
+        require_flag: str,
+        fixture_name: str = "distill-fixtures.json",
+        deadline: int = 480,
+        chat_check: bool = False,
+    ) -> None:
         import urllib.error
         import urllib.request
 
@@ -222,7 +248,7 @@ class RealRuntimeTests(unittest.TestCase):
         from scripts.ollama_refinery import LAST_DISTILL_PATHS, draft_memory_atoms
         from scripts.personal_eval import evaluate_file
 
-        fixture_path = Path(__file__).resolve().parents[1] / "docs" / "distill-fixtures.json"
+        fixture_path = Path(__file__).resolve().parents[1] / "docs" / fixture_name
         fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
         notes = fixture["notes"]
         try:
@@ -246,6 +272,7 @@ class RealRuntimeTests(unittest.TestCase):
         atoms_total = 0
         gate_pass = 0
         contaminated = False
+        by_note: dict[str, list[str]] = {}
         started = time.monotonic()
         try:
             with tempfile.TemporaryDirectory(prefix="sb-distill-") as tmp:
@@ -255,7 +282,7 @@ class RealRuntimeTests(unittest.TestCase):
                 raw.mkdir(parents=True)
                 atoms.mkdir()
                 for note in notes:
-                    if time.monotonic() - started > 480:
+                    if time.monotonic() - started > deadline:
                         print(f"DISTILL_NOTE {note['id']} atoms=0 path=timeout verbatim=0 gate=0")
                         continue
                     (vault / note["filename"]).parent.mkdir(parents=True, exist_ok=True)
@@ -284,6 +311,9 @@ class RealRuntimeTests(unittest.TestCase):
                             anchored += 1
                         except Exception:
                             pass
+                    from scripts.evidence import quotes_in_source
+
+                    by_note[str(note["id"])] = [doc for doc in drafted if quotes_in_source(doc, note["text"])]
                     if drafted:
                         notes_with_atoms += 1
                         atoms_total += len(drafted)
@@ -295,21 +325,74 @@ class RealRuntimeTests(unittest.TestCase):
                 print(f"DISTILL_SUCCESS {notes_with_atoms}/{len(notes)} model={model} atoms={atoms_total} gate={gate_pass}")
                 if contaminated:
                     self.fail(f"{model} kept a coffee atom for the coffee-free note")
-                if any(atoms.glob("*.md")):
-                    index = vault / "lexical.sqlite3"
-                    rebuild_lexical_index(str(atoms), str(index))
-                    spec = {
-                        "name": fixture["name"],
-                        "k": fixture["eval"]["k"],
-                        "allow_unreviewed_exploratory": True,
-                        "queries": fixture["eval"]["queries"],
-                    }
-                    spec_path = vault / "eval.json"
-                    spec_path.write_text(json.dumps(spec), encoding="utf-8")
-                    report = evaluate_file(str(spec_path), atoms_dir=str(atoms), index_path=str(index))
-                    print(f"EVAL_RECALL {report['recall_at_k']} EVAL_MRR {report['mrr']} model={model}")
-                else:
-                    print(f"EVAL_RECALL 0.0 EVAL_MRR 0.0 model={model}")
+                facts = fixture.get("facts") or []
+                if facts:
+                    from scripts.messy_notes_tests import score_messy
+
+                    recall, precision = score_messy(by_note, facts)
+                    bar = 0.85
+                    met = recall >= bar
+                    print(
+                        f"APPROVED_RECALL {recall:.3f} APPROVED_PRECISION {precision:.3f} "
+                        f"BAR {bar:.2f} BAR_MET {str(met).lower()} model={model} facts={len(facts)}"
+                    )
+                    # The 0.85 bar is reported, not pretended. A live model under it is a miss.
+                    # The strict pass/fail gate is the empty-model test, which requires recall 1.0.
+                    if _require(require_flag) and recall < bar:
+                        print(f"APPROVED_BAR_MISSED {model} approved-claim recall {recall:.3f} is under {bar:.2f}")
+                if chat_check:
+                    from scripts.streaming_chat import answer_with_citations
+
+                    verified = []
+                    for docs in by_note.values():
+                        for document in docs:
+                            claim = ""
+                            evidence = ""
+                            if "## Claim\n" in document:
+                                claim = document.split("## Claim\n", 1)[1].split("\n", 1)[0]
+                            if "## Evidence\n" in document:
+                                evidence = document.split("## Evidence\n", 1)[1].split("\n", 1)[0]
+                            if claim:
+                                verified.append({
+                                    "id": f"V{len(verified) + 1}",
+                                    "claim": claim,
+                                    "evidence": evidence,
+                                    "title": claim[:80],
+                                })
+                    hale = next((item for item in verified if "Dr. Hale" in item["claim"] and "9:30" in item["claim"]), None)
+                    host = next((item for item in verified if "192.168.1.40" in f"{item['claim']} {item['evidence']}"), None)
+                    self.assertIsNotNone(hale, "messy distill missed Dr. Hale at 9:30")
+                    self.assertIsNotNone(host, "messy distill missed 192.168.1.40")
+                    hale["id"] = "V1"
+                    host["id"] = "V2"
+                    grounded = answer_with_citations(
+                        "Dr. [V1] Hale is at 9:30. The host is 10.0.0.10 [V2]. The standup is on Thursday [V1].",
+                        "When did we see Dr. Hale?",
+                        [hale, host],
+                    )
+                    print(f"CHAT_GROUNDED {grounded!r} model={model}")
+                    self.assertIn("Dr. Hale", grounded)
+                    self.assertIn("9:30", grounded)
+                    self.assertNotIn("10.0.0.10", grounded)
+                    self.assertNotIn("Thursday", grounded)
+                    self.assertNotIn("Dr. [V1]", grounded)
+                    self.assertNotIn("[V1] [V1]", grounded)
+                if fixture.get("eval"):
+                    if any(atoms.glob("*.md")):
+                        index = vault / "lexical.sqlite3"
+                        rebuild_lexical_index(str(atoms), str(index))
+                        spec = {
+                            "name": fixture["name"],
+                            "k": fixture["eval"]["k"],
+                            "allow_unreviewed_exploratory": True,
+                            "queries": fixture["eval"]["queries"],
+                        }
+                        spec_path = vault / "eval.json"
+                        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+                        report = evaluate_file(str(spec_path), atoms_dir=str(atoms), index_path=str(index))
+                        print(f"EVAL_RECALL {report['recall_at_k']} EVAL_MRR {report['mrr']} model={model}")
+                    else:
+                        print(f"EVAL_RECALL 0.0 EVAL_MRR 0.0 model={model}")
         finally:
             _unload_ollama_model(model)
             if previous is None:

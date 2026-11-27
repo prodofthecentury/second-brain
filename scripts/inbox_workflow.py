@@ -112,19 +112,34 @@ def _extract_origin_tag(text: str) -> str:
 
 _SECRET_CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("anthropic_api_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
-    ("openai_api_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
+    ("openai_api_key", re.compile(r"\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{4,}\b")),
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35,}\b")),
-    ("github_pat", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b")),
+    ("github_pat", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{8,}\b")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("aws_sts_key", re.compile(r"\bASIA[0-9A-Z]{16}\b")),
     ("jwt_token", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
-    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{6,}")),
     ("huggingface_token", re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
     ("stripe_live_key", re.compile(r"\b(?:sk|rk)_live_[0-9a-zA-Z]{24,}\b")),
     ("url_basic_auth", re.compile(r"https?://[^/\s:@\"']+:[^/\s@\"']+@")),
     ("private_key_pem", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
     ("bearer_header_secret", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b")),
+    ("password_phrase", re.compile(r"(?i)\b(?:password|passwd|api[_ -]?key|secret|access[_ -]?token)\s*(?:[:=]|is)\s+\S+")),
 )
+
+
+def _high_entropy_token(content: str) -> bool:
+    for token in re.findall(r"[A-Za-z0-9_\-]{20,}", content or ""):
+        if re.fullmatch(r"[a-z0-9]+(?:[_-][a-z0-9]+)*", token):
+            continue
+        if re.fullmatch(r"[A-Z0-9]+(?:[_-][A-Z0-9]+)*", token):
+            continue
+        lower = any(char.islower() for char in token)
+        upper = any(char.isupper() for char in token)
+        digit = any(char.isdigit() for char in token)
+        if lower and upper and digit and len(set(token)) / len(token) >= 0.55:
+            return True
+    return False
 
 
 def scan_inbox_payload_risks(content: str) -> tuple[str, ...]:
@@ -135,6 +150,8 @@ def scan_inbox_payload_risks(content: str) -> tuple[str, ...]:
     for label, pattern in _SECRET_CREDENTIAL_PATTERNS:
         if pattern.search(content):
             flags.append(f"secret_credential:{label}")
+    if _high_entropy_token(content):
+        flags.append("secret_credential:high_entropy")
     if any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in content):
         flags.append("control_characters_present")
     if len(content.encode("utf-8")) > MAX_PROMOTED_BYTES:

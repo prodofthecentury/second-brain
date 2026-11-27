@@ -1,0 +1,75 @@
+{
+  "max_claim_words": 80,
+  "min_fact_chars": 12,
+  "max_atoms_per_note": 12,
+  "model_atoms_per_call": 5,
+  "dangling_endings": [
+    "a", "an", "the", "of", "to", "in", "for", "and", "or", "is", "are", "was", "were",
+    "with", "by", "from", "that", "this", "should", "would", "could", "grab"
+  ],
+  "abbreviations": [
+    "Dr", "Mr", "Mrs", "Ms", "St", "Jr", "Sr", "Prof", "etc", "vs", "No", "approx",
+    "Fig", "Eq", "Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep", "Sept", "Oct", "Nov", "Dec"
+  ],
+  "relative_dates": ["tomorrow", "yesterday", "tonight", "next week", "next month"],
+  "subjectless_starts": ["too", "also", "still", "just", "very", "not", "and", "but", "so", "then", "same", "worse", "better"],
+  "mood_patterns": [
+    "i feel",
+    "i'm feeling",
+    "i am feeling",
+    "i'm so happy",
+    "i am so happy",
+    "feel tired",
+    "feeling tired",
+    "worn out",
+    "so annoying",
+    "this is annoying"
+  ],
+  "qualifies": [
+    "durable checkable facts",
+    "decisions",
+    "config values",
+    "ports, paths, and hosts",
+    "dates and deadlines",
+    "people and roles",
+    "preferences",
+    "procedures",
+    "todos with an owner or a date",
+    "measurements and results"
+  ],
+  "rejects": [
+    "mood or feelings without a checkable fact",
+    "filler",
+    "headings",
+    "markup, table syntax, and code-fence syntax",
+    "truncated fragments",
+    "speculation unless marked tentative",
+    "duplicates",
+    "secrets, passwords, and tokens",
+    "transient chatter",
+    "relative dates such as tomorrow"
+  ],
+  "shape": {
+    "one_fact_per_atom": true,
+    "subject_explicit": true,
+    "absolute_dates": true,
+    "verbatim_evidence": true,
+    "source_note_required": true,
+    "auto_approve": false
+  },
+  "uncertain": "Mark the atom tentative and leave it pending for the owner. Never auto-approve an uncertain fact.",
+  "prompt": "Keep one durable checkable fact per atom: a decision, config value, port, path, host, date, person and role, preference, procedure, todo, or measurement. The subject must be in the sentence. Use an absolute date, not a relative one. Evidence must be a verbatim span from the note. Reject mood, filler, headings, markup, fragments, secrets, and unmarked speculation. If a fact is uncertain, mark it tentative and do not treat it as approved.",
+  "examples": {
+    "good": [
+      "The dashboard listens on port 8501.",
+      "Decision: the public beta stays paused until the staging rate limit is raised.",
+      "Saw Dr. Hale at 9:30 on 27 Nov 2026."
+    ],
+    "bad": [
+      "I feel worn out by backups.",
+      "password: hunter2",
+      "Rotation to.",
+      "Ship the beta tomorrow."
+    ]
+  }
+}

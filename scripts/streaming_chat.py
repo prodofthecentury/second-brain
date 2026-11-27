@@ -130,6 +130,7 @@ from scripts.host_adapters import (  # noqa: E402
 from scripts.memory_format import split_frontmatter  # noqa: E402
 from scripts.memory_review import parse_frontmatter_values, section_text  # noqa: E402
 from scripts.notes_store import NotePaths, search_notes  # noqa: E402
+from scripts.sentence_spans import split_sentences  # noqa: E402
 from scripts.recall import (  # noqa: E402
     MemoryRecallUnavailable,
     RecallOptions,
@@ -504,10 +505,10 @@ def warmup(policy_path: Path | None = None) -> dict[str, object]:
     return {"model": model, "warmup_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
 
-def _claim_and_evidence(content: str) -> tuple[str, str]:
+def _claim_and_evidence(content: str) -> tuple[str, str, str]:
     parsed = split_frontmatter(content)
     body = "\n".join(parsed[1]) if parsed else content
-    return section_text(body, "Claim"), section_text(body, "Evidence")
+    return section_text(body, "Claim"), section_text(body, "Evidence"), section_text(body, "Context")
 
 
 def _note_excerpt(body: str, query: str) -> str:
@@ -592,7 +593,7 @@ def retrieve_context(
                 seen_fnames.add(nb.filename)
                 combined.append(nb)
         for result in combined[:MAX_VERIFIED]:
-            claim, evidence = _claim_and_evidence(result.content)
+            claim, evidence, context = _claim_and_evidence(result.content)
             if not claim:
                 continue
             parsed_fm = split_frontmatter(result.content)
@@ -605,6 +606,7 @@ def retrieve_context(
                     "atom_id": result.filename,
                     "claim": claim,
                     "evidence": evidence,
+                    "context": context,
                     "title": support_title,
                 })
             else:
@@ -613,9 +615,54 @@ def retrieve_context(
                     "atom_id": result.filename,
                     "claim": claim,
                     "evidence": evidence,
+                    "context": context,
                     "title": support_title,
                 })
             records.append({"filename": result.filename, "content": result.content})
+        titles = {str(item.get("title") or "") for item in verified if item.get("title")}
+        known = {str(item.get("atom_id") or "") for item in verified}
+        for title in list(titles)[:4]:
+            label = title.split()[0]
+            if len(label) < 3:
+                continue
+            try:
+                extra, _extra_neighbors = search_memory(
+                    label,
+                    RecallOptions(
+                        n_results=4,
+                        follow_links=False,
+                        include_statuses={"accepted"},
+                    retrieval_mode="lexical",
+                    use_l0_bus=safe_l0_bus,
+                    projects=(project_scope,) if project_scope else (),
+                    ),
+                    atoms_dir=paths.atoms_dir,
+                    index_path=paths.lexical_index_path,
+                    chroma_path=paths.chroma_path,
+                )
+            except Exception:
+                extra = []
+            for result in extra:
+                if result.filename in known or len(verified) >= MAX_VERIFIED + 4:
+                    continue
+                claim, evidence, context = _claim_and_evidence(result.content)
+                if not claim:
+                    continue
+                parsed_fm = split_frontmatter(result.content)
+                fm = parse_frontmatter_values(parsed_fm[0]) if parsed_fm else {}
+                sibling_title = _support_title(fm)
+                sibling_blob = f"{sibling_title} {claim} {context}"
+                if label.casefold() not in sibling_blob.casefold():
+                    continue
+                known.add(result.filename)
+                verified.append({
+                    "id": f"V{len(verified) + 1}",
+                    "atom_id": result.filename,
+                    "claim": claim,
+                    "evidence": evidence,
+                    "context": context,
+                    "title": sibling_title,
+                })
         try:
             candidate_ids = peek_lexical_candidate_atom_ids(
                 query,
@@ -783,6 +830,8 @@ def build_synthesis_prompt(
         line = f"[{item['id']}] {item['claim']}"
         if item.get("evidence"):
             line += f" Evidence: {item['evidence']}"
+        if item.get("context"):
+            line += f" Context: {item['context']}"
         if item.get("title"):
             line += f" Title: {item['title']}"
         return line
@@ -817,6 +866,7 @@ def build_synthesis_prompt(
         "[V#] are owner-verified claims; [N#] are the owner's unverified notes."
         f"{pref_instruction}{hist_instruction}\n"
         "Use only words that appear in the claim or its evidence. Do not add reasons or details that are not written there.\n"
+        "Facts that share a Title or a context block name are one block. Use every line from that block together.\n"
         "Answer only the question. Do not add a sentence about a different fact, even if that fact is in the sources.\n"
         "If the sources do not answer the question, say so briefly. Do not use outside knowledge.\n\n"
         f"<verified_claims>\n{v_block}\n</verified_claims>\n\n<notes>\n{n_block}\n</notes>{pref_block}{hist_block}{ws_block}\n\n"
@@ -827,7 +877,7 @@ def build_synthesis_prompt(
 def _support_blob(item: dict[str, object]) -> str:
     return " ".join(
         str(item.get(key) or "")
-        for key in ("claim", "evidence", "title", "source_note", "atom_id")
+        for key in ("claim", "evidence", "context", "title", "source_note", "atom_id")
     )
 
 
@@ -839,7 +889,36 @@ def best_supporting_claims(query: str, verified: list[dict[str, object]], *, min
         if score >= minimum:
             scored.append((score, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [item for _score, item in scored[:3]]
+    chosen = [item for _score, item in scored[:3]]
+    titles = {str(item.get("title") or "") for item in chosen if item.get("title")}
+    seen = {id(item) for item in chosen}
+    block_keys = {_block_key(item) for item in chosen}
+    block_keys.discard("")
+    if not titles and not block_keys:
+        return chosen
+    for item in verified:
+        if id(item) in seen:
+            continue
+        same_title = str(item.get("title") or "") in titles
+        same_block = _block_key(item) in block_keys
+        if same_title or same_block:
+            chosen.append(item)
+            seen.add(id(item))
+    return chosen
+
+
+def _block_key(item: dict[str, object]) -> str:
+    """A config block label shared by the lines inside one server or host block."""
+    for part in re.split(r"\s+¦\s+", str(item.get("context") or "")):
+        part = part.strip()
+        named = re.match(r"^(?:.*\s)?([A-Za-z0-9_.:-]+)\s*\{\s*$", part)
+        if named:
+            return named.group(1).casefold()
+        if re.fullmatch(r"[A-Za-z0-9_.:-]+\s*:", part):
+            return part[:-1].strip().casefold()
+    claim = str(item.get("claim") or "")
+    named = re.match(r"^([^:]{1,40}):\s+", claim)
+    return named.group(1).strip().casefold() if named else ""
 
 
 def _chat_stem(word: str) -> str:
@@ -875,34 +954,211 @@ _MODEL_ABSTENTION_RE = re.compile(
 )
 
 
+def _token_covered(token: str, blob: str) -> bool:
+    if token.casefold() in blob.casefold():
+        return True
+    return _normalize_temporal(token) in _normalize_temporal(blob)
+
+
+def _normalize_temporal(text: str) -> str:
+    months = {
+        "jan": "january", "january": "january", "feb": "february", "february": "february",
+        "mar": "march", "march": "march", "apr": "april", "april": "april",
+        "may": "may", "jun": "june", "june": "june", "jul": "july", "july": "july",
+        "aug": "august", "august": "august", "sep": "september", "sept": "september",
+        "september": "september", "oct": "october", "october": "october",
+        "nov": "november", "november": "november", "dec": "december", "december": "december",
+    }
+    folded = str(text or "").casefold()
+    folded = re.sub(r"(\d+)(?:st|nd|rd|th)\b", r"\1", folded)
+    folded = re.sub(r"\bof\b", " ", folded)
+    for source, target in months.items():
+        folded = re.sub(rf"\b{source}\b", target, folded)
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def _sensitive_tokens(text: str) -> list[str]:
+    """Numbers, addresses, dates, weekdays, paths, and proper nouns a citation must cover."""
+    found: list[str] = []
+    for pattern in (
+        r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+        r"\b\d{1,2}:\d{2}\b",
+        r"[A-Za-z]:\\[^\s]+",
+        r"\b\d{1,2}(?:st|nd|rd|th)?(?:\s+of)?\s+[A-Za-z]{3,9}(?:\s+\d{4})?\b",
+        r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
+    ):
+        found.extend(match.group(0).rstrip(".,") for match in re.finditer(pattern, text, flags=re.IGNORECASE))
+    masked = text
+    for token in found:
+        masked = masked.replace(token, " ")
+    found.extend(match.group(0) for match in re.finditer(r"\b\d+(?:\.\d+)?\b", masked))
+    words = re.findall(r"[A-Za-z][A-Za-z'.-]*", CITATION_RE.sub(" ", text))
+    for index, word in enumerate(words):
+        if index == 0 or len(word) < 3 or not word[0].isupper():
+            continue
+        if word.casefold() in {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "dr", "mr", "mrs", "ms", "st"}:
+            continue
+        found.append(word)
+    return found
+
+
+def _move_citations_to_end(sentence: str) -> str:
+    tags: list[str] = []
+
+    def _grab(match: re.Match[str]) -> str:
+        tag = f"[{match.group(1)}{int(match.group(2))}]"
+        if tag not in tags:
+            tags.append(tag)
+        return " "
+
+    body = CITATION_RE.sub(_grab, sentence)
+    body = re.sub(r"\s+", " ", body).strip()
+    if not tags:
+        return body
+    suffix = " ".join(tags)
+    if body.endswith((".", "!", "?")):
+        return f"{body[:-1]} {suffix}{body[-1]}"
+    return f"{body} {suffix}"
+
+
+def _uncited_sentence_allowed(sentence: str, verified: list[dict[str, object]]) -> bool:
+    """Drop an uncited sentence that states a checkable or factual claim."""
+    if _sensitive_tokens(sentence):
+        return False
+    words = re.findall(r"[A-Za-z']+", sentence)
+    return len(words) < 6
+
+
+def _cited_items(sentence: str, verified: list[dict[str, object]]) -> tuple[list[dict[str, object]], list[str]]:
+    ids = [f"{match.group(1)}{int(match.group(2))}" for match in CITATION_RE.finditer(sentence)]
+    by_id = {str(item.get("id")): item for item in verified}
+    return [by_id[item_id] for item_id in ids if item_id in by_id], ids
+
+
+def _sentence_is_grounded(sentence: str, verified: list[dict[str, object]]) -> bool:
+    tokens = _sensitive_tokens(sentence)
+    if not tokens:
+        return True
+    items, ids = _cited_items(sentence, verified)
+    if ids and not items:
+        return True
+    if not items:
+        return False
+    blob = " ".join(_support_blob(item) for item in items)
+    return all(_token_covered(token, blob) for token in tokens)
+
+
+def _cite(sentence: str, ids: list[str]) -> str:
+    body = CITATION_RE.sub(" ", sentence)
+    body = re.sub(r"\s+", " ", body).strip()
+    if not ids:
+        return body
+    suffix = " ".join(f"[{item_id}]" for item_id in ids)
+    if body.endswith((".", "!", "?")):
+        return f"{body[:-1]} {suffix}{body[-1]}"
+    return f"{body} {suffix}"
+
+
+def _covering_ids(sentence: str, verified: list[dict[str, object]]) -> list[str] | None:
+    """Atom ids that entail this sentence, or None when a checkable token is unsupported."""
+    tokens = _sensitive_tokens(sentence)
+    if tokens:
+        for item in verified:
+            blob = _support_blob(item)
+            if all(_token_covered(token, blob) for token in tokens):
+                return [str(item["id"])]
+        covered: list[str] = []
+        for token in tokens:
+            hits = [item for item in verified if _token_covered(token, _support_blob(item))]
+            if not hits:
+                return None
+            item_id = str(hits[0]["id"])
+            if item_id not in covered:
+                covered.append(item_id)
+        return covered
+    best_item = None
+    best_score = 0.0
+    for item in verified:
+        score = _query_claim_overlap(sentence, _support_blob(item))
+        if score > best_score:
+            best_score = score
+            best_item = item
+    words = re.findall(r"[A-Za-z']+", sentence)
+    if best_item is not None and best_score >= 0.34:
+        return [str(best_item["id"])]
+    if len(words) < 6:
+        return []
+    return None
+
+
+def _extractive_answer(query: str, verified: list[dict[str, object]]) -> str:
+    chosen = best_supporting_claims(query, verified)
+    if not chosen:
+        ranked = sorted(
+            verified,
+            key=lambda item: _query_claim_overlap(query, _support_blob(item)),
+            reverse=True,
+        )
+        chosen = [item for item in ranked if _query_claim_overlap(query, _support_blob(item)) > 0][:3]
+        chosen = chosen or ranked[:1]
+    parts = []
+    for item in chosen[:4]:
+        claim = str(item.get("claim") or "").strip()
+        if claim:
+            parts.append(f"{claim} [{item['id']}]")
+    return " ".join(parts)
+
+
+def _rich_fact(token: str) -> bool:
+    """An address, clock time, date, or mixed quantity, not a bare name fragment."""
+    if "." in token or ":" in token or re.search(r"\d{4}", token):
+        return True
+    return bool(re.search(r"[A-Za-z]", token) and re.search(r"\d", token))
+
+
+def _addresses_question(answer: str, query: str, verified: list[dict[str, object]]) -> bool:
+    words = re.findall(r"[A-Za-z0-9']+", CITATION_RE.sub(" ", answer or ""))
+    if len(words) >= 6:
+        return True
+    chosen = best_supporting_claims(query, verified) or verified[:1]
+    missing = [
+        token
+        for item in chosen[:2]
+        for token in _sensitive_tokens(_support_blob(item))
+        if _rich_fact(token) and not _token_covered(token, answer or "")
+    ]
+    if missing and len(words) < 6:
+        return False
+    return len(words) >= 4 or bool(_sensitive_tokens(answer or ""))
+
+
 def answer_with_citations(text: str, query: str, verified: list[dict[str, object]]) -> str:
-    """Replace a false abstention and attach [V#] tags the model left off."""
+    """Keep sentences whose facts are in the retrieved atoms, and cite those atoms."""
     if not verified:
         return text
     supporting = best_supporting_claims(query, verified)
     if supporting and (not (text or "").strip() or _MODEL_ABSTENTION_RE.search(text or "")):
-        top = supporting[0]
-        return f"{top['claim']} [{top['id']}]"
-    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if part.strip()]
+        return _extractive_answer(query, verified)
+    parts = split_sentences(text or "")
     if not parts:
-        return text
+        return _extractive_answer(query, verified) or text
     rewritten: list[str] = []
     for part in parts:
-        if CITATION_RE.search(part):
-            rewritten.append(part)
+        sentence = CITATION_RE.sub(" ", part)
+        sentence = re.sub(r"\s+", " ", sentence).strip()
+        if not sentence:
             continue
-        best_item = None
-        best_score = 0.0
-        for item in verified:
-            score = _query_claim_overlap(part, _support_blob(item))
-            if score > best_score:
-                best_score = score
-                best_item = item
-        if best_item is not None and best_score >= 0.34 and f"[{best_item['id']}]" not in part:
-            rewritten.append(f"{part.rstrip()} [{best_item['id']}]")
-        else:
-            rewritten.append(part)
-    return _drop_off_question_clauses(_collapse_adjacent_citations(" ".join(rewritten)), query, verified)
+        ids = _covering_ids(sentence, verified)
+        if ids is None:
+            continue
+        rewritten.append(_cite(sentence, ids))
+    joined = _drop_off_question_clauses(_collapse_adjacent_citations(" ".join(rewritten)), query, verified)
+    if joined and _addresses_question(joined, query, verified):
+        return joined
+    extracted = _extractive_answer(query, verified)
+    if extracted:
+        return extracted
+    return "No grounded sentence remained in the cited sources."
 
 
 def _drop_off_question_clauses(text: str, query: str, verified: list[dict[str, object]]) -> str:
@@ -961,7 +1217,7 @@ def check_citations(
         cleaned_line = _BULLET_PREFIX_RE.sub("", stripped).strip()
         if not cleaned_line:
             continue
-        for sentence in SENTENCE_RE.split(cleaned_line):
+        for sentence in split_sentences(cleaned_line):
             seg = sentence.strip()
             if not seg:
                 continue
@@ -2110,12 +2366,13 @@ def chat_events(
         elapsed = round((time.perf_counter() - started) * 1000, 1)
         yield _done_event(elapsed)
         return
-    full_text = answer_with_citations("".join(pieces), query, model_verified)
-    if full_text != "".join(pieces):
-        extra = full_text[len("".join(pieces)) :] if full_text.startswith("".join(pieces)) else "\n" + full_text
+    raw_text = "".join(pieces)
+    full_text = answer_with_citations(raw_text, query, model_verified)
+    if full_text != raw_text:
+        extra = full_text[len(raw_text) :] if full_text.startswith(raw_text) else "\n" + full_text
         if extra.strip():
             yield {"type": "token", "text": extra, "token": extra}
-    grounding = check_citations(full_text, model_verified, model_notes, model_preferences)
+    grounding = check_citations(raw_text, model_verified, model_notes, model_preferences)
     grounding["first_token_ms"] = first_token_ms
     grounding["host_id"] = active_host_id
     grounding["retrieval_mode"] = retrieval_mode

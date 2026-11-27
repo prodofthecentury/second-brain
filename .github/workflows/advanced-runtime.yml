@@ -116,3 +116,24 @@ jobs:
         run: |
           uv run --locked --python 3.11 python -m unittest \
             scripts.real_runtime_tests.RealRuntimeTests.test_hermes_distills_the_same_fixtures
+
+      - name: Distill messy notes with llama3.2:3b
+        env:
+          BRAIN_REQUIRE_OLLAMA: "1"
+          BRAIN_REQUIRE_DISTILL: "1"
+          BRAIN_GEN_MODEL: "llama3.2:3b"
+          BRAIN_OLLAMA_TIMEOUT: "120"
+        run: |
+          uv run --locked --python 3.11 python -m unittest \
+            scripts.real_runtime_tests.RealRuntimeTests.test_llama32_distills_messy_notes
+
+      - name: Distill messy notes with hermes3:3b
+        env:
+          BRAIN_REQUIRE_OLLAMA: "1"
+          BRAIN_REQUIRE_HERMES: "1"
+          BRAIN_GEN_MODEL: "hermes3:3b"
+          BRAIN_HERMES_DISTILL_MODEL: "hermes3:3b"
+          BRAIN_OLLAMA_TIMEOUT: "120"
+        run: |
+          uv run --locked --python 3.11 python -m unittest \
+            scripts.real_runtime_tests.RealRuntimeTests.test_hermes_distills_messy_notes

@@ -47,7 +47,7 @@ Tools exposed (35 total):
   record_experience(goal, result_summary, ...)     — Record risk-scanned episodic experience in 4-experiences/
   record_feedback(atom_id, helpful, project?)      — Record disposable sidecar telemetry feedback
 
-Resources: no listable resource catalog; direct approved atom resources only.
+Resources: the only listed resource is brain://policy/capture. Approved atom reads stay direct and are not catalogued.
 Tool/resource use is audited by canonical name and timestamp; input text is not logged.
 
 Run only from an explicitly trusted local process:
@@ -130,6 +130,7 @@ from scripts.recall import (
     project_tags_match,
     search_memory,
 )
+from scripts.capture_policy import POLICY_URI, agent_brief, policy_markdown, rejection_reasons, tool_hint
 from scripts.review_atom import approved_revision_is_current
 
 
@@ -748,7 +749,10 @@ ALL_TOOLS = (
     ),
     types.Tool(
         name="add_to_inbox",
-        description="Add a new note or idea to the Second Brain quarantined inbox (0-raw/inbox/) for owner review.",
+        description=(
+            "Add a new note or idea to the Second Brain quarantined inbox (0-raw/inbox/) for owner review."
+            + tool_hint()
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -803,6 +807,7 @@ ALL_TOOLS = (
         description=(
             "Save a durable fact, decision, or preference the user wants remembered (e.g. 'this repo uses pnpm'). "
             "Becomes searchable immediately as an agent-captured note; suspicious content is quarantined for owner review."
+            + tool_hint()
         ),
         inputSchema={
             "type": "object",
@@ -1020,6 +1025,7 @@ ALL_TOOLS = (
         description=(
             "Distill recent Git commits with DLP secret scrubbing into episodic 4-experiences/ and quarantined 0-raw/inbox/. "
             "Never creates or approves canonical 2-atoms/."
+            + tool_hint()
         ),
         inputSchema={
             "type": "object",
@@ -1033,7 +1039,10 @@ ALL_TOOLS = (
     ),
     types.Tool(
         name="record_experience",
-        description="Save a risk-scanned immutable Experience Record in 4-experiences/ (optionally staging a candidate skill to 0-raw/inbox/).",
+        description=(
+            "Save a risk-scanned immutable Experience Record in 4-experiences/ (optionally staging a candidate skill to 0-raw/inbox/)."
+            + tool_hint()
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -1307,6 +1316,12 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
 
         if not content.strip() or len(content) > MAX_INBOX_CHARS:
             raise ValueError(f"Inbox content must contain 1 to {MAX_INBOX_CHARS} characters.")
+        policy_reasons = rejection_reasons(content)
+        if policy_reasons:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=_policy_rejection_text(policy_reasons))],
+                isError=True,
+            )
 
         source  = arguments.get("source", "MCP agent")
         source = str(source).replace("--", "—").replace("\r", " ").replace("\n", " ")[:500]
@@ -1383,6 +1398,11 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
                 text = f"<owner_note file=\"{note.filename}\" origin=\"{note.origin}\" untrusted=\"true\">\n# {note.title}\n\n{note.body}\n</owner_note>"
             else:
                 tags = arguments.get("tags") or []
+                remembered = str(arguments.get("content") or "")
+                policy_reasons = rejection_reasons(remembered)
+                if policy_reasons:
+                    text = _policy_rejection_text(policy_reasons)
+                    return types.CallToolResult(content=[types.TextContent(type="text", text=text)], isError=True)
                 res = create_note(
                     str(arguments.get("title") or "")[:200],
                     str(arguments.get("content") or ""),
@@ -2938,12 +2958,24 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
 
 # ─── MCP Resources ────────────────────────────────────────────────────────────
 
+def _policy_rejection_text(reasons: list[str]) -> str:
+    lines = "\n".join(f"- {reason}" for reason in reasons)
+    return f"Rejected by the capture policy:\n{lines}\nFix the text and resubmit. Read {POLICY_URI}."
+
+
 async def handle_list_resources(_ctx, _params) -> types.ListResourcesResult:
     assert_mcp_loopback_transport()
     if not is_authorized(_params, _ctx):
         raise PermissionError("403 Forbidden: Invalid or missing MCP bearer token.")
-    # No listable resource catalog: it would enumerate private vault material.
-    return types.ListResourcesResult(resources=[])
+    # The catalog is only the capture policy. It does not enumerate private vault atoms.
+    return types.ListResourcesResult(resources=[
+        types.Resource(
+            uri=POLICY_URI,
+            name="Capture policy",
+            description="What belongs in a note or memory atom, and what does not.",
+            mimeType="text/markdown",
+        )
+    ])
 
 
 async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) -> types.ReadResourceResult:
@@ -2960,6 +2992,10 @@ async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) ->
         return types.ReadResourceResult(contents=[])
     audit_mcp_use("resource:read", outcome="authorized", audit_path=eff_audit_path)
     uri = str(params.uri)
+    if uri == POLICY_URI:
+        return types.ReadResourceResult(
+            contents=[types.TextResourceContents(uri=uri, mimeType="text/markdown", text=policy_markdown())]
+        )
     if uri.startswith("brain://atoms/"):
         filename = uri.removeprefix("brain://atoms/")
         loaded = _load_verified_non_preference_atom(filename, vdirs=vdirs)
@@ -2976,6 +3012,7 @@ app = (
     Server(
         "second-brain",
         version="1.0.0",
+        instructions=agent_brief(),
         on_list_tools=handle_list_tools,
         on_call_tool=handle_call_tool,
         on_list_resources=handle_list_resources,
