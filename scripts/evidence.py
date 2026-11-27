@@ -284,6 +284,69 @@ def verify_evidence_anchor_known_source(
     return str(anchor.get("evidence_start")) == str(byte_start) and str(anchor.get("evidence_end")) == str(byte_end)
 
 
+_ENTAIL_STOP = frozenset({
+    "that", "this", "with", "from", "have", "been", "were", "they", "them", "your", "into", "about",
+    "when", "where", "what", "which", "their", "there", "would", "could", "should", "after", "before",
+    "also", "only", "just", "than", "then", "such", "some", "more", "most", "very", "each", "both",
+})
+
+
+def _entail_stem(word: str) -> str:
+    for suffix in ("ments", "ment", "ings", "ing", "ied", "ies", "es", "s"):
+        if len(word) > len(suffix) + 3 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
+def number_tokens(text: str) -> set[str]:
+    """Digit tokens, so 02:00 and 70B cannot be treated as the same fact.
+
+    A leading list marker such as ``1.`` is not a fact number.
+    """
+    cleaned = re.sub(r"(?<!\d)(?<!\.)\b\d{1,2}[.)]\s+", "", str(text or ""))
+    return set(re.findall(r"\d+(?:\.\d+)?", cleaned.casefold()))
+
+
+def config_tokens(text: str) -> set[str]:
+    return {
+        match.group(0).casefold()
+        for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", str(text or ""))
+    }
+
+
+def entail_stems(text: str) -> set[str]:
+    return {
+        _entail_stem(word)
+        for word in re.findall(r"[a-z0-9]+", str(text or "").casefold())
+        if len(word) >= 4 and word not in _ENTAIL_STOP
+    }
+
+
+def claim_entailed_by_evidence(claim: str, evidence: str) -> bool:
+    """True when the claim's numbers, settings, and most content words are in its own evidence.
+
+    A real quote is not enough: the claim has to be about that quote.
+    """
+    claim_text = str(claim or "").strip()
+    evidence_text = str(evidence or "").strip()
+    if not claim_text or not evidence_text:
+        return False
+    evidence_numbers = number_tokens(evidence_text)
+    if not number_tokens(claim_text) <= evidence_numbers:
+        return False
+    evidence_fold = evidence_text.casefold()
+    if any(token not in evidence_fold for token in config_tokens(claim_text)):
+        return False
+    claim_stems = entail_stems(claim_text)
+    if not claim_stems:
+        return bool(number_tokens(claim_text) or config_tokens(claim_text))
+    evidence_stems = entail_stems(evidence_text)
+    evidence_blob = " ".join(_entail_stem(word) for word in re.findall(r"[a-z0-9]+", evidence_fold))
+    hits = sum(1 for stem in claim_stems if stem in evidence_stems or stem in evidence_blob)
+    needed = max(1, int(round(len(claim_stems) * 0.7)))
+    return hits >= needed
+
+
 def verify_evidence_anchor(content: str, anchor: dict, brain_dir: str) -> bool:
     try:
         current = find_evidence_anchor(content, brain_dir)

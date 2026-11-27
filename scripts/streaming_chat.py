@@ -817,6 +817,7 @@ def build_synthesis_prompt(
         "[V#] are owner-verified claims; [N#] are the owner's unverified notes."
         f"{pref_instruction}{hist_instruction}\n"
         "Use only words that appear in the claim or its evidence. Do not add reasons or details that are not written there.\n"
+        "Answer only the question. Do not add a sentence about a different fact, even if that fact is in the sources.\n"
         "If the sources do not answer the question, say so briefly. Do not use outside knowledge.\n\n"
         f"<verified_claims>\n{v_block}\n</verified_claims>\n\n<notes>\n{n_block}\n</notes>{pref_block}{hist_block}{ws_block}\n\n"
         f"Question: {query}\nAnswer:"
@@ -901,7 +902,31 @@ def answer_with_citations(text: str, query: str, verified: list[dict[str, object
             rewritten.append(f"{part.rstrip()} [{best_item['id']}]")
         else:
             rewritten.append(part)
-    return _collapse_adjacent_citations(" ".join(rewritten))
+    return _drop_off_question_clauses(_collapse_adjacent_citations(" ".join(rewritten)), query, verified)
+
+
+def _drop_off_question_clauses(text: str, query: str, verified: list[dict[str, object]]) -> str:
+    """Drop a sentence that matches a different atom than the question."""
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", (text or "").strip()) if part.strip()]
+    if len(parts) < 2:
+        return text
+    on_question = best_supporting_claims(query, verified)
+    if not on_question:
+        return text
+    on_ids = {str(item.get("id")) for item in on_question}
+    others = [item for item in verified if str(item.get("id")) not in on_ids]
+    if not others:
+        return text
+    kept: list[str] = []
+    for part in parts:
+        on_score = max(_query_claim_overlap(part, _support_blob(item)) for item in on_question)
+        off_score = max(_query_claim_overlap(part, _support_blob(item)) for item in others)
+        if off_score >= 0.34 and on_score < 0.2:
+            continue
+        kept.append(part)
+    if not kept:
+        return text
+    return _collapse_adjacent_citations(" ".join(kept))
 
 
 def _collapse_adjacent_citations(text: str) -> str:

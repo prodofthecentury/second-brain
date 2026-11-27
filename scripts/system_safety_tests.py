@@ -1734,6 +1734,27 @@ The source makes a claim.
             decision_log = vault / "0-raw" / "archive" / "decision-record.jsonl"
             expected = hashlib.sha256(atom_path.read_bytes()).hexdigest()
 
+            with self.assertRaises(ReviewTransitionError) as mismatched:
+                apply_review_transition(
+                    atom_path=str(atom_path),
+                    action="approve",
+                    expected_sha256=expected,
+                    actor="owner-test",
+                    decision_log_path=str(decision_log),
+                    history_dir=str(atoms / ".history"),
+                    brain_dir=str(vault),
+                    atoms_dir=str(atoms),
+                    reviewed_on="2026-10-24",
+                )
+            self.assertIn("supported by its own evidence", str(mismatched.exception))
+
+            atom = atom.replace(
+                "## Claim\nThe source makes a claim.\n",
+                "## Claim\nThe exact source sentence is here.\n",
+            )
+            atom_path.write_text(atom, encoding="utf-8")
+            expected = hashlib.sha256(atom_path.read_bytes()).hexdigest()
+
             decision = apply_review_transition(
                 atom_path=str(atom_path),
                 action="approve",
@@ -1798,7 +1819,7 @@ The source makes a claim.
             edit_hash = hashlib.sha256(atom_path.read_bytes()).hexdigest()
             apply_atom_edit(
                 atom_path=str(atom_path),
-                edited_content=approved_text.replace("source makes", "source once made"),
+                edited_content=approved_text.replace("exact source", "exact revised source"),
                 expected_sha256=edit_hash,
                 actor="owner-test",
                 decision_log_path=str(decision_log),
