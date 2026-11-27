@@ -509,6 +509,9 @@ def _coverage_hijacks() -> list[tuple[str, str, str, list[str]]]:
         ("hijack-slash-ask", "slash-idiom", "What is 24/7?", ["slash-idiom"]),
         ("hijack-slash-compute", "slash-idiom", "Compute 12/25.", ["slash-idiom"]),
         ("hijack-slash-evaluate", "slash-idiom", "Evaluate 9/11.", ["slash-idiom"]),
+        ("hijack-spaced-year", "spaced-hyphen", "2026 -11", ["spaced-hyphen", "no-prefix"]),
+        ("hijack-spaced-year-dot", "spaced-hyphen", "2020 -4.", ["spaced-hyphen", "no-prefix"]),
+        ("hijack-spaced-year-paren", "spaced-hyphen", "(2026 -11)", ["spaced-hyphen", "no-prefix"]),
     ]
     return rows
 
@@ -675,11 +678,12 @@ def build_tools_items() -> list[dict]:
         # The whole-parse engine declines this sentence. 101 remains the gold if a tool does fire.
         ("tools-0007", "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?", "101", "integer", None, "migrated", "docs/reasoning-benchmarks.json#gsm-pens", "ANSWER = 12 * 8 + 5"),
         ("tools-0012", "What is 1/3 + 1/6?", "1/2", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(1, 3) + Fraction(1, 6)"),
-        ("tools-0013", "What is 2/3?", "2/3", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(2, 3)"),
-        ("tools-0014", "What is 5/6?", "5/6", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(5, 6)"),
-        ("tools-0015", "What is 1/7?", "1/7", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(1, 7)"),
-        ("tools-0016", "What is 1/2?", "1/2", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(1, 2)"),
-        ("tools-0017", "What is 3/4?", "3/4", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(3, 4)"),
+        # A reduced a/b with no other operator only echoes the input, so the tool must decline.
+        ("tools-0013", "What is 2/3?", None, "unanswerable", None, "original", None, "ANSWER = None"),
+        ("tools-0014", "What is 5/6?", None, "unanswerable", None, "original", None, "ANSWER = None"),
+        ("tools-0015", "What is 1/7?", None, "unanswerable", None, "original", None, "ANSWER = None"),
+        ("tools-0016", "What is 1/2?", None, "unanswerable", None, "original", None, "ANSWER = None"),
+        ("tools-0017", "What is 3/4?", None, "unanswerable", None, "original", None, "ANSWER = None"),
         ("tools-0018", "What is 1/4 + 1/4?", "1/2", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(1, 2)"),
         ("tools-0019", "Convert 2 kg to g.", "2000", "integer", "any", "original", None, "ANSWER = 2000"),
         ("tools-0020", "Convert 30 min to s.", "1800", "integer", "any", "original", None, "ANSWER = 1800"),
@@ -723,6 +727,11 @@ def build_tools_items() -> list[dict]:
         rows.append(_tool_row(*spec))
     for spec in _coverage_tools():
         rows.append(_tool_row(*spec))
+    for spec in _case_unit_traps():
+        rows.append(_tool_row(*spec))
+    for row in rows:
+        if row["id"] in {f"tools-00{index}" for index in range(13, 18)}:
+            row["tags"] = ["must-not-fire", "reduced-fraction"]
     return rows
 
 
@@ -788,11 +797,63 @@ def _coverage_tools() -> list[tuple]:
         ("tools-cov-prefix-dab", "What is 2 daB in B?", None, "unanswerable", None, "ANSWER = None", ["decline-ok", "nonsense-prefix"]),
         ("tools-cov-prefix-nb", "Convert 2 nb to b.", None, "unanswerable", None, "ANSWER = None", ["decline-ok", "nonsense-prefix"]),
         ("tools-cov-prod", "What is 12 * 8 + 5 - 96?", "5", "integer", "any", "ANSWER = 12 * 8 + 5 - 96", ["should-fire", "precedence"]),
+        ("tools-cov-reduce-100", "What is 100/4?", "25", "integer", "any", "ANSWER = 100 // 4", ["should-fire", "reduces"]),
+        ("tools-cov-reduce-50", "What is 50/50?", "1", "integer", "any", "ANSWER = 50 // 50", ["should-fire", "reduces"]),
+        ("tools-cov-dec-bare", "11 / 2 as a decimal", "5.5", "decimal", "any", "ANSWER = '5.5'", ["should-fire", "as-decimal"]),
     ]
     out = []
     for item_id, question, answer, answer_type, expected, reference, tags in specs:
         out.append((item_id, question, answer, answer_type, expected, "original", None, reference, tags))
     return out
+
+
+def _case_unit_traps() -> list[tuple]:
+    """Thirteen case collisions. A fire must be the case-sensitive reading; a decline is allowed.
+
+    M is mega and m is milli, so folding MM into mm is not that reading.
+    """
+    rows: list[tuple] = []
+
+    def add(item_id: str, question: str, answer, answer_type: str, reference: str, kind: str) -> None:
+        rows.append((
+            item_id, question, answer, answer_type, None, "original", None, reference,
+            ["correct-or-decline", "case-trap", kind],
+        ))
+
+    for item_id, question in (
+        ("tools-case-mm-1", "Convert 1 MM to m."),
+        ("tools-case-mm-2", "What is 1 MM in m?"),
+        ("tools-case-mm-3", "How much is 1 MM into m?"),
+    ):
+        add(item_id, question, "1000000", "integer", "ANSWER = 10**6", "mega-length")
+    for item_id, question in (
+        ("tools-case-mg-1", "Convert 1 MG to kg."),
+        ("tools-case-mg-2", "What is 1 MG in kg?"),
+        ("tools-case-mg-3", "How much is 1 MG into kg?"),
+    ):
+        add(item_id, question, "1000", "integer", "ANSWER = 1000", "mega-mass")
+    for item_id, question in (
+        ("tools-case-pm-1", "Convert 1 PM to m."),
+        ("tools-case-pm-2", "What is 1 PM in m?"),
+        ("tools-case-pm-3", "How much is 1 PM into m?"),
+    ):
+        add(item_id, question, "1000000000000000", "integer", "ANSWER = 10**15", "peta-length")
+    for item_id, question in (
+        ("tools-case-ms-1", "Convert 1 MS to s."),
+        ("tools-case-ms-2", "What is 1 MS in s?"),
+        ("tools-case-ms-3", "How much is 1 MS into s?"),
+    ):
+        add(item_id, question, "1000000", "integer", "ANSWER = 10**6", "mega-time")
+    add("tools-case-bare-m", "Convert 1 M to m.", None, "unanswerable", "ANSWER = None", "bare-symbol")
+    add("tools-case-bare-g", "What is 1 G in g?", None, "unanswerable", "ANSWER = None", "bare-symbol")
+    add("tools-case-bare-s", "How much is 1 S into s?", None, "unanswerable", "ANSWER = None", "bare-symbol")
+    add("tools-case-km-mm", "Convert 1 KM to MM.", "0.001", "decimal", "ANSWER = '0.001'", "crossed-case")
+    add("tools-case-km-m", "What is 1 km in M?", None, "unanswerable", "ANSWER = None", "crossed-case")
+    add("tools-case-ms-ms", "How much is 1 Ms into MS?", "1", "integer", "ANSWER = 1", "crossed-case")
+    add("tools-case-pg", "Convert 1 PG to g.", "1000000000000000", "integer", "ANSWER = 10**15", "peta-other")
+    add("tools-case-ps", "What is 1 PS in s?", "1000000000000000", "integer", "ANSWER = 10**15", "peta-other")
+    add("tools-case-gm", "How much is 1 GM into m?", "1000000000", "integer", "ANSWER = 10**9", "peta-other")
+    return rows
 
 
 def _precision_traps() -> list[tuple]:
