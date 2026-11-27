@@ -509,11 +509,12 @@ def _coverage_hijacks() -> list[tuple[str, str, str, list[str]]]:
         ("hijack-slash-ask", "slash-idiom", "What is 24/7?", ["slash-idiom"]),
         ("hijack-slash-compute", "slash-idiom", "Compute 12/25.", ["slash-idiom"]),
         ("hijack-slash-evaluate", "slash-idiom", "Evaluate 9/11.", ["slash-idiom"]),
-        ("hijack-spaced-ask", "spaced-hyphen", "What is 2026 -11?", ["spaced-hyphen"]),
-        ("hijack-spaced-form", "spaced-hyphen", "The form says 10 -4 at the top.", ["spaced-hyphen"]),
-        ("hijack-spaced-call", "spaced-hyphen", "Call (2026 -11) ext.", ["spaced-hyphen"]),
-        ("hijack-spaced-ten", "spaced-hyphen", "10 -4", ["spaced-hyphen"]),
-        ("hijack-spaced-nine", "spaced-hyphen", "9 -5", ["spaced-hyphen"]),
+        ("hijack-spaced-form", "spaced-hyphen", "The form says 10 -4 at the top.", ["spaced-hyphen", "must-not-fire"]),
+        ("hijack-spaced-call", "spaced-hyphen", "Call (2026 -11) ext.", ["spaced-hyphen", "must-not-fire"]),
+        ("hijack-spaced-bare", "spaced-hyphen", "2026 -11", ["spaced-hyphen", "must-not-fire"]),
+        ("hijack-spaced-paren", "spaced-hyphen", "(2026 -11)", ["spaced-hyphen", "must-not-fire"]),
+        ("hijack-spaced-ten", "spaced-hyphen", "10 -4", ["spaced-hyphen", "must-not-fire"]),
+        ("hijack-spaced-nine", "spaced-hyphen", "9 -5", ["spaced-hyphen", "must-not-fire"]),
     ]
     return rows
 
@@ -799,6 +800,8 @@ def _coverage_tools() -> list[tuple]:
         ("tools-cov-reduce-100", "What is 100/4?", "25", "integer", "any", "ANSWER = 100 // 4", ["should-fire", "reduces"]),
         ("tools-cov-reduce-50", "What is 50/50?", "1", "integer", "any", "ANSWER = 50 // 50", ["should-fire", "reduces"]),
         ("tools-cov-dec-bare", "11 / 2 as a decimal", "5.5", "decimal", "any", "ANSWER = '5.5'", ["should-fire", "as-decimal"]),
+        # A compute prefix asks for arithmetic. 2026 - 11 is 2015. Bare '2026 -11' stays must-not-fire.
+        ("tools-spaced-ask", "What is 2026 -11?", "2015", "integer", "any", "ANSWER = 2026 - 11", ["should-fire", "spaced-hyphen"]),
     ]
     out = []
     for item_id, question, answer, answer_type, expected, reference, tags in specs:
@@ -1797,6 +1800,7 @@ def collect_hard_failures(root: Path, *, include_mock: bool = True, recall_answe
         records.append({"id": "commitment", "sympy_mode": "natural", "status": "error", "correct": False, "verified": False, "answer_source": None, "plan_step_verified": False, "plan_not_executed": []})
     tuples = failure_tuples(hijack_reports=reports, records=records)
     tuples = _with_coverage_tuples(root, tuples, records, recall_answered=recall_answered)
+    tuples = [row for row in tuples if is_hard_tuple(row)]
     if not manifest_ok:
         tuples = sorted(set(tuples) | {("manifest_ok", "manifest", "natural")})
     if not commitment_ok:
@@ -1811,6 +1815,17 @@ def collect_hard_failures(root: Path, *, include_mock: bool = True, recall_answe
         "b3_fired": b3,
         "hijack_fire_counts": {mode: len(report["fires"]) for mode, report in zip(("natural", "off"), reports)},
         "records": len(records),
+        "recall_records": [
+            {
+                "id": str(row.get("id")),
+                "sympy_mode": str(row.get("sympy_mode") or "natural"),
+                "runner": row.get("runner"),
+                "answer_source": row.get("answer_source"),
+                "correct": bool(row.get("correct")),
+            }
+            for row in records
+            if row.get("runner") == "tools_only"
+        ],
         "tool_fire_rate": (fire_seen / fire_total) if fire_total else 0.0,
         "should_fire_recall": _should_fire_recall(root, records),
         "should_fire_answered": _should_fire_answered(records),
@@ -1834,6 +1849,16 @@ FATAL_INTEGRITY = frozenset({
     "tool_crash",
     "engine_exception",
 })
+# Absolute HARD is only these gates, in both SymPy modes. A should-fire decline is the recall gate.
+HARD_GATES = frozenset({
+    "tool_wrong",
+    "claimed_verified_wrong",
+    "hijack_fires",
+    "tool_precision",
+    "tool_crash",
+    "engine_exception",
+}) | FATAL_INTEGRITY
+RECALL_FLOOR = (122, 150)
 GATE_BASELINE = "bench/reasoning/baseline/fingerprint.json"
 OWNER_APPROVALS = "bench/reasoning/owner-approvals.json"
 
@@ -1859,6 +1884,10 @@ def item_content_hashes(root: Path) -> dict[str, str]:
         for row in rows:
             hashes[str(row["id"])] = hash_item(row)
     return hashes
+
+
+def is_hard_tuple(row: tuple[str, str, str] | list[str]) -> bool:
+    return str(row[0]) in HARD_GATES or str(row[1]) in FATAL_INTEGRITY
 
 
 def is_integrity_tuple(row: tuple[str, str, str] | list[str]) -> bool:
@@ -1938,21 +1967,6 @@ def _with_coverage_tuples(
         if left[0] != right[0] or (left[0] and right[0] and left[1] != right[1]):
             found.add(("sympy_parity", item_id, "natural"))
             found.add(("sympy_parity", item_id, "off"))
-    wanted = _should_fire_ids(root)
-    current_ok = {tuple(pair) for pair in _should_fire_answered(records) if pair[0] in wanted}
-    ran = {
-        (str(row["id"]), str(row.get("sympy_mode") or "natural"))
-        for row in records
-        if row.get("runner") == "tools_only" and str(row.get("id")) in wanted
-    }
-    # A should-fire item that was run and did not answer is HARD even when no baseline lists it.
-    for item_id, mode in sorted(ran):
-        if (item_id, mode) not in current_ok:
-            found.add(("should_fire_declined", item_id, mode))
-    if recall_answered:
-        for item_id, mode in sorted(recall_answered):
-            if str(item_id) in wanted and (str(item_id), str(mode)) not in current_ok:
-                found.add(("should_fire_declined", str(item_id), str(mode)))
     return sorted(found)
 
 
@@ -2480,6 +2494,62 @@ def evaluate_gates(observed: list[tuple[str, str, str]], expected: list[tuple[st
     return 0
 
 
+def evaluate_recall(
+    records: list[dict],
+    wanted: set[str],
+    baseline_answered: set[tuple[str, str]] | None = None,
+    *,
+    floor: tuple[int, int] = RECALL_FLOOR,
+) -> int:
+    """Separate from HARD. Fails on a regression, a floor breach, or a mode split.
+
+    Every decline is printed by id. Nothing is folded into a count.
+    """
+    by_mode: dict[str, tuple[set[str], list[str]]] = {}
+    for mode in ("natural", "off"):
+        rows = [
+            row for row in records
+            if row.get("runner") == "tools_only"
+            and str(row.get("id")) in wanted
+            and str(row.get("sympy_mode") or "natural") == mode
+        ]
+        answered = {
+            str(row["id"])
+            for row in rows
+            if row.get("answer_source") == "tool_exact" and row.get("correct")
+        }
+        declined = sorted(item_id for item_id in wanted if item_id not in answered)
+        by_mode[mode] = (answered, declined)
+        print(f"recall {mode} {len(answered)}/{len(wanted)}")
+        for item_id in declined:
+            print(f"decline {mode} {item_id}")
+    failed = False
+    floor_value = floor[0] / floor[1]
+    for mode, (answered, _declined) in by_mode.items():
+        total = len(wanted)
+        ratio = (len(answered) / total) if total else 1.0
+        if ratio < floor_value:
+            print(
+                f"recall below floor {mode} {len(answered)}/{total} < {floor[0]}/{floor[1]}",
+                file=sys.stderr,
+            )
+            failed = True
+    natural, off = by_mode["natural"][0], by_mode["off"][0]
+    for item_id in sorted(natural ^ off):
+        print(f"recall mode disagreement {item_id}", file=sys.stderr)
+        failed = True
+    if baseline_answered:
+        for item_id, mode in sorted(baseline_answered):
+            if str(item_id) not in wanted:
+                continue
+            if str(item_id) not in by_mode[str(mode)][0]:
+                print(f"recall regression {mode} {item_id}", file=sys.stderr)
+                failed = True
+    if not failed:
+        print("recall_ok")
+    return 1 if failed else 0
+
+
 def gates_main(root: Path) -> int:
     payload = collect_hard_failures(root, include_mock=True)
     print(f"sympy_available={payload['sympy_available']} sympy_version={payload['sympy_version']}")
@@ -2492,7 +2562,9 @@ def gates_main(root: Path) -> int:
         print("missing expected-hard-failures.current.json", file=sys.stderr)
         return 1
     expected = [tuple(item) for item in json.loads(expected_path.read_text(encoding="utf-8"))["tuples"]]
-    return evaluate_gates(list(payload["tuples"]), expected)
+    hard = evaluate_gates(list(payload["tuples"]), expected)
+    recall = evaluate_recall(list(payload.get("recall_records") or []), _should_fire_ids(root))
+    return 1 if hard or recall else 0
 
 
 def compare_fingerprint(

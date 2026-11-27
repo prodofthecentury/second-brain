@@ -28,14 +28,20 @@ Exit 0 is pass or warn. Exit 1 is a HARD gate or a calibrated FAIL. Exit 2 is a 
 ## What CI checks
 
 - `validate` checks schemas, references, solvers, hidden tests, canonical hashes, and forbidden held-out paths.
-- `hard-gates` fails immediately on integrity tuples (`manifest_ok`, `commitment_ok`, `isolation`, `canary`, `harness_errors`, `tool_crash`, `engine_exception`). Other HARD tuples must match `expected-hard-failures.current.json`.
+- `hard-gates` is absolute zero, in both SymPy modes, for `tool_wrong`, `claimed_verified_wrong`, `hijack_fires`, `tool_precision`, `tool_crash`, `engine_exception`, and every integrity failure (`manifest_ok`, `commitment_ok`, `isolation`, `canary`, `harness_errors`). A should-fire decline is not in that set.
 - `hard-failure-fingerprint` runs the checker from the pinned harness. The pin is the Actions variable `PINNED_HARNESS_SHA`, or `.github/harness-pin` on the base branch. A missing pin exits 2. The job builds its environment from the pinned `uv.lock`.
 - Replacing the fingerprint step with a no-op is not visible to that checker, because `pull_request` runs the workflow file from the pull request. Code-owner review plus the required checks are what stop that replacement.
 - A Windows job checks out with `core.autocrlf=true` and re-runs `validate`.
 
 ## Gold notes
 
-A single reduced `a/b` with no other operator and no conversion asked is an echo and must decline. `What is 2/3?`, `24/7`, `12/25` and `9/11` are that shape. A reducible `a/b` is computed: `100/4` is 25 and `50/50` is 1. `11 / 2 as a decimal` is 5.5, and a should-fire item that declines is HARD even when no baseline lists it.
+A single reduced `a/b` with no other operator and no conversion asked is an echo and must decline. `What is 2/3?`, `24/7`, `12/25` and `9/11` are that shape. A reducible `a/b` is computed: `100/4` is 25 and `50/50` is 1. `11 / 2 as a decimal` is 5.5. A question with a compute prefix is arithmetic: `What is 2026 -11?` is 2015. Bare `2026 -11` and `(2026 -11)` stay must-not-fire.
+
+## Two gates
+
+HARD is absolute zero in both SymPy modes for `tool_wrong`, `claimed_verified_wrong`, `hijack_fires`, `tool_precision`, `tool_crash`, `engine_exception`, and every integrity failure. `should_fire_declined` is not a HARD tuple.
+
+Recall is a separate gate. It fails when any should-fire item the pinned baseline answered now declines, when recall in either mode is below 122/150, or when the two SymPy modes disagree on any should-fire item. Every decline is printed by id.
 
 The base units `m`, `g` and `s` are lower-case. An uppercase base-unit letter is not an SI symbol and must decline; any answer is a failure. The case-insensitive whitelist is `KM`, `KG`, `LB`, `OZ`, `FT`, `MI`, `MIN`, `CM`, `DM` and `KS`. Properly cased `Mm`, `Mg`, `Ms`, `Pm`, `Gm`, `Pg` and `Ps` are exact conversions.
 
