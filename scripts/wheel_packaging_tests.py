@@ -198,6 +198,7 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
                 "second_brain/scripts/reason_bench_models.py",
                 "second_brain/scripts/reason_bench_scoring.py",
                 "second_brain/scripts/reason_bench_shapes.py",
+                "second_brain/scripts/reason_bench_worker.py",
             ],
         )
         with zipfile.ZipFile(self._wheel_path, "r") as zf2:
