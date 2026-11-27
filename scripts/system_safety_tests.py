@@ -2574,6 +2574,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
             "speed_restore_tests",
             "fifth_pass_tests",
             "reason_engine_tests",
+            "reason_bench_tests",
             "desktop_ui_tests",
             "vscode_extension_tests",
             "dashboard_apptest_tests",
