@@ -1014,8 +1014,13 @@ class MechanismProbeTests(unittest.TestCase):
                 except OSError:
                     return
                 try:
+                    conn.settimeout(0.2)
                     while not stop.is_set():
-                        stop.wait(0.1)
+                        try:
+                            if not conn.recv(65536):
+                                break
+                        except (TimeoutError, socket.timeout):
+                            continue
                 finally:
                     conn.close()
 
@@ -1046,7 +1051,8 @@ class MechanismProbeTests(unittest.TestCase):
                     started = time.perf_counter()
                     result = reason("Why is the sky blue?", use_default_model=True)
                     elapsed = time.perf_counter() - started
-            deadline = time.perf_counter() + 2.5
+            # The call also probes hardware before the budgeted request. That probe is a few seconds on Windows.
+            deadline = time.perf_counter() + 12.0
             while time.perf_counter() < deadline and _model_workers():
                 time.sleep(0.05)
             self.assertEqual(_model_workers(), [])
