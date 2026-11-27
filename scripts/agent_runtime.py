@@ -496,15 +496,40 @@ def _run_agent_step(
     security_dir: str | None,
     timeout: float,
     workspace: str,
-) -> tuple[str, str, bool]:
+) -> tuple[str, str, bool, list[dict[str, str]]]:
     """Run one allow-listed action. The third value is true only when the step did real work."""
     action = str(step.get("action_type") or "")
     try:
         if action == "vault_recall":
-            query = str(inputs.get("query") if inputs and inputs.get("query") else step.get("query") or "")
-            _scan_text_for_secrets_and_risks(query, context_label="vault_recall.query")
-            found = _recall(query, brain_dir, security_dir)
-            payload = json.dumps({"query": query, "count": len(found), "filenames": found}, sort_keys=True) + "\n"
+            user_query = str(inputs.get("query") or "").strip() if inputs else ""
+            step_query = str(step.get("query") or "").strip()
+            queries: list[str] = []
+            for candidate in (user_query, step_query):
+                if candidate and candidate not in queries:
+                    queries.append(candidate)
+            if not queries:
+                queries = [""]
+            names: list[str] = []
+            packets: list[dict[str, str]] = []
+            for candidate in queries:
+                _scan_text_for_secrets_and_risks(candidate, context_label="vault_recall.query")
+                found_names, found_packets = _recall_packets(candidate, brain_dir, security_dir)
+                for name, packet in zip(found_names, found_packets):
+                    if name in names:
+                        continue
+                    names.append(name)
+                    if packet.get("text"):
+                        packets.append(packet)
+            payload = json.dumps(
+                {
+                    "query": queries[0],
+                    "queries": queries,
+                    "count": len(names),
+                    "filenames": names,
+                    "notes": packets,
+                },
+                sort_keys=True,
+            ) + "\n"
             out_file = str(step.get("output_file") or "recall.json")
             _write_workspace_file_safe(
                 workspace,
@@ -512,7 +537,7 @@ def _run_agent_step(
                 payload.encode("utf-8"),
                 max_output_bytes=MAX_WORKSPACE_WRITE_BYTES,
             )
-            return "ok", f"recall {len(found)}", bool(found)
+            return "ok", f"recall {len(names)}", bool(names), packets
         if action == "vault_audit":
             kind = str(step.get("audit_kind") or "")
             report = _run_vault_audit(kind, brain_dir)
@@ -525,7 +550,7 @@ def _run_agent_step(
             )
             count = len(report) if isinstance(report, list) else ""
             suffix = f" {count}" if count != "" else ""
-            return "ok", f"audit {kind}{suffix}", True
+            return "ok", f"audit {kind}{suffix}", True, []
         if action == "workspace_write":
             content = str(step.get("content") or "")
             _scan_text_for_secrets_and_risks(content, context_label="workspace_write.content")
@@ -535,7 +560,7 @@ def _run_agent_step(
                 content.encode("utf-8"),
                 max_output_bytes=MAX_WORKSPACE_WRITE_BYTES,
             )
-            return "ok", f"wrote {step.get('rel_path')}", True
+            return "ok", f"wrote {step.get('rel_path')}", True, []
         if action == "workspace_assert":
             ok, assert_detail = _evaluate_workspace_assert(
                 workspace,
@@ -545,8 +570,8 @@ def _run_agent_step(
                 json_key=str(step.get("json_key") or ""),
             )
             if not ok:
-                return "failed", assert_detail, False
-            return "ok", assert_detail, True
+                return "failed", assert_detail, False, []
+            return "ok", assert_detail, True, []
         if action == "sandbox_python":
             run_status, run_detail = _run_python(
                 str(step.get("script_body") or ""),
@@ -554,10 +579,10 @@ def _run_agent_step(
                 security_dir=security_dir,
                 timeout=timeout,
             )
-            return run_status, run_detail, run_status == "ok"
+            return run_status, run_detail, run_status == "ok", []
     except (AgentRuntimeError, ExecutableSkillValidationError, OSError, PermissionError, ValueError) as exc:
-        return "failed", str(exc), False
-    return "failed", f"unsupported {action}", False
+        return "failed", str(exc), False, []
+    return "failed", f"unsupported {action}", False, []
 
 
 def _run_vault_audit(kind: str, brain_dir: str) -> object:
@@ -588,10 +613,24 @@ def _run_vault_audit(kind: str, brain_dir: str) -> object:
     raise AgentRuntimeError(f"Unsupported audit_kind: {kind}")
 
 
-def _recall(query: str, brain_dir: str, security_dir: str | None = None) -> list[str]:
+def _recall_packet(source: str, filename: str, title: str, text: str, vault: str) -> dict[str, str]:
+    return {
+        "source": source,
+        "filename": filename,
+        "title": title or filename,
+        "text": (text or "")[:_LEARN_CLAIM_CHARS],
+        "vault": vault,
+    }
+
+
+def _recall_packets(
+    query: str, brain_dir: str, security_dir: str | None = None
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Filenames a recall found, paired with the text the caller should follow."""
     atoms = os.path.join(brain_dir, "2-atoms")
     index = os.path.join(brain_dir, ".sidecar", "lexical.sqlite3")
     names: list[str] = []
+    packets: list[dict[str, str]] = []
     try:
         direct, _neighbors = search_memory(
             query,
@@ -600,25 +639,40 @@ def _recall(query: str, brain_dir: str, security_dir: str | None = None) -> list
             index_path=index,
             chroma_path=os.path.join(brain_dir, ".chroma"),
         )
-        names = [item.filename for item in direct]
+        for item in direct:
+            if item.filename in names:
+                continue
+            names.append(item.filename)
+            packets.append(_recall_packet("atom", item.filename, item.filename, item.content, "active"))
     except Exception:
         names = []
+        packets = []
     try:
         for hit in search_connected_knowledge(
             query,
             brain_dir=brain_dir,
-            limit=5,
+            limit=8,
             learn=False,
             security_dir=security_dir,
         ):
             if hit.get("source") == "agent_skill":
                 continue
             label = hit["filename"]
-            if label not in names:
-                names.append(label)
+            if label in names:
+                continue
+            names.append(label)
+            packets.append(
+                _recall_packet(
+                    str(hit.get("source") or ""),
+                    label,
+                    str(hit.get("title") or ""),
+                    str(hit.get("text") or ""),
+                    str(hit.get("vault") or ""),
+                )
+            )
     except Exception:
-        return names
-    return names
+        return names, packets
+    return names, packets
 
 
 def execute_agent_skill(
@@ -652,6 +706,7 @@ def execute_agent_skill(
     status = "ok"
     detail = ""
     productive = False
+    materials: list[dict[str, str]] = []
     try:
         _validate_steps(loaded["steps"])
     except (AgentRuntimeError, ExecutableSkillValidationError) as exc:
@@ -659,7 +714,7 @@ def execute_agent_skill(
     with tempfile.TemporaryDirectory(prefix="sb-agent-workspace-") as workspace:
         if status == "ok":
             for step in loaded["steps"]:
-                status, detail, step_productive = _run_agent_step(
+                status, detail, step_productive, step_materials = _run_agent_step(
                     step,
                     inputs=inputs,
                     skill_id=norm_id,
@@ -668,6 +723,7 @@ def execute_agent_skill(
                     timeout=timeout,
                     workspace=workspace,
                 )
+                materials.extend(step_materials)
                 productive = productive or step_productive
                 if status != "ok":
                     break
@@ -705,7 +761,9 @@ def execute_agent_skill(
     _append_execution(dirs, record)
     if status == "stopped":
         _mark_run(dirs, run_id, "stopped", detail=detail)
-    return record
+    returned = dict(record)
+    returned["materials"] = materials
+    return returned
 
 
 def _mark_run(dirs: dict[str, str], run_id: str, status: str, *, detail: str = "", depth: int | None = None, goal: str = "") -> str:
@@ -919,28 +977,29 @@ def run_agent(
         project=project,
         brain_dir=brain_dir,
     )
-    materials: list[dict[str, str]] = []
-    try:
-        for hit in search_connected_knowledge(
-            own_goal,
-            brain_dir=skill_brain,
-            security_dir=security_dir,
-            learn=False,
-            limit=6,
-        ):
-            if hit.get("source") not in {"note", "agent_skill"}:
-                continue
-            materials.append(
-                {
-                    "source": hit.get("source") or "",
-                    "filename": hit.get("filename") or "",
-                    "title": hit.get("title") or "",
-                    "text": hit.get("text") or "",
-                    "vault": hit.get("vault") or "",
-                }
-            )
-    except Exception:
-        materials = []
+    materials = [item for item in (executed.get("materials") or []) if item.get("text")]
+    if not materials:
+        try:
+            for hit in search_connected_knowledge(
+                own_goal,
+                brain_dir=skill_brain,
+                security_dir=security_dir,
+                learn=False,
+                limit=6,
+            ):
+                if hit.get("source") not in {"note", "agent_skill"}:
+                    continue
+                materials.append(
+                    {
+                        "source": hit.get("source") or "",
+                        "filename": hit.get("filename") or "",
+                        "title": hit.get("title") or "",
+                        "text": hit.get("text") or "",
+                        "vault": hit.get("vault") or "",
+                    }
+                )
+        except Exception:
+            materials = []
     child_id = None
     if child_goal and steps >= 2:
         child = run_agent(
@@ -1112,6 +1171,62 @@ def learn_from_notes(*, brain_dir: str = BRAIN_DIR) -> dict[str, int]:
     return {"learned": learned, "skills": skills, "skipped": skipped}
 
 
+def _notes_for_query(query: str, brain_dir: str, *, project: str = "", limit: int = 2) -> list[dict[str, str]]:
+    """Full note text for one recall query. Does not search skills."""
+    clean = " ".join(str(query or "").split())
+    if not clean:
+        return []
+    try:
+        from notes_store import NotePaths, get_note, search_notes
+    except Exception:
+        return []
+    paths = NotePaths.for_brain(brain_dir)
+    found: list[dict[str, str]] = []
+    try:
+        matches = search_notes(clean, limit=max(1, limit), project=project or None, paths=paths)
+    except Exception:
+        return []
+    for note in matches:
+        text = (note.snippet or note.title or "").strip()
+        try:
+            full = get_note(note.filename, paths=paths)
+            if full.body and full.body.strip():
+                text = full.body.strip()
+        except Exception:
+            pass
+        if not text:
+            continue
+        found.append(
+            {
+                "source": "note",
+                "filename": note.filename,
+                "title": note.title or note.filename,
+                "text": text[:_LEARN_CLAIM_CHARS],
+            }
+        )
+    return found
+
+
+def _skill_note_brief(steps: list[Any], brain_dir: str, project: str) -> str:
+    """Note bodies a skill's recall steps would open, so the skill result carries the procedure."""
+    queries: list[str] = []
+    for step in steps[:4]:
+        if not isinstance(step, dict) or str(step.get("action_type") or "") != "vault_recall":
+            continue
+        candidate = str(step.get("query") or "").strip()
+        if candidate and candidate not in queries:
+            queries.append(candidate)
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for candidate in queries[:2]:
+        for note in _notes_for_query(candidate, brain_dir, project=project, limit=2):
+            if note["filename"] in seen:
+                continue
+            seen.add(note["filename"])
+            blocks.append(f"### {note['title']}\n{note['text']}")
+    return "\n\n".join(blocks)
+
+
 def search_connected_knowledge(
     query: str,
     *,
@@ -1235,6 +1350,9 @@ def search_connected_knowledge(
             score = _term_overlap(query, brief)
             if score < 1:
                 continue
+            used = _skill_note_brief(loaded["steps"], root, vault_project)
+            if used:
+                brief = f"{brief}\n\nNotes this skill uses:\n{used}"
             add(
                 "agent_skill",
                 name,

@@ -29,7 +29,7 @@ The `second-brain` MCP server exposes 17 audited, scope-enforced tools across ve
 
 ## Workflow
 
-1. Before every task, call `search_memory` with the user's request. The search already looks through every connected vault, so do not ask which vault to open. If the result includes a skill, follow the procedure in that result. Pass `project` (e.g. `project:second_brain`) when you are inside one repository; that filter does not hide the other vaults. Use `list_playbooks` / `assemble_plan` when the task is an operational workflow.
+1. Before every task, call `search_memory` with the user's request. The search already looks through every connected vault, so do not ask which vault to open. If the result includes a skill, follow the notes included with that skill. Pass `project` (e.g. `project:second_brain`) when you are inside one repository; that filter does not hide the other vaults. Use `list_playbooks` / `assemble_plan` when the task is an operational workflow.
 2. Cite every source you rely on: `[verified: <atom file>]` for approved atoms, `[playbook: <playbook_id>]` for active Skill Playbooks, or `[note: <note file>]` for working notes.
 3. Never present unverified note content as verified fact. If only working notes support an answer, state explicitly that it comes from the owner's notes.
 4. **Abstention rule**: If neither verified memory/playbooks nor working notes support the answer, say so clearly instead of guessing.
