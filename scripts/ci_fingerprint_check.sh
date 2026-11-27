@@ -20,16 +20,6 @@ if ! git cat-file -e "${pin}^{commit}" 2>/dev/null; then
   exit 2
 fi
 
-# ci.yml may contain a PINNED_HARNESS_SHA line. That one line is not a rewrite.
-mask_workflow() {
-  python3 -c '
-import re, sys
-text = sys.stdin.read()
-text = re.sub(r"^[ \t]*PINNED_HARNESS_SHA:.*$", "PINNED_HARNESS_SHA: \"<masked>\"", text, flags=re.M)
-sys.stdout.write(text)
-'
-}
-
 protected=(
   scripts/ci_fingerprint_check.sh
   .github/workflows/ci.yml
@@ -47,13 +37,8 @@ for path in "${protected[@]}"; do
     echo "PR removed ${path} relative to pinned harness ${pin}" >&2
     exit 1
   fi
-  if [ "$path" = ".github/workflows/ci.yml" ]; then
-    recorded="$(git show "${pin}:${path}" | mask_workflow | git hash-object --stdin)"
-    current="$(mask_workflow < "$workspace/$path" | git hash-object --stdin)"
-  else
-    recorded="$(git rev-parse "${pin}:${path}")"
-    current="$(git hash-object "$workspace/$path")"
-  fi
+  recorded="$(git rev-parse "${pin}:${path}")"
+  current="$(git hash-object "$workspace/$path")"
   if [ "$current" != "$recorded" ]; then
     echo "PR rewrote ${path} relative to pinned harness ${pin}" >&2
     exit 1
@@ -73,9 +58,11 @@ if [ -n "$owner_key" ]; then
   chmod 700 "$GNUPGHOME"
   printf '%s\n' "$owner_key" | gpg --batch --import
 fi
-# The checker environment is the pinned lockfile, not the pull request's.
-lock_id="$(git rev-parse "${pin}:uv.lock")"
-export UV_PROJECT_ENVIRONMENT="${RUNNER_TEMP:-/tmp}/pinned-venv-${lock_id}"
+# Fresh environment from the pinned lockfile. Removed when this script exits.
+venv="$(mktemp -d)"
+cleanup() { rm -rf "$dest" "$venv"; }
+trap cleanup EXIT
+export UV_PROJECT_ENVIRONMENT="$venv"
 uv sync --frozen --extra math --project "$dest"
 cd "$dest"
 uv run --frozen --project "$dest" python -c '

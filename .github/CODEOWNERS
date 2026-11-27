@@ -3,9 +3,7 @@
 # plus the required checks, because a pull_request workflow runs from the PR.
 .github/CODEOWNERS @prodofthecentury
 .github/** @prodofthecentury
-scripts/ci_fingerprint_check.sh @prodofthecentury
-scripts/reason_bench.py @prodofthecentury
-scripts/reason_bench_*.py @prodofthecentury
+scripts/** @prodofthecentury
 bench/reasoning/** @prodofthecentury
 config/reasoning.json @prodofthecentury
 pyproject.toml @prodofthecentury

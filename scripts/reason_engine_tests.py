@@ -1296,30 +1296,13 @@ class MechanismProbeTests(unittest.TestCase):
 
 
 class ReasonBenchmarkTests(unittest.TestCase):
-    def test_tool_precision_on_the_migrated_controls(self) -> None:
-        """Five migrated tool controls stay exact. gsm-pens (tools-0007) correctly declines."""
-        from scripts.reason_bench import read_jsonl, bench_root, run_tools_only, repo_root
-
-        must_fire = {
-            "tools-0001",
-            "tools-0002",
-            "tools-0003",
-            "tools-0004",
-            "tools-0005",
-        }
-        items = [row for row in read_jsonl(bench_root(repo_root()) / "suites" / "tools.jsonl") if row["id"] in must_fire or row["id"] == "tools-0007"]
-        self.assertEqual(len(items), 6)
-        records = run_tools_only(items, sympy="natural", tier="tool-precision")
-        by_id = {row["id"]: row for row in records}
-        answered = [by_id[item_id] for item_id in sorted(must_fire)]
-        self.assertTrue(all(row.get("answer_source") == "tool_exact" and row["correct"] for row in answered), answered)
-        pens = by_id["tools-0007"]
-        if pens.get("answer_source") == "tool_exact":
-            self.assertTrue(pens["correct"])
-            self.assertEqual(str(pens.get("predicted")), "101")
-        else:
-            self.assertNotEqual(pens.get("answer_source"), "tool_exact")
-        self.assertEqual(sum(row["model_calls"] for row in records), 0)
+    def test_deterministic_benchmark_is_exact(self) -> None:
+        rows = run_deterministic_benchmark()
+        self.assertGreaterEqual(len(rows), 6)
+        for row in rows:
+            self.assertTrue(row["correct"], row)
+            self.assertEqual(row["model_calls"], 0, row)
+            self.assertLess(row["elapsed_ms"], 2000, row)
 
     def test_live_models_are_recorded_when_ollama_is_required(self) -> None:
         if os.environ.get("BRAIN_REQUIRE_OLLAMA") != "1":

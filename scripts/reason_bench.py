@@ -171,9 +171,8 @@ def iter_public_files(root: Path) -> Iterator[Path]:
             continue
         if path.name == "MANIFEST.json":
             continue
+        # .gitkeep files are empty directory markers. They are not suite content.
         if path.name == ".gitkeep":
-            continue
-        if path.name.startswith("expected-hard-failures"):
             continue
         yield path
 
@@ -184,6 +183,9 @@ def public_rel(root: Path, path: Path) -> str:
 
 def compute_manifest(root: Path, *, suite_version: str = SUITE_VERSION) -> dict[str, Any]:
     files = {public_rel(root, path): file_hash(path) for path in iter_public_files(root)}
+    spec = root / "docs" / "reasoning-benchmark-spec.md"
+    if spec.is_file():
+        files["docs/reasoning-benchmark-spec.md"] = file_hash(spec)
     counts, template_counts = suite_counts(root)
     corpus = bench_root(root) / "corpus" / "dev"
     return {
@@ -1776,7 +1778,118 @@ def _live_verified_floor(records: list[dict]) -> set[tuple[str, str, str]]:
     return found
 
 
-def collect_hard_failures(root: Path, *, include_mock: bool = True, recall_answered: set[tuple[str, str]] | None = None) -> dict[str, Any]:
+def _engine_worker_path() -> Path:
+    return Path(__file__).with_name("reason_bench_worker.py")
+
+
+def query_engine_subprocess(engine_root: Path, items: list[dict]) -> list[dict]:
+    """Ask the engine process for answers. Scoring stays in this process."""
+    proc = subprocess.run(
+        [sys.executable, str(_engine_worker_path())],
+        input=json.dumps({"engine_root": str(engine_root), "items": items}),
+        capture_output=True,
+        text=True,
+        cwd=str(engine_root),
+    )
+    if proc.returncode != 0:
+        raise BenchError(f"engine subprocess failed: {proc.stderr[-400:]}")
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise BenchError(f"engine subprocess returned non-JSON: {proc.stdout[-400:]}") from exc
+    if not payload.get("ok"):
+        raise BenchError(f"engine subprocess failed: {payload.get('error')}")
+    return list(payload.get("results") or [])
+
+
+def _result_from_worker(row: dict) -> dict:
+    return {
+        "answer": row.get("answer"),
+        "answer_source": row.get("answer_source"),
+        "verified": bool(row.get("verified")),
+        "abstained": bool(row.get("abstained")),
+        "backend": row.get("backend"),
+        "model_calls": int(row.get("model_calls") or 0),
+        "contract_version": row.get("contract_version") or 0,
+        "delegated": bool(row.get("delegated")),
+        "steps": row.get("steps") or [],
+        "plan": row.get("plan") or {},
+    }
+
+
+def _collect_via_subprocess(root: Path, engine_root: Path) -> tuple[list[dict], list[dict], int, int]:
+    hijack = read_jsonl(bench_root(root) / "suites" / "hijack.jsonl")
+    tools = read_jsonl(bench_root(root) / "suites" / "tools.jsonl")
+    dev = dev_items(root)
+    batch: list[dict] = []
+    for mode in ("natural", "off"):
+        for item in hijack:
+            batch.append({
+                "id": item["id"],
+                "sympy": mode,
+                "kind": "hijack",
+                "question": str(item.get("text") or item.get("question") or ""),
+            })
+        for item in tools + dev:
+            batch.append({
+                "id": item["id"],
+                "sympy": mode,
+                "kind": "tool",
+                "question": tool_question(item),
+                "tests": item.get("visible_tests") if item.get("suite") == "code" else None,
+            })
+    results = query_engine_subprocess(engine_root, batch)
+    by_key = {(str(row["id"]), str(row["sympy"]), str(row["kind"])): row for row in results}
+    reports = []
+    records: list[dict] = []
+    fire_seen = 0
+    fire_total = 0
+    for mode in ("natural", "off"):
+        fires = []
+        crashes = []
+        for item in hijack:
+            row = by_key.get((str(item["id"]), mode, "hijack"), {})
+            if row.get("crash"):
+                crashes.append({"id": item["id"], "sympy_mode": mode, "error": row["crash"]})
+            if row.get("fired"):
+                fires.append({
+                    "id": item["id"],
+                    "sympy_mode": mode,
+                    "answer": row.get("answer"),
+                    "backend": row.get("backend"),
+                    "classify": row.get("classify"),
+                })
+        reports.append({"fires": fires, "crashes": crashes, "misroutes": []})
+        for item in tools + dev:
+            fire_total += 1
+            row = by_key.get((str(item["id"]), mode, "tool"), {})
+            record = blank_record(item, "tools_only", sympy=mode, tier="model-free")
+            if row.get("exception"):
+                record["status"] = "engine_exception"
+                record["engine_exception"] = True
+                record["error"] = str(row["exception"])
+                records.append(record)
+                continue
+            if row.get("fired") or row.get("answer_source"):
+                fire_seen += 1
+            try:
+                score_engine_result(item, _result_from_worker(row), record)
+            except BenchError:
+                raise
+            except Exception as exc:
+                record["status"] = "error"
+                record["error"] = f"harness {type(exc).__name__}: {exc}"
+            records.append(record)
+    return reports, records, fire_seen, fire_total
+
+
+def collect_hard_failures(
+    root: Path,
+    *,
+    include_mock: bool = True,
+    recall_answered: set[tuple[str, str]] | None = None,
+    engine_root: Path | None = None,
+) -> dict[str, Any]:
     vault_info, retriever, canary = _arm_isolation(root)
     status = sympy_status()
     hijack = read_jsonl(bench_root(root) / "suites" / "hijack.jsonl")
@@ -1786,25 +1899,28 @@ def collect_hard_failures(root: Path, *, include_mock: bool = True, recall_answe
     records: list[dict] = []
     fire_seen = 0
     fire_total = 0
-    for mode in ("natural", "off"):
-        reports.append(run_hijack(hijack, sympy=mode))
-        records.extend(run_tools_only(tools, sympy=mode, tier="model-free", retriever=retriever))
-        records.extend(run_tools_only(dev, sympy=mode, tier="model-free", retriever=retriever))
-        crashes, fired, total = _scan_tool_use(tools + dev, sympy=mode)
-        fire_seen += fired
-        fire_total += total
-        for crash in crashes:
-            records.append({
-                "id": crash["id"],
-                "sympy_mode": mode,
-                "status": "ok",
-                "tool_crash": True,
-                "correct": False,
-                "verified": False,
-                "answer_source": None,
-                "plan_step_verified": False,
-                "plan_not_executed": [],
-            })
+    if engine_root is not None:
+        reports, records, fire_seen, fire_total = _collect_via_subprocess(root, engine_root)
+    else:
+        for mode in ("natural", "off"):
+            reports.append(run_hijack(hijack, sympy=mode))
+            records.extend(run_tools_only(tools, sympy=mode, tier="model-free", retriever=retriever))
+            records.extend(run_tools_only(dev, sympy=mode, tier="model-free", retriever=retriever))
+            crashes, fired, total = _scan_tool_use(tools + dev, sympy=mode)
+            fire_seen += fired
+            fire_total += total
+            for crash in crashes:
+                records.append({
+                    "id": crash["id"],
+                    "sympy_mode": mode,
+                    "status": "ok",
+                    "tool_crash": True,
+                    "correct": False,
+                    "verified": False,
+                    "answer_source": None,
+                    "plan_step_verified": False,
+                    "plan_not_executed": [],
+                })
     if include_mock:
         records.extend(run_mock_tier(root, sympy="natural", retriever=retriever))
         records.extend(run_mock_tier(root, sympy="off", retriever=retriever))
@@ -2511,17 +2627,42 @@ def evaluate_gates(observed: list[tuple[str, str, str]], expected: list[tuple[st
     return 0
 
 
+def recall_floor_digest(ids: list[str]) -> str:
+    return hashlib.sha256(canonical_json(sorted(ids)).encode("utf-8")).hexdigest()
+
+
+def load_recall_floor_payload(payload: dict) -> tuple[set[str], int]:
+    ids = [str(item) for item in payload.get("ids") or []]
+    digest = str(payload.get("ids_sha256") or "")
+    if digest != recall_floor_digest(ids):
+        raise BenchError("recall floor id set hash mismatch; fail closed")
+    minimum = int(payload.get("minimum_answered") or 0)
+    if minimum != len(ids):
+        raise BenchError("recall floor count must equal the frozen id set")
+    return set(ids), minimum
+
+
+def load_recall_floor(root: Path) -> tuple[set[str], int]:
+    path = bench_root(root) / "recall-floor.json"
+    if not path.is_file():
+        raise BenchError("recall-floor.json is missing; fail closed")
+    return load_recall_floor_payload(json.loads(path.read_text(encoding="utf-8")))
+
+
 def evaluate_recall(
     records: list[dict],
     wanted: set[str],
     baseline_answered: set[tuple[str, str]] | None = None,
     *,
-    floor: tuple[int, int] = RECALL_FLOOR,
+    floor_ids: set[str] | None = None,
+    floor_minimum: int | None = None,
 ) -> int:
-    """Separate from HARD. Fails on a regression, a floor breach, or a mode split.
+    """Count floor over a frozen id set, plus per-id regression and mode agreement.
 
-    Every decline is printed by id. Nothing is folded into a count.
+    Every decline is printed by id. The floor is a count, not a rate.
     """
+    if floor_ids is None or floor_minimum is None:
+        raise BenchError("recall floor id set is required")
     by_mode: dict[str, tuple[set[str], list[str]]] = {}
     for mode in ("natural", "off"):
         rows = [
@@ -2541,13 +2682,11 @@ def evaluate_recall(
         for item_id in declined:
             print(f"decline {mode} {item_id}")
     failed = False
-    floor_value = floor[0] / floor[1]
     for mode, (answered, _declined) in by_mode.items():
-        total = len(wanted)
-        ratio = (len(answered) / total) if total else 1.0
-        if ratio < floor_value:
+        hit = len(answered & floor_ids)
+        if hit < floor_minimum:
             print(
-                f"recall below floor {mode} {len(answered)}/{total} < {floor[0]}/{floor[1]}",
+                f"recall frozen {mode} {hit}/{len(floor_ids)} < {floor_minimum}",
                 file=sys.stderr,
             )
             failed = True
@@ -2567,8 +2706,26 @@ def evaluate_recall(
     return 1 if failed else 0
 
 
-def gates_main(root: Path) -> int:
-    payload = collect_hard_failures(root, include_mock=True)
+def _recall_from_payload(root: Path, payload: dict[str, Any], baseline_answered: set[tuple[str, str]] | None) -> int:
+    floor_ids, minimum = load_recall_floor(root)
+    return evaluate_recall(
+        list(payload.get("recall_records") or []),
+        _should_fire_ids(root),
+        baseline_answered,
+        floor_ids=floor_ids,
+        floor_minimum=minimum,
+    )
+
+
+def gates_main(root: Path, engine_root: Path | None = None) -> int:
+    try:
+        check_manifest(root)
+    except BenchError as exc:
+        print(str(exc), file=sys.stderr)
+        print("manifest_ok=False")
+        return 1
+    payload = collect_hard_failures(root, include_mock=True, engine_root=engine_root or root)
+    print(f"isolation_ok={payload.get('isolation_ok')} manifest_ok={payload.get('manifest_ok')} commitment_ok={payload.get('commitment_ok')}")
     print(f"sympy_available={payload['sympy_available']} sympy_version={payload['sympy_version']}")
     print(f"should_fire_recall={json.dumps(payload.get('should_fire_recall') or {}, sort_keys=True)}")
     for gate, item_id, mode in payload["tuples"]:
@@ -2578,9 +2735,11 @@ def gates_main(root: Path) -> int:
     if not expected_path.is_file():
         print("missing expected-hard-failures.current.json", file=sys.stderr)
         return 1
-    expected = [tuple(item) for item in json.loads(expected_path.read_text(encoding="utf-8"))["tuples"]]
+    expected_payload = json.loads(expected_path.read_text(encoding="utf-8"))
+    expected = [tuple(item) for item in expected_payload["tuples"]]
     hard = evaluate_gates(list(payload["tuples"]), expected)
-    recall = evaluate_recall(list(payload.get("recall_records") or []), _should_fire_ids(root))
+    baseline = {tuple(pair) for pair in expected_payload.get("should_fire_answered") or []}
+    recall = _recall_from_payload(root, payload, baseline)
     return 1 if hard or recall else 0
 
 
@@ -2592,6 +2751,7 @@ def compare_fingerprint(
     engine_ref: str | None = None,
     base_ref: str | None = None,
     base_file: str | None = None,
+    engine_root: Path | None = None,
 ) -> int:
     expected_payload = json.loads(expect_path.read_text(encoding="utf-8"))
     expected = [tuple(item) for item in expected_payload["tuples"]]
@@ -2615,7 +2775,12 @@ def compare_fingerprint(
     recall = None
     if baseline is not None:
         recall = {tuple(pair) for pair in baseline.get("should_fire_answered") or []}
-    observed_payload = collect_hard_failures(root, include_mock=True, recall_answered=recall)
+    observed_payload = collect_hard_failures(
+        root,
+        include_mock=True,
+        recall_answered=recall,
+        engine_root=engine_root or root,
+    )
     observed = observed_payload["tuples"]
     missing = sorted(set(expected) - set(observed))
     extra = sorted(set(observed) - set(expected))
@@ -2742,27 +2907,27 @@ def _approval_tags(root: Path) -> list[str]:
     return [tag for tag in tags.split() if tag]
 
 
-def _tag_signer_fingerprint(root: Path, tag: str) -> str | None:
-    """Fingerprint from `git verify-tag --raw`, or None when the signature does not verify.
+def fingerprint_from_verify_status(text: str) -> str | None:
+    """The VALIDSIG fingerprint only. A 40-hex token in a GOODSIG name is ignored."""
+    for line in text.splitlines():
+        if "[GNUPG:] VALIDSIG " not in line and not line.startswith("VALIDSIG "):
+            continue
+        parts = line.replace("[GNUPG:]", "").split()
+        # VALIDSIG <fingerprint> <sig-time> ... [primary-fpr]
+        if len(parts) >= 2 and len(parts[1]) >= 40 and all(char in "0123456789abcdefABCDEF" for char in parts[1]):
+            return parts[1].lower()
+    return None
 
-    Force OpenPGP so a runner whose git is set to SSH signing still verifies these tags.
-    """
+
+def _tag_signer_fingerprint(root: Path, tag: str) -> str | None:
+    """Fingerprint from the VALIDSIG status line, or None when it does not verify."""
     verified = subprocess.run(
         ["git", "-c", "gpg.format=openpgp", "verify-tag", "--raw", tag],
         cwd=root,
         capture_output=True,
         text=True,
     )
-    blob = f"{verified.stdout}\n{verified.stderr}"
-    if "VALIDSIG" not in blob and "GOODSIG" not in blob:
-        return None
-    for line in blob.splitlines():
-        if "VALIDSIG" not in line and "GOODSIG" not in line:
-            continue
-        for part in line.split():
-            if len(part) >= 40 and all(char in "0123456789abcdefABCDEF" for char in part):
-                return part.lower()
-    return None
+    return fingerprint_from_verify_status(f"{verified.stdout}\n{verified.stderr}")
 
 
 def _tag_is_signed(root: Path, tag: str) -> bool:
@@ -2782,6 +2947,8 @@ def pinned_owner_fingerprint(root: Path, pin: str) -> str:
 def reject_foreign_tags(root: Path, pin: str) -> None:
     """A tag signed by any key other than the pinned owner fingerprint is rejected."""
     expected = pinned_owner_fingerprint(root, pin)
+    if expected and not (_git_show(root, pin, ".github/owner-signing-key.asc") or "").strip():
+        raise BenchError("owner signing fingerprint is pinned but .github/owner-signing-key.asc is missing; fail closed")
     for tag in _approval_tags(root):
         signer = _tag_signer_fingerprint(root, tag)
         if signer is None and not _tag_is_signed(root, tag):
@@ -2883,21 +3050,28 @@ def _load_workspace_engine(workspace: Path) -> None:
     spec.loader.exec_module(module)
 
 
-def _absolute_zero(workspace: Path, pin: str) -> int:
-    """Zero HARD tuples. The suite and reason_bench come from the pin; helpers and config come from the PR."""
-    pin_tree = _extract_commit(workspace, pin)
+def _absolute_zero(workspace: Path, pin: str, *, suite_root: Path | None = None, engine_root: Path | None = None) -> int:
+    """Zero HARD tuples plus the recall count. The engine runs in another process."""
+    pin_tree = suite_root or _extract_commit(workspace, pin)
+    own_tree = suite_root is None
     try:
-        _load_workspace_engine(workspace)
         try:
-            payload = collect_hard_failures(pin_tree, include_mock=True, recall_answered=None)
+            payload = collect_hard_failures(
+                pin_tree,
+                include_mock=True,
+                recall_answered=None,
+                engine_root=engine_root or workspace,
+            )
         except Exception as exc:
             print(f"absolute-zero failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
+        print(f"isolation_ok={payload.get('isolation_ok')} manifest_ok={payload.get('manifest_ok')} commitment_ok={payload.get('commitment_ok')}")
         try:
             reject_integrity(payload["tuples"])
         except BenchError as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        failed = False
         if payload["tuples"]:
             print(
                 f"absolute-zero failed: {len(payload['tuples'])} HARD tuples under pinned harness {pin}",
@@ -2905,11 +3079,21 @@ def _absolute_zero(workspace: Path, pin: str) -> int:
             )
             for row in payload["tuples"][:8]:
                 print(f"HARD {' '.join(row)}", file=sys.stderr)
+            failed = True
+        print(f"hard_failure_count={len(payload['tuples'])}")
+        baseline_text = _git_show(workspace, pin, "bench/reasoning/expected-hard-failures.current.json")
+        baseline = set()
+        if baseline_text:
+            baseline = {tuple(pair) for pair in json.loads(baseline_text).get("should_fire_answered") or []}
+        if _recall_from_payload(pin_tree, payload, baseline):
+            failed = True
+        if failed:
             return 1
         print("absolute_zero_ok")
         return 0
     finally:
-        shutil.rmtree(pin_tree, ignore_errors=True)
+        if own_tree:
+            shutil.rmtree(pin_tree, ignore_errors=True)
 
 
 def gate_main(workspace: Path, base_ref: str, pin: str) -> int:
@@ -2961,8 +3145,7 @@ def gate_main(workspace: Path, base_ref: str, pin: str) -> int:
         except BenchError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-        load_pinned_engine(workspace, base_ref)
-        payload = collect_hard_failures(base_tree, include_mock=True, recall_answered=None)
+        payload = collect_hard_failures(base_tree, include_mock=True, recall_answered=None, engine_root=base_tree)
         try:
             reject_integrity(payload["tuples"])
         except BenchError as exc:
@@ -3001,6 +3184,20 @@ def gate_main(workspace: Path, base_ref: str, pin: str) -> int:
             return 1
         if regenerated:
             print(f"regenerated baseline has {len(regenerated)} HARD tuples; residue is not accepted", file=sys.stderr)
+            return 1
+        floor_text = _git_show(workspace, pin, "bench/reasoning/recall-floor.json")
+        if not floor_text:
+            print("recall floor missing from the pinned harness; fail closed", file=sys.stderr)
+            return 2
+        floor_ids, minimum = load_recall_floor_payload(json.loads(floor_text))
+        answered = {tuple(pair) for pair in baseline.get("should_fire_answered") or []}
+        if evaluate_recall(
+            list(payload.get("recall_records") or []),
+            _should_fire_ids(base_tree),
+            answered,
+            floor_ids=floor_ids,
+            floor_minimum=minimum,
+        ):
             return 1
         print("fingerprint_ok tuples=0")
         return 0
@@ -3136,7 +3333,8 @@ def build_parser() -> argparse.ArgumentParser:
     lock_p = sub.add_parser("lock")
     lock_p.add_argument("--bump-version", required=True)
     lock_p.add_argument("--reason", required=True)
-    sub.add_parser("gates")
+    gates_p = sub.add_parser("gates")
+    gates_p.add_argument("--engine-ref", default=None)
     finger_p = sub.add_parser("fingerprint")
     finger_p.add_argument("--write", default=None)
     finger_p.add_argument("--check", default=None)
@@ -3192,16 +3390,25 @@ def _dispatch(args: argparse.Namespace) -> int:
         print(f"locked {payload['suite_version']} files={len(payload['files'])}")
         return 0
     if args.command == "gates":
-        return gates_main(root)
+        extracted = _extract_commit(root, args.engine_ref) if args.engine_ref else None
+        try:
+            return gates_main(root, engine_root=extracted or root)
+        finally:
+            if extracted is not None:
+                shutil.rmtree(extracted, ignore_errors=True)
     if args.command == "fingerprint":
-        if getattr(args, "engine_ref", None):
-            load_pinned_engine(root, args.engine_ref)
+        extracted = _extract_commit(root, args.engine_ref) if getattr(args, "engine_ref", None) and (args.write or args.check) else None
+        engine_root = extracted or root
         if args.write:
             recall = None
             if args.recall_file:
                 recall_payload = _require_baseline_payload(json.loads(Path(args.recall_file).read_text(encoding="utf-8")))
                 recall = {tuple(pair) for pair in recall_payload.get("should_fire_answered") or []}
-            payload = collect_hard_failures(root, include_mock=True, recall_answered=recall)
+            try:
+                payload = collect_hard_failures(root, include_mock=True, recall_answered=recall, engine_root=engine_root)
+            finally:
+                if extracted is not None and not args.check:
+                    shutil.rmtree(extracted, ignore_errors=True)
             meta = {
                 "engine_sha": engine_blob_sha(root, args.engine_ref or "HEAD"),
                 "sympy_available": payload["sympy_available"],
@@ -3220,14 +3427,19 @@ def _dispatch(args: argparse.Namespace) -> int:
             return gate_main(Path(args.workspace), args.base_ref, args.pin)
         if args.check:
             base = load_fingerprint(Path(args.base_file)) if args.base_file and Path(args.base_file).is_file() else None
-            return compare_fingerprint(
-                root,
-                Path(args.check),
-                base,
-                engine_ref=args.engine_ref,
-                base_ref=args.base_ref,
-                base_file=args.base_file,
-            )
+            try:
+                return compare_fingerprint(
+                    root,
+                    Path(args.check),
+                    base,
+                    engine_ref=args.engine_ref,
+                    base_ref=args.base_ref,
+                    base_file=args.base_file,
+                    engine_root=engine_root,
+                )
+            finally:
+                if extracted is not None:
+                    shutil.rmtree(extracted, ignore_errors=True)
         raise BenchError("fingerprint needs --write or --check")
     if args.command == "run":
         return run_command(root, args)

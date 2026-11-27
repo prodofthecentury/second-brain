@@ -29,7 +29,7 @@ Exit 0 is pass or warn. Exit 1 is a HARD gate or a calibrated FAIL. Exit 2 is a 
 
 - `validate` checks schemas, references, solvers, hidden tests, canonical hashes, and forbidden held-out paths.
 - `hard-gates` is absolute zero, in both SymPy modes, for `tool_wrong`, `claimed_verified_wrong`, `hijack_fires`, `tool_precision`, `tool_crash`, `engine_exception`, and every integrity failure (`manifest_ok`, `commitment_ok`, `isolation`, `canary`, `harness_errors`). A should-fire decline is not in that set.
-- `hard-failure-fingerprint` runs the checker from the pinned harness. The pin is the Actions variable `PINNED_HARNESS_SHA`, or `.github/harness-pin` on the base branch. A missing pin exits 2. The job builds its environment from the pinned `uv.lock`.
+- `hard-failure-fingerprint` runs the checker from the pinned harness. The pin is the Actions variable `PINNED_HARNESS_SHA`, or `.github/harness-pin` on the base branch. A missing pin exits 2. The job does not install the pull-request tree. It builds a fresh temporary environment from the pinned `uv.lock` and deletes that environment when the check finishes. The pull-request engine runs in a separate process and returns answers only. The pinned checker scores those answers.
 - Replacing the fingerprint step with a no-op is not visible to that checker, because `pull_request` runs the workflow file from the pull request. Code-owner review plus the required checks are what stop that replacement.
 - A Windows job checks out with `core.autocrlf=true` and re-runs `validate`.
 
@@ -41,17 +41,18 @@ A single reduced `a/b` with no other operator and no conversion asked is an echo
 
 HARD is absolute zero in both SymPy modes for `tool_wrong`, `claimed_verified_wrong`, `hijack_fires`, `tool_precision`, `tool_crash`, `engine_exception`, and every integrity failure. `should_fire_declined` is not a HARD tuple.
 
-Recall is a separate gate. It fails when any should-fire item the pinned baseline answered now declines, when recall in either mode is below 122/150, or when the two SymPy modes disagree on any should-fire item. Every decline is printed by id.
+Recall is a separate gate. The floor is a count over the frozen id set in `recall-floor.json` (132 ids, hashed). It fails when fewer than 132 of those ids answer in either mode, when any id in the pinned baseline's answered set now declines, or when the two SymPy modes disagree on any should-fire item. Every decline is printed by id. A raw rate is not the floor: answering a new id does not replace a frozen id.
 
 The base units `m`, `g` and `s` are lower-case. An uppercase base-unit letter is not an SI symbol and must decline; any answer is a failure. The case-insensitive whitelist is `KM`, `KG`, `LB`, `OZ`, `FT`, `MI`, `MIN`, `CM`, `DM` and `KS`. Properly cased `Mm`, `Mg`, `Ms`, `Pm`, `Gm`, `Pg` and `Ps` are exact conversions.
 
 ## One-time bootstrap
 
-1. The harness pin is the Actions variable `PINNED_HARNESS_SHA`, or the base file `.github/harness-pin`. It is not a line in `ci.yml`. `ci.yml` is compared with that line masked, so filling a pin value in is not a workflow rewrite. Editing any other workflow step fails the checker.
-2. Suite bumps come from `bench/reasoning/owner-approvals.json` on the base branch. A signed tag counts only when `git verify-tag --raw` reports the fingerprint in `.github/owner-signing-fingerprint` on the pinned commit. Any other key is rejected. The committed fingerprint file is `none`, so no tag is trusted until that file names a key.
-3. An engine-surface change (`scripts/**` other than tests, `config/reasoning.json`, `pyproject.toml`, `uv.lock`) is absolute zero: 0 HARD tuples in both SymPy modes, using the pull request's helpers and config and the pinned suite and `reason_bench` modules.
-4. `expected-hard-failures.f24d020.json` is a non-regenerable record. It contains fatal `engine_exception` tuples, and `fingerprint --write` refuses those. Do not regenerate it.
-5. After the engine is at 0 HARD under the pin, the 0-tuple baseline regenerated at that commit is `bench/reasoning/baseline/fingerprint.json`. Later pulls are judged against that regeneration. Residue is not accepted.
+1. The harness pin is the Actions variable `PINNED_HARNESS_SHA`, or the base file `.github/harness-pin`. It is not a line in `ci.yml`. `ci.yml` is compared byte for byte with the pin. Editing a workflow step fails the checker.
+2. Suite bumps come from `bench/reasoning/owner-approvals.json` on the base branch. A signed tag counts only when the `VALIDSIG` fingerprint field from `git verify-tag --raw` matches `.github/owner-signing-fingerprint` on the pinned commit. A fingerprint inside a key name is not that field. If a fingerprint is pinned and `.github/owner-signing-key.asc` is missing, the check fails closed. The committed fingerprint file is `none`, so no tag is trusted until that file names a key.
+3. An engine-surface change (`scripts/**` other than tests, `config/reasoning.json`, `pyproject.toml`, `uv.lock`) is absolute zero under the pinned checker: 0 HARD tuples in both SymPy modes, and the recall count. The pull-request engine and its helper modules run in a separate process. The pinned process only scores the JSON answers. The suite and the checker come from the pin.
+4. `expected-hard-failures.f24d020.json` is a non-regenerable record. It contains fatal `engine_exception` tuples, and `fingerprint --write` refuses those. Do not regenerate it. `expected-hard-failures.d04b7fa.json`, `expected-hard-failures.8ff980d.json` and `expected-hard-failures.dda1ba9.json` are stale records of older engines. They are hashed so a silent edit fails the manifest, and they are not the current gate.
+5. The manifest hashes every file under `bench/reasoning` except `MANIFEST.json` itself and `.gitkeep` placeholders (empty directory markers, no suite content), and it hashes `docs/reasoning-benchmark-spec.md`. `expected-hard-failures.*.json` records are included.
+6. After the engine is at 0 HARD under the pin, the 0-tuple baseline regenerated at that commit is `bench/reasoning/baseline/fingerprint.json`. Later pulls are judged against that regeneration. Residue is not accepted.
 
 GSM-Symbolic stays off unless the owner types the confirmation at an interactive TTY after `--external gsm-symbolic`. A CLI string does not count. If the dataset card's licence is not `cc-by-nc-nd-4.0`, the run exits 2. Dev notes use `claim_state: synthetic_benchmark`. Nothing in this harness writes an owner approval.
 

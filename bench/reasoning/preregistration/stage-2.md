@@ -20,8 +20,8 @@ HARD is absolute zero in both SymPy modes for `tool_wrong`, `claimed_verified_wr
 
 Recall fails the run when any of these happen:
 
-- an item the pinned baseline answered correctly now declines (per item, not a hidden average)
-- recall in either mode is below 122/150
+- an item the pinned baseline answered correctly now declines (per item, listed by id)
+- fewer than 132 of the frozen ids in `recall-floor.json` answer, in either mode (a count, not a rate)
 - the two SymPy modes disagree on any should-fire item
 
 Every decline is listed by id. A compute prefix is a request for arithmetic (`What is 2026 -11?` is 2015). A bare `2026 -11` or `(2026 -11)` must not fire. A single reduced `a/b` with no other operator and no conversion is an echo and declines. A reducible `a/b` (`100/4`, `50/50`) is computed.

@@ -221,11 +221,6 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
-      - name: Install Python 3.12 with the math extra
-        run: |
-          uv python install 3.12
-          uv sync --locked --extra math --python 3.12
-
       - name: Compare observed HARD failures with the engine fingerprint
         run: |
           set -euo pipefail
