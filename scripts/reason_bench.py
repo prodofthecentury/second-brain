@@ -31,6 +31,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -1782,24 +1783,172 @@ def _engine_worker_path() -> Path:
     return Path(__file__).with_name("reason_bench_worker.py")
 
 
-def query_engine_subprocess(engine_root: Path, items: list[dict]) -> list[dict]:
-    """Ask the engine process for answers. Scoring stays in this process."""
+_SCORER_MODULES = (
+    "scripts.symbolic_sandbox",
+    "scripts.reason_bench_shapes",
+    "scripts.reason_bench_scoring",
+    "scripts.reason_bench_models",
+    "scripts.reason_bench_heldout",
+    "scripts.config",
+    "scripts.lexical_store",
+    "scripts.recall",
+)
+
+
+def preload_scorer_modules() -> None:
+    """Import every module the scorer reads after the worker returns.
+
+    A later import uses this cache. The worker cannot change what is already loaded.
+    """
+    for name in _SCORER_MODULES:
+        importlib.import_module(name)
+
+
+def _scorer_script_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _snapshot_scorer_files() -> dict[str, bytes]:
+    snap: dict[str, bytes] = {}
+    for path in _scorer_script_dir().rglob("*"):
+        if path.is_file() and "__pycache__" not in path.parts:
+            snap[path.relative_to(_scorer_script_dir()).as_posix()] = path.read_bytes()
+    return snap
+
+
+def _assert_scorer_unchanged(snapshot: dict[str, bytes]) -> None:
+    root = _scorer_script_dir()
+    current: dict[str, bytes] = {}
+    for path in root.rglob("*"):
+        if path.is_file() and "__pycache__" not in path.parts:
+            current[path.relative_to(root).as_posix()] = path.read_bytes()
+    if current != snapshot:
+        changed = sorted(set(current) ^ set(snapshot) or {key for key in current if current.get(key) != snapshot.get(key)})
+        raise BenchError(f"engine wrote a scorer file ({changed[0]}); fail closed")
+
+
+def _make_readonly(root: Path) -> None:
+    for path in [root, *root.rglob("*")]:
+        mode = path.stat().st_mode
+        path.chmod(mode & ~0o222)
+
+
+def _freeze_modes(root: Path) -> list[tuple[Path, int]]:
+    saved = [(root, root.stat().st_mode)]
+    for path in root.rglob("*"):
+        saved.append((path, path.stat().st_mode))
+        path.chmod(path.stat().st_mode & ~0o222)
+    root.chmod(root.stat().st_mode & ~0o222)
+    return saved
+
+
+def _thaw_modes(saved: list[tuple[Path, int]]) -> None:
+    for path, mode in reversed(saved):
+        if path.exists():
+            path.chmod(mode)
+
+
+def _stage_engine(engine_root: Path) -> Path:
+    """Copy only the engine and its helper modules. The scorer tree stays elsewhere."""
+    stage = Path(tempfile.mkdtemp(prefix="sb-engine-stage-"))
+    scripts_dst = stage / "scripts"
+    scripts_dst.mkdir()
+    source = engine_root / "scripts"
+    if not source.is_dir():
+        raise BenchError(f"engine tree has no scripts directory: {engine_root}")
+    for path in source.iterdir():
+        if path.name in {"__pycache__"} or path.name.startswith("reason_bench"):
+            continue
+        if path.name.endswith("_tests.py") or path.name in {"test_all.py"}:
+            continue
+        target = scripts_dst / path.name
+        if path.is_dir():
+            shutil.copytree(path, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        elif path.suffix == ".py":
+            shutil.copy2(path, target)
+    config = engine_root / "config"
+    if config.is_dir():
+        shutil.copytree(config, stage / "config", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy2(_engine_worker_path(), stage / "reason_bench_worker.py")
+    _make_readonly(stage)
+    return stage
+
+
+def _row_key(row: dict) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("id")),
+        str(row.get("sympy") or "natural"),
+        str(row.get("kind") or "tool"),
+        str(row.get("runner") or ""),
+    )
+
+
+def _require_exact_rows(items: list[dict], results: list[dict]) -> dict[tuple[str, str, str, str], dict]:
+    """One row per requested item. A missing, duplicate, or extra row is fatal."""
+    wanted = [_row_key(item) for item in items]
+    got = [_row_key(row) for row in results]
+    if len(got) != len(set(got)) or set(got) != set(wanted) or len(got) != len(wanted):
+        missing = sorted(set(wanted) - set(got))
+        extra = sorted(set(got) - set(wanted))
+        raise BenchError(
+            "engine_exception: engine result rows are not exactly the requested items "
+            f"missing={missing[:4]} extra={extra[:4]} rows={len(got)} requested={len(wanted)}"
+        )
+    return {_row_key(row): row for row in results}
+
+
+def _spawn_worker(stage: Path, items: list[dict], *, block_sympy: bool) -> tuple[list[dict], bool]:
+    work = Path(tempfile.mkdtemp(prefix="sb-engine-tmp-"))
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["TMPDIR"] = str(work)
     proc = subprocess.run(
-        [sys.executable, str(_engine_worker_path())],
-        input=json.dumps({"engine_root": str(engine_root), "items": items}),
+        [sys.executable, str(stage / "reason_bench_worker.py")],
+        input=json.dumps({"engine_root": str(stage), "items": items, "block_sympy": block_sympy}),
         capture_output=True,
         text=True,
-        cwd=str(engine_root),
+        cwd=str(stage),
+        env=env,
     )
+    shutil.rmtree(work, ignore_errors=True)
     if proc.returncode != 0:
         raise BenchError(f"engine subprocess failed: {proc.stderr[-400:]}")
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         raise BenchError(f"engine subprocess returned non-JSON: {proc.stdout[-400:]}") from exc
+    if block_sympy and payload.get("sympy_blocked") is not True:
+        raise BenchError("engine_exception: off mode imported sympy; fail closed")
     if not payload.get("ok"):
         raise BenchError(f"engine subprocess failed: {payload.get('error')}")
-    return list(payload.get("results") or [])
+    return list(payload.get("results") or []), bool(payload.get("sympy_blocked"))
+
+
+def query_engine_subprocess(engine_root: Path, items: list[dict]) -> list[dict]:
+    """Run the engine in a temp copy. This process only scores the JSON."""
+    if not items:
+        return []
+    preload_scorer_modules()
+    snapshot = _snapshot_scorer_files()
+    stage = _stage_engine(engine_root)
+    saved_modes = _freeze_modes(_scorer_script_dir())
+    try:
+        natural = [item for item in items if str(item.get("sympy") or "natural") != "off"]
+        off = [item for item in items if str(item.get("sympy") or "natural") == "off"]
+        rows: list[dict] = []
+        if natural:
+            part, _blocked = _spawn_worker(stage, natural, block_sympy=False)
+            rows.extend(part)
+        if off:
+            part, _blocked = _spawn_worker(stage, off, block_sympy=True)
+            rows.extend(part)
+        indexed = _require_exact_rows(items, rows)
+        _assert_scorer_unchanged(snapshot)
+        return [indexed[_row_key(item)] for item in items]
+    finally:
+        _thaw_modes(saved_modes)
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 def _result_from_worker(row: dict) -> dict:
@@ -1839,7 +1988,7 @@ def _collect_via_subprocess(root: Path, engine_root: Path) -> tuple[list[dict], 
                 "tests": item.get("visible_tests") if item.get("suite") == "code" else None,
             })
     results = query_engine_subprocess(engine_root, batch)
-    by_key = {(str(row["id"]), str(row["sympy"]), str(row["kind"])): row for row in results}
+    by_key = {_row_key(row): row for row in results}
     reports = []
     records: list[dict] = []
     fire_seen = 0
@@ -1848,7 +1997,7 @@ def _collect_via_subprocess(root: Path, engine_root: Path) -> tuple[list[dict], 
         fires = []
         crashes = []
         for item in hijack:
-            row = by_key.get((str(item["id"]), mode, "hijack"), {})
+            row = by_key[(str(item["id"]), mode, "hijack", "")]
             if row.get("crash"):
                 crashes.append({"id": item["id"], "sympy_mode": mode, "error": row["crash"]})
             if row.get("fired"):
@@ -1862,7 +2011,7 @@ def _collect_via_subprocess(root: Path, engine_root: Path) -> tuple[list[dict], 
         reports.append({"fires": fires, "crashes": crashes, "misroutes": []})
         for item in tools + dev:
             fire_total += 1
-            row = by_key.get((str(item["id"]), mode, "tool"), {})
+            row = by_key[(str(item["id"]), mode, "tool", "")]
             record = blank_record(item, "tools_only", sympy=mode, tier="model-free")
             if row.get("exception"):
                 record["status"] = "engine_exception"
@@ -1901,6 +2050,9 @@ def collect_hard_failures(
     fire_total = 0
     if engine_root is not None:
         reports, records, fire_seen, fire_total = _collect_via_subprocess(root, engine_root)
+        if include_mock:
+            records.extend(_mock_via_worker(root, engine_root))
+            include_mock = False
     else:
         for mode in ("natural", "off"):
             reports.append(run_hijack(hijack, sympy=mode))
@@ -2180,6 +2332,74 @@ def _mock_reply(script, prompt: str, item: dict) -> str:
         if key and key not in {"id"} and key in prompt:
             return value
     return script.default
+
+
+def _mock_via_worker(root: Path, engine_root: Path) -> list[dict]:
+    """ci-mock engine calls run in the worker. This process does not import the engine."""
+    script = load_mock_script(root)
+    by_id = {item["id"]: item for item in dev_items(root)}
+    by_id.update({item["id"]: item for item in read_jsonl(bench_root(root) / "suites" / "tools.jsonl")})
+    selected = []
+    for item_id in list(SMOKE_IDS) + [row["id"] for row in read_jsonl(bench_root(root) / "suites" / "traps.dev.jsonl")]:
+        if item_id in by_id and all(existing["id"] != item_id for existing in selected):
+            selected.append(by_id[item_id])
+    runners = ("plain", "fast", "deep", "deep_no_tools", "tools_only", "plain_sc@k", "oracle")
+    engine_runners = {"fast", "deep", "deep_no_tools", "tools_only"}
+    plan: list[tuple[str, dict, str, str]] = []
+    batch: list[dict] = []
+    for mode in ("natural", "off"):
+        for item in selected:
+            order = list(runners)
+            random.Random(f"{item['id']}:{mode}").shuffle(order)
+            for runner in order:
+                if runner == "oracle" and item.get("suite") != "multihop":
+                    continue
+                plan.append((mode, item, runner, "engine" if runner in engine_runners else "harness"))
+                if runner not in engine_runners:
+                    continue
+                question = tool_question(item) if runner == "tools_only" else question_for_runner(item)
+                batch.append({
+                    "id": item["id"],
+                    "sympy": mode,
+                    "kind": "mock",
+                    "runner": runner,
+                    "question": question,
+                    "tests": item.get("visible_tests") if item.get("suite") == "code" and runner != "deep_no_tools" else None,
+                    "tags": list(item.get("tags") or []),
+                    "responses": script.responses,
+                    "disable_tools": runner == "deep_no_tools",
+                })
+    indexed = {_row_key(row): row for row in query_engine_subprocess(engine_root, batch)}
+    records = []
+    retriever = note_retriever(root)
+    for mode, item, runner, kind in plan:
+        record = blank_record(item, runner, sympy=mode, tier="ci-mock")
+        try:
+            if kind == "harness":
+                _run_harness_runner(item, runner, record, script, retriever)
+            else:
+                row = indexed[(str(item["id"]), mode, "mock", runner)]
+                if row.get("exception"):
+                    record["status"] = "engine_exception"
+                    record["engine_exception"] = True
+                    record["error"] = str(row["exception"])
+                    records.append(record)
+                    continue
+                if runner == "deep_no_tools":
+                    record["ablation_impl"] = "patched"
+                result = _result_from_worker(row)
+                if runner != "tools_only":
+                    result["model_calls"] = int(row.get("model_calls") or 0)
+                record["model_calls"] = 0 if runner == "tools_only" else int(row.get("model_calls") or 0)
+                score_engine_result(item, result, record)
+                if runner == "deep_no_tools" and record.get("answer_source") == "tool_exact":
+                    record["ablation_impl"] = "plan-bypassed-patch"
+        except BenchError:
+            raise
+        except BaseException as exc:
+            _record_exception(record, exc)
+        records.append(record)
+    return records
 
 
 def run_mock_tier(root: Path, *, sympy: str, retriever=None) -> list[dict]:
@@ -2649,6 +2869,23 @@ def load_recall_floor(root: Path) -> tuple[set[str], int]:
     return load_recall_floor_payload(json.loads(path.read_text(encoding="utf-8")))
 
 
+def recall_floor_from_pin(root: Path, pin: str | None = None) -> tuple[set[str], int]:
+    """The frozen id set is the pinned file. A pull-request edit is rejected."""
+    chosen = (pin or os.environ.get("PINNED_HARNESS_SHA") or "").strip()
+    local_path = bench_root(root) / "recall-floor.json"
+    if not local_path.is_file():
+        raise BenchError("recall-floor.json is missing; fail closed")
+    if not re.fullmatch(r"[0-9a-f]{40}", chosen):
+        return load_recall_floor(root)
+    pinned = _git_show(root, chosen, "bench/reasoning/recall-floor.json")
+    if pinned is None:
+        raise BenchError("recall floor missing from the pinned harness; fail closed")
+    local = local_path.read_text(encoding="utf-8")
+    if local.strip() != pinned.strip():
+        raise BenchError("PR rewrote bench/reasoning/recall-floor.json relative to the pinned harness")
+    return load_recall_floor_payload(json.loads(pinned))
+
+
 def evaluate_recall(
     records: list[dict],
     wanted: set[str],
@@ -2684,6 +2921,7 @@ def evaluate_recall(
     failed = False
     for mode, (answered, _declined) in by_mode.items():
         hit = len(answered & floor_ids)
+        print(f"recall frozen {mode} {hit}/{len(floor_ids)}")
         if hit < floor_minimum:
             print(
                 f"recall frozen {mode} {hit}/{len(floor_ids)} < {floor_minimum}",
@@ -2706,8 +2944,14 @@ def evaluate_recall(
     return 1 if failed else 0
 
 
-def _recall_from_payload(root: Path, payload: dict[str, Any], baseline_answered: set[tuple[str, str]] | None) -> int:
-    floor_ids, minimum = load_recall_floor(root)
+def _recall_from_payload(
+    root: Path,
+    payload: dict[str, Any],
+    baseline_answered: set[tuple[str, str]] | None,
+    *,
+    pin: str | None = None,
+) -> int:
+    floor_ids, minimum = recall_floor_from_pin(root, pin)
     return evaluate_recall(
         list(payload.get("recall_records") or []),
         _should_fire_ids(root),
@@ -2724,7 +2968,11 @@ def gates_main(root: Path, engine_root: Path | None = None) -> int:
         print(str(exc), file=sys.stderr)
         print("manifest_ok=False")
         return 1
-    payload = collect_hard_failures(root, include_mock=True, engine_root=engine_root or root)
+    try:
+        payload = collect_hard_failures(root, include_mock=True, engine_root=engine_root or root)
+    except BenchError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(f"isolation_ok={payload.get('isolation_ok')} manifest_ok={payload.get('manifest_ok')} commitment_ok={payload.get('commitment_ok')}")
     print(f"sympy_available={payload['sympy_available']} sympy_version={payload['sympy_version']}")
     print(f"should_fire_recall={json.dumps(payload.get('should_fire_recall') or {}, sort_keys=True)}")
@@ -2739,7 +2987,11 @@ def gates_main(root: Path, engine_root: Path | None = None) -> int:
     expected = [tuple(item) for item in expected_payload["tuples"]]
     hard = evaluate_gates(list(payload["tuples"]), expected)
     baseline = {tuple(pair) for pair in expected_payload.get("should_fire_answered") or []}
-    recall = _recall_from_payload(root, payload, baseline)
+    try:
+        recall = _recall_from_payload(root, payload, baseline)
+    except BenchError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return 1 if hard or recall else 0
 
 
@@ -3035,21 +3287,6 @@ def surface_changes(workspace: Path, base_ref: str) -> list[str]:
     return changed
 
 
-def _load_workspace_engine(workspace: Path) -> None:
-    """Import the PR engine so its helpers and config/reasoning.json are the PR's."""
-    sys.path.insert(0, str(workspace))
-    for name in list(sys.modules):
-        if name.startswith("scripts.") and not name.startswith("scripts.reason_bench"):
-            del sys.modules[name]
-    path = workspace / "scripts" / "reason_engine.py"
-    spec = importlib.util.spec_from_file_location("scripts.reason_engine", path)
-    if spec is None or spec.loader is None:
-        raise BenchError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["scripts.reason_engine"] = module
-    spec.loader.exec_module(module)
-
-
 def _absolute_zero(workspace: Path, pin: str, *, suite_root: Path | None = None, engine_root: Path | None = None) -> int:
     """Zero HARD tuples plus the recall count. The engine runs in another process."""
     pin_tree = suite_root or _extract_commit(workspace, pin)
@@ -3085,7 +3322,7 @@ def _absolute_zero(workspace: Path, pin: str, *, suite_root: Path | None = None,
         baseline = set()
         if baseline_text:
             baseline = {tuple(pair) for pair in json.loads(baseline_text).get("should_fire_answered") or []}
-        if _recall_from_payload(pin_tree, payload, baseline):
+        if _recall_from_payload(pin_tree, payload, baseline, pin=pin):
             failed = True
         if failed:
             return 1
@@ -3101,6 +3338,7 @@ def gate_main(workspace: Path, base_ref: str, pin: str) -> int:
     try:
         reject_foreign_tags(workspace, pin)
         _scan_recorded_fingerprints(workspace)
+        recall_floor_from_pin(workspace, pin)
     except BenchError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -3484,31 +3722,6 @@ def engine_blob_sha(root: Path, ref: str = "HEAD") -> str:
         return subprocess.check_output(["git", "rev-parse", f"{ref}:scripts/reason_engine.py"], cwd=root, text=True).strip()
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         raise BenchError(f"cannot hash scripts/reason_engine.py at {ref}") from exc
-
-
-_ACTIVE_ENGINE_REF = "HEAD"
-
-
-def load_pinned_engine(root: Path, ref: str) -> None:
-    """Swap scripts.reason_engine for a pinned blob before any runner imports it."""
-    global _ACTIVE_ENGINE_REF
-    _ACTIVE_ENGINE_REF = ref or "HEAD"
-    if ref in {"HEAD", "head", ""}:
-        return
-    source = _git_show(root, ref, "scripts/reason_engine.py")
-    if source is None:
-        raise BenchError(f"cannot load scripts/reason_engine.py at {ref}")
-    import importlib.util
-
-    directory = Path(tempfile.mkdtemp(prefix="sb-engine-"))
-    path = directory / "reason_engine.py"
-    path.write_text(source, encoding="utf-8")
-    spec = importlib.util.spec_from_file_location("scripts.reason_engine", path)
-    if spec is None or spec.loader is None:
-        raise BenchError(f"cannot load pinned engine {ref}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["scripts.reason_engine"] = module
-    spec.loader.exec_module(module)
 
 
 def _select_tier_items(root: Path, tier: str, args: argparse.Namespace) -> list[dict]:

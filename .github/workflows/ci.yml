@@ -205,6 +205,10 @@ jobs:
 
       - name: Validate, both SymPy passes, ci-mock, and the canary
         run: |
+          set -euo pipefail
+          if [ -n "${{ vars.PINNED_HARNESS_SHA }}" ]; then
+            export PINNED_HARNESS_SHA="${{ vars.PINNED_HARNESS_SHA }}"
+          fi
           uv run --frozen python -m scripts.reason_bench validate
           uv run --frozen python -m scripts.reason_bench gates
 

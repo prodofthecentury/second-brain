@@ -24,6 +24,7 @@ protected=(
   scripts/ci_fingerprint_check.sh
   .github/workflows/ci.yml
   .github/owner-signing-fingerprint
+  bench/reasoning/recall-floor.json
 )
 if git cat-file -e "${pin}:.github/owner-signing-key.asc" 2>/dev/null; then
   protected+=(".github/owner-signing-key.asc")
@@ -68,6 +69,8 @@ cleanup() { rm -rf "$dest" "$venv"; }
 trap cleanup EXIT
 export UV_PROJECT_ENVIRONMENT="$venv"
 uv sync --frozen --extra math --project "$dest"
+# The scorer must not import a copy of the engine. The worker loads the pull-request engine.
+rm -f "$dest/scripts/reason_engine.py"
 cd "$dest"
 uv run --frozen --project "$dest" python -c '
 import sys
