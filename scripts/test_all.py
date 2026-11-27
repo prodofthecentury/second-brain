@@ -184,6 +184,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "fifth_pass_tests.py")),
     ),
     (
+        "reason_engine_tests",
+        "Deep-by-default reasoning engine: exact tools, verification, chat opt-out, and the deterministic benchmark (scripts/reason_engine_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "reason_engine_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),
@@ -200,7 +205,7 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "parity_1c_tests",
-        "1C cross-layer parity: bi-temporal graph API/SDK, 35-tool MCP + ONNX NLI, CLI commands & PWA/clipper manifests/icons (scripts/parity_1c_tests.py)",
+        "1C cross-layer parity: bi-temporal graph API/SDK, 36-tool MCP + ONNX NLI, CLI commands & PWA/clipper manifests/icons (scripts/parity_1c_tests.py)",
         ("-m", "unittest", str(SCRIPTS_DIR / "parity_1c_tests.py")),
     ),
     (

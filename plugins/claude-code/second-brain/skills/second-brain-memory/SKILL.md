@@ -5,7 +5,7 @@ description: Use the owner's local Second Brain for verifiable long-term memory,
 
 # Second Brain Memory
 
-The `second-brain` MCP server exposes 35 audited, scope-enforced tools across verified knowledge, distilled principles/mental models, adversarial debate, self-model curiosity, L0 predictive bus pre-warming, working notes, Stage 4 executable skills, multi-vault federated recall, cognitive planning/verification, Gen-4 hierarchy/concepts/world-model simulation, quantitative symbolic/SafeVerify checks, creative media inspection, git commit distillation, and quarantined/sidecar write paths:
+The `second-brain` MCP server exposes 36 audited, scope-enforced tools across verified knowledge, distilled principles/mental models, adversarial debate, self-model curiosity, L0 predictive bus pre-warming, working notes, Stage 4 executable skills, multi-vault federated recall, cognitive planning/verification, Gen-4 hierarchy/concepts/world-model simulation, quantitative symbolic/SafeVerify checks, creative media inspection, git commit distillation, quarantined/sidecar write paths, and the default deep reasoning engine:
 
 | Tool | Tier | Parameters | Use for |
 | --- | --- | --- | --- |
@@ -44,6 +44,7 @@ The `second-brain` MCP server exposes 35 audited, scope-enforced tools across ve
 | `add_to_inbox` | **Write (Quarantine)** | `content` (max 100,000 chars), `source` (optional origin label) | Stage untrusted external text, pasted articles, or long captures into quarantined `brain/0-raw/inbox/` for owner review |
 | `record_experience` | **Write (Experience)** | `goal`, `result_summary`, `success` (required); optional `context`, `plan`, `actions`, `tools_used`, `referenced_atoms`, `reasoning_summary`, `confidence_before`, `confidence_after`, `new_memories`, `updated_memories`, `candidate_skills`, `reflection`, `lessons`, `propose_to_inbox` | Log a risk-scanned episodic Experience Record to `brain/4-experiences/` (and optionally stage a candidate skill in `0-raw/inbox/`) |
 | `record_feedback` | **Write (Telemetry)** | `atom_id` (required), `helpful` (boolean, required), `project` (optional) | Record helpful/correction utility signals in disposable `telemetry.sqlite3` without mutating canonical owner logs |
+| `reason` | **Reasoning** | `question` (required), `profile` (optional deep or fast, default deep) | Run the reasoning engine. Omit profile for deep. Pass profile fast only for the smaller budget. Deep can take several model calls on a small CPU model. |
 
 ## Workflow
 

@@ -1237,6 +1237,7 @@ class MCPBoundaryTests(unittest.TestCase):
                         "run_debate",
                         "curiosity_gaps",
                         "record_context_signal",
+                        "reason",
                     },
                 )
                 resources = await mcp_server.handle_list_resources(auth_ctx, None)
@@ -2572,6 +2573,7 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
             "real_runtime_tests",
             "speed_restore_tests",
             "fifth_pass_tests",
+            "reason_engine_tests",
             "desktop_ui_tests",
             "vscode_extension_tests",
             "dashboard_apptest_tests",

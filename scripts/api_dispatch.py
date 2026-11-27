@@ -346,6 +346,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                     "behavior_mode": req.behavior_mode,
                     "custom_rules": req.custom_rules,
                     "done_criteria": req.done_criteria,
+                    "profile": req.profile,
                 }
                 if req.thread_id:
                     ce_kwargs["thread_id"] = req.thread_id

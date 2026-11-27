@@ -1,6 +1,6 @@
 # Second Brain Plugin for Claude Code
 
-Local-first verifiable memory integration (`second-brain`) for Claude Code, combining **Gen-4 automatic lifecycle recall & closed-loop episodic logging** (`~/.claude/settings.json` hooks) with **all 35 audited, project-scoped MCP tools on demand** over local stdio:
+Local-first verifiable memory integration (`second-brain`) for Claude Code, combining **Gen-4 automatic lifecycle recall & closed-loop episodic logging** (`~/.claude/settings.json` hooks) with **all 36 audited, project-scoped MCP tools on demand** over local stdio:
 - **Automatic Gen-4 Cognitive Lifecycle Hooks (`~/.claude/settings.json`)**:
   - `SessionStart`: surfaces active verified Skill Playbooks, active Stage 4 Executable Skills, active owner-promoted Principles & Mental Models, workspace-scoped verified atoms, fast structural contradiction/drift alerts (`enable_nli=False`), and open project action items once at session start.
   - `UserPromptSubmit`: deduplicates per session using per-conversation lock-free state files, checks the L0 Predictive Memory Bus, prevents workspace recall starvation by prioritizing scoped project atoms alongside global memories, surfaces relevant Principles/Mental Models, Playbooks, inline contradiction warnings, concise `meta_router` tool hints, and scoped working notes wrapped in `<second_brain_auto_context untrusted="true">`. Set `BRAIN_HOOK_AUTO_RECALL=0` to disable automatic injection while keeping on-demand MCP tools active.

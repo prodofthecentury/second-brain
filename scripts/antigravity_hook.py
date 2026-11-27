@@ -870,7 +870,7 @@ def _wrap_context_block(
         "Cite verified atoms as [verified: <file>], active playbooks as [playbook: <id>], active skills as [skill: <id>], "
         "active principles as [principle: <id>], active mental models as [mental-model: <id>], "
         "and working notes as [note: <file>] (explicitly labeled as unverified owner notes). "
-        "All 35 Second Brain MCP tools remain available on-demand for deeper queries.\n\n"
+        "All 36 Second Brain MCP tools remain available on-demand for deeper queries. Call reason first for a question, plan, or build. The default profile is deep.\n\n"
     )
     footer = "\n</second_brain_auto_context>"
     body = "\n\n".join(s for s in sections if s.strip())

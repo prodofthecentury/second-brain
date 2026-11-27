@@ -116,3 +116,11 @@ jobs:
         run: |
           uv run --locked --python 3.11 python -m unittest \
             scripts.real_runtime_tests.RealRuntimeTests.test_hermes_distills_the_same_fixtures
+
+      - name: Compare the reasoning engine with llama3.2:3b and hermes3:3b
+        env:
+          BRAIN_REQUIRE_OLLAMA: "1"
+          BRAIN_OLLAMA_TIMEOUT: "90"
+        run: |
+          uv run --locked --python 3.11 python -m unittest \
+            scripts.reason_engine_tests.ReasonBenchmarkTests.test_live_models_are_recorded_when_ollama_is_required

@@ -611,6 +611,19 @@ class ApiAnswerRequest(BaseModel):
     include_expired: bool = False
     as_of: str | None = Field(default=None, max_length=64)
     history: list[ApiChatHistoryItem] = Field(default_factory=list, max_length=20)
+    profile: str | None = None
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def _coerce_profile(cls, v: object) -> str | None:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        if not isinstance(v, str):
+            raise ValueError("profile must be 'deep' or 'fast'.")
+        cleaned = v.strip().lower()
+        if cleaned not in {"deep", "fast"}:
+            raise ValueError("profile must be 'deep' or 'fast'.")
+        return cleaned
 
     @field_validator("model_override")
     @classmethod
@@ -1769,6 +1782,37 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                         {"error": "403 Forbidden: subjective preference mode requires owner authorization."},
                     )
                     return
+                from scripts.reason_engine import delegation_trace, reason, resolve_profile
+
+                if resolve_profile(req.profile) != "fast":
+                    solved = reason(req.query, profile=req.profile, use_default_model=False)
+                    if solved.get("problem_type") in {"math", "date", "unit"} and not solved.get("abstained"):
+                        _audit_api_event(rt.brain_dir, path, "POST", 200)
+                        self._send_json(
+                            200,
+                            {
+                                "answerable": True,
+                                "mode": req.mode,
+                                "host_id": req.host_id,
+                                "latency_ms": solved.get("elapsed_ms"),
+                                "resolved_query": req.query,
+                                "query_expanded": False,
+                                "text": solved.get("answer"),
+                                "reason": f"tool:{solved.get('problem_type')}",
+                                "claims": [],
+                                "reasoning": {
+                                    "engine": True,
+                                    "profile": solved.get("profile"),
+                                    "problem_type": solved.get("problem_type"),
+                                    "steps": solved.get("steps"),
+                                    "citations": solved.get("citations"),
+                                    "confidence": solved.get("confidence"),
+                                    "model_calls": solved.get("model_calls"),
+                                    "latency_note": solved.get("latency_note"),
+                                },
+                            },
+                        )
+                        return
                 projects = (req.project_scope.strip(),) if req.project_scope and req.project_scope.strip() else ()
                 from scripts.chat_threads import resolve_followup_query
 
@@ -1858,6 +1902,8 @@ class MemoryApiRequestHandler(BaseHTTPRequestHandler):
                 }
                 if req.mode == "research":
                     answer_payload["unverified_leads"] = [lead.as_dict() for lead in ans.unverified_leads]
+                if resolve_profile(req.profile) != "fast":
+                    answer_payload["reasoning"] = delegation_trace(req.query, profile=req.profile)
                 self._send_json(200, answer_payload)
                 return
 
@@ -2124,6 +2170,7 @@ class MemoryApiClient:
         include_expired: bool = False,
         as_of: str | None = None,
         history: list[dict[str, str]] | None = None,
+        profile: str | None = None,
     ) -> dict[str, object]:
         body: dict[str, object] = {
             "query": query,
@@ -2138,6 +2185,8 @@ class MemoryApiClient:
             body["as_of"] = as_of
         if history:
             body["history"] = list(history)
+        if profile:
+            body["profile"] = profile
         return self._request("POST", "/v1/answer", body)
 
     def list_chat_threads(
@@ -2213,6 +2262,7 @@ class MemoryApiClient:
         include_expired: bool = False,
         as_of: str | None = None,
         history: list[dict[str, str]] | None = None,
+        profile: str | None = None,
     ) -> list[dict[str, object]]:
         payload: dict[str, object] = {
             "query": query,
@@ -2232,6 +2282,8 @@ class MemoryApiClient:
             payload["thread_id"] = thread_id
         if history:
             payload["history"] = list(history)
+        if profile:
+            payload["profile"] = profile
         events: list[dict[str, object]] = []
         with httpx.Client(timeout=self._timeout, follow_redirects=False, trust_env=False) as client:
             with client.stream("POST", f"{self.base_url}/v1/chat/stream", headers=self._headers, json=payload) as resp:

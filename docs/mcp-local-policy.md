@@ -28,7 +28,7 @@ try {
 }
 ```
 
-## Complete 35-Tool Catalog (`scripts/mcp_server.py:TOOL_NAMES`)
+## Complete 36-Tool Catalog (`scripts/mcp_server.py:TOOL_NAMES`)
 
 | Tier / Trust Boundary | Tool Name | Behavior & Epistemic Guarantee |
 | --- | --- | --- |
@@ -67,3 +67,4 @@ try {
 | **Quarantined Intake & Episodic** | `record_experience` | Appends create-only episodic record in `4-experiences/`. |
 | **Sidecar Cache & Telemetry Only** | `record_context_signal` | Pre-warms the disposable L0 Predictive Memory Bus cache from risk-scanned IDE context signals without mutating canonical stores. |
 | **Sidecar Cache & Telemetry Only** | `record_feedback` | Updates disposable sidecar telemetry (`agent_negative_feedback`); cannot deactivate playbooks or alter trust. |
+| **Reasoning** | `reason` | Default deep reasoning engine. Exact arithmetic, dates, and units use tools. Other questions are checked and abstain when unverified. Omit `profile` for deep. `profile` `fast` is the smaller budget, not a bypass of the engine. |

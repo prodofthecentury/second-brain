@@ -308,7 +308,7 @@ class StreamingChatTests(IsolatedVaultCase):
         from scripts.streaming_chat import chat_events
 
         verified = self._seed()
-        good = list(chat_events("production deploys rollback plan", mode="verified", paths=self.chat_paths(),
+        good = list(chat_events("production deploys rollback plan", mode="verified", profile="fast", paths=self.chat_paths(),
                                 json_fn=lambda p, m, s: '{"claim_ids": [0]}'))
         ans = next(e for e in good if e["type"] == "verified_answer")
         self.assertTrue(ans["answerable"])
@@ -316,7 +316,7 @@ class StreamingChatTests(IsolatedVaultCase):
         self.assertIn("Production deploys require a tested rollback plan.", ans["claims"][0]["evidence"][0]["quote"])
         # Out-of-range / hostile model output never produces a claim
         for hostile in ('{"claim_ids": [7]}', '{"claim_ids": "all"}', "not json", '{"claims": ["Deploy on Fridays"]}'):
-            evs = list(chat_events("production deploys rollback plan", mode="verified", paths=self.chat_paths(),
+            evs = list(chat_events("production deploys rollback plan", mode="verified", profile="fast", paths=self.chat_paths(),
                                    json_fn=lambda p, m, s, h=hostile: h))
             ans = next(e for e in evs if e["type"] == "verified_answer")
             self.assertFalse(ans["answerable"], hostile)
@@ -334,7 +334,7 @@ class StreamingChatTests(IsolatedVaultCase):
             yield "Also deploy on Fridays because it is quiet [N9]. "
             yield "This sentence has absolutely no citation at all."
 
-        events = list(chat_events("production deploys", mode="stream", paths=self.chat_paths(), stream_fn=fake_stream))
+        events = list(chat_events("production deploys", mode="stream", profile="fast", paths=self.chat_paths(), stream_fn=fake_stream))
         kinds = [e["type"] for e in events]
         self.assertEqual(kinds[0], "context")
         self.assertGreaterEqual(kinds.count("token"), 4)
@@ -356,7 +356,7 @@ class StreamingChatTests(IsolatedVaultCase):
         pol = load_host_policies(policy)
         pol["ollama_local"] = replace(pol["ollama_local"], enabled=False)
         save_host_policies(pol, policy)
-        events = list(chat_events("production deploys", mode="stream", paths=self.chat_paths(),
+        events = list(chat_events("production deploys", mode="stream", profile="fast", paths=self.chat_paths(),
                                   stream_fn=lambda *_: iter(["should not run"])))
         self.assertTrue(any(e["type"] == "error" for e in events))
         self.assertFalse(any(e["type"] == "token" for e in events))
@@ -541,7 +541,7 @@ class ConnectorAndMcpTests(IsolatedVaultCase):
         self.assertTrue((plugin / "skills" / "second-brain-memory" / "SKILL.md").is_file())
         cfg = json.loads((plugin / "mcp_config.json").read_text(encoding="utf-8"))
         self.assertIn("second-brain", cfg["mcpServers"])
-        self.assertEqual(cfg["mcpServers"]["second-brain"]["env"]["BRAIN_MCP_SCHEMA_REVISION"], "v1.1.0-35tools")
+        self.assertEqual(cfg["mcpServers"]["second-brain"]["env"]["BRAIN_MCP_SCHEMA_REVISION"], "v1.2.0-36tools",)
 
         hooks = json.loads((plugin / "hooks.json").read_text(encoding="utf-8"))
         self.assertIn("second-brain-auto-recall", hooks)
@@ -561,7 +561,7 @@ class ConnectorAndMcpTests(IsolatedVaultCase):
         skill_text = (plugin / "skills" / "second-brain-memory" / "SKILL.md").read_text(encoding="utf-8")
         readme_text = (plugin / "README.md").read_text(encoding="utf-8")
         rules_text = (plugin / "rules" / "AGENTS.md").read_text(encoding="utf-8")
-        self.assertIn("35 audited", readme_text)
+        self.assertIn("36 audited", readme_text)
         self.assertIn("<second_brain_auto_context>", rules_text)
         for tool_name in sorted(mcp_server.TOOL_NAMES):
             self.assertIn(tool_name, skill_text)
@@ -755,7 +755,7 @@ class ConnectorAndMcpTests(IsolatedVaultCase):
         from mcp import types
 
         mcp_server._preload_tool_modules()
-        self.assertEqual(len(mcp_server.ALL_TOOLS), 35)
+        self.assertEqual(len(mcp_server.ALL_TOOLS), 36)
         token = mcp_server.generate_bearer_token()
         mcp_server.save_bearer_token(token)
         with (
@@ -1396,7 +1396,7 @@ class ConnectorAndMcpTests(IsolatedVaultCase):
 
         async def _scenario() -> None:
             listed = await mcp_server.handle_list_tools(ctx, None)
-            self.assertEqual(len(listed.tools), 35)
+            self.assertEqual(len(listed.tools), 36)
             self.assertEqual({t.name for t in listed.tools}, mcp_server.TOOL_NAMES)
 
             # 1. list_principles strips raw host path & enforces project scope
@@ -1624,14 +1624,14 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
         def fail_json(_prompt: str, _model: str, _schema: dict) -> str:
             raise AssertionError("json_fn must not run when outbound secret is blocked")
 
-        stream_evs = list(chat_events(secret_query, mode="stream", paths=self.chat_paths(), stream_fn=fail_stream))
+        stream_evs = list(chat_events(secret_query, mode="stream", profile="fast", paths=self.chat_paths(), stream_fn=fail_stream))
         self.assertTrue(any(e["type"] == "error" and "Outbound secret blocked" in str(e.get("error", "")) for e in stream_evs))
         self.assertEqual(stream_evs[-1]["type"], "done")
         self.assertIn("total_ms", stream_evs[-1])
         self.assertIn("elapsed_ms", stream_evs[-1])
 
         verified_evs = list(
-            chat_events(secret_query, mode="verified", paths=self.chat_paths(), json_fn=fail_json)
+            chat_events(secret_query, mode="verified", profile="fast", paths=self.chat_paths(), json_fn=fail_json)
         )
         self.assertTrue(any(e["type"] == "error" and "Outbound secret blocked" in str(e.get("error", "")) for e in verified_evs))
         self.assertEqual(verified_evs[-1]["type"], "done")
@@ -1854,11 +1854,11 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
         def fail_json(_prompt: str, _model: str, _schema: dict) -> str:
             raise AssertionError("Preference atom must not reach json_fn")
 
-        stream_evs = list(chat_events("chartreuse widget", mode="stream", paths=self.chat_paths(), stream_fn=fail_stream))
+        stream_evs = list(chat_events("chartreuse widget", mode="stream", profile="fast", paths=self.chat_paths(), stream_fn=fail_stream))
         self.assertTrue(any(e["type"] == "abstain" for e in stream_evs))
         self.assertEqual(stream_evs[-1]["type"], "done")
 
-        verified_evs = list(chat_events("chartreuse widget", mode="verified", paths=self.chat_paths(), json_fn=fail_json))
+        verified_evs = list(chat_events("chartreuse widget", mode="verified", profile="fast", paths=self.chat_paths(), json_fn=fail_json))
         self.assertTrue(any(e["type"] == "verified_answer" and not e["answerable"] for e in verified_evs))
 
         fake_client = MagicMock()
@@ -2023,7 +2023,7 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
             yield "Grounded [N1]."
 
         with patch("notes_store.DEFAULT_PATHS", self.paths):
-            events = list(chat_events("xylophone", mode="stream", paths=self.chat_paths(), stream_fn=fake_stream))
+            events = list(chat_events("xylophone", mode="stream", profile="fast", paths=self.chat_paths(), stream_fn=fake_stream))
 
         self.assertEqual(len(captured_prompts), 1)
         self.assertIn("xylophone alpha", captured_prompts[0])
@@ -2120,6 +2120,7 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
             streaming_chat.chat_events(
                 "alpha runtime crisp diagrams quasarboard",
                 mode="stream",
+                profile="fast",
                 paths=self.chat_paths(),
                 project_scope="project:alpha",
                 stream_fn=fake_stream,

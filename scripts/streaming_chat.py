@@ -222,6 +222,19 @@ class ChatStreamRequest(BaseModel):
     custom_rules: str | None = Field(default=None, max_length=4000)
     done_criteria: str | None = Field(default=None, max_length=2000)
     history: list[ChatHistoryItem] = Field(default_factory=list, max_length=20)
+    profile: str | None = None
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def _coerce_profile(cls, v: object) -> str | None:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        if not isinstance(v, str):
+            raise ValueError("profile must be 'deep' or 'fast'.")
+        cleaned = v.strip().lower()
+        if cleaned not in {"deep", "fast"}:
+            raise ValueError("profile must be 'deep' or 'fast'.")
+        return cleaned
 
     @field_validator("work_mode", mode="before")
     @classmethod
@@ -1305,14 +1318,57 @@ def chat_events(
     behavior_mode: str | None = None,
     custom_rules: str | None = None,
     done_criteria: str | None = None,
+    profile: str | None = None,
 ) -> Iterator[dict[str, object]]:
-    """Yield chat events: context → (tokens|verified_answer) → grounding → [research_leads] → done."""
+    """Yield chat events. The default profile is deep and goes through the reasoning engine."""
     if mode not in CHAT_MODES:
         raise ValueError(f"mode must be one of {CHAT_MODES}")
     if retrieval_mode not in RETRIEVAL_MODES:
         raise ValueError(f"retrieval_mode must be one of {RETRIEVAL_MODES}")
     if answer_view not in ANSWER_VIEWS:
         raise ValueError(f"answer_view must be one of {ANSWER_VIEWS}")
+    from scripts.reason_engine import delegation_trace, reason, resolve_profile
+
+    resolved_profile = resolve_profile(profile)
+    if resolved_profile != "fast" and mode not in {"stream", "verified"}:
+        delegated = list(
+            chat_events(
+                query,
+                mode=mode,
+                paths=paths,
+                project_scope=project_scope,
+                stream_fn=stream_fn,
+                json_fn=json_fn,
+                model_override=model_override,
+                include_preferences=include_preferences,
+                host_id=host_id,
+                retrieval_mode=retrieval_mode,
+                allow_cross_project=allow_cross_project,
+                answer_view=answer_view,
+                allow_unverified_leads=allow_unverified_leads,
+                thread_id=thread_id,
+                history=history,
+                include_expired=include_expired,
+                as_of=as_of,
+                work_mode=work_mode,
+                persona_id=persona_id,
+                behavior_mode=behavior_mode,
+                custom_rules=custom_rules,
+                done_criteria=done_criteria,
+                profile="fast",
+            )
+        )
+        trace = delegation_trace(query, profile=resolved_profile)
+        for event in delegated:
+            if event.get("type") == "done":
+                event = {
+                    **event,
+                    "answer_source": trace.get("answer_source"),
+                    "verified": bool(trace.get("verified")),
+                    "reasoning": trace,
+                }
+            yield event
+        return
     paths = paths or ChatPaths()
     started = time.perf_counter()
     active_host_id = (host_id or "ollama_local").strip() or "ollama_local"
@@ -1396,6 +1452,173 @@ def chat_events(
 
     retrieval_query, query_expanded = resolve_followup_query(query, combined_history)
     history_block = format_history_for_prompt(combined_history)
+    # Deep stream runs the engine. Verified mode keeps claim selection and preference views.
+    if resolved_profile != "fast" and mode == "stream":
+        from scripts.reason_engine import retrieve_atoms, tool_chat_events
+
+        if getattr(context_rule, "transport", "") == "online":
+            try:
+                enforce_vault_online_policy(
+                    context_rule,
+                    brain_dir=paths.brain_dir,
+                    policy_path=paths.policy_path,
+                    security_dir=paths.security_dir,
+                )
+            except HostConsentError as exc:
+                yield {"type": "error", "error": str(exc)}
+                elapsed = round((time.perf_counter() - started) * 1000, 1)
+                yield {
+                    "type": "done",
+                    "total_ms": elapsed,
+                    "elapsed_ms": elapsed,
+                    "answer_source": "abstain",
+                    "verified": False,
+                }
+                return
+
+        def _engine_model(prompt: str) -> str:
+            fn = stream_fn
+            model_name = model_override or ""
+            if fn is None:
+                rule, pinned_target = _resolve_chat_host_rule(
+                    active_host_id,
+                    paths.policy_path,
+                    brain_dir=paths.brain_dir,
+                    security_dir=paths.security_dir,
+                    http_transport=paths.http_transport,
+                    skip_dns_check_for_mock_transport=paths.skip_dns_check_for_mock_transport,
+                )
+                from scripts.hardware_profile import model_for_local_rule
+
+                model_name = validate_model_identifier(
+                    model_for_local_rule(rule.default_model, model_override),
+                    provider=rule.provider,
+                )
+                fn = _provider_stream_fn(
+                    rule,
+                    http_transport=paths.http_transport,
+                    pinned_target=pinned_target,
+                )
+            return "".join(str(part) for part in fn(prompt, model_name))
+
+        def _engine_retriever(question: str) -> list[dict[str, Any]]:
+            return retrieve_atoms(
+                question,
+                atoms_dir=paths.atoms_dir,
+                index_path=paths.lexical_index_path,
+                chroma_path=paths.chroma_path,
+            )
+
+        routed = reason(
+            retrieval_query,
+            profile=resolved_profile,
+            model_fn=_engine_model,
+            retriever=_engine_retriever,
+            atoms_dir=paths.atoms_dir,
+            index_path=paths.lexical_index_path,
+            chroma_path=paths.chroma_path,
+            use_default_model=False,
+        )
+        answer_text = str(routed.get("answer") or "")
+        if active_thread_id and answer_text:
+            try:
+                append_chat_turn(
+                    active_thread_id,
+                    role="user",
+                    content=query,
+                    resolved_query=retrieval_query if query_expanded else None,
+                    answer_mode=mode,
+                    host_id=active_host_id,
+                    brain_dir=paths.brain_dir,
+                )
+                append_chat_turn(
+                    active_thread_id,
+                    role="assistant",
+                    content=answer_text,
+                    answer_mode=mode,
+                    host_id=active_host_id,
+                    grounding={
+                        "answer_source": routed.get("answer_source"),
+                        "verified": bool(routed.get("verified")),
+                    },
+                    brain_dir=paths.brain_dir,
+                )
+            except Exception:
+                pass
+        events = list(tool_chat_events(routed))
+        source_name = str(routed.get("answer_source") or "")
+        if source_name in {"model", "memory"}:
+            try:
+                raw_ctx = retrieve_context(
+                    retrieval_query,
+                    paths,
+                    project_scope=project_scope,
+                    retrieval_mode=retrieval_mode,
+                    allow_cross_project=allow_cross_project,
+                    include_expired=bool(include_expired),
+                    as_of=as_of,
+                )
+                ctx = _filter_and_redact_context(raw_ctx, context_rule)
+                if not include_preferences or answer_view == "research":
+                    ctx = {
+                        **ctx,
+                        "preferences": [],
+                        "sources": [s for s in ctx["sources"] if s.get("tier") != "preference"],
+                    }
+                grounding = check_citations(
+                    answer_text,
+                    list(ctx.get("verified") or []),
+                    list(ctx.get("notes") or []),
+                    list(ctx.get("preferences") or []),
+                )
+                grounding["host_id"] = active_host_id
+                grounding["retrieval_mode"] = retrieval_mode
+                events[0] = _public(ctx)
+                events = [
+                    grounding if event.get("type") == "grounding" else event
+                    for event in events
+                ]
+            except (ValueError, OSError, HostConsentError):
+                pass
+        if bool(allow_unverified_leads) and answer_view == "research":
+            research_leads = collect_unverified_leads(
+                retrieval_query,
+                atoms_dir=paths.atoms_dir,
+                brain_dir=paths.brain_dir,
+                index_path=paths.lexical_index_path,
+                chroma_path=paths.chroma_path,
+                project_scope=project_scope,
+                allow_cross_project=allow_cross_project,
+                retrieval_mode=retrieval_mode,
+                include_quarantined_inbox=bool(paths.include_quarantined_inbox or allow_unverified_leads),
+            )
+            if research_leads:
+                leads_payload = [
+                    {
+                        "id": f"L{i}",
+                        "filename": lead.lead_id,
+                        "status": lead.review_status,
+                        "claim": lead.summary,
+                        "excerpt": lead.summary,
+                        **lead.as_dict(),
+                    }
+                    for i, lead in enumerate(research_leads, start=1)
+                ]
+                events.insert(
+                    -1,
+                    {
+                        "type": "research_leads",
+                        "label": "UNVERIFIED LEADS — NOT OWNER-APPROVED",
+                        "text": format_unverified_leads_section(research_leads),
+                        "unverified_leads": leads_payload,
+                        "leads": leads_payload,
+                    },
+                )
+        for event in events:
+            if event.get("type") == "done" and active_thread_id:
+                event = {**event, "thread_id": active_thread_id}
+            yield event
+        return
 
     try:
         raw_ctx = retrieve_context(
@@ -1512,6 +1735,15 @@ def chat_events(
         evt_done: dict[str, object] = {"type": "done", "total_ms": elapsed_val, "elapsed_ms": elapsed_val}
         if active_thread_id:
             evt_done["thread_id"] = active_thread_id
+        if resolved_profile != "fast":
+            evt_done["answer_source"] = "model"
+            evt_done["verified"] = False
+            evt_done["reasoning"] = {
+                "engine": True,
+                "profile": resolved_profile,
+                "answer_source": "model",
+                "verified": False,
+            }
         return evt_done
 
     yield _public(ctx)
@@ -2208,6 +2440,7 @@ def _render_chat_turn(
     json_fn: JsonFn | None = None,
     json_output: bool = False,
     print_fn: Callable[..., None] = print,
+    profile: str | None = None,
 ) -> dict[str, Any]:
     """Stream and render a single query turn via `chat_events`, returning turn summary metadata."""
     resolved_thread_id = thread_id if (thread_id and thread_id != "new") else ""
@@ -2233,6 +2466,7 @@ def _render_chat_turn(
         allow_unverified_leads=allow_unverified_leads,
         thread_id=thread_id,
         history=history,
+        profile=profile,
     ):
         kind = event.get("type")
         if kind == "context" and event.get("thread_id"):
@@ -2339,6 +2573,7 @@ def run_interactive_chat_repl(
     json_output: bool = False,
     input_fn: Callable[[str], str] | None = None,
     print_fn: Callable[..., None] | None = None,
+    profile: str | None = None,
 ) -> int:
     """Run an interactive multi-turn terminal chat loop backed by `chat_events()`."""
     if mode not in CHAT_MODES:
@@ -2471,6 +2706,7 @@ def run_interactive_chat_repl(
                 json_fn=json_fn,
                 json_output=json_output,
                 print_fn=emit,
+                profile=profile,
             )
         except Exception as exc:
             emit(f"! Error processing turn: {exc}")
@@ -2524,6 +2760,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("query", nargs="?", default="", help="Chat question (omit to start interactive REPL, or use --list-threads / --pin).")
     parser.add_argument("--interactive", action="store_true", help="Start interactive multi-turn terminal chat REPL.")
     parser.add_argument("--mode", choices=CHAT_MODES, default="stream")
+    parser.add_argument(
+        "--profile",
+        choices=("deep", "fast"),
+        default=None,
+        help="Reasoning profile. Default is deep (the engine). fast is the single-pass chat path.",
+    )
     parser.add_argument("--retrieval-mode", "--retrieval", dest="retrieval_mode", choices=RETRIEVAL_MODES, default="lexical")
     parser.add_argument("--host-id", "--host", dest="host_id", default="ollama_local", help="Host policy id (default ollama_local).")
     parser.add_argument("--view", "--answer-mode", dest="answer_view", choices=ANSWER_VIEWS, default="standard", help="Answer view (standard/preference/research).")
@@ -2653,6 +2895,7 @@ def main(argv: list[str] | None = None) -> int:
             pin_title=args.pin_title,
             pin_tags=parsed_pin_tags,
             json_output=bool(args.json),
+            profile=args.profile,
         )
 
     turn_summary = _render_chat_turn(
@@ -2669,6 +2912,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_unverified_leads=bool(args.answer_view == "research" or args.mode == "research"),
         thread_id=chosen_thread_id,
         json_output=bool(args.json),
+        profile=args.profile,
     )
 
     if args.pin is not None and turn_summary["thread_id"] and not turn_summary["saw_error_or_abstain"]:

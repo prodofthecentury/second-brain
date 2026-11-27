@@ -10,7 +10,7 @@ Feature 4 — Native MCP Server
 Exposes a bounded, scope-enforced, audited MCP (Model Context Protocol) interface
 to a trusted local stdio process. It is disabled unless BRAIN_ENABLE_LOCAL_MCP=1 is set.
 
-Tools exposed (35 total):
+Tools exposed (36 total):
   search_memory(query, n_results?, project?)       — Shared recall over currently approved atoms
   get_atom(atom_id)                                — Read a specifically named, currently approved atom
   add_to_inbox(content, source?)                   — Add a size-limited, untrusted capture to 0-raw/inbox/
@@ -46,6 +46,7 @@ Tools exposed (35 total):
   distill_git_commits(repo?, project?, ...)        — Distill recent Git commits to 4-experiences/ & quarantined inbox
   record_experience(goal, result_summary, ...)     — Record risk-scanned episodic experience in 4-experiences/
   record_feedback(atom_id, helpful, project?)      — Record disposable sidecar telemetry feedback
+  reason(question, profile?)                       — Deep reasoning engine. Profile defaults to deep.
 
 Resources: no listable resource catalog; direct approved atom resources only.
 Tool/resource use is audited by canonical name and timestamp; input text is not logged.
@@ -81,6 +82,7 @@ import glob
 import hashlib
 import hmac
 import inspect
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -185,6 +187,7 @@ TOOL_NAMES = {
     "run_debate",
     "curiosity_gaps",
     "record_context_signal",
+    "reason",
 }
 UNAVAILABLE_ATOM_MESSAGE = "Atom not found or not currently owner-approved for external reading."
 UNAVAILABLE_PLAYBOOK_MESSAGE = "Playbook not found or not currently active in scope."
@@ -1184,6 +1187,32 @@ ALL_TOOLS = (
                 "open_symbols": {"type": "array", "items": {"type": "string"}, "description": "Optional list of active symbols or identifiers."},
                 "cursor_topic": {"type": "string", "maxLength": 260, "description": "Optional current editing topic or intent."},
             },
+        },
+    ),
+    types.Tool(
+        name="reason",
+        description=(
+            "Default deep reasoning for a question, plan, or build. Exact arithmetic, dates, and unit conversions "
+            "use tools. Other questions are planned, checked against retrieved memory when a model is available, "
+            "and abstain when the result is not verified. Omit profile for deep. Pass profile fast only for the "
+            "smaller step and model budget. Deep can take several model calls on a small CPU model."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "maxLength": 4000, "description": "Question, plan, or build request."},
+                "profile": {
+                    "type": "string",
+                    "enum": ["deep", "fast"],
+                    "description": "Default deep. fast keeps the engine and uses the smaller budget.",
+                },
+                "tests": {
+                    "type": "string",
+                    "maxLength": 4000,
+                    "description": "Optional Python asserts. They are appended to generated code and run in the sandbox. They are not shown back as the answer.",
+                },
+            },
+            "required": ["question"],
         },
     ),
     ]
@@ -2933,6 +2962,39 @@ async def handle_call_tool(_ctx, params: types.CallToolRequestParams) -> types.C
             content=[types.TextContent(type="text", text=json.dumps(sig_res, indent=2, ensure_ascii=False))]
         )
 
+    elif name == "reason":
+        from scripts.reason_engine import reason as _reason
+
+        question = str(arguments.get("question") or "").strip()
+        if not question:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Invalid reason request: 'question' must be a non-empty string.")],
+                isError=True,
+            )
+        if len(question) > 4000:
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Invalid reason request: question is too long.")],
+                isError=True,
+            )
+        profile_arg = arguments.get("profile")
+        tests_arg = arguments.get("tests")
+        try:
+            reasoned = await asyncio.to_thread(
+                _reason,
+                question,
+                profile=None if profile_arg in (None, "") else str(profile_arg),
+                tests=None if tests_arg in (None, "") else str(tests_arg),
+                atoms_dir=vdirs.get("atoms_dir"),
+                index_path=vdirs.get("lexical_index_path"),
+                chroma_path=vdirs.get("chroma_path"),
+                use_default_model=True,
+            )
+        except ValueError as exc:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], isError=True)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(reasoned, indent=2, ensure_ascii=False))]
+        )
+
     return types.CallToolResult(content=[types.TextContent(type="text", text=f"Unknown tool: {name}")], isError=True)
 
 
@@ -2972,10 +3034,13 @@ async def handle_read_resource(_ctx, params: types.ReadResourceRequestParams) ->
     return types.ReadResourceResult(contents=[])
 
 
+from scripts.reason_engine import server_instructions as _reason_instructions
+
 app = (
     Server(
         "second-brain",
         version="1.0.0",
+        instructions=_reason_instructions(),
         on_list_tools=handle_list_tools,
         on_call_tool=handle_call_tool,
         on_list_resources=handle_list_resources,

@@ -1,0 +1,62 @@
+{
+  "name": "reason-stage1",
+  "note": "Deterministic items must be solved by tools with no model. Model rows are a comparison, not a claim that a 3B model is accurate.",
+  "items": [
+    {
+      "id": "arith-17-23-9",
+      "kind": "math",
+      "question": "What is 17 * 23 + 9?",
+      "answer": "400",
+      "requires_model": false
+    },
+    {
+      "id": "gsm-pens",
+      "kind": "math",
+      "question": "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?",
+      "answer": "101",
+      "requires_model": true
+    },
+    {
+      "id": "thousands-1500-20",
+      "kind": "math",
+      "question": "What is 1,500 + 20?",
+      "answer": "1520",
+      "requires_model": false
+    },
+    {
+      "id": "signed-minus-5-plus-3",
+      "kind": "math",
+      "question": "What is -5 + 3?",
+      "answer": "-2",
+      "requires_model": false
+    },
+    {
+      "id": "date-14-days",
+      "kind": "date",
+      "question": "What date is 14 days after 2026-11-27?",
+      "answer": "2026-12-11",
+      "requires_model": false
+    },
+    {
+      "id": "days-between",
+      "kind": "date",
+      "question": "How many days between 2026-11-01 and 2026-11-27?",
+      "answer": "26",
+      "requires_model": false
+    },
+    {
+      "id": "unit-km",
+      "kind": "unit",
+      "question": "Convert 3 km to m.",
+      "answer": "3000",
+      "requires_model": false
+    },
+    {
+      "id": "unit-celsius",
+      "kind": "unit",
+      "question": "Convert 100 C to F.",
+      "answer": "212",
+      "requires_model": false
+    }
+  ]
+}
