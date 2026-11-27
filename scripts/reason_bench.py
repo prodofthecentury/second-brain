@@ -2869,17 +2869,18 @@ def load_recall_floor(root: Path) -> tuple[set[str], int]:
     return load_recall_floor_payload(json.loads(path.read_text(encoding="utf-8")))
 
 
-def recall_floor_from_pin(root: Path, pin: str | None = None) -> tuple[set[str], int]:
+def recall_floor_from_pin(root: Path, pin: str | None = None, *, git_root: Path | None = None) -> tuple[set[str], int]:
     """The frozen id set is the pinned file. A pull-request edit is rejected."""
     chosen = (pin or os.environ.get("PINNED_HARNESS_SHA") or "").strip()
-    local_path = bench_root(root) / "recall-floor.json"
-    if not local_path.is_file():
-        raise BenchError("recall-floor.json is missing; fail closed")
     if not re.fullmatch(r"[0-9a-f]{40}", chosen):
         return load_recall_floor(root)
-    pinned = _git_show(root, chosen, "bench/reasoning/recall-floor.json")
+    repo = git_root or root
+    pinned = _git_show(repo, chosen, "bench/reasoning/recall-floor.json")
     if pinned is None:
         raise BenchError("recall floor missing from the pinned harness; fail closed")
+    local_path = bench_root(repo) / "recall-floor.json"
+    if not local_path.is_file():
+        raise BenchError("recall-floor.json is missing; fail closed")
     local = local_path.read_text(encoding="utf-8")
     if local.strip() != pinned.strip():
         raise BenchError("PR rewrote bench/reasoning/recall-floor.json relative to the pinned harness")
@@ -2950,8 +2951,9 @@ def _recall_from_payload(
     baseline_answered: set[tuple[str, str]] | None,
     *,
     pin: str | None = None,
+    git_root: Path | None = None,
 ) -> int:
-    floor_ids, minimum = recall_floor_from_pin(root, pin)
+    floor_ids, minimum = recall_floor_from_pin(root, pin, git_root=git_root)
     return evaluate_recall(
         list(payload.get("recall_records") or []),
         _should_fire_ids(root),
@@ -2964,9 +2966,10 @@ def _recall_from_payload(
 def gates_main(root: Path, engine_root: Path | None = None) -> int:
     try:
         check_manifest(root)
+        recall_floor_from_pin(root)
     except BenchError as exc:
         print(str(exc), file=sys.stderr)
-        print("manifest_ok=False")
+        print("manifest_ok=False" if "manifest" in str(exc) else "recall_floor_ok=False")
         return 1
     try:
         payload = collect_hard_failures(root, include_mock=True, engine_root=engine_root or root)
@@ -3322,7 +3325,7 @@ def _absolute_zero(workspace: Path, pin: str, *, suite_root: Path | None = None,
         baseline = set()
         if baseline_text:
             baseline = {tuple(pair) for pair in json.loads(baseline_text).get("should_fire_answered") or []}
-        if _recall_from_payload(pin_tree, payload, baseline, pin=pin):
+        if _recall_from_payload(pin_tree, payload, baseline, pin=pin, git_root=workspace):
             failed = True
         if failed:
             return 1
