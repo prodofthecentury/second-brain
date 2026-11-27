@@ -1,0 +1,62 @@
+import json as _json
+TEMPLATE_ID = "m02"
+SUITE = "multihop"
+ANSWER_TYPE = "entity"
+INSTANCES = 2
+SKIP_NUMBER_CHECK = True
+WORLDS = _json.loads('[{"question": "How large is one Atlas full backup, in GB?", "answer": "14", "answer_type": "integer", "tags": ["substring-verify-trap", "unit-mismatch"], "unit": "GB", "hops": 1, "gold_support": ["atlas-backup-size"], "distractors": ["atlas-backup-schedule"], "support_spans": {"atlas-backup-size": "14 GB"}, "notes": [{"id": "atlas-backup-schedule", "claim": "The Atlas server takes a full backup every 6 hours."}, {"id": "atlas-backup-size", "claim": "Each Atlas full backup is 14 GB."}]}, {"question": "How large is one Beacon full backup, in GB?", "answer": "9", "answer_type": "integer", "tags": ["substring-verify-trap"], "hops": 1, "gold_support": ["m02-1-size"], "distractors": ["m02-1-schedule"], "notes": [{"id": "m02-1-schedule", "claim": "The Beacon server takes a full backup every 8 hours."}, {"id": "m02-1-size", "claim": "Each Beacon full backup is 9 GB."}]}]')
+
+def sample(rng):
+    return {"index": rng.randrange(2)}
+
+def render(params):
+    return WORLDS[params["index"]]["question"]
+
+def solve(params):
+    world = WORLDS[params["index"]]
+    if world["answer"] is None:
+        return None
+    if world["answer_type"] == "integer":
+        return int(world["answer"])
+    return world["answer"]
+
+def build_item(instance):
+    import json as _json
+    world = WORLDS[instance]
+    answer = world["answer"]
+    if answer is None:
+        reference = "ANSWER = None"
+    elif world["answer_type"] == "integer":
+        reference = f"ANSWER = {int(answer)}"
+    else:
+        reference = "ANSWER = " + _json.dumps(answer)
+    item = {
+        "id": f"multihop-dev-{TEMPLATE_ID}-{instance}",
+        "template_id": TEMPLATE_ID,
+        "instance": instance,
+        "suite": "multihop",
+        "split": "dev",
+        "question": world["question"],
+        "answer": None if answer is None else (int(answer) if world["answer_type"] == "integer" else answer),
+        "answer_type": world["answer_type"],
+        "approx_ok": None,
+        "answerable": answer is not None,
+        "hops": world["hops"],
+        "gold_support": list(world["gold_support"]),
+        "distractors": list(world["distractors"]),
+        "notes": world["notes"],
+        "expected_tool": None,
+        "difficulty": 2 if world["hops"] > 1 else 1,
+        "tags": list(world["tags"]),
+        "provenance": {'source': 'original', 'derived_from': None, 'license': 'CC0-1.0', 'author': 'grok-bot', 'created': '2026-11-27', 'llm_assisted': True, 'seed': None},
+        "reference": reference,
+    }
+    if world.get("aliases"):
+        item["aliases"] = list(world["aliases"])
+    if world.get("unit"):
+        item["unit"] = world["unit"]
+    if world.get("support_spans"):
+        item["support_spans"] = world["support_spans"]
+    if world["answer_type"] == "integer" and answer is not None:
+        item["answer"] = str(int(answer))
+    return item

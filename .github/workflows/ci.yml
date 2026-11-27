@@ -1,5 +1,10 @@
 name: CI
 
+# The harness pin is the Actions variable PINNED_HARNESS_SHA, or the file
+# .github/harness-pin on the base branch. It is not stored in this workflow.
+# A pull request that replaces the fingerprint step is stopped by code-owner
+# review and required checks, because pull_request runs the workflow from the PR.
+
 on:
   push:
     branches: [main, master]
@@ -154,7 +159,7 @@ jobs:
           )
           uv run --frozen python scripts/run_desktop_tests.py --require-packaged --skip-unit
 
-  # Fails the workflow when the engine tests fail with SymPy or without it.
+  # Engine unit tests with SymPy and without it. A failure fails the workflow.
   reason-hard-gate:
     name: reason hard gate
     runs-on: ubuntu-latest
@@ -180,3 +185,99 @@ jobs:
         run: |
           uv pip uninstall --python .venv/bin/python sympy
           uv run --no-sync --python .venv/bin/python -m unittest scripts.reason_engine_tests -q
+
+  # Known HARD tuples must match the committed fingerprint. Drift fails the job.
+  hard-gates:
+    name: hard-gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Install Python 3.12 with the math extra
+        run: |
+          uv python install 3.12
+          uv sync --locked --extra math --python 3.12
+
+      - name: Validate, both SymPy passes, ci-mock, and the canary
+        run: |
+          set -euo pipefail
+          if [ -n "${{ vars.PINNED_HARNESS_SHA }}" ]; then
+            export PINNED_HARNESS_SHA="${{ vars.PINNED_HARNESS_SHA }}"
+          fi
+          uv run --frozen python -m scripts.reason_bench validate
+          uv run --frozen python -m scripts.reason_bench gates
+
+  hard-failure-fingerprint:
+    name: hard-failure-fingerprint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Compare observed HARD failures with the engine fingerprint
+        run: |
+          set -euo pipefail
+          if [ -z "${{ github.base_ref }}" ]; then
+            echo "fingerprint check requires a pull request base ref" >&2
+            exit 2
+          fi
+          git fetch origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          # Repository variable first. The file on the base is the fallback.
+          # A value written only in this pull request is ignored.
+          pin="${{ vars.PINNED_HARNESS_SHA }}"
+          if [ -z "$pin" ]; then
+            pin="$(git show "$base:.github/harness-pin" 2>/dev/null | tr -d '[:space:]' || true)"
+          fi
+          export PINNED_HARNESS_SHA="$pin"
+          if ! printf '%s' "$pin" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "owner has not set PINNED_HARNESS_SHA for ${base}; fail closed" >&2
+            exit 2
+          fi
+          git fetch origin "$pin"
+          dest="${RUNNER_TEMP}/pinned-harness"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          git archive "$pin" | tar -x -C "$dest"
+          # Run the pinned checker. Do not execute the pull request's copy.
+          bash "$dest/scripts/ci_fingerprint_check.sh" "$base"
+
+  reason-bench-windows-crlf:
+    name: windows crlf reason-bench
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Force core.autocrlf before checkout
+        shell: bash
+        run: git config --global core.autocrlf true
+
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Install Python 3.12 and sync
+        shell: bash
+        run: |
+          uv python install 3.12
+          uv sync --locked --python 3.12
+
+      - name: Validate the benchmark and the CRLF hash tests
+        shell: bash
+        run: |
+          uv run --frozen python -m scripts.reason_bench validate
+          uv run --frozen python -m unittest \
+            scripts.reason_bench_tests.HashTests \
+            scripts.reason_bench_tests.SandboxSmokeTests

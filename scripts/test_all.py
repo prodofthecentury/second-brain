@@ -189,6 +189,11 @@ SUITES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("-m", "unittest", str(SCRIPTS_DIR / "reason_engine_tests.py")),
     ),
     (
+        "reason_bench_tests",
+        "Reasoning benchmark harness: scoring, hashes, gates, held-out sealing, and model-free checks (scripts/reason_bench_tests.py)",
+        ("-m", "unittest", str(SCRIPTS_DIR / "reason_bench_tests.py")),
+    ),
+    (
         "desktop_ui_tests",
         "Electron Desktop DOM/XSS/Markdown/graph/pagination behavioral suite & packaged smoke-test (scripts/run_desktop_tests.py)",
         (str(SCRIPTS_DIR / "run_desktop_tests.py"),),

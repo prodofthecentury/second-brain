@@ -30,6 +30,10 @@ desktop.ini
 *.tmp
 *~
 
+# Reasoning benchmark run output and response cache. Suites and the held-out commitment stay tracked.
+bench/reasoning/results/
+bench/reasoning/cache/
+
 # Python/runtime output
 __pycache__/
 *.py[cod]

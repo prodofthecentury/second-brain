@@ -187,6 +187,20 @@ class WheelPackagingAndReleaseTests(unittest.TestCase):
         )
         self.assertIn("second_brain/scripts/doc_fixtures.py", names)
         self.assertIn("second_brain/scripts/publish_registries.py", names)
+        bench_modules = sorted(
+            n for n in names if n.startswith("second_brain/scripts/reason_bench") and n.endswith(".py")
+        )
+        self.assertEqual(
+            bench_modules,
+            [
+                "second_brain/scripts/reason_bench.py",
+                "second_brain/scripts/reason_bench_heldout.py",
+                "second_brain/scripts/reason_bench_models.py",
+                "second_brain/scripts/reason_bench_scoring.py",
+                "second_brain/scripts/reason_bench_shapes.py",
+                "second_brain/scripts/reason_bench_worker.py",
+            ],
+        )
         with zipfile.ZipFile(self._wheel_path, "r") as zf2:
             pub_src = zf2.read("second_brain/scripts/publish_registries.py").decode("utf-8")
         self.assertIn("import re\n", pub_src.replace("\r\n", "\n"))
