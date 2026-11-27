@@ -32,6 +32,7 @@ from scripts.evidence import (
     EvidenceValidationError,
     claim_entailed_by_evidence,
     extract_evidence_from_body_lines,
+    fact_portion,
     find_evidence_anchor,
     has_cached_normalized_source,
     verify_evidence_anchor,
@@ -578,13 +579,14 @@ def apply_atom_mutation(
                 if epistemic_label != "preference":
                     claim_text = section_text("\n".join(body), "Claim")
                     evidence_text = section_text("\n".join(body), "Evidence")
-                    if not claim_entailed_by_evidence(claim_text, evidence_text):
+                    context_text = section_text("\n".join(body), "Context")
+                    if not claim_entailed_by_evidence(claim_text, evidence_text, context_text):
                         raise ReviewTransitionError(
                             "Approval requires the claim to be supported by its own evidence quote."
                         )
                     from scripts.capture_policy import rejection_reasons
 
-                    reasons = rejection_reasons(claim_text)
+                    reasons = rejection_reasons(fact_portion(claim_text, context_text))
                     if reasons:
                         raise ReviewTransitionError(
                             "Approval blocked by capture policy: " + "; ".join(reasons)

@@ -67,8 +67,8 @@ _MOD_PATH_DEFAULTS["HOUSE_RULES_PATH"] = str(HOUSE_RULES_PATH)
 _MOD_PATH_DEFAULTS["CHROMA_DB_PATH"] = str(CHROMA_DB_PATH)
 from scripts.hardware_profile import strip_reasoning_think_blocks
 from scripts.ollama_utils import chat_with_fallback, embed_text, embedding_metadata
-from scripts.capture_policy import max_atoms_per_note, max_claim_words, prompt_text, rejection_reasons
-from scripts.evidence import claim_entailed_by_evidence, entail_stems, number_tokens
+from scripts.capture_policy import load_policy, max_atoms_per_note, max_claim_words, prompt_text, rejection_reasons
+from scripts.evidence import claim_entailed_by_evidence, entail_stems, fact_portion, number_tokens
 from scripts.sentence_spans import extract_fact_rows, sentence_spans, split_sentences
 from scripts.memory_format import (
     MEMORY_BOUNDARY,
@@ -616,12 +616,15 @@ def claim_supported_by_evidence(claim: str, evidence: str) -> bool:
     return hits >= needed
 
 
-def _claim_is_padded(claim: str, evidence: str) -> bool:
-    """True when the claim adds content words or is much longer than its evidence."""
-    extras = entail_stems(claim) - entail_stems(evidence)
+def _claim_is_padded(claim: str, evidence: str, context: str = "") -> bool:
+    """True when the fact portion adds content words or is much longer than its evidence."""
+    from scripts.evidence import fact_portion
+
+    fact = fact_portion(claim, context)
+    extras = entail_stems(fact) - entail_stems(evidence) - entail_stems(context)
     if extras:
         return True
-    claim_words = len(str(claim or "").split())
+    claim_words = len(fact.split())
     evidence_words = max(1, len(str(evidence or "").split()))
     return claim_words > evidence_words * 1.6 + 2
 
@@ -637,25 +640,45 @@ def _as_sentence(text: str) -> str:
     return cleaned.rstrip(".") + "."
 
 
-def _align_claim_and_evidence(claim: str, evidence: str, source: str) -> tuple[str, str]:
+def _align_claim_and_evidence(claim: str, evidence: str, source: str, context: str = "") -> tuple[str, str]:
     """Pair the claim with the source sentence that supports it, or use that sentence as the claim."""
+    claim, evidence = _expand_subjectless(claim, evidence, source)
     best = evidence
     best_score = -1
-    if claim_entailed_by_evidence(claim, evidence) and not _claim_is_padded(claim, evidence):
+    if claim_entailed_by_evidence(claim, evidence, context) and not _claim_is_padded(claim, evidence, context):
         best_score = _support_score(claim, evidence)
     else:
         for sentence in _fact_sentences(source):
             if _is_heading_or_boilerplate(sentence):
                 continue
-            if not claim_entailed_by_evidence(claim, sentence) or _claim_is_padded(claim, sentence):
+            if not claim_entailed_by_evidence(claim, sentence, context) or _claim_is_padded(claim, sentence, context):
                 continue
             score = _support_score(claim, sentence)
             if score > best_score:
                 best = sentence
                 best_score = score
     if best_score >= 0:
+        if number_tokens(best) - number_tokens(claim):
+            return best.strip(), best.strip()
         return claim.strip(), best
     return _as_sentence(evidence), evidence
+
+
+def _expand_subjectless(claim: str, evidence: str, source: str) -> tuple[str, str]:
+    words = re.findall(r"[A-Za-z']+", str(claim or "").strip())
+    starters = {item.casefold() for item in load_policy()["subjectless_starts"]}
+    if not words or words[0].casefold() not in starters:
+        return claim, evidence
+    position = source.find(evidence) if evidence and evidence in source else source.find(claim)
+    if position <= 0:
+        return claim, evidence
+    previous = source.rfind(".", 0, position)
+    start = source.rfind("\n", 0, previous if previous >= 0 else position)
+    start = 0 if start < 0 else start + 1
+    combined = source[start : position + len(evidence or claim)].strip()
+    if combined and combined in source and words[0].casefold() not in combined[:20].casefold():
+        return combined, combined
+    return claim, evidence
 
 
 def salvage_claim(claim: str, evidence: str, source: str) -> str | None:
@@ -708,7 +731,7 @@ def _rewrite_memory_identity(document: str, source_text: str, current_date: str,
     claim = section_text(body, "Claim")
     evidence = section_text(body, "Evidence")
     exact = exact_source_span(source_text, evidence)
-    if exact:
+    if exact and not (evidence in source_text and len(evidence) + 8 < len(exact)):
         body = _replace_section(body, "Evidence", exact)
         body_lines = body.splitlines()
     values = parse_frontmatter_values(frontmatter)
@@ -793,7 +816,8 @@ def _documents_from_json(output: str, source_filename: str, current_date: str) -
             "---\n\n"
             f"## Claim\n{claim}\n\n"
             f"## Evidence\n{evidence}\n\n"
-            f"## Why It Matters\n{why}\n"
+            + (f"## Context\n{str(row.get('context') or '').strip()}\n\n" if str(row.get("context") or "").strip() else "")
+            + f"## Why It Matters\n{why}\n"
         )
     return documents
 
@@ -1031,6 +1055,8 @@ def _call_model(prompt: str, model: str | None, *, schema: dict | str | None, te
 
 
 def _finish_row(row: dict, source_text: str, source_filename: str, current_date: str, model: str | None) -> tuple[str | None, str]:
+    from scripts.sentence_spans import _fact_clauses
+
     title = str(row.get("title") or "").strip()
     claim = str(row.get("claim") or "").strip()
     evidence = str(row.get("evidence") or "").strip()
@@ -1048,28 +1074,39 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
         else:
             print(f"  [!] Dropped atom; evidence is not a span of this note: {evidence[:80]!r}")
             return None, "unanchored"
-    evidence = exact
+    if evidence in source_text and len(_fact_clauses(evidence)) == 1 and exact and len(evidence) + 8 < len(exact):
+        pass
+    else:
+        evidence = exact
     path = "schema"
     if title and claim.casefold().strip(" .") == title.casefold().strip(" ."):
         claim = ""
     original_claim = claim
     support = str(row.get("support") or "").strip()
-    structured = bool(support) and claim_entailed_by_evidence(claim, support)
+    context = str(row.get("context") or "").strip()
+    clauses = _fact_clauses(evidence)
+    if len(clauses) > 1:
+        print(f"  [!] Dropped atom; evidence hides more than one fact: {evidence[:80]!r}")
+        return None, "split"
+    if _evidence_is_table_header(source_text, evidence):
+        print(f"  [!] Dropped atom; evidence is a table header: {evidence[:80]!r}")
+        return None, "header"
+    structured = bool(support) and claim_entailed_by_evidence(claim, support, context)
     if not structured and (len(split_sentences(claim)) >= 3 or len(claim.split()) > max_claim_words()):
         print(f"  [!] Dropped atom; claim is a paragraph dump: {claim[:80]!r}")
         return None, "too_long"
     if structured:
         pass
     else:
-        claim, evidence = _align_claim_and_evidence(claim, evidence, source_text)
+        claim, evidence = _align_claim_and_evidence(claim, evidence, source_text, context)
         support = evidence
-    if rejection_reasons(claim):
+    if rejection_reasons(claim, config_line=_short_config_fact(claim, evidence)):
         print(f"  [!] Dropped atom; capture policy rejected the claim: {claim[:80]!r}")
         return None, "policy"
     if (
         _is_heading_or_boilerplate(claim)
         or _is_heading_or_boilerplate(evidence)
-        or not claim_entailed_by_evidence(claim, support or evidence)
+        or not claim_entailed_by_evidence(claim, support or evidence, context)
     ):
         print(f"  [!] Dropped atom; claim is not grounded in the evidence: {original_claim[:80]!r}")
         return None, "ungrounded"
@@ -1081,7 +1118,7 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     claim_key = re.sub(r"[^a-z0-9]+", " ", claim.casefold()).strip().rstrip(".")
     if len(title) < 3 or (title_key and claim_key.startswith(title_key) and len(title_key.split()) < 3):
         title = " ".join(claim.split()[:8]).rstrip(".")
-    if len(claim) < 12 or len(evidence) < 8:
+    if len(claim) < (6 if _short_config_fact(claim, evidence) else 12) or len(evidence) < 8:
         return None, path
     model_support = _optional_model_support_check(claim, evidence, model)
     if model_support is False:
@@ -1095,6 +1132,7 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
             "title": title,
             "claim": claim,
             "evidence": evidence,
+            "context": context,
             "why": why,
             "memory_type": memory_type,
         }]}),
@@ -1104,9 +1142,34 @@ def _finish_row(row: dict, source_text: str, source_filename: str, current_date:
     if not document:
         return None, path
     finished = _rewrite_memory_identity(document[0], source_text, current_date, source_filename)
-    if model_support is None and not evidence_supports_claim(claim, support or evidence):
+    if model_support is None and not claim_entailed_by_evidence(claim, evidence, context):
         return None, "unsupported"
     return finished, path
+
+
+def _short_config_fact(claim: str, evidence: str) -> bool:
+    raw = str(evidence or "").strip()
+    if any(mark in raw for mark in ".!?") or len(raw.split()) > 6:
+        return False
+    return 6 <= len(raw) < 20
+
+
+def _evidence_is_table_header(source: str, evidence: str) -> bool:
+    lines = source.splitlines()
+    target = str(evidence or "").strip()
+    for index, line in enumerate(lines):
+        if line.strip() != target:
+            continue
+        nxt = lines[index + 1].strip() if index + 1 < len(lines) else ""
+        if re.match(r"^\|?\s*:?-{3,}", nxt):
+            return True
+    return False
+
+
+def _evidence_of(document: str) -> str:
+    if "## Evidence\n" not in document:
+        return ""
+    return document.split("## Evidence\n", 1)[1].split("\n##", 1)[0].strip()
 
 
 def _fact_sentences(source: str) -> list[str]:
@@ -1430,7 +1493,9 @@ def draft_memory_atoms(
         evidence_text = str(row.get("evidence") or "")
         if not evidence_text:
             continue
-        if evidence_text.casefold().strip() in LAST_REJECTED_SPANS or evidence_text.casefold() in covered_text:
+        if evidence_text.casefold().strip() in LAST_REJECTED_SPANS:
+            continue
+        if any(_evidence_of(document).casefold().strip() == evidence_text.casefold().strip() for document in collected):
             continue
         mentioned = bool(mention_blob) and _sentence_mentioned(evidence_text, mention_blob)
         row["why"] = (

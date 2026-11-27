@@ -942,7 +942,7 @@ class DoctorVaultTests(unittest.TestCase):
         self.assertIn("auto=qwen2.5-coder:7b", text)
 
 
-from scripts.messy_notes_tests import CapturePolicyTests, MessyFixtureTests  # noqa: E402,F401
+from scripts.messy_notes_tests import CapturePolicyTests, MessyFixtureTests, SyntheticCaptureTests  # noqa: E402,F401
 
 
 if __name__ == "__main__":

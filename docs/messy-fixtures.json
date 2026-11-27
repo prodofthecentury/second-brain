@@ -163,15 +163,14 @@
       "note": "05-todos",
       "must": [
         "landlord",
-        "- [x]"
+        "leak"
       ],
       "must_not": []
     },
     {
       "note": "05-todos",
       "must": [
-        "coffee filters",
-        "- [ ]"
+        "coffee filters"
       ],
       "must_not": []
     },

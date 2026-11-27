@@ -25,6 +25,10 @@ An atom is one durable, checkable, self-contained fact. The owner approves it la
 - Duplicates of a fact already captured.
 - Secrets, passwords, API keys, and tokens.
 - Relative dates (`tomorrow`, `yesterday`, `tonight`, `next week`, `next month`).
+- A first-person sentence with no number, date, proper noun, decision, path, or other checkable token (`I keep forgetting.`).
+- A secret written with a space (`password is swordfish`, `api key sk-test123`) or a token prefix such as `sk-`, `ghp_`, `xox`, or `AKIA`.
+
+A heading date, block label, or speaker may be stored as context with its own verbatim span. The evidence quote then has to support only the fact, not repeat that context. A short config line with no sentence punctuation is still a fact.
 
 ## Atom shape
 

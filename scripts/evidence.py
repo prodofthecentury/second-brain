@@ -166,16 +166,39 @@ def _source_candidates(source: str, brain_dir: str) -> list[Path]:
     return candidates
 
 
+def _short_config_quote(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not (8 <= len(raw) < 12) or any(mark in raw for mark in ".!?"):
+        return False
+    return len(raw.split()) <= 6
+
+
+def _context_parts(content: str) -> list[str]:
+    parsed = split_frontmatter(content)
+    if parsed is None:
+        return []
+    from scripts.memory_review import section_text
+
+    context = section_text("\n".join(parsed[1]), "Context")
+    parts = [part.strip() for part in re.split(r"\s+\|\s+", context) if part.strip()]
+    # Skill-pack and other notes use ## Context as commentary. Capture context is a short label.
+    if any("\n" in part or part.lstrip().startswith(("-", "*", "`")) or len(part) > 160 for part in parts):
+        return []
+    return parts
+
+
 def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
     """Find exactly quoted evidence in exactly one source file and return byte offsets."""
     evidence = _evidence_text(content)
     normalized_quote, _ = _normalize_with_offsets(evidence)
-    if len(normalized_quote) < 12:
+    floor = 8 if _short_config_quote(evidence) else 12
+    if len(normalized_quote) < floor:
         raise EvidenceValidationError("Evidence excerpt is too short to anchor safely (minimum 12 characters).")
 
     sources = _source_values(content)
     if not sources:
         raise EvidenceValidationError("The atom must name at least one source file.")
+    context_parts = _context_parts(content)
 
     matches: list[dict[str, str | int]] = []
     for source in sources:
@@ -184,6 +207,8 @@ def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
             if loaded is None:
                 continue
             source_sha256, source_text, normalized_source, offsets = loaded
+            if context_parts and any(part not in source_text for part in context_parts):
+                continue
             start = 0
             while True:
                 start = normalized_source.find(normalized_quote, start)
@@ -202,6 +227,10 @@ def find_evidence_anchor(content: str, brain_dir: str) -> dict[str, str | int]:
                 start += 1
 
     if not matches:
+        if context_parts:
+            raise EvidenceValidationError(
+                "The evidence excerpt or its context span does not occur verbatim in any named source revision."
+            )
         raise EvidenceValidationError("The evidence excerpt does not occur verbatim in any named source revision.")
     unique = {(item["evidence_source"], item["evidence_start"], item["evidence_end"]) for item in matches}
     if len(unique) != 1:
@@ -322,24 +351,41 @@ def entail_stems(text: str) -> set[str]:
     }
 
 
-def claim_entailed_by_evidence(claim: str, evidence: str) -> bool:
-    """True when the claim's numbers, settings, and most content words are in its own evidence.
+def fact_portion(claim: str, context: str = "") -> str:
+    """Drop heading, block-label, or speaker prefixes that are recorded as context."""
+    text = str(claim or "").strip()
+    parts = [part.strip() for part in re.split(r"\s+\|\s+", str(context or "")) if part.strip()]
+    for part in parts:
+        for prefix in (f"{part}:", part):
+            if text.casefold().startswith(prefix.casefold()):
+                rest = text[len(prefix) :].lstrip(" :-")
+                if rest:
+                    text = rest
+                    break
+    return text
 
-    A real quote is not enough: the claim has to be about that quote.
+
+def claim_entailed_by_evidence(claim: str, evidence: str, context: str = "") -> bool:
+    """True when the fact portion's numbers, settings, and most content words are in its evidence.
+
+    A heading, block label, or speaker recorded as context does not have to be repeated in the quote.
     """
-    claim_text = str(claim or "").strip()
+    claim_text = fact_portion(claim, context)
     evidence_text = str(evidence or "").strip()
+    context_text = str(context or "")
     if not claim_text or not evidence_text:
         return False
     evidence_numbers = number_tokens(evidence_text)
-    if not number_tokens(claim_text) <= evidence_numbers:
+    claim_numbers = number_tokens(claim_text) - number_tokens(context_text)
+    if not claim_numbers <= evidence_numbers:
         return False
     evidence_fold = evidence_text.casefold()
-    if any(token not in evidence_fold for token in config_tokens(claim_text)):
+    claim_config = config_tokens(claim_text) - config_tokens(context_text)
+    if any(token not in evidence_fold for token in claim_config):
         return False
-    claim_stems = entail_stems(claim_text)
+    claim_stems = entail_stems(claim_text) - entail_stems(context_text)
     if not claim_stems:
-        return bool(number_tokens(claim_text) or config_tokens(claim_text))
+        return bool(claim_numbers or claim_config or len(claim_text.split()) <= 8)
     evidence_stems = entail_stems(evidence_text)
     evidence_blob = " ".join(_entail_stem(word) for word in re.findall(r"[a-z0-9]+", evidence_fold))
     hits = sum(1 for stem in claim_stems if stem in evidence_stems or stem in evidence_blob)

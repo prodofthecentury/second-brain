@@ -617,6 +617,48 @@ def retrieve_context(
                     "title": support_title,
                 })
             records.append({"filename": result.filename, "content": result.content})
+        titles = {str(item.get("title") or "") for item in verified if item.get("title")}
+        known = {str(item.get("atom_id") or "") for item in verified}
+        for title in list(titles)[:4]:
+            label = title.split()[0]
+            if len(label) < 3:
+                continue
+            try:
+                extra, _extra_neighbors = search_memory(
+                    label,
+                    RecallOptions(
+                        n_results=4,
+                        follow_links=False,
+                        include_statuses={"accepted"},
+                    retrieval_mode="lexical",
+                    use_l0_bus=safe_l0_bus,
+                    projects=(project_scope,) if project_scope else (),
+                    ),
+                    atoms_dir=paths.atoms_dir,
+                    index_path=paths.lexical_index_path,
+                    chroma_path=paths.chroma_path,
+                )
+            except Exception:
+                extra = []
+            for result in extra:
+                if result.filename in known or len(verified) >= MAX_VERIFIED + 4:
+                    continue
+                claim, evidence = _claim_and_evidence(result.content)
+                if not claim:
+                    continue
+                parsed_fm = split_frontmatter(result.content)
+                fm = parse_frontmatter_values(parsed_fm[0]) if parsed_fm else {}
+                sibling_title = _support_title(fm)
+                if label.casefold() not in sibling_title.casefold() and label.casefold() not in claim.casefold():
+                    continue
+                known.add(result.filename)
+                verified.append({
+                    "id": f"V{len(verified) + 1}",
+                    "atom_id": result.filename,
+                    "claim": claim,
+                    "evidence": evidence,
+                    "title": sibling_title,
+                })
         try:
             candidate_ids = peek_lexical_candidate_atom_ids(
                 query,
@@ -818,6 +860,7 @@ def build_synthesis_prompt(
         "[V#] are owner-verified claims; [N#] are the owner's unverified notes."
         f"{pref_instruction}{hist_instruction}\n"
         "Use only words that appear in the claim or its evidence. Do not add reasons or details that are not written there.\n"
+        "Facts that share a Title are one block. Use every line from that block together.\n"
         "Answer only the question. Do not add a sentence about a different fact, even if that fact is in the sources.\n"
         "If the sources do not answer the question, say so briefly. Do not use outside knowledge.\n\n"
         f"<verified_claims>\n{v_block}\n</verified_claims>\n\n<notes>\n{n_block}\n</notes>{pref_block}{hist_block}{ws_block}\n\n"
@@ -840,7 +883,18 @@ def best_supporting_claims(query: str, verified: list[dict[str, object]], *, min
         if score >= minimum:
             scored.append((score, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [item for _score, item in scored[:3]]
+    chosen = [item for _score, item in scored[:3]]
+    titles = {str(item.get("title") or "") for item in chosen if item.get("title")}
+    if not titles:
+        return chosen
+    seen = {id(item) for item in chosen}
+    for item in verified:
+        if id(item) in seen:
+            continue
+        if str(item.get("title") or "") in titles:
+            chosen.append(item)
+            seen.add(id(item))
+    return chosen
 
 
 def _chat_stem(word: str) -> str:
@@ -876,6 +930,29 @@ _MODEL_ABSTENTION_RE = re.compile(
 )
 
 
+def _token_covered(token: str, blob: str) -> bool:
+    if token.casefold() in blob.casefold():
+        return True
+    return _normalize_temporal(token) in _normalize_temporal(blob)
+
+
+def _normalize_temporal(text: str) -> str:
+    months = {
+        "jan": "january", "january": "january", "feb": "february", "february": "february",
+        "mar": "march", "march": "march", "apr": "april", "april": "april",
+        "may": "may", "jun": "june", "june": "june", "jul": "july", "july": "july",
+        "aug": "august", "august": "august", "sep": "september", "sept": "september",
+        "september": "september", "oct": "october", "october": "october",
+        "nov": "november", "november": "november", "dec": "december", "december": "december",
+    }
+    folded = str(text or "").casefold()
+    folded = re.sub(r"(\d+)(?:st|nd|rd|th)\b", r"\1", folded)
+    folded = re.sub(r"\bof\b", " ", folded)
+    for source, target in months.items():
+        folded = re.sub(rf"\b{source}\b", target, folded)
+    return re.sub(r"\s+", " ", folded).strip()
+
+
 def _sensitive_tokens(text: str) -> list[str]:
     """Numbers, addresses, dates, weekdays, paths, and proper nouns a citation must cover."""
     found: list[str] = []
@@ -883,7 +960,7 @@ def _sensitive_tokens(text: str) -> list[str]:
         r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
         r"\b\d{1,2}:\d{2}\b",
         r"[A-Za-z]:\\[^\s]+",
-        r"\b\d{1,2}\s+[A-Za-z]{3,9}(?:\s+\d{4})?\b",
+        r"\b\d{1,2}(?:st|nd|rd|th)?(?:\s+of)?\s+[A-Za-z]{3,9}(?:\s+\d{4})?\b",
         r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
     ):
         found.extend(match.group(0).rstrip(".,") for match in re.finditer(pattern, text, flags=re.IGNORECASE))
@@ -920,6 +997,14 @@ def _move_citations_to_end(sentence: str) -> str:
     return f"{body} {suffix}"
 
 
+def _uncited_sentence_allowed(sentence: str, verified: list[dict[str, object]]) -> bool:
+    """Drop an uncited sentence that states a checkable or factual claim."""
+    if _sensitive_tokens(sentence):
+        return False
+    words = re.findall(r"[A-Za-z']+", sentence)
+    return len(words) < 6
+
+
 def _cited_items(sentence: str, verified: list[dict[str, object]]) -> tuple[list[dict[str, object]], list[str]]:
     ids = [f"{match.group(1)}{int(match.group(2))}" for match in CITATION_RE.finditer(sentence)]
     by_id = {str(item.get("id")): item for item in verified}
@@ -936,7 +1021,7 @@ def _sentence_is_grounded(sentence: str, verified: list[dict[str, object]]) -> b
     if not items:
         return False
     blob = " ".join(_support_blob(item) for item in items)
-    return all(token.casefold() in blob.casefold() for token in tokens)
+    return all(_token_covered(token, blob) for token in tokens)
 
 
 def answer_with_citations(text: str, query: str, verified: list[dict[str, object]]) -> str:
@@ -963,7 +1048,10 @@ def answer_with_citations(text: str, query: str, verified: list[dict[str, object
                     best_item = item
             if best_item is not None and best_score >= 0.34:
                 sentence = f"{sentence.rstrip()} [{best_item['id']}]"
-        if CITATION_RE.search(sentence) and not _sentence_is_grounded(sentence, verified):
+        if CITATION_RE.search(sentence):
+            if not _sentence_is_grounded(sentence, verified):
+                continue
+        elif not _uncited_sentence_allowed(sentence, verified):
             continue
         rewritten.append(sentence)
     if not rewritten:
@@ -2176,12 +2264,13 @@ def chat_events(
         elapsed = round((time.perf_counter() - started) * 1000, 1)
         yield _done_event(elapsed)
         return
-    full_text = answer_with_citations("".join(pieces), query, model_verified)
-    if full_text != "".join(pieces):
-        extra = full_text[len("".join(pieces)) :] if full_text.startswith("".join(pieces)) else "\n" + full_text
+    raw_text = "".join(pieces)
+    full_text = answer_with_citations(raw_text, query, model_verified)
+    if full_text != raw_text:
+        extra = full_text[len(raw_text) :] if full_text.startswith(raw_text) else "\n" + full_text
         if extra.strip():
             yield {"type": "token", "text": extra, "token": extra}
-    grounding = check_citations(full_text, model_verified, model_notes, model_preferences)
+    grounding = check_citations(raw_text, model_verified, model_notes, model_preferences)
     grounding["first_token_ms"] = first_token_ms
     grounding["host_id"] = active_host_id
     grounding["retrieval_mode"] = retrieval_mode

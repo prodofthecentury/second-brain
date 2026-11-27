@@ -14,26 +14,49 @@ from scripts.capture_policy import load_policy, policy_markdown, rejection_reaso
 from scripts.ollama_refinery import draft_memory_atoms
 
 
+def approved_claim(document: str) -> str | None:
+    """Return the claim only when this drafted atom would pass approval."""
+    from scripts.evidence import claim_entailed_by_evidence
+    from scripts.memory_review import section_text
+
+    if "## Claim\n" not in document or "## Evidence\n" not in document:
+        return None
+    body = document.split("---\n\n", 1)[-1]
+    claim = section_text(body, "Claim")
+    evidence = section_text(body, "Evidence")
+    context = section_text(body, "Context")
+    if not claim or not evidence:
+        return None
+    from scripts.evidence import fact_portion
+
+    if rejection_reasons(fact_portion(claim, context)):
+        return None
+    if not claim_entailed_by_evidence(claim, evidence, context):
+        return None
+    return claim
+
+
 def score_messy(by_note: dict[str, list[str]], facts: list[dict]) -> tuple[float, float]:
+    approved: dict[str, list[str]] = {}
+    for note, documents in by_note.items():
+        approved[note] = [claim for document in documents if (claim := approved_claim(document))]
     hits = 0
     for fact in facts:
-        docs = by_note.get(str(fact["note"]), [])
-        matched = False
-        for document in docs:
-            if all(token in document for token in fact["must"]) and not any(
-                token in document for token in fact.get("must_not") or []
-            ):
-                matched = True
-                break
+        claims = approved.get(str(fact["note"]), [])
+        matched = any(
+            all(token in claim for token in fact["must"])
+            and not any(token in claim for token in fact.get("must_not") or [])
+            for claim in claims
+        )
         hits += int(matched)
     recall = hits / len(facts) if facts else 0.0
-    atoms = [(note, document) for note, docs in by_note.items() for document in docs]
+    atoms = [(note, claim) for note, claims in approved.items() for claim in claims]
     matched_atoms = 0
-    for note, document in atoms:
+    for note, claim in atoms:
         if any(
             str(fact["note"]) == note
-            and all(token in document for token in fact["must"])
-            and not any(token in document for token in fact.get("must_not") or [])
+            and all(token in claim for token in fact["must"])
+            and not any(token in claim for token in fact.get("must_not") or [])
             for fact in facts
         ):
             matched_atoms += 1
@@ -146,6 +169,84 @@ class MessyFixtureTests(unittest.TestCase):
         self.assertIn("9:30", answer)
         self.assertIn("Dr. Hale", answer)
         self.assertNotIn("no information", answer.casefold())
+
+
+class SyntheticCaptureTests(unittest.TestCase):
+    """Unseen notes. These are not the laptop held-out set."""
+
+    def test_new_topics_approve_facts_and_drop_mood_secrets_and_braces(self) -> None:
+        note = "\n".join([
+            "kiln log 4 Apr 2026",
+            "Attendees: Nia, Omar, Tess.",
+            "Next meeting Thu 16 Apr 2026.",
+            "Rate limit 30/90 on the glaze API.",
+            "- [ ] Nia: order feldspar by 16 Apr 2026.",
+            "I keep forgetting the sponge.",
+            "feeling restless and a bit flat today.",
+            "I walked to the quay anyway and the wind helped a little.",
+            "api key sk-test123",
+            "The studio password is swordfish.",
+            "host kiln-01 {",
+            "fixed-address 10.4.4.8",
+            "}",
+            "Visited Ft. Bragg on 2 Mar 2026.",
+            "| Glaze | Cone |",
+            "| --- | --- |",
+            "| Shino | 10 |",
+            "The shelf fee was $40, plot 9 is Nia's, and the library hold expires 3 May 2026.",
+            "Pick up the feldspar should grab.",
+            "Tried the 12V fan. Too loud, ~40 dB at one metre.",
+        ])
+        docs = _distill_note(note, "0-raw/kiln-log.md")
+        claims = [approved_claim(document) for document in docs]
+        claims = [claim for claim in claims if claim]
+        blob = "\n".join(claims)
+        self.assertIn("10.4.4.8", blob)
+        self.assertIn("Ft. Bragg", blob)
+        self.assertIn("4 Apr 2026", blob)
+        self.assertIn("Shino", blob)
+        self.assertIn("feldspar", blob)
+        self.assertIn("$40", blob)
+        self.assertIn("plot 9", blob)
+        self.assertIn("3 May 2026", blob)
+        self.assertIn("12V", blob)
+        self.assertIn("40 dB", blob)
+        self.assertNotIn("sk-test123", blob)
+        self.assertNotIn("swordfish", blob)
+        self.assertNotIn("restless", blob.casefold())
+        self.assertNotIn("forgetting", blob.casefold())
+        self.assertNotIn("quay", blob.casefold())
+        self.assertFalse(any(claim.rstrip().endswith("{") for claim in claims))
+        self.assertFalse(any(claim.strip().startswith("|") for claim in claims))
+        self.assertNotIn("should grab", blob)
+
+    def test_mt_style_abbreviation_stays_one_sentence(self) -> None:
+        from scripts.sentence_spans import split_sentences
+
+        sentences = split_sentences("The hike reached Ft. Bragg before noon. Tess signed the log. The trail crossed Mt. Rowan before dusk. OK. The kiln was cool.")
+        self.assertTrue(any("Ft. Bragg" in sentence and "noon" in sentence for sentence in sentences))
+        self.assertTrue(any("Mt. Rowan" in sentence and "dusk" in sentence for sentence in sentences))
+        self.assertFalse(any(sentence.strip().startswith("Bragg") for sentence in sentences))
+        self.assertTrue(any(sentence.strip() == "OK." or sentence.strip().startswith("OK.") for sentence in sentences))
+        self.assertTrue(any(sentence.strip().startswith("The kiln") for sentence in sentences))
+
+    def test_chat_drops_an_uncited_address_and_keeps_a_normalised_date(self) -> None:
+        from scripts.streaming_chat import answer_with_citations
+
+        verified = [{
+            "id": "V1",
+            "claim": "The firing review is on 3 Apr 2026 with Tess.",
+            "evidence": "The firing review is on 3 Apr 2026 with Tess.",
+            "title": "Firing",
+        }]
+        answer = answer_with_citations(
+            "The review is the 3rd of April 2026 with Tess [V1]. The kiln controller is at 10.9.9.9.",
+            "When is the firing review?",
+            verified,
+        )
+        self.assertIn("Tess", answer)
+        self.assertIn("2026", answer)
+        self.assertNotIn("10.9.9.9", answer)
 
 
 class CapturePolicyTests(unittest.TestCase):
