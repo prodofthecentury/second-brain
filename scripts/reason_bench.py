@@ -500,6 +500,15 @@ def _coverage_hijacks() -> list[tuple[str, str, str, list[str]]]:
         ("hijack-c02-range-1", "decimal-range", "1.2-1.3", ["decimal-range"]),
         ("hijack-c02-range-2", "decimal-range", "3.14-3.15", ["decimal-range"]),
         ("hijack-c02-range-3", "decimal-range", "2.2-2.3", ["decimal-range"]),
+        ("hijack-hyphen-bare", "unspaced-hyphen", "10-4", ["unspaced-hyphen"]),
+        ("hijack-hyphen-ask", "unspaced-hyphen", "What is 9-5?", ["unspaced-hyphen"]),
+        ("hijack-hyphen-solve", "unspaced-hyphen", "Solve 1-800.", ["unspaced-hyphen"]),
+        ("hijack-hyphen-decimal", "unspaced-hyphen", "7-9.5", ["unspaced-hyphen"]),
+        ("hijack-hyphen-compute", "unspaced-hyphen", "Compute 12.5-15.", ["unspaced-hyphen"]),
+        ("hijack-hyphen-week", "unspaced-hyphen", "What is 24-7?", ["unspaced-hyphen"]),
+        ("hijack-slash-ask", "slash-idiom", "What is 24/7?", ["slash-idiom"]),
+        ("hijack-slash-compute", "slash-idiom", "Compute 12/25.", ["slash-idiom"]),
+        ("hijack-slash-evaluate", "slash-idiom", "Evaluate 9/11.", ["slash-idiom"]),
     ]
     return rows
 
@@ -735,8 +744,8 @@ def _coverage_tools() -> list[tuple]:
         ("tools-cov-mm-1", "Convert 5 Mm to m.", "5000000", "integer", "any", "ANSWER = 5000000", ["should-fire", "case-unit"]),
         ("tools-cov-mm-2", "Convert 3 Mm to m.", "3000000", "integer", "any", "ANSWER = 3000000", ["should-fire", "case-unit"]),
         ("tools-cov-mm-3", "Convert 12 Mm to m.", "12000000", "integer", "any", "ANSWER = 12000000", ["should-fire", "case-unit"]),
-        ("tools-cov-mbmb", "Convert 8 MB to Mb.", "64", "integer", "any", "ANSWER = 64", ["should-fire", "case-unit"]),
-        ("tools-cov-bit", "Convert 3 b to B.", "3/8", "fraction", "any", fraction.format(n=3, d=8), ["should-fire", "case-unit"]),
+        ("tools-cov-mbmb", "Convert 8 MB to Mb.", "64", "integer", "any", "ANSWER = 64", ["should-fire", "mb-to-Mb"]),
+        ("tools-cov-bit", "Convert 3 b to B.", "3/8", "fraction", "any", fraction.format(n=3, d=8), ["should-fire", "bit-to-byte"]),
         ("tools-cov-round-1", "Calculate 10 / 4 rounded down.", "2", "integer", "any", "ANSWER = 2", ["should-fire", "rounded-down"]),
         ("tools-cov-round-2", "Calculate 15 / 4 rounded down.", "3", "integer", "any", "ANSWER = 3", ["should-fire", "rounded-down"]),
         ("tools-cov-round-3", "Calculate 9 / 2 rounded down.", "4", "integer", "any", "ANSWER = 4", ["should-fire", "rounded-down"]),
@@ -760,6 +769,25 @@ def _coverage_tools() -> list[tuple]:
         ("tools-cov-sym-3", "What is 0.5 * 8?", "4", "integer", "any", "ANSWER = 4", ["should-fire", "sympy-parity"]),
         ("tools-cov-word-2", "What is 5 + 6 times 3?", "23", "integer", "any", "ANSWER = 23", ["should-fire", "word-operator"]),
         ("tools-cov-word-3", "What is 2 + 3 squared?", "11", "integer", "any", "ANSWER = 11", ["should-fire", "word-operator"]),
+        ("tools-cov-word-4", "What is 6 + 2 times 5?", "16", "integer", "any", "ANSWER = 16", ["should-fire", "word-operator"]),
+        ("tools-cov-float-3", "Compute 5/6 + 0.5.", "4/3", "fraction", "any", fraction.format(n=4, d=3), ["should-fire", "rounded-float"]),
+        ("tools-cov-mbmb-2", "What is 2 MB in Mb?", "16", "integer", "any", "ANSWER = 16", ["should-fire", "mb-to-Mb"]),
+        ("tools-cov-mbmb-3", "8 MB to Mb", "64", "integer", "any", "ANSWER = 64", ["should-fire", "mb-to-Mb"]),
+        ("tools-cov-bit-2", "What is 8 b in B?", "1", "integer", "any", "ANSWER = 1", ["should-fire", "bit-to-byte"]),
+        ("tools-cov-bit-3", "3 b to B", "3/8", "fraction", "any", fraction.format(n=3, d=8), ["should-fire", "bit-to-byte"]),
+        ("tools-cov-mega-1", "Convert 4 Mm to m.", "4000000", "integer", "any", "ANSWER = 4000000", ["should-fire", "mega-to-metre"]),
+        ("tools-cov-mega-2", "What is 3 Mm in metres?", "3000000", "integer", "any", "ANSWER = 3000000", ["should-fire", "mega-to-metre"]),
+        ("tools-cov-mega-3", "How long is 12 Mm, in metres?", "12000000", "integer", "any", "ANSWER = 12000000", ["should-fire", "mega-to-metre"]),
+        ("tools-cov-gib-dec", "Convert 1 GiB to MB.", "1073.741824", "decimal", "any", "ANSWER = '1073.741824'", ["should-fire", "terminating-decimal"]),
+        ("tools-cov-gib-ask", "What is 1 GiB in MB?", "1073.741824", "decimal", "any", "ANSWER = '1073.741824'", ["should-fire", "terminating-decimal"]),
+        ("tools-cov-mib-kb", "How much is 2 MiB in kB?", "2097.152", "decimal", "any", "ANSWER = '2097.152'", ["should-fire", "terminating-decimal"]),
+        ("tools-cov-prefix-mb", "Convert 1 MB to mb.", None, "unanswerable", None, "ANSWER = None", ["decline-ok", "nonsense-prefix"]),
+        ("tools-cov-prefix-db", "What is 2 dB in B?", None, "unanswerable", None, "ANSWER = None", ["decline-ok", "nonsense-prefix"]),
+        ("tools-cov-prefix-cb", "Convert 4 cB to B.", None, "unanswerable", None, "ANSWER = None", ["decline-ok", "nonsense-prefix"]),
+        ("tools-cov-prefix-hb", "Convert 3 hB to B.", None, "unanswerable", None, "ANSWER = None", ["decline-ok", "nonsense-prefix"]),
+        ("tools-cov-prefix-dab", "What is 2 daB in B?", None, "unanswerable", None, "ANSWER = None", ["decline-ok", "nonsense-prefix"]),
+        ("tools-cov-prefix-nb", "Convert 2 nb to b.", None, "unanswerable", None, "ANSWER = None", ["decline-ok", "nonsense-prefix"]),
+        ("tools-cov-prod", "What is 12 * 8 + 5 - 96?", "5", "integer", "any", "ANSWER = 12 * 8 + 5 - 96", ["should-fire", "precedence"]),
     ]
     out = []
     for item_id, question, answer, answer_type, expected, reference, tags in specs:
@@ -1651,7 +1679,7 @@ def _live_verified_floor(records: list[dict]) -> set[tuple[str, str, str]]:
     return found
 
 
-def collect_hard_failures(root: Path, *, include_mock: bool = True) -> dict[str, Any]:
+def collect_hard_failures(root: Path, *, include_mock: bool = True, recall_answered: set[tuple[str, str]] | None = None) -> dict[str, Any]:
     vault_info, retriever, canary = _arm_isolation(root)
     status = sympy_status()
     hijack = read_jsonl(bench_root(root) / "suites" / "hijack.jsonl")
@@ -1691,7 +1719,7 @@ def collect_hard_failures(root: Path, *, include_mock: bool = True) -> dict[str,
     if not commitment_ok:
         records.append({"id": "commitment", "sympy_mode": "natural", "status": "error", "correct": False, "verified": False, "answer_source": None, "plan_step_verified": False, "plan_not_executed": []})
     tuples = failure_tuples(hijack_reports=reports, records=records)
-    tuples = _with_coverage_tuples(root, tuples, records)
+    tuples = _with_coverage_tuples(root, tuples, records, recall_answered=recall_answered)
     if not manifest_ok:
         tuples = sorted(set(tuples) | {("manifest_ok", "manifest", "natural")})
     if not commitment_ok:
@@ -1767,7 +1795,13 @@ def _should_fire_recall(root: Path, records: list[dict]) -> dict[str, Any]:
     return report
 
 
-def _with_coverage_tuples(root: Path, tuples: list[tuple[str, str, str]], records: list[dict]) -> list[tuple[str, str, str]]:
+def _with_coverage_tuples(
+    root: Path,
+    tuples: list[tuple[str, str, str]],
+    records: list[dict],
+    *,
+    recall_answered: set[tuple[str, str]] | None = None,
+) -> list[tuple[str, str, str]]:
     found = set(tuples)
     tools = {str(row["id"]): row for row in read_jsonl(bench_root(root) / "suites" / "tools.jsonl")}
     by_key: dict[tuple[str, str], dict] = {}
@@ -1790,15 +1824,11 @@ def _with_coverage_tuples(root: Path, tuples: list[tuple[str, str, str]], record
         if left[0] != right[0] or (left[0] and right[0] and left[1] != right[1]):
             found.add(("sympy_parity", item_id, "natural"))
             found.add(("sympy_parity", item_id, "off"))
-    baseline = bench_root(root) / "expected-hard-failures.d04b7fa.json"
-    if baseline.is_file():
-        payload = json.loads(baseline.read_text(encoding="utf-8"))
-        active = engine_blob_sha(root, _ACTIVE_ENGINE_REF)
-        if str(payload.get("engine_sha") or "") != active:
-            wanted = _should_fire_ids(root)
-            answered = {tuple(pair) for pair in payload.get("should_fire_answered") or [] if str(pair[0]) in wanted}
-            current_ok = {tuple(pair) for pair in _should_fire_answered(records) if pair[0] in wanted}
-            for item_id, mode in sorted(answered - current_ok):
+    if recall_answered:
+        wanted = _should_fire_ids(root)
+        current_ok = {tuple(pair) for pair in _should_fire_answered(records) if pair[0] in wanted}
+        for item_id, mode in sorted(recall_answered):
+            if str(item_id) in wanted and (str(item_id), str(mode)) not in current_ok:
                 found.add(("should_fire_declined", str(item_id), str(mode)))
     return sorted(found)
 
@@ -2293,6 +2323,8 @@ def write_fingerprint(path: Path, tuples: list[tuple[str, str, str]], meta: dict
         "should_fire_answered": meta.get("should_fire_answered") or [],
         "should_fire_recall": meta.get("should_fire_recall") or {},
         "item_hashes": meta.get("item_hashes") or {},
+        "suite_version": meta.get("suite_version") or SUITE_VERSION,
+        "owner_approved_suite_versions": meta.get("owner_approved_suite_versions") or [SUITE_VERSION],
         "tuples": [list(item) for item in tuples],
     }
     path.write_text(canonical_json(payload) + "\n", encoding="utf-8", newline="\n")
@@ -2351,7 +2383,10 @@ def compare_fingerprint(
     except BenchError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    observed_payload = collect_hard_failures(root, include_mock=True)
+    recall = None
+    if baseline is not None:
+        recall = {tuple(pair) for pair in baseline.get("should_fire_answered") or []}
+    observed_payload = collect_hard_failures(root, include_mock=True, recall_answered=recall)
     observed = observed_payload["tuples"]
     missing = sorted(set(expected) - set(observed))
     extra = sorted(set(observed) - set(expected))
@@ -2383,23 +2418,30 @@ def _first_fingerprint_commit(root: Path) -> str | None:
     return lines[0] if lines else None
 
 
+BASELINE_PATH = "bench/reasoning/baseline/fingerprint.json"
+
+
+def _require_baseline_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    hashes = payload.get("item_hashes")
+    if not isinstance(hashes, dict) or not hashes:
+        raise BenchError("baseline fingerprint has no item_hashes; fail closed")
+    if "should_fire_answered" not in payload:
+        raise BenchError("baseline fingerprint has no should_fire_answered; fail closed")
+    return payload
+
+
 def _baseline_fingerprint(root: Path, *, base_ref: str | None, base_tuples_file: str | None) -> dict[str, Any] | None:
     if base_tuples_file:
         path = Path(base_tuples_file)
         if not path.is_file():
             raise BenchError(f"baseline fingerprint is missing: {path}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return _require_baseline_payload(json.loads(path.read_text(encoding="utf-8")))
     if not base_ref:
         return None
-    text = _git_show(root, base_ref, "bench/reasoning/expected-hard-failures.current.json")
-    if text:
-        return json.loads(text)
-    pinned = _first_fingerprint_commit(root)
-    if pinned:
-        text = _git_show(root, pinned, "bench/reasoning/expected-hard-failures.current.json")
-        if text:
-            return json.loads(text)
-    raise BenchError("no baseline fingerprint; the shrink check cannot be skipped")
+    text = _git_show(root, base_ref, BASELINE_PATH)
+    if not text:
+        raise BenchError(f"baseline fingerprint missing at {base_ref}:{BASELINE_PATH}; fail closed")
+    return _require_baseline_payload(json.loads(text))
 
 
 def _assert_no_suite_shrink(
@@ -2410,22 +2452,30 @@ def _assert_no_suite_shrink(
     baseline: dict[str, Any] | None = None,
     expected_payload: dict[str, Any] | None = None,
 ) -> None:
-    """Added failures on an unchanged item, deleted ids, and in-place edits that drop a failure all fail."""
+    """A missing hash map fails closed. Tupled items cannot change without an owner-approved suite bump."""
     if baseline is None:
         raise BenchError("no baseline fingerprint; the shrink check cannot be skipped")
-    base_hashes = {str(key): str(value) for key, value in (baseline.get("item_hashes") or {}).items()}
-    new_hashes = {str(key): str(value) for key, value in ((expected_payload or {}).get("item_hashes") or item_content_hashes(root)).items()}
+    baseline = _require_baseline_payload(baseline)
+    base_hashes = {str(key): str(value) for key, value in baseline["item_hashes"].items()}
     tree_hashes = item_content_hashes(root)
     removed = sorted(set(base_hashes) - set(tree_hashes))
     if removed:
         raise BenchError(f"suite item ids removed relative to the baseline: {removed[:12]}")
     base_tuples = {tuple(item) for item in baseline.get("tuples") or []}
     new_tuples = set(expected)
+    approved = {str(item) for item in baseline.get("owner_approved_suite_versions") or []}
+    base_version = str(baseline.get("suite_version") or "")
+    current_version = str(load_manifest(root).get("suite_version") or "")
+    bump_ok = bool(current_version) and current_version in approved and current_version != base_version
+    tupled = {row[1] for row in base_tuples}
     for item_id in set(base_hashes) & set(tree_hashes):
-        if base_hashes[item_id] != tree_hashes[item_id]:
-            lost = [row for row in base_tuples if row[1] == item_id and row not in new_tuples]
-            if lost:
-                raise BenchError(f"in-place edit dropped HARD failures for {item_id}")
+        if base_hashes[item_id] == tree_hashes[item_id]:
+            continue
+        gained = [row for row in new_tuples if row[1] == item_id and row not in base_tuples]
+        if (item_id in tupled or gained) and not bump_ok:
+            raise BenchError(
+                f"item {item_id} changed and has HARD tuples; that needs an owner-approved suite version bump"
+            )
     for gate, item_id, mode in sorted(new_tuples - base_tuples):
         if item_id in base_hashes and base_hashes.get(item_id) == tree_hashes.get(item_id):
             raise BenchError(f"new HARD {gate} on unchanged item {item_id} {mode}")
@@ -2581,6 +2631,7 @@ def build_parser() -> argparse.ArgumentParser:
     finger_p.add_argument("--base-file", default=None)
     finger_p.add_argument("--base-ref", default=None)
     finger_p.add_argument("--engine-ref", default=None)
+    finger_p.add_argument("--recall-file", default=None)
     seal_p = sub.add_parser("heldout-seal-templates")
     seal_p.add_argument("--in", dest="src", required=True)
     seal_p.add_argument("--out", required=True)
@@ -2627,7 +2678,11 @@ def _dispatch(args: argparse.Namespace) -> int:
         if getattr(args, "engine_ref", None):
             load_pinned_engine(root, args.engine_ref)
         if args.write:
-            payload = collect_hard_failures(root, include_mock=True)
+            recall = None
+            if args.recall_file:
+                recall_payload = _require_baseline_payload(json.loads(Path(args.recall_file).read_text(encoding="utf-8")))
+                recall = {tuple(pair) for pair in recall_payload.get("should_fire_answered") or []}
+            payload = collect_hard_failures(root, include_mock=True, recall_answered=recall)
             meta = {
                 "engine_sha": engine_blob_sha(root, args.engine_ref or "HEAD"),
                 "sympy_available": payload["sympy_available"],

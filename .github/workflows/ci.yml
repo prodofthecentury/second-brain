@@ -229,21 +229,7 @@ jobs:
             exit 2
           fi
           git fetch --depth=1 origin "${{ github.base_ref }}"
-          base_fp="${RUNNER_TEMP}/base-hard-failures.json"
-          if git cat-file -e "origin/${{ github.base_ref }}:bench/reasoning/expected-hard-failures.current.json" 2>/dev/null; then
-            git show "origin/${{ github.base_ref }}:bench/reasoning/expected-hard-failures.current.json" > "${base_fp}"
-          else
-            pin="$(git log --reverse --format=%H -- bench/reasoning/expected-hard-failures.current.json | head -n 1)"
-            if [ -z "${pin}" ]; then
-              echo "no baseline fingerprint; the shrink check cannot be skipped" >&2
-              exit 2
-            fi
-            git show "${pin}:bench/reasoning/expected-hard-failures.current.json" > "${base_fp}"
-          fi
-          uv run --frozen python -m scripts.reason_bench fingerprint \
-            --check bench/reasoning/expected-hard-failures.current.json \
-            --base-ref "origin/${{ github.base_ref }}" \
-            --base-file "${base_fp}"
+          bash scripts/ci_fingerprint_check.sh "origin/${{ github.base_ref }}"
 
   reason-bench-windows-crlf:
     name: windows crlf reason-bench

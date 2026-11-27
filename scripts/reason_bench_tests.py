@@ -439,6 +439,67 @@ class IsolationTests(unittest.TestCase):
                 )
 
 
+def _cr2_reference(groups: dict) -> tuple[float, float]:
+    """Independent CR2 / Bell–McCaffrey interval. Residuals use (1-h)^{-1/2} and not G/(G-1)."""
+    import math
+
+    from scripts.reason_bench_scoring import student_t_ppf
+
+    names = list(groups)
+    n = sum(len(values) for values in groups.values())
+    point = sum(value for values in groups.values() for value in values) / n
+    pieces = []
+    for values in groups.values():
+        local = sum(values) / len(values)
+        h = len(values) / n
+        residual = len(values) * (local - point)
+        pieces.append((residual / math.sqrt(1.0 - h)) / n)
+    se = math.sqrt(sum(piece * piece for piece in pieces))
+    critical = student_t_ppf(0.975, len(names) - 1)
+    return (point - critical * se, point + critical * se)
+
+
+def _cr1_interval(groups: dict) -> tuple[float, float]:
+    """CR1: the same cluster scores, scaled by G/(G-1), without the leverage correction."""
+    import math
+
+    from scripts.reason_bench_scoring import student_t_ppf
+
+    names = list(groups)
+    g = len(names)
+    n = sum(len(values) for values in groups.values())
+    point = sum(value for values in groups.values() for value in values) / n
+    pieces = []
+    for values in groups.values():
+        local = sum(values) / len(values)
+        pieces.append((len(values) * (local - point)) / n)
+    se = math.sqrt(sum(piece * piece for piece in pieces) * g / (g - 1))
+    critical = student_t_ppf(0.975, g - 1)
+    return (point - critical * se, point + critical * se)
+
+
+def _bca_reference(replicates: list[float], *, theta: float, acceleration: float) -> tuple[float, float]:
+    """Efron (1987) eq. (2.3), coded apart from bca_interval."""
+    import math
+    from statistics import NormalDist
+
+    ordered = sorted(replicates)
+    n = len(ordered)
+    prop = min(max(sum(1 for value in ordered if value < theta) / n, 1e-6), 1 - 1e-6)
+    z0 = NormalDist().inv_cdf(prop)
+
+    def adjusted(z_alpha: float) -> float:
+        numer = z0 + z_alpha
+        denom = 1.0 - acceleration * numer
+        return NormalDist().cdf(z0 + numer / denom)
+
+    lo_p = adjusted(NormalDist().inv_cdf(0.025))
+    hi_p = adjusted(NormalDist().inv_cdf(0.975))
+    lo = ordered[min(n - 1, max(0, int(math.floor(lo_p * (n - 1)))))]
+    hi = ordered[min(n - 1, max(0, int(math.ceil(hi_p * (n - 1)))))]
+    return (lo, hi) if lo <= hi else (hi, lo)
+
+
 class ScoringReferenceTests(unittest.TestCase):
     def test_percent_and_unknown_and_decimal_form(self) -> None:
         from fractions import Fraction
@@ -456,15 +517,27 @@ class ScoringReferenceTests(unittest.TestCase):
 
         from scripts.reason_bench_scoring import bca_interval, cluster_t_interval
 
-        # Two equal clusters of 1 and 0. CR2 se is 0.5. Published t_{1, 0.975} is 12.7062047364.
-        interval = cluster_t_interval({"a": [1.0, 1.0], "b": [0.0, 0.0]})
-        self.assertAlmostEqual(interval[0], 0.5 - 12.7062047364 * 0.5, places=4)
-        self.assertAlmostEqual(interval[1], 0.5 + 12.7062047364 * 0.5, places=4)
-        # BCa with theta 0.2 on five evenly spaced replicates. z0 = Phi^{-1}(0.2).
+        # Two equal clusters match CR1 and CR2, so they do not identify the correction.
+        equal = cluster_t_interval({"a": [1.0, 1.0], "b": [0.0, 0.0]})
+        self.assertAlmostEqual(equal[0], -5.853102368, places=5)
+        self.assertAlmostEqual(equal[1], 6.853102368, places=5)
+        # Unequal clusters. CR2 scales by (1-h)^{-1/2}. CR1 multiplies by G/(G-1) and does not.
+        unequal = {
+            "a": [1.0, 1.0, 0.0, 1.0],
+            "b": [0.0, 1.0, 0.0],
+            "c": [1.0, 0.0],
+            "d": [0.0, 0.0, 1.0, 1.0],
+        }
+        cr2 = cluster_t_interval(unequal)
+        cr1 = _cr1_interval(unequal)
+        self.assertNotAlmostEqual(cr2[0], cr1[0], places=4)
+        self.assertAlmostEqual(cr2[0], _cr2_reference(unequal)[0], places=6)
+        self.assertAlmostEqual(cr2[1], _cr2_reference(unequal)[1], places=6)
+        # BCa formula: Efron, B. (1987), "Better Bootstrap Confidence Intervals",
+        # Journal of the American Statistical Association 82(397), 171-185, eq. (2.3).
         replicates = [0.1, 0.2, 0.3, 0.4, 0.5]
-        # z0 = Phi^{-1}(1/5). With a=0 the adjusted tails land on order stats 0.1 and 0.4.
         biased = bca_interval(replicates, 0.0, theta=0.2)
-        self.assertEqual(biased, (0.1, 0.4))
+        self.assertEqual(biased, _bca_reference(replicates, theta=0.2, acceleration=0.0))
         self.assertTrue(math.isfinite(biased[0]))
 
     def test_sealed_extension_is_forbidden_inside_heldout_results(self) -> None:
