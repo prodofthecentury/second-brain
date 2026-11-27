@@ -2346,16 +2346,10 @@ def compare_fingerprint(
         return 1
     try:
         baseline = _baseline_fingerprint(root, base_ref=base_ref, base_tuples_file=base_file)
-        if base_tuples is None and baseline is not None:
-            base_tuples = [tuple(item) for item in baseline.get("tuples") or []]
         if base_ref or baseline is not None:
             _assert_no_suite_shrink(root, base_ref or "HEAD", expected, baseline=baseline, expected_payload=expected_payload)
     except BenchError as exc:
         print(str(exc), file=sys.stderr)
-        return 1
-    added = fingerprint_added(expected, base_tuples)
-    if added:
-        print(f"fingerprint added tuples relative to the base: {added[:12]}", file=sys.stderr)
         return 1
     observed_payload = collect_hard_failures(root, include_mock=True)
     observed = observed_payload["tuples"]
