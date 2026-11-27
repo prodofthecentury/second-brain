@@ -350,7 +350,7 @@ def exact_arithmetic(expr: str) -> tuple[str, str, bool]:
 
     A rounded float is never verified. Decimal literals are exact ratios first.
     """
-    had_decimal = bool(re.search(r"\d\.\d", expr))
+    had_decimal = bool(re.search(r"\.\d", expr))
     cleaned = _prepare_expression(expr)
     try:
         restricted_value = _ast_eval(cleaned)
@@ -387,6 +387,7 @@ def _question_text(question: Any) -> str:
 
 def _normalize_question(question: str) -> str:
     text = question.replace("\u2019", "'").replace("\u2018", "'")
+    text = text.replace("\u2212", "-")
     text = re.sub(r"\s+", " ", text).strip()
     return text.rstrip("?.!").strip()
 
@@ -410,24 +411,16 @@ def _glued_dimension(text: str) -> bool:
 
 
 def _hyphen_literal(text: str) -> bool:
-    """Hyphenated numbers are literals only without spaces around the hyphens.
+    """Any tight hyphen between numbers is a literal, not subtraction.
 
-    Three or more tight parts are an id or a date. A phone shape is a literal
-    even with two parts or parentheses. Spaced subtraction is not a literal.
+    Digit count and decimals do not matter: 10-4, 1-800 and 10.5-12 all decline.
+    A space on either side of the hyphen keeps it as subtraction, including 40 -15.
+    Parentheses do not split a phone such as (555)-1234.
     """
-    if "-" not in text or re.search(r"[+*/%^xX×]", text):
+    if "-" not in text:
         return False
-    if re.search(r"\s-|-\s", text):
-        return False
-    core = re.sub(r"[()\s]", "", text)
-    if not re.fullmatch(r"\d+(?:-\d+)+", core):
-        return False
-    parts = core.split("-")
-    if len(parts) >= 3:
-        return True
-    if "(" in text or ")" in text:
-        return True
-    return sum(len(part) for part in parts) >= 7 and all(len(part) >= 2 for part in parts)
+    core = re.sub(r"[()]", "", text)
+    return re.search(r"(?<!\s)\d(?:\.\d+)?-(?!\s)\d", core) is not None
 
 
 def _date_phone_or_range(text: str) -> bool:
@@ -535,11 +528,15 @@ _SI_PREFIXES = (
     ("p", Fraction(1, 10**12)),
 )
 _IEC_PREFIXES = (
+    ("Ei", 1024**6),
+    ("Pi", 1024**5),
     ("Ti", 1024**4),
     ("Gi", 1024**3),
     ("Mi", 1024**2),
     ("Ki", 1024),
 )
+_DATA_SI_PREFIXES = frozenset({"k", "M", "G", "T", "P", "E", "Z", "Y"})
+_REJECT_UNIT = object()
 _WORD_UNITS = {
     "meter": "m", "meters": "m", "metre": "m", "metres": "m",
     "kilometer": "km", "kilometers": "km", "kilometre": "km", "kilometres": "km",
@@ -564,12 +561,9 @@ def _base_unit(symbol: str) -> tuple[str, Fraction] | None:
     return None
 
 
-def _parse_unit(raw: str) -> tuple[str, Fraction | str] | None:
-    """Case-sensitive symbol parse. M is mega, m is milli or metre, B is byte, b is bit."""
-    token = raw.strip().replace("°", "")
-    if len(token) > 2 and token.casefold() in _WORD_UNITS:
-        token = _WORD_UNITS[token.casefold()]
-    if token in {"C", "F"}:
+def _parse_unit_strict(token: str) -> tuple[str, Fraction | str] | object | None:
+    """Case-sensitive parse. Data units take only the large SI prefixes and IEC prefixes."""
+    if len(token) == 1 and token in {"C", "F"}:
         return ("temp", token)
     whole = {
         "in": ("length", Fraction(254, 10000)),
@@ -596,8 +590,35 @@ def _parse_unit(raw: str) -> tuple[str, Fraction | str] | None:
             base = _base_unit(token[len(name):])
             if base is None:
                 continue
+            if base[0] == "data" and name not in _DATA_SI_PREFIXES:
+                return _REJECT_UNIT
             return (base[0], Fraction(scale) * base[1])
     return _base_unit(token)
+
+
+def _parse_unit(raw: str) -> tuple[str, Fraction | str] | None:
+    """M is mega, m is milli or metre, B is byte, b is bit.
+
+    A whole unit whose case cannot be a different prefix, such as KM or LB,
+    is read by its letters. A failed data prefix is never folded into another unit.
+    """
+    token = raw.strip().replace("°", "")
+    if len(token) > 2 and token.casefold() in _WORD_UNITS:
+        token = _WORD_UNITS[token.casefold()]
+    if len(token) == 1 and token.casefold() in {"c", "f"}:
+        return ("temp", token.upper())
+    parsed = _parse_unit_strict(token)
+    if parsed is _REJECT_UNIT:
+        return None
+    if parsed is not None:
+        return parsed
+    folded = token.casefold()
+    if folded == token:
+        return None
+    folded_parsed = _parse_unit_strict(folded)
+    if folded_parsed is None or folded_parsed is _REJECT_UNIT or folded_parsed[0] == "data":
+        return None
+    return folded_parsed
 
 
 def _unit_answer(question: str) -> str | None:
@@ -616,25 +637,19 @@ def _unit_answer(question: str) -> str | None:
         return None
     if src[0] == "temp":
         if src[1] == "C" and dst[1] == "F":
-            value = float(amount) * 9.0 / 5.0 + 32.0
+            value = amount * Fraction(9, 5) + 32
+            back = (value - 32) * Fraction(5, 9)
         elif src[1] == "F" and dst[1] == "C":
-            value = (float(amount) - 32.0) * 5.0 / 9.0
+            value = (amount - 32) * Fraction(5, 9)
+            back = value * Fraction(9, 5) + 32
         elif src[1] == dst[1]:
-            value = float(amount)
+            value = amount
+            back = amount
         else:
             return None
-        forward = _format_number(value)
-        if src[1] == dst[1]:
-            back = float(forward)
-        elif src[1] == "C" and dst[1] == "F":
-            back = (float(forward) - 32.0) * 5.0 / 9.0
-        elif src[1] == "F" and dst[1] == "C":
-            back = float(forward) * 9.0 / 5.0 + 32.0
-        else:
+        if back != amount:
             return None
-        if abs(back - float(amount)) > 1e-6:
-            return None
-        return forward
+        return _format_number(value, prefer_decimal=True)
     try:
         forward_value = amount * src[1] / dst[1]
         back = forward_value * dst[1] / src[1]
@@ -642,7 +657,7 @@ def _unit_answer(question: str) -> str | None:
         return None
     if back != amount:
         return None
-    return _format_number(forward_value, prefer_decimal="." in match.group(1))
+    return _format_number(forward_value, prefer_decimal=True)
 
 
 def classify(question: str) -> str:
@@ -841,7 +856,7 @@ def _call_model(model_fn: Callable[[str], str] | None, prompt: str, state: dict[
         except Exception as exc:
             box["error"] = str(exc)
 
-    worker = threading.Thread(target=_run, daemon=True)
+    worker = threading.Thread(target=_run, daemon=True, name="reason-model-call")
     worker.start()
     worker.join(remaining)
     if worker.is_alive():

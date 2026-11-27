@@ -892,6 +892,25 @@ class MechanismProbeTests(unittest.TestCase):
             "555-1234",
             "(555)-1234",
             "(09) 377-1234",
+            "10-4",
+            "2026-11",
+            "What is 2026-11?",
+            "11-27",
+            "4-20",
+            "9-5",
+            "3-2",
+            "24-7",
+            "50-50",
+            "1-0",
+            "2-1",
+            "112-0",
+            "1-800",
+            "10.5-12",
+            "7.5-9",
+            "3.5-4",
+            "0.5-1",
+            "2.0-1",
+            "3.11-3",
             "What is 2 + 3 4?",
             "What is 3 4 + 1?",
             "A shop packs 12 boxes of 8 pens. It sells half of the pens and then gets 5 more pens delivered. How many pens does it have now?",
@@ -913,6 +932,9 @@ class MechanismProbeTests(unittest.TestCase):
             "10 - 4": "6",
             "What is 10 - 2 - 3?": "5",
             "Calculate 2026 - 1990": "36",
+            "40 -15": "25",
+            "40 − 15": "25",
+            ".5 + .25": "0.75",
             "What is 17 * 23 + 9?": "400",
             "What is 1,500 + 20?": "1520",
             "What is -5 + 3?": "-2",
@@ -929,6 +951,10 @@ class MechanismProbeTests(unittest.TestCase):
             for question, answer in exact.items():
                 result = reason(question, use_default_model=False)
                 self.assertEqual(result["answer"], answer, question)
+                if result["verified"] and "." not in answer:
+                    self.assertNotIn(".", result["answer"], question)
+                if result["verified"] and "/" in result["answer"]:
+                    self.assertNotIn(".", result["answer"], question)
                 seen[question] = result["answer"]
             self.assertEqual(seen["What is 2.5 * 2?"], "5")
             self.assertEqual(seen["What is 2/3 + 0.5?"], "7/6")
@@ -1006,6 +1032,13 @@ class MechanismProbeTests(unittest.TestCase):
             "OLLAMA_HOST": f"http://127.0.0.1:{port}",
             "BRAIN_OLLAMA_TIMEOUT": "30",
         }
+        def _model_workers() -> list[threading.Thread]:
+            return [
+                thread
+                for thread in threading.enumerate()
+                if thread.name == "reason-model-call" and thread.is_alive()
+            ]
+
         try:
             with patch.dict(os.environ, env, clear=False):
                 os.environ.pop("BRAIN_OLLAMA_HOST", None)
@@ -1013,6 +1046,10 @@ class MechanismProbeTests(unittest.TestCase):
                     started = time.perf_counter()
                     result = reason("Why is the sky blue?", use_default_model=True)
                     elapsed = time.perf_counter() - started
+            deadline = time.perf_counter() + 2.5
+            while time.perf_counter() < deadline and _model_workers():
+                time.sleep(0.05)
+            self.assertEqual(_model_workers(), [])
         finally:
             stop.set()
             server.close()
@@ -1023,39 +1060,65 @@ class MechanismProbeTests(unittest.TestCase):
         self.assertTrue(any("timeout" in error for error in result["errors"]))
 
     def test_unit_prefix_case_and_bit_byte(self) -> None:
-        """Prefix and case stay distinct. Expectations are computed independently of the engine."""
+        """Prefix and case stay distinct. The assertion is the printed string."""
         from fractions import Fraction
 
-        mega, kilo, giga = 10**6, 10**3, 10**9
-        gibi = 1024**3
-        rows = [
-            ("100 Mb to kB", Fraction(100) * mega / 8 / kilo),
-            ("1 Gb to MB", Fraction(1) * giga / 8 / mega),
-            ("1 Mm to m", Fraction(mega)),
-            ("1 Mg to kg", Fraction(mega) / kilo),
-            ("1 mm to m", Fraction(1, 1000)),
-            ("1 km to m", Fraction(1000)),
-            ("100 Mb to MB", Fraction(100) / 8),
-            ("8 b to B", Fraction(1)),
-            ("1 GiB to MB", Fraction(gibi, mega)),
-            ("1 Gib to MB", Fraction(gibi, 8 * mega)),
-            ("2 kg to g", Fraction(2000)),
-            ("30 min to s", Fraction(1800)),
-            ("3 km to m", Fraction(3000)),
-        ]
-
-        def _as_fraction(text: str) -> Fraction:
-            if "/" in text:
-                numer, denom = text.split("/", 1)
-                return Fraction(int(numer), int(denom))
-            return Fraction(text)
+        rows = {
+            "100 Mb to kB": "12500",
+            "1 Gb to MB": "125",
+            "1 Mm to m": "1000000",
+            "1 Mg to kg": "1000",
+            "1 mm to m": "0.001",
+            "1 km to m": "1000",
+            "100 Mb to MB": "12.5",
+            "8 b to B": "1",
+            "1 GiB to MB": "1073.741824",
+            "1 Gib to MB": "134.217728",
+            "3 mi to km": "4.828032",
+            "1 lb to kg": "0.45359237",
+            "1 kB to KiB": "0.9765625",
+            "1 cm to in": "50/127",
+            "2 kg to g": "2000",
+            "30 min to s": "1800",
+            "3 km to m": "3000",
+            "5 KM to m": "5000",
+            "1 LB to oz": "16",
+            "100 C to F": "212",
+            "72 F to C": "200/9",
+            "98 F to C": "110/3",
+            "61 F to C": "145/9",
+            "100 F to C": "340/9",
+            "0 F to C": "-160/9",
+            "451 F to C": "2095/9",
+            "32 F to c": "0",
+        }
+        declined = (
+            "1 MB to mb",
+            "1 mb to MB",
+            "1 MB to mB",
+            "1000 mB to B",
+            "1 Mb to mb",
+            "1 dB to B",
+            "10 dB to B",
+            "1 cB to B",
+            "1 hB to B",
+            "1 daB to B",
+            "1 nb to b",
+        )
 
         def check() -> None:
-            for question, expected in rows:
+            for question, expected in rows.items():
                 result = reason(f"Convert {question}.", use_default_model=False)
-                self.assertFalse(result["abstained"], question)
-                self.assertEqual(_as_fraction(result["answer"]), expected, question)
-                self.assertTrue(str(result["answer_source"]).startswith("tool:"), question)
+                self.assertEqual(result["answer"], expected, question)
+                self.assertTrue(result["verified"], question)
+                self.assertEqual(Fraction(result["answer"]), Fraction(expected), question)
+                if "/" in expected:
+                    self.assertNotIn(".", result["answer"], question)
+            for question in declined:
+                tool = try_exact_tool(f"Convert {question}.")
+                self.assertTrue(tool is None or tool.get("refused"), question)
+                result = reason(f"Convert {question}.", use_default_model=False)
+                self.assertFalse(result["verified"], question)
 
         self._both(check)
 
