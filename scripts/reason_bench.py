@@ -509,9 +509,11 @@ def _coverage_hijacks() -> list[tuple[str, str, str, list[str]]]:
         ("hijack-slash-ask", "slash-idiom", "What is 24/7?", ["slash-idiom"]),
         ("hijack-slash-compute", "slash-idiom", "Compute 12/25.", ["slash-idiom"]),
         ("hijack-slash-evaluate", "slash-idiom", "Evaluate 9/11.", ["slash-idiom"]),
-        ("hijack-spaced-year", "spaced-hyphen", "2026 -11", ["spaced-hyphen", "no-prefix"]),
-        ("hijack-spaced-year-dot", "spaced-hyphen", "2020 -4.", ["spaced-hyphen", "no-prefix"]),
-        ("hijack-spaced-year-paren", "spaced-hyphen", "(2026 -11)", ["spaced-hyphen", "no-prefix"]),
+        ("hijack-spaced-ask", "spaced-hyphen", "What is 2026 -11?", ["spaced-hyphen"]),
+        ("hijack-spaced-form", "spaced-hyphen", "The form says 10 -4 at the top.", ["spaced-hyphen"]),
+        ("hijack-spaced-call", "spaced-hyphen", "Call (2026 -11) ext.", ["spaced-hyphen"]),
+        ("hijack-spaced-ten", "spaced-hyphen", "10 -4", ["spaced-hyphen"]),
+        ("hijack-spaced-nine", "spaced-hyphen", "9 -5", ["spaced-hyphen"]),
     ]
     return rows
 
@@ -670,30 +672,30 @@ def _generated_hijack(category: str, rng: random.Random, names: list[str], seria
 
 def build_tools_items() -> list[dict]:
     specs = [
-        ("tools-0001", "What is 17 * 23 + 9?", "400", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#arith-17-23-9", "ANSWER = 17 * 23 + 9"),
-        ("tools-0002", "What date is 14 days after 2026-11-27?", "2026-12-11", "date", "any", "migrated", "docs/reasoning-benchmarks.json#date-14-days", "ANSWER = '2026-12-11'"),
-        ("tools-0003", "How many days between 2026-11-01 and 2026-11-27?", "26", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#days-between", "ANSWER = 26"),
-        ("tools-0004", "Convert 3 km to m.", "3000", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#unit-km", "ANSWER = 3000"),
-        ("tools-0005", "Convert 100 C to F.", "212", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#unit-celsius", "ANSWER = 212"),
+        ("tools-0001", "What is 17 * 23 + 9?", "400", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#arith-17-23-9", "ANSWER = 17 * 23 + 9", ["should-fire"]),
+        ("tools-0002", "What date is 14 days after 2026-11-27?", "2026-12-11", "date", "any", "migrated", "docs/reasoning-benchmarks.json#date-14-days", "ANSWER = '2026-12-11'", ["should-fire"]),
+        ("tools-0003", "How many days between 2026-11-01 and 2026-11-27?", "26", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#days-between", "ANSWER = 26", ["should-fire"]),
+        ("tools-0004", "Convert 3 km to m.", "3000", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#unit-km", "ANSWER = 3000", ["should-fire"]),
+        ("tools-0005", "Convert 100 C to F.", "212", "integer", "any", "migrated", "docs/reasoning-benchmarks.json#unit-celsius", "ANSWER = 212", ["should-fire"]),
         # The whole-parse engine declines this sentence. 101 remains the gold if a tool does fire.
-        ("tools-0007", "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?", "101", "integer", None, "migrated", "docs/reasoning-benchmarks.json#gsm-pens", "ANSWER = 12 * 8 + 5"),
-        ("tools-0012", "What is 1/3 + 1/6?", "1/2", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(1, 3) + Fraction(1, 6)"),
-        # A reduced a/b with no other operator only echoes the input, so the tool must decline.
-        ("tools-0013", "What is 2/3?", None, "unanswerable", None, "original", None, "ANSWER = None"),
-        ("tools-0014", "What is 5/6?", None, "unanswerable", None, "original", None, "ANSWER = None"),
-        ("tools-0015", "What is 1/7?", None, "unanswerable", None, "original", None, "ANSWER = None"),
-        ("tools-0016", "What is 1/2?", None, "unanswerable", None, "original", None, "ANSWER = None"),
-        ("tools-0017", "What is 3/4?", None, "unanswerable", None, "original", None, "ANSWER = None"),
-        ("tools-0018", "What is 1/4 + 1/4?", "1/2", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(1, 2)"),
-        ("tools-0019", "Convert 2 kg to g.", "2000", "integer", "any", "original", None, "ANSWER = 2000"),
-        ("tools-0020", "Convert 30 min to s.", "1800", "integer", "any", "original", None, "ANSWER = 1800"),
-        ("tools-0021", "What date is 7 days after 2026-01-28?", "2026-02-04", "date", "any", "original", None, "ANSWER = '2026-02-04'"),
-        ("tools-0022", "How many days between 2024-02-01 and 2024-03-01?", "29", "integer", "any", "original", None, "ANSWER = 29"),
-        ("tools-0023", "What does the owner prefer for coffee?", None, "unanswerable", None, "original", None, "ANSWER = None"),
+        ("tools-0007", "A shop sold 12 boxes of 8 pens and then 5 more pens. How many pens were sold?", "101", "integer", None, "migrated", "docs/reasoning-benchmarks.json#gsm-pens", "ANSWER = 12 * 8 + 5", ["decline-ok"]),
+        ("tools-0012", "What is 1/3 + 1/6?", "1/2", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(1, 3) + Fraction(1, 6)", ["should-fire"]),
+        # A single reduced a/b with no other operator and no conversion is an echo and must decline.
+        ("tools-0013", "What is 2/3?", None, "unanswerable", None, "original", None, "ANSWER = None", ["must-not-fire", "reduced-fraction"]),
+        ("tools-0014", "What is 5/6?", None, "unanswerable", None, "original", None, "ANSWER = None", ["must-not-fire", "reduced-fraction"]),
+        ("tools-0015", "What is 1/7?", None, "unanswerable", None, "original", None, "ANSWER = None", ["must-not-fire", "reduced-fraction"]),
+        ("tools-0016", "What is 1/2?", None, "unanswerable", None, "original", None, "ANSWER = None", ["must-not-fire", "reduced-fraction"]),
+        ("tools-0017", "What is 3/4?", None, "unanswerable", None, "original", None, "ANSWER = None", ["must-not-fire", "reduced-fraction"]),
+        ("tools-0018", "What is 1/4 + 1/4?", "1/2", "fraction", "any", "original", None, "from fractions import Fraction\nANSWER = Fraction(1, 2)", ["should-fire"]),
+        ("tools-0019", "Convert 2 kg to g.", "2000", "integer", "any", "original", None, "ANSWER = 2000", ["should-fire"]),
+        ("tools-0020", "Convert 30 min to s.", "1800", "integer", "any", "original", None, "ANSWER = 1800", ["should-fire"]),
+        ("tools-0021", "What date is 7 days after 2026-01-28?", "2026-02-04", "date", "any", "original", None, "ANSWER = '2026-02-04'", ["should-fire"]),
+        ("tools-0022", "How many days between 2024-02-01 and 2024-03-01?", "29", "integer", "any", "original", None, "ANSWER = 29", ["should-fire"]),
+        ("tools-0023", "What does the owner prefer for coffee?", None, "unanswerable", None, "original", None, "ANSWER = None", ["decline-ok"]),
     ]
     rows = []
-    for item_id, question, answer, answer_type, expected, source, derived, reference in specs:
-        rows.append(_tool_row(item_id, question, answer, answer_type, expected, source, derived, reference, tags=["should-fire"] if expected else ["decline-ok"]))
+    for item_id, question, answer, answer_type, expected, source, derived, reference, tags in specs:
+        rows.append(_tool_row(item_id, question, answer, answer_type, expected, source, derived, reference, tags))
     # Twenty further should-fire arithmetic controls the current tool can answer exactly.
     extras = [
         (2, 2, "+"), (8, 7, "*"), (40, 15, "-"), (9, 3, "/"), (12, 5, "+"),
@@ -729,9 +731,6 @@ def build_tools_items() -> list[dict]:
         rows.append(_tool_row(*spec))
     for spec in _case_unit_traps():
         rows.append(_tool_row(*spec))
-    for row in rows:
-        if row["id"] in {f"tools-00{index}" for index in range(13, 18)}:
-            row["tags"] = ["must-not-fire", "reduced-fraction"]
     return rows
 
 
@@ -807,52 +806,69 @@ def _coverage_tools() -> list[tuple]:
     return out
 
 
-def _case_unit_traps() -> list[tuple]:
-    """Thirteen case collisions. A fire must be the case-sensitive reading; a decline is allowed.
+def _unit_shapes(body: str) -> list[str]:
+    """Three frames the unit parser accepts. The words change; the quantity does not."""
+    inward = body.replace(" to ", " in ", 1)
+    into = body.replace(" to ", " into ", 1)
+    return [f"Convert {body}.", f"What is {inward}?", f"How much is {into}?"]
 
-    M is mega and m is milli, so folding MM into mm is not that reading.
+
+def _case_unit_traps() -> list[tuple]:
+    """Case rules for unit symbols.
+
+    m, g and s are lower-case base units. An uppercase base-unit letter is not an SI
+    symbol and must decline: any answer is a failure. The case-insensitive whitelist
+    is KM, KG, LB, OZ, FT, MI, MIN, CM, DM and KS. Properly cased Mm, Mg, Ms, Pm, Gm,
+    Pg and Ps are exact should-fire conversions.
     """
     rows: list[tuple] = []
 
-    def add(item_id: str, question: str, answer, answer_type: str, reference: str, kind: str) -> None:
-        rows.append((
-            item_id, question, answer, answer_type, None, "original", None, reference,
-            ["correct-or-decline", "case-trap", kind],
-        ))
+    def add(prefix: str, kind: str, body: str, answer, answer_type: str, reference: str, tags: list[str]) -> None:
+        for index, question in enumerate(_unit_shapes(body), start=1):
+            rows.append((
+                f"{prefix}-{index}", question, answer, answer_type, "any" if "should-fire" in tags else None,
+                "original", None, reference, [*tags, kind],
+            ))
 
-    for item_id, question in (
-        ("tools-case-mm-1", "Convert 1 MM to m."),
-        ("tools-case-mm-2", "What is 1 MM in m?"),
-        ("tools-case-mm-3", "How much is 1 MM into m?"),
-    ):
-        add(item_id, question, "1000000", "integer", "ANSWER = 10**6", "mega-length")
-    for item_id, question in (
-        ("tools-case-mg-1", "Convert 1 MG to kg."),
-        ("tools-case-mg-2", "What is 1 MG in kg?"),
-        ("tools-case-mg-3", "How much is 1 MG into kg?"),
-    ):
-        add(item_id, question, "1000", "integer", "ANSWER = 1000", "mega-mass")
-    for item_id, question in (
-        ("tools-case-pm-1", "Convert 1 PM to m."),
-        ("tools-case-pm-2", "What is 1 PM in m?"),
-        ("tools-case-pm-3", "How much is 1 PM into m?"),
-    ):
-        add(item_id, question, "1000000000000000", "integer", "ANSWER = 10**15", "peta-length")
-    for item_id, question in (
-        ("tools-case-ms-1", "Convert 1 MS to s."),
-        ("tools-case-ms-2", "What is 1 MS in s?"),
-        ("tools-case-ms-3", "How much is 1 MS into s?"),
-    ):
-        add(item_id, question, "1000000", "integer", "ANSWER = 10**6", "mega-time")
-    add("tools-case-bare-m", "Convert 1 M to m.", None, "unanswerable", "ANSWER = None", "bare-symbol")
-    add("tools-case-bare-g", "What is 1 G in g?", None, "unanswerable", "ANSWER = None", "bare-symbol")
-    add("tools-case-bare-s", "How much is 1 S into s?", None, "unanswerable", "ANSWER = None", "bare-symbol")
-    add("tools-case-km-mm", "Convert 1 KM to MM.", "0.001", "decimal", "ANSWER = '0.001'", "crossed-case")
-    add("tools-case-km-m", "What is 1 km in M?", None, "unanswerable", "ANSWER = None", "crossed-case")
-    add("tools-case-ms-ms", "How much is 1 Ms into MS?", "1", "integer", "ANSWER = 1", "crossed-case")
-    add("tools-case-pg", "Convert 1 PG to g.", "1000000000000000", "integer", "ANSWER = 10**15", "peta-other")
-    add("tools-case-ps", "What is 1 PS in s?", "1000000000000000", "integer", "ANSWER = 10**15", "peta-other")
-    add("tools-case-gm", "How much is 1 GM into m?", "1000000000", "integer", "ANSWER = 10**9", "peta-other")
+    def decline(prefix: str, kind: str, body: str) -> None:
+        add(prefix, kind, body, None, "unanswerable", "ANSWER = None", ["must-decline", "case-trap"])
+
+    def exact(prefix: str, kind: str, body: str, answer: str, answer_type: str, reference: str) -> None:
+        add(prefix, kind, body, answer, answer_type, reference, ["should-fire", "case-exact"])
+
+    # All-caps base units are not SI. Any printed answer, including a mega reading, fails.
+    decline("tools-case-mm", "mega-length", "1 MM to m")
+    decline("tools-case-mg", "mega-mass", "1 MG to kg")
+    decline("tools-case-pm", "peta-length", "1 PM to m")
+    decline("tools-case-ms", "mega-time", "1 MS to s")
+    decline("tools-case-km-mm", "crossed-case", "1 KM to MM")
+    decline("tools-case-km-m", "crossed-case", "1 km to M")
+    decline("tools-case-ms-ms", "crossed-case", "1 Ms to MS")
+    decline("tools-case-pg", "peta-other", "1 PG to g")
+    decline("tools-case-ps", "peta-other", "1 PS to s")
+    decline("tools-case-gm", "peta-other", "1 GM to m")
+    decline("tools-case-bare-m", "bare-symbol", "1 M to m")
+    decline("tools-case-bare-g", "bare-symbol", "1 G to g")
+    decline("tools-case-bare-s", "bare-symbol", "1 S to s")
+    # Properly cased symbols.
+    exact("tools-si-mm", "mega-length", "1 Mm to m", "1000000", "integer", "ANSWER = 10**6")
+    exact("tools-si-mg", "mega-mass", "1 Mg to kg", "1000", "integer", "ANSWER = 1000")
+    exact("tools-si-ms", "mega-time", "1 Ms to s", "1000000", "integer", "ANSWER = 10**6")
+    exact("tools-si-pm", "peta-length", "1 Pm to m", "1000000000000000", "integer", "ANSWER = 10**15")
+    exact("tools-si-gm", "giga-length", "1 Gm to m", "1000000000", "integer", "ANSWER = 10**9")
+    exact("tools-si-pg", "peta-mass", "1 Pg to g", "1000000000000000", "integer", "ANSWER = 10**15")
+    exact("tools-si-ps", "peta-time", "1 Ps to s", "1000000000000000", "integer", "ANSWER = 10**15")
+    # Whitelist: these all-caps spellings are accepted case-insensitively.
+    exact("tools-wl-km", "whitelist", "1 KM to m", "1000", "integer", "ANSWER = 1000")
+    exact("tools-wl-kg", "whitelist", "1 KG to g", "1000", "integer", "ANSWER = 1000")
+    exact("tools-wl-lb", "whitelist", "1 LB to oz", "16", "integer", "ANSWER = 16")
+    exact("tools-wl-oz", "whitelist", "1 OZ to g", "28.349523125", "decimal", "ANSWER = '28.349523125'")
+    exact("tools-wl-ft", "whitelist", "1 FT to in", "12", "integer", "ANSWER = 12")
+    exact("tools-wl-mi", "whitelist", "1 MI to km", "1.609344", "decimal", "ANSWER = '1.609344'")
+    exact("tools-wl-min", "whitelist", "1 MIN to s", "60", "integer", "ANSWER = 60")
+    exact("tools-wl-cm", "whitelist", "1 CM to m", "0.01", "decimal", "ANSWER = '0.01'")
+    exact("tools-wl-dm", "whitelist", "1 DM to m", "0.1", "decimal", "ANSWER = '0.1'")
+    exact("tools-wl-ks", "whitelist", "1 KS to s", "1000", "integer", "ANSWER = 1000")
     return rows
 
 
@@ -1922,9 +1938,18 @@ def _with_coverage_tuples(
         if left[0] != right[0] or (left[0] and right[0] and left[1] != right[1]):
             found.add(("sympy_parity", item_id, "natural"))
             found.add(("sympy_parity", item_id, "off"))
+    wanted = _should_fire_ids(root)
+    current_ok = {tuple(pair) for pair in _should_fire_answered(records) if pair[0] in wanted}
+    ran = {
+        (str(row["id"]), str(row.get("sympy_mode") or "natural"))
+        for row in records
+        if row.get("runner") == "tools_only" and str(row.get("id")) in wanted
+    }
+    # A should-fire item that was run and did not answer is HARD even when no baseline lists it.
+    for item_id, mode in sorted(ran):
+        if (item_id, mode) not in current_ok:
+            found.add(("should_fire_declined", item_id, mode))
     if recall_answered:
-        wanted = _should_fire_ids(root)
-        current_ok = {tuple(pair) for pair in _should_fire_answered(records) if pair[0] in wanted}
         for item_id, mode in sorted(recall_answered):
             if str(item_id) in wanted and (str(item_id), str(mode)) not in current_ok:
                 found.add(("should_fire_declined", str(item_id), str(mode)))
@@ -2612,14 +2637,10 @@ def _assert_no_suite_shrink(
             raise BenchError("suite_version changed in a change that also removes fingerprint tuples")
 
 
-def owner_approved_versions(root: Path, base_ref: str) -> set[str]:
-    """Suite bumps are approved only from the base branch file or a verified signed tag."""
-    approved: set[str] = set()
-    if base_ref:
-        text = _git_show(root, base_ref, OWNER_APPROVALS)
-        if text:
-            payload = json.loads(text)
-            approved.update(str(item) for item in payload.get("suite_versions") or [])
+OWNER_SIGNING_FINGERPRINT = ".github/owner-signing-fingerprint"
+
+
+def _approval_tags(root: Path) -> list[str]:
     try:
         tags = subprocess.check_output(
             ["git", "tag", "-l", "reason-bench-approve-*"],
@@ -2628,15 +2649,61 @@ def owner_approved_versions(root: Path, base_ref: str) -> set[str]:
             stderr=subprocess.DEVNULL,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
-        tags = ""
-    for tag in tags.split():
-        verified = subprocess.run(
-            ["git", "verify-tag", tag],
-            cwd=root,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if verified.returncode == 0:
+        return []
+    return [tag for tag in tags.split() if tag]
+
+
+def _tag_signer_fingerprint(root: Path, tag: str) -> str | None:
+    """Fingerprint from `git verify-tag --raw`, or None when the tag is not a trusted signature."""
+    verified = subprocess.run(
+        ["git", "verify-tag", "--raw", tag],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    blob = f"{verified.stdout}\n{verified.stderr}"
+    if verified.returncode != 0 and "VALIDSIG" not in blob and "GOODSIG" not in blob:
+        return None
+    for line in blob.splitlines():
+        if "VALIDSIG" not in line and "GOODSIG" not in line:
+            continue
+        for part in line.split():
+            if len(part) >= 40 and all(char in "0123456789abcdefABCDEF" for char in part):
+                return part.lower()
+    return None
+
+
+def pinned_owner_fingerprint(root: Path, pin: str) -> str:
+    """The only signing key the gate trusts. `none` and an empty file trust nobody."""
+    text = (_git_show(root, pin, OWNER_SIGNING_FINGERPRINT) or "").strip().lower()
+    if text in {"", "none"}:
+        return ""
+    return text.split()[0]
+
+
+def reject_foreign_tags(root: Path, pin: str) -> None:
+    """A tag signed by any key other than the pinned owner fingerprint is rejected."""
+    expected = pinned_owner_fingerprint(root, pin)
+    for tag in _approval_tags(root):
+        signer = _tag_signer_fingerprint(root, tag)
+        if signer is None:
+            continue
+        if not expected or signer != expected:
+            raise BenchError(f"signed tag {tag} is not from the pinned owner key")
+
+
+def owner_approved_versions(root: Path, base_ref: str, *, pin: str | None = None) -> set[str]:
+    """Suite bumps are approved only from the base branch file, or a tag signed by the pinned key."""
+    approved: set[str] = set()
+    if base_ref:
+        text = _git_show(root, base_ref, OWNER_APPROVALS)
+        if text:
+            payload = json.loads(text)
+            approved.update(str(item) for item in payload.get("suite_versions") or [])
+    expected = pinned_owner_fingerprint(root, pin or base_ref)
+    for tag in _approval_tags(root):
+        signer = _tag_signer_fingerprint(root, tag)
+        if signer and expected and signer == expected:
             approved.add(tag.removeprefix("reason-bench-approve-"))
     return approved
 
@@ -2679,13 +2746,55 @@ def _scan_recorded_fingerprints(root: Path) -> None:
     reject_integrity(payload.get("tuples") or [])
 
 
+def _is_test_script(path: str) -> bool:
+    return "test" in Path(path).name.casefold()
+
+
+def surface_changes(workspace: Path, base_ref: str) -> list[str]:
+    """Engine-surface paths. Test modules are not part of the surface."""
+    try:
+        diff = subprocess.check_output(
+            ["git", "diff", "--name-only", base_ref],
+            cwd=workspace,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    changed: list[str] = []
+    for path in diff.splitlines():
+        if path in {"config/reasoning.json", "pyproject.toml", "uv.lock"}:
+            changed.append(path)
+        elif path.startswith("scripts/") and not _is_test_script(path):
+            changed.append(path)
+    return changed
+
+
+def _load_workspace_engine(workspace: Path) -> None:
+    """Import the PR engine so its helpers and config/reasoning.json are the PR's."""
+    sys.path.insert(0, str(workspace))
+    for name in list(sys.modules):
+        if name.startswith("scripts.") and not name.startswith("scripts.reason_bench"):
+            del sys.modules[name]
+    path = workspace / "scripts" / "reason_engine.py"
+    spec = importlib.util.spec_from_file_location("scripts.reason_engine", path)
+    if spec is None or spec.loader is None:
+        raise BenchError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["scripts.reason_engine"] = module
+    spec.loader.exec_module(module)
+
+
 def _absolute_zero(workspace: Path, pin: str) -> int:
-    """An engine pull request passes only with zero HARD tuples under the pinned harness suite."""
+    """Zero HARD tuples. The suite and reason_bench come from the pin; helpers and config come from the PR."""
     pin_tree = _extract_commit(workspace, pin)
     try:
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=workspace, text=True).strip()
-        load_pinned_engine(workspace, sha)
-        payload = collect_hard_failures(pin_tree, include_mock=True, recall_answered=None)
+        _load_workspace_engine(workspace)
+        try:
+            payload = collect_hard_failures(pin_tree, include_mock=True, recall_answered=None)
+        except Exception as exc:
+            print(f"absolute-zero failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
         try:
             reject_integrity(payload["tuples"])
         except BenchError as exc:
@@ -2708,13 +2817,14 @@ def _absolute_zero(workspace: Path, pin: str) -> int:
 def gate_main(workspace: Path, base_ref: str, pin: str) -> int:
     """Judge the workspace with the pinned harness. The baseline is regenerated, not trusted."""
     try:
+        reject_foreign_tags(workspace, pin)
         _scan_recorded_fingerprints(workspace)
     except BenchError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    pr_engine = engine_blob_sha(workspace, "HEAD")
-    base_engine = engine_blob_sha(workspace, base_ref)
-    if pr_engine != base_engine:
+    changed = surface_changes(workspace, base_ref)
+    if changed:
+        print("engine surface changed: " + ", ".join(changed[:8]), file=sys.stderr)
         return _absolute_zero(workspace, pin)
     text = _git_show(workspace, base_ref, GATE_BASELINE)
     if not text:
@@ -2745,7 +2855,7 @@ def gate_main(workspace: Path, base_ref: str, pin: str) -> int:
             assert_item_edits(
                 recorded_hashes,
                 item_content_hashes(workspace),
-                approved=owner_approved_versions(workspace, base_ref),
+                approved=owner_approved_versions(workspace, base_ref, pin=pin),
                 base_version=str(baseline.get("suite_version") or ""),
                 current_version=str(load_manifest(workspace).get("suite_version") or ""),
             )

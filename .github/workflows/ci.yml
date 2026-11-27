@@ -1,11 +1,9 @@
 name: CI
 
-# Owner pin. The fingerprint job reads this line from the base branch only.
-# A value committed on a pull request is ignored. After reviewing the harness,
-# set a 40-character SHA on the base branch:
-#   PINNED_HARNESS_SHA: "<sha>"
-env:
-  PINNED_HARNESS_SHA: ""
+# The harness pin is the Actions variable PINNED_HARNESS_SHA, or the file
+# .github/harness-pin on the base branch. It is not stored in this workflow.
+# A pull request that replaces the fingerprint step is stopped by code-owner
+# review and required checks, because pull_request runs the workflow from the PR.
 
 on:
   push:
@@ -237,10 +235,15 @@ jobs:
           fi
           git fetch origin "${{ github.base_ref }}"
           base="origin/${{ github.base_ref }}"
-          # The pin is read from the base branch workflow. This file's value is ignored.
-          pin=$(git show "$base:.github/workflows/ci.yml" | python3 -c 'import re,sys; m=re.search(r"^[ \t]*PINNED_HARNESS_SHA:\s*\"([0-9a-f]{40})\"", sys.stdin.read(), re.M); print(m.group(1) if m else "")')
+          # Repository variable first. The file on the base is the fallback.
+          # A value written only in this pull request is ignored.
+          pin="${{ vars.PINNED_HARNESS_SHA }}"
           if [ -z "$pin" ]; then
-            echo "owner has not set PINNED_HARNESS_SHA on ${base}; fail closed" >&2
+            pin="$(git show "$base:.github/harness-pin" 2>/dev/null | tr -d '[:space:]' || true)"
+          fi
+          export PINNED_HARNESS_SHA="$pin"
+          if ! printf '%s' "$pin" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "owner has not set PINNED_HARNESS_SHA for ${base}; fail closed" >&2
             exit 2
           fi
           git fetch origin "$pin"
