@@ -2826,6 +2826,7 @@ def gate_main(workspace: Path, base_ref: str, pin: str) -> int:
     if changed:
         print("engine surface changed: " + ", ".join(changed[:8]), file=sys.stderr)
         return _absolute_zero(workspace, pin)
+    base_engine = engine_blob_sha(workspace, base_ref)
     text = _git_show(workspace, base_ref, GATE_BASELINE)
     if not text:
         print(f"baseline fingerprint missing at {base_ref}:{GATE_BASELINE}; fail closed", file=sys.stderr)
