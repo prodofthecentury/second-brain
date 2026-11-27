@@ -64,6 +64,15 @@ dest="${RUNNER_TEMP:-/tmp}/pinned-harness-$$"
 rm -rf "$dest"
 mkdir -p "$dest"
 git archive "$pin" | tar -x -C "$dest"
+# Import only the pinned owner key, when the pin publishes one. Never import the PR keyring.
+owner_key="$(git show "${pin}:.github/owner-signing-key.asc" 2>/dev/null || true)"
+if [ -n "$owner_key" ]; then
+  export GNUPGHOME="${RUNNER_TEMP:-/tmp}/pinned-owner-gpg"
+  rm -rf "$GNUPGHOME"
+  mkdir -p "$GNUPGHOME"
+  chmod 700 "$GNUPGHOME"
+  printf '%s\n' "$owner_key" | gpg --batch --import
+fi
 # The checker environment is the pinned lockfile, not the pull request's.
 lock_id="$(git rev-parse "${pin}:uv.lock")"
 export UV_PROJECT_ENVIRONMENT="${RUNNER_TEMP:-/tmp}/pinned-venv-${lock_id}"

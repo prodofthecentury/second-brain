@@ -2654,15 +2654,18 @@ def _approval_tags(root: Path) -> list[str]:
 
 
 def _tag_signer_fingerprint(root: Path, tag: str) -> str | None:
-    """Fingerprint from `git verify-tag --raw`, or None when the tag is not a trusted signature."""
+    """Fingerprint from `git verify-tag --raw`, or None when the signature does not verify.
+
+    Force OpenPGP so a runner whose git is set to SSH signing still verifies these tags.
+    """
     verified = subprocess.run(
-        ["git", "verify-tag", "--raw", tag],
+        ["git", "-c", "gpg.format=openpgp", "verify-tag", "--raw", tag],
         cwd=root,
         capture_output=True,
         text=True,
     )
     blob = f"{verified.stdout}\n{verified.stderr}"
-    if verified.returncode != 0 and "VALIDSIG" not in blob and "GOODSIG" not in blob:
+    if "VALIDSIG" not in blob and "GOODSIG" not in blob:
         return None
     for line in blob.splitlines():
         if "VALIDSIG" not in line and "GOODSIG" not in line:
@@ -2671,6 +2674,12 @@ def _tag_signer_fingerprint(root: Path, tag: str) -> str | None:
             if len(part) >= 40 and all(char in "0123456789abcdefABCDEF" for char in part):
                 return part.lower()
     return None
+
+
+def _tag_is_signed(root: Path, tag: str) -> bool:
+    shown = subprocess.run(["git", "cat-file", "-p", tag], cwd=root, capture_output=True, text=True)
+    text = shown.stdout
+    return "BEGIN PGP SIGNATURE" in text or "BEGIN SSH SIGNATURE" in text
 
 
 def pinned_owner_fingerprint(root: Path, pin: str) -> str:
@@ -2686,7 +2695,7 @@ def reject_foreign_tags(root: Path, pin: str) -> None:
     expected = pinned_owner_fingerprint(root, pin)
     for tag in _approval_tags(root):
         signer = _tag_signer_fingerprint(root, tag)
-        if signer is None:
+        if signer is None and not _tag_is_signed(root, tag):
             continue
         if not expected or signer != expected:
             raise BenchError(f"signed tag {tag} is not from the pinned owner key")
