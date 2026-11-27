@@ -38,7 +38,7 @@ import httpx
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import _is_reparse_or_link, security_state_dir  # noqa: E402
+from config import _is_reparse_or_link, is_untrusted_reparse_or_link, security_state_dir  # noqa: E402
 from cross_encoder import (  # noqa: E402
     MAX_ONNX_MODEL_BYTES,
     OnnxCrossEncoder,
@@ -204,7 +204,7 @@ def _models_root(state_dir: str | Path | None = None) -> Path:
 
 def _assert_no_symlink_ancestors(path: Path) -> None:
     for candidate in (path, *path.parents):
-        if os.path.lexists(str(candidate)) and _is_reparse_or_link(str(candidate)):
+        if is_untrusted_reparse_or_link(str(candidate)):
             raise OnnxModelSecurityError(
                 f"Refusing to access ONNX model directory via symlink or reparse point: {candidate}"
             )

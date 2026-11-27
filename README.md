@@ -113,7 +113,8 @@ uv run --locked second-brain notes list
 uv run --locked second-brain notes search "<query>"
 uv run --locked second-brain notes verify <note.md> --excerpt "<exact excerpt>" --actor <owner>
 uv run --locked second-brain import <obsidian_or_markdown_dir>
-uv run --locked second-brain chat "<question>" --mode stream   # modes: instant | stream | verified | research
+uv run --locked second-brain chat "<question>" --mode direct   # modes: direct | instant | stream | verified | research
+uv run --locked second-brain agent run --goal "<goal>"          # autonomous memory under brain/7-agent; searches every vault, runs the matching skill, and returns the notes that skill uses
 
 # Loopback HTTP API, IDE/MCP connectors & host sharing policies
 uv run --locked second-brain serve --port 8765
@@ -176,7 +177,7 @@ uv run --locked python scripts/test_all.py
 
 Dataset `second-brain-retrieval-curated-90` (`v3.0.0`, [docs/retrieval-evaluation-proposed.json](docs/retrieval-evaluation-proposed.json)) evaluates **90 agent-drafted queries (pending owner review)** (`25` standard factual positives pinned to SHA-256 atom revisions, `15` owner preference queries, `25` multi-atom & pending exploratory queries, and `25` adversarial/unapproved/cross-project/secret trap queries) partitioned evenly across `regression` (`30`), `development` (`30`), and `holdout` (`30`) splits over the 78-atom vault (`75` owner-approved, `3` pending traps). See the [v1.0.0 Benchmark Report](docs/benchmark-report-v1.0.0.md), [live third-party curated benchmark](docs/live-third-party-benchmark-2026-11-22.json), [live SOTA + LLM benchmark](docs/sota-live-benchmark-results-2026-11-22.json), and [300-atom ONNX Cross-Encoder benchmark](docs/sota-benchmark-results-2026-11-21.json) (`14.7–15.7 ms` P95 across 3 runs (median `15.18 ms`; Tier-0 `15.0 ms` target not reliably met), `100.0%` recall/precision/citation grounding, `0.0%` trap & cross-project leakage). Run `uv run --locked python scripts/evaluate_answers.py --model qwen2.5-coder:7b --runs 2` to repeat end-to-end answer checks, or `uv run --with rank-bm25 --with faiss-cpu --with mem0ai python scripts/live_third_party_benchmark.py` for live third-party comparisons. Raw candidate labels are not approved memories.
 
-On the 90-case curated suite (`50` scored answerable + trap cases), `qwen2.5-coder:7b` achieved `100.0%` expected claim coverage, `100.0%` citation grounding, and `0.0%` trap leakage at `23.63 s` P50 / `36.45 s` P95 on this 8-thread CPU-only host (`<= 45.0 s` Tier-2 8-thread CPU SLO). Smaller 3B models (`llama3.2:3b`) remain fallback-only on Tier-1 hardware.
+On an 8-thread CPU host, `qwen2.5-coder:7b` measured `23.63 s` P50 / `36.45 s` P95. That P95 is outside the owner-accepted 35s Tier-2 budget. A 45s budget remains a proposal until the owner accepts it. The 90-case dataset stays `pending_owner_review`, so those measurements are not an owner-signed release gate. Generation latency is not remeasured on a machine without Ollama. Smaller 3B models (`llama3.2:3b`) remain fallback-only on Tier-1 hardware.
 
 ## Loopback Memory API, Host Adapters, and MCP policy
 

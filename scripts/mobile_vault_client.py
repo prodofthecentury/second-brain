@@ -41,7 +41,7 @@ from filelock import FileLock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import _is_reparse_or_link, resolve_active_brain_dir, security_state_dir  # noqa: E402
+from config import _is_reparse_or_link, is_untrusted_reparse_or_link, resolve_active_brain_dir, security_state_dir  # noqa: E402
 from host_adapters import read_bounded_security_file, restrict_security_file_permissions  # noqa: E402
 from inbox_drop import create_mobile_drop_pairing, revoke_mobile_drop_pairing  # noqa: E402
 from vault_sync import _resolve_master_key, sync_config_path  # noqa: E402
@@ -109,7 +109,7 @@ def _assert_no_symlinks(path: Path, *, stop_at: Path | None = None) -> None:
     stop_norm = os.path.normcase(os.path.abspath(str(stop_at))) if stop_at is not None else None
     cur = Path(os.path.abspath(str(path)))
     while True:
-        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+        if is_untrusted_reparse_or_link(str(cur)):
             raise MobileVaultSecurityError(f"Refusing to traverse symlink or reparse point: {cur}")
         if stop_norm is not None and os.path.normcase(str(cur)) == stop_norm:
             break

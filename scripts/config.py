@@ -40,6 +40,38 @@ def _is_reparse_or_link(path: str) -> bool:
     return False
 
 
+_PLATFORM_PATH_ALIASES = {
+    "/var": "/private/var",
+    "/tmp": "/private/tmp",
+    "/etc": "/private/etc",
+}
+
+
+def _is_platform_path_alias(path: str) -> bool:
+    """True only for the macOS directories that always alias /private.
+
+    A symlink anywhere else, including a file or directory underneath these
+    aliases, stays untrusted.
+    """
+    if sys.platform != "darwin":
+        return False
+    norm = os.path.normpath(os.path.abspath(path))
+    expected = _PLATFORM_PATH_ALIASES.get(norm)
+    if expected is None:
+        return False
+    try:
+        return os.path.realpath(norm) == expected
+    except OSError:
+        return False
+
+
+def is_untrusted_reparse_or_link(path: str) -> bool:
+    """True when path is a symlink or reparse point that is not an OS path alias."""
+    if not _is_reparse_or_link(path):
+        return False
+    return not _is_platform_path_alias(path)
+
+
 def _default_installed_vault() -> str | None:
     """Keep wheel-installed user data outside the immutable Python package."""
     if (Path(ROOT_DIR) / "pyproject.toml").exists():

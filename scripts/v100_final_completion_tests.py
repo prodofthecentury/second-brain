@@ -361,8 +361,20 @@ class V100FinalCompletionTests(unittest.TestCase):
                 hook_txt = hook_path.read_text(encoding="utf-8")
                 self.assertIn("# custom-user-hook-line", hook_txt)
                 self.assertIn("second-brain-post-commit", hook_txt)
-                # Spaces in path are single-quoted safely
-                self.assertIn("'repo with spaces'", hook_txt.replace(str(repo.as_posix()), "repo with spaces"))
+                # Spaces in path are single-quoted safely. Git's toplevel and
+                # Python's temp path can differ by a Windows 8.3 alias.
+                hook_cmp = hook_txt
+                # Replace the longer real path first. On macOS the /var form is
+                # a suffix of /private/var, and a short-path replace would
+                # splice the quote.
+                variants = sorted(
+                    {repo.as_posix(), Path(os.path.realpath(repo)).as_posix()},
+                    key=len,
+                    reverse=True,
+                )
+                for variant in variants:
+                    hook_cmp = hook_cmp.replace(variant, "repo with spaces")
+                self.assertIn("'repo with spaces'", hook_cmp)
 
                 dist_res = owner.distill_git_commits(repo=str(repo), project_scope="project:space_repo", max_commits=5)
                 self.assertEqual(dist_res["distilled_count"], 2)

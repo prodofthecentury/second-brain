@@ -96,6 +96,9 @@ FENCED_JSON_RE = re.compile(r"^```json\s*\r?\n(.*?)\r?\n^```\s*$", re.MULTILINE 
 
 GENESIS_EXECUTION_HASH = "0" * 64
 MAX_KILL_SWITCH_FILE_BYTES = 65536
+KILL_SWITCH_REPLACE_ATTEMPTS_WINDOWS = 100
+KILL_SWITCH_REPLACE_DELAY_SECONDS = 0.05
+KILL_SWITCH_REPLACE_ATTEMPTS = KILL_SWITCH_REPLACE_ATTEMPTS_WINDOWS if os.name == "nt" else 1
 MAX_SCRIPT_BODY_BYTES = 65536
 MAX_WORKSPACE_WRITE_BYTES = 65536
 POLL_INTERVAL_SECONDS = 0.025
@@ -280,6 +283,11 @@ def skill_kill_switch_path(security_dir: str | Path | None = None) -> Path:
     else:
         base = security_state_dir()
     return base / "skill-kill-switch.json"
+
+
+def skill_kill_switch_halt_path(ks_path: Path) -> Path:
+    """Sibling marker that stays engaged when Windows still has the JSON file open."""
+    return ks_path.with_name(ks_path.name + ".halt")
 
 
 def _sha256_text(text: str) -> str:
@@ -1118,7 +1126,33 @@ def get_skill_kill_switch_status(
 
     if os.path.lexists(parent_str) and _is_reparse_or_link(parent_str):
         return _fail_closed("symlinked_kill_switch_parent_directory")
+    try:
+        marker_engaged = _halt_marker_engaged(ks_path)
+    except PermissionError as exc:
+        return _fail_closed(str(exc))
+
+    def _apply_halt_marker(status: dict[str, object]) -> dict[str, object]:
+        if marker_engaged and not bool(status.get("global_engaged")):
+            updated = dict(status)
+            updated["global_engaged"] = True
+            updated["global_reason"] = "halt_marker"
+            updated["global_actor"] = str(updated.get("global_actor") or "halt_marker")
+            return updated
+        return status
+
     if not os.path.lexists(ks_str):
+        if marker_engaged:
+            return _apply_halt_marker(
+                {
+                    "global_engaged": False,
+                    "global_reason": "",
+                    "global_actor": "",
+                    "global_updated_at": "",
+                    "killed_skills": {},
+                    "corrupt": False,
+                    "path": ks_str,
+                }
+            )
         return {
             "global_engaged": False,
             "global_reason": "",
@@ -1162,15 +1196,17 @@ def get_skill_kill_switch_status(
                 "updated_at": str(entry.get("updated_at") or ""),
             }
 
-    return {
-        "global_engaged": bool(data["global_engaged"]),
-        "global_reason": str(data.get("global_reason") or ""),
-        "global_actor": str(data.get("global_actor") or ""),
-        "global_updated_at": str(data.get("global_updated_at") or ""),
-        "killed_skills": active_killed_skills,
-        "corrupt": False,
-        "path": ks_str,
-    }
+    return _apply_halt_marker(
+        {
+            "global_engaged": bool(data["global_engaged"]),
+            "global_reason": str(data.get("global_reason") or ""),
+            "global_actor": str(data.get("global_actor") or ""),
+            "global_updated_at": str(data.get("global_updated_at") or ""),
+            "killed_skills": active_killed_skills,
+            "corrupt": False,
+            "path": ks_str,
+        }
+    )
 
 
 def _is_skill_killed(ks_status: dict[str, object], skill_id: str) -> tuple[bool, str]:
@@ -1183,6 +1219,54 @@ def _is_skill_killed(ks_status: dict[str, object], skill_id: str) -> tuple[bool,
         reason = str(entry.get("reason") or skill_id) if isinstance(entry, dict) else skill_id
         return True, f"skill:{skill_id}:{reason}"
     return False, ""
+
+
+def _replace_file_retrying_share(src: str, dst: str) -> None:
+    """Replace a file. Windows denies the replace while a reader still has it open."""
+    attempts = KILL_SWITCH_REPLACE_ATTEMPTS
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(KILL_SWITCH_REPLACE_DELAY_SECONDS)
+
+
+def _halt_marker_engaged(ks_path: Path) -> bool:
+    marker = skill_kill_switch_halt_path(ks_path)
+    marker_str = str(marker)
+    if not os.path.lexists(marker_str):
+        return False
+    if _is_reparse_or_link(marker_str):
+        raise PermissionError("symlinked_kill_switch_halt_marker")
+    st = os.lstat(marker_str)
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 1024:
+        raise PermissionError("invalid_kill_switch_halt_marker")
+    return True
+
+
+def _write_halt_marker(ks_path: Path) -> None:
+    marker = skill_kill_switch_halt_path(ks_path)
+    marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _assert_not_reparse(marker.parent, "security_dir")
+    _assert_not_reparse(marker, "skill-kill-switch.json.halt")
+    fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        payload = b"engaged\n"
+        if os.write(fd, payload) != len(payload):
+            raise OSError("Incomplete write to skill-kill-switch halt marker.")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    restrict_security_file_permissions(marker)
+
+
+def _clear_halt_marker(ks_path: Path) -> None:
+    marker = skill_kill_switch_halt_path(ks_path)
+    if os.path.lexists(str(marker)):
+        os.remove(str(marker))
 
 
 def set_skill_kill_switch(
@@ -1272,7 +1356,16 @@ def set_skill_kill_switch(
         os.fsync(fd)
         os.close(fd)
         closed = True
-        os.replace(tmp_path, ks_path)
+        if norm_scope == "global" and engaged:
+            _write_halt_marker(ks_path)
+        try:
+            _replace_file_retrying_share(tmp_path, str(ks_path))
+        except PermissionError:
+            if not (norm_scope == "global" and engaged):
+                raise
+        else:
+            if norm_scope == "global":
+                _clear_halt_marker(ks_path)
         restrict_security_file_permissions(ks_path)
     finally:
         if not closed:

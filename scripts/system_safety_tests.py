@@ -47,6 +47,34 @@ class EvaluationDatasetTests(unittest.TestCase):
             ],
         }
 
+    def test_missing_vault_keeps_schema_checks_and_skips_file_binding(self):
+        from evaluation_dataset import main
+
+        missing = ROOT / "this-vault-is-not-checked-out"
+        code = main(
+            [
+                "--dataset",
+                str(ROOT / "docs" / "retrieval-evaluation-proposed.json"),
+                "--atoms-dir",
+                str(missing),
+            ]
+        )
+        self.assertEqual(code, 0)
+
+    def test_empty_atom_directory_still_requires_bound_files(self):
+        from evaluation_dataset import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            code = main(
+                [
+                    "--dataset",
+                    str(ROOT / "docs" / "retrieval-evaluation-proposed.json"),
+                    "--atoms-dir",
+                    directory,
+                ]
+            )
+        self.assertEqual(code, 1)
+
     def test_versioned_answerable_case_requires_current_approved_atom_revision(self):
         from evaluation_dataset import validate_dataset
 
@@ -2511,6 +2539,8 @@ class ProductionPackagingAndGateTests(unittest.TestCase):
                 "v100_final_completion_tests",
                 "creative_media_tests",
                 "stage4_executable_skills_tests",
+                "agent_runtime_tests",
+                "upgrade_recall_tests",
                 "mobile_vault_client_tests",
                 "desktop_ui_tests",
                 "vscode_extension_tests",

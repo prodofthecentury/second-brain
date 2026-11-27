@@ -31,7 +31,7 @@ const {
 
 const DEFAULT_API_PORT = 8765;
 const LOOPBACK_HOST = "127.0.0.1";
-const VALID_CHAT_MODES = new Set(["instant", "verified", "stream"]);
+const VALID_CHAT_MODES = new Set(["direct", "instant", "verified", "stream"]);
 const VALID_RETRIEVAL_MODES = new Set(["auto", "lexical", "dense", "rrf"]);
 const VALID_ANSWER_VIEWS = new Set(["standard", "preference", "research"]);
 const VALID_MEMORY_TYPES = ["semantic", "procedural", "episodic", "self"];
@@ -2248,7 +2248,7 @@ function activate(context) {
         abortActiveChatStream();
         lastChatSourcesByCitation = Object.create(null);
 
-        const mode = VALID_CHAT_MODES.has(msg.mode) ? msg.mode : "stream";
+        const mode = VALID_CHAT_MODES.has(msg.mode) ? msg.mode : "direct";
         const retrievalMode = VALID_RETRIEVAL_MODES.has(msg.retrieval_mode)
           ? msg.retrieval_mode
           : "auto";
@@ -3604,7 +3604,7 @@ function activate(context) {
             title: String(opts.title || ""),
             project_scope: opts.project_scope || undefined,
             host_id: String(opts.host_id || "ollama_local"),
-            mode: String(opts.mode || "stream"),
+            mode: String(opts.mode || "direct"),
           },
           { useOwnerToken: true }
         );

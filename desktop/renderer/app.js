@@ -689,6 +689,17 @@ async function refreshHealth() {
     document.getElementById(
       "vaultMetrics"
     ).textContent = `Notes: ${nCount} · Verified Atoms: ${aCount}`;
+    const agentEl = document.getElementById("agentStatusBanner");
+    if (agentEl) {
+      try {
+        const agentRes = await window.secondBrain.request("GET", "/v1/agent/status");
+        agentEl.textContent = agentRes.ok && agentRes.data?.summary
+          ? `Agent runtime: ${agentRes.data.summary}`
+          : "Agent runtime status unavailable.";
+      } catch {
+        agentEl.textContent = "Agent runtime status unavailable.";
+      }
+    }
   } catch {
     document.getElementById("apiStatusText").textContent = "Disconnected";
   }
@@ -1354,6 +1365,9 @@ function tierBadgeInfo(src) {
   if (tier === "unverified_lead" || cid.startsWith("L")) {
     return { cls: "tier-l", label: `[${cid || "L"}] Unverified Lead` };
   }
+  if (tier === "agent" || /^A\d+$/i.test(cid)) {
+    return { cls: "tier-a", label: `[${cid || "A"}] Agent memory` };
+  }
   return { cls: "tier-n", label: `[${cid || "N"}] Working Note` };
 }
 
@@ -1400,6 +1414,9 @@ function renderChatSourceCards(turn, highlightCitationId = null) {
     );
     card.onclick = () => {
       const tier = String(src.tier || "").toLowerCase();
+      if (tier === "agent" || /^A\d+$/i.test(cid)) {
+        return;
+      }
       if (tier === "note" || cid.startsWith("N")) {
         switchView("notes");
         openNote(src.filename);
@@ -1863,7 +1880,7 @@ if (chatNewThreadBtnEl) {
   chatNewThreadBtnEl.addEventListener("click", async () => {
     const scope = document.getElementById("chatScopeInput")?.value.trim() || undefined;
     const host_id = document.getElementById("chatHostSelect")?.value || "ollama_local";
-    const mode = document.getElementById("chatModeSelect")?.value || "stream";
+    const mode = document.getElementById("chatModeSelect")?.value || "direct";
     const res = await window.secondBrain.request("POST", "/v1/chat/threads", {
       title: "",
       project_scope: scope,

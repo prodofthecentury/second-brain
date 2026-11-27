@@ -142,23 +142,35 @@ def _find_and_pack_cached_wheel(uv_cache: Path, pkg_name: str, version: str, out
             continue
         prefix = f"{version}-"
         for entry in pkg_dir.iterdir():
-            if not entry.is_file():
-                continue
             if entry.suffix in {".http", ".msgpack", ".lock"}:
                 continue
             if not entry.name.startswith(prefix):
                 continue
             tag_suffix = entry.name[len(prefix):]
+            # Current uv stores the extracted wheel as a directory symlink.
+            # Older caches store a text file whose contents point at that directory.
+            if entry.is_symlink() and entry.is_dir():
+                archive_dir = entry.resolve()
+            elif entry.is_file():
+                try:
+                    pointer_rel = entry.read_bytes().decode("utf-8").strip()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                archive_dir = (pkg_dir / pointer_rel).resolve() if not (uv_cache / pointer_rel).is_dir() else (uv_cache / pointer_rel)
+            else:
+                continue
+            if not archive_dir.is_dir():
+                continue
             score = _compatible_wheel_score(tag_suffix)
-            if score < 0:
-                continue
-            try:
-                pointer_rel = entry.read_bytes().decode("utf-8").strip()
-            except (OSError, UnicodeDecodeError):
-                continue
-            archive_dir = (pkg_dir / pointer_rel).resolve() if not (uv_cache / pointer_rel).is_dir() else (uv_cache / pointer_rel)
-            if archive_dir.is_dir():
+            if score >= 0:
                 candidates.append((score, tag_suffix, archive_dir))
+                continue
+            # uv names some cached wheels `<version>-<hash>`. The real tags
+            # live in the extracted WHEEL metadata.
+            for tag in _wheel_tags(archive_dir):
+                tag_score = _compatible_wheel_score(tag)
+                if tag_score >= 0:
+                    candidates.append((tag_score, tag, archive_dir))
 
     if not candidates:
         return None
@@ -169,6 +181,21 @@ def _find_and_pack_cached_wheel(uv_cache: Path, pkg_name: str, version: str, out
     dist_stem = dist_infos[0].name[:-len(".dist-info")] if dist_infos else f"{dist_prefix}-{version}"
     out_whl = out_dir / f"{dist_stem}-{best_tag}.whl"
     return _repack_uv_archive_to_wheel(best_archive, out_whl)
+
+
+def _wheel_tags(archive_dir: Path) -> list[str]:
+    tags: list[str] = []
+    for wheel_meta in archive_dir.glob("*.dist-info/WHEEL"):
+        try:
+            text = wheel_meta.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("Tag:"):
+                tag = line.split(":", 1)[1].strip()
+                if tag:
+                    tags.append(tag)
+    return tags
 
 
 def _export_pinned_requirements(repo_root: Path, extras: list[str]) -> list[tuple[str, str]]:
@@ -187,11 +214,31 @@ def _export_pinned_requirements(repo_root: Path, extras: list[str]) -> list[tupl
         if not match:
             continue
         name, ver = match.group(1), match.group(2)
-        key = f"{_normalize_dist_name(name)}=={ver}"
-        if key not in seen:
-            seen.add(key)
-            pins.append((name, ver))
+        if not _requirement_marker_matches(line):
+            continue
+        key = _normalize_dist_name(name)
+        if key in seen:
+            continue
+        seen.add(key)
+        pins.append((name, ver))
     return pins
+
+
+def _requirement_marker_matches(line: str) -> bool:
+    """Keep a pin when its environment marker matches this interpreter."""
+    if ";" not in line:
+        return True
+    marker = line.split(";", 1)[1].strip()
+    if not marker:
+        return True
+    try:
+        from packaging.markers import Marker
+    except ImportError:
+        return True
+    try:
+        return bool(Marker(marker).evaluate())
+    except Exception:
+        return True
 
 
 def build_wheelhouse(

@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from atom_mutator import atomic_write_bytes  # noqa: E402
-from config import _is_reparse_or_link  # noqa: E402
+from config import _is_reparse_or_link, is_untrusted_reparse_or_link  # noqa: E402
 from inbox_drop import export_static_pwa_bundle  # noqa: E402
 
 
@@ -56,7 +56,7 @@ def _resolve_project_version(explicit_version: str | None = None) -> str:
 
 def _assert_no_symlink_ancestors(path: Path) -> None:
     for cur in (path, *path.parents):
-        if os.path.lexists(str(cur)) and _is_reparse_or_link(str(cur)):
+        if is_untrusted_reparse_or_link(str(cur)):
             raise PermissionError(f"Refusing to write distribution artifact under symlink/reparse path: {cur}")
 
 

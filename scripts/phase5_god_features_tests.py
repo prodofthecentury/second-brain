@@ -794,7 +794,11 @@ class TimeTravelSnapshotAndApiTests(Phase5IsolatedTestCase):
 
                 rem1 = sdk_owner.remember("Use uv sync --frozen for reproducible Python builds.", title="UV Rule", tags=["python", "ci"])
                 self.assertEqual(rem1["status"], "saved")
-                sdk_owner.remember("Frontend styles live in styles.css.", title="CSS Rule", tags=["frontend"])
+                sdk_owner.remember(
+                    "Frontend styles live in styles.css and are served from /static/styles.css.",
+                    title="CSS Rule",
+                    tags=["frontend"],
+                )
                 by_q_and_tag = sdk_owner.list_notes(query="reproducible", tag="python")
                 self.assertEqual(by_q_and_tag["total"], 1)
                 self.assertEqual(by_q_and_tag["items"][0]["title"], "UV Rule")
@@ -1279,11 +1283,12 @@ class Goal1CoreRuntimeDurabilityAndScaleTests(Phase5IsolatedTestCase):
                 os.environ.pop("SECOND_BRAIN_PORT", None)
 
                 # 1. Unified vault-path.txt resolution across config, cli, mcp_server, ide_connector
-                self.assertEqual(Path(config.resolve_active_brain_dir()), switched_vault.resolve())
+                # resolve() folds Windows 8.3 short names (RUNNER~1) to the long path.
+                self.assertEqual(Path(config.resolve_active_brain_dir()).resolve(), switched_vault.resolve())
                 vdir, _, _ = cli._resolve_active_vault_paths()
-                self.assertEqual(Path(vdir), switched_vault.resolve())
+                self.assertEqual(Path(vdir).resolve(), switched_vault.resolve())
                 mcp_brain, _, _, _ = mcp_server._effective_mcp_paths()
-                self.assertEqual(Path(mcp_brain), switched_vault.resolve())
+                self.assertEqual(Path(mcp_brain).resolve(), switched_vault.resolve())
                 entry = ide_connector.server_entry("test-token-1234567890")
                 self.assertNotIn("BRAIN_VAULT_DIR", entry["env"])
 

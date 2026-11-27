@@ -9,6 +9,8 @@
 Four modes, all yielding structured events so any UI (desktop app, VS Code webview,
 CLI) can render progressively:
 
+* ``direct``: default. One owner-verified claim is returned with no model call. Several
+  claims use the claim-id selector. Zero claims abstain. Long prose stays on ``stream``.
 * ``instant``: retrieval only. Verified claim cards and note cards arrive in tens of
   milliseconds with no model call.
 * ``verified``: fast grounded answer. The model sees only short claim strings tagged
@@ -88,16 +90,20 @@ from host_adapters import (  # noqa: E402
 from memory_format import split_frontmatter  # noqa: E402
 from memory_review import parse_frontmatter_values, section_text  # noqa: E402
 from notes_store import NotePaths, search_notes  # noqa: E402
+from query_planner import plan_subqueries  # noqa: E402
 from recall import (  # noqa: E402
     MemoryRecallUnavailable,
     RecallOptions,
     consume_last_degradation_warning,
+    consume_last_retrieval_fallback,
     normalize_project_tag,
     project_tags_match,
+    search_episodes,
     search_memory,
 )
 
-CHAT_MODES = ("instant", "verified", "stream", "research")
+DEFAULT_CHAT_MODE = "direct"
+CHAT_MODES = ("direct", "instant", "verified", "stream", "research")
 RETRIEVAL_MODES = ("lexical", "dense", "rrf", "auto")
 ANSWER_VIEWS = ("standard", "preference", "research")
 MAX_VERIFIED = 6
@@ -144,7 +150,7 @@ class ChatStreamRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(..., min_length=1, max_length=2000)
-    mode: str = "verified"
+    mode: str = DEFAULT_CHAT_MODE
     retrieval_mode: str = "lexical"
     host_id: str = "ollama_local"
     project_scope: str | None = None
@@ -194,7 +200,7 @@ class ChatStreamRequest(BaseModel):
     @classmethod
     def _coerce_mode(cls, v: object) -> str:
         if v is None or (isinstance(v, str) and not v.strip()):
-            return "verified"
+            return DEFAULT_CHAT_MODE
         if not isinstance(v, str):
             raise ValueError(f"mode must be one of {CHAT_MODES}")
         cleaned = v.strip()
@@ -451,8 +457,12 @@ def retrieve_context(
     preferences: list[dict[str, object]] = []
     records: list[dict[str, str]] = []
     warning = None
+    candidate_atom_ids: list[str] = []
+    planned = plan_subqueries(query)
+    retrieval_fallback: str | None = None
     telemetry_db = paths.telemetry_db_path or os.path.join(paths.brain_dir, ".sidecar", "telemetry.sqlite3")
     consume_last_degradation_warning()
+    consume_last_retrieval_fallback()
     try:
         opts = RecallOptions(
             n_results=MAX_VERIFIED,
@@ -466,21 +476,30 @@ def retrieve_context(
             include_expired=bool(include_expired),
             as_of=as_of,
         )
-        direct, neighbors = search_memory(
-            query, opts, atoms_dir=paths.atoms_dir, index_path=paths.lexical_index_path, chroma_path=paths.chroma_path
-        )
-        degraded_banner = consume_last_degradation_warning()
-        if degraded_banner:
-            warning = degraded_banner
-        combined = list(direct)
-        seen_fnames = {r.filename for r in combined}
-        for nb in neighbors:
-            if len(combined) >= MAX_VERIFIED:
-                break
-            if nb.filename not in seen_fnames:
-                seen_fnames.add(nb.filename)
-                combined.append(nb)
-        for result in combined[:MAX_VERIFIED]:
+        primary: list = []
+        secondary: list = []
+        seen_fnames: set[str] = set()
+        for index, piece in enumerate(planned):
+            direct, neighbors = search_memory(
+                piece,
+                opts,
+                atoms_dir=paths.atoms_dir,
+                index_path=paths.lexical_index_path,
+                chroma_path=paths.chroma_path,
+            )
+            degraded_banner = consume_last_degradation_warning()
+            if degraded_banner:
+                warning = degraded_banner
+            if consume_last_retrieval_fallback() == "dense":
+                retrieval_fallback = "dense"
+            bucket = primary if index == 0 else secondary
+            for item in list(direct) + list(neighbors):
+                if item.filename in seen_fnames:
+                    continue
+                seen_fnames.add(item.filename)
+                bucket.append(item)
+        combined = (primary + secondary)[:MAX_VERIFIED]
+        for result in combined:
             claim, evidence = _claim_and_evidence(result.content)
             if not claim:
                 continue
@@ -498,6 +517,7 @@ def retrieve_context(
                 index_path=paths.lexical_index_path,
                 atoms_dir=paths.atoms_dir,
             )
+            candidate_atom_ids = list(candidate_ids)
             record_retrieval_telemetry(
                 [r["filename"] for r in records],
                 candidate_atom_ids=candidate_ids,
@@ -562,6 +582,33 @@ def retrieve_context(
         }
         for n in notes
     ]
+    try:
+        from agent_runtime import search_connected_knowledge
+
+        known_notes = {n["filename"] for n in notes}
+        security_dir = str(paths.security_dir) if getattr(paths, "security_dir", None) else None
+        for hit in search_connected_knowledge(
+            query,
+            brain_dir=paths.brain_dir,
+            project=scope_raw,
+            limit=6,
+            security_dir=security_dir,
+        ):
+            if hit.get("source") == "note" and hit.get("filename") in known_notes:
+                continue
+            text = hit.get("text") or ""
+            sources.append(
+                {
+                    "tier": "agent",
+                    "citation_id": f"A{len([s for s in sources if s.get('tier') == 'agent']) + 1}",
+                    "filename": hit.get("filename") or "",
+                    "title": hit.get("title") or hit.get("filename") or "",
+                    "claim": text,
+                    "excerpt": text,
+                }
+            )
+    except Exception:
+        pass
     return {
         "type": "context",
         "retrieval_mode": retrieval_mode,
@@ -571,8 +618,11 @@ def retrieve_context(
         "sources": sources,
         "retrieval_ms": round((time.perf_counter() - t0) * 1000, 1),
         "warning": warning,
+        "subqueries": list(planned),
+        "retrieval_fallback": retrieval_fallback,
         "_records": records,
         "_note_tags": note_tags,
+        "_candidate_atom_ids": candidate_atom_ids,
     }
 
 
@@ -901,6 +951,7 @@ def _filter_and_redact_context(ctx: dict[str, object], rule) -> dict[str, object
             }
             for n in scoped_notes
         ]
+        + [dict(s) for s in list(ctx.get("sources") or []) if isinstance(s, dict) and s.get("tier") == "agent"]
     )
 
     return {
@@ -959,7 +1010,7 @@ def _prepare_outbound_prompt(
 def chat_events(
     query: str,
     *,
-    mode: str = "stream",
+    mode: str = DEFAULT_CHAT_MODE,
     paths: ChatPaths | None = None,
     project_scope: str | None = None,
     stream_fn: StreamFn | None = None,
@@ -1091,6 +1142,39 @@ def chat_events(
             for i, lead in enumerate(research_leads, start=1)
         ]
         leads_block = format_unverified_leads_section(research_leads) if research_leads else ""
+        try:
+            episodes = search_episodes(retrieval_query, brain_dir=paths.brain_dir, limit=4)
+        except Exception:
+            episodes = []
+        if episodes:
+            episode_lines: list[str] = []
+            for episode in episodes:
+                episode_lines.append(
+                    f"- [episodic | status=experience | origin=experience] {episode['filename']}: {episode['summary']}"
+                )
+                leads_payload.append(
+                    {
+                        "id": f"E{len(episode_lines)}",
+                        "filename": episode["filename"],
+                        "status": "experience",
+                        "claim": episode["summary"],
+                        "excerpt": episode["summary"],
+                        "source_kind": "episodic",
+                        "review_status": "experience",
+                        "claim_state": "episodic",
+                        "origin": "experience",
+                        "tier": "episodic",
+                        "lead_id": episode["filename"],
+                        "summary": episode["summary"],
+                        "sha256": "",
+                        "risk_flags": [],
+                    }
+                )
+            header = leads_block or (
+                "[UNVERIFIED LEADS]\n"
+                "The following pending, candidate, or quarantined items matched exploratorily and are NOT owner-approved facts:"
+            )
+            leads_block = header + "\n" + "\n".join(episode_lines)
         ctx = {
             **ctx,
             "host_id": active_host_id,
@@ -1105,6 +1189,22 @@ def chat_events(
     ctx["query_expanded"] = query_expanded
     if active_thread_id:
         ctx["thread_id"] = active_thread_id
+
+    def _note_unanswered() -> None:
+        if mode not in {"direct", "verified"}:
+            return
+        try:
+            from cognitive_core import record_unanswered_query
+
+            record_unanswered_query(
+                retrieval_query,
+                project_scope=project_scope,
+                rejected_atom_ids=[str(item) for item in list(ctx.get("_candidate_atom_ids") or [])],
+                brain_dir=paths.brain_dir,
+                db_path=paths.telemetry_db_path or os.path.join(paths.brain_dir, ".sidecar", "telemetry.sqlite3"),
+            )
+        except Exception:
+            pass
 
     def _persist_completed_exchange(
         assistant_text: str,
@@ -1154,13 +1254,22 @@ def chat_events(
 
     if mode == "instant":
         instant_summary = ""
-        if not verified and not preferences and not notes:
+        learned = [
+            source
+            for source in list(ctx.get("sources") or [])
+            if isinstance(source, dict) and source.get("tier") == "agent"
+        ]
+        if not verified and not preferences and not notes and not learned:
             msg = "Nothing in your verified memory or notes matches this question yet."
             instant_summary = msg
             yield {"type": "abstain", "text": msg, "reason": msg}
         else:
             instant_summary = "\n".join(
-                [*(f"[{v['id']}] {v['claim']}" for v in verified), *(f"[{n['id']}] {n['title']}" for n in notes)]
+                [
+                    *(f"[{v['id']}] {v['claim']}" for v in verified),
+                    *(f"[{n['id']}] {n['title']}" for n in notes),
+                    *(f"[{source.get('citation_id')}] {source.get('claim')}" for source in learned),
+                ]
             )
         if leads_block:
             yield {"type": "research_leads", "text": leads_block, "unverified_leads": leads_payload, "leads": leads_payload}
@@ -1168,6 +1277,113 @@ def chat_events(
             instant_summary,
             cited_ids=[str(s["citation_id"]) for s in list(ctx.get("sources") or []) if isinstance(s, dict) and s.get("citation_id")],
         )
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield _done_event(elapsed)
+        return
+
+    if mode == "direct" and answer_view == "preference":
+        if not preferences:
+            msg = "No owner preference memory matches this question."
+            yield {"type": "verified_answer", "answerable": False, "text": msg, "answer": msg, "claims": [], "host_id": active_host_id}
+            _persist_completed_exchange(msg)
+        else:
+            pref_text = "\n".join(f"- [Preference] {p['claim']} [{p['id']}]" for p in preferences)
+            yield {
+                "type": "verified_answer",
+                "answerable": True,
+                "text": pref_text,
+                "answer": pref_text,
+                "model_ms": 0.0,
+                "host_id": active_host_id,
+                "claims": [
+                    {"text": str(p["claim"]), "is_preference": True, "evidence": [{"atom_id": p["atom_id"]}]}
+                    for p in preferences
+                ],
+            }
+            _persist_completed_exchange(pref_text, cited_ids=[str(p["id"]) for p in preferences])
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
+        yield _done_event(elapsed)
+        return
+
+    if mode == "direct" and len(verified) < 2:
+        if not verified:
+            _note_unanswered()
+            msg = NO_APPROVED_MEMORY_RESPONSE if want_research else "No owner-verified claim matches this question."
+            if leads_block:
+                msg = f"{msg}\n\n{leads_block}"
+            empty_evt: dict[str, object] = {
+                "type": "verified_answer",
+                "answerable": False,
+                "text": msg,
+                "answer": msg,
+                "claims": [],
+                "model_ms": 0.0,
+                "host_id": active_host_id,
+            }
+            if want_research:
+                empty_evt["unverified_leads"] = leads_payload
+                empty_evt["leads"] = leads_payload
+            yield empty_evt
+            if leads_block:
+                yield {"type": "research_leads", "text": leads_block, "unverified_leads": leads_payload, "leads": leads_payload}
+            _persist_completed_exchange(msg, grounding_meta={"answerable": False})
+        else:
+            raw_claims_by_vid = dict(ctx.get("_raw_claims_by_vid") or {})
+            only = verified[0]
+            claim_text = str(raw_claims_by_vid.get(str(only["id"]), only["claim"]))
+            result = validate_standard_answer(
+                json.dumps({"claims": [claim_text]}),
+                list(ctx.get("_factual_records") or []),
+                atoms_dir=paths.atoms_dir,
+                mode="research" if want_research else "standard",
+                unverified_leads=research_leads if want_research else (),
+            )
+            if result.answerable:
+                try:
+                    record_grounded_answer_telemetry(
+                        sorted({e.atom_id for c in result.claims for e in c.evidence}),
+                        abstained=False,
+                        mode="chat_direct",
+                        latency_ms=0.0,
+                        db_path=paths.telemetry_db_path or os.path.join(paths.brain_dir, ".sidecar", "telemetry.sqlite3"),
+                    )
+                except Exception:
+                    pass
+            answer_evt: dict[str, object] = {
+                "type": "verified_answer",
+                "answerable": bool(result.answerable),
+                "text": result.text,
+                "answer": result.text,
+                "model_ms": 0.0,
+                "host_id": active_host_id,
+                "claims": [
+                    {
+                        "text": c.text,
+                        "evidence": [
+                            {
+                                "atom_id": e.atom_id,
+                                "quote": e.evidence_quote,
+                                "source": e.evidence_source,
+                                "source_sha256": e.evidence_sha256,
+                                "bytes": [e.evidence_start, e.evidence_end],
+                            }
+                            for e in c.evidence
+                        ],
+                    }
+                    for c in result.claims
+                ],
+            }
+            if want_research:
+                answer_evt["unverified_leads"] = leads_payload
+                answer_evt["leads"] = leads_payload
+            yield answer_evt
+            if leads_block:
+                yield {"type": "research_leads", "text": leads_block, "unverified_leads": leads_payload, "leads": leads_payload}
+            _persist_completed_exchange(
+                result.text,
+                cited_ids=[str(only["id"])] if result.answerable else [],
+                grounding_meta={"answerable": bool(result.answerable)},
+            )
         elapsed = round((time.perf_counter() - started) * 1000, 1)
         yield _done_event(elapsed)
         return
@@ -1217,8 +1433,9 @@ def chat_events(
         yield _done_event(elapsed)
         return
 
-    if mode in {"verified", "research"}:
+    if mode in {"verified", "research", "direct"}:
         if not model_verified:
+            _note_unanswered()
             msg = NO_APPROVED_MEMORY_RESPONSE if want_research else "No owner-verified claim matches this question."
             if leads_block:
                 msg = f"{msg}\n\n{leads_block}"
@@ -1335,6 +1552,8 @@ def chat_events(
                 )
                 if want_research and leads_block and "[UNVERIFIED LEADS]" not in text_val:
                     text_val = f"{text_val}\n\n{leads_block}"
+                if not model_errored:
+                    _note_unanswered()
                 abstain_evt: dict[str, object] = {
                     "type": "verified_answer",
                     "answerable": False,
@@ -1444,7 +1663,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description="Chat with your Second Brain (streaming / verified / research).")
     parser.add_argument("query", nargs="?", default="", help="Chat question (optional when --list-threads is set).")
-    parser.add_argument("--mode", choices=CHAT_MODES, default="stream")
+    parser.add_argument("--mode", choices=CHAT_MODES, default=DEFAULT_CHAT_MODE)
     parser.add_argument("--retrieval-mode", "--retrieval", dest="retrieval_mode", choices=RETRIEVAL_MODES, default="lexical")
     parser.add_argument("--host-id", "--host", dest="host_id", default="ollama_local", help="Host policy id (default ollama_local).")
     parser.add_argument("--view", dest="answer_view", choices=ANSWER_VIEWS, default="standard", help="Answer view (standard/preference/research).")

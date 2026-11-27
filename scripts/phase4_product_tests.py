@@ -306,6 +306,110 @@ class StreamingChatTests(IsolatedVaultCase):
             self.assertFalse(ans["answerable"], hostile)
             self.assertEqual(ans["claims"], [])
 
+    def test_direct_mode_one_claim_skips_the_model(self) -> None:
+        from streaming_chat import chat_events
+
+        verified = self._seed()
+
+        def boom_json(*_args, **_kwargs):
+            raise AssertionError("direct mode must not call the model for one claim")
+
+        def boom_stream(*_args, **_kwargs):
+            raise AssertionError("direct mode must not stream for one claim")
+
+        events = list(
+            chat_events(
+                "production deploys rollback plan",
+                mode="direct",
+                paths=self.chat_paths(),
+                json_fn=boom_json,
+                stream_fn=boom_stream,
+            )
+        )
+        ans = next(e for e in events if e["type"] == "verified_answer")
+        self.assertTrue(ans["answerable"])
+        self.assertEqual(ans["model_ms"], 0.0)
+        self.assertEqual(ans["claims"][0]["text"], verified["claim"])
+        self.assertIn("Production deploys require a tested rollback plan.", ans["text"])
+        self.assertFalse(any(e["type"] == "token" for e in events))
+
+    def test_direct_mode_two_claims_selects_ids_and_does_not_stream(self) -> None:
+        from notes_store import create_note, get_note, verify_note_excerpt
+        from streaming_chat import chat_events
+
+        self._seed()
+        saved = create_note(
+            "On-call",
+            "Rule: Production deploys notify the on-call channel before rollback.",
+            paths=self.paths,
+        )
+        note = get_note(saved["filename"], paths=self.paths)
+        verify_note_excerpt(
+            saved["filename"],
+            "Production deploys notify the on-call channel before rollback.",
+            actor="camer",
+            expected_note_sha256=note.sha256,
+            paths=self.paths,
+        )
+        self.rebuild_atoms_index()
+        seen = {"json": 0}
+
+        def json_fn(prompt, model, schema):
+            seen["json"] += 1
+            self.assertIn("claim_ids", prompt)
+            return '{"claim_ids": [0, 1]}'
+
+        def boom_stream(*_args, **_kwargs):
+            raise AssertionError("direct mode must not stream when selecting claims")
+
+        events = list(
+            chat_events(
+                "production deploys rollback",
+                mode="direct",
+                paths=self.chat_paths(),
+                json_fn=json_fn,
+                stream_fn=boom_stream,
+            )
+        )
+        ans = next(e for e in events if e["type"] == "verified_answer")
+        self.assertEqual(seen["json"], 1)
+        self.assertTrue(ans["answerable"])
+        self.assertGreaterEqual(len(ans["claims"]), 2)
+        self.assertFalse(any(e["type"] == "token" for e in events))
+
+    def test_direct_mode_unrelated_query_abstains_without_a_model(self) -> None:
+        from streaming_chat import chat_events
+
+        self._seed()
+
+        def boom_json(*_args, **_kwargs):
+            raise AssertionError("direct abstain must not call the model")
+
+        def boom_stream(*_args, **_kwargs):
+            raise AssertionError("direct abstain must not stream")
+
+        events = list(
+            chat_events(
+                "sodium ion battery kilowatt hour",
+                mode="direct",
+                paths=self.chat_paths(),
+                json_fn=boom_json,
+                stream_fn=boom_stream,
+            )
+        )
+        ans = next(e for e in events if e["type"] == "verified_answer")
+        self.assertFalse(ans["answerable"])
+        self.assertEqual(ans["claims"], [])
+        self.assertFalse(any(e["type"] == "token" for e in events))
+
+    def test_chat_request_missing_mode_is_direct_and_stream_stays_explicit(self) -> None:
+        from streaming_chat import DEFAULT_CHAT_MODE, ChatStreamRequest
+
+        self.assertEqual(DEFAULT_CHAT_MODE, "direct")
+        self.assertEqual(ChatStreamRequest.model_validate({"query": "hello"}).mode, "direct")
+        self.assertEqual(ChatStreamRequest.model_validate({"query": "hello", "mode": ""}).mode, "direct")
+        self.assertEqual(ChatStreamRequest.model_validate({"query": "hello", "mode": "stream"}).mode, "stream")
+
     def test_stream_mode_streams_tokens_and_flags_bad_citations(self) -> None:
         from streaming_chat import chat_events
 
@@ -384,9 +488,32 @@ class ProductApiTests(IsolatedVaultCase):
             r = c.request(method, f"http://127.0.0.1:{self.port}{path}", headers=headers, json=body if body is not None else None)
         return r if raw else (r.status_code, r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text)
 
-    def test_agent_token_cannot_write_notes_or_grant_trust(self) -> None:
-        status, _ = self.req("POST", "/v1/notes", {"title": "x", "body": "y"})
-        self.assertEqual(status, 403)
+    def test_agent_can_add_notes_but_not_change_or_delete(self) -> None:
+        status, added = self.req(
+            "POST",
+            "/v1/notes",
+            {
+                "title": "Agent note",
+                "body": "This checkout rejects when `risk_score` from `/v1/payments/assess` is >= 0.82.",
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(added["status"], "saved")
+        status, rejected = self.req(
+            "POST",
+            "/v1/notes",
+            {"title": "Generic tip", "body": "Always use HTTPS and validate user input."},
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(rejected["reason"], "generic")
+        for method, path, body in (
+            ("PUT", f"/v1/notes/{added['filename']}", {"body": "hijack", "expected_sha256": added["sha256"]}),
+            ("DELETE", f"/v1/notes/{added['filename']}", {"expected_sha256": added["sha256"]}),
+        ):
+            denied, _ = self.req(method, path, body)
+            self.assertEqual(denied, 403, f"{method} {path}")
+        status, _ = self.req("POST", "/v1/notes", {"title": "x", "body": ""})
+        self.assertEqual(status, 422)
         status, created = self.req("POST", "/v1/notes", {"title": "Owner note", "body": "Rotate API keys every 90 days."}, owner=True)
         self.assertEqual(status, 201)
         fname = created["filename"]
@@ -433,6 +560,39 @@ class ProductApiTests(IsolatedVaultCase):
         self.assertEqual(events[0]["type"], "context")
         self.assertEqual(events[0]["notes"][0]["title"], "Coffee")
         self.assertEqual(events[-1]["type"], "done")
+
+    def test_sse_chat_stream_omitted_mode_is_direct(self) -> None:
+        from notes_store import NotePaths, create_note, get_note, verify_note_excerpt
+
+        paths = NotePaths.for_brain(str(self.brain))
+        created = self.req(
+            "POST",
+            "/v1/notes",
+            {"title": "Deploys", "body": "Production deploys require a tested rollback plan."},
+            owner=True,
+        )
+        self.assertEqual(created[0], 201)
+        note = get_note(created[1]["filename"], paths=paths)
+        verified = verify_note_excerpt(
+            created[1]["filename"],
+            "Production deploys require a tested rollback plan.",
+            actor="camer",
+            expected_note_sha256=note.sha256,
+            paths=paths,
+        )
+        self.assertEqual(verified["status"], "verified")
+        r = self.req(
+            "POST",
+            "/v1/chat/stream",
+            {"query": "production deploys rollback plan"},
+            raw=True,
+        )
+        self.assertEqual(r.status_code, 200)
+        events = [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")]
+        ans = next(e for e in events if e["type"] == "verified_answer")
+        self.assertTrue(ans["answerable"])
+        self.assertEqual(ans["model_ms"], 0.0)
+        self.assertIn("Production deploys require a tested rollback plan.", ans["text"])
 
     def test_cas_conflict_returns_409(self) -> None:
         _, created = self.req("POST", "/v1/notes", {"title": "T", "body": "one"}, owner=True)
@@ -654,8 +814,11 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
 
         ctx = retrieve_context("xylophone", self.chat_paths(), project_scope="alpha")
         self.assertEqual([n["title"] for n in ctx["notes"]], ["Alpha Spec"])
-        source_titles = [s.get("title") for s in ctx["sources"] if s.get("title")]
-        self.assertEqual(source_titles, ["Alpha Spec"])
+        source_text = " ".join(
+            f"{s.get('title') or ''} {s.get('claim') or ''} {s.get('excerpt') or ''}" for s in ctx["sources"]
+        )
+        self.assertIn("Alpha Spec", source_text)
+        self.assertNotIn("beta", source_text.casefold())
 
         # Add a verified atom for alpha so verified mode exercises claim-selection secret scan.
         alpha_note = get_note(alpha["filename"], paths=self.paths)
@@ -738,8 +901,24 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
             conn.close()
             return resp.status, data
 
-        # Agent-only mutation must 403 and be audited.
-        st_denied, _ = req("POST", "/v1/notes", {"title": "Blocked", "body": "Nope"}, owner=False)
+        # Agents may add a note. Changing one that already exists stays forbidden.
+        st_added, raw_added = req(
+            "POST",
+            "/v1/notes",
+            {
+                "title": "Agent note",
+                "body": "This checkout rejects when `risk_score` from `/v1/payments/assess` is >= 0.82.",
+            },
+            owner=False,
+        )
+        self.assertEqual(st_added, 201)
+        added = json.loads(raw_added)
+        st_denied, _ = req(
+            "PUT",
+            f"/v1/notes/{added['filename']}",
+            {"body": "rewrite", "expected_sha256": added["sha256"]},
+            owner=False,
+        )
         self.assertEqual(st_denied, 403)
 
         # Owner note creation + retrieval must return both items and legacy keys.
@@ -775,7 +954,8 @@ class Phase4SecurityAuditAndContractTests(IsolatedVaultCase):
         self.assertTrue(audit_path.is_file())
         records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         endpoints = {(r["method"], r["endpoint"], r["status_code"]) for r in records}
-        self.assertIn(("POST", "/v1/notes", 403), endpoints)
+        self.assertIn(("POST", "/v1/notes", 201), endpoints)
+        self.assertTrue(any(method == "PUT" and code == 403 for method, _endpoint, code in endpoints))
         self.assertIn(("GET", "/v1/notes", 200), endpoints)
         self.assertIn(("GET", "/v1/atoms", 200), endpoints)
         self.assertIn(("POST", "/v1/chat/stream", 200), endpoints)

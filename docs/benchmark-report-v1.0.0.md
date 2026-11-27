@@ -1,5 +1,7 @@
 # Second Brain `v1.0.0` — Empirical Benchmark & Live Third-Party Comparison Report
 
+> Current state (2026-11-26): the 90-case dataset remains `pending_owner_review`. The owner-accepted Tier-2 answer budget is 35s. The 45s figure below is an unaccepted proposal; the measured 8-thread P95 of 36.45s does not meet 35s. This checkout does not remeasure generation latency without Ollama.
+
 **Published:** 2026-11-22  
 **Dataset:** `second-brain-retrieval-curated-90` (`v3.0.0`, SHA-256 `b51661c99cb72129f06080afebbc758063fece1de0466188979cc8c93b629404`, [retrieval-evaluation-proposed.json](retrieval-evaluation-proposed.json))  
 **Raw Result Artifacts:**

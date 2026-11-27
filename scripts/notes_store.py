@@ -346,6 +346,97 @@ def _quarantine_agent_capture(paths: NotePaths, title: str, body: str, risks: tu
     }
 
 
+_GENERIC_NOTE_MESSAGE = (
+    "Not saved. This is general knowledge, or it is too thin to teach the brain. "
+    "Add an operational rule for this system: a command, a named threshold, a config value, "
+    "or which tool this project uses. Otherwise include two concrete details, such as a path and a file. "
+    "A single filename is not enough."
+)
+_PATH_ANCHOR_RE = re.compile(r"(?:^|[\s\"'(])((?:\.\./|\./|/)[\w./-]{3,})", re.MULTILINE)
+_FILE_ANCHOR_RE = re.compile(
+    r"\b[\w.-]+\.(?:css|scss|sass|less|js|mjs|cjs|jsx|ts|tsx|py|pyi|go|rs|java|kt|rb|php|json|ya?ml|toml|ini|cfg|conf|md|html|htm|sql|sh|ps1|xml|lock|txt|vue|svelte)\b",
+    re.IGNORECASE,
+)
+_FLAG_ANCHOR_RE = re.compile(r"\b[\w.-]+\s+--[\w-]+")
+_UNIT_ANCHOR_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:%|ms|s|px|mb|gb)\b", re.IGNORECASE)
+_VERSION_ANCHOR_RE = re.compile(r"\bv?\d+\.\d+\.\d+\b")
+_CHOICE_ANCHOR_RE = re.compile(
+    r"\b(?:this |our |the )?(?:repo|project|site|vault|app|service|checkout|codebase) uses "
+    r"(?!best\b|proper\b|secure\b|good\b|https\b)[A-Za-z0-9_./+-]{2,}",
+    re.IGNORECASE,
+)
+_ASSIGN_ANCHOR_RE = re.compile(r"\b[A-Za-z][\w.-]{1,40}[ \t]*(?:=|:)[ \t]*[^\s,]{1,48}")
+_TICK_ANCHOR_RE = re.compile(r"`([^`\n]{3,80})`")
+_GENERIC_TICK_RE = re.compile(r"^(?:https|http|input|password|user|data|token|secret|true|false|null|none)$", re.IGNORECASE)
+_THRESHOLD_RE = re.compile(
+    r"(?:`[^`\n]{2,40}`|\b[A-Za-z_][\w.-]{2,40})\s*(?:is\s+)?(?:>=|<=|==|>|<)\s*\d+(?:\.\d+)?"
+)
+_PROCEDURE_RE = re.compile(r"^\s*(?:\d+[.)]|[-*])\s+\S", re.MULTILINE)
+_STRONG_NOTE_SIGNALS = frozenset({"command", "choice", "threshold", "config"})
+
+
+def note_spec_signals(title: str, body: str) -> set[str]:
+    """Concrete signals that make a note local to this system.
+
+    A command, named threshold, config value, or project tool choice is enough on
+    its own. A path, file, version, measurement, identifier, or procedure counts
+    only together with a second concrete detail.
+    """
+    text = f"{title}\n{body}"
+    signals: set[str] = set()
+    if _PATH_ANCHOR_RE.search(text):
+        signals.add("path")
+    if _FILE_ANCHOR_RE.search(text):
+        signals.add("file")
+    if _FLAG_ANCHOR_RE.search(text):
+        signals.add("command")
+    if _UNIT_ANCHOR_RE.search(text):
+        signals.add("measure")
+    if _VERSION_ANCHOR_RE.search(text):
+        signals.add("version")
+    if _CHOICE_ANCHOR_RE.search(text):
+        signals.add("choice")
+    if _THRESHOLD_RE.search(text):
+        signals.add("threshold")
+    if len(_PROCEDURE_RE.findall(text)) >= 2:
+        signals.add("procedure")
+    for match in _ASSIGN_ANCHOR_RE.finditer(text):
+        value = match.group(0).split("=", 1)[-1].split(":", 1)[-1].strip()
+        if re.search(r"[\d/._]", value) and value.casefold() not in {"true", "false", "null", "none", "https"}:
+            signals.add("config")
+            break
+    for match in _TICK_ANCHOR_RE.finditer(text):
+        inner = match.group(1).strip()
+        if re.search(r"[\d/._:]", inner) and not _GENERIC_TICK_RE.match(inner):
+            signals.add("identifier")
+            break
+    return signals
+
+
+def agent_capture_rejection(title: str, body: str) -> str | None:
+    """Refuse an agent note that is general knowledge or only one thin detail.
+
+    Owner-written notes are not checked. One operational rule is enough. Two
+    different concrete details are enough. A filename by itself is not.
+    """
+    signals = note_spec_signals(title, body)
+    if signals & _STRONG_NOTE_SIGNALS:
+        return None
+    if len(signals) >= 2:
+        return None
+    return _GENERIC_NOTE_MESSAGE
+
+
+def _learn_saved_notes(paths: NotePaths) -> None:
+    """Best-effort: a saved note becomes shared memory without blocking the save."""
+    try:
+        from agent_runtime import learn_from_notes
+
+        learn_from_notes(brain_dir=paths.brain_dir)
+    except Exception:
+        return
+
+
 def create_note(
     title: str,
     body: str,
@@ -368,6 +459,9 @@ def create_note(
         risks = scan_inbox_payload_risks(f"{clean_title}\n{text_body}")
         if risks:
             return _quarantine_agent_capture(paths, clean_title, text_body, risks, capture_source)
+        generic = agent_capture_rejection(clean_title, text_body)
+        if generic:
+            return {"status": "not_saved", "reason": "generic", "message": generic}
     now = _now_iso()
     rendered = render_note(
         title=clean_title,
@@ -385,7 +479,9 @@ def create_note(
         name = _create_exclusive(paths.notes_dir, slugify(clean_title), rendered)
         if reindex:
             upsert_lexical_atoms(paths.notes_dir, paths.index_path, [name])
-    return {"status": "saved", "filename": name, "sha256": content_sha256(rendered), "origin": origin}
+    saved = {"status": "saved", "filename": name, "sha256": content_sha256(rendered), "origin": origin}
+    _learn_saved_notes(paths)
+    return saved
 
 
 def update_note(
@@ -435,7 +531,9 @@ def update_note(
             atomic_write_bytes(str(backup), original)
         atomic_write_bytes(str(target), rendered)
         upsert_lexical_atoms(paths.notes_dir, paths.index_path, [filename])
-    return {"status": "saved", "filename": filename, "sha256": content_sha256(rendered), "previous_sha256": current}
+    saved = {"status": "saved", "filename": filename, "sha256": content_sha256(rendered), "previous_sha256": current}
+    _learn_saved_notes(paths)
+    return saved
 
 
 def delete_note(filename: str, *, expected_sha256: str, paths: NotePaths = DEFAULT_PATHS) -> dict[str, object]:

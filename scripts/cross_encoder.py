@@ -32,7 +32,7 @@ if __name__ in ("cross_encoder", "scripts.cross_encoder"):
     sys.modules.setdefault("cross_encoder", sys.modules[__name__])
     sys.modules.setdefault("scripts.cross_encoder", sys.modules[__name__])
 
-from config import _is_reparse_or_link, security_state_dir
+from config import _is_reparse_or_link, is_untrusted_reparse_or_link, security_state_dir
 from lexical_store import FTS_STOP_WORDS, TOKEN_PATTERN, porter_stem
 from memory_format import split_frontmatter
 from memory_review import section_text
@@ -85,7 +85,7 @@ def resolve_cross_encoder_dir(explicit_dir: str | Path | None = None) -> Path | 
     if not os.path.lexists(str(cand)):
         return None
     for ancestor in (cand, *cand.parents):
-        if os.path.lexists(str(ancestor)) and _is_reparse_or_link(str(ancestor)):
+        if is_untrusted_reparse_or_link(str(ancestor)):
             return None
     if not cand.is_dir():
         return None
@@ -572,7 +572,7 @@ def _min_span_density(q_stem_set: set[str], doc_stems: Sequence[str]) -> float:
 class InteractionCrossEncoder:
     """Fast (< 1 ms) deterministic token-interaction Cross-Encoder for Markdown memory atoms."""
 
-    backend_name = "cross_encoder"
+    backend_name = "interaction_cross_encoder"
 
     def score_pairs(self, query: str, contents: Sequence[str]) -> list[float]:
         if not contents:

@@ -797,7 +797,12 @@ class V040SotaUpgradesTests(unittest.TestCase):
 
                 ext_origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
                 base_url = f"http://127.0.0.1:{port}"
-                with httpx.Client(trust_env=False, timeout=10) as client:
+                with httpx.Client(
+                    trust_env=False,
+                    timeout=10,
+                    limits=httpx.Limits(max_keepalive_connections=0, max_connections=20),
+                    headers={"Connection": "close"},
+                ) as client:
                     # Unpaired extension preflight to /v1/clipper/redeem MUST succeed (204)
                     opt_r = client.options(
                         f"{base_url}/v1/clipper/redeem",
@@ -862,11 +867,21 @@ class V040SotaUpgradesTests(unittest.TestCase):
                     for idx in range(20):
                         hex16 = f"{idx:032x}".translate(str.maketrans("0123456789abcdef", "abcdefghijklmnop"))
                         spoof_o = f"chrome-extension://{hex16}"
-                        last_rot = client.post(
-                            f"{base_url}/v1/clipper/redeem",
-                            headers={"Host": f"127.0.0.1:{port}", "Origin": spoof_o},
-                            json={"code": "SBC-3333-3333-3333", "origin": spoof_o},
-                        )
+                        posted = None
+                        transport_error: Exception | None = None
+                        for _attempt in range(4):
+                            try:
+                                posted = client.post(
+                                    f"{base_url}/v1/clipper/redeem",
+                                    headers={"Host": f"127.0.0.1:{port}", "Origin": spoof_o},
+                                    json={"code": "SBC-3333-3333-3333", "origin": spoof_o},
+                                )
+                                break
+                            except httpx.TransportError as exc:
+                                transport_error = exc
+                        if posted is None:
+                            raise transport_error or RuntimeError("clipper redeem request failed")
+                        last_rot = posted
                     assert last_rot is not None
                     self.assertEqual(last_rot.status_code, 429)
 
@@ -1222,7 +1237,18 @@ class V040SotaUpgradesTests(unittest.TestCase):
                     skip_dns_check_for_mock_transport=True,
                 )
                 mig_res = migrate_sync_key_to_keychain(brain_dir=vault_b, state_dir=sec_b)
-                self.assertTrue(mig_res["keychain_sealed"])
+                # An isolated state_dir never writes the login keychain. Linux and macOS
+                # then seal into the restricted keyfile and report keychain_sealed False.
+                # Windows DPAPI still reports True. Either way the JSON master key is gone.
+                backend = str(mig_res["keychain_backend"])
+                self.assertIn(
+                    backend,
+                    {"windows_dpapi", "macos_keychain", "linux_secret_service", "posix_restricted_keyfile"},
+                )
+                if backend == "posix_restricted_keyfile":
+                    self.assertFalse(mig_res["keychain_sealed"])
+                else:
+                    self.assertTrue(mig_res["keychain_sealed"])
                 self.assertIsNone(json.loads(sync_config_path(vault_b, state_dir=sec_b).read_text(encoding="utf-8"))["master_key_b64"])
 
                 with (

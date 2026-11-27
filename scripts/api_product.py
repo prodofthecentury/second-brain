@@ -1094,15 +1094,34 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             )
 
         if path == "/v1/notes" and method == "POST":
-            if not owner_only():
-                return True
+            # Connected agents may add a note. They cannot change or delete one that already exists.
+            if had_failed_owner_hdr:
+                return send(403, {"error": "403 Forbidden: invalid owner token."})
+            if is_owner:
+                res = create_note(
+                    _str(body, "title", max_len=200, required=False),
+                    _str(body, "body", max_len=MAX_NOTE_BYTES, required=False),
+                    tags=_tags(body),
+                    paths=paths,
+                )
+                return send(201, res)
+            client_ip = handler.client_address[0] if getattr(handler, "client_address", None) else "127.0.0.1"
+            if not check_capture_rate_limit(client_ip):
+                return send(429, {"error": "Too Many Requests: capture write rate limit exceeded (max 180 per minute)."})
+            text = _str(body, "body", max_len=16_000, required=False) or _str(body, "content", max_len=16_000, required=False)
+            if not str(text or "").strip():
+                raise NoteError("A note needs text.")
             res = create_note(
                 _str(body, "title", max_len=200, required=False),
-                _str(body, "body", max_len=MAX_NOTE_BYTES, required=False),
+                text,
+                origin="agent_capture",
                 tags=_tags(body),
+                capture_source="api-agent",
                 paths=paths,
             )
-            return send(201, res)
+            if res.get("status") == "not_saved":
+                return send(422, res)
+            return send(202 if res.get("status") == "quarantined" else 201, res)
 
         if path == "/v1/notes/tasks" and method == "GET":
             from notes_store import extract_action_items
@@ -1185,7 +1204,17 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 capture_source=_str(body, "source", max_len=64, required=False, default="agent"),
                 paths=paths,
             )
+            if res.get("status") == "not_saved":
+                return send(422, res)
             return send(202 if res["status"] == "quarantined" else 201, res)
+
+        # ── Agent runtime status (owner-only; skill triggers stay off the agent bearer) ──
+        if path == "/v1/agent/status" and method == "GET":
+            if not owner_only():
+                return True
+            from agent_runtime import agent_status
+
+            return send(200, agent_status(rt.brain_dir))
 
         # ── Multi-turn Chat Threads (owner-only) & Streaming Chat ──
         if path == "/v1/chat/threads" and method == "GET":
@@ -1209,7 +1238,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
                 title=_str(body, "title", max_len=160, required=False),
                 project_scope=_str(body, "project_scope", max_len=120, required=False).strip() or None,
                 host_id=_str(body, "host_id", default="ollama_local", max_len=64, required=False) or "ollama_local",
-                mode=_str(body, "mode", default="verified", max_len=32, required=False) or "verified",
+                mode=_str(body, "mode", default="direct", max_len=32, required=False) or "direct",
                 brain_dir=rt.brain_dir,
             )
             return send(201, created)
@@ -1248,7 +1277,7 @@ def dispatch(handler, method: str, path: str, query: str, body: dict | None) -> 
             if "mode" not in chat_payload or chat_payload.get("mode") is None or (
                 isinstance(chat_payload.get("mode"), str) and not str(chat_payload.get("mode")).strip()
             ):
-                chat_payload["mode"] = "stream"
+                chat_payload["mode"] = "direct"
             req = ChatStreamRequest.model_validate(chat_payload)
             if req.thread_id and not is_owner:
                 return send(

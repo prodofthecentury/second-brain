@@ -504,6 +504,7 @@ function buildChatWebviewHtml(nonce) {
   <div class="row">
     <label class="ctrl-label">Mode
       <select id="m">
+        <option value="direct">direct</option>
         <option value="stream">stream</option>
         <option value="verified">verified</option>
         <option value="instant">instant</option>

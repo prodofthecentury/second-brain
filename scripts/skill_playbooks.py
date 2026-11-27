@@ -50,7 +50,9 @@ from recall import normalize_project_tag, project_tags_match
 from review_atom import approved_revision_is_current
 
 PLAYBOOK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
-DISALLOWED_AUTOMATED_ACTORS = frozenset({"auto", "system", "llm", "model", "ollama", "assistant", "agent"})
+DISALLOWED_AUTOMATED_ACTORS = frozenset(
+    {"auto", "system", "llm", "model", "ollama", "assistant", "agent", "agent_runtime"}
+)
 REQUIRED_PLAYBOOK_SECTIONS: tuple[str, ...] = (
     "Trigger & Applicability",
     "Preconditions & Inputs",
@@ -164,7 +166,9 @@ def _normalize_playbook_id(raw_id: str) -> str:
 
 def _validate_human_actor(actor: str) -> str:
     cleaned = _sanitize_line(actor, max_len=120)
-    if not cleaned or cleaned.lower() in DISALLOWED_AUTOMATED_ACTORS:
+    lowered = cleaned.lower()
+    prefix = lowered.split(":", 1)[0].strip()
+    if not cleaned or lowered in DISALLOWED_AUTOMATED_ACTORS or prefix in DISALLOWED_AUTOMATED_ACTORS:
         raise PlaybookValidationError(
             f"Playbook mutation requires an explicit human owner actor (got {actor!r})."
         )

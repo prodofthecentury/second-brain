@@ -315,6 +315,11 @@ label.inline-check {
   border-color: rgba(56, 189, 248, 0.55);
   color: #7dd3fc;
 }
+.badge.tier-a {
+  background: rgba(232, 121, 249, 0.16);
+  border-color: rgba(232, 121, 249, 0.55);
+  color: #f5d0fe;
+}
 .badge.tier-p {
   background: rgba(124, 92, 255, 0.2);
   border-color: rgba(124, 92, 255, 0.6);
@@ -993,6 +998,11 @@ label.inline-check {
   background: rgba(56, 189, 248, 0.18);
   border-color: rgba(56, 189, 248, 0.6);
   color: #7dd3fc;
+}
+.citation-badge.tier-a {
+  background: rgba(232, 121, 249, 0.18);
+  border-color: rgba(232, 121, 249, 0.6);
+  color: #f5d0fe;
 }
 .citation-badge.tier-p {
   background: rgba(124, 92, 255, 0.22);

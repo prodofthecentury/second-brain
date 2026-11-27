@@ -439,8 +439,8 @@ def process_audio(filepath: str) -> str | None:
     archive_note = _is_direct_raw_child(filepath)
     out_name = save_capture_and_archive(filepath, out_name, content, source_sha256)
 
-    print(f"  [✓] Transcript saved → {out_name}")
-    print("  [✓] Original archived." if archive_note else "  [✓] External original copied into archive.")
+    _console_print(f"  [✓] Transcript saved → {out_name}")
+    _console_print("  [✓] Original archived." if archive_note else "  [✓] External original copied into archive.")
     return out_name
 
 
@@ -666,8 +666,8 @@ def process_image(filepath: str) -> str | None:
     archive_note = _is_direct_raw_child(filepath)
     out_name = save_capture_and_archive(filepath, out_name, content, source_sha256)
 
-    print(f"  [✓] Image description saved → {out_name}")
-    print("  [✓] Original archived." if archive_note else "  [✓] External original copied into archive.")
+    _console_print(f"  [✓] Image description saved → {out_name}")
+    _console_print("  [✓] Original archived." if archive_note else "  [✓] External original copied into archive.")
     return out_name
 
 
@@ -716,8 +716,8 @@ def process_document(filepath: str) -> str | None:
     )
     archive_note = _is_direct_raw_child(filepath)
     out_name = save_capture_and_archive(filepath, out_name, content, source_sha256, allow_large=True)
-    print(f"  [✓] Document extracted → {out_name}")
-    print("  [✓] Original archived." if archive_note else "  [✓] External original copied into archive.")
+    _console_print(f"  [✓] Document extracted → {out_name}")
+    _console_print("  [✓] Original archived." if archive_note else "  [✓] External original copied into archive.")
     return out_name
 
 
@@ -848,6 +848,16 @@ def process_file(filepath: str) -> str | None:
     return None
 
 
+def _console_print(message: str) -> None:
+    """Print a status line when the console encoding cannot hold a glyph."""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        message.encode(encoding)
+    except UnicodeEncodeError:
+        message = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    print(message)
+
+
 def scan_raw_dir() -> list[str]:
     """Find and process all unhandled audio, image, and document files in 0-raw/."""
     ensure_dirs()
@@ -870,7 +880,7 @@ def scan_raw_dir() -> list[str]:
         if not wait_for_stable_file(filepath):
             print(f"  [!] Skipping unstable or empty media file: {filename}")
             continue
-        print(f"\n[→] Processing: {filename}")
+        _console_print(f"\n[→] Processing: {filename}")
         try:
             out = process_file(filepath)
             if out:

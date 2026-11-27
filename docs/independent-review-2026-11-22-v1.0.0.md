@@ -1,5 +1,7 @@
 # Independent Adversarial Architecture & Security Audit — `v1.0.0` Release Gate (2026-11-22)
 
+> Current state (2026-11-26): this note is a historical audit. The 90-case dataset remains `pending_owner_review`, and the 45s answer budget is still an unaccepted proposal. The accepted Tier-2 answer budget in code is 35s.
+
 **Primary Security & Contract Audit Session:** Isolated Read-Only `security-auditor` Subagent (`a964c8d4-b50a-459e-b470-01dd943624d8`)  
 **Post-Remediation Final Code & Release Review:** Isolated Read-Only `code-reviewer` Subagent *(recorded in Section 5 on final `v1.0.0` tag)*  
 **Audited Specification:** [CODEX_CLI_GOAL.md](../CODEX_CLI_GOAL.md) (Objective, Milestones 1–6, Next Goal Set 1–4, 9 Hard Architectural Contract Invariants, Release Gate & Working Rules)  

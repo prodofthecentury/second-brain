@@ -446,7 +446,14 @@ def sync_notes_index_for_vault(*, brain_dir: str | None = None, notes_dir: str |
     if os.path.lexists(npaths.notes_dir) and _is_reparse_or_link(str(npaths.notes_dir)):
         raise PermissionError(f"Refusing to sync symlinked notes directory: {npaths.notes_dir}")
     os.makedirs(npaths.notes_dir, exist_ok=True)
-    return ensure_notes_index(npaths)
+    indexed = ensure_notes_index(npaths)
+    try:
+        from agent_runtime import learn_from_notes
+
+        learn_from_notes(brain_dir=resolved_brain)
+    except Exception:
+        pass
+    return indexed
 
 
 def sync_atoms_and_detect_stale_anchors(
@@ -737,8 +744,19 @@ def run_daemon(*, once: bool = False, auto_sync: bool = False, sync_interval: in
 
     try:
         scan_unprocessed_raw_files(dispatcher, RAW_DIR)
+        agent_tick_at = 0.0
         while True:
             time.sleep(1.0)
+            now_m = time.monotonic()
+            if now_m < agent_tick_at:
+                continue
+            agent_tick_at = now_m + 30.0
+            try:
+                from agent_runtime import run_scheduled_goals
+
+                run_scheduled_goals()
+            except Exception as exc:
+                log.warning(f"Agent schedule tick failed: {exc}")
     except KeyboardInterrupt:
         log.info("Shutting down watchdog...")
     finally:
