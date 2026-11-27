@@ -257,6 +257,8 @@ def _sympy_value(expr: str) -> Any:
     return value
 
 
+_DECIMAL_SUFFIX = re.compile(r"\s+as\s+a\s+decimal$", re.IGNORECASE)
+_FOLDABLE_UNITS = frozenset({"km", "kg", "lb", "oz", "ft", "mi", "min", "cm", "dm", "ks"})
 _COMPUTE_PREFIXES = (
     "what date is",
     "how much is",
@@ -345,18 +347,21 @@ def _is_whole_expression(text: str) -> bool:
     return True
 
 
-def exact_arithmetic(expr: str) -> tuple[str, str, bool]:
+def exact_arithmetic(expr: str, *, force_decimal: bool = False) -> tuple[str, str, bool]:
     """Return (text, answer_source, verified). Verified only when SymPy and the AST agree.
 
     A rounded float is never verified. Decimal literals are exact ratios first.
+    force_decimal prints a terminating result as a decimal and refuses one that does not end.
     """
-    had_decimal = bool(re.search(r"\.\d", expr))
+    had_decimal = force_decimal or bool(re.search(r"\.\d", expr))
     cleaned = _prepare_expression(expr)
     try:
         restricted_value = _ast_eval(cleaned)
         restricted = _format_number(restricted_value, prefer_decimal=had_decimal)
     except SyntaxError as exc:
         raise ValueError("expression is not plain arithmetic") from exc
+    if force_decimal and "/" in restricted:
+        raise ValueError("not a terminating decimal")
     rounded = isinstance(restricted_value, float) and not float(restricted_value).is_integer()
     try:
         symbolic = _format_number(_sympy_value(cleaned), prefer_decimal=had_decimal)
@@ -368,6 +373,8 @@ def exact_arithmetic(expr: str) -> tuple[str, str, bool]:
         raise ValueError(str(exc)) from exc
     if symbolic != restricted:
         raise ValueError("calculator mismatch")
+    if force_decimal and "/" in symbolic:
+        raise ValueError("not a terminating decimal")
     if rounded:
         return restricted, "tool:calculator", False
     return symbolic, "tool:sympy", True
@@ -437,12 +444,31 @@ def _date_phone_or_range(text: str) -> bool:
     return _hyphen_literal(text)
 
 
+def _irreducible_ratio(expr: str) -> bool:
+    """True when the whole expression is one a/b that is already in lowest terms."""
+    match = re.fullmatch(r"([+-]?\d+)/([+-]?\d+)", re.sub(r"\s+", "", expr))
+    if not match:
+        return False
+    numer, denom = int(match.group(1)), int(match.group(2))
+    if denom == 0:
+        return False
+    value = Fraction(numer, denom)
+    return value.numerator == numer and value.denominator == denom
+
+
+def _lopsided_minus(text: str) -> bool:
+    """'2026 -11' has a space only before the minus. '40 - 15' does not."""
+    return re.search(r"\d\s+-\d", text) is not None
+
+
 def _ordinary_literal(text: str) -> bool:
     """A bare phone, date, range, percent, or dimension is not a calculation."""
     compact = re.sub(r"\s+", "", text)
     if _date_phone_or_range(text):
         return True
-    if re.fullmatch(r"\d+/\d+(?:/\d+)?", compact):
+    if _irreducible_ratio(compact):
+        return True
+    if re.fullmatch(r"\d+/\d+/\d+", compact):
         return True
     if re.fullmatch(r"\d+(?:\.\d+)?%", compact):
         return True
@@ -469,13 +495,33 @@ def _expression_text(text: str, *, prefixed: bool) -> str | None:
     return candidate
 
 
+def _asks_for_decimal(question: str) -> bool:
+    text = _normalize_question(_question_text(question))
+    body, _prefixed = _strip_compute_prefix(text)
+    return _DECIMAL_SUFFIX.search(body) is not None
+
+
 def extract_expression(question: str) -> str | None:
-    """Fire only when the whole question, minus one leading compute phrase, is the expression."""
+    """Fire only when the whole question, minus one leading compute phrase, is the expression.
+
+    A single a/b already in lowest terms is not a calculation. A space only before
+    a minus is not a calculation unless a compute phrase introduces it.
+    """
     text = _normalize_question(_question_text(question))
     if not text:
         return None
     body, prefixed = _strip_compute_prefix(text)
-    return _expression_text(body, prefixed=prefixed)
+    decimal = _DECIMAL_SUFFIX.search(body) is not None
+    if decimal:
+        body = _DECIMAL_SUFFIX.sub("", body).strip()
+    if not body:
+        return None
+    if not prefixed and _lopsided_minus(body):
+        return None
+    expr = _expression_text(body, prefixed=prefixed or decimal)
+    if expr is None or (_irreducible_ratio(expr) and not decimal):
+        return None
+    return expr
 
 
 def _date_pair(question: str) -> tuple[str, str] | None:
@@ -599,8 +645,8 @@ def _parse_unit_strict(token: str) -> tuple[str, Fraction | str] | object | None
 def _parse_unit(raw: str) -> tuple[str, Fraction | str] | None:
     """M is mega, m is milli or metre, B is byte, b is bit.
 
-    A whole unit whose case cannot be a different prefix, such as KM or LB,
-    is read by its letters. A failed data prefix is never folded into another unit.
+    Only KM, KG, LB, OZ, FT, MI, MIN, CM, DM and KS are read in either case.
+    A single letter and a capital SI prefix stay case-sensitive.
     """
     token = raw.strip().replace("°", "")
     if len(token) > 2 and token.casefold() in _WORD_UNITS:
@@ -613,7 +659,7 @@ def _parse_unit(raw: str) -> tuple[str, Fraction | str] | None:
     if parsed is not None:
         return parsed
     folded = token.casefold()
-    if folded == token:
+    if len(token) == 1 or folded not in _FOLDABLE_UNITS or folded == token:
         return None
     folded_parsed = _parse_unit_strict(folded)
     if folded_parsed is None or folded_parsed is _REJECT_UNIT or folded_parsed[0] == "data":
@@ -696,7 +742,7 @@ def _try_exact_tool(question: str) -> dict[str, Any] | None:
     if not expr:
         return None
     try:
-        value, source, verified = exact_arithmetic(expr)
+        value, source, verified = exact_arithmetic(expr, force_decimal=_asks_for_decimal(text))
     except ZeroDivisionError:
         return {"refused": True, "problem_type": "math"}
     except (SyntaxError, ValueError, OverflowError, ArithmeticError):

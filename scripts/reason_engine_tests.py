@@ -9,8 +9,56 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
+from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from unittest.mock import patch
+
+
+def _exact_decimal(value: Fraction) -> str | None:
+    """The full decimal of a fraction, computed here and not by the engine."""
+    denom = abs(value.denominator)
+    while denom % 2 == 0:
+        denom //= 2
+    while denom % 5 == 0:
+        denom //= 5
+    if denom != 1:
+        return None
+    text = format(Decimal(value.numerator) / Decimal(value.denominator), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _assert_verified_decimal(test: unittest.TestCase, printed: str, exact: Fraction) -> None:
+    """A verified decimal must be the exact expansion, not a rounded stand-in."""
+    test.assertEqual(Fraction(printed), exact)
+    test.assertEqual(printed, _exact_decimal(exact))
+
+
+_INDEPENDENT_EXACT = {
+    "What is 2/3 + 0.5?": Fraction(2, 3) + Fraction(1, 2),
+    "What is 1/3 + 0.0?": Fraction(1, 3) + Fraction(0),
+    "What is 2.5 * 2?": Fraction(5, 2) * 2,
+    "What is 0.1 + 0.2?": Fraction(1, 10) + Fraction(2, 10),
+    "What is 40 - 15?": Fraction(40) - 15,
+    "10 - 4": Fraction(10) - 4,
+    "What is 10 - 2 - 3?": Fraction(10) - 2 - 3,
+    "Calculate 2026 - 1990": Fraction(2026) - 1990,
+    "What is 40 -15?": Fraction(40) - 15,
+    "40 − 15": Fraction(40) - 15,
+    ".5 + .25": Fraction(1, 2) + Fraction(1, 4),
+    "What is 17 * 23 + 9?": Fraction(17) * 23 + 9,
+    "What is 1,500 + 20?": Fraction(1500) + 20,
+    "What is -5 + 3?": Fraction(-5) + 3,
+    "What is 100/4?": Fraction(100, 4),
+    "What is 50/50?": Fraction(50, 50),
+    "What is 4/20?": Fraction(4, 20),
+    "100/4": Fraction(100, 4),
+    "4/20": Fraction(4, 20),
+    "What is 1/2 + 1/4?": Fraction(1, 2) + Fraction(1, 4),
+    "What is 11 / 2 as a decimal?": Fraction(11, 2),
+}
 
 @contextmanager
 def _sympy_blocked():
@@ -644,12 +692,15 @@ class ReviewRegressionTests(unittest.TestCase):
             self.assertFalse(result["verified"], question)
 
     def test_exact_fractions_stay_exact(self) -> None:
-        third = reason("What is 2/3?")
-        self.assertEqual(third["answer"], "2/3")
-        self.assertNotIn(".", third["answer"])
-        self.assertEqual(reason("What is 1/2 + 1/3?")["answer"], "5/6")
-        self.assertEqual(reason("What is 5/2?")["answer"], "5/2")
+        echoed = reason("What is 2/3?", use_default_model=False)
+        self.assertFalse(str(echoed["answer_source"]).startswith("tool:"))
+        self.assertFalse(echoed["verified"])
+        self.assertIsNone(try_exact_tool("What is 5/2?"))
+        combined = reason("What is 1/2 + 1/3?")
+        self.assertEqual(combined["answer"], "5/6")
+        self.assertNotIn(".", combined["answer"])
         self.assertEqual(reason("What is 4/2?")["answer"], "2")
+        self.assertEqual(reason("What is 100/4?")["answer"], "25")
         self.assertEqual(reason("What is 17 * 23 + 9?")["answer"], "400")
 
     def test_supported_numbers_are_whole_tokens(self) -> None:
@@ -892,6 +943,16 @@ class MechanismProbeTests(unittest.TestCase):
             "555-1234",
             "(555)-1234",
             "(09) 377-1234",
+            "2026 -11",
+            "10 -4",
+            "What is 24/7?",
+            "Compute 12/25.",
+            "Evaluate 9/11.",
+            "Calculate 24/7",
+            "What is 2/3?",
+            "What is 28/11?",
+            "What is 16/9?",
+            "What is 22/7?",
             "10-4",
             "2026-11",
             "What is 2026-11?",
@@ -932,12 +993,19 @@ class MechanismProbeTests(unittest.TestCase):
             "10 - 4": "6",
             "What is 10 - 2 - 3?": "5",
             "Calculate 2026 - 1990": "36",
-            "40 -15": "25",
+            "What is 40 -15?": "25",
             "40 − 15": "25",
             ".5 + .25": "0.75",
             "What is 17 * 23 + 9?": "400",
             "What is 1,500 + 20?": "1520",
             "What is -5 + 3?": "-2",
+            "What is 100/4?": "25",
+            "What is 50/50?": "1",
+            "What is 4/20?": "1/5",
+            "100/4": "25",
+            "4/20": "1/5",
+            "What is 1/2 + 1/4?": "3/4",
+            "What is 11 / 2 as a decimal?": "5.5",
         }
 
         def check() -> None:
@@ -951,10 +1019,8 @@ class MechanismProbeTests(unittest.TestCase):
             for question, answer in exact.items():
                 result = reason(question, use_default_model=False)
                 self.assertEqual(result["answer"], answer, question)
-                if result["verified"] and "." not in answer:
-                    self.assertNotIn(".", result["answer"], question)
-                if result["verified"] and "/" in result["answer"]:
-                    self.assertNotIn(".", result["answer"], question)
+                if "." in result["answer"] and result["verified"]:
+                    _assert_verified_decimal(self, result["answer"], _INDEPENDENT_EXACT[question])
                 seen[question] = result["answer"]
             self.assertEqual(seen["What is 2.5 * 2?"], "5")
             self.assertEqual(seen["What is 2/3 + 0.5?"], "7/6")
@@ -1097,6 +1163,13 @@ class MechanismProbeTests(unittest.TestCase):
             "0 F to C": "-160/9",
             "451 F to C": "2095/9",
             "32 F to c": "0",
+            "1 Mm to m": "1000000",
+            "1 Mg to kg": "1000",
+            "1 Ms to s": "1000000",
+            "1 Pm to m": "1000000000000000",
+            "1 Gm to m": "1000000000",
+            "1 Pg to g": "1000000000000000",
+            "1 Ps to s": "1000000000000000",
         }
         declined = (
             "1 MB to mb",
@@ -1110,21 +1183,97 @@ class MechanismProbeTests(unittest.TestCase):
             "1 hB to B",
             "1 daB to B",
             "1 nb to b",
+            "1 MM to m",
+            "1 MG to kg",
+            "1 MG to mg",
+            "1 PM to m",
+            "1 MS to s",
+            "1 M to m",
+            "1 G to g",
+            "1 S to s",
+            "1 H to min",
+            "1 KM to MM",
+            "1 km to M",
+            "1 mm to MM",
+            "1 Ms to MS",
+            "5 Km to M",
+            "2 MM to m",
+            "3 mm to M",
+            "1 mg to MG",
+            "1 mi to M",
+            "1 GM to m",
+            "1 PG to g",
+            "1 PS to s",
         )
+        independent = {
+            "100 Mb to kB": Fraction(100) * 10**6 / 8 / 10**3,
+            "1 Gb to MB": Fraction(10**9) / 8 / 10**6,
+            "1 Mm to m": Fraction(10**6),
+            "1 Mg to kg": Fraction(10**6) / 10**3,
+            "1 mm to m": Fraction(1, 1000),
+            "1 km to m": Fraction(1000),
+            "100 Mb to MB": Fraction(100) / 8,
+            "8 b to B": Fraction(1),
+            "1 GiB to MB": Fraction(1024**3, 10**6),
+            "1 Gib to MB": Fraction(1024**3, 8 * 10**6),
+            "3 mi to km": Fraction(3) * Fraction("1609.344") / 1000,
+            "1 lb to kg": Fraction("453.59237") / 1000,
+            "1 kB to KiB": Fraction(1000, 1024),
+            "1 cm to in": Fraction(1, 100) / Fraction(254, 10000),
+            "2 kg to g": Fraction(2000),
+            "30 min to s": Fraction(1800),
+            "3 km to m": Fraction(3000),
+            "5 KM to m": Fraction(5000),
+            "1 LB to oz": Fraction("453.59237") / Fraction("28.349523125"),
+            "100 C to F": Fraction(100) * 9 / 5 + 32,
+            "72 F to C": (Fraction(72) - 32) * 5 / 9,
+            "98 F to C": (Fraction(98) - 32) * 5 / 9,
+            "61 F to C": (Fraction(61) - 32) * 5 / 9,
+            "100 F to C": (Fraction(100) - 32) * 5 / 9,
+            "0 F to C": (Fraction(0) - 32) * 5 / 9,
+            "451 F to C": (Fraction(451) - 32) * 5 / 9,
+            "32 F to c": Fraction(0),
+            "1 Mm to m": Fraction(10**6),
+            "1 Mg to kg": Fraction(10**6) / 10**3,
+            "1 Ms to s": Fraction(10**6),
+            "1 Pm to m": Fraction(10**15),
+            "1 Gm to m": Fraction(10**9),
+            "1 Pg to g": Fraction(10**15),
+            "1 Ps to s": Fraction(10**15),
+        }
 
         def check() -> None:
             for question, expected in rows.items():
                 result = reason(f"Convert {question}.", use_default_model=False)
                 self.assertEqual(result["answer"], expected, question)
                 self.assertTrue(result["verified"], question)
-                self.assertEqual(Fraction(result["answer"]), Fraction(expected), question)
-                if "/" in expected:
-                    self.assertNotIn(".", result["answer"], question)
+                exact = independent[question]
+                self.assertEqual(Fraction(result["answer"]), exact, question)
+                if "." in result["answer"]:
+                    _assert_verified_decimal(self, result["answer"], exact)
             for question in declined:
                 tool = try_exact_tool(f"Convert {question}.")
                 self.assertTrue(tool is None or tool.get("refused"), question)
                 result = reason(f"Convert {question}.", use_default_model=False)
                 self.assertFalse(result["verified"], question)
+
+        self._both(check)
+
+    def test_verified_decimals_match_an_independent_fraction(self) -> None:
+        samples = (
+            ("What is 0.2 + 0.3?", Fraction(1, 5) + Fraction(3, 10)),
+            ("What is 0.5 * 0.5?", Fraction(1, 2) * Fraction(1, 2)),
+            ("Convert 2 cm to m.", Fraction(2, 100)),
+            ("What is 11 / 2 as a decimal?", Fraction(11, 2)),
+            ("Convert 72 F to C.", (Fraction(72) - 32) * 5 / 9),
+        )
+
+        def check() -> None:
+            for question, exact in samples:
+                result = reason(question, use_default_model=False)
+                self.assertEqual(Fraction(result["answer"]), exact, question)
+                if "." in result["answer"] and result["verified"]:
+                    _assert_verified_decimal(self, result["answer"], exact)
 
         self._both(check)
 
